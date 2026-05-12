@@ -5,8 +5,14 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{cached_trivy_cli_version, Scanner, VersionCache};
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, ScanOutput, Scanner, VersionCache,
+};
+
+#[cfg(test)]
+use crate::models::security::RawFinding;
+#[cfg(test)]
+use crate::services::scanner_service::convert_trivy_findings;
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -25,6 +31,12 @@ pub struct TrivyResult {
     pub result_type: String,
     #[serde(rename = "Vulnerabilities", default)]
     pub vulnerabilities: Option<Vec<TrivyVulnerability>>,
+    /// Populated when Trivy is invoked with `--list-all-pkgs`. Lists every
+    /// package the scanner enumerated for this target, including ones with
+    /// no known vulnerabilities, so SBOM generation (#903) can reflect the
+    /// full dependency tree rather than only the CVE-bearing subset.
+    #[serde(rename = "Packages", default)]
+    pub packages: Option<Vec<TrivyPackage>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +57,31 @@ pub struct TrivyVulnerability {
     pub description: Option<String>,
     #[serde(rename = "PrimaryURL")]
     pub primary_url: Option<String>,
+}
+
+/// A package entry from a Trivy `Packages` block. Only fields used by
+/// inventory persistence are deserialized; everything else (DependsOn,
+/// SrcVersion, Layer, etc.) is dropped silently via the default
+/// `deny_unknown_fields` policy being absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackage {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "Version", default)]
+    pub version: String,
+    /// Trivy emits `Licenses` as an array of strings. Multi-license packages
+    /// produce multiple entries; persistence joins them with `" OR "` per
+    /// CycloneDX convention.
+    #[serde(rename = "Licenses", default)]
+    pub licenses: Option<Vec<String>>,
+    #[serde(rename = "Identifier", default)]
+    pub identifier: Option<TrivyPackageIdentifier>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackageIdentifier {
+    #[serde(rename = "PURL", default)]
+    pub purl: Option<String>,
 }
 
 /// Container image scanner that delegates to a Trivy server instance.
@@ -70,13 +107,11 @@ impl ImageScanner {
         }
     }
 
-    /// Check if this artifact is an OCI/Docker image manifest.
+    /// Check if this artifact is an OCI/Docker image manifest. Thin wrapper
+    /// around the shared [`crate::services::scanner_service::is_oci_image_artifact`]
+    /// helper so the predicate has one source of truth.
     fn is_container_image(artifact: &Artifact) -> bool {
-        let ct = &artifact.content_type;
-        ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || artifact.path.contains("/manifests/")
+        crate::services::scanner_service::is_oci_image_artifact(artifact)
     }
 
     /// Extract an image reference from the artifact path.
@@ -180,6 +215,10 @@ impl ImageScanner {
                 &self.trivy_url,
                 "--format",
                 "json",
+                // #903: enumerate the full package inventory, not just
+                // CVE-bearing rows. Adds the `Packages` block to the
+                // JSON report which `convert_trivy_packages` consumes.
+                "--list-all-pkgs",
                 "--quiet",
                 "--timeout",
                 "5m",
@@ -212,12 +251,18 @@ impl ImageScanner {
         // POST /twirp/trivy.scanner.v1.Scanner/Scan
         let url = format!("{}/twirp/trivy.scanner.v1.Scanner/Scan", self.trivy_url);
 
+        // `list_all_packages: true` mirrors the `--list-all-pkgs` CLI flag
+        // (#903): without it the Twirp endpoint returns no `Packages`
+        // block, and any environment that falls through to this HTTP
+        // path (ARC runners + demo EC2 without the trivy CLI binary)
+        // would silently keep the empty-SBOM bug for image scans.
         let body = serde_json::json!({
             "target": image_ref,
             "artifact_type": "container_image",
             "options": {
                 "vuln_type": ["os", "library"],
                 "scanners": ["vuln"],
+                "list_all_packages": true,
             }
         });
 
@@ -243,36 +288,14 @@ impl ImageScanner {
             .map_err(|e| AppError::Internal(format!("Failed to parse Trivy response: {}", e)))
     }
 
-    /// Convert Trivy vulnerabilities to RawFindings.
-    fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
-        let mut findings = Vec::new();
-
-        for result in &report.results {
-            if let Some(ref vulns) = result.vulnerabilities {
-                for vuln in vulns {
-                    let severity =
-                        Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info);
-
-                    let title = vuln.title.clone().unwrap_or_else(|| {
-                        format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
-                    });
-
-                    findings.push(RawFinding {
-                        severity,
-                        title,
-                        description: vuln.description.clone(),
-                        cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
-                        affected_version: Some(vuln.installed_version.clone()),
-                        fixed_version: vuln.fixed_version.clone(),
-                        source: Some("trivy".to_string()),
-                        source_url: vuln.primary_url.clone(),
-                    });
-                }
-            }
-        }
-
-        findings
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
+    /// around the shared [`convert_trivy_findings`] helper so the existing
+    /// tests can call `ImageScanner::convert_findings(report)` as before.
+    /// Production code uses `ScanOutput::from_trivy_report` instead, which
+    /// also extracts the package inventory (#903).
+    #[cfg(test)]
+    pub(crate) fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
+        convert_trivy_findings(report, "trivy")
     }
 }
 
@@ -284,6 +307,16 @@ impl Scanner for ImageScanner {
 
     fn scan_type(&self) -> &str {
         "image"
+    }
+
+    /// Surface the container-image content-type check through the trait so
+    /// the orchestrator can gate on it without creating a `scan_results`
+    /// row for non-image artifacts (issues #961, #994). This is the exact
+    /// case that produced the lodash silent-success: a generic tarball
+    /// uploaded as `scan_type=image` should never have flowed into
+    /// `ImageScanner::scan` at all.
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_container_image(artifact)
     }
 
     /// Probe `trivy --version` once and cache the parsed version string.
@@ -298,20 +331,24 @@ impl Scanner for ImageScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         _content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        // Only scan OCI/Docker image manifests
-        if !Self::is_container_image(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        debug_assert!(
+            Self::is_container_image(artifact),
+            "ImageScanner::scan called on a non-container artifact; the orchestrator must gate on is_applicable first"
+        );
 
+        // Image reference extraction can still fail even on an applicable
+        // (content-type-matching) artifact when the path is malformed.
+        // That is a real error, not a "not applicable" case: surface it as
+        // a failed scan so the operator sees error_message rather than a
+        // silent completed-with-zero-findings row (issue #994).
         let image_ref = match Self::extract_image_ref(artifact) {
             Some(r) => r,
             None => {
-                info!(
+                return Err(AppError::Internal(format!(
                     "Could not extract image reference from artifact path: {}",
                     artifact.path
-                );
-                return Ok(vec![]);
+                )));
             }
         };
 
@@ -329,21 +366,28 @@ impl Scanner for ImageScanner {
         info!("Starting Trivy scan for image: {}", image_ref);
 
         let report = self.scan_with_trivy(&image_ref).await?;
-        let findings = Self::convert_findings(&report);
+        // Source label is intentionally "trivy" (not "trivy-image") to
+        // preserve back-compat with dashboards / filters that group
+        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
+        // the same string. Changing it here would silently drop
+        // existing image-scanner rows from any operator filter.
+        let output = ScanOutput::from_trivy_report(&report, "trivy");
 
         info!(
-            "Trivy scan complete for {}: {} vulnerabilities found",
+            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
             image_ref,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::security::Severity;
 
     /// Build an Artifact fixture for scanner tests. Most fields are not
     /// load-bearing for the scanner — the scanner only branches on `path`
@@ -442,6 +486,7 @@ mod tests {
                         primary_url: None,
                     },
                 ]),
+                packages: None,
             }],
         };
 
@@ -472,6 +517,7 @@ mod tests {
                 class: "os-pkgs".to_string(),
                 result_type: "alpine".to_string(),
                 vulnerabilities: None,
+                packages: None,
             }],
         };
 
@@ -561,19 +607,26 @@ mod tests {
         );
     }
 
-    /// When the artifact is not a container image, the scanner returns
-    /// Ok(vec![]) without ever contacting Trivy. This must remain true
-    /// even after the #888 fix — non-applicable artifacts are not failures.
-    #[tokio::test]
-    async fn test_scan_non_image_returns_ok_empty_without_trivy() {
+    /// Non-container artifacts must report `is_applicable=false` so the
+    /// orchestrator never calls `scan()` on them, rather than the scanner
+    /// silently swallowing them inside `scan()` and producing a
+    /// completed-with-zero-findings row. This is the trait-level contract
+    /// behind the fix for issues #961 and #994.
+    ///
+    /// `scan()` itself is now allowed to panic on a non-applicable artifact
+    /// via `debug_assert!`, because the orchestrator is the single gate
+    /// point. Asserting on `is_applicable` here keeps the regression-test
+    /// pressure on the right surface.
+    #[test]
+    fn test_is_applicable_rejects_non_container_artifact() {
+        use crate::services::scanner_service::Scanner;
+
         let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
         let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
-        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
         assert!(
-            result.is_ok(),
-            "non-container artifacts should not cause the image scanner to error"
+            !Scanner::is_applicable(&scanner, &artifact),
+            "ImageScanner must yield to a filesystem scanner for non-container artifacts (#961, #994)"
         );
-        assert!(result.unwrap().is_empty());
     }
 
     #[test]

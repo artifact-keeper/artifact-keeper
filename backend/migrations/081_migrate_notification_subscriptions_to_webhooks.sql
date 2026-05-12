@@ -27,12 +27,15 @@
 --
 -- Event-type mapping: notifications use dot-separated names
 -- (artifact.uploaded), webhooks use underscore-separated names
--- (artifact_uploaded). The CASE expression below mirrors
--- backend/src/services/notification_dispatcher.rs::
--- NOTIFICATION_TO_WEBHOOK_EVENT_MAP. Keep both in sync; the unit test
--- `notification_dispatcher::tests::test_migration_081_case_matches_rust_map`
--- regex-extracts the WHEN/THEN pairs from this file and asserts they equal
--- the Rust constant.
+-- (artifact_uploaded). The CASE expression below was historically guarded
+-- by a Rust drift-fence test in `notification_dispatcher::tests`. Both
+-- the dispatcher and that test were removed in artifact-keeper#920
+-- (v1.2.0) when System B notifications were retired. Migration 081 itself
+-- still runs on upgrades from any pre-v1.1.9 cluster, but the mapping is
+-- effectively frozen now: no future Rust code reads it, and the data it
+-- moves into the `webhooks` table is stable. Edit ONLY in lock-step with
+-- a manual one-off migration that rewrites the affected `webhooks.events`
+-- rows.
 
 -- Idempotency guard: hard uniqueness on (url, repository_id) treating NULL
 -- repository_id as a synthetic zero-UUID so the constraint covers both

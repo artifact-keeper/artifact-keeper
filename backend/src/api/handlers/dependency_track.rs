@@ -15,8 +15,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::dependency_track_service::{
-    DtAnalysisResponse, DtComponentFull, DtFinding, DtPolicyFull, DtPolicyViolation,
-    DtPortfolioMetrics, DtProject, DtProjectMetrics,
+    DtAnalysisResponse, DtComponentFull, DtFinding, DtHealthStatus, DtPolicyFull,
+    DtPolicyViolation, DtPortfolioMetrics, DtProject, DtProjectMetrics,
 };
 
 /// Create Dependency-Track proxy routes.
@@ -57,11 +57,30 @@ pub fn router() -> Router<SharedState> {
 
 // === Request/Response types ===
 
+/// Dependency-Track integration status surfaced to the frontend.
+///
+/// `healthy` is the boolean the existing UI already binds to. The new
+/// `error_status` and `error_message` fields let the UI distinguish a
+/// genuine "DT replied OK with no findings" state from "DT is down or
+/// misconfigured" (issue #963). When `healthy = true` both error fields
+/// are None; when `healthy = false`:
+///   - `error_status = Some(401)`: auth failure (check API key)
+///   - `error_status = Some(5xx)`: upstream is broken
+///   - `error_status = None`:     transport failure (DT pod unreachable)
+///   - `error_message`:           operator-facing failure description
 #[derive(Debug, Serialize, ToSchema)]
 struct DtStatusResponse {
     enabled: bool,
     healthy: bool,
     url: Option<String>,
+    /// Upstream HTTP status if the health probe got a response, else None.
+    /// Only populated when `healthy = false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_status: Option<u16>,
+    /// Human-readable explanation when `healthy = false`. Safe to surface
+    /// in the UI; does not leak credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -116,17 +135,24 @@ fn get_dt_service(
 async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResponse>> {
     match &state.dependency_track {
         Some(dt) => {
-            let healthy = dt.health_check().await.unwrap_or(false);
+            let (healthy, error_status, error_message) = match dt.health_status().await {
+                DtHealthStatus::Healthy => (true, None, None),
+                DtHealthStatus::Unhealthy { status, reason } => (false, status, Some(reason)),
+            };
             Ok(Json(DtStatusResponse {
                 enabled: true,
                 healthy,
                 url: Some(dt.base_url().to_string()),
+                error_status,
+                error_message,
             }))
         }
         None => Ok(Json(DtStatusResponse {
             enabled: false,
             healthy: false,
             url: None,
+            error_status: None,
+            error_message: None,
         })),
     }
 }
@@ -465,11 +491,16 @@ mod tests {
             enabled: true,
             healthy: true,
             url: Some("http://dt.example.com".to_string()),
+            error_status: None,
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["enabled"], true);
         assert_eq!(json["healthy"], true);
         assert_eq!(json["url"], "http://dt.example.com");
+        // Error fields elided when healthy.
+        assert!(json.get("error_status").is_none());
+        assert!(json.get("error_message").is_none());
     }
 
     #[test]
@@ -478,6 +509,8 @@ mod tests {
             enabled: false,
             healthy: false,
             url: None,
+            error_status: None,
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["enabled"], false);
@@ -491,11 +524,60 @@ mod tests {
             enabled: true,
             healthy: false,
             url: Some("http://dt.example.com:8081".to_string()),
+            error_status: None,
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["enabled"], true);
         assert_eq!(json["healthy"], false);
         assert_eq!(json["url"], "http://dt.example.com:8081");
+    }
+
+    /// Issue #963 regression: when DT replies with non-2xx (e.g. 401 from a
+    /// wrong API key), the status endpoint must surface both the upstream
+    /// HTTP status and a human-readable reason so the UI can render an
+    /// explicit "scanner unavailable" banner instead of failing open to
+    /// "0 dependencies".
+    #[test]
+    fn test_dt_status_response_unhealthy_with_upstream_401() {
+        let resp = DtStatusResponse {
+            enabled: true,
+            healthy: false,
+            url: Some("http://dt.example.com".to_string()),
+            error_status: Some(401),
+            error_message: Some(
+                "Upstream returned HTTP 401 Unauthorized (check DEPENDENCY_TRACK_API_KEY)"
+                    .to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["healthy"], false);
+        assert_eq!(json["error_status"], 401);
+        assert!(json["error_message"].as_str().unwrap().contains("401"));
+    }
+
+    /// When DT is unreachable (pod down, DNS failure) there is no upstream
+    /// HTTP status. The status endpoint surfaces `error_status = null` and a
+    /// "unreachable" reason so the UI renders a different state than
+    /// "auth failed".
+    #[test]
+    fn test_dt_status_response_unhealthy_transport_failure() {
+        let resp = DtStatusResponse {
+            enabled: true,
+            healthy: false,
+            url: Some("http://dt.example.com".to_string()),
+            error_status: None,
+            error_message: Some("Dependency-Track unreachable: connection refused".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["healthy"], false);
+        // error_status field elided (skip_serializing_if = None) to signal
+        // "no HTTP status was returned" cleanly to the frontend.
+        assert!(json.get("error_status").is_none());
+        assert!(json["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable"));
     }
 
     // -----------------------------------------------------------------------
@@ -589,6 +671,8 @@ mod tests {
             enabled: true,
             healthy: true,
             url: Some("http://dt.internal:8080/api".to_string()),
+            error_status: None,
+            error_message: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["url"], "http://dt.internal:8080/api");
@@ -600,12 +684,18 @@ mod tests {
             enabled: true,
             healthy: false,
             url: Some("http://localhost".to_string()),
+            error_status: Some(503),
+            error_message: Some("upstream down".to_string()),
         };
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
         assert!(obj.contains_key("enabled"));
         assert!(obj.contains_key("healthy"));
         assert!(obj.contains_key("url"));
-        assert_eq!(obj.len(), 3);
+        // error_status / error_message are present here because they are
+        // Some(...). When None they are elided by skip_serializing_if.
+        assert!(obj.contains_key("error_status"));
+        assert!(obj.contains_key("error_message"));
+        assert_eq!(obj.len(), 5);
     }
 }

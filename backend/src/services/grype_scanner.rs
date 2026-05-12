@@ -13,8 +13,8 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanWorkspace,
-    Scanner, VersionCache,
+    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanOutput,
+    ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +155,17 @@ impl Scanner for GrypeScanner {
         "grype"
     }
 
+    /// Grype currently runs `grype dir:<workspace>` which scans whatever
+    /// bytes the artifact's content body holds. For OCI / Docker image
+    /// manifests the body is the manifest JSON, not the layer blobs that
+    /// hold the installed packages, so the scan returns 0 findings while
+    /// ImageScanner (Trivy server mode against the registry) finds
+    /// hundreds (#966). Gate OCI artifacts out until Grype can scan
+    /// images via `registry:` mode (follow-up #1160).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        !crate::services::scanner_service::is_oci_image_artifact(artifact)
+    }
+
     /// Probe `grype --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed.
@@ -171,7 +182,7 @@ impl Scanner for GrypeScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         info!(
             "Starting Grype scan for artifact: {} ({})",
             artifact.name, artifact.id
@@ -199,7 +210,11 @@ impl Scanner for GrypeScanner {
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
-        Ok(findings)
+        // Grype's default JSON shape does not enumerate non-vulnerable
+        // packages; SBOM generation for Grype-scanned artifacts depends on
+        // Trivy's filesystem inventory running alongside. Returning an
+        // empty packages Vec is correct rather than misleading.
+        Ok(ScanOutput::findings_only(findings))
     }
 }
 
@@ -210,6 +225,71 @@ mod tests {
 
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         make_test_artifact(name, content_type, &format!("test/{}", name))
+    }
+
+    // -----------------------------------------------------------------------
+    // is_applicable: #966 gate. Grype's dir-scan mode returns 0 findings
+    // against an OCI manifest JSON because it can't see the layer blobs;
+    // ImageScanner (Trivy) is authoritative for container images today.
+    // Follow-up #1160 tracks the proper Grype-on-OCI-via-registry work.
+    // -----------------------------------------------------------------------
+
+    fn grype() -> GrypeScanner {
+        GrypeScanner::new("/tmp/grype-applicability-test".to_string())
+    }
+
+    #[test]
+    fn test_is_applicable_rejects_oci_image_manifest() {
+        let a = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        assert!(
+            !grype().is_applicable(&a),
+            "OCI image manifests must NOT route to Grype (#966); ImageScanner \
+             handles them via Trivy server mode"
+        );
+    }
+
+    #[test]
+    fn test_is_applicable_rejects_docker_distribution_manifest() {
+        let a = make_test_artifact(
+            "redis",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/library/redis/manifests/latest",
+        );
+        assert!(!grype().is_applicable(&a));
+    }
+
+    #[test]
+    fn test_is_applicable_rejects_path_with_manifests_segment() {
+        // Path-based detection catches OCI artifacts that lack the OCI
+        // content_type, which can happen for some proxy upstream variants.
+        let a = make_test_artifact("foo", "application/octet-stream", "v2/foo/manifests/v1");
+        assert!(!grype().is_applicable(&a));
+    }
+
+    #[test]
+    fn test_is_applicable_accepts_npm_tarball() {
+        // The happy path: Grype's existing fs scan does work on lockfiles,
+        // SBOMs, language-pkg targets — keep those routing to Grype.
+        let a = make_test_artifact(
+            "body-parser-1.20.1.tgz",
+            "application/gzip",
+            "npm/body-parser/-/body-parser-1.20.1.tgz",
+        );
+        assert!(grype().is_applicable(&a));
+    }
+
+    #[test]
+    fn test_is_applicable_accepts_pypi_wheel() {
+        let a = make_test_artifact(
+            "requests-2.31.0.whl",
+            "application/zip",
+            "pypi/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
+        );
+        assert!(grype().is_applicable(&a));
     }
 
     #[test]

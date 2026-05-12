@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
+use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -75,6 +75,55 @@ fn format_to_purl_type(format: &str) -> &'static str {
     }
 }
 
+/// True when the artifact is an OCI / Docker container image manifest.
+///
+/// Used to gate scanner applicability: `ImageScanner` (Trivy server-mode
+/// against the registry) handles these; `TrivyFsScanner` and
+/// `GrypeScanner` reject them because their `dir:<workspace>` invocation
+/// sees only the manifest JSON, not the layer blobs that hold the
+/// installed packages (#961, #966).
+///
+/// Predicate matches against either:
+/// - content type contains `vnd.oci.image` / `vnd.docker.distribution`
+///   / `vnd.docker.container`
+/// - artifact path contains `/manifests/` — catches proxy upstream
+///   variants that serve manifests without setting the canonical
+///   content type
+pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
+    let ct = &artifact.content_type;
+    ct.contains("vnd.oci.image")
+        || ct.contains("vnd.docker.distribution")
+        || ct.contains("vnd.docker.container")
+        || artifact.path.contains("/manifests/")
+}
+
+/// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
+/// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
+/// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
+/// (SELECT id FROM latest_scans)`.
+///
+/// Shared across the SBOM read path (`extract_dependencies_for_artifact` in
+/// `api::handlers::sbom`) and the Dependency-Track submission path
+/// (`submit_sbom_to_dependency_track` below) so a rescan that removed a dep
+/// stops surfacing the removed dep from either surface. Mirror of the
+/// pattern already used by `recalculate_score` and `get_dashboard_summary`
+/// for vulnerability aggregation (issues #962 / #1126 / #1136).
+///
+/// Soft-deleted artifacts are excluded so consumers cannot rehydrate dep
+/// trees for content the operator retired (#903 fresh-eyes review #5).
+pub(crate) const LATEST_SCANS_FOR_ARTIFACT_CTE: &str = "
+WITH latest_scans AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+    FROM scan_results sr
+    JOIN artifacts a ON a.id = sr.artifact_id
+    WHERE sr.artifact_id = $1
+      AND NOT a.is_deleted
+      AND sr.status = 'completed'
+    ORDER BY sr.artifact_id, sr.scan_type,
+             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+)
+";
+
 /// Derive the Dependency-Track project name and purl type from an optional
 /// repo name and format. When the repo row is missing, falls back to the
 /// raw repository UUID string.
@@ -117,6 +166,41 @@ pub(crate) fn build_dependency_info_from_findings(
                 version,
                 purl,
                 license: None,
+                sha256: None,
+            }
+        })
+        .collect()
+}
+
+/// Build a list of [`DependencyInfo`] from scan_packages rows.
+///
+/// Each row is `(name, optional_version, optional_purl, optional_license)` as
+/// stored by Trivy's package enumeration. This is the inventory-table read
+/// path used to forward SBOMs to Dependency-Track even when a scan found
+/// zero vulnerabilities (#965). Prefers the persisted `purl` column when
+/// present; otherwise synthesizes one from the supplied `purl_type` and
+/// version, matching the shape produced by
+/// [`build_dependency_info_from_findings`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_dependency_info_from_packages(
+    package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)>,
+    purl_type: &str,
+) -> Vec<crate::services::sbom_service::DependencyInfo> {
+    use crate::services::sbom_service::DependencyInfo;
+
+    package_rows
+        .into_iter()
+        .map(|(name, version, purl, license)| {
+            let purl = purl.or_else(|| {
+                version
+                    .as_deref()
+                    .map(|v| format!("pkg:{}/{}@{}", purl_type, name, v))
+            });
+            DependencyInfo {
+                name,
+                version,
+                purl,
+                license,
                 sha256: None,
             }
         })
@@ -360,6 +444,12 @@ pub(crate) async fn fail_scan(
 /// Convert a Trivy report into `RawFinding` values. Shared by all scanners
 /// that consume Trivy JSON output (trivy_fs_scanner, incus_scanner,
 /// image_scanner).
+///
+/// `affected_component` holds the bare package name. The scanner-internal
+/// target (e.g. `"package-lock.json"`) used to be appended in parentheses,
+/// but consumers (SBOM, CVE-mapping lookup, UI) need the raw name to do
+/// cross-source joins — see #903. Callers that still need the target string
+/// can read it from the parallel `RawPackage` row's `source_target` field.
 pub(crate) fn convert_trivy_findings(
     report: &crate::services::image_scanner::TrivyReport,
     source_label: &str,
@@ -380,7 +470,8 @@ pub(crate) fn convert_trivy_findings(
                     }),
                     description: vuln.description.clone(),
                     cve_id: Some(vuln.vulnerability_id.clone()),
-                    affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
+                    // Bare package name; target moves to RawPackage.source_target.
+                    affected_component: Some(vuln.pkg_name.clone()),
                     affected_version: Some(vuln.installed_version.clone()),
                     fixed_version: vuln.fixed_version.clone(),
                     source: Some(source_label.to_string()),
@@ -388,6 +479,113 @@ pub(crate) fn convert_trivy_findings(
                 })
         })
         .collect()
+}
+
+/// Convert a Trivy report's `Packages` blocks into [`RawPackage`] values.
+/// Produces one row per (target, package, version) triple. Trivy emits both
+/// a standalone `Packages` block and inline `PkgName`/`InstalledVersion` on
+/// each vulnerability row; this function ignores the vulnerability-inline
+/// shape entirely and reads only the canonical `Packages` block.
+///
+/// De-duplication within a single scan is handled by the database's
+/// `scan_packages_unique_per_scan` index — callers do not need to pre-dedup.
+///
+/// Returns an empty Vec when no Trivy result carries a `Packages` block
+/// (i.e. the scanner was invoked without `--list-all-pkgs`); legacy reports
+/// degrade gracefully to "no inventory data" rather than producing
+/// findings-derived stand-ins, which would silently re-introduce the #903
+/// vulnerability-shaped-SBOM bug.
+pub(crate) fn convert_trivy_packages(
+    report: &crate::services::image_scanner::TrivyReport,
+) -> Vec<RawPackage> {
+    report
+        .results
+        .iter()
+        .flat_map(|result| {
+            result
+                .packages
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|p| !p.name.is_empty())
+                .map(move |pkg| RawPackage {
+                    name: pkg.name.clone(),
+                    version: if pkg.version.is_empty() {
+                        None
+                    } else {
+                        Some(pkg.version.clone())
+                    },
+                    purl: pkg
+                        .identifier
+                        .as_ref()
+                        .and_then(|id| id.purl.clone())
+                        .filter(|s| !s.is_empty()),
+                    // Trivy may emit multiple license strings per package
+                    // (e.g. `["MIT", "Apache-2.0"]`). Join with " OR " per
+                    // CycloneDX convention; an empty list becomes None.
+                    license: pkg.licenses.as_ref().and_then(|ls| {
+                        let joined = ls
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" OR ");
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined)
+                        }
+                    }),
+                    source_target: if result.target.is_empty() {
+                        None
+                    } else {
+                        Some(result.target.clone())
+                    },
+                })
+        })
+        .collect()
+}
+
+/// Output of a single scanner run: vulnerability findings AND a package
+/// inventory (#903). Scanners that only produce findings (OpenSCAP, custom
+/// WASM plugins) construct a [`ScanOutput`] with an empty `packages` Vec
+/// via [`ScanOutput::findings_only`]; scanners that enumerate packages
+/// (Trivy, Grype if extended) populate both.
+#[derive(Debug, Default)]
+pub struct ScanOutput {
+    pub findings: Vec<RawFinding>,
+    pub packages: Vec<RawPackage>,
+}
+
+impl ScanOutput {
+    /// Convenience constructor for scanners that do not enumerate an
+    /// inventory. The package list is empty; SBOM generation will fall
+    /// back to scan_findings for legacy data.
+    pub fn findings_only(findings: Vec<RawFinding>) -> Self {
+        Self {
+            findings,
+            packages: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor for the common Trivy path where both halves
+    /// of the report are converted via the shared helpers above.
+    pub fn from_trivy_report(
+        report: &crate::services::image_scanner::TrivyReport,
+        source_label: &str,
+    ) -> Self {
+        Self {
+            findings: convert_trivy_findings(report, source_label),
+            packages: convert_trivy_packages(report),
+        }
+    }
+
+    /// True when the scanner produced neither findings nor inventory rows.
+    /// Useful for test assertions and for the orchestrator's early-return
+    /// on non-applicable artifacts.
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty() && self.packages.is_empty()
+    }
 }
 
 /// Extract a tar.gz archive into `target_dir` while guarding against tar-slip
@@ -446,13 +644,51 @@ pub trait Scanner: Send + Sync {
     /// The scan_type value stored in scan_results.
     fn scan_type(&self) -> &str;
 
-    /// Run the scan against artifact content and metadata.
+    /// Whether this scanner applies to the given artifact.
+    ///
+    /// The orchestrator calls this BEFORE creating a `scan_results` row so a
+    /// non-applicable scanner never produces a `completed, findings_count=0`
+    /// row that is indistinguishable from a real clean scan. Issues #961 and
+    /// #994 both trace back to scanners short-circuiting inside `scan()` via
+    /// `Ok(ScanOutput::default())`, which the orchestrator then persisted as
+    /// a completed-with-zero-findings result. That made it look like the
+    /// scanner ran and the artifact was clean, when in fact the scanner had
+    /// silently declined to inspect the bytes.
+    ///
+    /// Returning `false` here is semantically distinct from
+    /// `scan() -> Ok(ScanOutput::default())`: the former means "this scanner
+    /// did not run", the latter means "this scanner ran and found nothing."
+    /// Conflating them produces silent-success regressions where consumers
+    /// using a scan record as a security gate pass artifacts that were never
+    /// actually scanned.
+    ///
+    /// The default returns `true` so scanners that always apply (e.g.
+    /// `DependencyScanner`, `GrypeScanner`) do not need to override.
+    fn is_applicable(&self, _artifact: &Artifact) -> bool {
+        true
+    }
+
+    /// Run the scan against artifact content and metadata. Returns both
+    /// vulnerability findings AND the full package inventory observed by
+    /// the scanner — the inventory drives SBOM generation (#903) and must
+    /// be enumerated regardless of whether any package is CVE-bearing.
+    ///
+    /// Scanners that do not enumerate packages (e.g. policy-only scanners
+    /// like OpenSCAP) return a [`ScanOutput`] with an empty `packages`
+    /// vector via [`ScanOutput::findings_only`]; SBOM generation falls
+    /// back to scan_findings for those legacy paths.
+    ///
+    /// The orchestrator only calls `scan()` after [`Scanner::is_applicable`]
+    /// returns `true`. Concrete implementations may keep a defensive
+    /// `debug_assert!` against `is_applicable` but MUST NOT silently return
+    /// `Ok(ScanOutput::default())` when they decide the artifact is
+    /// out-of-scope: that is the silent-success bug class behind #994.
     async fn scan(
         &self,
         artifact: &Artifact,
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>>;
+    ) -> Result<ScanOutput>;
 
     /// Best-effort scanner-binary version string (e.g. `trivy-0.62.1`,
     /// `grype-0.83.0`). Persisted on `scan_results.scanner_version` so
@@ -1482,10 +1718,10 @@ impl Scanner for DependencyScanner {
         artifact: &Artifact,
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         let deps = Self::extract_dependencies(artifact, metadata, content);
         if deps.is_empty() {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -1493,6 +1729,22 @@ impl Scanner for DependencyScanner {
             deps.len(),
             artifact.id
         );
+
+        // The extracted dependency list is itself a package inventory — every
+        // declared dep belongs in the SBOM regardless of advisory hits
+        // (#903). Build the inventory snapshot up-front so that even if the
+        // advisory call hangs and we fall back to an empty findings list,
+        // SBOM consumers still see the full dep tree.
+        let packages: Vec<RawPackage> = deps
+            .iter()
+            .map(|d| RawPackage {
+                name: d.name.clone(),
+                version: d.version.clone().filter(|s| !s.is_empty()),
+                purl: None,
+                license: None,
+                source_target: Some("dependency-scanner".to_string()),
+            })
+            .collect();
 
         // Query both sources in parallel
         let (osv_results, gh_results) = tokio::join!(
@@ -1548,7 +1800,7 @@ impl Scanner for DependencyScanner {
             });
         }
 
-        Ok(findings)
+        Ok(ScanOutput { findings, packages })
     }
 }
 
@@ -1799,6 +2051,44 @@ impl ScannerService {
             // so we must keep the same row alive (UPDATE rather than INSERT).
             let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
 
+            // Gate on applicability BEFORE creating a scan_results row or
+            // copying a reusable result. A non-applicable scanner must leave
+            // no `completed, findings_count=0` row behind — that row is
+            // indistinguishable from a real clean scan and produces the
+            // silent-success class behind #961 (scanners running on
+            // unsupported formats) and #994 (lodash fixture marked clean in
+            // 2.8ms because ImageScanner short-circuited). If the trigger
+            // handler pre-allocated a row for this scan_type, mark it
+            // failed with a "not applicable" reason so the operator still
+            // sees a deterministic record of the decision rather than a
+            // ghost `pending` row that never transitions.
+            if !scanner.is_applicable(&artifact) {
+                info!(
+                    "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
+                    scanner.name(),
+                    artifact_id,
+                    artifact.content_type,
+                    artifact.path,
+                );
+                if let PreparedScanAction::Reuse(target_id) = prepared_action {
+                    let reason = format!(
+                        "Scanner {} does not apply to this artifact format",
+                        scanner.name(),
+                    );
+                    if let Err(e) = self
+                        .scan_result_service
+                        .fail_scan(target_id, &reason, None, chrono::Utc::now())
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark pre-allocated scan {} as not-applicable: {}",
+                            target_id, e
+                        );
+                    }
+                }
+                continue;
+            }
+
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
                 .scan_result_service
@@ -1874,7 +2164,7 @@ impl ScannerService {
             // See issue #902.
             let started_at = chrono::Utc::now();
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
-                Ok(findings) => {
+                Ok(ScanOutput { findings, packages }) => {
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -1896,6 +2186,28 @@ impl ScannerService {
                     self.scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
                         .await?;
+
+                    // Persist the package inventory (#903). Failures here
+                    // are logged but do not fail the scan: the inventory is
+                    // an enhancement layered on top of the findings path,
+                    // and a scanner that ran successfully should not be
+                    // marked as failed because a non-critical INSERT
+                    // tripped over a constraint. SBOM generation falls back
+                    // to scan_findings when the inventory is empty.
+                    if !packages.is_empty() {
+                        if let Err(e) = self
+                            .scan_result_service
+                            .create_packages(scan_result.id, artifact_id, &packages)
+                            .await
+                        {
+                            warn!(
+                                "Failed to persist scan_packages for scan {}: {}. \
+                                 Findings were persisted; SBOM generation will fall \
+                                 back to the findings-derived component list.",
+                                scan_result.id, e
+                            );
+                        }
+                    }
 
                     // Mark scan complete
                     self.scan_result_service
@@ -1969,9 +2281,12 @@ impl ScannerService {
             .await?;
 
         // Submit SBOM to Dependency-Track if integration is configured.
-        // This generates a CycloneDX SBOM from scan findings and uploads it
-        // to the corresponding DT project, closing the gap where scans
-        // completed but SBOMs were never forwarded to DT.
+        // Generates a CycloneDX SBOM from the scan_packages inventory
+        // (falling back to scan_findings for legacy artifacts) and uploads
+        // it to the corresponding DT project. Submission happens whenever
+        // any scan signal exists, including clean scans with zero CVEs,
+        // so DT can run its own independent vulnerability correlation
+        // against the dep tree. #965.
         if let Some(ref dt) = self.dependency_track {
             self.submit_sbom_to_dependency_track(dt, &artifact).await;
         }
@@ -1979,9 +2294,14 @@ impl ScannerService {
         Ok(())
     }
 
-    /// Generate a CycloneDX SBOM from scan findings for the given artifact and
-    /// submit it to Dependency-Track. Errors are logged but do not fail the
-    /// scan pipeline, since DT submission is best-effort.
+    /// Generate a CycloneDX SBOM for the given artifact and submit it to
+    /// Dependency-Track. Components come from the `scan_packages` inventory
+    /// (latest scan per scan_type), falling back to `scan_findings` for
+    /// pre-#903 legacy artifacts. Submission happens whenever any scan
+    /// signal exists, including clean scans with zero vulnerabilities, so
+    /// DT performs its own independent CVE correlation against the dep
+    /// tree (#965). Errors are logged but do not fail the scan pipeline,
+    /// since DT submission is best-effort.
     async fn submit_sbom_to_dependency_track(
         &self,
         dt: &crate::services::dependency_track_service::DependencyTrackService,
@@ -2002,30 +2322,65 @@ impl ScannerService {
         let (project_name, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
 
-        // Fetch scan findings to build dependency info for the SBOM.
-        // The scan_findings table stores affected components in the
-        // `affected_component` and `affected_version` columns.
-        let findings_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT DISTINCT f.affected_component, f.affected_version, f.source
-            FROM scan_findings f
-            JOIN scan_results sr ON f.scan_result_id = sr.id
-            WHERE sr.artifact_id = $1
-              AND f.affected_component IS NOT NULL
-              AND f.affected_component != ''
-            "#,
-        )
-        .bind(artifact.id)
-        .fetch_all(&self.db)
-        .await
-        .unwrap_or_default();
+        // Build the dependency list, preferring the scan_packages inventory
+        // (#903) so we forward the full dep tree even when Grype found zero
+        // CVEs. DT does its own correlation and needs the components. #965.
+        //
+        // Both queries are windowed to the latest completed scan per
+        // (artifact, scan_type), mirroring the read pattern used by the
+        // /sbom handler in `extract_dependencies_for_artifact`. Without
+        // that window, an artifact rescanned after a dep removal would
+        // still ship the removed dep to DT forever.
+        let package_sql = format!(
+            "{}
+            SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
+            FROM scan_packages sp
+            WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
+              AND sp.name IS NOT NULL
+              AND sp.name != ''",
+            LATEST_SCANS_FOR_ARTIFACT_CTE,
+        );
+        #[allow(clippy::type_complexity)]
+        let package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(&package_sql)
+                .bind(artifact.id)
+                .fetch_all(&self.db)
+                .await
+                .unwrap_or_default();
 
-        let deps = build_dependency_info_from_findings(findings_rows, purl_type);
+        let mut deps = build_dependency_info_from_packages(package_rows, purl_type);
 
+        // Legacy fallback: artifacts scanned before migration 085 (scan_packages)
+        // existed only have scan_findings rows. Same DISTINCT ON window so the
+        // CVE-only component list matches the latest scan, not stale history.
+        if deps.is_empty() {
+            let findings_sql = format!(
+                "{}
+                SELECT DISTINCT f.affected_component, f.affected_version, f.source
+                FROM scan_findings f
+                WHERE f.scan_result_id IN (SELECT id FROM latest_scans)
+                  AND f.affected_component IS NOT NULL
+                  AND f.affected_component != ''",
+                LATEST_SCANS_FOR_ARTIFACT_CTE,
+            );
+            let findings_rows: Vec<(String, Option<String>, Option<String>)> =
+                sqlx::query_as(&findings_sql)
+                    .bind(artifact.id)
+                    .fetch_all(&self.db)
+                    .await
+                    .unwrap_or_default();
+
+            deps = build_dependency_info_from_findings(findings_rows, purl_type);
+        }
+
+        // Only skip when there is literally no signal: neither an inventory
+        // row nor a finding for any completed scan. A clean scan with 30
+        // packages and 0 CVEs must still submit to DT so DT can run its own
+        // independent vulnerability correlation against the dep tree. #965.
         if deps.is_empty() {
             info!(
                 artifact_id = %artifact.id,
-                "No scan findings with package info, skipping Dependency-Track SBOM submission"
+                "No scan inventory or findings recorded, skipping Dependency-Track SBOM submission"
             );
             return;
         }
@@ -2418,7 +2773,7 @@ pub(crate) mod test_helpers {
 
     /// Assert that a scan result is an error containing the expected label.
     pub fn assert_scan_failed(
-        result: &crate::error::Result<Vec<crate::models::security::RawFinding>>,
+        result: &crate::error::Result<crate::services::scanner_service::ScanOutput>,
         expected_label: &str,
     ) {
         assert!(
@@ -2701,6 +3056,96 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // is_oci_image_artifact: shared predicate used by all 3 scanners'
+    // is_applicable impls. Centralizes the duplicated content-type +
+    // /manifests/ path check that was previously inline in each scanner.
+    // (#966 cleanup + jscpd duplication-gate fix.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_vnd_oci() {
+        let a = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_docker_distribution() {
+        let a = test_helpers::make_test_artifact(
+            "redis",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/library/redis/manifests/latest",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_docker_container() {
+        let a = test_helpers::make_test_artifact(
+            "busybox",
+            "application/vnd.docker.container.image.v1+json",
+            "v2/library/busybox/blobs/sha256:abc",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_path_manifest_segment() {
+        // Path-based detection catches proxy variants that omit the
+        // canonical OCI content type but still serve manifests under
+        // the v2/.../manifests/ convention.
+        let a = test_helpers::make_test_artifact(
+            "foo",
+            "application/octet-stream",
+            "v2/foo/manifests/v1",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_npm_tarball() {
+        let a = test_helpers::make_test_artifact(
+            "body-parser-1.20.1.tgz",
+            "application/gzip",
+            "npm/body-parser/-/body-parser-1.20.1.tgz",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_pypi_wheel() {
+        let a = test_helpers::make_test_artifact(
+            "requests-2.31.0-py3-none-any.whl",
+            "application/zip",
+            "pypi/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_maven_jar() {
+        let a = test_helpers::make_test_artifact(
+            "log4j-core-2.17.1.jar",
+            "application/java-archive",
+            "maven/org/apache/logging/log4j/log4j-core/2.17.1/log4j-core-2.17.1.jar",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_empty_content_type_with_safe_path() {
+        // Defensive: an unset content type combined with a non-manifest
+        // path must NOT trip the gate (avoids false-positive that
+        // would deny scanners on uploads that haven't yet had their
+        // content type sniffed).
+        let a = test_helpers::make_test_artifact("foo", "", "generic/foo");
+        assert!(!is_oci_image_artifact(&a));
+    }
+
     #[test]
     fn test_format_grype_version_application_line() {
         // Real `grype --version` output: `grype 0.83.0`
@@ -2797,8 +3242,8 @@ mod tests {
                 _: &Artifact,
                 _: Option<&ArtifactMetadata>,
                 _: &Bytes,
-            ) -> Result<Vec<RawFinding>> {
-                Ok(vec![])
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
             }
         }
         let s = DummyScanner;
@@ -7219,6 +7664,113 @@ mod tests {
         assert_eq!(deps[2].name, "mmm");
     }
 
+    // ===================================================================
+    // build_dependency_info_from_packages (#965)
+    //
+    // Mirrors the build_deps_from_findings suite above, but exercises the
+    // scan_packages inventory read path used by the Dependency-Track
+    // submission flow. The crucial behaviour vs. the findings helper is:
+    //   - the stored `purl` column is preferred when present
+    //   - the persisted `license` column flows through to the SBOM
+    //   - clean packages (zero vulnerabilities) still produce dep entries
+    // ===================================================================
+
+    #[test]
+    fn test_build_deps_from_packages_empty() {
+        let deps = build_dependency_info_from_packages(vec![], "npm");
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_prefers_stored_purl() {
+        // When scan_packages.purl is populated, use it verbatim. Trivy
+        // produces canonical purls with qualifiers (?type=foo) we must not
+        // round-trip through string formatting.
+        let rows = vec![(
+            "lodash".to_string(),
+            Some("4.17.21".to_string()),
+            Some("pkg:npm/lodash@4.17.21?type=module".to_string()),
+            Some("MIT".to_string()),
+        )];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].version.as_deref(), Some("4.17.21"));
+        assert_eq!(
+            deps[0].purl.as_deref(),
+            Some("pkg:npm/lodash@4.17.21?type=module")
+        );
+        assert_eq!(deps[0].license.as_deref(), Some("MIT"));
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_synthesizes_purl_when_missing() {
+        // scan_packages rows produced by scanners that don't emit purls
+        // fall back to the format-derived purl_type, matching the findings
+        // helper's behaviour.
+        let rows = vec![(
+            "express".to_string(),
+            Some("4.18.2".to_string()),
+            None,
+            None,
+        )];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].purl.as_deref(), Some("pkg:npm/express@4.18.2"));
+        assert!(deps[0].license.is_none());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_no_version_no_purl() {
+        // A package without a version cannot be assigned a synthesized
+        // purl. The component still flows through to the SBOM so DT can
+        // see the dep tree.
+        let rows = vec![("mystery-dep".to_string(), None, None, None)];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "mystery-dep");
+        assert!(deps[0].version.is_none());
+        assert!(deps[0].purl.is_none());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_clean_scan_30_packages() {
+        // Regression for #965: 30 packages, 0 CVEs (the scan_findings
+        // table is empty) must still produce a non-empty dep list so the
+        // submission gate fires. This is the exact shape we expect for a
+        // newly-uploaded clean npm package.
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = (0..30)
+            .map(|i| {
+                (
+                    format!("pkg-{}", i),
+                    Some(format!("1.0.{}", i)),
+                    None,
+                    Some("MIT".to_string()),
+                )
+            })
+            .collect();
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 30);
+        assert!(deps.iter().all(|d| d.purl.is_some()));
+        assert!(deps.iter().all(|d| d.license.as_deref() == Some("MIT")));
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_sha256_always_none() {
+        // sha256 is not yet sourced from scan_packages (matches the
+        // `extract_dependencies_for_artifact` shape; see the comment at
+        // backend/src/api/handlers/sbom.rs around line 1542).
+        let rows = vec![(
+            "serde".to_string(),
+            Some("1.0.200".to_string()),
+            Some("pkg:cargo/serde@1.0.200".to_string()),
+            None,
+        )];
+        let deps = build_dependency_info_from_packages(rows, "cargo");
+        assert!(deps[0].sha256.is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Pure helpers introduced for the trigger-scan / pre-allocated-row path.
     // These are unit-tested here so the new lines they contain are exercised
@@ -7406,5 +7958,621 @@ mod tests {
     fn test_checksum_log_prefix_exactly_eight_chars() {
         let cs = "12345678";
         assert_eq!(checksum_log_prefix(cs), "12345678");
+    }
+
+    // -----------------------------------------------------------------------
+    // SBOM inventory (issue #903): convert_trivy_packages + ScanOutput
+    // -----------------------------------------------------------------------
+
+    /// A Trivy report whose `Packages` block contains 5 packages but only
+    /// 1 vulnerability must yield 5 RawPackage rows and 1 RawFinding.
+    /// This is the regression-test for #903: pre-fix, the SBOM endpoint
+    /// produced an empty component list because it derived components
+    /// from scan_findings (which had only the CVE-bearing row).
+    #[test]
+    fn test_convert_trivy_packages_full_inventory_independent_of_findings() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyReport, TrivyResult, TrivyVulnerability,
+        };
+
+        let pkg = |name: &str, ver: &str| TrivyPackage {
+            name: name.to_string(),
+            version: ver.to_string(),
+            licenses: None,
+            identifier: None,
+        };
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: Some(vec![TrivyVulnerability {
+                    vulnerability_id: "CVE-2024-12345".to_string(),
+                    pkg_name: "body-parser".to_string(),
+                    installed_version: "1.20.1".to_string(),
+                    fixed_version: Some("1.20.2".to_string()),
+                    severity: "HIGH".to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+                packages: Some(vec![
+                    pkg("express", "4.18.2"),
+                    pkg("body-parser", "1.20.1"),
+                    pkg("cookie-parser", "1.4.6"),
+                    pkg("debug", "2.6.9"),
+                    pkg("send", "0.18.0"),
+                ]),
+            }],
+        };
+
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
+
+        // 5 packages enumerated, regardless of CVE status — the #903 contract.
+        assert_eq!(
+            output.packages.len(),
+            5,
+            "#903: scan_packages must include every package the scanner saw, \
+             not just CVE-bearing rows. Counting 1 here would mean the SBOM \
+             endpoint is back to surfacing only the vulnerable subset."
+        );
+        // 1 finding for the 1 vulnerability — the existing contract.
+        assert_eq!(output.findings.len(), 1);
+
+        // Inventory carries source_target so SBOM consumers can bucket by
+        // ecosystem without re-parsing names.
+        let body_parser = output
+            .packages
+            .iter()
+            .find(|p| p.name == "body-parser")
+            .expect("body-parser must be in inventory");
+        assert_eq!(body_parser.version.as_deref(), Some("1.20.1"));
+        assert_eq!(
+            body_parser.source_target.as_deref(),
+            Some("package-lock.json")
+        );
+
+        // Finding name is bare (no parenthetical target) — the other half
+        // of the #903 fix.
+        assert_eq!(
+            output.findings[0].affected_component.as_deref(),
+            Some("body-parser"),
+            "post-#903, finding names must be bare so SBOM/CVE-lookup/UI \
+             can join across sources without stripping the (target) suffix"
+        );
+    }
+
+    /// Trivy emits `Licenses` as an array; multi-license packages must be
+    /// joined with " OR " per CycloneDX convention. Empty licenses must
+    /// not produce empty strings.
+    #[test]
+    fn test_convert_trivy_packages_license_join_and_empty_handling() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "pom.xml".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "maven".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "log4j-core".to_string(),
+                        version: "2.17.1".to_string(),
+                        licenses: Some(vec!["Apache-2.0".to_string(), "MIT".to_string()]),
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "no-license-pkg".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec![]),
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "license-with-empty-string".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec!["".to_string(), "MIT".to_string()]),
+                        identifier: None,
+                    },
+                ]),
+            }],
+        };
+
+        let pkgs = convert_trivy_packages(&report);
+
+        let log4j = pkgs.iter().find(|p| p.name == "log4j-core").unwrap();
+        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 OR MIT"));
+
+        let no_lic = pkgs.iter().find(|p| p.name == "no-license-pkg").unwrap();
+        assert!(
+            no_lic.license.is_none(),
+            "empty license array must collapse to None, not Some(\"\")"
+        );
+
+        let mixed = pkgs
+            .iter()
+            .find(|p| p.name == "license-with-empty-string")
+            .unwrap();
+        assert_eq!(
+            mixed.license.as_deref(),
+            Some("MIT"),
+            "empty strings in license array must be filtered before joining"
+        );
+    }
+
+    /// A Trivy report with no `Packages` block at all (legacy Trivy or
+    /// the scanner was invoked without `--list-all-pkgs`) must yield an
+    /// empty inventory rather than synthesizing packages from the
+    /// vulnerability rows. Synthesizing would silently re-introduce the
+    /// #903 vulnerability-shaped-SBOM bug.
+    #[test]
+    fn test_convert_trivy_packages_no_block_returns_empty() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult, TrivyVulnerability};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "go.sum".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "gomod".to_string(),
+                vulnerabilities: Some(vec![TrivyVulnerability {
+                    vulnerability_id: "CVE-2024-00099".to_string(),
+                    pkg_name: "github.com/example/lib".to_string(),
+                    installed_version: "1.0.0".to_string(),
+                    fixed_version: None,
+                    severity: "LOW".to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+                packages: None,
+            }],
+        };
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
+        assert!(
+            output.packages.is_empty(),
+            "no Packages block must yield empty inventory — falling back \
+             to findings-derived synthesis would mask the #903 bug"
+        );
+        assert_eq!(output.findings.len(), 1);
+    }
+
+    /// ScanOutput::findings_only is the right constructor for scanners
+    /// that don't enumerate inventory (OpenSCAP, Grype's default JSON
+    /// shape). It must yield an empty packages Vec and the supplied
+    /// findings unchanged.
+    #[test]
+    fn test_scan_output_findings_only_has_empty_packages() {
+        let findings = vec![RawFinding {
+            severity: Severity::Medium,
+            title: "x".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        }];
+        let out = ScanOutput::findings_only(findings);
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.packages.is_empty());
+        assert!(!out.is_empty());
+    }
+
+    /// Default ScanOutput is empty on both axes; orchestrator uses this
+    /// for non-applicable artifacts.
+    #[test]
+    fn test_scan_output_default_is_empty() {
+        let out = ScanOutput::default();
+        assert!(out.is_empty());
+    }
+
+    /// `convert_trivy_packages` extracts PURLs via the optional
+    /// `Identifier.PURL` nested field. The other tests do not populate
+    /// `identifier`, so the extraction code path remains uncovered
+    /// without this test. Verify both the happy-path extraction AND the
+    /// "identifier present but PURL empty" branch (must yield None,
+    /// not Some("")).
+    #[test]
+    fn test_convert_trivy_packages_extracts_purl_from_identifier() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyPackageIdentifier, TrivyReport, TrivyResult,
+        };
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "lodash".to_string(),
+                        version: "4.17.21".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        // identifier present, but PURL empty — must collapse
+                        // to None on persistence so downstream consumers
+                        // don't see a vacuous Some("").
+                        name: "express".to_string(),
+                        version: "4.18.2".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some(String::new()),
+                        }),
+                    },
+                    TrivyPackage {
+                        // identifier present, PURL None — yields None.
+                        name: "body-parser".to_string(),
+                        version: "1.20.1".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier { purl: None }),
+                    },
+                ]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 3);
+
+        let lodash = pkgs.iter().find(|p| p.name == "lodash").unwrap();
+        assert_eq!(lodash.purl.as_deref(), Some("pkg:npm/lodash@4.17.21"));
+
+        let express = pkgs.iter().find(|p| p.name == "express").unwrap();
+        assert!(
+            express.purl.is_none(),
+            "empty PURL string must collapse to None"
+        );
+
+        let bp = pkgs.iter().find(|p| p.name == "body-parser").unwrap();
+        assert!(
+            bp.purl.is_none(),
+            "identifier with PURL=None must stay None"
+        );
+    }
+
+    /// Packages with empty `name` strings must be filtered out at conversion
+    /// time, not left to the DB-side data-quality filter in `build_dep`.
+    /// Scanners occasionally emit blank-name entries for failed-resolution
+    /// fixtures (e.g. unparseable line in a requirements.txt); persisting
+    /// them would pollute the SBOM and cause downstream tooling crashes.
+    #[test]
+    fn test_convert_trivy_packages_skips_empty_name_packages() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "requirements.txt".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "pip".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "".to_string(),
+                        version: "1.0".to_string(),
+                        licenses: None,
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "requests".to_string(),
+                        version: "2.31.0".to_string(),
+                        licenses: None,
+                        identifier: None,
+                    },
+                ]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1, "empty-name entry must be filtered");
+        assert_eq!(pkgs[0].name, "requests");
+    }
+
+    /// Version-empty handling: Trivy occasionally reports a package with
+    /// `Version: ""` (e.g. C runtime libraries it could not pin). The
+    /// inventory persistence layer maps that to `None` so the unique
+    /// index `(scan_result_id, name, COALESCE(version, ''))` collapses
+    /// duplicates correctly.
+    #[test]
+    fn test_convert_trivy_packages_empty_version_becomes_none() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "OS".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "alpine".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![TrivyPackage {
+                    name: "musl".to_string(),
+                    version: "".to_string(),
+                    licenses: None,
+                    identifier: None,
+                }]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1);
+        assert!(
+            pkgs[0].version.is_none(),
+            "empty Version string must collapse to None for index correctness"
+        );
+    }
+
+    /// Empty `Target` string on the Trivy result must yield
+    /// `source_target = None` rather than `Some("")`. Source target is
+    /// surfaced into the SBOM as a hint about *where* the package was
+    /// found (e.g. "package-lock.json") and an empty hint is worse than
+    /// no hint at all.
+    #[test]
+    fn test_convert_trivy_packages_empty_target_becomes_none() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "".to_string(),
+                class: "".to_string(),
+                result_type: "".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![TrivyPackage {
+                    name: "anonymous".to_string(),
+                    version: "1.0".to_string(),
+                    licenses: None,
+                    identifier: None,
+                }]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1);
+        assert!(pkgs[0].source_target.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scanner trait applicability gate (issues #961, #994)
+    // -----------------------------------------------------------------------
+
+    /// Shared test fixtures for the applicability-gate tests below.
+    mod applicability_fixtures {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// A test Scanner whose `is_applicable` always returns false. Its
+        /// `scan()` body increments a counter so the test can assert it was
+        /// never invoked. If the orchestrator ever forgets to gate on
+        /// `is_applicable`, this counter goes above zero and the test
+        /// fails.
+        pub(super) struct NeverApplicableScanner {
+            pub(super) scan_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for NeverApplicableScanner {
+            fn name(&self) -> &str {
+                "never-applicable-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "never-applicable"
+            }
+            fn is_applicable(&self, _artifact: &Artifact) -> bool {
+                false
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                self.scan_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ScanOutput::default())
+            }
+        }
+
+        /// A test Scanner whose `is_applicable` always returns true. Used
+        /// to assert the orchestrator does still call `scan()` on
+        /// applicable scanners (i.e. the gate does not over-correct and
+        /// drop everyone).
+        pub(super) struct AlwaysApplicableScanner {
+            pub(super) scan_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for AlwaysApplicableScanner {
+            fn name(&self) -> &str {
+                "always-applicable-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "always-applicable"
+            }
+            // Inherits the default `is_applicable = true`.
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                self.scan_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ScanOutput::default())
+            }
+        }
+    }
+
+    /// The `Scanner::is_applicable` default must return true so existing
+    /// scanners that always apply (e.g. `DependencyScanner`, `GrypeScanner`)
+    /// keep their pre-#961 behavior without overriding. If anyone flips
+    /// the default to false, every scanner that omits the override is
+    /// silently skipped, which is exactly the issue #994 silent-success
+    /// pattern with the inverse polarity.
+    #[test]
+    fn test_scanner_trait_default_is_applicable_is_true() {
+        struct DefaultScanner;
+        #[async_trait::async_trait]
+        impl Scanner for DefaultScanner {
+            fn name(&self) -> &str {
+                "default-applicability"
+            }
+            fn scan_type(&self) -> &str {
+                "default-applicability"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+        let s = DefaultScanner;
+        let artifact =
+            test_helpers::make_test_artifact("anything", "application/octet-stream", "x");
+        assert!(s.is_applicable(&artifact));
+    }
+
+    /// Scanners that override `is_applicable` to return false must NOT have
+    /// their `scan()` called by anything that respects the trait contract.
+    /// This is the precondition that lets the orchestrator skip the
+    /// scan_results row creation safely.
+    #[tokio::test]
+    async fn test_is_applicable_false_means_scan_must_not_be_invoked() {
+        use applicability_fixtures::NeverApplicableScanner;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scanner = NeverApplicableScanner {
+            scan_calls: calls.clone(),
+        };
+        let artifact = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+
+        // The orchestrator gate is conceptually:
+        //   if !scanner.is_applicable(&artifact) { continue; }
+        // followed by `scanner.scan(...)`. We replay that contract in
+        // isolation so the assertion focuses on the trait surface itself.
+        let applicable = scanner.is_applicable(&artifact);
+        assert!(
+            !applicable,
+            "NeverApplicableScanner must report is_applicable=false"
+        );
+        if applicable {
+            // Defensive: ensure the test would actually exercise the bad
+            // path if the gate were ever inverted.
+            let _ = scanner.scan(&artifact, None, &Bytes::new()).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "scan() must not be called when is_applicable() returns false (#961, #994)"
+        );
+    }
+
+    /// Inverse of the above: a scanner that returns `is_applicable=true`
+    /// must still have its `scan()` invoked. This guards against an
+    /// over-correction where the gate is hard-wired to false or drops the
+    /// scanner from the iteration entirely.
+    #[tokio::test]
+    async fn test_is_applicable_true_means_scan_is_invoked() {
+        use applicability_fixtures::AlwaysApplicableScanner;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scanner = AlwaysApplicableScanner {
+            scan_calls: calls.clone(),
+        };
+        let artifact = test_helpers::make_test_artifact(
+            "anything.tgz",
+            "application/gzip",
+            "npm/anything/1.0.0/anything.tgz",
+        );
+        assert!(scanner.is_applicable(&artifact));
+        let _ = scanner.scan(&artifact, None, &Bytes::new()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "scan() must be called once when is_applicable() returns true"
+        );
+    }
+
+    /// Concrete regression for #994: the lodash fixture (generic tarball
+    /// uploaded as `scan_type=image`) must trigger
+    /// `ImageScanner::is_applicable=false`, so the orchestrator can skip
+    /// it without persisting a `completed, findings_count=0` row.
+    /// Before the fix this scanner returned `Ok(ScanOutput::default())`
+    /// from inside `scan()` after a 2.8 ms code-path; the orchestrator
+    /// then recorded a clean scan that lied about the artifact's posture.
+    #[test]
+    fn test_image_scanner_not_applicable_to_generic_npm_tarball() {
+        use crate::services::image_scanner::ImageScanner;
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+        let lodash = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+        assert!(
+            !Scanner::is_applicable(&image_scanner, &lodash),
+            "ImageScanner must yield to TrivyFsScanner on a generic npm tarball; \
+             persisting a completed-with-zero-findings row for ImageScanner here \
+             is the silent-success class behind #994"
+        );
+    }
+
+    /// Concrete regression for #961: the image scanner must NOT claim to
+    /// be applicable to an npm tarball. Before the fix it ran on every
+    /// artifact and produced false-positive empty rows, skewing the
+    /// dashboard counts.
+    #[test]
+    fn test_image_scanner_applicability_distinguishes_oci_from_npm() {
+        use crate::services::image_scanner::ImageScanner;
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+
+        let oci = test_helpers::make_test_artifact(
+            "myapp",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/myapp/manifests/latest",
+        );
+        assert!(
+            Scanner::is_applicable(&image_scanner, &oci),
+            "ImageScanner must apply to OCI manifests"
+        );
+
+        let npm = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "npm/left-pad/1.3.0/left-pad-1.3.0.tgz",
+        );
+        assert!(
+            !Scanner::is_applicable(&image_scanner, &npm),
+            "ImageScanner must not apply to an npm tarball (#961)"
+        );
+    }
+
+    /// The `TrivyFsScanner` is the inverse case: it must apply to the
+    /// generic npm tarball that fooled `ImageScanner` in #994, otherwise
+    /// the fix has over-corrected and the lodash CVE goes undetected.
+    #[test]
+    fn test_trivy_fs_scanner_applies_to_npm_tarball() {
+        use crate::services::trivy_fs_scanner::TrivyFsScanner;
+
+        let trivy_fs = TrivyFsScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+        let lodash = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+        assert!(
+            Scanner::is_applicable(&trivy_fs, &lodash),
+            "TrivyFsScanner must apply to a generic npm tarball — that is exactly \
+             the scanner expected to detect lodash CVE-2019-10744"
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod auth_service;
 pub mod backup_service;
 pub mod build_service;
 pub mod dependency_track_service;
+pub mod email_dispatcher;
 pub mod encryption;
 pub mod event_bus;
 pub mod grype_scanner;
@@ -23,7 +24,6 @@ pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod nexus_client;
-pub mod notification_dispatcher;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod opensearch_service;
@@ -68,9 +68,11 @@ pub mod upstream_auth;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
+pub mod webhook_notifier;
 pub mod webhook_payloads;
 pub mod webhook_producer;
 pub mod webhook_secret_crypto;
+pub mod webhook_signing;
 
 // Observability & lifecycle
 pub mod analytics_service;

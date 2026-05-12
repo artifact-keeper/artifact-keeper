@@ -16,7 +16,8 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner, VersionCache,
+    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanOutput, ScanWorkspace, Scanner,
+    VersionCache,
 };
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
@@ -226,6 +227,13 @@ impl Scanner for OpenScapScanner {
         "openscap"
     }
 
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     /// Probe the wrapper sidecar's `/health` endpoint once and cache the
     /// `oscap` version string. Returns `None` if the wrapper is unreachable
     /// or its response cannot be parsed.
@@ -241,10 +249,11 @@ impl Scanner for OpenScapScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "OpenScapScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         info!(
             "Starting OpenSCAP compliance scan for artifact: {} ({})",
@@ -281,7 +290,9 @@ impl Scanner for OpenScapScanner {
 
         ScanWorkspace::cleanup(&self.scan_workspace, Some("openscap"), artifact).await;
 
-        Ok(findings)
+        // OpenSCAP is a compliance scanner, not an inventory enumerator;
+        // packages list intentionally empty.
+        Ok(ScanOutput::findings_only(findings))
     }
 }
 
