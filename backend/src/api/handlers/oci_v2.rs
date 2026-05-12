@@ -275,12 +275,20 @@ async fn authenticate_oci(
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
 
-            // Try username/password authentication first.
-            if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
-                // Re-generate short-lived claims so downstream code has a consistent
-                // Claims value regardless of the authentication method.
+            // Try API token in the password field first (service accounts, CI
+            // pipelines, registry mirrors, curl scripts). #1195: `authenticate`
+            // bumps `users.failed_login_attempts` on every bcrypt miss, so any
+            // OCI verb (manifest GET, blob HEAD, blob PUT, etc.) that
+            // presented Basic `<user>:<api_token>` would lock the service
+            // account out after `account_lockout_threshold` requests. Mirrors
+            // the #1145 fix on `/v2/token`. `validate_api_token` has no
+            // failure-counter side effect and runs a constant-time bcrypt
+            // pad on miss so this reorder is safe. The username from Basic
+            // auth is ignored when an API token validates (matching the
+            // /v2/token behavior): the token itself identifies the user.
+            if let Ok(validation) = auth_service.validate_api_token(&password).await {
                 return auth_service
-                    .generate_tokens(&user)
+                    .generate_tokens(&validation.user)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -289,10 +297,12 @@ async fn authenticate_oci(
                     });
             }
 
-            // Also try API token in the password field (service accounts, CI pipelines).
-            if let Ok(validation) = auth_service.validate_api_token(&password).await {
+            // Fall through to username/password authentication. Re-generate
+            // short-lived claims so downstream code has a consistent Claims
+            // value regardless of the authentication method.
+            if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
                 return auth_service
-                    .generate_tokens(&validation.user)
+                    .generate_tokens(&user)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -5184,6 +5194,95 @@ mod token_lockout_regression_tests {
             counter, 0,
             "a successful password login must not leave failed_login_attempts \
              elevated (got {counter})"
+        );
+    }
+
+    /// Regression for #1195. The `/v2/token` exchange was reordered in #1145
+    /// so API tokens are tried first, but `authenticate_oci` (used by every
+    /// non-token verb: manifest GET, blob HEAD, blob PUT, catalog, etc.) had
+    /// the same bug: it called `authenticate(user, api_token)` before
+    /// `validate_api_token(api_token)`. Clients that skip the token exchange
+    /// and send `Basic <user>:<api_token>` on every verb (curl, some CI
+    /// runners, registry mirrors) bumped `failed_login_attempts` once per
+    /// request and locked the account out after `account_lockout_threshold`
+    /// calls. This test exercises `authenticate_oci` directly and asserts
+    /// the counter stays at zero across many requests.
+    #[tokio::test]
+    async fn authenticate_oci_verb_basic_auth_does_not_bump_failed_login_attempts() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Real bcrypt hash so the `authenticate` arm (which bumps the
+        // counter on bcrypt mismatch) is reachable, not short-circuited.
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+
+        let storage_dir = std::env::temp_dir().join(format!("oci-verb-lockout-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (api_token, _) = auth_service
+            .generate_api_token(
+                user_id,
+                "verb-lockout-regression",
+                vec!["*".to_string()],
+                None,
+            )
+            .await
+            .expect("generate API token");
+
+        // Drive `authenticate_oci` directly: that is the function the bug
+        // lives in, and it does not need a repository row to exercise.
+        let basic_value = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{api_token}"))
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&basic_value).expect("valid basic header"),
+        );
+
+        // Call it several times so the regression would be obvious if the
+        // counter incremented per-request. `account_lockout_threshold`
+        // defaults to a low number, so even 5 calls is enough to lock out
+        // pre-fix.
+        for _ in 0..5 {
+            let result = authenticate_oci(&state.db, &state.config, &headers).await;
+            assert!(
+                result.is_ok(),
+                "API-token Basic auth must succeed via authenticate_oci",
+            );
+        }
+
+        let counter: i32 =
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read counter");
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            counter, 0,
+            "authenticate_oci with Basic <user>:<api_token> must not bump \
+             failed_login_attempts (got {counter} after 5 requests)"
         );
     }
 }

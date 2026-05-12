@@ -186,6 +186,19 @@ pub struct Config {
     /// the storage backend the attacker can drive in parallel. See
     /// #1053. Env var: `RATE_LIMIT_PRESIGN_PER_MIN`. Default: 30.
     pub rate_limit_presign_per_window: u32,
+    /// Maximum self-password-change attempts per user per
+    /// `rate_limit_password_change_window_secs`. Tighter than the global API
+    /// bucket because `POST /users/:id/password` verifies the current
+    /// password via bcrypt, so an attacker who already holds a victim's JWT
+    /// can otherwise grind 100+ password guesses per minute against the
+    /// account through this endpoint. See #1026. Env var:
+    /// `RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW`. Default: 5.
+    pub rate_limit_password_change_per_window: u32,
+    /// Window length for the password-change limiter, in seconds. Decoupled
+    /// from `rate_limit_window_secs` (which is typically 60) so the password
+    /// bucket can use a longer, lockout-style window (default 15 minutes).
+    /// Env var: `RATE_LIMIT_PASSWORD_CHANGE_WINDOW_SECS`. Default: 900.
+    pub rate_limit_password_change_window_secs: u64,
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
@@ -336,6 +349,8 @@ redacted_debug!(Config {
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
+    show rate_limit_password_change_per_window,
+    show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
     show rate_limit_exempt_usernames,
     show rate_limit_exempt_service_accounts,
@@ -415,6 +430,8 @@ impl Default for Config {
             rate_limit_api_per_window: 10000,
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
+            rate_limit_password_change_per_window: 5,
+            rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
@@ -555,6 +572,14 @@ impl Config {
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
             rate_limit_presign_per_window: env_parse("RATE_LIMIT_PRESIGN_PER_MIN", 30),
+            rate_limit_password_change_per_window: env_parse(
+                "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
+                5,
+            ),
+            rate_limit_password_change_window_secs: env_parse(
+                "RATE_LIMIT_PASSWORD_CHANGE_WINDOW_SECS",
+                900,
+            ),
             rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
             rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
                 .ok()
@@ -727,6 +752,17 @@ mod tests {
         assert_eq!(config.database_min_connections, 5);
         assert_eq!(config.rate_limit_api_per_window, 10000);
         assert_eq!(config.rate_limit_search_per_window, 300);
+        // #1026: password-change limiter defaults must be strictly tighter
+        // than the global API bucket so a victim-JWT bearer cannot grind
+        // 100+ password guesses per minute through the bcrypt verifier.
+        assert_eq!(config.rate_limit_password_change_per_window, 5);
+        assert_eq!(config.rate_limit_password_change_window_secs, 900);
+        assert!(
+            (config.rate_limit_password_change_per_window as u64) * config.rate_limit_window_secs
+                < (config.rate_limit_api_per_window as u64)
+                    * config.rate_limit_password_change_window_secs,
+            "password-change effective rate must be tighter than the API bucket"
+        );
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
         assert_eq!(config.smtp_port, 587);
         assert_eq!(config.smtp_tls_mode, "starttls");

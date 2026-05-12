@@ -11,6 +11,20 @@ use thiserror::Error;
 /// Application result type alias
 pub type Result<T> = std::result::Result<T, AppError>;
 
+/// Detect filesystem name-too-long errors across the message strings that
+/// surface from std::io and object_store/S3 backends. Linux io::Error
+/// renders as "File name too long (os error 36)"; some layers prefix or
+/// wrap the message, so match canonical fragments rather than an exact
+/// string. Mirrors `error_helpers::is_name_too_long` but lives here so
+/// `AppError::Storage` and `AppError::Io` map ENAMETOOLONG to 400 globally,
+/// even for format handlers that never adopted `error_helpers` (#1047).
+fn is_name_too_long(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("file name too long")
+        || lower.contains("name too long")
+        || lower.contains("enametoolong")
+}
+
 /// Application error types.
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -98,6 +112,21 @@ impl AppError {
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             Self::QuotaExceeded(_) => (StatusCode::INSUFFICIENT_STORAGE, "QUOTA_EXCEEDED"),
+            // ENAMETOOLONG is a client-supplied path that exceeds the
+            // underlying filesystem's name limit (255 bytes on ext4/xfs).
+            // Surfacing this as 500 makes abuse / fuzzing payloads look
+            // like server faults in monitoring. Map to 400 instead - it is
+            // a client problem, not a server failure. This mirrors the
+            // `map_storage_err` helper but applies to every handler that
+            // returns `AppError::Storage(...)` or `AppError::Io(...)`,
+            // including the 30+ format handlers that never adopted
+            // `error_helpers`. See #1047 (audit of #990's three patterns).
+            Self::Storage(msg) if is_name_too_long(msg) => {
+                (StatusCode::BAD_REQUEST, "PATH_TOO_LONG")
+            }
+            Self::Io(err) if is_name_too_long(&err.to_string()) => {
+                (StatusCode::BAD_REQUEST, "PATH_TOO_LONG")
+            }
             Self::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
             Self::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR"),
             Self::AddrParse(_) => (StatusCode::INTERNAL_SERVER_ERROR, "ADDR_PARSE_ERROR"),
@@ -119,6 +148,12 @@ impl AppError {
             // Server-side errors: return generic messages (details are logged)
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
+            Self::Storage(msg) if is_name_too_long(msg) => {
+                "Path segment exceeds filesystem name length limit".to_string()
+            }
+            Self::Io(err) if is_name_too_long(&err.to_string()) => {
+                "Path segment exceeds filesystem name length limit".to_string()
+            }
             Self::Storage(_) => "Storage operation failed".to_string(),
             Self::Config(_) => "Server configuration error".to_string(),
             Self::Internal(_) => "Internal server error".to_string(),
@@ -317,5 +352,65 @@ mod tests {
         let err = AppError::BadGateway("upstream failed".to_string());
         assert_eq!(err.user_message(), "upstream failed");
         assert_eq!(err.to_string(), "Bad gateway: upstream failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1047: ENAMETOOLONG must map to 400, not 500, regardless of which
+    // handler returned the error.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_enametoolong_maps_to_400() {
+        // Canonical Linux io::Error rendering.
+        let err = AppError::Storage("File name too long (os error 36)".into());
+        let (status, code) = err.status_and_code();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "PATH_TOO_LONG");
+        assert_eq!(
+            err.user_message(),
+            "Path segment exceeds filesystem name length limit"
+        );
+    }
+
+    #[test]
+    fn test_storage_enametoolong_wrapped_message_maps_to_400() {
+        // Some storage backends wrap the underlying message.
+        let err = AppError::Storage("storage put failed: file name too long".into());
+        let (status, _) = err.status_and_code();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_io_enametoolong_maps_to_400() {
+        // The host's `from_raw_os_error(36 | 63)` lookup is platform-specific
+        // (Linux: 36 => ENAMETOOLONG; macOS: 36 => EINPROGRESS, 63 =>
+        // ENAMETOOLONG), so use a constructed io::Error whose Display string
+        // matches the canonical ENAMETOOLONG fragment instead. The detector
+        // matches on the rendered string, not the errno.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "File name too long (os error 36)",
+        );
+        let err = AppError::Io(io_err);
+        let (status, code) = err.status_and_code();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "PATH_TOO_LONG");
+    }
+
+    #[test]
+    fn test_storage_unrelated_error_still_500() {
+        let err = AppError::Storage("disk quota exceeded".into());
+        let (status, _) = err.status_and_code();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_io_unrelated_error_still_500() {
+        let err = AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        let (status, _) = err.status_and_code();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

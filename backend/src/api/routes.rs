@@ -204,6 +204,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_presign_per_window,
         state.config.rate_limit_window_secs,
     ));
+    // Stricter per-user bucket for self-password-change attempts. The
+    // handler bcrypt-verifies the current password, so an attacker who
+    // already holds the victim's JWT can otherwise drive ~`api/min`
+    // password guesses through this endpoint and CPU-grind the bcrypt
+    // verifier. Default: 5 attempts / 15 minutes per user. See #1026.
+    let password_change_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_password_change_per_window,
+        state.config.rate_limit_password_change_window_secs,
+    ));
 
     let auth_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&auth_rate_limiter),
@@ -221,6 +230,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&presign_rate_limiter),
         exemptions: Arc::clone(&exemptions),
     };
+    let password_change_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&password_change_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -229,6 +242,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let api_cleanup = Arc::clone(&api_rate_limiter);
         let search_cleanup = Arc::clone(&search_rate_limiter);
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
+        let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -237,6 +251,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 api_cleanup.cleanup_expired().await;
                 search_cleanup.cleanup_expired().await;
                 presign_cleanup.cleanup_expired().await;
+                password_change_cleanup.cleanup_expired().await;
             }
         });
     }
@@ -307,10 +322,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User management routes require admin privileges
+        // User management routes require admin privileges. Password-mutating
+        // routes ride a stricter per-user rate-limit bucket (#1026) on top
+        // of admin auth; the bcrypt-verify in `change_password` is a
+        // CPU-DoS vector and a victim-JWT bearer would otherwise burn
+        // ~`api/min` password guesses through this endpoint.
         .nest(
             "/users",
             handlers::users::router()
+                .merge(
+                    handlers::users::password_router().layer(middleware::from_fn_with_state(
+                        password_change_rate_limit_state,
+                        rate_limit_middleware,
+                    )),
+                )
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),

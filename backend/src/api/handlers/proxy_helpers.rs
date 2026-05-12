@@ -21,27 +21,84 @@ use std::time::Duration;
 // Base URL from request headers
 // ---------------------------------------------------------------------------
 
+/// Operator-configured external base URL, read once from `AK_EXTERNAL_URL`
+/// and cached for the process lifetime. When set, this overrides whatever
+/// `request_base_url` derives from request headers.
+///
+/// Set this in deployments where reverse-proxy header forwarding cannot be
+/// trusted (or is unconfigured) and the Docker / Cargo / NuGet / Git LFS
+/// client must receive a stable, externally reachable URL in the
+/// `WWW-Authenticate: Bearer realm=...` challenge and other client-facing
+/// links. See #1021.
+///
+/// Trailing slashes are stripped so callers can build paths uniformly with
+/// `format!("{base}/v2/token")`.
+fn configured_external_url() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var("AK_EXTERNAL_URL").ok()?;
+            let trimmed = raw.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Validate at startup: must include a scheme so clients (Docker,
+            // Cargo, etc.) don't construct accidentally-relative URLs.
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                tracing::warn!(
+                    value = %trimmed,
+                    "AK_EXTERNAL_URL must start with http:// or https://; ignoring"
+                );
+                return None;
+            }
+            Some(trimmed.to_string())
+        })
+        .as_deref()
+}
+
 /// Derive the external base URL from reverse-proxy headers.
 ///
-/// Checks `X-Forwarded-Proto` for the scheme (defaults to `"http"`) and
-/// `X-Forwarded-Host` then `Host` for the hostname (defaults to
-/// `"localhost"`). If the host value already contains a scheme prefix it is
-/// returned as-is to avoid duplication.
+/// Resolution order (#1021):
+/// 1. `AK_EXTERNAL_URL` environment variable, if set. Operator-supplied
+///    external URL; takes precedence over request headers. This is the
+///    correct setting when the backend cannot be trusted to receive
+///    correct `X-Forwarded-*` headers from the ingress, or when several
+///    layers of proxies make header forwarding fragile.
+/// 2. `X-Forwarded-Host` + `X-Forwarded-Proto`. Standard Helm-chart ingress
+///    setup.
+/// 3. The `Host` request header. Vulnerable to host-header spoofing if no
+///    upstream sanitizes it; acceptable as a development fallback but a
+///    warning is logged the first time it is the only available source.
+/// 4. `http://localhost`. Last-resort fallback so handlers do not panic.
+///
+/// If a host value already carries an embedded scheme it is returned as-is
+/// to avoid `http://https://...` duplication.
 ///
 /// Most format handlers need to construct absolute URLs for clients (OCI,
 /// NuGet, npm, Cargo, Git LFS, SSO/OIDC). This function centralizes the
 /// header inspection logic so each handler does not duplicate it.
 pub fn request_base_url(headers: &HeaderMap) -> String {
+    // 1. Operator-supplied override (env var). #1021.
+    if let Some(external) = configured_external_url() {
+        return external.to_string();
+    }
+
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
 
-    let host = headers
+    let forwarded_host = headers
         .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
+        .and_then(|v| v.to_str().ok());
+
+    let host = match forwarded_host {
+        Some(h) => h,
+        None => headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost"),
+    };
 
     if host.contains("://") {
         host.to_string()
@@ -2632,6 +2689,8 @@ mod tests {
                 rate_limit_api_per_window: 5000,
                 rate_limit_search_per_window: 300,
                 rate_limit_presign_per_window: 30,
+                rate_limit_password_change_per_window: 5,
+                rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
                 rate_limit_exempt_usernames: Vec::new(),
                 rate_limit_exempt_service_accounts: false,

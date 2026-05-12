@@ -21,7 +21,12 @@ use crate::services::auth_service::{
 use crate::services::password_policy::PasswordPolicyConfig;
 use std::sync::atomic::Ordering;
 
-/// Create user routes
+/// Create user routes that should ride the standard API rate-limit bucket.
+///
+/// Password-mutating routes are intentionally excluded; mount them via
+/// [`password_router`] with the tighter `rate_limit_password_change_*` bucket
+/// (#1026). The handler itself enforces the self-vs-admin authorization
+/// check, so this split is purely about rate limiting, not access control.
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
@@ -30,6 +35,16 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/roles/:role_id", delete(revoke_role))
         .route("/:id/tokens", get(list_user_tokens).post(create_api_token))
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
+}
+
+/// Password-mutating user routes, separated out so callers can attach a
+/// stricter rate limit (#1026). `POST /:id/password` verifies the current
+/// password via bcrypt, so an attacker holding a victim's JWT can otherwise
+/// grind ~`rate_limit_api_per_window` guesses per window through this
+/// endpoint - far weaker than `/auth/login`'s `auth_rate_limit_state` bucket.
+/// Default: 5 attempts per 15 minutes per user.
+pub fn password_router() -> Router<SharedState> {
+    Router::new()
         .route("/:id/password", post(change_password))
         .route("/:id/password/reset", post(reset_password))
         .route("/:id/force-password-change", post(force_password_change))

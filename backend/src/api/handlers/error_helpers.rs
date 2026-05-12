@@ -4,7 +4,6 @@
 //! `AppError` response, replacing the repetitive closure pattern that was
 //! copy-pasted across maven, npm, pypi, and cargo handlers.
 
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::AppError;
@@ -21,36 +20,22 @@ pub fn map_db_err(e: impl std::fmt::Display) -> Response {
 /// Filesystem ENAMETOOLONG (a path or name segment exceeds the underlying FS
 /// limit, typically 255 bytes on ext4/xfs) is mapped to 400 Bad Request
 /// rather than 500. The client supplied an invalid path; that is a client
-/// problem, not a server failure.
+/// problem, not a server failure. Since #1047, this mapping is enforced
+/// inside `AppError::Storage` directly so every handler that returns
+/// `AppError::Storage(...)` benefits (not just the four formats that adopted
+/// this helper). This wrapper is kept for the existing call sites; new code
+/// can return `Err(AppError::Storage(e.to_string()))` and get the same
+/// behavior.
 ///
 /// Usage: `.map_err(map_storage_err)?`
 pub fn map_storage_err(e: impl std::fmt::Display) -> Response {
-    let s = e.to_string();
-    if is_name_too_long(&s) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Path segment exceeds filesystem name length limit",
-        )
-            .into_response();
-    }
-    AppError::Storage(s).into_response()
-}
-
-/// Detect filesystem name-too-long errors across the message strings that
-/// surface from std::io and object_store/S3 backends. Linux io::Error
-/// renders as "File name too long (os error 36)"; some layers prefix or
-/// wrap the message, so match canonical fragments rather than an exact
-/// string.
-fn is_name_too_long(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("file name too long")
-        || lower.contains("name too long")
-        || lower.contains("enametoolong")
+    AppError::Storage(e.to_string()).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     #[test]
     fn test_map_db_err_returns_500() {
@@ -100,10 +85,11 @@ mod tests {
     }
 
     #[test]
-    fn test_is_name_too_long_negative() {
-        // Unrelated storage messages must not be misclassified.
-        assert!(!is_name_too_long("disk quota exceeded"));
-        assert!(!is_name_too_long("connection reset"));
-        assert!(!is_name_too_long(""));
+    fn test_map_storage_err_unrelated_error_still_500() {
+        // Unrelated storage messages must not be misclassified as 400.
+        let resp = map_storage_err("disk quota exceeded");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = map_storage_err("connection reset");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
