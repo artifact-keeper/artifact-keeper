@@ -1455,6 +1455,50 @@ mod tests {
         assert_eq!(path, "simple/flask/Flask-3.0.0.tar.gz");
     }
 
+    #[test]
+    fn test_pypi_upstream_bare_simple_collapses_to_root() {
+        // Edge case: configured upstream is literally "/simple" — strip the
+        // suffix and substitute "/" so build_upstream_url has a non-empty
+        // base to operate on. Exercises the `if base.is_empty()` branch.
+        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_bare_simple_with_trailing_slash_collapses_to_root() {
+        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_strips_leading_slash_from_tail() {
+        // Tail with a stray leading slash should not produce `simple//flask/`.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_simple_substring_not_stripped() {
+        // `simple-index` ends with `simple` substring but NOT the `/simple`
+        // path segment, so it must not be stripped.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.example.com/pypi-simple-index", "flask/");
+        assert_eq!(url, "https://mirror.example.com/pypi-simple-index");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_multiple_trailing_slashes_handled() {
+        // trim_end_matches('/') strips all trailing slashes; the resulting
+        // URL must still strip the `/simple` segment correctly.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
     // -----------------------------------------------------------------------
     // normalize_pep503
     // -----------------------------------------------------------------------
