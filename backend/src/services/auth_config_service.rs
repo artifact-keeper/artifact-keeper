@@ -353,13 +353,21 @@ pub fn encryption_key() -> String {
 /// The verifier is a high-entropy string of 43-128 unreserved characters.
 /// We produce 64 base64url-no-pad characters (48 random bytes encoded), which
 /// yields 384 bits of entropy and stays well within the spec bounds.
+///
+/// RFC 7636 §7.1 requires the verifier be generated with a cryptographically
+/// secure RNG. We pull bytes from the OS CSPRNG (`rand::rngs::OsRng`, backed
+/// by `getrandom`) directly rather than via the thread-local PRNG so the
+/// provenance of the entropy is unambiguous in source review and audits.
 pub fn generate_pkce_verifier() -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use rand::RngCore;
+    use rand::rngs::OsRng;
+    use rand::TryRngCore;
 
     let mut bytes = [0u8; 48];
-    rand::rng().fill_bytes(&mut bytes);
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG must be available to mint PKCE verifiers");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -2615,6 +2623,29 @@ mod tests {
                 .await
                 .expect("validate_sso_session");
             assert!(validated.pkce_code_verifier.is_none());
+        }
+
+        /// Regression for cross-provider state replay: validate_sso_session
+        /// must return the session that owns the state, so the handler can
+        /// reject mismatched URL-path provider ids. We assert here that the
+        /// returned provider_id is exactly the one we minted the session
+        /// with, never one we picked at the call site.
+        #[tokio::test]
+        async fn test_validate_sso_session_returns_minted_provider_id() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let provider_a = Uuid::new_v4();
+            let session = AuthConfigService::create_sso_session(&pool, "oidc", provider_a)
+                .await
+                .expect("create_sso_session");
+            let validated = AuthConfigService::validate_sso_session(&pool, &session.state)
+                .await
+                .expect("validate_sso_session");
+            assert_eq!(
+                validated.provider_id, provider_a,
+                "session must report the provider_id it was minted with so callback handlers can compare it against the URL path"
+            );
         }
     }
 }

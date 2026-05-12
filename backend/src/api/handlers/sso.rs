@@ -189,11 +189,23 @@ pub async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
-    // Validate SSO session (CSRF check), then delegate to shared logic
+    // Validate SSO session (CSRF check), then delegate to shared logic.
+    //
+    // Security: the path id MUST match the provider_id that was bound to the
+    // SSO session at login time. Without this check, an attacker can mint a
+    // valid (state, code) pair against provider A and replay the callback at
+    // /oidc/{B}/callback so the PKCE code_verifier and code travel to
+    // provider B's token endpoint. We derive provider_id from the session
+    // (the authoritative side) and reject if the URL path disagrees.
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    if session.provider_id != id {
+        return Err(AppError::Authentication(
+            "SSO state does not match provider".to_string(),
+        ));
+    }
     oidc_callback_inner(
         state,
-        id,
+        session.provider_id,
         params.code,
         session.nonce,
         session.pkce_code_verifier,
@@ -763,33 +775,32 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
             continue;
         }
 
-        // Try to find an existing group with this name. Reuse operator-
-        // managed groups (NULL external_source) so admins can pre-create
-        // groups that match the IdP's group naming.
-        let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM groups WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let group_id = if let Some((gid,)) = existing {
-            gid
-        } else {
-            let (gid,): (Uuid,) = sqlx::query_as(
-                r#"
-                INSERT INTO groups (name, description, external_source, external_provider_id)
-                VALUES ($1, $2, 'oidc', $3)
-                RETURNING id
-                "#,
-            )
-            .bind(name)
-            .bind(format!("Auto-created from OIDC group claim: {name}"))
-            .bind(provider_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            gid
-        };
+        // Find-or-create the group atomically. Concurrent first-logins for
+        // the same brand-new group name from different users would race a
+        // separate SELECT + INSERT, with the loser of the race hitting the
+        // UNIQUE constraint on `groups.name` and aborting the transaction.
+        // ON CONFLICT (name) DO UPDATE … RETURNING id collapses the race
+        // into a single atomic upsert. The `DO UPDATE` (a no-op assignment)
+        // is what makes RETURNING populate for the conflicting row; a plain
+        // DO NOTHING would return zero rows on conflict. Operator-managed
+        // groups (NULL external_source) are reused without modification
+        // because we only assign description/external_source/external_provider_id
+        // when inserting, and the ON CONFLICT branch does not touch those
+        // columns.
+        let (group_id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO groups (name, description, external_source, external_provider_id)
+            VALUES ($1, $2, 'oidc', $3)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         sqlx::query(
             r#"
