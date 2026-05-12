@@ -99,6 +99,23 @@ pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
         || artifact.path.contains("/manifests/")
 }
 
+/// Parse a `v2/<name>/manifests/<reference>` registry path into `(name, ref)`.
+///
+/// Used by ImageScanner (Trivy) and GrypeScanner (#1160) to reconstruct a
+/// scannable image ref from the artifact path. Returns `None` for paths that
+/// don't match the OCI distribution-spec pull URL shape; callers fall back
+/// to alternative scan modes or skip the artifact.
+pub fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.trim_start_matches('/').strip_prefix("v2/")?;
+    let idx = rest.find("/manifests/")?;
+    let name = &rest[..idx];
+    let reference = &rest[idx + "/manifests/".len()..];
+    if name.is_empty() || reference.is_empty() {
+        return None;
+    }
+    Some((name, reference))
+}
+
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
 /// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
 /// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
