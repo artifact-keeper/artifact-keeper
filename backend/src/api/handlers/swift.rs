@@ -54,6 +54,63 @@ async fn resolve_swift_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["swift"], "a Swift").await
 }
 
+/// Extract Package.swift from a Swift source archive (issue #1100).
+///
+/// SwiftPM resolves dependencies via the manifest endpoint before downloading
+/// the full source archive, so a `404` here breaks dependency resolution even
+/// when the archive itself is sound. Operators (and CI tooling) can't always
+/// pass Package.swift through the `X-Swift-Package-Manifest` header because
+/// SwiftPM manifests are multi-line files and HTTP header values are
+/// effectively single-line, so we parse the uploaded zip ourselves.
+///
+/// Returns the manifest text when found at `Package.swift` or at
+/// `<prefix>/Package.swift` (the common GitHub-style archive layout that
+/// nests everything under `<repo>-<sha>/`). Returns `None` when neither
+/// layout matches; the caller falls back to "manifest not found".
+fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
+    let reader = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(reader).ok()?;
+
+    // Pass 1: top-level Package.swift wins. This is the layout produced by
+    // `swift package archive-source` and most CI helpers.
+    // Pass 2: any `<single-prefix>/Package.swift` (one directory deep).
+    // Pass 3: deepest fallback -- the shortest path that ends in
+    // `/Package.swift`. Avoids accidentally picking up
+    // `Tests/.../Package.swift` fixtures shipped alongside the real one.
+    use std::io::Read;
+    let mut best: Option<(usize, String)> = None;
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let is_top_level = name == "Package.swift";
+        let is_nested = name.ends_with("/Package.swift");
+        if !is_top_level && !is_nested {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        if is_top_level {
+            return Some(text);
+        }
+        let depth = name.matches('/').count();
+        let take = match &best {
+            None => true,
+            Some((d, _)) => depth < *d,
+        };
+        if take {
+            best = Some((depth, text));
+        }
+    }
+    best.map(|(_, text)| text)
+}
+
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
@@ -440,20 +497,58 @@ async fn fetch_manifest(
     })?
     .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
 
-    let manifest = artifact
+    // Prefer the cached manifest from artifact_metadata. When that is missing
+    // (legacy uploads predating issue #1100, or publishes that bypassed the
+    // header path), parse the source archive on demand so SwiftPM dependency
+    // resolution still succeeds.
+    let cached_manifest = artifact
         .metadata
         .as_ref()
         .and_then(|m| m.get("manifest"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
-        })?;
+        .map(|s| s.to_string());
+
+    let manifest = match cached_manifest {
+        Some(m) => m,
+        None => {
+            // Look up the storage key separately so the primary query above can
+            // keep its existing .sqlx offline cache entry (no schema change).
+            let storage_key: String = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts \
+                 WHERE repository_id = $1 AND is_deleted = false \
+                 AND LOWER(name) = LOWER($2) AND version = $3 LIMIT 1",
+            )
+            .bind(repo.id)
+            .bind(&package_id)
+            .bind(version)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Database error: {}", e),
+                )
+            })?;
+            let storage = state
+                .storage_for_repo(&repo.storage_location())
+                .map_err(|e| e.into_response())?;
+            let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Storage error: {}", e),
+                )
+            })?;
+            extract_manifest_from_zip(&zip_bytes).ok_or_else(|| {
+                swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
+            })?
+        }
+    };
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/x-swift")
         .header("Content-Version", "1")
-        .body(Body::from(manifest.to_string()))
+        .body(Body::from(manifest))
         .unwrap())
 }
 
@@ -552,13 +647,17 @@ async fn publish_release(
         )
     })?;
 
-    // Extract manifest from multipart body if present, or store the raw archive.
-    // For simplicity, we treat the body as the source archive. Metadata can be
-    // supplied via the swift_metadata field in a JSON content-type header.
+    // Prefer the explicit X-Swift-Package-Manifest header (lets clients override
+    // what's inside the archive), and fall back to parsing Package.swift from
+    // the uploaded zip when the header is absent. Without the fallback, raw
+    // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
+    // because the manifest endpoint returns 404 even though the archive is
+    // perfectly valid (issue #1100).
     let manifest = headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| extract_manifest_from_zip(&body));
 
     let swift_metadata = serde_json::json!({
         "scope": scope,
@@ -871,5 +970,76 @@ mod tests {
             repo.upstream_url.as_deref(),
             Some("https://swift-packages.example.com")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1100 -- extract Package.swift from uploaded zip
+    // -----------------------------------------------------------------------
+
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_top_level_package_swift() {
+        let zip = make_zip(&[
+            ("Package.swift", b"// swift-tools-version:5.9\nlet pkg = 1"),
+            ("Sources/Lib/lib.swift", b"public let x = 1"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("swift-tools-version:5.9"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_handles_github_prefix_layout() {
+        // Common layout from `git archive` / GitHub release tarballs:
+        // a single top-level directory contains the package contents.
+        let zip = make_zip(&[
+            ("swift-log-1.5.0/README.md", b"# Log"),
+            ("swift-log-1.5.0/Package.swift", b"let pkg = \"swift-log\""),
+            ("swift-log-1.5.0/Sources/Logging/Logger.swift", b"// source"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("swift-log"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_prefers_shallowest_when_multiple() {
+        // Tests/Fixtures often ship a nested Package.swift; the shallower one
+        // is the real manifest and must win.
+        let zip = make_zip(&[
+            ("pkg/Tests/Fixtures/Subpkg/Package.swift", b"// fixture"),
+            ("pkg/Package.swift", b"// real manifest"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("real manifest"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_none_for_archive_without_manifest() {
+        let zip = make_zip(&[
+            ("README.md", b"no manifest"),
+            ("src/lib.swift", b"// no manifest"),
+        ]);
+        assert!(extract_manifest_from_zip(&zip).is_none());
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_none_for_malformed_zip() {
+        let not_a_zip = b"this is not a zip file at all";
+        assert!(extract_manifest_from_zip(not_a_zip).is_none());
     }
 }

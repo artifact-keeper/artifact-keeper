@@ -127,20 +127,21 @@ async fn create_session(
     // Validate artifact path before doing anything else
     upload_service::validate_artifact_path(&req.artifact_path).map_err(map_upload_err)?;
 
-    // Resolve repository
-    let repo = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM repositories WHERE key = $1 AND is_deleted = false",
-    )
-    .bind(&req.repository_key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .ok_or_else(|| {
-        map_err(
-            StatusCode::NOT_FOUND,
-            format!("Repository '{}' not found", req.repository_key),
-        )
-    })?;
+    // Resolve repository. The `repositories` table has no `is_deleted` column
+    // (the soft-delete pattern lives on `artifacts`); the previous
+    // `AND is_deleted = false` predicate was a copy-paste from artifact
+    // queries that crashed every session create (issue #1168).
+    let repo = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM repositories WHERE key = $1")
+        .bind(&req.repository_key)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            map_err(
+                StatusCode::NOT_FOUND,
+                format!("Repository '{}' not found", req.repository_key),
+            )
+        })?;
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
@@ -349,18 +350,35 @@ async fn complete(
         .await
         .map_err(map_upload_err)?;
 
-    // Move temp file to final storage location and create artifact record
-    let temp_path = std::path::PathBuf::from(&session.temp_file_path);
-    let storage_key = format!(
-        "uploads/{}/{}",
-        session.repository_id, session.artifact_path
+    // Resolve the *repo-scoped* storage backend and use a content-addressable
+    // key, matching how non-chunked uploads work (issue #1168 part 3).
+    //
+    // Before this fix, the handler wrote via `state.storage` (the global
+    // default backend, no repo path prefix) to `uploads/<repo_id>/<path>`,
+    // while download_artifact resolves via `state.storage_for_repo(...)`
+    // which prepends `<repo.storage_path>/`. The two paths never lined up,
+    // so a 200 OK chunked upload produced a 404 on first download. Using
+    // the content-addressable scheme (`<hash[:2]>/<hash[2:4]>/<full-hash>`)
+    // also matches `ArtifactService::storage_key_from_checksum` so future
+    // dedup, GC, and replication paths see the upload like any other write.
+    let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+        &session.checksum_sha256,
     );
+
+    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+        .get_by_id(session.repository_id)
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
-    state
-        .storage
+    storage
         .put_file(&storage_key, &temp_path)
         .await
         .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1337,5 +1355,28 @@ mod tests {
         assert!(err.is_err());
         let resp = map_upload_err(err.unwrap_err());
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1168 -- chunked upload uses content-addressable
+    // storage key matching non-chunked uploads, so download can find it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn complete_uses_content_addressable_storage_key() {
+        // The chunked-upload finalize path must derive the same storage key
+        // as ArtifactService::storage_key_from_checksum so the repo-scoped
+        // download handler finds the bytes. Before #1168, finalize used
+        // "uploads/<repo_id>/<path>" which broke downloads.
+        let checksum = "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+        let expected =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(checksum);
+        assert_eq!(
+            expected,
+            "de/ad/deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+        );
+        // The leading two-char shards are what the download path expects.
+        assert!(expected.starts_with("de/ad/"));
+        assert!(!expected.starts_with("uploads/"));
     }
 }
