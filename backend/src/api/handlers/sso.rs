@@ -86,8 +86,21 @@ pub async fn oidc_login(
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
-    // 2. Create SSO session for CSRF protection (generates state + nonce internally)
-    let session = AuthConfigService::create_sso_session(&state.db, "oidc", id).await?;
+    // 2. If PKCE is enabled for this provider, generate a verifier and stash
+    //    it in the SSO session for use on callback.
+    let pkce_verifier = if row.pkce_enabled {
+        Some(crate::services::auth_config_service::generate_pkce_verifier())
+    } else {
+        None
+    };
+
+    let session = AuthConfigService::create_sso_session_with_pkce(
+        &state.db,
+        "oidc",
+        id,
+        pkce_verifier.clone(),
+    )
+    .await?;
     let state_str = session.state;
     let nonce_str = session.nonce.unwrap_or_default();
 
@@ -124,7 +137,7 @@ pub async fn oidc_login(
         row.scopes.join(" ")
     };
 
-    let auth_url = format!(
+    let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
         authorization_endpoint,
         urlencoding::encode(&row.client_id),
@@ -133,6 +146,14 @@ pub async fn oidc_login(
         urlencoding::encode(&state_str),
         urlencoding::encode(&nonce_str),
     );
+
+    // 6. Append PKCE S256 challenge if enabled (issue #1091).
+    if let Some(verifier) = pkce_verifier.as_deref() {
+        let challenge = crate::services::auth_config_service::pkce_challenge_s256(verifier);
+        auth_url.push_str("&code_challenge=");
+        auth_url.push_str(&urlencoding::encode(&challenge));
+        auth_url.push_str("&code_challenge_method=S256");
+    }
 
     Ok(Redirect::temporary(&auth_url))
 }
@@ -170,7 +191,15 @@ pub async fn oidc_callback(
 ) -> Result<Redirect> {
     // Validate SSO session (CSRF check), then delegate to shared logic
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
-    oidc_callback_inner(state, id, params.code, session.nonce, headers).await
+    oidc_callback_inner(
+        state,
+        id,
+        params.code,
+        session.nonce,
+        session.pkce_code_verifier,
+        headers,
+    )
+    .await
 }
 
 /// Handle OIDC callback without provider UUID in the path.
@@ -191,6 +220,7 @@ pub async fn oidc_callback_generic(
         session.provider_id,
         params.code,
         session.nonce,
+        session.pkce_code_verifier,
         headers,
     )
     .await
@@ -203,6 +233,7 @@ async fn oidc_callback_inner(
     provider_id: Uuid,
     authorization_code: String,
     session_nonce: Option<String>,
+    pkce_code_verifier: Option<String>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
@@ -232,16 +263,20 @@ async fn oidc_callback_inner(
     // 3. Build redirect_uri (must match the one used in the login request)
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, &headers);
 
-    // 4. Exchange authorization code for tokens
+    // 4. Exchange authorization code for tokens (with PKCE verifier when present).
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &authorization_code),
+        ("redirect_uri", &redirect_uri),
+        ("client_id", &row.client_id),
+        ("client_secret", &client_secret),
+    ];
+    if let Some(verifier) = pkce_code_verifier.as_deref() {
+        form.push(("code_verifier", verifier));
+    }
     let token_response: serde_json::Value = http_client
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &authorization_code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &row.client_id),
-            ("client_secret", &client_secret),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?
@@ -298,7 +333,7 @@ async fn oidc_callback_inner(
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Oidc,
             FederatedCredentials {
@@ -306,11 +341,28 @@ async fn oidc_callback_inner(
                 username: preferred_username,
                 email,
                 display_name,
-                groups,
+                groups: groups.clone(),
                 required_admin_group,
             },
         )
         .await?;
+
+    // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
+    //     OIDC group claim values as Artifact Keeper group memberships.
+    //     Auto-create groups (tagged with external_source = 'oidc') on first
+    //     sight and reconcile membership so removed groups drop their members.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_oidc_groups_to_local_groups(&state.db, user.id, provider_id, &groups).await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %provider_id,
+                "Failed to sync OIDC groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // 8. Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -678,6 +730,112 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Reconcile an OIDC user's group memberships against the `groups` table.
+///
+/// For each group name in `oidc_groups`:
+/// - Find the group by name; if missing, auto-create it tagged with
+///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
+/// - Ensure a `user_group_members` row exists.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `oidc_groups`.
+///
+/// Operator-managed groups (NULL `external_source`) are never modified by
+/// this sync. (Issue #1094.)
+pub(crate) async fn sync_oidc_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    oidc_groups: &[String],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Upsert each OIDC group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
+    for name in oidc_groups {
+        if name.trim().is_empty() {
+            continue;
+        }
+
+        // Try to find an existing group with this name. Reuse operator-
+        // managed groups (NULL external_source) so admins can pre-create
+        // groups that match the IdP's group naming.
+        let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM groups WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let group_id = if let Some((gid,)) = existing {
+            gid
+        } else {
+            let (gid,): (Uuid,) = sqlx::query_as(
+                r#"
+                INSERT INTO groups (name, description, external_source, external_provider_id)
+                VALUES ($1, $2, 'oidc', $3)
+                RETURNING id
+                "#,
+            )
+            .bind(name)
+            .bind(format!("Auto-created from OIDC group claim: {name}"))
+            .bind(provider_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            gid
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_group_members (user_id, group_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        current_group_ids.push(group_id);
+    }
+
+    // Remove the user from any OIDC-managed group (same provider) that they
+    // are no longer a member of according to the latest claims. We deliberately
+    // limit the scope to groups marked external_source = 'oidc' AND
+    // external_provider_id = provider_id so we never strip membership in
+    // operator-managed groups or groups owned by other IdPs.
+    sqlx::query(
+        r#"
+        DELETE FROM user_group_members
+        WHERE user_id = $1
+          AND group_id IN (
+              SELECT id FROM groups
+              WHERE external_source = 'oidc'
+                AND external_provider_id = $2
+                AND NOT (id = ANY($3))
+          )
+        "#,
+    )
+    .bind(user_id)
+    .bind(provider_id)
+    .bind(&current_group_ids)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 /// Build a `DecodingKey` from a JWK JSON value based on its key type.

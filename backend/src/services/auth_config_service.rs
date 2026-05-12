@@ -28,6 +28,13 @@ pub struct OidcConfigRow {
     pub attribute_mapping: serde_json::Value,
     pub is_enabled: bool,
     pub auto_create_users: bool,
+    /// When true, PKCE with S256 challenge is added to the authorization
+    /// request and the verifier is sent on token exchange (RFC 7636).
+    pub pkce_enabled: bool,
+    /// When true, the OIDC `groups` claim values are reflected as
+    /// Artifact Keeper group memberships (auto-creating groups on first
+    /// sight). Otherwise legacy role mapping is used.
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -101,6 +108,9 @@ pub struct SsoSession {
     pub provider_id: Uuid,
     pub state: String,
     pub nonce: Option<String>,
+    /// PKCE code_verifier (RFC 7636). Generated at login time, sent to the
+    /// token endpoint during the callback to prove possession.
+    pub pkce_code_verifier: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -121,6 +131,8 @@ pub struct OidcConfigResponse {
     pub attribute_mapping: serde_json::Value,
     pub is_enabled: bool,
     pub auto_create_users: bool,
+    pub pkce_enabled: bool,
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -183,6 +195,12 @@ pub struct CreateOidcConfigRequest {
     pub attribute_mapping: Option<serde_json::Value>,
     pub is_enabled: Option<bool>,
     pub auto_create_users: Option<bool>,
+    /// Enable PKCE (S256) on the authorization request. Defaults to `true`.
+    pub pkce_enabled: Option<bool>,
+    /// When `true`, OIDC group claim values are reflected as Artifact Keeper
+    /// group memberships (auto-creating groups on first sight). Defaults to
+    /// `false` to preserve legacy role-mapping behavior.
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -192,10 +210,20 @@ pub struct UpdateOidcConfigRequest {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub scopes: Option<Vec<String>>,
+    /// Partial update for `attribute_mapping`. Keys present in this object
+    /// overwrite the matching keys in the stored mapping. Keys not present
+    /// are preserved. To remove a key, set it to `null`. To replace the
+    /// whole mapping atomically, set `attribute_mapping_replace = true`.
+    /// (See issue #1191.)
     #[schema(value_type = Option<Object>)]
     pub attribute_mapping: Option<serde_json::Value>,
+    /// When `true`, treat `attribute_mapping` as a wholesale replacement
+    /// (legacy behavior). Defaults to `false` — partial merge.
+    pub attribute_mapping_replace: Option<bool>,
     pub is_enabled: Option<bool>,
     pub auto_create_users: Option<bool>,
+    pub pkce_enabled: Option<bool>,
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -317,6 +345,76 @@ pub fn encryption_key() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// PKCE helpers (RFC 7636)
+// ---------------------------------------------------------------------------
+
+/// Generate a cryptographically random PKCE code_verifier per RFC 7636 §4.1.
+///
+/// The verifier is a high-entropy string of 43-128 unreserved characters.
+/// We produce 64 base64url-no-pad characters (48 random bytes encoded), which
+/// yields 384 bits of entropy and stays well within the spec bounds.
+pub fn generate_pkce_verifier() -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 48];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Derive the S256 PKCE code_challenge from a verifier per RFC 7636 §4.2.
+///
+/// `challenge = base64url(SHA256(verifier))` with no padding.
+pub fn pkce_challenge_s256(verifier: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+// ---------------------------------------------------------------------------
+// JSON merge helper (for issue #1191 attribute_mapping PATCH semantics)
+// ---------------------------------------------------------------------------
+
+/// Deep-merge a JSON patch into a base object, returning the merged value.
+///
+/// Semantics:
+/// - If both `base` and `patch` are objects, recursively merge keys.
+/// - If a patch value is `null`, the corresponding key is **removed** from
+///   the base (RFC 7396-ish merge-patch semantics).
+/// - Otherwise, the patch value overwrites the base value at that key.
+/// - Arrays and primitives in `patch` replace the corresponding `base` value.
+///
+/// This is intentionally narrow: it is only used to merge OIDC
+/// `attribute_mapping` blobs, which are flat (or near-flat) JSON objects.
+pub fn merge_attribute_mapping(
+    base: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(patch_map)) => {
+            let mut out = base_map.clone();
+            for (k, v) in patch_map {
+                if v.is_null() {
+                    out.remove(k);
+                } else if out.contains_key(k) {
+                    let merged = merge_attribute_mapping(&out[k], v);
+                    out.insert(k.clone(), merged);
+                } else {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        // Patch isn't an object, or base isn't an object: patch wins.
+        (_, patch) => patch.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Service implementation
 // ---------------------------------------------------------------------------
 
@@ -332,6 +430,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
+                   pkce_enabled, map_groups_to_groups,
                    created_at, updated_at
             FROM oidc_configs
             ORDER BY name
@@ -349,6 +448,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
+                   pkce_enabled, map_groups_to_groups,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -369,6 +469,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
+                   pkce_enabled, map_groups_to_groups,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -405,14 +506,18 @@ impl AuthConfigService {
         let attribute_mapping = req.attribute_mapping.unwrap_or(serde_json::json!({}));
         let is_enabled = req.is_enabled.unwrap_or(true);
         let auto_create_users = req.auto_create_users.unwrap_or(true);
+        let pkce_enabled = req.pkce_enabled.unwrap_or(true);
+        let map_groups_to_groups = req.map_groups_to_groups.unwrap_or(false);
 
         let row = sqlx::query_as::<_, OidcConfigRow>(
             r#"
             INSERT INTO oidc_configs (id, name, issuer_url, client_id, client_secret_encrypted,
-                                      scopes, attribute_mapping, is_enabled, auto_create_users)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                      scopes, attribute_mapping, is_enabled, auto_create_users,
+                                      pkce_enabled, map_groups_to_groups)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
+                      pkce_enabled, map_groups_to_groups,
                       created_at, updated_at
             "#,
         )
@@ -425,6 +530,8 @@ impl AuthConfigService {
         .bind(&attribute_mapping)
         .bind(is_enabled)
         .bind(auto_create_users)
+        .bind(pkce_enabled)
+        .bind(map_groups_to_groups)
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create OIDC config: {e}")))?;
@@ -441,6 +548,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
+                   pkce_enabled, map_groups_to_groups,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -456,9 +564,19 @@ impl AuthConfigService {
         let issuer_url = req.issuer_url.unwrap_or(existing.issuer_url);
         let client_id = req.client_id.unwrap_or(existing.client_id);
         let scopes = req.scopes.unwrap_or(existing.scopes);
-        let attribute_mapping = req.attribute_mapping.unwrap_or(existing.attribute_mapping);
+        // Issue #1191: deep-merge attribute_mapping by default. Callers that
+        // want the legacy wholesale-replace behavior must opt in.
+        let attribute_mapping = match req.attribute_mapping {
+            Some(patch) if req.attribute_mapping_replace.unwrap_or(false) => patch,
+            Some(patch) => merge_attribute_mapping(&existing.attribute_mapping, &patch),
+            None => existing.attribute_mapping,
+        };
         let is_enabled = req.is_enabled.unwrap_or(existing.is_enabled);
         let auto_create_users = req.auto_create_users.unwrap_or(existing.auto_create_users);
+        let pkce_enabled = req.pkce_enabled.unwrap_or(existing.pkce_enabled);
+        let map_groups_to_groups = req
+            .map_groups_to_groups
+            .unwrap_or(existing.map_groups_to_groups);
 
         // Preserve existing encrypted secret if not provided
         let secret_hex = if let Some(new_secret) = &req.client_secret {
@@ -473,10 +591,12 @@ impl AuthConfigService {
             UPDATE oidc_configs
             SET name = $1, issuer_url = $2, client_id = $3, client_secret_encrypted = $4,
                 scopes = $5, attribute_mapping = $6, is_enabled = $7, auto_create_users = $8,
+                pkce_enabled = $9, map_groups_to_groups = $10,
                 updated_at = NOW()
-            WHERE id = $9
+            WHERE id = $11
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
+                      pkce_enabled, map_groups_to_groups,
                       created_at, updated_at
             "#,
         )
@@ -488,6 +608,8 @@ impl AuthConfigService {
         .bind(&attribute_mapping)
         .bind(is_enabled)
         .bind(auto_create_users)
+        .bind(pkce_enabled)
+        .bind(map_groups_to_groups)
         .bind(id)
         .fetch_one(pool)
         .await
@@ -520,6 +642,7 @@ impl AuthConfigService {
             WHERE id = $2
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
+                      pkce_enabled, map_groups_to_groups,
                       created_at, updated_at
             "#,
         )
@@ -544,6 +667,8 @@ impl AuthConfigService {
             attribute_mapping: row.attribute_mapping,
             is_enabled: row.is_enabled,
             auto_create_users: row.auto_create_users,
+            pkce_enabled: row.pkce_enabled,
+            map_groups_to_groups: row.map_groups_to_groups,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -1207,15 +1332,28 @@ impl AuthConfigService {
         provider_type: &str,
         provider_id: Uuid,
     ) -> Result<SsoSession> {
+        Self::create_sso_session_with_pkce(pool, provider_type, provider_id, None).await
+    }
+
+    /// Create an SSO session, optionally storing a PKCE code_verifier.
+    /// The verifier is read back during the callback so it can be sent on
+    /// the token-exchange request (RFC 7636).
+    pub async fn create_sso_session_with_pkce(
+        pool: &PgPool,
+        provider_type: &str,
+        provider_id: Uuid,
+        pkce_code_verifier: Option<String>,
+    ) -> Result<SsoSession> {
         let id = Uuid::new_v4();
         let state = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
 
         let session = sqlx::query_as::<_, SsoSession>(
             r#"
-            INSERT INTO sso_sessions (id, provider_type, provider_id, state, nonce)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, provider_type, provider_id, state, nonce, created_at, expires_at
+            INSERT INTO sso_sessions (id, provider_type, provider_id, state, nonce, pkce_code_verifier)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, provider_type, provider_id, state, nonce, pkce_code_verifier,
+                      created_at, expires_at
             "#,
         )
         .bind(id)
@@ -1223,6 +1361,7 @@ impl AuthConfigService {
         .bind(provider_id)
         .bind(&state)
         .bind(&nonce)
+        .bind(pkce_code_verifier.as_deref())
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create SSO session: {e}")))?;
@@ -1237,7 +1376,8 @@ impl AuthConfigService {
             r#"
             DELETE FROM sso_sessions
             WHERE state = $1
-            RETURNING id, provider_type, provider_id, state, nonce, created_at, expires_at
+            RETURNING id, provider_type, provider_id, state, nonce, pkce_code_verifier,
+                      created_at, expires_at
             "#,
         )
         .bind(state)
@@ -1444,6 +1584,8 @@ mod tests {
             attribute_mapping: json!({"email": "email"}),
             is_enabled: true,
             auto_create_users: false,
+            pkce_enabled: true,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         }
@@ -1667,12 +1809,15 @@ mod tests {
             attribute_mapping: json!({}),
             is_enabled: true,
             auto_create_users: false,
+            pkce_enabled: true,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         };
         let json_str = serde_json::to_string(&resp).unwrap();
         assert!(json_str.contains("\"has_secret\":true"));
         assert!(json_str.contains("\"name\":\"Test\""));
+        assert!(json_str.contains("\"pkce_enabled\":true"));
     }
 
     #[test]
@@ -1976,5 +2121,98 @@ mod tests {
         assert!(debug.contains("test-saml"));
         assert!(!debug.contains("BEGIN CERTIFICATE"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PKCE S256 (issue #1091)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pkce_verifier_length_and_charset() {
+        let v = generate_pkce_verifier();
+        // 48 bytes base64url-no-pad => 64 characters
+        assert_eq!(v.len(), 64);
+        assert!(v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn test_pkce_verifier_is_random() {
+        let a = generate_pkce_verifier();
+        let b = generate_pkce_verifier();
+        assert_ne!(a, b, "two verifiers should not collide");
+    }
+
+    #[test]
+    fn test_pkce_challenge_s256_known_vector() {
+        // RFC 7636 Appendix B test vector.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = pkce_challenge_s256(verifier);
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn test_pkce_challenge_s256_deterministic() {
+        let verifier = generate_pkce_verifier();
+        let c1 = pkce_challenge_s256(&verifier);
+        let c2 = pkce_challenge_s256(&verifier);
+        assert_eq!(c1, c2);
+    }
+
+    // -----------------------------------------------------------------------
+    // attribute_mapping merge semantics (issue #1191)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_preserves_keys_not_in_patch() {
+        let base = serde_json::json!({
+            "redirect_uri": "https://ak.example.com/cb",
+            "username_claim": "preferred_username"
+        });
+        let patch = serde_json::json!({
+            "username_claim": "email"
+        });
+        let out = merge_attribute_mapping(&base, &patch);
+        // redirect_uri must survive.
+        assert_eq!(out["redirect_uri"], "https://ak.example.com/cb");
+        assert_eq!(out["username_claim"], "email");
+    }
+
+    #[test]
+    fn test_merge_null_value_removes_key() {
+        let base = serde_json::json!({
+            "redirect_uri": "https://ak.example.com/cb",
+            "admin_group": "platform-admins"
+        });
+        let patch = serde_json::json!({ "admin_group": null });
+        let out = merge_attribute_mapping(&base, &patch);
+        assert_eq!(out["redirect_uri"], "https://ak.example.com/cb");
+        assert!(out.get("admin_group").is_none());
+    }
+
+    #[test]
+    fn test_merge_adds_new_keys() {
+        let base = serde_json::json!({"a": 1});
+        let patch = serde_json::json!({"b": 2});
+        let out = merge_attribute_mapping(&base, &patch);
+        assert_eq!(out["a"], 1);
+        assert_eq!(out["b"], 2);
+    }
+
+    #[test]
+    fn test_merge_empty_patch_is_noop() {
+        let base = serde_json::json!({"a": 1, "b": 2});
+        let patch = serde_json::json!({});
+        let out = merge_attribute_mapping(&base, &patch);
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn test_merge_non_object_patch_replaces() {
+        let base = serde_json::json!({"a": 1});
+        let patch = serde_json::json!("scalar");
+        let out = merge_attribute_mapping(&base, &patch);
+        assert_eq!(out, serde_json::json!("scalar"));
     }
 }

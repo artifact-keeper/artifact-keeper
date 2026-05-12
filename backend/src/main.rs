@@ -1061,6 +1061,8 @@ fn build_oidc_request_from_values(
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
         auto_create_users: Some(true),
+        pkce_enabled: None,
+        map_groups_to_groups: None,
     })
 }
 
