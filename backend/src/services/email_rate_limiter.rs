@@ -713,17 +713,23 @@ mod tests {
 
     #[test]
     fn test_recipient_map_prunes_idle_entries_past_soft_cap() {
-        // Plant SOFT_CAP+1 distinct (sub, recipient) pairs at t0. Then
-        // advance past PRUNE_IDLE_THRESHOLD so all planted entries are
-        // older than the eviction threshold, and trigger one more
-        // acquire — the lazy prune fires and drops every stale entry.
+        // Plant SOFT_CAP+1 distinct (sub, recipient) pairs at t0. Each
+        // plant uses a DISTINCT domain so the per-domain bucket can't
+        // bottleneck the seeding loop — the per-domain cap is 1000/min,
+        // and reusing one domain across 10001 inserts would trip the
+        // DomainLimited branch after 1000 calls. Then advance past
+        // PRUNE_IDLE_THRESHOLD and trigger one more acquire — the lazy
+        // prune fires and drops every stale entry.
         let limiter = EmailRateLimiter::new(100, 1000);
         let t0 = Instant::now();
         for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
             let s = Uuid::from_u128(i as u128);
+            let addr = format!("a@d{}.com", i);
             assert_eq!(
-                limiter.try_acquire_at(s, "a@x.com", t0),
-                RateLimitDecision::Allowed
+                limiter.try_acquire_at(s, &addr, t0),
+                RateLimitDecision::Allowed,
+                "seed iteration {} should be Allowed",
+                i
             );
         }
         assert!(limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP);
@@ -783,10 +789,11 @@ mod tests {
         let limiter = EmailRateLimiter::new(100, 1000);
         let t0 = Instant::now();
 
-        // First wave of stale plants, plus a triggering acquire after
-        // the idle threshold so the first prune fires.
+        // First wave of stale plants. Distinct domains per address so
+        // the per-domain bucket (1000/min) doesn't run dry mid-seed.
         for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
-            let _ = limiter.try_acquire_at(Uuid::from_u128(i as u128), "a@x.com", t0);
+            let addr = format!("a@d{}.com", i);
+            let _ = limiter.try_acquire_at(Uuid::from_u128(i as u128), &addr, t0);
         }
         let t1 = t0 + PRUNE_IDLE_THRESHOLD + Duration::from_secs(1);
         let _ = limiter.try_acquire_at(Uuid::from_u128(u128::MAX), "trigger@x.com", t1);
@@ -794,12 +801,11 @@ mod tests {
 
         // Second wave: fresh entries at t1 with `last_refill=t1`. These
         // would still be too young to evict on age. Re-cross the cap.
+        // Same distinct-domain pattern as above.
         for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
-            let _ = limiter.try_acquire_at(
-                Uuid::from_u128((i as u128) | (1u128 << 100)),
-                "a@x.com",
-                t1,
-            );
+            let addr = format!("b@d{}.com", i);
+            let _ =
+                limiter.try_acquire_at(Uuid::from_u128((i as u128) | (1u128 << 100)), &addr, t1);
         }
         assert!(limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP);
 
