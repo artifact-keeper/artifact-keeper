@@ -14,6 +14,8 @@ use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
     cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
+// `ScanCompleteness` is used via `output.scan_completeness.as_str()` in the
+// info!() log line below.
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
@@ -61,7 +63,18 @@ impl TrivyFsScanner {
 
     /// Run Trivy filesystem scan, optionally connecting to a server.
     /// When `server_url` is Some, `--server <url>` is added to the command.
-    async fn run_trivy(&self, workspace: &Path, server_url: Option<&str>) -> Result<TrivyReport> {
+    ///
+    /// Returns `(report, stderr_text)`. Trivy's stderr is captured even on
+    /// success so the caller can detect the partial-scan signal (#1153):
+    /// a malformed lockfile makes Trivy log a warning and skip the target
+    /// without failing the process, and the empty Packages block that
+    /// results is indistinguishable from "no lockfile present" without
+    /// the stderr text.
+    async fn run_trivy(
+        &self,
+        workspace: &Path,
+        server_url: Option<&str>,
+    ) -> Result<(TrivyReport, String)> {
         let ws = workspace.to_string_lossy();
         let mut args = vec!["filesystem"];
         if let Some(url) = server_url {
@@ -96,22 +109,74 @@ impl TrivyFsScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
 
+        let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             if server_url.is_some()
-                && (stderr.contains("not found") || stderr.contains("No such file"))
+                && (stderr_text.contains("not found") || stderr_text.contains("No such file"))
             {
                 return Err(AppError::Internal("Trivy CLI not available".to_string()));
             }
             return Err(AppError::Internal(format!(
                 "Trivy {} scan failed (exit {}): {}",
-                mode_label, output.status, stderr
+                mode_label, output.status, stderr_text
             )));
         }
 
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
+        let report: TrivyReport = serde_json::from_slice(&output.stdout)
+            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))?;
+        Ok((report, stderr_text))
     }
+}
+
+/// Lockfile / manifest basenames that Trivy parses when invoked with
+/// `filesystem` mode. If one of these is present in the scan workspace
+/// but absent from the Trivy report's `results[].target` list, the scan
+/// is treated as partial (#1153). The list mirrors the file types Trivy
+/// claims to handle in `pkg/dependency/parser/`.
+const TRIVY_KNOWN_TARGETS: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "requirements.txt",
+    "Pipfile.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "go.mod",
+    "go.sum",
+    "Cargo.lock",
+    "composer.lock",
+    "packages.lock.json",
+    "pubspec.lock",
+    "mix.lock",
+    "conan.lock",
+    "pom.xml",
+];
+
+/// List the basenames of lockfile/manifest files present in the workspace.
+/// Used to feed [`ScanOutput::from_trivy_report_with_context`]'s
+/// known-targets check (#1153). Errors are swallowed — an unreadable
+/// directory simply yields an empty list, which collapses the partial-
+/// scan check to "use stderr only".
+fn workspace_known_targets(workspace: &Path) -> Vec<&'static str> {
+    let mut hits: Vec<&'static str> = Vec::new();
+    let walker = walkdir::WalkDir::new(workspace)
+        .max_depth(8)
+        .into_iter()
+        .filter_map(|e| e.ok());
+    for entry in walker {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(known) = TRIVY_KNOWN_TARGETS.iter().find(|k| **k == name) {
+                if !hits.contains(known) {
+                    hits.push(*known);
+                }
+            }
+        }
+    }
+    hits
 }
 
 #[async_trait]
@@ -162,15 +227,15 @@ impl Scanner for TrivyFsScanner {
             ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
         // Try CLI with server mode first, then standalone
-        let report = match self.run_trivy(&workspace, Some(&self.trivy_url)).await {
-            Ok(report) => report,
+        let (report, stderr) = match self.run_trivy(&workspace, Some(&self.trivy_url)).await {
+            Ok(out) => out,
             Err(e) => {
                 warn!(
                     "Trivy server-mode CLI failed for {}: {}. Trying standalone mode.",
                     artifact.name, e
                 );
                 match self.run_trivy(&workspace, None).await {
-                    Ok(report) => report,
+                    Ok(out) => out,
                     Err(e) => {
                         return Err(fail_scan(
                             "Trivy filesystem scan",
@@ -185,13 +250,25 @@ impl Scanner for TrivyFsScanner {
             }
         };
 
-        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
+        // #1153: enumerate lockfile/manifest files in the workspace so the
+        // partial-scan classifier can flag a target Trivy silently skipped.
+        // The workspace listing happens after the scan so it is read-only
+        // and cannot perturb scanner behaviour.
+        let known_targets = workspace_known_targets(&workspace);
+        let known_target_refs: Vec<&str> = known_targets.iter().map(|s| *s as &str).collect();
+        let output = ScanOutput::from_trivy_report_with_context(
+            &report,
+            "trivy-filesystem",
+            &stderr,
+            &known_target_refs,
+        );
 
         info!(
-            "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages",
+            "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages, completeness={}",
             artifact.name,
             output.findings.len(),
-            output.packages.len()
+            output.packages.len(),
+            output.scan_completeness.as_str(),
         );
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;

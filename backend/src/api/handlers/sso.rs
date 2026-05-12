@@ -86,8 +86,21 @@ pub async fn oidc_login(
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
-    // 2. Create SSO session for CSRF protection (generates state + nonce internally)
-    let session = AuthConfigService::create_sso_session(&state.db, "oidc", id).await?;
+    // 2. If PKCE is enabled for this provider, generate a verifier and stash
+    //    it in the SSO session for use on callback.
+    let pkce_verifier = if row.pkce_enabled {
+        Some(crate::services::auth_config_service::generate_pkce_verifier())
+    } else {
+        None
+    };
+
+    let session = AuthConfigService::create_sso_session_with_pkce(
+        &state.db,
+        "oidc",
+        id,
+        pkce_verifier.clone(),
+    )
+    .await?;
     let state_str = session.state;
     let nonce_str = session.nonce.unwrap_or_default();
 
@@ -124,7 +137,7 @@ pub async fn oidc_login(
         row.scopes.join(" ")
     };
 
-    let auth_url = format!(
+    let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
         authorization_endpoint,
         urlencoding::encode(&row.client_id),
@@ -133,6 +146,14 @@ pub async fn oidc_login(
         urlencoding::encode(&state_str),
         urlencoding::encode(&nonce_str),
     );
+
+    // 6. Append PKCE S256 challenge if enabled (issue #1091).
+    if let Some(verifier) = pkce_verifier.as_deref() {
+        let challenge = crate::services::auth_config_service::pkce_challenge_s256(verifier);
+        auth_url.push_str("&code_challenge=");
+        auth_url.push_str(&urlencoding::encode(&challenge));
+        auth_url.push_str("&code_challenge_method=S256");
+    }
 
     Ok(Redirect::temporary(&auth_url))
 }
@@ -168,9 +189,29 @@ pub async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
-    // Validate SSO session (CSRF check), then delegate to shared logic
+    // Validate SSO session (CSRF check), then delegate to shared logic.
+    //
+    // Security: the path id MUST match the provider_id that was bound to the
+    // SSO session at login time. Without this check, an attacker can mint a
+    // valid (state, code) pair against provider A and replay the callback at
+    // /oidc/{B}/callback so the PKCE code_verifier and code travel to
+    // provider B's token endpoint. We derive provider_id from the session
+    // (the authoritative side) and reject if the URL path disagrees.
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
-    oidc_callback_inner(state, id, params.code, session.nonce, headers).await
+    if session.provider_id != id {
+        return Err(AppError::Authentication(
+            "SSO state does not match provider".to_string(),
+        ));
+    }
+    oidc_callback_inner(
+        state,
+        session.provider_id,
+        params.code,
+        session.nonce,
+        session.pkce_code_verifier,
+        headers,
+    )
+    .await
 }
 
 /// Handle OIDC callback without provider UUID in the path.
@@ -191,6 +232,7 @@ pub async fn oidc_callback_generic(
         session.provider_id,
         params.code,
         session.nonce,
+        session.pkce_code_verifier,
         headers,
     )
     .await
@@ -203,6 +245,7 @@ async fn oidc_callback_inner(
     provider_id: Uuid,
     authorization_code: String,
     session_nonce: Option<String>,
+    pkce_code_verifier: Option<String>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
@@ -232,16 +275,20 @@ async fn oidc_callback_inner(
     // 3. Build redirect_uri (must match the one used in the login request)
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, &headers);
 
-    // 4. Exchange authorization code for tokens
+    // 4. Exchange authorization code for tokens (with PKCE verifier when present).
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &authorization_code),
+        ("redirect_uri", &redirect_uri),
+        ("client_id", &row.client_id),
+        ("client_secret", &client_secret),
+    ];
+    if let Some(verifier) = pkce_code_verifier.as_deref() {
+        form.push(("code_verifier", verifier));
+    }
     let token_response: serde_json::Value = http_client
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &authorization_code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &row.client_id),
-            ("client_secret", &client_secret),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?
@@ -298,7 +345,7 @@ async fn oidc_callback_inner(
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Oidc,
             FederatedCredentials {
@@ -306,11 +353,28 @@ async fn oidc_callback_inner(
                 username: preferred_username,
                 email,
                 display_name,
-                groups,
+                groups: groups.clone(),
                 required_admin_group,
             },
         )
         .await?;
+
+    // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
+    //     OIDC group claim values as Artifact Keeper group memberships.
+    //     Auto-create groups (tagged with external_source = 'oidc') on first
+    //     sight and reconcile membership so removed groups drop their members.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_oidc_groups_to_local_groups(&state.db, user.id, provider_id, &groups).await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %provider_id,
+                "Failed to sync OIDC groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // 8. Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -678,6 +742,111 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Reconcile an OIDC user's group memberships against the `groups` table.
+///
+/// For each group name in `oidc_groups`:
+/// - Find the group by name; if missing, auto-create it tagged with
+///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
+/// - Ensure a `user_group_members` row exists.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `oidc_groups`.
+///
+/// Operator-managed groups (NULL `external_source`) are never modified by
+/// this sync. (Issue #1094.)
+pub(crate) async fn sync_oidc_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    oidc_groups: &[String],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Upsert each OIDC group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
+    for name in oidc_groups {
+        if name.trim().is_empty() {
+            continue;
+        }
+
+        // Find-or-create the group atomically. Concurrent first-logins for
+        // the same brand-new group name from different users would race a
+        // separate SELECT + INSERT, with the loser of the race hitting the
+        // UNIQUE constraint on `groups.name` and aborting the transaction.
+        // ON CONFLICT (name) DO UPDATE … RETURNING id collapses the race
+        // into a single atomic upsert. The `DO UPDATE` (a no-op assignment)
+        // is what makes RETURNING populate for the conflicting row; a plain
+        // DO NOTHING would return zero rows on conflict. Operator-managed
+        // groups (NULL external_source) are reused without modification
+        // because we only assign description/external_source/external_provider_id
+        // when inserting, and the ON CONFLICT branch does not touch those
+        // columns.
+        let (group_id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO groups (name, description, external_source, external_provider_id)
+            VALUES ($1, $2, 'oidc', $3)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_group_members (user_id, group_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        current_group_ids.push(group_id);
+    }
+
+    // Remove the user from any OIDC-managed group (same provider) that they
+    // are no longer a member of according to the latest claims. We deliberately
+    // limit the scope to groups marked external_source = 'oidc' AND
+    // external_provider_id = provider_id so we never strip membership in
+    // operator-managed groups or groups owned by other IdPs.
+    sqlx::query(
+        r#"
+        DELETE FROM user_group_members
+        WHERE user_id = $1
+          AND group_id IN (
+              SELECT id FROM groups
+              WHERE external_source = 'oidc'
+                AND external_provider_id = $2
+                AND NOT (id = ANY($3))
+          )
+        "#,
+    )
+    .bind(user_id)
+    .bind(provider_id)
+    .bind(&current_group_ids)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 /// Build a `DecodingKey` from a JWK JSON value based on its key type.
@@ -1523,5 +1692,362 @@ mod tests {
         let result = super::select_jwk_key(&keys, Some("k1"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unsupported"));
+    }
+
+    // =======================================================================
+    // DB-backed tests for sync_oidc_groups_to_local_groups (issue #1094).
+    //
+    // These opt into a real Postgres via test_db_helpers::try_pool(): when
+    // DATABASE_URL is unset they no-op so `cargo test --lib` stays usable
+    // without a database. The coverage CI job provisions Postgres and runs
+    // migrations, so the group-reconciliation paths are exercised there.
+    // =======================================================================
+
+    mod sync_db {
+        use super::super::sync_oidc_groups_to_local_groups;
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// Insert a user with the local auth_provider and a random username.
+        async fn make_user(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+                VALUES ($1, $2, $3, 'unused', 'oidc', false, true)
+                "#,
+            )
+            .bind(id)
+            .bind(format!("oidc-sync-{}", id.as_simple()))
+            .bind(format!("oidc-sync-{}@test.local", id.as_simple()))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            id
+        }
+
+        async fn group_id_by_name(pool: &PgPool, name: &str) -> Option<Uuid> {
+            let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM groups WHERE name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .expect("group lookup");
+            row.map(|(id,)| id)
+        }
+
+        async fn user_is_in_group(pool: &PgPool, user_id: Uuid, group_id: Uuid) -> bool {
+            let row: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT group_id FROM user_group_members WHERE user_id = $1 AND group_id = $2",
+            )
+            .bind(user_id)
+            .bind(group_id)
+            .fetch_optional(pool)
+            .await
+            .expect("membership lookup");
+            row.is_some()
+        }
+
+        async fn group_external_source(pool: &PgPool, group_id: Uuid) -> Option<String> {
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT external_source FROM groups WHERE id = $1")
+                    .bind(group_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("group source lookup");
+            row.and_then(|(s,)| s)
+        }
+
+        /// Random group name with a UUID suffix so parallel tests do not
+        /// collide on the UNIQUE constraint.
+        fn rand_group_name(prefix: &str) -> String {
+            format!("{prefix}-{}", Uuid::new_v4().as_simple())
+        }
+
+        async fn cleanup_groups(pool: &PgPool, ids: &[Uuid]) {
+            for id in ids {
+                let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+
+        async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+            let _ = sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_creates_groups_and_membership() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("eng");
+            let g2 = rand_group_name("ops");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[g1.clone(), g2.clone()],
+            )
+            .await
+            .expect("sync");
+
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            // Auto-created groups must be tagged with external_source = 'oidc'.
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
+                Some("oidc")
+            );
+            assert_eq!(
+                group_external_source(&pool, g2_id).await.as_deref(),
+                Some("oidc")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_skips_empty_and_whitespace_group_names() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let real = rand_group_name("real");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[
+                    String::new(),
+                    "   ".to_string(),
+                    "\t".to_string(),
+                    real.clone(),
+                ],
+            )
+            .await
+            .expect("sync");
+
+            // Only the real group should exist.
+            let real_id = group_id_by_name(&pool, &real).await.expect("real group");
+            assert!(user_is_in_group(&pool, user_id, real_id).await);
+            // Empty/whitespace names must not have produced groups.
+            assert!(group_id_by_name(&pool, "").await.is_none());
+            assert!(group_id_by_name(&pool, "   ").await.is_none());
+
+            cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_reuses_operator_managed_group_without_modifying_source() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("operator");
+
+            // Pre-create an operator-managed group (NULL external_source).
+            let preexisting_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)")
+                .bind(preexisting_id)
+                .bind(&name)
+                .bind("operator-managed")
+                .execute(&pool)
+                .await
+                .expect("create operator group");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync");
+
+            // The same group id must be reused (not duplicated).
+            let found_id = group_id_by_name(&pool, &name).await.expect("found");
+            assert_eq!(found_id, preexisting_id);
+            assert!(user_is_in_group(&pool, user_id, found_id).await);
+            // external_source must remain NULL (operator-managed).
+            assert!(group_external_source(&pool, found_id).await.is_none());
+
+            cleanup_groups(&pool, &[found_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_prunes_removed_oidc_groups_but_not_operator_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let oidc_name_a = rand_group_name("oidc-a");
+            let oidc_name_b = rand_group_name("oidc-b");
+            let operator_name = rand_group_name("op-stable");
+
+            // First sync seeds both OIDC groups + adds the user.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[oidc_name_a.clone(), oidc_name_b.clone()],
+            )
+            .await
+            .expect("first sync");
+
+            let a_id = group_id_by_name(&pool, &oidc_name_a).await.unwrap();
+            let b_id = group_id_by_name(&pool, &oidc_name_b).await.unwrap();
+
+            // Add the user to an operator-managed group (NULL external_source).
+            let op_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(op_id)
+                .bind(&operator_name)
+                .execute(&pool)
+                .await
+                .expect("create op group");
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(op_id)
+                .execute(&pool)
+                .await
+                .expect("op membership");
+
+            // Second sync drops oidc_name_b from the claim list. Expect a_id
+            // membership to survive, b_id membership to be pruned, and the
+            // operator-managed group membership to remain untouched.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&oidc_name_a),
+            )
+            .await
+            .expect("second sync");
+
+            assert!(user_is_in_group(&pool, user_id, a_id).await);
+            assert!(!user_is_in_group(&pool, user_id, b_id).await);
+            assert!(
+                user_is_in_group(&pool, user_id, op_id).await,
+                "operator-managed membership must survive pruning"
+            );
+
+            cleanup_groups(&pool, &[a_id, b_id, op_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_scoped_to_provider_id() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_a = Uuid::new_v4();
+            let provider_b = Uuid::new_v4();
+            let shared_name = rand_group_name("shared");
+            let provider_a_only = rand_group_name("pa-only");
+
+            // Sync against provider_a creates a group tagged with provider_a.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_a,
+                &[shared_name.clone(), provider_a_only.clone()],
+            )
+            .await
+            .expect("sync A");
+            let pa_only_id = group_id_by_name(&pool, &provider_a_only).await.unwrap();
+            let shared_id = group_id_by_name(&pool, &shared_name).await.unwrap();
+
+            // Now sync against provider_b with an empty claim list. This must
+            // NOT prune the provider_a-owned groups: the DELETE is scoped to
+            // external_provider_id = provider_b.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_b, &[])
+                .await
+                .expect("sync B empty");
+
+            assert!(
+                user_is_in_group(&pool, user_id, pa_only_id).await,
+                "provider_a-owned membership must not be touched by a provider_b sync"
+            );
+            assert!(user_is_in_group(&pool, user_id, shared_id).await);
+
+            cleanup_groups(&pool, &[pa_only_id, shared_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_empty_claim_list_is_clean_noop_on_first_run() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+
+            // No memberships exist; empty claim list must commit cleanly.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &[])
+                .await
+                .expect("sync empty");
+
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_is_idempotent() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("idem");
+
+            // Run the same sync twice. Second run must not error on the
+            // ON CONFLICT DO NOTHING path and must leave the same state.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync 1");
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync 2 (idempotent)");
+
+            let gid = group_id_by_name(&pool, &name).await.unwrap();
+            assert!(user_is_in_group(&pool, user_id, gid).await);
+            cleanup_groups(&pool, &[gid]).await;
+            cleanup_user(&pool, user_id).await;
+        }
     }
 }

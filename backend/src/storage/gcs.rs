@@ -870,6 +870,37 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
+    /// Fetch the GCS object's `etag` field via the JSON metadata endpoint
+    /// (no body transfer). GCS ETags change on every object replacement,
+    /// which makes them suitable for the #1051 fast-path tamper check.
+    /// Returns `Ok(None)` for a missing object so the freshness probe can
+    /// fall through to the slow path without losing the I/O-error
+    /// distinction.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            require_success(response, "GCS head_etag failed").await?;
+            unreachable!();
+        }
+
+        // Object metadata is a small JSON blob. We only need the `etag`
+        // field; deserialize directly rather than pulling in a full schema.
+        #[derive(serde::Deserialize)]
+        struct ObjectMeta {
+            etag: Option<String>,
+        }
+        let meta: ObjectMeta = response
+            .json()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS head_etag: parse metadata json: {}", e)))?;
+        Ok(meta.etag)
+    }
+
     fn supports_redirect(&self) -> bool {
         matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) && self.config.redirect_downloads
     }

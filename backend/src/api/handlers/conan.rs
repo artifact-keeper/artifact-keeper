@@ -134,6 +134,27 @@ fn normalize_channel(channel: &str) -> &str {
     }
 }
 
+/// Push items from `incoming` onto `sink`, skipping any whose key (per
+/// `key_fn`) has already been recorded in `seen`. Used by the virtual-repo
+/// fan-out paths in `search`, `recipe_revisions`, `package_revisions`,
+/// `recipe_files_list`, and `package_files_list` to dedupe metadata rows
+/// across hosted members while preserving member priority order.
+fn merge_unique_by<V, K, F>(
+    incoming: Vec<V>,
+    seen: &mut std::collections::HashSet<K>,
+    sink: &mut Vec<V>,
+    key_fn: F,
+) where
+    K: Eq + std::hash::Hash,
+    F: Fn(&V) -> K,
+{
+    for v in incoming {
+        if seen.insert(key_fn(&v)) {
+            sink.push(v);
+        }
+    }
+}
+
 /// Build a storage key for a recipe file.
 fn recipe_storage_key(
     name: &str,
@@ -234,6 +255,38 @@ fn content_type_for_conan_file(path: &str) -> &'static str {
     }
 }
 
+/// Maximum byte length for any single Conan reference path segment
+/// (`name`, `version`, `user`, `channel`, `revision`, `package_id`,
+/// `pkg_revision`, `file_path`). This matches the typical filesystem
+/// `NAME_MAX` limit (255) and keeps storage-backend operations from
+/// surfacing low-level filesystem errors as 5xx responses.
+const CONAN_MAX_SEGMENT_LEN: usize = 255;
+
+/// Validate the byte length of every user-supplied Conan path segment.
+///
+/// Returns a 414 (URI Too Long) plain-text error response when any segment
+/// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
+/// in the response body so abuse / fuzzing payloads do not look like server
+/// faults in monitoring (issue #990).
+#[allow(clippy::result_large_err)]
+fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
+    for (label, value) in segments {
+        if value.len() > CONAN_MAX_SEGMENT_LEN {
+            return Err((
+                StatusCode::URI_TOO_LONG,
+                format!(
+                    "Conan path segment '{}' exceeds {} bytes (got {})",
+                    label,
+                    CONAN_MAX_SEGMENT_LEN,
+                    value.len()
+                ),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GET /conan/{repo_key}/v2/ping
 // ---------------------------------------------------------------------------
@@ -310,18 +363,15 @@ struct SearchQuery {
     q: Option<String>,
 }
 
-async fn search(
-    State(state): State<SharedState>,
-    Path(repo_key): Path<String>,
-    Query(query): Query<SearchQuery>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-
-    let pattern = query.q.unwrap_or_else(|| "*".to_string());
-
-    // Convert glob-like pattern to SQL LIKE pattern
-    let like_pattern = pattern.replace('*', "%");
-
+/// Pure helper extracted from [`search`] so the per-repo query can be reused
+/// for both the non-virtual fast path and for virtual fan-out across hosted
+/// member repositories. Returns the list of recipe references
+/// (`name/version@user/channel`) for one repository matching `like_pattern`.
+async fn search_recipes_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    like_pattern: &str,
+) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT DISTINCT
@@ -338,12 +388,11 @@ async fn search(
           AND a.name LIKE $2
         ORDER BY a.name, a.version
         "#,
-        repo.id,
+        repository_id,
         like_pattern,
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    .fetch_all(db)
+    .await?;
 
     // Build search results in Conan v2 format.
     //
@@ -352,7 +401,7 @@ async fn search(
     // client uploaded. Fall back to the artifact column / spec defaults when
     // the JSON field is absent (preserves Conan v2 protocol: `_` is the
     // sentinel for "no user / no channel", `0.0.0` is the fallback version).
-    let results: Vec<String> = rows
+    Ok(rows
         .iter()
         .map(|r| {
             let version = r
@@ -364,11 +413,121 @@ async fn search(
             let channel = r.meta_channel.as_deref().unwrap_or("_");
             format!("{}/{}@{}/{}", r.name, version, user, channel)
         })
-        .collect();
+        .collect())
+}
 
-    let json = serde_json::json!({
-        "results": results
-    });
+/// Forward a Conan v2 search query to a remote upstream and parse the JSON
+/// `results: [...]` array. Returns `Ok(Vec::new())` on any non-200 response
+/// or parse error — search is a best-effort, additive operation, so a remote
+/// failure must not block locally-uploaded recipes from being returned. The
+/// caller is responsible for merging the result with local hits.
+async fn search_recipes_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    pattern: &str,
+) -> Vec<String> {
+    let encoded = urlencoding::encode(pattern);
+    let upstream_path = format!("v2/conans/search?q={}", encoded);
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) => v
+                .get("results")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    "conan search: failed to parse upstream JSON for member '{}': {}",
+                    repo_key,
+                    e
+                );
+                Vec::new()
+            }
+        },
+        Err(_e) => {
+            tracing::debug!(
+                "conan search: upstream fetch failed or returned non-2xx for member '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+async fn search(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    let pattern = query.q.unwrap_or_else(|| "*".to_string());
+
+    // Convert glob-like pattern to SQL LIKE pattern.
+    let like_pattern = pattern.replace('*', "%");
+
+    // Aggregate using a deduped Vec so order is preserved across members.
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut results: Vec<String> = Vec::new();
+    let push = |refs: Vec<String>, seen: &mut _, sink: &mut Vec<String>| {
+        merge_unique_by(refs, seen, sink, |r| r.clone());
+    };
+
+    if repo.repo_type == RepositoryType::Virtual {
+        // Walk virtual members in priority order. Hosted members are queried
+        // directly; remote members are forwarded to their upstream. Each
+        // member's results are merged and deduped.
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type.is_hosted() {
+                let local = search_recipes_for_repo(&state.db, member.id, &like_pattern)
+                    .await
+                    .map_err(map_db_err)?;
+                push(local, &mut seen, &mut results);
+            } else if member.repo_type == RepositoryType::Remote {
+                if let (Some(upstream_url), Some(proxy)) = (
+                    member.upstream_url.as_deref(),
+                    state.proxy_service.as_deref(),
+                ) {
+                    let remote = search_recipes_from_remote(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &pattern,
+                    )
+                    .await;
+                    push(remote, &mut seen, &mut results);
+                }
+            }
+        }
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward upstream and merge any remote hits.
+        let local = search_recipes_for_repo(&state.db, repo.id, &like_pattern)
+            .await
+            .map_err(map_db_err)?;
+        push(local, &mut seen, &mut results);
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote =
+                search_recipes_from_remote(proxy, repo.id, &repo_key, upstream_url, &pattern).await;
+            push(remote, &mut seen, &mut results);
+        }
+    } else {
+        let local = search_recipes_for_repo(&state.db, repo.id, &like_pattern)
+            .await
+            .map_err(map_db_err)?;
+        push(local, &mut seen, &mut results);
+    }
+
+    let json = serde_json::json!({ "results": results });
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -482,15 +641,21 @@ async fn recipe_latest(
 // GET /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions
 // ---------------------------------------------------------------------------
 
-async fn recipe_revisions(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+/// Row shape for the revisions query, factored so the per-repo helper can be
+/// reused for both the non-virtual fast path and virtual fan-out.
+struct RecipeRevisionRow {
+    revision: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
 
-    // Must filter by user/channel so revisions uploaded under one namespace
-    // (e.g. myuser/stable) do not appear in the revisions list for a different
-    // namespace (e.g. _/_).
+async fn recipe_revisions_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+) -> Result<Vec<RecipeRevisionRow>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT am.metadata->>'revision' as "revision?",
@@ -508,24 +673,67 @@ async fn recipe_revisions(
         GROUP BY am.metadata->>'revision'
         ORDER BY "created_at!" DESC
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
-        normalize_user(&user),
-        normalize_channel(&channel),
+        normalize_user(user),
+        normalize_channel(channel),
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            r.revision.map(|rev| RecipeRevisionRow {
+                revision: rev,
+                created_at: r.created_at,
+            })
+        })
+        .collect())
+}
+
+async fn recipe_revisions(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // Must filter by user/channel so revisions uploaded under one namespace
+    // (e.g. myuser/stable) do not appear in the revisions list for a different
+    // namespace (e.g. _/_).
+    //
+    // For virtual repos, walk hosted members in priority order and merge the
+    // union of revisions, deduped by revision id, ordered by newest first.
+    // Remote-member aggregation is deferred (matches recipe_latest semantics).
+    let rows = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<RecipeRevisionRow> = Vec::new();
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            let member_rows =
+                recipe_revisions_for_repo(&state.db, member.id, &name, &version, &user, &channel)
+                    .await
+                    .map_err(map_db_err)?;
+            merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
+        }
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        merged
+    } else {
+        recipe_revisions_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
+            .await
+            .map_err(map_db_err)?
+    };
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
-        .filter_map(|r| {
-            r.revision.map(|rev| {
-                serde_json::json!({
-                    "revision": rev,
-                    "time": r.created_at.to_rfc3339()
-                })
+        .map(|r| {
+            serde_json::json!({
+                "revision": r.revision,
+                "time": r.created_at.to_rfc3339()
             })
         })
         .collect();
@@ -545,19 +753,15 @@ async fn recipe_revisions(
 // GET  .../revisions/{rev}/files — List recipe files
 // ---------------------------------------------------------------------------
 
-async fn recipe_files_list(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, user, channel, revision)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-
+async fn recipe_files_list_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT am.metadata->>'file' as "file?"
@@ -573,18 +777,58 @@ async fn recipe_files_list(
           AND am.metadata->>'channel' = $5
           AND am.metadata->>'revision' = $6
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
-        normalize_user(&user),
-        normalize_channel(&channel),
+        normalize_user(user),
+        normalize_channel(channel),
         revision,
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    .fetch_all(db)
+    .await?;
 
-    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(rows.into_iter().filter_map(|r| r.file).collect())
+}
+
+async fn recipe_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // For virtual repos, walk hosted members in priority order and merge the
+    // union of file names, deduped. Order matches recipe_revisions semantics.
+    let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            let member_files = recipe_files_list_for_repo(
+                &state.db, member.id, &name, &version, &user, &channel, &revision,
+            )
+            .await
+            .map_err(map_db_err)?;
+            merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
+    } else {
+        recipe_files_list_for_repo(
+            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+        )
+        .await
+        .map_err(map_db_err)?
+    };
+
     Ok(files_listing_response(filenames))
 }
 
@@ -753,7 +997,7 @@ async fn recipe_file_download(
 
 async fn recipe_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, file_path)): Path<(
         String,
         String,
@@ -765,8 +1009,29 @@ async fn recipe_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject path segments that exceed the filesystem NAME_MAX before any
+    // DB, auth, or storage-backend call, so deeply-nested or fuzzing-style
+    // payloads surface as a 414 instead of a low-level 500 (issue #990).
+    // Path-shape is independent of authn/authz so it is safe (and useful
+    // for monitoring) to fail it first.
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Validate the repo BEFORE checking auth, so an upload to a non-existent
+    // repo returns 404 instead of 500 (issue #990). The repo-visibility
+    // middleware skips the auth-extension insertion when the repo key is
+    // unknown, so a strict `Extension<Option<AuthExtension>>` extractor
+    // would surface a 500 here. Accepting the extension as `Option<...>`
+    // lets us run the resolve-then-auth-then-validate sequence cleanly.
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let auth_ext = auth.and_then(|Extension(a)| a);
+    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path =
@@ -889,20 +1154,17 @@ async fn recipe_file_upload(
 // GET .../packages/{package_id}/latest — Latest package revision
 // ---------------------------------------------------------------------------
 
-async fn package_latest(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-
+/// Per-repo helper: latest package revision (newest by created_at) for a
+/// given (name, version, recipe revision, package_id). Returns `Ok(None)` when
+/// the repository has no matching rows. Mirrors [`latest_recipe_revision_for_repo`].
+async fn latest_package_revision_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    revision: &str,
+    package_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT am.metadata->>'packageRevision' as "pkg_revision?"
@@ -920,26 +1182,75 @@ async fn package_latest(
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
         revision,
         package_id,
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?;
+    .fetch_optional(db)
+    .await?;
 
-    let pkg_revision = row
-        .pkg_revision
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?;
+    Ok(row.and_then(|r| r.pkg_revision))
+}
+
+async fn package_latest(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // For virtual repos, fan out to each hosted member in priority order and
+    // return the first member that has a matching package revision. Matches
+    // recipe_latest semantics. Remote-member aggregation is deferred.
+    let pkg_revision = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut found: Option<String> = None;
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            match latest_package_revision_for_repo(
+                &state.db,
+                member.id,
+                &name,
+                &version,
+                &revision,
+                &package_id,
+            )
+            .await
+            .map_err(map_db_err)?
+            {
+                Some(rev) => {
+                    found = Some(rev);
+                    break;
+                }
+                None => continue,
+            }
+        }
+        found
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?
+    } else {
+        latest_package_revision_for_repo(
+            &state.db,
+            repo.id,
+            &name,
+            &version,
+            &revision,
+            &package_id,
+        )
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?
+    };
 
     let json = serde_json::json!({
         "revision": pkg_revision,
@@ -957,20 +1268,20 @@ async fn package_latest(
 // GET .../packages/{package_id}/revisions — List package revisions
 // ---------------------------------------------------------------------------
 
-async fn package_revisions(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+/// Row shape for the package-revisions query. Mirrors [`RecipeRevisionRow`].
+struct PackageRevisionRow {
+    revision: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
 
+async fn package_revisions_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    revision: &str,
+    package_id: &str,
+) -> Result<Vec<PackageRevisionRow>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT am.metadata->>'packageRevision' as "pkg_revision?",
@@ -989,24 +1300,76 @@ async fn package_revisions(
         GROUP BY am.metadata->>'packageRevision'
         ORDER BY "created_at!" DESC
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
         revision,
         package_id,
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            r.pkg_revision.map(|rev| PackageRevisionRow {
+                revision: rev,
+                created_at: r.created_at,
+            })
+        })
+        .collect())
+}
+
+async fn package_revisions(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // Virtual fan-out: union of package revisions across hosted members,
+    // deduped by revision id and re-sorted by newest first.
+    let rows = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<PackageRevisionRow> = Vec::new();
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            let member_rows = package_revisions_for_repo(
+                &state.db,
+                member.id,
+                &name,
+                &version,
+                &revision,
+                &package_id,
+            )
+            .await
+            .map_err(map_db_err)?;
+            merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
+        }
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        merged
+    } else {
+        package_revisions_for_repo(&state.db, repo.id, &name, &version, &revision, &package_id)
+            .await
+            .map_err(map_db_err)?
+    };
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
-        .filter_map(|r| {
-            r.pkg_revision.map(|rev| {
-                serde_json::json!({
-                    "revision": rev,
-                    "time": r.created_at.to_rfc3339()
-                })
+        .map(|r| {
+            serde_json::json!({
+                "revision": r.revision,
+                "time": r.created_at.to_rfc3339()
             })
         })
         .collect();
@@ -1026,22 +1389,18 @@ async fn package_revisions(
 // GET  .../packages/{pkg_id}/revisions/{pkg_rev}/files — List package files
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::type_complexity)]
-async fn package_files_list(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-
+#[allow(clippy::too_many_arguments)]
+async fn package_files_list_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+    pkg_revision: &str,
+) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT am.metadata->>'file' as "file?"
@@ -1059,20 +1418,79 @@ async fn package_files_list(
           AND am.metadata->>'packageId' = $7
           AND am.metadata->>'packageRevision' = $8
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
-        normalize_user(&user),
-        normalize_channel(&channel),
+        normalize_user(user),
+        normalize_channel(channel),
         revision,
         package_id,
         pkg_revision,
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    .fetch_all(db)
+    .await?;
 
-    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(rows.into_iter().filter_map(|r| r.file).collect())
+}
+
+#[allow(clippy::type_complexity)]
+async fn package_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // Virtual fan-out: union of package file names across hosted members,
+    // deduped by file name.
+    let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            let member_files = package_files_list_for_repo(
+                &state.db,
+                member.id,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+                &package_id,
+                &pkg_revision,
+            )
+            .await
+            .map_err(map_db_err)?;
+            merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
+    } else {
+        package_files_list_for_repo(
+            &state.db,
+            repo.id,
+            &name,
+            &version,
+            &user,
+            &channel,
+            &revision,
+            &package_id,
+            &pkg_revision,
+        )
+        .await
+        .map_err(map_db_err)?
+    };
+
     Ok(files_listing_response(filenames))
 }
 
@@ -1275,7 +1693,7 @@ async fn package_file_download(
 #[allow(clippy::type_complexity)]
 async fn package_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(
         String,
         String,
@@ -1289,8 +1707,25 @@ async fn package_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject excessively long path segments up front (before any DB, auth,
+    // or storage-backend call) so the storage backend and DB never see paths
+    // that would surface as opaque 5xx errors (issue #990).
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("package_id", &package_id),
+        ("pkg_revision", &pkg_revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Resolve repo BEFORE auth so unknown repo keys surface as 404, not 500.
+    // See `recipe_file_upload` for the full rationale (issue #990).
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let auth_ext = auth.and_then(|Extension(a)| a);
+    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path = package_artifact_path(
@@ -4915,6 +5350,66 @@ mod tests {
             let _ = std::fs::remove_dir_all(&storage_dir);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // validate_conan_segments — issue #990 long-path guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_conan_segments_accepts_normal_segments() {
+        let segments = [
+            ("name", "zlib"),
+            ("version", "1.3.1"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "deadbeefcafebabedeadbeefcafebabe"),
+            ("file_path", "conanfile.py"),
+        ];
+        assert!(validate_conan_segments(&segments).is_ok());
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_segment_at_max() {
+        let max_segment: String = "a".repeat(CONAN_MAX_SEGMENT_LEN);
+        let segments = [("name", max_segment.as_str())];
+        assert!(
+            validate_conan_segments(&segments).is_ok(),
+            "exactly {} bytes must be accepted",
+            CONAN_MAX_SEGMENT_LEN
+        );
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_name() {
+        // Mirrors test-conan-errors.sh #15: a 300-char package name.
+        let long_name: String = "a".repeat(300);
+        let segments = [
+            ("name", long_name.as_str()),
+            ("version", "1.0.0"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "rev"),
+            ("file_path", "conanfile.py"),
+        ];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 300-char name");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_version() {
+        let long_version: String = "1.".repeat(200); // 400 chars
+        let segments = [("name", "zlib"), ("version", long_version.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 400-char version");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_file_path() {
+        let long_path: String = "x".repeat(CONAN_MAX_SEGMENT_LEN + 1);
+        let segments = [("file_path", long_path.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
 }
 
 // ===========================================================================
@@ -5824,5 +6319,492 @@ mod agent2_recipe_reads {
 
         cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual fan-out for remaining metadata endpoints (#876)
+    //
+    // recipe_latest already aggregates across hosted virtual-repo members
+    // (covered by `recipe_latest_aggregates_across_virtual_members` in the
+    // `tests` module). The same pattern is required for recipe_revisions,
+    // recipe_files_list, package_latest, package_revisions, and
+    // package_files_list. The tests below seed a hosted member of a virtual
+    // repo and exercise each handler through the virtual key.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a virtual repo with one hosted member already linked.
+    /// Returns `(virtual_repo_id, virtual_key, member_repo_id, virtual_storage_dir,
+    /// member_storage_dir, user_id, state, auth)`. Tests should cleanup all
+    /// returned resources at the end.
+    #[allow(clippy::type_complexity)]
+    async fn setup_virtual_with_member(
+        pool: &sqlx::PgPool,
+    ) -> (
+        Uuid,
+        String,
+        Uuid,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Uuid,
+        crate::api::SharedState,
+        crate::api::middleware::auth::AuthExtension,
+    ) {
+        let (user_id, _u, _p) = create_user(pool).await;
+        let (member_id, _member_key, member_dir) = create_conan_repo(pool, "local").await;
+        let (virtual_id, virtual_key, virtual_dir) = create_conan_repo(pool, "virtual").await;
+        let state = build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+        (
+            virtual_id,
+            virtual_key,
+            member_id,
+            virtual_dir,
+            member_dir,
+            user_id,
+            state,
+            auth,
+        )
+    }
+
+    async fn cleanup_virtual_pair(
+        pool: &sqlx::PgPool,
+        virtual_id: Uuid,
+        member_id: Uuid,
+        virtual_dir: &std::path::Path,
+        member_dir: &std::path::Path,
+        user_id: Uuid,
+    ) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(pool)
+            .await;
+        cleanup(pool, member_id, user_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(pool)
+            .await;
+        let _ = std::fs::remove_dir_all(virtual_dir);
+        let _ = std::fs::remove_dir_all(member_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_recipe_row(
+            &pool,
+            member_id,
+            "vlib",
+            "1.0",
+            "_",
+            "_",
+            "rev_alpha",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_recipe_row(
+            &pool,
+            member_id,
+            "vlib",
+            "1.0",
+            "_",
+            "_",
+            "rev_beta",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/vlib/1.0/_/_/revisions", virtual_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        let ids: Vec<&str> = revs
+            .iter()
+            .filter_map(|r| r.get("revision").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["rev_beta", "rev_alpha"],
+            "virtual recipe_revisions must aggregate hosted member rows, newest first"
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn recipe_files_list_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_recipe_row(
+            &pool,
+            member_id,
+            "flib",
+            "1.0",
+            "_",
+            "_",
+            "rev_files",
+            "conanfile.py",
+        )
+        .await;
+        let _ = seed_recipe_row(
+            &pool,
+            member_id,
+            "flib",
+            "1.0",
+            "_",
+            "_",
+            "rev_files",
+            "conanmanifest.txt",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/flib/1.0/_/_/revisions/rev_files/files",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let files = json
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("object");
+        assert!(
+            files.contains_key("conanfile.py") && files.contains_key("conanmanifest.txt"),
+            "virtual recipe_files_list must surface both seeded files, got {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn package_latest_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "plib",
+            "1.0",
+            "_",
+            "_",
+            "recipe_rev_x",
+            "pkgid1",
+            "pkg_rev_old",
+            "conan_package.tgz",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "plib",
+            "1.0",
+            "_",
+            "_",
+            "recipe_rev_x",
+            "pkgid1",
+            "pkg_rev_new",
+            "conan_package.tgz",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/plib/1.0/_/_/revisions/recipe_rev_x/packages/pkgid1/latest",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            json.get("revision").and_then(|v| v.as_str()),
+            Some("pkg_rev_new"),
+            "virtual package_latest must return newest member revision"
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn package_revisions_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "prlib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_a",
+            "pkgid2",
+            "pkg_rev_one",
+            "conan_package.tgz",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "prlib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_a",
+            "pkgid2",
+            "pkg_rev_two",
+            "conan_package.tgz",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/prlib/1.0/_/_/revisions/rrev_a/packages/pkgid2/revisions",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        let ids: Vec<&str> = revs
+            .iter()
+            .filter_map(|r| r.get("revision").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["pkg_rev_two", "pkg_rev_one"],
+            "virtual package_revisions must aggregate hosted member rows, newest first"
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn package_files_list_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "pflib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_pf",
+            "pkgid3",
+            "pkgrev_pf",
+            "conan_package.tgz",
+        )
+        .await;
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "pflib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_pf",
+            "pkgid3",
+            "pkgrev_pf",
+            "conaninfo.txt",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/pflib/1.0/_/_/revisions/rrev_pf/packages/pkgid3/revisions/pkgrev_pf/files",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let files = json
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("object");
+        assert!(
+            files.contains_key("conan_package.tgz") && files.contains_key("conaninfo.txt"),
+            "virtual package_files_list must surface both seeded files, got {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn search_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_recipe_row(
+            &pool,
+            member_id,
+            "searchlib",
+            "1.2.3",
+            "myuser",
+            "stable",
+            "rev_s",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/search?q=searchlib*", virtual_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let results = json
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        let refs: Vec<&str> = results.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            refs.iter()
+                .any(|r| r.starts_with("searchlib/1.2.3@myuser/stable")),
+            "virtual search must aggregate from hosted member, got {:?}",
+            refs
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
     }
 }

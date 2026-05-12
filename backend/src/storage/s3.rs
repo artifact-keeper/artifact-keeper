@@ -878,6 +878,28 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
+    /// Surface S3's ETag from a HEAD on `key`. For single-part PUTs the
+    /// ETag equals the MD5 of the object; for multipart uploads it is an
+    /// opaque per-upload value. Either way the value is stable per object
+    /// version and changes if the object is overwritten, which is exactly
+    /// the integrity signal #1051's fast-path revalidation needs.
+    ///
+    /// Returns `Ok(None)` when the object is missing rather than an error,
+    /// so the freshness probe can treat "ETag unavailable" as "do not
+    /// fast-path" without losing the distinction from a real I/O failure.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(meta.e_tag),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(AppError::Storage(format!(
+                "head_etag failed for '{}': {}",
+                key, e
+            ))),
+        }
+    }
+
     fn supports_redirect(&self) -> bool {
         self.redirect_downloads
     }
