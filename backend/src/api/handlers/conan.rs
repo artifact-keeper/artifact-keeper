@@ -134,6 +134,27 @@ fn normalize_channel(channel: &str) -> &str {
     }
 }
 
+/// Push items from `incoming` onto `sink`, skipping any whose key (per
+/// `key_fn`) has already been recorded in `seen`. Used by the virtual-repo
+/// fan-out paths in `search`, `recipe_revisions`, `package_revisions`,
+/// `recipe_files_list`, and `package_files_list` to dedupe metadata rows
+/// across hosted members while preserving member priority order.
+fn merge_unique_by<V, K, F>(
+    incoming: Vec<V>,
+    seen: &mut std::collections::HashSet<K>,
+    sink: &mut Vec<V>,
+    key_fn: F,
+) where
+    K: Eq + std::hash::Hash,
+    F: Fn(&V) -> K,
+{
+    for v in incoming {
+        if seen.insert(key_fn(&v)) {
+            sink.push(v);
+        }
+    }
+}
+
 /// Build a storage key for a recipe file.
 fn recipe_storage_key(
     name: &str,
@@ -422,13 +443,8 @@ async fn search(
     // Aggregate using a deduped Vec so order is preserved across members.
     let mut seen = std::collections::HashSet::<String>::new();
     let mut results: Vec<String> = Vec::new();
-
-    let mut push_unique = |refs: Vec<String>, sink: &mut Vec<String>| {
-        for r in refs {
-            if seen.insert(r.clone()) {
-                sink.push(r);
-            }
-        }
+    let push = |refs: Vec<String>, seen: &mut _, sink: &mut Vec<String>| {
+        merge_unique_by(refs, seen, sink, |r| r.clone());
     };
 
     if repo.repo_type == RepositoryType::Virtual {
@@ -441,7 +457,7 @@ async fn search(
                 let local = search_recipes_for_repo(&state.db, member.id, &like_pattern)
                     .await
                     .map_err(map_db_err)?;
-                push_unique(local, &mut results);
+                push(local, &mut seen, &mut results);
             } else if member.repo_type == RepositoryType::Remote {
                 if let (Some(upstream_url), Some(proxy)) = (
                     member.upstream_url.as_deref(),
@@ -455,7 +471,7 @@ async fn search(
                         &pattern,
                     )
                     .await;
-                    push_unique(remote, &mut results);
+                    push(remote, &mut seen, &mut results);
                 }
             }
         }
@@ -464,19 +480,19 @@ async fn search(
         let local = search_recipes_for_repo(&state.db, repo.id, &like_pattern)
             .await
             .map_err(map_db_err)?;
-        push_unique(local, &mut results);
+        push(local, &mut seen, &mut results);
         if let (Some(upstream_url), Some(proxy)) =
             (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
         {
             let remote =
                 search_recipes_from_remote(proxy, repo.id, &repo_key, upstream_url, &pattern).await;
-            push_unique(remote, &mut results);
+            push(remote, &mut seen, &mut results);
         }
     } else {
         let local = search_recipes_for_repo(&state.db, repo.id, &like_pattern)
             .await
             .map_err(map_db_err)?;
-        push_unique(local, &mut results);
+        push(local, &mut seen, &mut results);
     }
 
     let json = serde_json::json!({ "results": results });
@@ -670,11 +686,7 @@ async fn recipe_revisions(
                 recipe_revisions_for_repo(&state.db, member.id, &name, &version, &user, &channel)
                     .await
                     .map_err(map_db_err)?;
-            for row in member_rows {
-                if seen.insert(row.revision.clone()) {
-                    merged.push(row);
-                }
-            }
+            merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         merged
@@ -774,11 +786,7 @@ async fn recipe_files_list(
             )
             .await
             .map_err(map_db_err)?;
-            for f in member_files {
-                if seen.insert(f.clone()) {
-                    merged.push(f);
-                }
-            }
+            merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
         }
         merged
     } else {
@@ -1293,11 +1301,7 @@ async fn package_revisions(
             )
             .await
             .map_err(map_db_err)?;
-            for row in member_rows {
-                if seen.insert(row.revision.clone()) {
-                    merged.push(row);
-                }
-            }
+            merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         merged
@@ -1415,11 +1419,7 @@ async fn package_files_list(
             )
             .await
             .map_err(map_db_err)?;
-            for f in member_files {
-                if seen.insert(f.clone()) {
-                    merged.push(f);
-                }
-            }
+            merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
         }
         merged
     } else {
