@@ -220,13 +220,12 @@ mod tests {
         assert_copy::<BackfillStats>();
     }
 
-    #[test]
-    fn max_index_manifest_bytes_is_sane_ceiling() {
-        // The cap exists to protect startup from a corrupted/malicious
-        // body. Real OCI image-index manifests are well under 1 MiB; a
-        // 4 MiB ceiling is far above legitimate sizes but small enough
-        // that a single bad blob cannot exhaust process memory.
-        assert!(MAX_INDEX_MANIFEST_BYTES >= 64 * 1024);
-        assert!(MAX_INDEX_MANIFEST_BYTES <= 16 * 1024 * 1024);
-    }
+    // The cap exists to protect startup from a corrupted/malicious
+    // body. Real OCI image-index manifests are well under 1 MiB; a
+    // 4 MiB ceiling is far above legitimate sizes but small enough
+    // that a single bad blob cannot exhaust process memory. Asserted
+    // at compile time so a future bump out of the safe range fails the
+    // build rather than a single test invocation.
+    const _SANE_LOWER: () = assert!(MAX_INDEX_MANIFEST_BYTES >= 64 * 1024);
+    const _SANE_UPPER: () = assert!(MAX_INDEX_MANIFEST_BYTES <= 16 * 1024 * 1024);
 }
