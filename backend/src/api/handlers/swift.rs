@@ -67,9 +67,22 @@ async fn resolve_swift_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 /// `<prefix>/Package.swift` (the common GitHub-style archive layout that
 /// nests everything under `<repo>-<sha>/`). Returns `None` when neither
 /// layout matches; the caller falls back to "manifest not found".
+///
+/// The extracted manifest is hard-capped at `MAX_MANIFEST_BYTES` to bound
+/// memory consumption against zip-bomb uploads. A real Package.swift is
+/// typically a few KB; the cap is generous enough to allow even the most
+/// elaborate manifests while refusing pathological inputs.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
     let reader = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(reader).ok()?;
+    let mut archive = match zip::ZipArchive::new(reader) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(error = %e, "swift manifest extraction: invalid zip archive");
+            return None;
+        }
+    };
 
     // Pass 1: top-level Package.swift wins. This is the layout produced by
     // `swift package archive-source` and most CI helpers.
@@ -80,8 +93,12 @@ fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
     use std::io::Read;
     let mut best: Option<(usize, String)> = None;
     for i in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(i) else {
-            continue;
+        let mut entry = match archive.by_index(i) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(index = i, error = %e, "swift manifest extraction: skipped unreadable entry");
+                continue;
+            }
         };
         if !entry.is_file() {
             continue;
@@ -92,8 +109,37 @@ fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
         if !is_top_level && !is_nested {
             continue;
         }
+        // Refuse oversized entries before reading. `size()` is the
+        // uncompressed size from the local file header; treat it as a
+        // hint and re-check with `take()` below in case the header lies.
+        if entry.size() > MAX_MANIFEST_BYTES {
+            tracing::debug!(
+                entry = %name,
+                size = entry.size(),
+                cap = MAX_MANIFEST_BYTES,
+                "swift manifest extraction: skipped oversized Package.swift candidate"
+            );
+            continue;
+        }
         let mut text = String::new();
-        if entry.read_to_string(&mut text).is_err() {
+        // `take(N+1)` reads at most N+1 bytes; we then reject if the
+        // result exceeds N. This catches archives whose local file header
+        // understates the actual entry size.
+        if let Err(e) = entry
+            .by_ref()
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_string(&mut text)
+        {
+            tracing::debug!(entry = %name, error = %e, "swift manifest extraction: skipped non-UTF8 entry");
+            continue;
+        }
+        if text.len() as u64 > MAX_MANIFEST_BYTES {
+            tracing::debug!(
+                entry = %name,
+                read = text.len(),
+                cap = MAX_MANIFEST_BYTES,
+                "swift manifest extraction: skipped entry exceeding cap after read"
+            );
             continue;
         }
         if is_top_level {
@@ -1106,5 +1152,63 @@ mod tests {
         // return None (rather than panicking or returning a partial buffer).
         let zip = make_zip_with_non_utf8_manifest();
         assert!(extract_manifest_from_zip(&zip).is_none());
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_rejects_oversized_manifest() {
+        // Defense against zip bombs: an attacker-controlled Package.swift
+        // entry larger than MAX_MANIFEST_BYTES must be skipped, not read
+        // into memory. With only an oversized candidate present the function
+        // must return None.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            // Use Deflate so the compressed archive stays tiny while the
+            // uncompressed entry exceeds MAX_MANIFEST_BYTES. This mimics
+            // a zip-bomb payload.
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("Package.swift", opts).unwrap();
+            // 2 MiB of a single byte -- compresses to a few hundred bytes
+            // on disk but exceeds the 1 MiB manifest cap.
+            let payload = vec![b'a'; (MAX_MANIFEST_BYTES as usize) + 1024];
+            writer.write_all(&payload).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(
+            extract_manifest_from_zip(&buf).is_none(),
+            "oversized Package.swift must be refused to bound memory"
+        );
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_accepts_manifest_at_size_cap() {
+        // A Package.swift right at the size limit must still be accepted.
+        // Verifies the boundary check is `>` not `>=` so legitimate large
+        // manifests aren't punished.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        // Build content under the cap that still parses as text.
+        let prefix = b"// swift-tools-version:5.9\n// padding ";
+        let pad_size = (MAX_MANIFEST_BYTES as usize) - prefix.len() - 16;
+        let content: Vec<u8> = prefix
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(b'x').take(pad_size))
+            .collect();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("Package.swift", opts).unwrap();
+            writer.write_all(&content).unwrap();
+            writer.finish().unwrap();
+        }
+        let manifest = extract_manifest_from_zip(&buf).expect("manifest at cap must be accepted");
+        assert!(manifest.contains("swift-tools-version:5.9"));
+        assert!((manifest.len() as u64) <= MAX_MANIFEST_BYTES);
     }
 }
