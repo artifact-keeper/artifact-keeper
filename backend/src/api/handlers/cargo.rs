@@ -1177,7 +1177,15 @@ async fn try_virtual_index(
     let mut aggregated: Vec<String> = Vec::new();
     let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for member in &members {
+    // Visit non-Remote (Local/Staging) members before Remote members so a
+    // locally-published crate version cannot be shadowed by an upstream
+    // entry of the same `(name, vers)`. This mirrors the supply-chain
+    // protection applied to Hex package_info in this same PR (#973) and
+    // closes the gap where a Remote member configured at higher priority
+    // could pre-empt a Local member's authoritative entry.
+    let ordered_members = order_members_local_first(&members);
+
+    for member in ordered_members {
         match member.repo_type {
             RepositoryType::Remote => {
                 let (Some(proxy), Some(upstream_url)) =
@@ -1250,6 +1258,37 @@ async fn try_virtual_index(
         }
         Err(resp) => Err(resp),
     })
+}
+
+/// Order virtual repo members so non-Remote members come before Remote
+/// members, preserving the original priority ordering within each group.
+///
+/// Pure function so the supply-chain-shadowing rule can be unit-tested
+/// without standing up a real virtual-repo configuration. Non-Remote-first
+/// ordering prevents an upstream from shadowing a locally-published crate
+/// version even when the admin configures the Remote member at a higher
+/// raw priority than the Local member (#1143).
+///
+/// Matches the equivalent helper in `hex.rs` so the two formats apply the
+/// same supply-chain protection. Keeping a local copy (rather than sharing
+/// via `proxy_helpers`) avoids cross-module churn for a 6-line function;
+/// the followup to consolidate is tracked in the review notes.
+fn order_members_local_first(
+    members: &[crate::models::repository::Repository],
+) -> Vec<&crate::models::repository::Repository> {
+    let mut ordered: Vec<&crate::models::repository::Repository> =
+        Vec::with_capacity(members.len());
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote),
+    );
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote),
+    );
+    ordered
 }
 
 /// Pick the upstream base URL to use when fetching a virtual member's
@@ -1599,6 +1638,82 @@ mod tests {
         let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
         let resp = out.expect_err("empty aggregation must surface as 404");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // order_members_local_first (cargo virtual-index shadowing guard, #1143)
+    //
+    // Mirrors the equivalent hex.rs tests: Local/Staging members must
+    // precede Remote members in the iteration so a Remote-hosted crate
+    // version cannot pre-empt a locally-published `(name, vers)`.
+    // -----------------------------------------------------------------------
+
+    fn make_cargo_member(
+        repo_type: RepositoryType,
+        key: &str,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Cargo,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: String::new(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_puts_local_before_remote() {
+        // Admin configured Remote at higher raw priority. The helper must
+        // still surface Local first so an upstream `serde 1.0.0` cannot
+        // shadow a locally-published `serde 1.0.0`.
+        let m1 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m2 = make_cargo_member(RepositoryType::Local, "internal-fork");
+        let members = vec![m1, m2];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "internal-fork");
+        assert_eq!(ordered[1].key, "crates-io");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_preserves_within_group_order() {
+        // Within each group, original input order is preserved so
+        // configured priority still matters when there is no shadowing
+        // conflict to resolve.
+        let m1 = make_cargo_member(RepositoryType::Staging, "stage");
+        let m2 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m3 = make_cargo_member(RepositoryType::Local, "fork");
+        let m4 = make_cargo_member(RepositoryType::Remote, "mirror");
+        let members = vec![m1, m2, m3, m4];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "stage");
+        assert_eq!(ordered[1].key, "fork");
+        assert_eq!(ordered[2].key, "crates-io");
+        assert_eq!(ordered[3].key, "mirror");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_empty_input() {
+        let members: Vec<crate::models::repository::Repository> = Vec::new();
+        let ordered = order_members_local_first(&members);
+        assert!(ordered.is_empty());
     }
 
     // -----------------------------------------------------------------------
