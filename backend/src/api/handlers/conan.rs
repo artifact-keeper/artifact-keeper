@@ -720,7 +720,7 @@ async fn recipe_revisions(
                     .map_err(map_db_err)?;
             merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
         }
-        merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         merged
     } else {
         recipe_revisions_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
@@ -1356,7 +1356,7 @@ async fn package_revisions(
             .map_err(map_db_err)?;
             merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
         }
-        merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         merged
     } else {
         package_revisions_for_repo(&state.db, repo.id, &name, &version, &revision, &package_id)
