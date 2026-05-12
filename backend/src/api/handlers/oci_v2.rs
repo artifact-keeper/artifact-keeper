@@ -3159,6 +3159,13 @@ struct TokenQuery {
     scope: Option<String>,
     #[allow(dead_code)]
     account: Option<String>,
+    /// GET-flow equivalent of OAuth2 `access_type=offline`, per the
+    /// [Distribution token spec](https://distribution.github.io/distribution/spec/auth/token/).
+    /// `docker login` sends this on the GET path; the POST OAuth2 path uses
+    /// `access_type=offline` in the form body instead. Normalized to the
+    /// same `"offline"` string before reaching `offline_refresh_token`, so
+    /// the API-token suppression rule applies uniformly.
+    offline_token: Option<String>,
 }
 
 /// Service identifier the OCI handler advertises in `WWW-Authenticate` and
@@ -3173,8 +3180,8 @@ struct TokenResponse {
     access_token: String,
     expires_in: u64,
     /// Only emitted when the client explicitly requested `access_type=offline`
-    /// AND the credential isn't an API token (see security note on
-    /// `build_token_response`). `skip_serializing_if` keeps the response
+    /// AND the credential isn't an API token (see the security rationale on
+    /// `offline_refresh_token`). `skip_serializing_if` keeps the response
     /// byte-compatible with the pre-PR shape for every other code path.
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
@@ -3241,6 +3248,20 @@ fn offline_refresh_token(
         return None;
     }
     Some(refresh.to_string())
+}
+
+/// Normalize the GET-flow `?offline_token=true` query parameter into the same
+/// `"offline"` string that the POST OAuth2 path's `access_type=offline` form
+/// field carries. Strict `"true"` match by design: any other value
+/// (`"TRUE"`, `"1"`, `""`, `"false"`, trailing whitespace) fails closed and
+/// the response omits the refresh token. Mirrors the strict-equality check
+/// on `"offline"` in `offline_refresh_token`.
+fn offline_access_type_from_query(offline_token: Option<&str>) -> Option<String> {
+    if offline_token == Some("true") {
+        Some("offline".to_string())
+    } else {
+        None
+    }
 }
 
 /// Exchange a refresh token for a fresh access token (and optionally a new
@@ -3336,9 +3357,17 @@ async fn token(
     }
 
     // `access_type=offline` is opt-in for a refresh token in the response of
-    // the credential-auth path. Captured here so it's in scope for the
-    // success-response builder later in the function.
-    let access_type = form.as_ref().and_then(|f| f.access_type.clone());
+    // the credential-auth path. Two carriers, both normalized to the same
+    // string before reaching `offline_refresh_token`:
+    //   - POST OAuth2 form body: `access_type=offline` (Docker's OAuth2 flow).
+    //   - GET query string: `offline_token=true` (Distribution token spec, the
+    //     classic `docker login` GET path).
+    // Strict `"true"` match mirrors the strict `"offline"` match elsewhere —
+    // `"TRUE"`, `"1"`, trailing-whitespace variants all fail closed.
+    let access_type = form
+        .as_ref()
+        .and_then(|f| f.access_type.clone())
+        .or_else(|| offline_access_type_from_query(query.offline_token.as_deref()));
 
     // Credential extraction order, per the OCI Distribution Spec + OAuth2:
     //   1. HTTP Basic Auth header (the original code path; works for `docker
@@ -9467,6 +9496,77 @@ mod tests {
         // for the full rationale (industry precedent + revocation gap).
         let rt = offline_refresh_token(Some("offline"), true, "refresh-jwt");
         assert!(rt.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth2_form_empty_body_returns_none() {
+        // Empty body short-circuits before content-type lookup.
+        assert!(parse_oauth2_form(&form_headers(), &Bytes::new()).is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth2_form_missing_content_type_returns_none() {
+        let body = Bytes::from_static(b"grant_type=password&username=u&password=p");
+        assert!(parse_oauth2_form(&HeaderMap::new(), &body).is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth2_form_wrong_content_type_returns_none() {
+        // `application/json` is the most common wrong CT a client might send;
+        // the parser must reject it rather than misinterpret JSON as form-urlencoded.
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let body = Bytes::from_static(b"{}");
+        assert!(parse_oauth2_form(&h, &body).is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth2_form_valid_password_grant() {
+        let body =
+            Bytes::from_static(b"grant_type=password&username=alice&password=secret&service=reg");
+        let form = parse_oauth2_form(&form_headers(), &body).expect("parse");
+        assert_eq!(form.grant_type.as_deref(), Some("password"));
+        assert_eq!(form.username.as_deref(), Some("alice"));
+        assert_eq!(form.password.as_deref(), Some("secret"));
+        assert!(form.refresh_token.is_none());
+        assert!(form.access_type.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth2_form_refresh_grant_with_access_type() {
+        let body = Bytes::from_static(
+            b"grant_type=refresh_token&refresh_token=eyJabc.def.ghi&access_type=offline",
+        );
+        let form = parse_oauth2_form(&form_headers(), &body).expect("parse");
+        assert_eq!(form.grant_type.as_deref(), Some("refresh_token"));
+        assert_eq!(form.refresh_token.as_deref(), Some("eyJabc.def.ghi"));
+        assert_eq!(form.access_type.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn test_offline_access_type_from_query_strict_true_only() {
+        // Only the exact lowercase `"true"` activates offline mode. Every
+        // near-miss must fail closed so the response shape stays consistent
+        // with the strict `"offline"` match in `offline_refresh_token`.
+        assert_eq!(
+            offline_access_type_from_query(Some("true")),
+            Some("offline".to_string())
+        );
+        for v in [
+            None,
+            Some(""),
+            Some("false"),
+            Some("TRUE"),
+            Some("True"),
+            Some("1"),
+            Some("true "),
+        ] {
+            assert_eq!(
+                offline_access_type_from_query(v),
+                None,
+                "expected None for offline_token={v:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -19304,7 +19404,7 @@ mod cross_repo_session_regression_tests {
 mod token_refresh_grant_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use crate::services::auth_service::AuthService;
+    use crate::services::auth_service::{invalidate_user_tokens, AuthService};
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Arc;
@@ -19347,6 +19447,17 @@ mod token_refresh_grant_tests {
             .uri(uri)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn get_with_basic(uri: &str, username: &str, password: &str) -> Request<Body> {
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Basic {basic}"))
+            .body(Body::empty())
             .unwrap()
     }
 
@@ -19564,6 +19675,144 @@ mod token_refresh_grant_tests {
             );
         }
         cleanup(&pool, user_id).await;
+    }
+
+    /// GET /v2/token + Basic auth + `?offline_token=true` — the `docker login`
+    /// flow per the Distribution token spec. POST OAuth2 path uses
+    /// `access_type=offline` in the form body; the GET path is the other
+    /// half of the same feature.
+    #[tokio::test]
+    async fn get_offline_token_true_emits_refresh_for_password_auth() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(get_with_basic(
+                "/token?service=artifact-keeper&offline_token=true",
+                &username,
+                "real-test-password",
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["refresh_token"].as_str().is_some(),
+            "GET /v2/token?offline_token=true must emit refresh_token: {body}"
+        );
+    }
+
+    /// GET without `offline_token=true` — pre-PR shape preserved on the wire,
+    /// asserted on raw bytes so a regression to `Value::Null` would fail.
+    #[tokio::test]
+    async fn get_without_offline_token_omits_refresh() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(get_with_basic(
+                "/token?service=artifact-keeper",
+                &username,
+                "real-test-password",
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = read_body_bytes(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !raw.contains("refresh_token"),
+            "GET without offline_token must not emit refresh_token: {raw}"
+        );
+    }
+
+    /// GET + Basic API-token-as-password + `?offline_token=true` must NOT emit
+    /// a refresh token. Same security pivot as the POST OAuth2 version
+    /// (`api_token_offline_does_not_get_refresh_token`); this test extends
+    /// the invariant to the GET path now that `offline_token=true` is honored.
+    #[tokio::test]
+    async fn get_api_token_offline_token_true_does_not_emit_refresh() {
+        let Some((pool, user_id, username, state, auth_service)) = setup().await else {
+            return;
+        };
+        let (api_token, _) = auth_service
+            .generate_api_token(user_id, "get-offline-test", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(get_with_basic(
+                "/token?service=artifact-keeper&offline_token=true",
+                &username,
+                &api_token,
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = read_body_bytes(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = std::str::from_utf8(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_ne!(body["token"].as_str(), Some("anonymous"));
+        assert!(
+            !raw.contains("refresh_token"),
+            "API-token + GET offline_token=true must NOT emit refresh: {raw}"
+        );
+    }
+
+    /// TOTP enable/disable bumps the credential-invalidation timestamp via
+    /// `invalidate_user_tokens` (see `totp.rs::enable_totp` and
+    /// `totp.rs::disable_totp`). A refresh JWT issued *before* the toggle
+    /// must fail at the refresh-grant short-circuit, not silently get
+    /// swapped for a fresh access token bypassing the new factor.
+    ///
+    /// Sleep before invalidating so `is_token_invalidated`'s second-
+    /// granularity `issued_at < changed_at` comparison is unambiguous; this
+    /// mirrors the pattern in `totp.rs::enable_totp_invalidates_pre_change_user_tokens`.
+    #[tokio::test]
+    async fn refresh_grant_after_totp_toggle_returns_401() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let json = read_body(resp).await;
+        let refresh = json["refresh_token"]
+            .as_str()
+            .expect("issued refresh")
+            .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Simulates what `totp.rs::enable_totp` (and `disable_totp`) do
+        // after their UPDATE. The end-to-end HTTP path is covered by
+        // `enable_totp_invalidates_pre_change_user_tokens` in totp.rs; this
+        // test owns the refresh-grant half of the invariant.
+        invalidate_user_tokens(user_id);
+
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        cleanup(&pool, user_id).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "TOTP-toggle must invalidate pre-issue refresh tokens via the refresh-grant path"
+        );
     }
 
     /// Deactivated user can't refresh — `auth_service::refresh_tokens`
