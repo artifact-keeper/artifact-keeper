@@ -20,6 +20,7 @@ use std::sync::Once;
 use base64::Engine;
 use reqwest::Client;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 static INIT: Once = Once::new();
 static mut BASE_URL: String = String::new();
@@ -170,6 +171,36 @@ impl TestServer {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| "No OCI token in response".into())
+    }
+
+    /// Push an OCI/Docker manifest via the real `PUT /v2/{name}/manifests/{ref}`
+    /// endpoint, which is the only path that updates the `oci_tags` table that
+    /// `tags/list` and `_catalog` read from. The generic
+    /// `/api/v1/repositories/{key}/artifacts/{path}` upload only writes to
+    /// `artifacts`, so tests that need OCI catalog/tags visibility must use
+    /// this helper. PR #642 added catalog/tags tests against the generic
+    /// upload by mistake — they never appeared in `oci_tags` and the
+    /// assertions silently observed empty arrays (CI never ran them because
+    /// `cargo test --workspace --test '*'` is invoked without `--ignored`).
+    async fn oci_push_manifest(
+        &self,
+        repo_key: &str,
+        image: &str,
+        reference: &str,
+        manifest_body: &[u8],
+        media_type: &str,
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        let token = self.get_oci_token("admin", "admin123").await?;
+        Ok(Client::new()
+            .put(format!(
+                "{}/v2/{}/{}/manifests/{}",
+                self.base_url, repo_key, image, reference
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", media_type)
+            .body(manifest_body.to_vec())
+            .send()
+            .await?)
     }
 
     async fn upload_artifact(
@@ -637,16 +668,24 @@ mod tests {
             .create_repository(repo_key, "Docker Tags Test", "docker")
             .await;
 
-        // Push a manifest with a tag (via the generic artifact API)
-        let manifest_path = "v2/myimage/manifests/v1.0";
-        let _ = server
-            .upload_artifact(
+        // Push the manifest through the OCI endpoint so `oci_tags` is
+        // populated — `tags/list` reads from there, not `artifacts`.
+        let push = server
+            .oci_push_manifest(
                 repo_key,
-                manifest_path,
+                "myimage",
+                "v1.0",
                 samples::docker_manifest(),
                 "application/vnd.docker.distribution.manifest.v2+json",
             )
-            .await;
+            .await
+            .expect("OCI manifest push request");
+        assert!(
+            push.status().is_success(),
+            "manifest push must succeed, got {}: {}",
+            push.status(),
+            push.text().await.unwrap_or_default()
+        );
 
         // Query tags/list via OCI V2 API
         let client = Client::new();
@@ -682,17 +721,24 @@ mod tests {
             .create_repository(repo_key, "Docker Tags Page Test", "docker")
             .await;
 
-        // Push two manifests with different tags
+        // Push two manifests with different tags through the OCI endpoint so
+        // they land in `oci_tags`.
         for tag in &["alpha", "beta"] {
-            let path = format!("v2/paged/manifests/{}", tag);
-            let _ = server
-                .upload_artifact(
+            let push = server
+                .oci_push_manifest(
                     repo_key,
-                    &path,
+                    "paged",
+                    tag,
                     samples::docker_manifest(),
                     "application/vnd.docker.distribution.manifest.v2+json",
                 )
-                .await;
+                .await
+                .expect("OCI manifest push request");
+            assert!(
+                push.status().is_success(),
+                "manifest push for tag {tag} must succeed, got {}",
+                push.status()
+            );
         }
 
         let client = Client::new();
@@ -729,9 +775,10 @@ mod tests {
             .create_repository(repo_key, "Docker Tags Zero Test", "docker")
             .await;
         let _ = server
-            .upload_artifact(
+            .oci_push_manifest(
                 repo_key,
-                "v2/img/manifests/latest",
+                "img",
+                "latest",
                 samples::docker_manifest(),
                 "application/vnd.docker.distribution.manifest.v2+json",
             )
@@ -769,14 +816,21 @@ mod tests {
         let _ = server
             .create_repository(repo_key, "Docker Catalog Test", "docker")
             .await;
-        let _ = server
-            .upload_artifact(
+        let push = server
+            .oci_push_manifest(
                 repo_key,
-                "v2/catalogimg/manifests/v1",
+                "catalogimg",
+                "v1",
                 samples::docker_manifest(),
                 "application/vnd.docker.distribution.manifest.v2+json",
             )
-            .await;
+            .await
+            .expect("OCI manifest push request");
+        assert!(
+            push.status().is_success(),
+            "manifest push must succeed, got {}",
+            push.status()
+        );
 
         let client = Client::new();
         let token = server.get_oci_token("admin", "admin123").await.unwrap();
@@ -804,28 +858,45 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires running HTTP server"]
     async fn test_oci_catalog_includes_private_repos_for_authenticated_non_admin_user() {
+        // Username is suffixed per-run so a leftover row from a previous run
+        // against the same DB doesn't 409 on user creation. UUIDv4 is
+        // collision-free without depending on the wall clock.
         let server = get_server().await;
         let repo_key = "docker-private-catalog-test";
-        let username = "catalog-reader";
+        let username = format!("catalog-reader-{}", Uuid::new_v4().simple());
         let password = "CatalogPass123!";
 
         let _ = server
             .create_private_repository(repo_key, "Docker Private Catalog Test", "docker")
             .await;
-        let _ = server
-            .upload_artifact(
+        // Push via the OCI endpoint — `_catalog` reads from `oci_tags`,
+        // which only the OCI manifest handler populates.
+        let push = server
+            .oci_push_manifest(
                 repo_key,
-                "v2/privateimg/manifests/v1",
+                "privateimg",
+                "v1",
                 samples::docker_manifest(),
                 "application/vnd.docker.distribution.manifest.v2+json",
             )
-            .await;
+            .await
+            .expect("OCI manifest push request");
+        assert!(
+            push.status().is_success(),
+            "manifest push must succeed, got {}",
+            push.status()
+        );
         let _ = server
-            .create_user(username, "catalog-reader@example.test", password, false)
+            .create_user(
+                &username,
+                &format!("{username}@example.test"),
+                password,
+                false,
+            )
             .await;
 
         let token = server
-            .get_oci_token(username, password)
+            .get_oci_token(&username, password)
             .await
             .expect("Failed to issue OCI token for non-admin user");
 
@@ -1202,20 +1273,31 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires running HTTP server"]
     async fn test_search_artifacts() {
+        // The real route is `/api/v1/search/quick` — `/search/artifacts` was
+        // never registered (see `backend/src/api/handlers/search.rs::router`).
         let server = get_server().await;
         let client = Client::new();
 
-        // Search all artifacts
         let resp = client
-            .get(format!("{}/api/v1/search/artifacts", server.base_url))
+            .get(format!("{}/api/v1/search/quick?q=", server.base_url))
             .header("Authorization", server.auth_header())
             .send()
             .await
             .expect("Search request failed");
 
-        assert!(resp.status().is_success());
+        assert!(
+            resp.status().is_success(),
+            "search/quick must succeed, got {}",
+            resp.status()
+        );
         let body: Value = resp.json().await.expect("Failed to parse search response");
-        assert!(body["items"].is_array());
+        // `quick` returns `{"results": [...]}`. Assert the known shape strictly:
+        // accepting `items[]` as a fallback would silently mask a future
+        // regression if the wrapper shape ever changes back.
+        assert!(
+            body["results"].is_array(),
+            "expected results[] in search response, got: {body}"
+        );
     }
 
     // ============= Repository List Tests =============
