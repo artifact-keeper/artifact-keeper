@@ -3571,4 +3571,91 @@ mod tests {
             Some(weird)
         );
     }
+
+    // -------------------------------------------------------------------
+    // #1183: behaviour-pin tests for the streaming-migration handlers.
+    //
+    // The slow-path remote fetch in five handlers (maven catch-all,
+    // goproxy `.zip`, gitlfs blob, alpine `.apk`, debian pool) was
+    // migrated from the buffered `proxy_fetch` helper to the streaming
+    // `proxy_fetch_streaming` helper in #1181 to avoid the OOM kills
+    // tracked in #895 / #737. The migration is invisible to existing
+    // tests because both helpers return the same `Response` type and
+    // the streaming helper has its own coverage via
+    // `proxy_service::tests` — a silent rebase that swapped
+    // `proxy_fetch_streaming` back to `proxy_fetch` would compile and
+    // pass the suite while quietly re-introducing the OOM regression.
+    //
+    // These tests read each handler's source at test time (the file
+    // is part of the same crate so the path is stable) and assert
+    // that the remote-fetch arm still calls `proxy_fetch_streaming`.
+    // Failure here means a contributor must either fix the regression
+    // or, if the migration is intentionally being rolled back, delete
+    // the matching test and document the reason in the PR.
+    //
+    // The matched substring is intentionally narrow (the
+    // `proxy_helpers::proxy_fetch_streaming(` token) so a passing
+    // mention in a comment or a different helper does not satisfy it.
+    // -------------------------------------------------------------------
+
+    const STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming(";
+
+    #[test]
+    fn test_maven_remote_fetch_uses_streaming_helper_1183() {
+        let src = include_str!("maven.rs");
+        assert!(
+            src.contains(STREAMING_CALL_TOKEN),
+            "maven handler MUST call proxy_fetch_streaming for the remote \
+             catch-all download (#1183). A revert to proxy_fetch would \
+             re-introduce the OOM regression closed by #895/#1181."
+        );
+    }
+
+    #[test]
+    fn test_goproxy_remote_fetch_uses_streaming_helper_1183() {
+        let src = include_str!("goproxy.rs");
+        assert!(
+            src.contains(STREAMING_CALL_TOKEN),
+            "goproxy handler MUST call proxy_fetch_streaming for the \
+             remote `@v/<ver>.zip` download (#1183). A revert to \
+             proxy_fetch would re-introduce the OOM regression closed \
+             by #895/#1181."
+        );
+    }
+
+    #[test]
+    fn test_gitlfs_remote_fetch_uses_streaming_helper_1183() {
+        let src = include_str!("gitlfs.rs");
+        assert!(
+            src.contains(STREAMING_CALL_TOKEN),
+            "gitlfs handler MUST call proxy_fetch_streaming for the \
+             remote blob download (#1183). LFS exists for large \
+             binaries; a revert to proxy_fetch would re-introduce the \
+             OOM regression closed by #895/#1181."
+        );
+    }
+
+    #[test]
+    fn test_alpine_remote_fetch_uses_streaming_helper_1183() {
+        let src = include_str!("alpine.rs");
+        assert!(
+            src.contains(STREAMING_CALL_TOKEN),
+            "alpine handler MUST call proxy_fetch_streaming for the \
+             remote `.apk` download (#1183). A revert to proxy_fetch \
+             would re-introduce the OOM regression closed by \
+             #895/#1181."
+        );
+    }
+
+    #[test]
+    fn test_debian_remote_fetch_uses_streaming_helper_1183() {
+        let src = include_str!("debian.rs");
+        assert!(
+            src.contains(STREAMING_CALL_TOKEN),
+            "debian handler MUST call proxy_fetch_streaming for the \
+             remote pool `.deb` download (#1183). A revert to \
+             proxy_fetch would re-introduce the OOM regression closed \
+             by #895/#1181."
+        );
+    }
 }
