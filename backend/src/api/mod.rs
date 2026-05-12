@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,25 @@ pub struct AppState {
     /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
     /// SHA-256 re-verification on every warm index request.
     pub index_cache: IndexCache,
+    /// Concurrency cap for bcrypt-bound auth work (login, password verify,
+    /// API token verify). `None` when `auth_max_concurrency == 0`, in which
+    /// case auth runs without a process-wide cap (legacy behaviour).
+    ///
+    /// See `config::auth_max_concurrency` for rationale: bcrypt-cost-12 is
+    /// CPU-bound (~100-300 ms / verify), so without a fast-fail shed every
+    /// extra concurrent login starves the blocking-thread pool and the rest
+    /// of the API degrades along with it (#991, #1088).
+    pub auth_semaphore: Option<Arc<Semaphore>>,
+}
+
+/// Build an auth-concurrency semaphore from a config value, or `None` when
+/// the operator has disabled the cap by setting `auth_max_concurrency = 0`.
+fn build_auth_semaphore(max: usize) -> Option<Arc<Semaphore>> {
+    if max == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(max)))
+    }
 }
 
 impl AppState {
@@ -104,6 +124,19 @@ impl AppState {
         storage_registry: Arc<StorageRegistry>,
     ) -> Self {
         let permission_service = Arc::new(PermissionService::new(db.clone()));
+        let auth_semaphore = build_auth_semaphore(config.auth_max_concurrency);
+        // Install the process-wide cap that `AuthService::verify_password` /
+        // `hash_password` consult on every bcrypt-bound call. Idempotent —
+        // the first AppState wins, which keeps multi-AppState test setups
+        // deterministic.
+        crate::services::auth_service::install_global_auth_semaphore(auth_semaphore.clone());
+        if config.auth_max_concurrency == 0 {
+            tracing::warn!(
+                "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap. \
+                 Under sustained load this can saturate the blocking-thread pool and starve \
+                 the API (#991, #1088). Production deployments should leave this unset."
+            );
+        }
         Self {
             config,
             db,
@@ -123,6 +156,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            auth_semaphore,
         }
     }
 
@@ -136,6 +170,13 @@ impl AppState {
         wasm_plugin_service: Arc<WasmPluginService>,
     ) -> Self {
         let permission_service = Arc::new(PermissionService::new(db.clone()));
+        let auth_semaphore = build_auth_semaphore(config.auth_max_concurrency);
+        crate::services::auth_service::install_global_auth_semaphore(auth_semaphore.clone());
+        if config.auth_max_concurrency == 0 {
+            tracing::warn!(
+                "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap"
+            );
+        }
         Self {
             config,
             db,
@@ -155,6 +196,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            auth_semaphore,
         }
     }
 
@@ -238,6 +280,32 @@ impl AppState {
     /// Create a RepositoryService with the shared search service.
     pub fn create_repository_service(&self) -> RepositoryService {
         RepositoryService::new_with_search(self.db.clone(), self.search_service.clone())
+    }
+
+    /// Try to claim a slot for a bcrypt-bound auth operation.
+    ///
+    /// **Deprecated as a per-handler call site**: handlers should NOT acquire
+    /// this manually. The cap is now enforced inside
+    /// [`crate::services::auth_service::AuthService::verify_password`] and
+    /// `hash_password`, so every bcrypt entry point (login, validate_api_token,
+    /// basic-auth fallback, SSO post-auth, password change) shares the same
+    /// shed boundary. Holding a permit in the handler and another inside
+    /// `verify_password` would double-count slots and cause spurious 503s.
+    ///
+    /// Kept as a thin wrapper for diagnostics / external observers that want
+    /// to probe the same `auth_semaphore` used internally.
+    pub fn try_acquire_auth_permit(
+        &self,
+    ) -> crate::error::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        match self.auth_semaphore.as_ref() {
+            None => Ok(None),
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(permit) => Ok(Some(permit)),
+                Err(_) => Err(crate::error::AppError::ServiceUnavailable(
+                    "Authentication service is at capacity, retry shortly".to_string(),
+                )),
+            },
+        }
     }
 }
 
@@ -532,5 +600,42 @@ mod tests {
             result,
             "/endpoint?token=[REDACTED]&password=[REDACTED]&secret=[REDACTED]&key=[REDACTED]"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth-concurrency semaphore (perf bundle #991/#1088)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_auth_semaphore_zero_disables_cap() {
+        assert!(build_auth_semaphore(0).is_none());
+    }
+
+    #[test]
+    fn test_build_auth_semaphore_positive_returns_some() {
+        let sem = build_auth_semaphore(4).expect("expected a semaphore");
+        // A fresh semaphore should have all permits available.
+        assert_eq!(sem.available_permits(), 4);
+    }
+
+    #[test]
+    fn test_auth_semaphore_sheds_when_saturated() {
+        let sem = build_auth_semaphore(2).expect("expected a semaphore");
+        let _p1 = sem.clone().try_acquire_owned().expect("permit 1");
+        let _p2 = sem.clone().try_acquire_owned().expect("permit 2");
+        // Third concurrent acquire must fail fast (the saturation signal that
+        // surfaces as 503 ServiceUnavailable in `try_acquire_auth_permit`).
+        assert!(sem.clone().try_acquire_owned().is_err());
+    }
+
+    #[test]
+    fn test_auth_semaphore_releases_on_permit_drop() {
+        let sem = build_auth_semaphore(1).expect("expected a semaphore");
+        {
+            let _p = sem.clone().try_acquire_owned().expect("permit");
+            assert!(sem.clone().try_acquire_owned().is_err());
+        }
+        // Permit returned to the pool after drop, the next acquire must succeed.
+        assert!(sem.clone().try_acquire_owned().is_ok());
     }
 }
