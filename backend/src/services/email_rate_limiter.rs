@@ -786,8 +786,7 @@ mod tests {
         // First wave of stale plants, plus a triggering acquire after
         // the idle threshold so the first prune fires.
         for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
-            let _ =
-                limiter.try_acquire_at(Uuid::from_u128(i as u128), "a@x.com", t0);
+            let _ = limiter.try_acquire_at(Uuid::from_u128(i as u128), "a@x.com", t0);
         }
         let t1 = t0 + PRUNE_IDLE_THRESHOLD + Duration::from_secs(1);
         let _ = limiter.try_acquire_at(Uuid::from_u128(u128::MAX), "trigger@x.com", t1);
@@ -807,8 +806,7 @@ mod tests {
         // 1s later — well inside PRUNE_MIN_INTERVAL (10s). Even though
         // we're over cap, the interval gate must suppress the sweep.
         let t2 = t1 + Duration::from_secs(1);
-        let _ =
-            limiter.try_acquire_at(Uuid::from_u128(u128::MAX - 1), "trigger2@x.com", t2);
+        let _ = limiter.try_acquire_at(Uuid::from_u128(u128::MAX - 1), "trigger2@x.com", t2);
 
         assert!(
             limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP,

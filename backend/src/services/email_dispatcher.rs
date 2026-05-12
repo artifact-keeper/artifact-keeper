@@ -144,7 +144,15 @@ async fn dispatch_event(
     .map_err(|e| format!("Failed to query email_subscriptions: {}", e))?;
 
     for sub in &subscriptions {
-        deliver_email(smtp_service, rate_limiter, event, mapped, &sub.recipients, sub.id).await;
+        deliver_email(
+            smtp_service,
+            rate_limiter,
+            event,
+            mapped,
+            &sub.recipients,
+            sub.id,
+        )
+        .await;
     }
 
     Ok(())
@@ -638,10 +646,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_for_log_passes_normal_email_unchanged() {
-        assert_eq!(
-            sanitize_for_log("alice@example.com"),
-            "alice@example.com"
-        );
+        assert_eq!(sanitize_for_log("alice@example.com"), "alice@example.com");
     }
 
     #[test]

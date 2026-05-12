@@ -289,9 +289,15 @@ mod tests {
 
     #[test]
     fn test_bounded_email_event_type_passes_known() {
-        assert_eq!(bounded_email_event_type("artifact.uploaded"), "artifact.uploaded");
+        assert_eq!(
+            bounded_email_event_type("artifact.uploaded"),
+            "artifact.uploaded"
+        );
         assert_eq!(bounded_email_event_type("scan.completed"), "scan.completed");
-        assert_eq!(bounded_email_event_type("vulnerability.detected"), "vulnerability.detected");
+        assert_eq!(
+            bounded_email_event_type("vulnerability.detected"),
+            "vulnerability.detected"
+        );
     }
 
     #[test]
@@ -311,9 +317,6 @@ mod tests {
             bounded_email_event_type("Artifact.Uploaded"),
             "artifact.uploaded"
         );
-        assert_eq!(
-            bounded_email_event_type("SCAN.COMPLETED"),
-            "scan.completed"
-        );
+        assert_eq!(bounded_email_event_type("SCAN.COMPLETED"), "scan.completed");
     }
 }

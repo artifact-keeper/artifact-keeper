@@ -242,9 +242,8 @@ pub(crate) fn validate_recipients(recipients: &[String]) -> Result<()> {
         // (U+2028, U+2029) and U+0085 NEL. The latter are general-category
         // Zl/Zp/Cc-but-not-C0 and `char::is_control()` does NOT cover the
         // separators, yet many log viewers render them as newlines.
-        let forbidden = |c: char| {
-            c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}')
-        };
+        let forbidden =
+            |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}');
         if addr.chars().any(forbidden) {
             return Err(AppError::Validation(
                 "recipient contains control or line-separator characters".to_string(),
@@ -798,8 +797,7 @@ mod tests {
         // Log-forgery prevention: a stored recipient that survives into
         // the dispatcher's tracing logs could otherwise inject fake log
         // lines. Reject at write time.
-        let err =
-            validate_recipients(&["victim@x.com\n[ERROR] fake".to_string()]).unwrap_err();
+        let err = validate_recipients(&["victim@x.com\n[ERROR] fake".to_string()]).unwrap_err();
         match err {
             AppError::Validation(msg) => assert!(msg.contains("control")),
             other => panic!("expected Validation, got {:?}", other),
