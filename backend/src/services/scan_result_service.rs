@@ -2559,6 +2559,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete legacy");
@@ -2591,6 +2592,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete modern");
@@ -2655,6 +2657,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now() - chrono::Duration::days(30),
+                "complete",
             )
             .await
             .expect("complete old scan");
@@ -2676,6 +2679,7 @@ mod tests {
                 0,
                 Some("v1"),
                 chrono::Utc::now(),
+                "complete",
             )
             .await
             .expect("complete new scan");
