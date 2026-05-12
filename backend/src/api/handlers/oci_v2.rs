@@ -351,6 +351,97 @@ fn compute_sha256(data: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// Whether a content-type string identifies an OCI / Docker image index
+/// (a "manifest list"). These manifests carry no layers of their own;
+/// they reference per-architecture child manifests by digest, which is
+/// what the storage GC's `oci_manifest_refs` table tracks for #1179.
+///
+/// The match is on the bare media type, ignoring `;` parameters and
+/// surrounding whitespace, so clients that include charset hints still
+/// trip the right branch.
+pub(crate) fn is_index_content_type(content_type: &str) -> bool {
+    let bare = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        bare.as_str(),
+        "application/vnd.oci.image.index.v1+json"
+            | "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
+}
+
+/// Parse an OCI image index manifest body and return the list of child
+/// manifest digests. Used by both the push handler (to populate
+/// `oci_manifest_refs` synchronously) and the startup backfill (to fill
+/// in any rows that pre-date this code).
+///
+/// Returns an empty vec when the body is not parseable as JSON or has no
+/// `manifests` array. Callers should treat that as a no-op rather than
+/// an error, since a stray non-conformant manifest should not block the
+/// rest of GC protection.
+pub(crate) fn extract_child_digests(body: &[u8]) -> Vec<String> {
+    let json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    json.get("manifests")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("digest").and_then(|d| d.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Insert (parent_digest, child_digest, repository_id) rows into
+/// `oci_manifest_refs` for every child of an image index. Idempotent: on
+/// conflict the existing row is kept.
+///
+/// Called inline from `handle_put_manifest` and from the startup
+/// backfill. The caller is responsible for verifying that `parent_body`
+/// really is an image-index manifest (use [`is_index_content_type`]);
+/// passing a regular image manifest just inserts zero rows.
+///
+/// Performance: the inserts run as a single round-trip via `UNNEST` so a
+/// multi-arch push of N platforms costs one DB call, not N. This matters
+/// because `handle_put_manifest` calls this synchronously on the request
+/// hot path.
+pub(crate) async fn record_oci_manifest_refs(
+    db: &PgPool,
+    repo_id: Uuid,
+    parent_digest: &str,
+    parent_body: &[u8],
+) -> Result<usize, sqlx::Error> {
+    let children = extract_child_digests(parent_body);
+    if children.is_empty() {
+        return Ok(0);
+    }
+    // Batched insert: expand the child digest array via UNNEST and
+    // pair every row with the constant parent_digest / repo_id. One
+    // round-trip total. `query_as` over `query!` because sqlx's macro
+    // form does not currently type-check `UNNEST` array bindings
+    // against the offline metadata cache without explicit casts.
+    let res = sqlx::query(
+        r#"
+        INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
+        SELECT $1, child, $3
+        FROM UNNEST($2::text[]) AS t(child)
+        ON CONFLICT (parent_digest, child_digest, repository_id) DO NOTHING
+        "#,
+    )
+    .bind(parent_digest)
+    .bind(&children)
+    .bind(repo_id)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Tags/list and catalog response types
 // ---------------------------------------------------------------------------
@@ -1811,6 +1902,29 @@ async fn handle_put_manifest(
             "INTERNAL_ERROR",
             &e.to_string(),
         );
+    }
+
+    // For multi-arch image indexes, record the (parent_digest -> child_digest)
+    // edges so the storage GC can protect per-architecture children for as
+    // long as the index is still tagged (#1179). The storage GC's NOT EXISTS
+    // guards in `storage_gc_service.rs` only protect digests that appear in
+    // `oci_tags` directly; children of an index never appear there.
+    //
+    // Best-effort: a failure to write the refs is logged but does not fail
+    // the push, since the manifest itself has been persisted and the tag
+    // upsert succeeded. The startup backfill in main.rs will fill in any
+    // gaps on the next restart.
+    if is_index_content_type(&content_type) {
+        if let Err(e) = record_oci_manifest_refs(&state.db, repo_id, &digest, &body).await {
+            warn!(
+                image = image_name,
+                reference = reference,
+                parent_digest = digest.as_str(),
+                error = %e,
+                "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
+                 child manifests as orphaned until the next backfill pass runs"
+            );
+        }
     }
 
     // Calculate total image size from manifest (config + layers)
@@ -5284,5 +5398,108 @@ mod token_lockout_regression_tests {
             "authenticate_oci with Basic <user>:<api_token> must not bump \
              failed_login_attempts (got {counter} after 5 requests)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the #1179 multi-arch index-manifest reference helpers.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod oci_manifest_refs_tests {
+    use super::*;
+
+    #[test]
+    fn is_index_content_type_matches_oci_and_docker_index() {
+        assert!(is_index_content_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+        assert!(is_index_content_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+    }
+
+    #[test]
+    fn is_index_content_type_rejects_regular_image_manifests() {
+        assert!(!is_index_content_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(!is_index_content_type(
+            "application/vnd.docker.distribution.manifest.v2+json"
+        ));
+        assert!(!is_index_content_type("application/json"));
+        assert!(!is_index_content_type(""));
+    }
+
+    #[test]
+    fn is_index_content_type_ignores_params_and_case() {
+        // RFC 7231 lets media-type tokens carry parameters; clients in
+        // the wild do attach `charset=utf-8` and similar. The check
+        // should look at the bare type only.
+        assert!(is_index_content_type(
+            "application/vnd.oci.image.index.v1+json; charset=utf-8"
+        ));
+        assert!(is_index_content_type(
+            "  Application/vnd.oci.image.index.v1+JSON  "
+        ));
+    }
+
+    #[test]
+    fn extract_child_digests_parses_oci_index() {
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:aaaa",
+                    "size": 100,
+                    "platform": {"architecture": "amd64", "os": "linux"}
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:bbbb",
+                    "size": 100,
+                    "platform": {"architecture": "arm64", "os": "linux"}
+                }
+            ]
+        }"#;
+        let children = extract_child_digests(body);
+        assert_eq!(children, vec!["sha256:aaaa", "sha256:bbbb"]);
+    }
+
+    #[test]
+    fn extract_child_digests_empty_for_regular_image_manifest() {
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"size": 7023, "digest": "sha256:cccc"},
+            "layers": [{"size": 32654, "digest": "sha256:dddd"}]
+        }"#;
+        let children = extract_child_digests(body);
+        assert!(
+            children.is_empty(),
+            "regular image manifest has no `manifests` array"
+        );
+    }
+
+    #[test]
+    fn extract_child_digests_empty_for_malformed_json() {
+        assert!(extract_child_digests(b"not json").is_empty());
+        assert!(extract_child_digests(b"").is_empty());
+        assert!(extract_child_digests(b"{").is_empty());
+    }
+
+    #[test]
+    fn extract_child_digests_skips_entries_missing_digest() {
+        let body = br#"{
+            "manifests": [
+                {"digest": "sha256:aaaa"},
+                {"platform": {"architecture": "arm64"}},
+                {"digest": null},
+                {"digest": "sha256:bbbb"}
+            ]
+        }"#;
+        let children = extract_child_digests(body);
+        assert_eq!(children, vec!["sha256:aaaa", "sha256:bbbb"]);
     }
 }

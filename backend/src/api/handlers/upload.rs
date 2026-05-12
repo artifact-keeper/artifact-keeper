@@ -127,20 +127,21 @@ async fn create_session(
     // Validate artifact path before doing anything else
     upload_service::validate_artifact_path(&req.artifact_path).map_err(map_upload_err)?;
 
-    // Resolve repository
-    let repo = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM repositories WHERE key = $1 AND is_deleted = false",
-    )
-    .bind(&req.repository_key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .ok_or_else(|| {
-        map_err(
-            StatusCode::NOT_FOUND,
-            format!("Repository '{}' not found", req.repository_key),
-        )
-    })?;
+    // Resolve repository. The `repositories` table has no `is_deleted` column
+    // (the soft-delete pattern lives on `artifacts`); the previous
+    // `AND is_deleted = false` predicate was a copy-paste from artifact
+    // queries that crashed every session create (issue #1168).
+    let repo = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM repositories WHERE key = $1")
+        .bind(&req.repository_key)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            map_err(
+                StatusCode::NOT_FOUND,
+                format!("Repository '{}' not found", req.repository_key),
+            )
+        })?;
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
@@ -349,18 +350,35 @@ async fn complete(
         .await
         .map_err(map_upload_err)?;
 
-    // Move temp file to final storage location and create artifact record
-    let temp_path = std::path::PathBuf::from(&session.temp_file_path);
-    let storage_key = format!(
-        "uploads/{}/{}",
-        session.repository_id, session.artifact_path
+    // Resolve the *repo-scoped* storage backend and use a content-addressable
+    // key, matching how non-chunked uploads work (issue #1168 part 3).
+    //
+    // Before this fix, the handler wrote via `state.storage` (the global
+    // default backend, no repo path prefix) to `uploads/<repo_id>/<path>`,
+    // while download_artifact resolves via `state.storage_for_repo(...)`
+    // which prepends `<repo.storage_path>/`. The two paths never lined up,
+    // so a 200 OK chunked upload produced a 404 on first download. Using
+    // the content-addressable scheme (`<hash[:2]>/<hash[2:4]>/<full-hash>`)
+    // also matches `ArtifactService::storage_key_from_checksum` so future
+    // dedup, GC, and replication paths see the upload like any other write.
+    let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+        &session.checksum_sha256,
     );
+
+    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+        .get_by_id(session.repository_id)
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
-    state
-        .storage
+    storage
         .put_file(&storage_key, &temp_path)
         .await
         .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1337,5 +1355,257 @@ mod tests {
         assert!(err.is_err());
         let resp = map_upload_err(err.unwrap_err());
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1168 -- chunked upload uses content-addressable
+    // storage key matching non-chunked uploads, so download can find it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn complete_uses_content_addressable_storage_key() {
+        // The chunked-upload finalize path must derive the same storage key
+        // as ArtifactService::storage_key_from_checksum so the repo-scoped
+        // download handler finds the bytes. Before #1168, finalize used
+        // "uploads/<repo_id>/<path>" which broke downloads.
+        let checksum = "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+        let expected =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(checksum);
+        assert_eq!(
+            expected,
+            "de/ad/deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+        );
+        // The leading two-char shards are what the download path expects.
+        assert!(expected.starts_with("de/ad/"));
+        assert!(!expected.starts_with("uploads/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1168 part 1 -- create_session must accept a valid
+    // repository key. The pre-fix predicate `AND is_deleted = false` referred
+    // to a column that does not exist on `repositories`, so every call to the
+    // handler crashed with a database error. These DB-backed tests exercise
+    // the rewritten repository lookup end-to-end through the axum router.
+    //
+    // No-ops without `DATABASE_URL` (matches the project-wide handler test
+    // pattern); CI runs `cargo llvm-cov --workspace --lib` with Postgres up
+    // and applied migrations so the coverage gate sees these instrumented.
+    // -----------------------------------------------------------------------
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Build a JSON POST request for the create_session route.
+    fn create_session_req(body: &serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        let payload = bytes::Bytes::from(serde_json::to_vec(body).unwrap());
+        tdh::post("/".to_string(), "application/json", payload)
+    }
+
+    /// Wrap the upload router with a bare `Extension(AuthExtension)` layer.
+    ///
+    /// `tdh::router_with_auth` inserts `Extension::<Option<AuthExtension>>`,
+    /// but the upload handlers use the non-optional `Extension<AuthExtension>`
+    /// extractor (the real middleware chain populates the bare type). The
+    /// handlers expect the bare value so we mimic that here.
+    fn upload_router_with_auth(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+        super::router()
+            .with_state(state)
+            .layer(Extension::<AuthExtension>(auth))
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_201_for_existing_repo() {
+        // Verify the repo lookup at line 134 returns the row (previously
+        // crashed with `column "is_deleted" does not exist`).
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "images/test.bin",
+            "total_size": 1024_i64,
+            "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create_session must succeed for an existing repo (issue #1168); body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("session_id").is_some());
+        assert!(json.get("chunk_count").is_some());
+        assert!(json.get("chunk_size").is_some());
+        assert!(json.get("expires_at").is_some());
+
+        // Clean up any upload_sessions / upload_chunks rows seeded by the
+        // handler before fixture teardown drops the repo. Fail-soft because
+        // tables may use ON DELETE CASCADE in some environments.
+        let session_id: Uuid =
+            serde_json::from_value(json["session_id"].clone()).expect("session_id is a UUID");
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_404_for_unknown_repo() {
+        // Drives the `ok_or_else(|| map_err(NOT_FOUND, ...))` branch at
+        // lines 139-144. Before #1168 this branch was never reached because
+        // the SQL itself errored on the phantom column.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": "this-repo-does-not-exist-1168",
+            "artifact_path": "x.bin",
+            "total_size": 16_i64,
+            "checksum_sha256": "abc",
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap_or_default();
+        assert!(
+            err_msg.contains("this-repo-does-not-exist-1168"),
+            "error must echo the missing key, got: {}",
+            err_msg
+        );
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_uses_repo_scoped_storage_and_writes_to_content_addressed_key() {
+        // End-to-end: create session, upload one chunk equal to the full
+        // file, complete. Drives `complete()` past `complete_session` and
+        // through the new `storage_for_repo` + `storage_key_from_checksum`
+        // path (lines 364-385). Asserts the bytes land at the hashed key
+        // under the repo storage dir and that a subsequent download finds
+        // them via the same backend.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        // Compute checksum of test payload up front -- complete_session
+        // verifies the temp-file SHA256 matches.
+        let payload: &[u8] = b"chunked-upload-test-bytes-for-1168";
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        // 1) Create session via the handler.
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let create_req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "bundles/test.bin",
+            "total_size": payload.len() as i64,
+            "checksum_sha256": checksum,
+            "chunk_size": 1024 * 1024_i64, // 1 MB, so total fits in one chunk
+        }));
+        let (status, body) = tdh::send(app, create_req).await;
+        assert_eq!(status, StatusCode::CREATED, "create_session must succeed");
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id: Uuid =
+            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
+
+        // 2) PATCH chunk index 0 with the full payload.
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", session_id))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunk PATCH must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // 3) PUT /:session_id/complete -- runs the new code path.
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "complete must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // 4) The new path uses content-addressable storage under the
+        //    repo-scoped backend. Verify the bytes are there at the expected
+        //    key (proves we no longer use the broken "uploads/<repo_id>/..."
+        //    layout, regression for #1168 part 3).
+        //
+        // FilesystemStorage::key_to_path prepends the first 2 chars of the
+        // sanitized key as a sharding prefix on top of the base path, so the
+        // on-disk layout becomes `<base>/<shard>/<key>` where `<shard>` is
+        // the first 2 chars of `<hash[:2]>/<hash[2:4]>/<full-hash>` -- i.e.
+        // `hash[:2]` again. We assert the bytes land there with the right
+        // content, and as a safety net, also verify the legacy "uploads/..."
+        // path from before #1168 does NOT exist.
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &checksum,
+            );
+        let shard = &expected_key[..2];
+        let on_disk_path = f.storage_dir.join(shard).join(&expected_key);
+        assert!(
+            on_disk_path.exists(),
+            "expected hashed bytes at {} (issue #1168 part 3)",
+            on_disk_path.display()
+        );
+        let read_back = std::fs::read(&on_disk_path).expect("read back");
+        assert_eq!(
+            read_back, payload,
+            "bytes round-trip through content-addressable storage"
+        );
+        // Regression guard: the old (broken) path scheme must NOT be in use.
+        let legacy_path = f
+            .storage_dir
+            .join("uploads")
+            .join(f.repo_id.to_string())
+            .join("bundles/test.bin");
+        assert!(
+            !legacy_path.exists(),
+            "legacy uploads/<repo_id>/<path> layout must not be used after #1168"
+        );
+
+        // Clean up everything we wrote.
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
     }
 }

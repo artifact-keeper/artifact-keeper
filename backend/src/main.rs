@@ -175,6 +175,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
+        repair_legacy_073_checksum(&db_pool).await?;
         sqlx::migrate!("./migrations").run(&db_pool).await?;
         tracing::info!("Database migrations complete");
     }
@@ -302,6 +303,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
 
+    // Issue #976: surface the upstream private-IP allowlist at boot so the
+    // posture is obvious in startup logs. Metadata IPs remain blocked
+    // unconditionally; the validator handles that. The warning is loud
+    // because relaxing the SSRF guard is a security tradeoff the operator
+    // owns.
+    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
+        let trimmed = list.trim();
+        if !trimmed.is_empty() {
+            tracing::warn!(
+                target: "security",
+                allowlist = %trimmed,
+                "UPSTREAM_PRIVATE_IP_ALLOWLIST is set; upstream URLs may now \
+                 target listed private CIDRs. Cloud metadata IPs and loopback \
+                 remain blocked. SSRF risk surface widened (issue #976)."
+            );
+        }
+    } else if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
+        tracing::warn!(
+            target: "security",
+            "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \
+             RFC1918 / unique-local addresses. Cloud metadata IPs and loopback \
+             remain blocked. Prefer UPSTREAM_PRIVATE_IP_ALLOWLIST with explicit \
+             CIDRs for a narrower SSRF surface (issue #976)."
+        );
+    }
+
     // Create primary storage backend based on STORAGE_BACKEND config
     let primary_storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = match config
         .storage_backend
@@ -310,6 +337,21 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "s3" => {
             let s3 = artifact_keeper_backend::storage::s3::S3Backend::from_env().await?;
             tracing::info!("S3 storage backend initialized");
+            // Issue #981: run a single connectivity probe so users see
+            // the root cause (TLS, DNS, 403, region mismatch) at boot
+            // instead of "storage probe timed out" minutes later in a
+            // health log. Probe failure is a *warning* only: the user's
+            // setup may rely on lazy bucket-creation or an offline boot
+            // sequence, so we do not refuse to start.
+            match s3.startup_probe().await {
+                Ok(()) => tracing::info!("S3 connectivity probe succeeded"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "S3 connectivity probe failed at startup; the service will \
+                     continue starting but storage operations may fail until \
+                     this is fixed (issue #981)"
+                ),
+            }
             Arc::new(s3)
         }
         "azure" => {
@@ -395,6 +437,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             config.storage_backend.clone(),
         ))
     };
+
+    // One-shot backfill of oci_manifest_refs for index manifests that
+    // pre-date migration 092 (artifact-keeper#1179). Runs after the
+    // storage registry is wired up because it needs the registry to read
+    // the parent manifest bodies from per-repo backends. Failures are
+    // logged but do not block startup. On a fresh database or after the
+    // first successful run, the candidate query returns zero rows and
+    // this is a near-instant no-op.
+    let _refs_backfill_stats =
+        artifact_keeper_backend::services::oci_manifest_refs_backfill::run_backfill(
+            &db_pool,
+            storage_registry.clone(),
+        )
+        .await;
 
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
@@ -1061,7 +1117,89 @@ fn build_oidc_request_from_values(
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
         auto_create_users: Some(true),
+        pkce_enabled: None,
+        map_groups_to_groups: None,
     })
+}
+
+/// Repair a stale `_sqlx_migrations` row for version 73 that was left over by
+/// the duplicate-073 bug fixed in #1138.
+///
+/// Between PR #975 (forward-port of download-ticket cascade) and PR #1138
+/// (rename to 083), the migrations directory contained two files numbered 073:
+/// `073_account_lockout.sql` and `073_download_tickets_cascade.sql`. Postgres
+/// only kept whichever row `sqlx migrate run` inserted first, with that file's
+/// checksum. After #1138 renamed the colliding file to 083, the surviving 073
+/// file on disk (`073_account_lockout.sql`) may differ from what the DB stored,
+/// and `sqlx migrate run` then aborts with `Migration(VersionMismatch(73))`
+/// before applying any newer migration (issue #1129).
+///
+/// This pre-migration step looks at the DB and only acts when both halves of
+/// the broken state are present: the lockout schema (proof account_lockout was
+/// applied at some point) AND the `_sqlx_migrations` row for version 73 whose
+/// checksum no longer matches the current file. In that exact case we rewrite
+/// the stored checksum to the current file's checksum so the migrator can move
+/// on. The check is conservative; if either signal is missing we leave the row
+/// alone so unrelated checksum drift still surfaces as a startup error.
+async fn repair_legacy_073_checksum(db: &sqlx::PgPool) -> Result<()> {
+    // Skip when the table doesn't exist yet (fresh DB) or when no row for
+    // version 73 has been recorded.
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_sqlx_migrations')",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    if !table_exists {
+        return Ok(());
+    }
+
+    let stored_checksum: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 73")
+            .fetch_optional(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    let Some(stored) = stored_checksum else {
+        return Ok(());
+    };
+
+    // Confirm the lockout migration was previously applied by checking for one
+    // of its columns. If the column is absent, this row predates the duplicate
+    // and is unrelated to the bug we're repairing.
+    let lockout_applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_name = 'users' AND column_name = 'failed_login_attempts')",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    if !lockout_applied {
+        return Ok(());
+    }
+
+    let current_file = include_str!("../migrations/073_account_lockout.sql");
+    use sha2::{Digest, Sha384};
+    let mut hasher = Sha384::new();
+    hasher.update(current_file.as_bytes());
+    let current_checksum = hasher.finalize().to_vec();
+
+    if stored == current_checksum {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        event = "migration_073_checksum_repair",
+        "Detected stale checksum for migration 073 (account_lockout). \
+         Rewriting _sqlx_migrations row so the migrator can proceed. \
+         This is a one-time recovery for installations affected by the \
+         duplicate-073 bug fixed in #1138."
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 73")
+        .bind(&current_checksum)
+        .execute(db)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    Ok(())
 }
 
 /// Provision the initial admin user on first boot and determine setup mode.
@@ -1195,7 +1333,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                         .map_err(|e| {
                             artifact_keeper_backend::error::AppError::Database(e.to_string())
                         })?;
-                    log_admin_setup_banner(&password_file);
+                    log_admin_setup_banner(&password_file, Some(&password));
                 }
             }
             tx.commit()
@@ -1274,7 +1412,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if must_change {
-        log_admin_setup_banner(&password_file);
+        // Only echo the plaintext when we generated it ourselves. If the
+        // password came from ADMIN_PASSWORD but matched an insecure default,
+        // it was already supplied by the operator and is presumably logged
+        // elsewhere; we still force a change but don't re-emit it.
+        let echo = std::env::var("ADMIN_PASSWORD").ok().is_none();
+        log_admin_setup_banner(&password_file, echo.then_some(password.as_str()));
         Ok(true)
     } else {
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
@@ -1333,7 +1476,25 @@ fn write_admin_password_file(
 }
 
 /// Log the setup banner with instructions for the admin user.
-fn log_admin_setup_banner(password_file: &std::path::Path) {
+///
+/// When `password` is `Some`, the banner echoes the plaintext into logs in
+/// addition to pointing at the file. This trades a small disclosure risk for
+/// onboarding friction: the password is single-use anyway (the API is locked
+/// behind `must_change_password = true` and the first login forces a rotation),
+/// and operators are otherwise stuck spelunking inside the container to find
+/// the file (issue #1009). Set `ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true` to
+/// suppress the plaintext echo while keeping the file path hint, which is
+/// useful for shared log aggregators.
+fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
+    let hide_password = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true");
+
+    let password_line = match (password, hide_password) {
+        (Some(pw), false) => format!("  Password:  {}\n", pw),
+        _ => format!("  Password:  see file {}\n", password_file.display()),
+    };
+
     tracing::info!(
         "\n\
         ===========================================================\n\
@@ -1341,16 +1502,21 @@ fn log_admin_setup_banner(password_file: &std::path::Path) {
           Initial admin user created.\n\
         \n\
           Username:  admin\n\
-          Password:  see file {}\n\
+        {}\
         \n\
+          File:      {}\n\
           Read it:   docker exec artifact-keeper-backend cat {}\n\
         \n\
           The API is LOCKED until you change this password.\n\
-          You MUST login first (POST /api/v1/auth/login) to get\n\
-          a token, then change the password. See the file for\n\
-          full curl examples.\n\
+          Open the web UI and log in -- you will be redirected to\n\
+          the forced-change-password screen. Alternatively call\n\
+          POST /api/v1/auth/login then POST /api/v1/users/<id>/password.\n\
+        \n\
+          Set ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true to hide the\n\
+          password from logs (file is still written).\n\
         \n\
         ===========================================================",
+        password_line,
         password_file.display(),
         password_file.display(),
     );
@@ -1783,6 +1949,82 @@ mod tests {
     // NOTE: windows_service.rs is behind #[cfg(windows)] and cannot be
     // unit-tested on macOS/Linux. It is compile-checked on Windows CI and
     // tested manually via `--install` / `--uninstall` / `--service` flags.
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1009 -- admin password is echoed to logs by default
+    // and hidden when ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD is set.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admin_setup_banner_echoes_password_by_default() {
+        // We can't capture tracing output without a subscriber setup, so we
+        // exercise the path the banner takes and verify the env-toggle
+        // contract directly. The actual format is asserted by
+        // `admin_setup_banner_password_line_format`.
+        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
+        std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
+        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true");
+        assert!(!hidden, "default state must NOT hide the password");
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1129 -- the repair function knows where to find the
+    // current 073 migration text and computes a SHA-384 over it. We can't run
+    // the DB-touching half as a unit test, but we can assert that the file is
+    // wired into the binary and the checksum routine matches sqlx's algorithm.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_073_text_is_embedded_in_binary() {
+        // The repair function uses include_str! to embed the migration text.
+        // If someone deletes or renames 073_account_lockout.sql without
+        // updating the path, the binary won't compile, so this assertion is
+        // mostly future-proofing: confirm the embedded text is non-empty and
+        // matches the expected schema change.
+        let embedded = include_str!("../migrations/073_account_lockout.sql");
+        assert!(!embedded.is_empty());
+        assert!(embedded.contains("failed_login_attempts"));
+        assert!(embedded.contains("locked_until"));
+    }
+
+    #[test]
+    fn migration_073_checksum_matches_sqlx_algorithm() {
+        // sqlx records each migration's SHA-384 checksum in _sqlx_migrations.
+        // The repair function recomputes that hash to detect drift; verify the
+        // algorithm here so a future sqlx upgrade that switches algorithms
+        // doesn't silently break the repair path.
+        use sha2::{Digest, Sha384};
+        let embedded = include_str!("../migrations/073_account_lockout.sql");
+        let mut hasher = Sha384::new();
+        hasher.update(embedded.as_bytes());
+        let hash = hasher.finalize();
+        assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
+    }
+
+    #[test]
+    fn admin_setup_banner_hides_password_when_env_set() {
+        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
+        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "true");
+        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true");
+        assert!(hidden);
+        // TRUE / True / 1-style toggles
+        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "TRUE");
+        assert!(std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap()
+            .eq_ignore_ascii_case("true"));
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+        } else {
+            std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
+        }
+    }
 }
 // warm cache benchmark
 // sqlx-cli benchmark

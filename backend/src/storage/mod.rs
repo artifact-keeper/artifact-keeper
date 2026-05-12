@@ -62,6 +62,25 @@ pub trait StorageBackend: Send + Sync {
     /// Check if key exists
     async fn exists(&self, key: &str) -> Result<bool>;
 
+    /// Return the storage backend's opaque ETag for `key` if the backend
+    /// supports per-object ETags (S3, GCS, Azure). Returns `Ok(None)` when
+    /// the backend has no concept of an ETag (filesystem) or when the
+    /// object exists but the backend did not surface an ETag header.
+    /// Returns an error only on transport/auth failures; a missing object
+    /// is reported as `Ok(None)` so callers can distinguish "no ETag to
+    /// revalidate against" from "backend is broken".
+    ///
+    /// Used by the proxy cache fast path (#1051) to detect cache-entry
+    /// tampering or backend-side replacement before signing a presigned
+    /// URL: we pin the storage ETag at cache-write time into the metadata
+    /// sidecar, then re-HEAD on each fast-path hit and compare. A mismatch
+    /// forces a fall-through to the slow path which recomputes the SHA-256
+    /// and self-heals the cache.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let _ = key; // Suppress unused warning for default impl
+        Ok(None)
+    }
+
     /// Delete content by key
     async fn delete(&self, key: &str) -> Result<()>;
 
