@@ -1042,4 +1042,69 @@ mod tests {
         let not_a_zip = b"this is not a zip file at all";
         assert!(extract_manifest_from_zip(not_a_zip).is_none());
     }
+
+    /// Builds a zip that includes an explicit directory entry alongside files.
+    /// Exercises the `!entry.is_file()` skip path inside the loop so the
+    /// directory entry does not get picked up as a Package.swift candidate.
+    fn make_zip_with_directory() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // Explicit directory entry. `add_directory` is the canonical
+            // way to emit a directory record in a zip archive; the resulting
+            // entry has `is_file() == false`.
+            writer.add_directory("dir/", opts).unwrap();
+            writer.start_file("dir/Package.swift", opts).unwrap();
+            writer.write_all(b"// nested manifest").unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_skips_directory_entries() {
+        // A real zip can include directory records (e.g. produced by
+        // `zip -r` or `add_directory`). The loop must skip them via the
+        // `!entry.is_file()` guard rather than treating "dir/" as a file
+        // path; the nested Package.swift inside should still be returned.
+        let zip = make_zip_with_directory();
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("nested manifest"));
+    }
+
+    /// Build a zip whose Package.swift body is non-UTF-8 bytes (raw 0xFF / 0xFE
+    /// noise). `read_to_string` returns an error in that case, exercising the
+    /// `continue` branch on the read error path so the file is skipped rather
+    /// than treated as a manifest.
+    fn make_zip_with_non_utf8_manifest() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // Invalid UTF-8: a lone continuation byte after a start-of-sequence
+            // byte without the required follow-up.
+            writer.start_file("Package.swift", opts).unwrap();
+            writer
+                .write_all(&[0xC3, 0x28, 0xA0, 0xA1, 0xFF, 0xFE, 0xFD])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_skips_non_utf8_manifest() {
+        // A Package.swift that doesn't decode as UTF-8 hits the read_to_string
+        // error path. Because it's also the only candidate, the function must
+        // return None (rather than panicking or returning a partial buffer).
+        let zip = make_zip_with_non_utf8_manifest();
+        assert!(extract_manifest_from_zip(&zip).is_none());
+    }
 }
