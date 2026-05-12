@@ -1346,21 +1346,35 @@ pub async fn list_artifacts(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
+    // For Maven/Gradle, also load the metadata.files arrays so we can
+    // surface POM, sources, javadoc, and other secondary files that the
+    // upload handler groups under one artifact row (#1092). Without this
+    // expansion the listing only sees the primary JAR/WAR and any
+    // secondary files appear "hidden" until a downstream remote proxy
+    // pulls them, at which point the proxy records them as their own
+    // artifact rows.
+    //
+    // Note: `pagination.total` is the number of primary artifact rows,
+    // not the post-expansion item count. The items array therefore
+    // exceeds `per_page` for any page that contains a GAV with grouped
+    // secondary files. Clients that need exact page sizes should call
+    // the grouped-by-component endpoint instead (`group_by=maven_component`).
+    let maven_files_by_artifact: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
+        if is_maven_format {
+            load_maven_secondary_files(&state.db, &artifact_ids).await
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let mut items = Vec::new();
     for artifact in artifacts {
-        items.push(ArtifactResponse {
-            id: artifact.id,
-            repository_key: key.clone(),
-            path: artifact.path,
-            name: artifact.name,
-            version: artifact.version,
-            size_bytes: artifact.size_bytes,
-            checksum_sha256: artifact.checksum_sha256,
-            content_type: artifact.content_type,
-            download_count: *download_counts.get(&artifact.id).unwrap_or(&0),
-            created_at: artifact.created_at,
-            metadata: None,
-        });
+        let artifact_id = artifact.id;
+        let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
+        items.push(build_artifact_response(&artifact, &key, download_count));
+
+        if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
+            items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
+        }
     }
 
     Ok(Json(ArtifactListResponse {
@@ -1373,6 +1387,155 @@ pub async fn list_artifacts(
         },
         components: None,
     }))
+}
+
+/// Build the `ArtifactResponse` representing a single primary artifact row.
+///
+/// Extracted from the inline listing loop so it can be unit-tested
+/// without a database. Pure transformation of `Artifact` fields plus
+/// the precomputed download count.
+fn build_artifact_response(
+    artifact: &crate::models::artifact::Artifact,
+    repo_key: &str,
+    download_count: i64,
+) -> ArtifactResponse {
+    ArtifactResponse {
+        id: artifact.id,
+        repository_key: repo_key.to_string(),
+        path: artifact.path.clone(),
+        name: artifact.name.clone(),
+        version: artifact.version.clone(),
+        size_bytes: artifact.size_bytes,
+        checksum_sha256: artifact.checksum_sha256.clone(),
+        content_type: artifact.content_type.clone(),
+        download_count,
+        created_at: artifact.created_at,
+        metadata: None,
+    }
+}
+
+/// Build `ArtifactResponse` rows for each Maven secondary file recorded
+/// under a single primary artifact (#1092).
+///
+/// Skips any entry without a `path` field and any entry whose path
+/// matches the primary's own path (defensive against an older upload
+/// path that may have double-recorded the primary). Returns the
+/// resulting rows in the order they appear in the metadata.files array.
+fn expand_maven_secondary_files(
+    artifact: &crate::models::artifact::Artifact,
+    repo_key: &str,
+    secondary: &[serde_json::Value],
+) -> Vec<ArtifactResponse> {
+    let mut out = Vec::new();
+    for f in secondary {
+        let Some(fpath) = f.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if fpath == artifact.path {
+            // Skip the primary's own entry if it ever made it into the
+            // files array.
+            continue;
+        }
+        let size = f.get("sizeBytes").and_then(|v| v.as_i64()).unwrap_or(0);
+        let sha = f
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ext = f.get("extension").and_then(|v| v.as_str()).unwrap_or("");
+        out.push(ArtifactResponse {
+            id: artifact.id,
+            repository_key: repo_key.to_string(),
+            path: fpath.to_string(),
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            size_bytes: size,
+            checksum_sha256: sha,
+            content_type: content_type_for_maven_extension(ext).to_string(),
+            download_count: 0,
+            created_at: artifact.created_at,
+            metadata: None,
+        });
+    }
+    out
+}
+
+/// Return a best-guess HTTP content type for a Maven file extension.
+/// Mirrors `api::handlers::maven::content_type_for_path` for the
+/// extensions secondary-file rows actually carry. Unknown extensions
+/// fall through to `application/octet-stream`.
+fn content_type_for_maven_extension(ext: &str) -> &'static str {
+    match ext {
+        "pom" | "xml" => "text/xml",
+        "jar" | "war" | "ear" | "aar" | "bundle" => "application/java-archive",
+        "zip" | "tar.gz" => "application/zip",
+        "asc" | "sig" => "application/pgp-signature",
+        "md5" | "sha1" | "sha256" | "sha512" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Load the `metadata.files` JSON array for a batch of Maven artifact ids,
+/// returning a map keyed by `artifact_id`. Used to expand grouped
+/// secondary-file entries into addressable rows in the listing API
+/// (#1092). Artifacts without a metadata row or without a `files` array
+/// are omitted from the returned map.
+async fn load_maven_secondary_files(
+    db: &sqlx::PgPool,
+    artifact_ids: &[Uuid],
+) -> std::collections::HashMap<Uuid, Vec<serde_json::Value>> {
+    use sqlx::Row;
+    if artifact_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let rows = match sqlx::query(
+        "SELECT artifact_id, metadata FROM artifact_metadata \
+         WHERE artifact_id = ANY($1) AND format = 'maven'",
+    )
+    .bind(artifact_ids)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Maven secondary-file metadata lookup failed: {}", e);
+            return std::collections::HashMap::new();
+        }
+    };
+
+    let mut out: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let id: Uuid = match r.try_get("artifact_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let meta: Option<serde_json::Value> = r.try_get("metadata").ok();
+        if let Some(files) = extract_secondary_files_from_metadata(meta.as_ref()) {
+            out.insert(id, files);
+        }
+    }
+    out
+}
+
+/// Pure helper that pulls the `files` array out of an `artifact_metadata.metadata`
+/// JSON blob. Returns `None` when the row has no metadata, no `files` array,
+/// or an empty `files` array, so the caller can omit the artifact from its
+/// "has secondary files" lookup table. Extracted so the JSON-shape parsing
+/// is testable without hitting Postgres.
+fn extract_secondary_files_from_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
+    let files = metadata
+        .and_then(|m| m.get("files"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
 }
 
 /// Build a grouped-by-component response for Maven/Gradle repositories.
@@ -2967,6 +3130,222 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // expand_maven_secondary_files & build_artifact_response (#1092)
+    // -----------------------------------------------------------------------
+
+    fn make_artifact_for_test(path: &str) -> crate::models::artifact::Artifact {
+        crate::models::artifact::Artifact {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path: path.to_string(),
+            name: "demo".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 500,
+            checksum_sha256: "primary-sha".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/java-archive".to_string(),
+            storage_key: format!("maven/{}", path),
+            is_deleted: false,
+            uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_build_artifact_response_copies_primary_fields() {
+        let a = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let resp = build_artifact_response(&a, "maven-hosted", 42);
+        assert_eq!(resp.id, a.id);
+        assert_eq!(resp.repository_key, "maven-hosted");
+        assert_eq!(resp.path, a.path);
+        assert_eq!(resp.size_bytes, 500);
+        assert_eq!(resp.checksum_sha256, "primary-sha");
+        assert_eq!(resp.download_count, 42);
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_emits_each_file() {
+        let primary = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let secondary = vec![
+            serde_json::json!({
+                "path": "com/example/demo/1.0.0/demo-1.0.0.pom",
+                "extension": "pom",
+                "storageKey": "maven/com/example/demo/1.0.0/demo-1.0.0.pom",
+                "sizeBytes": 200,
+                "sha256": "pom-sha",
+            }),
+            serde_json::json!({
+                "path": "com/example/demo/1.0.0/demo-1.0.0-sources.jar",
+                "extension": "jar",
+                "classifier": "sources",
+                "storageKey": "maven/com/example/demo/1.0.0/demo-1.0.0-sources.jar",
+                "sizeBytes": 800,
+                "sha256": "src-sha",
+            }),
+        ];
+        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "com/example/demo/1.0.0/demo-1.0.0.pom");
+        assert_eq!(rows[0].content_type, "text/xml");
+        assert_eq!(rows[0].size_bytes, 200);
+        assert_eq!(
+            rows[1].path,
+            "com/example/demo/1.0.0/demo-1.0.0-sources.jar"
+        );
+        assert_eq!(rows[1].content_type, "application/java-archive");
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_skips_primary_path() {
+        // If the primary's own path leaked into the files array, it must
+        // not produce a duplicate row.
+        let primary = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let secondary = vec![serde_json::json!({
+            "path": primary.path,
+            "extension": "jar",
+            "sizeBytes": 500,
+            "sha256": "primary-sha",
+        })];
+        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_skips_pathless_entries() {
+        // A malformed metadata entry without `path` is dropped silently
+        // rather than producing a row with an empty path field.
+        let primary = make_artifact_for_test("p/demo.jar");
+        let secondary = vec![
+            serde_json::json!({"extension": "pom", "sizeBytes": 100}),
+            serde_json::json!({"path": "p/demo.pom", "extension": "pom"}),
+        ];
+        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "p/demo.pom");
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_handles_missing_size_and_sha() {
+        let primary = make_artifact_for_test("p/demo.jar");
+        let secondary = vec![serde_json::json!({"path": "p/demo.pom", "extension": "pom"})];
+        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        assert_eq!(rows[0].size_bytes, 0);
+        assert_eq!(rows[0].checksum_sha256, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_secondary_files_from_metadata (Maven secondary-file lookup, #1092)
+    //
+    // Pure helper that parses the `metadata` JSON column for the
+    // `files` array used by the per-artifact secondary-files map.
+    // Covers each branch of the parsing chain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_secondary_files_returns_files_array_when_present() {
+        let meta = serde_json::json!({
+            "files": [
+                {"path": "p/demo.pom", "extension": "pom"},
+                {"path": "p/demo-sources.jar", "extension": "jar"},
+            ],
+        });
+        let out = extract_secondary_files_from_metadata(Some(&meta));
+        let files = out.expect("non-empty files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"].as_str(), Some("p/demo.pom"));
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_metadata_missing() {
+        // Artifact has no metadata row at all (Option::None).
+        assert!(extract_secondary_files_from_metadata(None).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_key_absent() {
+        // Metadata blob exists but has no `files` key (older POMs that
+        // never accumulated a secondary-files list).
+        let meta = serde_json::json!({"groupId": "com.example"});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_is_empty_array() {
+        // Explicit empty list -- still nothing to expand.
+        let meta = serde_json::json!({"files": []});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_is_not_an_array() {
+        // Defensive against schema drift -- a non-array `files` value
+        // is treated as "no secondary files" rather than panicking.
+        let meta = serde_json::json!({"files": "not-an-array"});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // content_type_for_maven_extension (Maven secondary-file listing, #1092)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_type_for_maven_extension_pom() {
+        assert_eq!(content_type_for_maven_extension("pom"), "text/xml");
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_jar() {
+        assert_eq!(
+            content_type_for_maven_extension("jar"),
+            "application/java-archive"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("war"),
+            "application/java-archive"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("aar"),
+            "application/java-archive"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_unknown_falls_back() {
+        assert_eq!(
+            content_type_for_maven_extension("xyz"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            content_type_for_maven_extension(""),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_checksum_files() {
+        assert_eq!(content_type_for_maven_extension("md5"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha1"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha256"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha512"), "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_signatures() {
+        assert_eq!(
+            content_type_for_maven_extension("asc"),
+            "application/pgp-signature"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("sig"),
+            "application/pgp-signature"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions for testability
