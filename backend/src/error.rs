@@ -15,10 +15,12 @@ pub type Result<T> = std::result::Result<T, AppError>;
 /// surface from std::io and object_store/S3 backends. Linux io::Error
 /// renders as "File name too long (os error 36)"; some layers prefix or
 /// wrap the message, so match canonical fragments rather than an exact
-/// string. Mirrors `error_helpers::is_name_too_long` but lives here so
-/// `AppError::Storage` and `AppError::Io` map ENAMETOOLONG to 400 globally,
-/// even for format handlers that never adopted `error_helpers` (#1047).
-fn is_name_too_long(msg: &str) -> bool {
+/// string. Exposed at `pub(crate)` so callers outside this module share the
+/// single source of truth for the ENAMETOOLONG -> 400 mapping (#1047).
+/// `AppError::Storage` and `AppError::Io` both consult this function during
+/// status mapping so every handler benefits, including the 30+ format
+/// handlers that never adopted `error_helpers`.
+pub(crate) fn is_name_too_long(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("file name too long")
         || lower.contains("name too long")

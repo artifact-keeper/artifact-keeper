@@ -21,6 +21,52 @@ use std::time::Duration;
 // Base URL from request headers
 // ---------------------------------------------------------------------------
 
+/// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
+/// the value is a syntactically valid `http`/`https` absolute URL with no
+/// embedded userinfo. Kept separate from [`configured_external_url`] so the
+/// validation rules can be unit-tested without poisoning the process-wide
+/// `OnceLock`.
+fn parse_external_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = match url::Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                value = %trimmed,
+                error = %e,
+                "AK_EXTERNAL_URL is not a valid URL; ignoring"
+            );
+            return None;
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        tracing::warn!(
+            value = %trimmed,
+            scheme = parsed.scheme(),
+            "AK_EXTERNAL_URL scheme must be http or https; ignoring"
+        );
+        return None;
+    }
+    if parsed.host_str().map_or(true, str::is_empty) {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must have a host; ignoring"
+        );
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must not contain embedded credentials; ignoring"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Operator-configured external base URL, read once from `AK_EXTERNAL_URL`
 /// and cached for the process lifetime. When set, this overrides whatever
 /// `request_base_url` derives from request headers.
@@ -32,26 +78,16 @@ use std::time::Duration;
 /// links. See #1021.
 ///
 /// Trailing slashes are stripped so callers can build paths uniformly with
-/// `format!("{base}/v2/token")`.
+/// `format!("{base}/v2/token")`. The value is validated with `url::Url::parse`
+/// at first access: the scheme must be `http` or `https`, a host must be
+/// present, and embedded credentials are rejected. Invalid values are logged
+/// and the override is treated as unset (handlers fall back to headers).
 fn configured_external_url() -> Option<&'static str> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
             let raw = std::env::var("AK_EXTERNAL_URL").ok()?;
-            let trimmed = raw.trim().trim_end_matches('/');
-            if trimmed.is_empty() {
-                return None;
-            }
-            // Validate at startup: must include a scheme so clients (Docker,
-            // Cargo, etc.) don't construct accidentally-relative URLs.
-            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-                tracing::warn!(
-                    value = %trimmed,
-                    "AK_EXTERNAL_URL must start with http:// or https://; ignoring"
-                );
-                return None;
-            }
-            Some(trimmed.to_string())
+            parse_external_url(&raw)
         })
         .as_deref()
 }
@@ -67,8 +103,11 @@ fn configured_external_url() -> Option<&'static str> {
 /// 2. `X-Forwarded-Host` + `X-Forwarded-Proto`. Standard Helm-chart ingress
 ///    setup.
 /// 3. The `Host` request header. Vulnerable to host-header spoofing if no
-///    upstream sanitizes it; acceptable as a development fallback but a
-///    warning is logged the first time it is the only available source.
+///    upstream sanitizes it; acceptable as a development fallback. In
+///    production, set `AK_EXTERNAL_URL` or configure the ingress to set
+///    `X-Forwarded-Host` so a hostile client cannot redirect Docker / Cargo
+///    / NuGet clients to an attacker-controlled token endpoint by tampering
+///    with the `Host` header.
 /// 4. `http://localhost`. Last-resort fallback so handlers do not panic.
 ///
 /// If a host value already carries an embedded scheme it is returned as-is
@@ -1680,6 +1719,90 @@ mod tests {
         assert_eq!(
             request_base_url(&headers),
             "https://already-absolute.example.com"
+        );
+    }
+
+    // ── parse_external_url tests (#1021) ─────────────────────────────
+    // Tested via the pure parser rather than the OnceLock-cached
+    // configured_external_url() so multiple tests can run in parallel
+    // without poisoning the process-wide cache.
+
+    #[test]
+    fn test_parse_external_url_https() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_http() {
+        assert_eq!(
+            parse_external_url("http://localhost:8080"),
+            Some("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_strips_trailing_slash() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com/"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_trims_whitespace() {
+        assert_eq!(
+            parse_external_url("  https://registry.example.com/  "),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_empty_rejected() {
+        assert_eq!(parse_external_url(""), None);
+        assert_eq!(parse_external_url("   "), None);
+        assert_eq!(parse_external_url("/"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_missing_scheme_rejected() {
+        assert_eq!(parse_external_url("registry.example.com"), None);
+        assert_eq!(parse_external_url("//registry.example.com"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_non_http_scheme_rejected() {
+        assert_eq!(parse_external_url("ftp://registry.example.com"), None);
+        assert_eq!(parse_external_url("file:///etc/passwd"), None);
+        assert_eq!(parse_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_embedded_credentials_rejected() {
+        assert_eq!(
+            parse_external_url("https://user:pass@registry.example.com"),
+            None
+        );
+        assert_eq!(
+            parse_external_url("https://user@registry.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_invalid_garbage_rejected() {
+        assert_eq!(parse_external_url("https://"), None);
+        assert_eq!(parse_external_url("not a url at all"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_with_path_preserved() {
+        // Some deployments host the registry under a path prefix.
+        assert_eq!(
+            parse_external_url("https://example.com/registry"),
+            Some("https://example.com/registry".to_string())
         );
     }
 
