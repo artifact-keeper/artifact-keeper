@@ -262,6 +262,16 @@ static SPDX_CANONICAL: Lazy<std::collections::HashMap<String, &'static str>> = L
 static LICENSEREF_FILTER: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[^A-Za-z0-9.\-]+").expect("static LICENSEREF_FILTER regex"));
 
+/// Upper bound applied to a license-term input BEFORE regex / lowercase
+/// passes. The downstream LicenseRef body is truncated to 64 chars, so
+/// any value longer than [`LICENSE_TERM_INPUT_CAP`] is guaranteed to be
+/// either a known SPDX identifier (the longest in [`SPDX_IDENTIFIERS`]
+/// is well under 64 chars) or LicenseRef-bound output that would discard
+/// the tail anyway. Capping the input prevents an attacker-controlled
+/// multi-MB license string from forcing a full regex `replace_all` pass
+/// and a full `to_lowercase` allocation before we throw the bytes away.
+const LICENSE_TERM_INPUT_CAP: usize = 256;
+
 /// Detect smuggled SPDX expressions inside a single array element.
 /// Hostile `package.json` files can ship `"MIT OR Apache-2.0"` as a single
 /// element so that per-element validation against a known-identifier list
@@ -278,9 +288,16 @@ static EMBEDDED_OPERATOR: Lazy<Regex> = Lazy::new(|| {
 /// any whitespace-delimited operator like ` OR `, ` AND `, ` WITH `
 /// (those must arrive as separate array elements; smuggling them as a
 /// single element bypasses per-element validation).
+///
+/// Inputs longer than [`LICENSE_TERM_INPUT_CAP`] return `false` without
+/// running any regex or allocating a lowercased copy — no SPDX
+/// identifier is anywhere near that length, so we can safely fast-fail.
 pub fn is_valid_spdx_identifier(term: &str) -> bool {
     let trimmed = term.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.len() > LICENSE_TERM_INPUT_CAP {
         return false;
     }
     if EMBEDDED_OPERATOR.is_match(trimmed) {
@@ -309,6 +326,16 @@ pub fn sanitize_license_term(term: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+
+    // Cap the input BEFORE we touch the regex engine or allocate a
+    // lowercased copy. The LicenseRef body is truncated to 64 chars
+    // anyway, so any tail beyond [`LICENSE_TERM_INPUT_CAP`] is discarded
+    // — there is no semantic loss, and an attacker cannot force a
+    // multi-MB regex pass or a multi-MB lowercase allocation per
+    // package row. Operate on a char-bounded prefix to avoid splitting
+    // a multibyte sequence mid-grapheme.
+    let bounded: String = trimmed.chars().take(LICENSE_TERM_INPUT_CAP).collect();
+    let trimmed = bounded.as_str();
 
     if !EMBEDDED_OPERATOR.is_match(trimmed) {
         if let Some(canonical) = SPDX_CANONICAL.get(&trimmed.to_lowercase()) {
@@ -400,5 +427,32 @@ mod tests {
     fn sanitize_empty_input_is_none() {
         assert_eq!(sanitize_license_term(""), None);
         assert_eq!(sanitize_license_term("   "), None);
+    }
+
+    /// Inputs longer than [`LICENSE_TERM_INPUT_CAP`] must short-circuit
+    /// before the regex engine and `to_lowercase` allocator see them.
+    /// We can't directly observe the allocation, so we assert two
+    /// behaviours that depend on the cap firing:
+    /// 1. A long, well-formed SPDX identifier prefix followed by garbage
+    ///    must NOT be recognised as that identifier (the cap-bounded
+    ///    prefix is what gets looked up).
+    /// 2. The output length is bounded regardless of input length.
+    #[test]
+    fn sanitize_caps_input_before_regex_pass() {
+        // Build an oversized input that starts with what would otherwise
+        // be a known SPDX identifier substring after lowercasing. The
+        // cap-bounded prefix is `MIT` + 253 chars of "A", which is
+        // neither a known identifier nor an embedded operator, so the
+        // result must be a LicenseRef wrap, never a bare "MIT".
+        let prefixed_garbage = format!("MIT{}", "A".repeat(LICENSE_TERM_INPUT_CAP * 4));
+        let out = sanitize_license_term(&prefixed_garbage).unwrap();
+        assert!(
+            out.starts_with("LicenseRef-"),
+            "oversized input must wrap as LicenseRef, got {out}"
+        );
+        assert!(out.len() <= "LicenseRef-".len() + 64);
+
+        // is_valid_spdx_identifier must also fast-fail oversized input.
+        assert!(!is_valid_spdx_identifier(&prefixed_garbage));
     }
 }

@@ -652,30 +652,55 @@ impl ScanCompleteness {
 /// structured; these substrings cover the warnings emitted by the v0.50+
 /// CLI when it skips a lockfile (truncated JSON, invalid version syntax,
 /// unrecognised lockfile version, "failed to parse"). The patterns are
-/// case-insensitive substring matches rather than full regexes because
-/// the upstream wording shifts between minor versions and we would
-/// rather false-positive on `partial` (a conservative signal) than false-
-/// negative on a real partial-scan condition.
+/// case-insensitive ASCII substring matches against individual stderr
+/// LINES, not the whole stderr blob — earlier prototypes globbed against
+/// the whole stderr text and tripped on `"skipping CVE-..."` or
+/// `"failed to analyze <built-in analyzer>"` noise that fires on every
+/// run. The current list intentionally omits `"skipping"` and
+/// `"failed to analyze"` for that reason; we accept the false-negative
+/// risk on novel wording in exchange for a usable signal.
 const TRIVY_PARTIAL_STDERR_MARKERS: &[&str] = &[
     "failed to parse",
-    "failed to analyze",
     "invalid lockfile",
     "unexpected eof",
     "syntax error",
     "unrecognized lockfile",
     "unknown lockfile",
-    "skipping",
 ];
+
+/// Returns `true` when `haystack` contains `needle`, comparing ASCII
+/// case-insensitively without allocating a lowercased copy of `haystack`.
+/// Used by the partial-scan classifier so we don't allocate `O(stderr)`
+/// memory for a single substring test on potentially-multi-MB stderr.
+fn ascii_icontains(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return n.is_empty();
+    }
+    h.windows(n.len()).any(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
 
 /// Decide whether a Trivy invocation should be marked partial.
 ///
 /// A scan is partial when *either*:
-/// 1. Trivy's stderr contains one of [`TRIVY_PARTIAL_STDERR_MARKERS`],
-///    indicating the scanner saw a target it could not parse, OR
+/// 1. Trivy's stderr contains one of [`TRIVY_PARTIAL_STDERR_MARKERS`] on
+///    any individual line, indicating the scanner saw a target it could
+///    not parse, OR
 /// 2. A target name from `known_targets` (typically derived from the
 ///    workspace directory listing or from artifact metadata) is missing
 ///    from the report's `results[].target` set, indicating Trivy
 ///    silently skipped a lockfile that exists on disk.
+///
+/// `known_targets` matching is by path **basename**, not raw substring,
+/// so a noisy target path like `prefix-package-lock.json` does not
+/// accidentally satisfy a request for `package-lock.json`. The
+/// comparison is also case-insensitive on ASCII (Windows-style mixed
+/// case in workspace paths shows up in practice).
 ///
 /// Pulled out as a free function so the decision is unit-testable
 /// without a Trivy process. (#1153)
@@ -684,20 +709,41 @@ pub(crate) fn classify_trivy_completeness(
     stderr: &str,
     known_targets: &[&str],
 ) -> ScanCompleteness {
-    let stderr_lc = stderr.to_lowercase();
-    if TRIVY_PARTIAL_STDERR_MARKERS
-        .iter()
-        .any(|m| stderr_lc.contains(m))
-    {
+    // Per-line ASCII case-insensitive substring scan avoids allocating
+    // a full lowercased copy of stderr (which can run to several MB on
+    // verbose Trivy runs).
+    let mut hit_marker = false;
+    for line in stderr.lines() {
+        if TRIVY_PARTIAL_STDERR_MARKERS
+            .iter()
+            .any(|m| ascii_icontains(line, m))
+        {
+            hit_marker = true;
+            break;
+        }
+    }
+    if hit_marker {
         return ScanCompleteness::Partial;
     }
 
     if !known_targets.is_empty() {
-        let seen: std::collections::HashSet<&str> =
-            report.results.iter().map(|r| r.target.as_str()).collect();
-        let missing = known_targets
+        // Compare on path basenames so "package-lock.json" never
+        // accidentally matches "prefix-package-lock.json". `Path::new`
+        // is allocation-free.
+        let seen_basenames: std::collections::HashSet<String> = report
+            .results
             .iter()
-            .any(|t| !seen.iter().any(|s| s.ends_with(*t) || *t == *s));
+            .filter_map(|r| {
+                std::path::Path::new(&r.target)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+            })
+            .collect();
+        let missing = known_targets.iter().any(|t| {
+            let want = t.to_ascii_lowercase();
+            !seen_basenames.contains(&want)
+        });
         if missing {
             return ScanCompleteness::Partial;
         }
@@ -8920,6 +8966,77 @@ mod tests {
         };
         let completeness = classify_trivy_completeness(&report, "", &["package-lock.json"]);
         assert_eq!(completeness, ScanCompleteness::Complete);
+    }
+
+    /// Benign stderr lines that contain words from the OLD marker list
+    /// (`"skipping CVE-..."`, `"failed to analyze <built-in analyzer>"`)
+    /// must NOT flip a clean scan to Partial. Without this regression
+    /// test the classifier would treat every Trivy run as Partial,
+    /// drowning the genuine signal.
+    #[test]
+    fn test_trivy_benign_stderr_stays_complete() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "/workspace/package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        // Lines Trivy emits on routine runs.
+        let benign = "\
+2026-05-12T10:00:00Z INFO  skipping CVE-2024-1234 because suppressed\n\
+2026-05-12T10:00:01Z INFO  failed to analyze python-pkg-built-in: not installed\n\
+2026-05-12T10:00:02Z INFO  Detected OS: alpine 3.20\n";
+        let completeness = classify_trivy_completeness(&report, benign, &["package-lock.json"]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Complete,
+            "benign 'skipping CVE-...' / 'failed to analyze <analyzer>' must not flip to Partial"
+        );
+    }
+
+    /// Path-confusion guard: a target named `prefix-package-lock.json`
+    /// must NOT satisfy a known-target request for `package-lock.json`.
+    /// The earlier `ends_with` match would have classified this Complete
+    /// because the target string ends with the basename. The basename-
+    /// based comparison correctly flags it as Partial.
+    #[test]
+    fn test_trivy_path_confusion_target_does_not_satisfy_known() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                // Note: NOT a lockfile basename, just a string that
+                // happens to end with one.
+                target: "/workspace/prefix-package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        let completeness = classify_trivy_completeness(&report, "", &["package-lock.json"]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Partial,
+            "prefix-package-lock.json must not satisfy known target package-lock.json"
+        );
+    }
+
+    /// The stderr scan is line-bounded and case-insensitive on ASCII.
+    /// A marker that appears with a mixed-case prefix on its own line
+    /// must still trigger Partial.
+    #[test]
+    fn test_trivy_partial_stderr_case_insensitive_per_line() {
+        use crate::services::image_scanner::TrivyReport;
+        let report = TrivyReport { results: vec![] };
+        let stderr = "\
+2026-05-12T10:00:00Z INFO  Detected OS: alpine 3.20\n\
+2026-05-12T10:00:01Z WARN  FAILED TO PARSE package-lock.json: unexpected EOF\n";
+        let completeness = classify_trivy_completeness(&report, stderr, &[]);
+        assert_eq!(completeness, ScanCompleteness::Partial);
     }
 
     // -----------------------------------------------------------------------
