@@ -3,7 +3,7 @@
 //! The push handler in `api::handlers::oci_v2` populates `oci_manifest_refs`
 //! eagerly whenever a multi-arch image index manifest is committed. That
 //! covers every push that lands after the upgrade to a release containing
-//! migration 087, but it does not cover index manifests that were pushed
+//! migration 092, but it does not cover index manifests that were pushed
 //! before the upgrade and are still tagged: those tags exist in
 //! `oci_tags` with no corresponding rows in `oci_manifest_refs`, and the
 //! storage GC's protection for their per-architecture children only
@@ -149,6 +149,16 @@ async fn select_unbackfilled_indexes(db: &PgPool) -> sqlx::Result<Vec<BackfillCa
     Ok(candidates)
 }
 
+/// Hard cap on the manifest body size we are willing to load and parse
+/// during backfill. OCI image-index manifests are tiny in practice (one
+/// JSON entry per platform, a few hundred bytes each); a 4 MiB ceiling
+/// is two orders of magnitude above legitimate sizes and prevents a
+/// corrupted or malicious storage key from OOMing startup. If a body
+/// exceeds this, we log at WARN and skip the candidate; the child
+/// manifests for that index just stay unprotected (same state as before
+/// this PR) until the index is re-pushed through the live handler.
+pub(crate) const MAX_INDEX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
 /// Load one index manifest from storage, parse it, and insert the
 /// resulting (parent, child, repo) edges into `oci_manifest_refs`.
 async fn process_candidate(
@@ -169,6 +179,14 @@ async fn process_candidate(
         .get(&storage_key)
         .await
         .map_err(|e| format!("read manifest from storage: {}", e))?;
+
+    if body.len() > MAX_INDEX_MANIFEST_BYTES {
+        return Err(format!(
+            "index manifest body exceeds {} bytes (got {}); skipping JSON parse",
+            MAX_INDEX_MANIFEST_BYTES,
+            body.len()
+        ));
+    }
 
     let inserted = crate::api::handlers::oci_v2::record_oci_manifest_refs(
         db,
@@ -200,5 +218,15 @@ mod tests {
         // be returned across async boundaries cheaply.
         fn assert_copy<T: Copy>() {}
         assert_copy::<BackfillStats>();
+    }
+
+    #[test]
+    fn max_index_manifest_bytes_is_sane_ceiling() {
+        // The cap exists to protect startup from a corrupted/malicious
+        // body. Real OCI image-index manifests are well under 1 MiB; a
+        // 4 MiB ceiling is far above legitimate sizes but small enough
+        // that a single bad blob cannot exhaust process memory.
+        assert!(MAX_INDEX_MANIFEST_BYTES >= 64 * 1024);
+        assert!(MAX_INDEX_MANIFEST_BYTES <= 16 * 1024 * 1024);
     }
 }

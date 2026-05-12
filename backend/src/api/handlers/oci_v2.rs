@@ -396,6 +396,11 @@ pub(crate) fn extract_child_digests(body: &[u8]) -> Vec<String> {
 /// backfill. The caller is responsible for verifying that `parent_body`
 /// really is an image-index manifest (use [`is_index_content_type`]);
 /// passing a regular image manifest just inserts zero rows.
+///
+/// Performance: the inserts run as a single round-trip via `UNNEST` so a
+/// multi-arch push of N platforms costs one DB call, not N. This matters
+/// because `handle_put_manifest` calls this synchronously on the request
+/// hot path.
 pub(crate) async fn record_oci_manifest_refs(
     db: &PgPool,
     repo_id: Uuid,
@@ -406,21 +411,25 @@ pub(crate) async fn record_oci_manifest_refs(
     if children.is_empty() {
         return Ok(0);
     }
-    let mut inserted = 0usize;
-    for child in &children {
-        let res = sqlx::query!(
-            r#"INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (parent_digest, child_digest, repository_id) DO NOTHING"#,
-            parent_digest,
-            child,
-            repo_id,
-        )
-        .execute(db)
-        .await?;
-        inserted += res.rows_affected() as usize;
-    }
-    Ok(inserted)
+    // Batched insert: expand the child digest array via UNNEST and
+    // pair every row with the constant parent_digest / repo_id. One
+    // round-trip total. `query_as` over `query!` because sqlx's macro
+    // form does not currently type-check `UNNEST` array bindings
+    // against the offline metadata cache without explicit casts.
+    let res = sqlx::query(
+        r#"
+        INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
+        SELECT $1, child, $3
+        FROM UNNEST($2::text[]) AS t(child)
+        ON CONFLICT (parent_digest, child_digest, repository_id) DO NOTHING
+        "#,
+    )
+    .bind(parent_digest)
+    .bind(&children)
+    .bind(repo_id)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() as usize)
 }
 
 // ---------------------------------------------------------------------------

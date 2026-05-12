@@ -20,7 +20,7 @@ use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 /// 2. It is not protected by an `oci_tags` row (manifests still tagged);
 /// 3. It is not protected by an `oci_blobs` row (named blobs);
 /// 4. It is not the per-architecture child of a still-tagged OCI image index
-///    (`oci_manifest_refs` joined against `oci_tags`; see migration 087).
+///    (`oci_manifest_refs` joined against `oci_tags`; see migration 092).
 ///
 /// The fragment expects two bindings: the outer `artifacts` row aliased
 /// `a` and the outer `repositories` row aliased `r`. Callers either inline
@@ -324,10 +324,11 @@ impl StorageGcService {
 /// the same SELECT, so we split the check into two steps:
 ///
 /// 1. Acquire row locks on every `artifacts` row matching the
-///    (storage_key, backend, path) tuple with a separate `SELECT ... FOR
-///    UPDATE`. This is the bit that blocks any racing writer from
-///    flipping `is_deleted` or otherwise modifying these rows until our
-///    tx ends.
+///    (storage_key, backend) tuple (path-narrowed only on `filesystem`
+///    because cloud backends share a global keyspace across repos on
+///    the same backend type) with a separate `SELECT ... FOR UPDATE`.
+///    This is the bit that blocks any racing writer from flipping
+///    `is_deleted` or otherwise modifying these rows until our tx ends.
 /// 2. Re-evaluate the orphan predicate (an aggregate over the locked
 ///    rows) in a second non-locking SELECT. Because we hold the lock
 ///    from step 1, no row visible in step 2 can change underneath us
@@ -336,6 +337,16 @@ impl StorageGcService {
 /// The aggregate uses `bool_and`; if there are no matching rows the
 /// aggregate is NULL and `COALESCE` returns false so we skip the delete
 /// (there's nothing left to delete anyway).
+///
+/// Lock scope rationale: `ORPHAN_PREDICATE_SQL` treats `oci_tags`,
+/// `oci_blobs`, and `oci_manifest_refs` as cross-repo on cloud backends
+/// because S3/GCS/Azure storage keys are globally unique within the
+/// configured bucket. The lock here must match the same scope, or a
+/// racing writer in a sibling cloud repo could flip `is_deleted=false`
+/// on a row that shares the storage_key without being blocked, and the
+/// recheck would still observe the new live row in step 2 only if it
+/// committed before the snapshot. Widening the lock to all repos on
+/// the same cloud backend closes that window.
 async fn is_still_orphan(
     tx: &mut Transaction<'_, Postgres>,
     storage_key: &str,
@@ -346,6 +357,11 @@ async fn is_still_orphan(
     // rows; we just need them locked for the rest of the transaction.
     // `FOR UPDATE OF a` restricts the lock to the artifacts table so
     // we do not inadvertently lock the joined repositories row.
+    //
+    // Filesystem narrows by `storage_path` (each repo has its own
+    // filesystem root); cloud backends span every repo on the same
+    // backend type because they all share one bucket and the same
+    // storage_key resolves to the same object.
     sqlx::query(
         r#"
         SELECT a.id
@@ -353,7 +369,10 @@ async fn is_still_orphan(
         JOIN repositories r ON r.id = a.repository_id
         WHERE a.storage_key = $1
           AND r.storage_backend = $2
-          AND r.storage_path = $3
+          AND (
+            r.storage_backend <> 'filesystem'
+            OR r.storage_path = $3
+          )
         FOR UPDATE OF a
         "#,
     )
@@ -364,6 +383,7 @@ async fn is_still_orphan(
     .await?;
 
     // Step 2: re-evaluate the orphan predicate against the locked rows.
+    // Match scope used by step 1.
     let sql = format!(
         r#"
         SELECT COALESCE(bool_and({predicate}), false) AS still_orphan
@@ -371,7 +391,10 @@ async fn is_still_orphan(
         JOIN repositories r ON r.id = a.repository_id
         WHERE a.storage_key = $1
           AND r.storage_backend = $2
-          AND r.storage_path = $3
+          AND (
+            r.storage_backend <> 'filesystem'
+            OR r.storage_path = $3
+          )
         "#,
         predicate = ORPHAN_PREDICATE_SQL,
     );

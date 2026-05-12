@@ -397,7 +397,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
-    // pre-date migration 087 (artifact-keeper#1179). Runs after the
+    // pre-date migration 092 (artifact-keeper#1179). Runs after the
     // storage registry is wired up because it needs the registry to read
     // the parent manifest bodies from per-repo backends. Failures are
     // logged but do not block startup. On a fresh database or after the
