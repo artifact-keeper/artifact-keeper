@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Pre-upgrade check
 
-- **Stuck-scan janitor will reap accumulated `running` rows on first tick** (#1015, #1062) -- v1.1.10 introduces a background janitor that transitions `scan_results` rows wedged in `status='running'` past the configured `STUCK_SCAN_THRESHOLD_SECS` (default 1800s / 30 min) to `status='failed'`. On long-running installs predating v1.1.10, a number of previously-stuck rows from crashed scan workers (OOM, pod evicted, deploy mid-scan) may flip to `failed` within roughly 10 minutes of upgrade. Operators who alert on `status='failed'` deltas should expect a one-time burst at upgrade and tune alerting accordingly.
+- **Stuck-scan janitor will reap accumulated `running` rows on first tick** (#1015, #1062) -- v1.1.10 introduces a background janitor that transitions `scan_results` rows wedged in `status='running'` past the configured `STUCK_SCAN_THRESHOLD_SECS` (default 1800s / 30 min) to `status='failed'`. On long-running installs predating v1.1.10, previously-stuck rows from crashed scan workers (OOM, pod evicted, deploy mid-scan) will flip to `failed` in batches of up to 1000 rows per 10-minute tick (the per-tick cap bounds memory and audit-log write volume). A backlog of N stuck rows therefore takes roughly `ceil(N / 1000) * 10` minutes to fully drain. Operators who alert on `status='failed'` deltas should expect this drain (one or many ticks depending on backlog size) at upgrade and tune alerting accordingly.
 
   Count the rows that will be reaped before upgrading:
 

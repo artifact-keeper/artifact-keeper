@@ -560,6 +560,13 @@ async fn test_cleanup_stuck_scans_reaps_row_even_when_audit_insert_fails() {
     let stuck_started = chrono::Utc::now() - chrono::Duration::minutes(45);
     let stuck_id = insert_running_scan(&pool, artifact_id, repo_id, stuck_started).await;
 
+    // Self-heal from a prior aborted run (Ctrl+C, OOM, CI timeout between
+    // ADD and DROP would otherwise leave the constraint behind and break
+    // every subsequent run with `constraint ... already exists`).
+    let _ = sqlx::query("ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS test_block_scan_reaped")
+        .execute(&pool)
+        .await;
+
     sqlx::query(
         "ALTER TABLE audit_log \
          ADD CONSTRAINT test_block_scan_reaped \
