@@ -14,6 +14,8 @@ use tokio::io::AsyncReadExt;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -95,6 +97,23 @@ pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
         || ct.contains("vnd.docker.distribution")
         || ct.contains("vnd.docker.container")
         || artifact.path.contains("/manifests/")
+}
+
+/// Parse a `v2/<name>/manifests/<reference>` registry path into `(name, ref)`.
+///
+/// Used by ImageScanner (Trivy) and GrypeScanner (#1160) to reconstruct a
+/// scannable image ref from the artifact path. Returns `None` for paths that
+/// don't match the OCI distribution-spec pull URL shape; callers fall back
+/// to alternative scan modes or skip the artifact.
+pub fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.trim_start_matches('/').strip_prefix("v2/")?;
+    let idx = rest.find("/manifests/")?;
+    let name = &rest[..idx];
+    let reference = &rest[idx + "/manifests/".len()..];
+    if name.is_empty() || reference.is_empty() {
+        return None;
+    }
+    Some((name, reference))
 }
 
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
@@ -481,6 +500,70 @@ pub(crate) fn convert_trivy_findings(
         .collect()
 }
 
+/// Upper bound for `scan_packages.purl`. Mirrors migration 087, which caps
+/// the column at `VARCHAR(2048)`. The PURL RFC's published examples cluster
+/// around 30-120 bytes and the practical real-world ceiling for valid PURLs
+/// is well under 2048; values longer than that are almost certainly hostile
+/// (lockfile-smuggled bloat) or buggy scanner output. Dropping the field on
+/// over-length rather than truncating prevents handing a downstream parser
+/// a syntactically half-valid PURL that happens to round to something
+/// resolvable.
+pub(crate) const PURL_MAX_LEN: usize = 2048;
+
+/// Cheap syntactic check for "looks like a PURL" per the spec's
+/// `pkg:<type>/<namespace>/<name>@<version>` shape. Matches the issue's
+/// recommended regex `^pkg:[a-z0-9.+-]+/`: a fixed scheme, a non-empty
+/// lowercase type token, then a slash. Fuller PURL validation (URL-encoding
+/// rules on the namespace, qualifier ordering, fragment shape) is left to
+/// the downstream consumer; the goal here is to reject obviously-malformed
+/// strings before they hit the DB column or the SBOM document.
+static PURL_PREFIX_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^pkg:[a-z0-9.+-]+/").expect("static PURL_PREFIX_RE regex"));
+
+/// Validate a PURL string against the length cap and syntactic prefix.
+/// Returns `Some(purl)` when the string passes both checks and is suitable
+/// for persistence; returns `None` (caller drops the field, keeps the row)
+/// when the string is empty, oversized, or syntactically malformed.
+///
+/// Length cap matches migration 087's `VARCHAR(2048)` column type — keeping
+/// the cap in the application layer too means a value that slipped past the
+/// application path on a legacy build still fails at the column level, and
+/// a value that fails at the application path never reaches the column at
+/// all. (#1151)
+pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > PURL_MAX_LEN {
+        return None;
+    }
+    if !PURL_PREFIX_RE.is_match(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Reduce a Trivy `Licenses` array to a SPDX-safe joined expression.
+///
+/// Each input element is run through [`crate::services::spdx_licenses::sanitize_license_term`]
+/// before joining with ` OR `. Known SPDX identifiers (case-insensitive)
+/// pass through in their canonical case; unknown terms and single-element
+/// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
+/// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
+/// classify them as permissive. (#1152)
+pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
+    let terms: Vec<String> = raw
+        .iter()
+        .filter_map(|s| crate::services::spdx_licenses::sanitize_license_term(s))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
 /// Convert a Trivy report's `Packages` blocks into [`RawPackage`] values.
 /// Produces one row per (target, package, version) triple. Trivy emits both
 /// a standalone `Packages` block and inline `PkgName`/`InstalledVersion` on
@@ -495,6 +578,13 @@ pub(crate) fn convert_trivy_findings(
 /// degrade gracefully to "no inventory data" rather than producing
 /// findings-derived stand-ins, which would silently re-introduce the #903
 /// vulnerability-shaped-SBOM bug.
+///
+/// Field-level validation (#1151, #1152):
+/// - `purl` runs through [`validate_trivy_purl`]; malformed or oversized
+///   PURLs are dropped (field set to `None`) while the package row is kept.
+/// - `license` runs through [`sanitize_trivy_licenses`]; non-SPDX terms
+///   are wrapped as `LicenseRef-...` so they cannot green-light a
+///   permissive-license policy check.
 pub(crate) fn convert_trivy_packages(
     report: &crate::services::image_scanner::TrivyReport,
 ) -> Vec<RawPackage> {
@@ -515,27 +605,25 @@ pub(crate) fn convert_trivy_packages(
                     } else {
                         Some(pkg.version.clone())
                     },
+                    // #1151: validate the PURL before persistence. Hostile
+                    // lockfiles can ship multi-MB or malformed PURL strings;
+                    // dropping the field (keeping the package row) is the
+                    // recommended behaviour so the inventory still reflects
+                    // the package without giving a downstream parser a
+                    // chance to misinterpret a half-valid PURL.
                     purl: pkg
                         .identifier
                         .as_ref()
-                        .and_then(|id| id.purl.clone())
-                        .filter(|s| !s.is_empty()),
-                    // Trivy may emit multiple license strings per package
-                    // (e.g. `["MIT", "Apache-2.0"]`). Join with " OR " per
-                    // CycloneDX convention; an empty list becomes None.
-                    license: pkg.licenses.as_ref().and_then(|ls| {
-                        let joined = ls
-                            .iter()
-                            .filter(|s| !s.is_empty())
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" OR ");
-                        if joined.is_empty() {
-                            None
-                        } else {
-                            Some(joined)
-                        }
-                    }),
+                        .and_then(|id| id.purl.as_deref())
+                        .and_then(validate_trivy_purl),
+                    // #1152: validate each license element against the SPDX
+                    // identifier list before joining with " OR ". Multi-
+                    // license packages still produce a SPDX OR expression;
+                    // hostile elements (unknown terms, smuggled pre-joined
+                    // expressions) are wrapped as LicenseRef-... so a
+                    // permissive-license policy check cannot green-light
+                    // them.
+                    license: pkg.licenses.as_deref().and_then(sanitize_trivy_licenses),
                     source_target: if result.target.is_empty() {
                         None
                     } else {
@@ -546,15 +634,156 @@ pub(crate) fn convert_trivy_packages(
         .collect()
 }
 
+/// Completeness signal for a scanner pass over an artifact. (#1153)
+///
+/// `Complete` means the scanner enumerated every target it found on the
+/// filesystem and emitted a `Packages` block (or empty block, when the
+/// artifact legitimately had no packages). `Partial` means the scanner
+/// logged a warning for at least one target that was known to be present
+/// on the filesystem — typically a truncated `package-lock.json`, an
+/// invalid version syntax in a `requirements.txt`, or an unrecognised
+/// lockfile version Trivy could not parse. A partial pass is persisted
+/// into `scan_results.scan_completeness` so the SBOM endpoint and
+/// downstream attestation tooling can distinguish "no lockfile present"
+/// from "lockfile present but unparseable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanCompleteness {
+    #[default]
+    Complete,
+    Partial,
+}
+
+impl ScanCompleteness {
+    /// Stable lowercase form used by the `scan_completeness` CHECK
+    /// constraint in migration 087 and by the SBOM document JSON field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScanCompleteness::Complete => "complete",
+            ScanCompleteness::Partial => "partial",
+        }
+    }
+}
+
+/// Trivy stderr line patterns that signal a target was present on the
+/// filesystem but could not be parsed. Trivy's stderr is not strictly
+/// structured; these substrings cover the warnings emitted by the v0.50+
+/// CLI when it skips a lockfile (truncated JSON, invalid version syntax,
+/// unrecognised lockfile version, "failed to parse"). The patterns are
+/// case-insensitive ASCII substring matches against individual stderr
+/// LINES, not the whole stderr blob — earlier prototypes globbed against
+/// the whole stderr text and tripped on `"skipping CVE-..."` or
+/// `"failed to analyze <built-in analyzer>"` noise that fires on every
+/// run. The current list intentionally omits `"skipping"` and
+/// `"failed to analyze"` for that reason; we accept the false-negative
+/// risk on novel wording in exchange for a usable signal.
+const TRIVY_PARTIAL_STDERR_MARKERS: &[&str] = &[
+    "failed to parse",
+    "invalid lockfile",
+    "unexpected eof",
+    "syntax error",
+    "unrecognized lockfile",
+    "unknown lockfile",
+];
+
+/// Returns `true` when `haystack` contains `needle`, comparing ASCII
+/// case-insensitively without allocating a lowercased copy of `haystack`.
+/// Used by the partial-scan classifier so we don't allocate `O(stderr)`
+/// memory for a single substring test on potentially-multi-MB stderr.
+fn ascii_icontains(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return n.is_empty();
+    }
+    h.windows(n.len()).any(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Decide whether a Trivy invocation should be marked partial.
+///
+/// A scan is partial when *either*:
+/// 1. Trivy's stderr contains one of [`TRIVY_PARTIAL_STDERR_MARKERS`] on
+///    any individual line, indicating the scanner saw a target it could
+///    not parse, OR
+/// 2. A target name from `known_targets` (typically derived from the
+///    workspace directory listing or from artifact metadata) is missing
+///    from the report's `results[].target` set, indicating Trivy
+///    silently skipped a lockfile that exists on disk.
+///
+/// `known_targets` matching is by path **basename**, not raw substring,
+/// so a noisy target path like `prefix-package-lock.json` does not
+/// accidentally satisfy a request for `package-lock.json`. The
+/// comparison is also case-insensitive on ASCII (Windows-style mixed
+/// case in workspace paths shows up in practice).
+///
+/// Pulled out as a free function so the decision is unit-testable
+/// without a Trivy process. (#1153)
+pub(crate) fn classify_trivy_completeness(
+    report: &crate::services::image_scanner::TrivyReport,
+    stderr: &str,
+    known_targets: &[&str],
+) -> ScanCompleteness {
+    // Per-line ASCII case-insensitive substring scan avoids allocating
+    // a full lowercased copy of stderr (which can run to several MB on
+    // verbose Trivy runs).
+    let mut hit_marker = false;
+    for line in stderr.lines() {
+        if TRIVY_PARTIAL_STDERR_MARKERS
+            .iter()
+            .any(|m| ascii_icontains(line, m))
+        {
+            hit_marker = true;
+            break;
+        }
+    }
+    if hit_marker {
+        return ScanCompleteness::Partial;
+    }
+
+    if !known_targets.is_empty() {
+        // Compare on path basenames so "package-lock.json" never
+        // accidentally matches "prefix-package-lock.json". `Path::new`
+        // is allocation-free.
+        let seen_basenames: std::collections::HashSet<String> = report
+            .results
+            .iter()
+            .filter_map(|r| {
+                std::path::Path::new(&r.target)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+            })
+            .collect();
+        let missing = known_targets.iter().any(|t| {
+            let want = t.to_ascii_lowercase();
+            !seen_basenames.contains(&want)
+        });
+        if missing {
+            return ScanCompleteness::Partial;
+        }
+    }
+
+    ScanCompleteness::Complete
+}
+
 /// Output of a single scanner run: vulnerability findings AND a package
 /// inventory (#903). Scanners that only produce findings (OpenSCAP, custom
 /// WASM plugins) construct a [`ScanOutput`] with an empty `packages` Vec
 /// via [`ScanOutput::findings_only`]; scanners that enumerate packages
 /// (Trivy, Grype if extended) populate both.
+///
+/// `scan_completeness` (#1153) carries the partial-scan signal so the
+/// orchestrator can record it on the `scan_results` row and the SBOM
+/// document can surface "lockfile present but unparseable" distinctly
+/// from "no lockfile present".
 #[derive(Debug, Default)]
 pub struct ScanOutput {
     pub findings: Vec<RawFinding>,
     pub packages: Vec<RawPackage>,
+    pub scan_completeness: ScanCompleteness,
 }
 
 impl ScanOutput {
@@ -565,11 +794,17 @@ impl ScanOutput {
         Self {
             findings,
             packages: Vec::new(),
+            scan_completeness: ScanCompleteness::Complete,
         }
     }
 
     /// Convenience constructor for the common Trivy path where both halves
     /// of the report are converted via the shared helpers above.
+    ///
+    /// `scan_completeness` is unconditionally `Complete` — callers that
+    /// have access to Trivy stderr or a known-target list should use
+    /// [`ScanOutput::from_trivy_report_with_context`] instead so the
+    /// partial-scan signal flows through.
     pub fn from_trivy_report(
         report: &crate::services::image_scanner::TrivyReport,
         source_label: &str,
@@ -577,6 +812,27 @@ impl ScanOutput {
         Self {
             findings: convert_trivy_findings(report, source_label),
             packages: convert_trivy_packages(report),
+            scan_completeness: ScanCompleteness::Complete,
+        }
+    }
+
+    /// Trivy-path constructor that incorporates the partial-scan signal
+    /// (#1153). `stderr` is the raw stderr output from the Trivy CLI;
+    /// `known_targets` is the list of lockfile/manifest basenames the
+    /// scanner expected to find (typically derived from the workspace
+    /// directory listing). When either source flags a partial scan,
+    /// `scan_completeness` becomes `Partial` and the orchestrator
+    /// persists that into `scan_results.scan_completeness`.
+    pub fn from_trivy_report_with_context(
+        report: &crate::services::image_scanner::TrivyReport,
+        source_label: &str,
+        stderr: &str,
+        known_targets: &[&str],
+    ) -> Self {
+        Self {
+            findings: convert_trivy_findings(report, source_label),
+            packages: convert_trivy_packages(report),
+            scan_completeness: classify_trivy_completeness(report, stderr, known_targets),
         }
     }
 
@@ -1800,7 +2056,11 @@ impl Scanner for DependencyScanner {
             });
         }
 
-        Ok(ScanOutput { findings, packages })
+        Ok(ScanOutput {
+            findings,
+            packages,
+            scan_completeness: ScanCompleteness::Complete,
+        })
     }
 }
 
@@ -2164,7 +2424,11 @@ impl ScannerService {
             // See issue #902.
             let started_at = chrono::Utc::now();
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
-                Ok(ScanOutput { findings, packages }) => {
+                Ok(ScanOutput {
+                    findings,
+                    packages,
+                    scan_completeness,
+                }) => {
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -2257,7 +2521,11 @@ impl ScannerService {
                         }
                     }
 
-                    // Mark scan complete
+                    // Mark scan complete. `scan_completeness` (#1153) flows
+                    // through to `scan_results.scan_completeness` so the
+                    // SBOM endpoint and downstream attestation tooling can
+                    // distinguish "lockfile present but unparseable" from
+                    // "no lockfile present".
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -2269,17 +2537,19 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
+                            scan_completeness.as_str(),
                         )
                         .await?;
 
                     info!(
-                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}",
+                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, completeness={}",
                         scanner.name(),
                         artifact_id,
                         total,
                         critical,
                         high,
                         scanner_version,
+                        scan_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -8399,6 +8669,391 @@ mod tests {
         let pkgs = convert_trivy_packages(&report);
         assert_eq!(pkgs.len(), 1);
         assert!(pkgs[0].source_target.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PURL validation (issue #1151)
+    // -----------------------------------------------------------------------
+
+    /// A syntactically malformed PURL must be dropped (field set to None);
+    /// the package row itself is preserved so the inventory still reflects
+    /// that the scanner saw the package. The regression this guards
+    /// against: hostile lockfiles smuggle non-`pkg:` strings into the
+    /// `Identifier.PURL` field and downstream parsers crash or normalize
+    /// them silently.
+    #[test]
+    fn test_convert_trivy_packages_drops_malformed_purl_keeps_row() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyPackageIdentifier, TrivyReport, TrivyResult,
+        };
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "valid".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some("pkg:npm/valid@1.0.0".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        name: "no-scheme".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some("npm/no-scheme@1.0.0".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        name: "empty-type".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            // `pkg:/foo` -- empty type token must reject.
+                            purl: Some("pkg:/empty-type@1.0.0".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        name: "uppercase-type".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            // PURL type tokens must be lowercase per spec.
+                            purl: Some("pkg:NPM/uppercase-type@1.0.0".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        name: "garbage".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some("<script>alert(1)</script>".to_string()),
+                        }),
+                    },
+                ]),
+            }],
+        };
+
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 5, "all package rows must be preserved");
+
+        let by_name = |n: &str| pkgs.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(
+            by_name("valid").purl.as_deref(),
+            Some("pkg:npm/valid@1.0.0")
+        );
+        assert!(by_name("no-scheme").purl.is_none());
+        assert!(by_name("empty-type").purl.is_none());
+        assert!(by_name("uppercase-type").purl.is_none());
+        assert!(by_name("garbage").purl.is_none());
+    }
+
+    /// An oversized PURL string (> PURL_MAX_LEN) must be rejected before
+    /// it can reach the VARCHAR(2048) column. Combined with the 50k row
+    /// cap on scan_packages, an unbounded PURL would allow a hostile
+    /// lockfile to balloon the SBOM JSON. The column-level cap from
+    /// migration 087 is the second line of defence; this test pins the
+    /// application-layer drop.
+    #[test]
+    fn test_convert_trivy_packages_rejects_oversized_purl() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyPackageIdentifier, TrivyReport, TrivyResult,
+        };
+
+        // Build a PURL that is well-formed but longer than the cap.
+        let big_name = "a".repeat(PURL_MAX_LEN);
+        let oversized = format!("pkg:npm/{}@1.0.0", big_name);
+        assert!(oversized.len() > PURL_MAX_LEN, "test setup sanity check");
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![TrivyPackage {
+                    name: "huge".to_string(),
+                    version: "1.0.0".to_string(),
+                    licenses: None,
+                    identifier: Some(TrivyPackageIdentifier {
+                        purl: Some(oversized),
+                    }),
+                }]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1, "package row must be preserved");
+        assert!(
+            pkgs[0].purl.is_none(),
+            "oversized PURL must be dropped before insert (would exceed VARCHAR(2048))"
+        );
+    }
+
+    /// `validate_trivy_purl` is the single-purpose helper used by
+    /// `convert_trivy_packages`. The function-level test exercises the
+    /// length / shape / empty branches independently so changes to
+    /// `convert_trivy_packages` cannot regress the helper.
+    #[test]
+    fn test_validate_trivy_purl_helper() {
+        assert_eq!(
+            validate_trivy_purl("pkg:npm/lodash@4.17.21"),
+            Some("pkg:npm/lodash@4.17.21".to_string())
+        );
+        assert_eq!(validate_trivy_purl(""), None);
+        assert_eq!(validate_trivy_purl("   "), None);
+        assert_eq!(validate_trivy_purl("pkg:/missing-type"), None);
+        assert_eq!(validate_trivy_purl("not-a-purl"), None);
+        let big = format!("pkg:npm/{}@1.0.0", "a".repeat(PURL_MAX_LEN));
+        assert!(validate_trivy_purl(&big).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SPDX license validation (issue #1152)
+    // -----------------------------------------------------------------------
+
+    /// Hostile license arrays must not produce a SPDX expression that a
+    /// permissive policy reads as "MIT-licensed if you pick that arm".
+    /// The mix below is drawn from the issue write-up: a known-SPDX term
+    /// joined with a free-form commercial restriction. The non-SPDX
+    /// element must be wrapped as `LicenseRef-...` so a SPDX-aware
+    /// policy engine cannot silently classify it as permissive.
+    #[test]
+    fn test_convert_trivy_packages_hostile_licenses_dont_greenlight() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    // Case 1: known + hostile mix. The hostile term must
+                    // become LicenseRef-..., never silently dropped.
+                    TrivyPackage {
+                        name: "mit-plus-commercial".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec![
+                            "MIT".to_string(),
+                            "Custom Commercial - see LICENSE".to_string(),
+                        ]),
+                        identifier: None,
+                    },
+                    // Case 2: smuggled SPDX expression as a single element.
+                    // Must not pass through as a permissive expression.
+                    TrivyPackage {
+                        name: "smuggled-expression".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec!["MIT OR Apache-2.0".to_string()]),
+                        identifier: None,
+                    },
+                    // Case 3: lowercase canonical input. Must promote to
+                    // the canonical SPDX casing.
+                    TrivyPackage {
+                        name: "lowercase-canonical".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec!["apache-2.0".to_string()]),
+                        identifier: None,
+                    },
+                ]),
+            }],
+        };
+
+        let pkgs = convert_trivy_packages(&report);
+        let by_name = |n: &str| pkgs.iter().find(|p| p.name == n).unwrap();
+
+        // Case 1: the joined expression carries both arms, but the
+        // hostile arm is a LicenseRef so a permissive-policy check
+        // cannot green-light it.
+        let mixed = by_name("mit-plus-commercial").license.clone().unwrap();
+        assert!(mixed.contains("MIT"), "MIT arm preserved; got {}", mixed);
+        assert!(
+            mixed.contains("LicenseRef-"),
+            "non-SPDX term must be wrapped as LicenseRef; got {}",
+            mixed
+        );
+        assert!(
+            !mixed.contains("Custom Commercial"),
+            "raw free-form license must not flow through verbatim; got {}",
+            mixed
+        );
+
+        // Case 2: the single smuggled element becomes a LicenseRef, not
+        // a plain SPDX OR expression. A policy permitting MIT alone
+        // would otherwise green-light this package.
+        let smuggled = by_name("smuggled-expression").license.clone().unwrap();
+        assert!(
+            smuggled.starts_with("LicenseRef-"),
+            "single-element smuggled expression must be neutered into LicenseRef; got {}",
+            smuggled
+        );
+        assert!(
+            smuggled != "MIT OR Apache-2.0",
+            "must not collapse to a permissive OR expression"
+        );
+
+        // Case 3: lowercase input promotes to canonical SPDX casing.
+        assert_eq!(
+            by_name("lowercase-canonical").license.as_deref(),
+            Some("Apache-2.0"),
+            "canonical-case promotion must happen at conversion time"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trivy partial-scan signal (issue #1153)
+    // -----------------------------------------------------------------------
+
+    /// A Trivy stderr warning indicating an unparseable lockfile must
+    /// flip `scan_completeness` to `Partial`. The regression this guards
+    /// against: a malformed `package-lock.json` makes Trivy log
+    /// "failed to parse" on stderr, the scan returns success with an
+    /// empty Packages block, and the SBOM endpoint reports "no
+    /// packages" -- giving a green light to a lockfile that actually
+    /// exists and is being executed at runtime.
+    #[test]
+    fn test_trivy_partial_signal_from_stderr() {
+        use crate::services::image_scanner::TrivyReport;
+
+        let report = TrivyReport { results: vec![] };
+        let stderr = "2026-05-11T10:00:00Z WARN  failed to parse package-lock.json: unexpected EOF";
+        let completeness = classify_trivy_completeness(&report, stderr, &[]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Partial,
+            "Trivy stderr 'failed to parse' must flip completeness to partial"
+        );
+
+        // Construct a full ScanOutput via the with_context helper and
+        // verify the field flows through.
+        let output =
+            ScanOutput::from_trivy_report_with_context(&report, "trivy-filesystem", stderr, &[]);
+        assert_eq!(output.scan_completeness, ScanCompleteness::Partial);
+        assert_eq!(output.scan_completeness.as_str(), "partial");
+    }
+
+    /// A known-present target missing from the report's results list
+    /// must also flip completeness to Partial. This covers the case
+    /// where Trivy silently skips a target without logging anything on
+    /// stderr (e.g. extension-mismatched lockfiles, unsupported
+    /// ecosystem versions).
+    #[test]
+    fn test_trivy_partial_signal_from_missing_known_target() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+
+        // Report claims it scanned only requirements.txt, but the
+        // workspace told us package-lock.json was also present.
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "requirements.txt".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "pip".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        let completeness = classify_trivy_completeness(&report, "", &["package-lock.json"]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Partial,
+            "known target absent from results must flip completeness to partial"
+        );
+    }
+
+    /// A clean scan (no stderr warnings, every known target seen)
+    /// stays `Complete`. Without this assertion the partial-scan
+    /// classifier could regress into a "always partial" default.
+    #[test]
+    fn test_trivy_complete_signal_when_no_warnings() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "/workspace/package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        let completeness = classify_trivy_completeness(&report, "", &["package-lock.json"]);
+        assert_eq!(completeness, ScanCompleteness::Complete);
+    }
+
+    /// Benign stderr lines that contain words from the OLD marker list
+    /// (`"skipping CVE-..."`, `"failed to analyze <built-in analyzer>"`)
+    /// must NOT flip a clean scan to Partial. Without this regression
+    /// test the classifier would treat every Trivy run as Partial,
+    /// drowning the genuine signal.
+    #[test]
+    fn test_trivy_benign_stderr_stays_complete() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "/workspace/package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        // Lines Trivy emits on routine runs.
+        let benign = "\
+2026-05-12T10:00:00Z INFO  skipping CVE-2024-1234 because suppressed\n\
+2026-05-12T10:00:01Z INFO  failed to analyze python-pkg-built-in: not installed\n\
+2026-05-12T10:00:02Z INFO  Detected OS: alpine 3.20\n";
+        let completeness = classify_trivy_completeness(&report, benign, &["package-lock.json"]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Complete,
+            "benign 'skipping CVE-...' / 'failed to analyze <analyzer>' must not flip to Partial"
+        );
+    }
+
+    /// Path-confusion guard: a target named `prefix-package-lock.json`
+    /// must NOT satisfy a known-target request for `package-lock.json`.
+    /// The earlier `ends_with` match would have classified this Complete
+    /// because the target string ends with the basename. The basename-
+    /// based comparison correctly flags it as Partial.
+    #[test]
+    fn test_trivy_path_confusion_target_does_not_satisfy_known() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                // Note: NOT a lockfile basename, just a string that
+                // happens to end with one.
+                target: "/workspace/prefix-package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: None,
+            }],
+        };
+        let completeness = classify_trivy_completeness(&report, "", &["package-lock.json"]);
+        assert_eq!(
+            completeness,
+            ScanCompleteness::Partial,
+            "prefix-package-lock.json must not satisfy known target package-lock.json"
+        );
+    }
+
+    /// The stderr scan is line-bounded and case-insensitive on ASCII.
+    /// A marker that appears with a mixed-case prefix on its own line
+    /// must still trigger Partial.
+    #[test]
+    fn test_trivy_partial_stderr_case_insensitive_per_line() {
+        use crate::services::image_scanner::TrivyReport;
+        let report = TrivyReport { results: vec![] };
+        let stderr = "\
+2026-05-12T10:00:00Z INFO  Detected OS: alpine 3.20\n\
+2026-05-12T10:00:01Z WARN  FAILED TO PARSE package-lock.json: unexpected EOF\n";
+        let completeness = classify_trivy_completeness(&report, stderr, &[]);
+        assert_eq!(completeness, ScanCompleteness::Partial);
     }
 
     // -----------------------------------------------------------------------

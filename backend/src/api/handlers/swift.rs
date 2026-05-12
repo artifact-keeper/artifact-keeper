@@ -54,6 +54,109 @@ async fn resolve_swift_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["swift"], "a Swift").await
 }
 
+/// Extract Package.swift from a Swift source archive (issue #1100).
+///
+/// SwiftPM resolves dependencies via the manifest endpoint before downloading
+/// the full source archive, so a `404` here breaks dependency resolution even
+/// when the archive itself is sound. Operators (and CI tooling) can't always
+/// pass Package.swift through the `X-Swift-Package-Manifest` header because
+/// SwiftPM manifests are multi-line files and HTTP header values are
+/// effectively single-line, so we parse the uploaded zip ourselves.
+///
+/// Returns the manifest text when found at `Package.swift` or at
+/// `<prefix>/Package.swift` (the common GitHub-style archive layout that
+/// nests everything under `<repo>-<sha>/`). Returns `None` when neither
+/// layout matches; the caller falls back to "manifest not found".
+///
+/// The extracted manifest is hard-capped at `MAX_MANIFEST_BYTES` to bound
+/// memory consumption against zip-bomb uploads. A real Package.swift is
+/// typically a few KB; the cap is generous enough to allow even the most
+/// elaborate manifests while refusing pathological inputs.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
+    let reader = std::io::Cursor::new(zip_bytes);
+    let mut archive = match zip::ZipArchive::new(reader) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(error = %e, "swift manifest extraction: invalid zip archive");
+            return None;
+        }
+    };
+
+    // Pass 1: top-level Package.swift wins. This is the layout produced by
+    // `swift package archive-source` and most CI helpers.
+    // Pass 2: any `<single-prefix>/Package.swift` (one directory deep).
+    // Pass 3: deepest fallback -- the shortest path that ends in
+    // `/Package.swift`. Avoids accidentally picking up
+    // `Tests/.../Package.swift` fixtures shipped alongside the real one.
+    use std::io::Read;
+    let mut best: Option<(usize, String)> = None;
+    for i in 0..archive.len() {
+        let mut entry = match archive.by_index(i) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(index = i, error = %e, "swift manifest extraction: skipped unreadable entry");
+                continue;
+            }
+        };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let is_top_level = name == "Package.swift";
+        let is_nested = name.ends_with("/Package.swift");
+        if !is_top_level && !is_nested {
+            continue;
+        }
+        // Refuse oversized entries before reading. `size()` is the
+        // uncompressed size from the local file header; treat it as a
+        // hint and re-check with `take()` below in case the header lies.
+        if entry.size() > MAX_MANIFEST_BYTES {
+            tracing::debug!(
+                entry = %name,
+                size = entry.size(),
+                cap = MAX_MANIFEST_BYTES,
+                "swift manifest extraction: skipped oversized Package.swift candidate"
+            );
+            continue;
+        }
+        let mut text = String::new();
+        // `take(N+1)` reads at most N+1 bytes; we then reject if the
+        // result exceeds N. This catches archives whose local file header
+        // understates the actual entry size.
+        if let Err(e) = entry
+            .by_ref()
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_string(&mut text)
+        {
+            tracing::debug!(entry = %name, error = %e, "swift manifest extraction: skipped non-UTF8 entry");
+            continue;
+        }
+        if text.len() as u64 > MAX_MANIFEST_BYTES {
+            tracing::debug!(
+                entry = %name,
+                read = text.len(),
+                cap = MAX_MANIFEST_BYTES,
+                "swift manifest extraction: skipped entry exceeding cap after read"
+            );
+            continue;
+        }
+        if is_top_level {
+            return Some(text);
+        }
+        let depth = name.matches('/').count();
+        let take = match &best {
+            None => true,
+            Some((d, _)) => depth < *d,
+        };
+        if take {
+            best = Some((depth, text));
+        }
+    }
+    best.map(|(_, text)| text)
+}
+
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
@@ -440,20 +543,58 @@ async fn fetch_manifest(
     })?
     .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
 
-    let manifest = artifact
+    // Prefer the cached manifest from artifact_metadata. When that is missing
+    // (legacy uploads predating issue #1100, or publishes that bypassed the
+    // header path), parse the source archive on demand so SwiftPM dependency
+    // resolution still succeeds.
+    let cached_manifest = artifact
         .metadata
         .as_ref()
         .and_then(|m| m.get("manifest"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
-        })?;
+        .map(|s| s.to_string());
+
+    let manifest = match cached_manifest {
+        Some(m) => m,
+        None => {
+            // Look up the storage key separately so the primary query above can
+            // keep its existing .sqlx offline cache entry (no schema change).
+            let storage_key: String = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts \
+                 WHERE repository_id = $1 AND is_deleted = false \
+                 AND LOWER(name) = LOWER($2) AND version = $3 LIMIT 1",
+            )
+            .bind(repo.id)
+            .bind(&package_id)
+            .bind(version)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Database error: {}", e),
+                )
+            })?;
+            let storage = state
+                .storage_for_repo(&repo.storage_location())
+                .map_err(|e| e.into_response())?;
+            let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Storage error: {}", e),
+                )
+            })?;
+            extract_manifest_from_zip(&zip_bytes).ok_or_else(|| {
+                swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
+            })?
+        }
+    };
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/x-swift")
         .header("Content-Version", "1")
-        .body(Body::from(manifest.to_string()))
+        .body(Body::from(manifest))
         .unwrap())
 }
 
@@ -552,13 +693,17 @@ async fn publish_release(
         )
     })?;
 
-    // Extract manifest from multipart body if present, or store the raw archive.
-    // For simplicity, we treat the body as the source archive. Metadata can be
-    // supplied via the swift_metadata field in a JSON content-type header.
+    // Prefer the explicit X-Swift-Package-Manifest header (lets clients override
+    // what's inside the archive), and fall back to parsing Package.swift from
+    // the uploaded zip when the header is absent. Without the fallback, raw
+    // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
+    // because the manifest endpoint returns 404 even though the archive is
+    // perfectly valid (issue #1100).
     let manifest = headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| extract_manifest_from_zip(&body));
 
     let swift_metadata = serde_json::json!({
         "scope": scope,
@@ -871,5 +1016,199 @@ mod tests {
             repo.upstream_url.as_deref(),
             Some("https://swift-packages.example.com")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1100 -- extract Package.swift from uploaded zip
+    // -----------------------------------------------------------------------
+
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_top_level_package_swift() {
+        let zip = make_zip(&[
+            ("Package.swift", b"// swift-tools-version:5.9\nlet pkg = 1"),
+            ("Sources/Lib/lib.swift", b"public let x = 1"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("swift-tools-version:5.9"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_handles_github_prefix_layout() {
+        // Common layout from `git archive` / GitHub release tarballs:
+        // a single top-level directory contains the package contents.
+        let zip = make_zip(&[
+            ("swift-log-1.5.0/README.md", b"# Log"),
+            ("swift-log-1.5.0/Package.swift", b"let pkg = \"swift-log\""),
+            ("swift-log-1.5.0/Sources/Logging/Logger.swift", b"// source"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("swift-log"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_prefers_shallowest_when_multiple() {
+        // Tests/Fixtures often ship a nested Package.swift; the shallower one
+        // is the real manifest and must win.
+        let zip = make_zip(&[
+            ("pkg/Tests/Fixtures/Subpkg/Package.swift", b"// fixture"),
+            ("pkg/Package.swift", b"// real manifest"),
+        ]);
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("real manifest"));
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_none_for_archive_without_manifest() {
+        let zip = make_zip(&[
+            ("README.md", b"no manifest"),
+            ("src/lib.swift", b"// no manifest"),
+        ]);
+        assert!(extract_manifest_from_zip(&zip).is_none());
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_returns_none_for_malformed_zip() {
+        let not_a_zip = b"this is not a zip file at all";
+        assert!(extract_manifest_from_zip(not_a_zip).is_none());
+    }
+
+    /// Builds a zip that includes an explicit directory entry alongside files.
+    /// Exercises the `!entry.is_file()` skip path inside the loop so the
+    /// directory entry does not get picked up as a Package.swift candidate.
+    fn make_zip_with_directory() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // Explicit directory entry. `add_directory` is the canonical
+            // way to emit a directory record in a zip archive; the resulting
+            // entry has `is_file() == false`.
+            writer.add_directory("dir/", opts).unwrap();
+            writer.start_file("dir/Package.swift", opts).unwrap();
+            writer.write_all(b"// nested manifest").unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_skips_directory_entries() {
+        // A real zip can include directory records (e.g. produced by
+        // `zip -r` or `add_directory`). The loop must skip them via the
+        // `!entry.is_file()` guard rather than treating "dir/" as a file
+        // path; the nested Package.swift inside should still be returned.
+        let zip = make_zip_with_directory();
+        let manifest = extract_manifest_from_zip(&zip).expect("manifest expected");
+        assert!(manifest.contains("nested manifest"));
+    }
+
+    /// Build a zip whose Package.swift body is non-UTF-8 bytes (raw 0xFF / 0xFE
+    /// noise). `read_to_string` returns an error in that case, exercising the
+    /// `continue` branch on the read error path so the file is skipped rather
+    /// than treated as a manifest.
+    fn make_zip_with_non_utf8_manifest() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // Invalid UTF-8: a lone continuation byte after a start-of-sequence
+            // byte without the required follow-up.
+            writer.start_file("Package.swift", opts).unwrap();
+            writer
+                .write_all(&[0xC3, 0x28, 0xA0, 0xA1, 0xFF, 0xFE, 0xFD])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_skips_non_utf8_manifest() {
+        // A Package.swift that doesn't decode as UTF-8 hits the read_to_string
+        // error path. Because it's also the only candidate, the function must
+        // return None (rather than panicking or returning a partial buffer).
+        let zip = make_zip_with_non_utf8_manifest();
+        assert!(extract_manifest_from_zip(&zip).is_none());
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_rejects_oversized_manifest() {
+        // Defense against zip bombs: an attacker-controlled Package.swift
+        // entry larger than MAX_MANIFEST_BYTES must be skipped, not read
+        // into memory. With only an oversized candidate present the function
+        // must return None.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            // Use Deflate so the compressed archive stays tiny while the
+            // uncompressed entry exceeds MAX_MANIFEST_BYTES. This mimics
+            // a zip-bomb payload.
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("Package.swift", opts).unwrap();
+            // 2 MiB of a single byte -- compresses to a few hundred bytes
+            // on disk but exceeds the 1 MiB manifest cap.
+            let payload = vec![b'a'; (MAX_MANIFEST_BYTES as usize) + 1024];
+            writer.write_all(&payload).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(
+            extract_manifest_from_zip(&buf).is_none(),
+            "oversized Package.swift must be refused to bound memory"
+        );
+    }
+
+    #[test]
+    fn extract_manifest_from_zip_accepts_manifest_at_size_cap() {
+        // A Package.swift right at the size limit must still be accepted.
+        // Verifies the boundary check is `>` not `>=` so legitimate large
+        // manifests aren't punished.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        // Build content under the cap that still parses as text.
+        let prefix = b"// swift-tools-version:5.9\n// padding ";
+        let pad_size = (MAX_MANIFEST_BYTES as usize) - prefix.len() - 16;
+        let content: Vec<u8> = prefix
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(b'x').take(pad_size))
+            .collect();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("Package.swift", opts).unwrap();
+            writer.write_all(&content).unwrap();
+            writer.finish().unwrap();
+        }
+        let manifest = extract_manifest_from_zip(&buf).expect("manifest at cap must be accepted");
+        assert!(manifest.contains("swift-tools-version:5.9"));
+        assert!((manifest.len() as u64) <= MAX_MANIFEST_BYTES);
     }
 }

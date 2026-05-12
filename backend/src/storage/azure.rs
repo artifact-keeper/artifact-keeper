@@ -857,6 +857,33 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    /// Surface Azure Blob's `ETag` response header on a HEAD. Azure quotes
+    /// ETags ("0x8D..."); we return the value verbatim so equality
+    /// comparisons remain string-stable. Used by the #1051 fast-path
+    /// revalidation. Returns `Ok(None)` for a missing blob or for a
+    /// response without an `ETag` header so the freshness probe can fall
+    /// through to the slow path without surfacing a backend error.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let url = self.read_url(key, Duration::from_secs(60))?;
+        let response = self.authorized_head(&url).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "Azure head_etag for '{}' returned {}",
+                key,
+                response.status()
+            )));
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        Ok(etag)
+    }
+
     fn supports_redirect(&self) -> bool {
         // SAS redirect downloads require Shared Key auth
         self.config.redirect_downloads && !self.is_rbac()
