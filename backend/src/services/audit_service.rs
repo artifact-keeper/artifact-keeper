@@ -63,6 +63,13 @@ pub enum AuditAction {
     // Email subscriptions (#1170)
     EmailSubscriptionCreated,
     EmailSubscriptionDeleted,
+
+    // SBOM operations (#1156). The SBOM endpoints emit audit trail entries
+    // tied to the underlying artifact so SOC 2 / EU CRA auditors can answer
+    // "who generated or fetched this attestation, and when?". `SbomRead`
+    // covers both `GET /sbom/:id` and `GET /sbom/by-artifact/:artifact_id`.
+    SbomGenerated,
+    SbomRead,
 }
 
 impl AuditAction {
@@ -105,6 +112,8 @@ impl AuditAction {
             AuditAction::PluginDisabled => "PLUGIN_DISABLED",
             AuditAction::EmailSubscriptionCreated => "EMAIL_SUBSCRIPTION_CREATED",
             AuditAction::EmailSubscriptionDeleted => "EMAIL_SUBSCRIPTION_DELETED",
+            AuditAction::SbomGenerated => "SBOM_GENERATED",
+            AuditAction::SbomRead => "SBOM_READ",
         }
     }
 }
@@ -488,6 +497,8 @@ mod tests {
             AuditAction::EmailSubscriptionDeleted.as_str(),
             "EMAIL_SUBSCRIPTION_DELETED"
         );
+        assert_eq!(AuditAction::SbomGenerated.as_str(), "SBOM_GENERATED");
+        assert_eq!(AuditAction::SbomRead.as_str(), "SBOM_READ");
     }
 
     // -----------------------------------------------------------------------

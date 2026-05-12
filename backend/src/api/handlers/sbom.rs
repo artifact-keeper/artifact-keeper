@@ -15,7 +15,34 @@ use crate::error::{AppError, Result};
 use crate::models::sbom::{
     CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
 };
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
+
+/// Emit an audit log entry for an SBOM action against an artifact. Failures
+/// are logged but never propagated: the mutation/read is already complete and
+/// breaking the response over a best-effort audit write would do callers no
+/// favors. Mirrors `email_subscriptions::write_audit_log` (#1170).
+async fn write_sbom_audit(
+    state: &SharedState,
+    action: AuditAction,
+    actor_user_id: Uuid,
+    artifact_id: Uuid,
+    extra: serde_json::Value,
+) {
+    let entry = AuditEntry::new(action, ResourceType::Artifact)
+        .user(actor_user_id)
+        .resource(artifact_id)
+        .details(extra);
+
+    if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+        tracing::warn!(
+            error = %e,
+            action = action.as_str(),
+            artifact_id = %artifact_id,
+            "Failed to write SBOM audit log; SBOM operation already committed"
+        );
+    }
+}
 
 /// Create SBOM routes.
 pub fn router() -> Router<SharedState> {
@@ -257,7 +284,7 @@ fn default_action() -> String {
 )]
 async fn generate_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<GenerateSbomRequest>,
 ) -> Result<Json<SbomResponse>> {
     let service = SbomService::new(state.db.clone());
@@ -289,6 +316,23 @@ async fn generate_sbom(
     let doc = service
         .generate_sbom(body.artifact_id, repository_id, format, deps)
         .await?;
+
+    // #1156: SBOMs are an attestation surface relied on for SOC 2 / EU CRA
+    // compliance. Record who generated which SBOM, when, and for which
+    // artifact. Best-effort: an audit-log failure must not undo the SBOM.
+    write_sbom_audit(
+        &state,
+        AuditAction::SbomGenerated,
+        auth.user_id,
+        body.artifact_id,
+        serde_json::json!({
+            "sbom_id": doc.id.to_string(),
+            "format": doc.format,
+            "repository_id": repository_id.to_string(),
+            "force_regenerate": body.force_regenerate,
+        }),
+    )
+    .await;
 
     Ok(Json(SbomResponse::from(doc)))
 }
@@ -424,6 +468,21 @@ async fn get_sbom(
         .await?
         .ok_or_else(|| AppError::NotFound("SBOM not found".into()))?;
 
+    // #1156: record SBOM read against the underlying artifact so the chain
+    // of custody is queryable per artifact.
+    write_sbom_audit(
+        &state,
+        AuditAction::SbomRead,
+        auth.user_id,
+        doc.artifact_id,
+        serde_json::json!({
+            "sbom_id": doc.id.to_string(),
+            "format": doc.format,
+            "lookup": "by_id",
+        }),
+    )
+    .await;
+
     Ok(Json(SbomContentResponse::from(doc)))
 }
 
@@ -460,6 +519,22 @@ async fn get_sbom_by_artifact(
         .get_sbom_by_artifact(artifact_id, format)
         .await?
         .ok_or_else(|| AppError::NotFound("SBOM not found for artifact".into()))?;
+
+    // #1156: by-artifact lookups are the path most exposed to scripted
+    // supply-chain consumers; record them so unusual access patterns are
+    // visible in the audit trail.
+    write_sbom_audit(
+        &state,
+        AuditAction::SbomRead,
+        auth.user_id,
+        artifact_id,
+        serde_json::json!({
+            "sbom_id": doc.id.to_string(),
+            "format": doc.format,
+            "lookup": "by_artifact",
+        }),
+    )
+    .await;
 
     Ok(Json(SbomContentResponse::from(doc)))
 }

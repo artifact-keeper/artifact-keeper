@@ -433,6 +433,11 @@ impl ScanResultService {
         // Status guard: only convert a row that is still 'running'. If another
         // caller already converted this row, the UPDATE matches zero rows and
         // we treat it as a no-op (idempotent).
+        // #1019: propagate `scanner_version` from the source row alongside the
+        // findings counts. Without this, dedup-via-prepare-then-convert rows
+        // were left with scanner_version=NULL (the placeholder's value),
+        // breaking the #1006 invariant that every completed scan records its
+        // scanner version. Mirrors the analogous fix in copy_scan_results.
         let updated = sqlx::query_as!(
             ScanResult,
             r#"
@@ -446,7 +451,8 @@ impl ScanResultService {
                 low_count = $6,
                 info_count = $7,
                 is_reused = true,
-                source_scan_id = $8
+                source_scan_id = $8,
+                scanner_version = $9
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
@@ -461,6 +467,7 @@ impl ScanResultService {
             low,
             info,
             source_scan_id,
+            source.scanner_version,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -1200,19 +1207,30 @@ impl ScanResultService {
     }
 
     /// Get aggregate dashboard summary across all repositories.
+    ///
+    /// #962: the finding totals are restricted to the LATEST completed scan
+    /// per (artifact_id, scan_type) tuple. Without this windowing, scanning
+    /// the same Docker image ten times multiplied the dashboard's
+    /// vulnerability count tenfold ("150 vulns" instead of the actual 15)
+    /// because every scan_results row owns its own `scan_findings`.
+    ///
+    /// Soft-deleted artifacts are excluded so users do not see deleted-
+    /// artifact CVE counts mixed into the live dashboard; this matches the
+    /// per-repo score recompute query.
+    ///
+    /// FILTER aggregates collapse the three finding subqueries into one
+    /// scan of the `latest_findings` CTE.
     pub async fn get_dashboard_summary(&self) -> Result<DashboardSummary> {
-        // The three finding counts (total / critical / high) all draw from
-        // the same `scan_findings JOIN latest_scans` set, so they are
-        // collapsed into one subquery using FILTER aggregates rather than
-        // three near-identical IN-subqueries.
         let summary = sqlx::query!(
             r#"
             WITH latest_scans AS (
-                SELECT DISTINCT ON (artifact_id, scan_type) id
-                FROM scan_results
-                WHERE status = 'completed'
-                ORDER BY artifact_id, scan_type,
-                         completed_at DESC NULLS LAST, created_at DESC
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE sr.status = 'completed'
+                  AND NOT a.is_deleted
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
             ),
             latest_findings AS (
                 SELECT sf.severity, sf.is_acknowledged
@@ -1222,13 +1240,16 @@ impl ScanResultService {
             SELECT
                 (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as "repos_with_scanning!",
                 (SELECT COUNT(*) FROM scan_results) as "total_scans!",
-                (SELECT COUNT(*) FROM latest_findings WHERE NOT is_acknowledged) as "total_findings!",
-                (SELECT COUNT(*) FROM latest_findings
-                   WHERE severity = 'critical' AND NOT is_acknowledged) as "critical_findings!",
-                (SELECT COUNT(*) FROM latest_findings
-                   WHERE severity = 'high' AND NOT is_acknowledged) as "high_findings!",
+                COUNT(*) FILTER (WHERE NOT is_acknowledged) as "total_findings!",
+                COUNT(*) FILTER (
+                    WHERE severity = 'critical' AND NOT is_acknowledged
+                ) as "critical_findings!",
+                COUNT(*) FILTER (
+                    WHERE severity = 'high' AND NOT is_acknowledged
+                ) as "high_findings!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as "repos_grade_a!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as "repos_grade_f!"
+            FROM latest_findings
             "#,
         )
         .fetch_one(&self.db)
