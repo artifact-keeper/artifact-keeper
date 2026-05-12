@@ -255,7 +255,31 @@ pub async fn proxy_fetch_streaming(
         .fetch_artifact_streaming(&repo, path)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    build_streaming_response(result, default_content_type).map_err(|e| {
+        map_proxy_error(
+            repo_key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
+}
 
+/// Build the outbound HTTP response from a [`StreamingFetchResult`].
+///
+/// Sets `Content-Type` from the result's `content_type` field when
+/// present, falling back to `default_content_type` otherwise.
+/// Sets `Content-Length` only when upstream advertised one; absent
+/// length means the outbound response uses chunked transfer encoding.
+///
+/// Extracted from [`proxy_fetch_streaming`] so the header-building
+/// rules can be unit-tested without standing up a live upstream or
+/// storage backend. Returns the underlying [`axum::http::Error`] on
+/// the rare malformed-header path so the caller can wrap into its
+/// own error type.
+pub(crate) fn build_streaming_response(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+) -> std::result::Result<Response, axum::http::Error> {
     let mut builder = Response::builder().status(StatusCode::OK).header(
         "content-type",
         result
@@ -271,13 +295,7 @@ pub async fn proxy_fetch_streaming(
             .body
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
     );
-    builder.body(body).map_err(|e| {
-        map_proxy_error(
-            repo_key,
-            path,
-            crate::error::AppError::Internal(e.to_string()),
-        )
-    })
+    builder.body(body)
 }
 
 /// Fetch from upstream via the proxy service, returning a presigned redirect
@@ -3428,5 +3446,129 @@ mod tests {
         let result = virtual_member_fetch_strategy(&RepositoryType::Remote, false, true);
         assert_ne!(result, VirtualMemberFetchStrategy::Local);
         assert_eq!(result, VirtualMemberFetchStrategy::Skip);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_streaming_response: pure response builder used by
+    // proxy_fetch_streaming. Tests the new default_content_type fallback
+    // and Content-Length passthrough rules without a live upstream or
+    // storage backend. #895 review N2 / coverage gate.
+    // -----------------------------------------------------------------------
+
+    use crate::services::proxy_service::StreamingFetchResult;
+    use futures::stream::BoxStream;
+
+    fn empty_body() -> BoxStream<'static, crate::error::Result<bytes::Bytes>> {
+        Box::pin(futures::stream::iter(Vec::new()))
+    }
+
+    #[test]
+    fn test_build_streaming_response_uses_upstream_content_type_when_set() {
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/java-archive".to_string()),
+            content_length: None,
+        };
+        let response = build_streaming_response(result, "application/octet-stream")
+            .expect("response build must succeed");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/java-archive"),
+            "upstream-supplied content_type MUST win over default"
+        );
+    }
+
+    #[test]
+    fn test_build_streaming_response_falls_back_to_default_when_upstream_omits() {
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response =
+            build_streaming_response(result, "text/xml").expect("response build must succeed");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/xml"),
+            "missing upstream content_type MUST fall back to the per-handler default \
+             (Maven .pom -> text/xml, Go .zip -> application/zip, etc.) — the \
+             #895 review N2 regression-prevention contract"
+        );
+    }
+
+    #[test]
+    fn test_build_streaming_response_sets_content_length_when_upstream_advertises_it() {
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: Some(12345),
+        };
+        let response = build_streaming_response(result, "application/octet-stream").unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some("12345"),
+            "upstream Content-Length must round-trip to the outbound response \
+             so clients with strict length-checking (some old apt/wget toolchains) \
+             work as before"
+        );
+    }
+
+    #[test]
+    fn test_build_streaming_response_omits_content_length_when_upstream_does() {
+        // Chunked-transfer-encoding case: upstream omits Content-Length,
+        // outbound response also omits it so axum falls back to TE: chunked.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: None,
+        };
+        let response = build_streaming_response(result, "application/octet-stream").unwrap();
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "absent upstream Content-Length must NOT be replaced with a synthetic \
+             value (e.g. 0) — that would mis-advertise an empty body on a chunked \
+             response and break clients"
+        );
+    }
+
+    #[test]
+    fn test_build_streaming_response_status_is_200() {
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response = build_streaming_response(result, "application/octet-stream").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_streaming_response_default_is_used_verbatim() {
+        // Maven catch-all passes `content_type_for_path(path)` (which can
+        // return any of ~8 mime types). The builder must use the supplied
+        // string as-is, not lowercase / normalize / sniff.
+        let weird = "application/vnd.android.package-archive";
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response = build_streaming_response(result, weird).unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some(weird)
+        );
     }
 }
