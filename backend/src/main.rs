@@ -318,10 +318,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                  remain blocked. SSRF risk surface widened (issue #976)."
             );
         }
-    } else if matches!(
-        std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").as_deref(),
-        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE")
-    ) {
+    } else if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
         tracing::warn!(
             target: "security",
             "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \

@@ -270,9 +270,21 @@ fn private_ip_allowed(ip: std::net::IpAddr) -> bool {
             return cidr_list_contains(trimmed, ip);
         }
     }
-    std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
-        .unwrap_or(false)
+    upstream_allow_private_ips_enabled()
+}
+
+/// True when `UPSTREAM_ALLOW_PRIVATE_IPS` is set to a truthy value
+/// (`1`, `true`, case-insensitive). Exposed at crate level so `main.rs`
+/// can use the same parsing for the startup-log message and there is
+/// only one place to update if the accepted vocabulary changes.
+pub fn upstream_allow_private_ips_enabled() -> bool {
+    match std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS") {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Parse a comma-separated CIDR list and return true if `ip` lies in
@@ -311,10 +323,19 @@ fn cidr_contains(entry: &str, ip: std::net::IpAddr) -> std::result::Result<bool,
     };
     let net: std::net::IpAddr = addr_str.parse().map_err(|_| "invalid IP")?;
     // Bare-IP entries: match family and full address.
-    if prefix_str.is_none() {
+    let Some(prefix_str) = prefix_str else {
         return Ok(net == ip);
+    };
+    let prefix: u8 = prefix_str.parse().map_err(|_| "invalid prefix")?;
+    // Reject the all-matches prefix in the allowlist. Accepting it would
+    // silently widen the allowlist to every RFC1918 / ULA address, which
+    // defeats the point of a narrower allowlist over the blanket toggle
+    // and is almost always operator error (a copy-pasted 0.0.0.0/0 or
+    // ::/0 from a different config). Operators who genuinely want every
+    // private IP should set UPSTREAM_ALLOW_PRIVATE_IPS=true explicitly.
+    if prefix == 0 {
+        return Err("prefix 0 (all-IPs) is not permitted in the allowlist");
     }
-    let prefix: u8 = prefix_str.unwrap().parse().map_err(|_| "invalid prefix")?;
     match (net, ip) {
         (std::net::IpAddr::V4(net4), std::net::IpAddr::V4(ip4)) => {
             if prefix > 32 {
@@ -834,6 +855,11 @@ mod tests {
         assert_blocked_ip("http://100.100.100.200/latest/meta-data");
         // IPv4-mapped IPv6 bypass must also stay closed.
         assert_blocked_ip("http://[::ffff:169.254.169.254]/latest/meta-data");
+        // GCP IPv6 link-local metadata equivalent (fe80::a9fe:a9fe). The
+        // IPv6 link-local branch catches the whole fe80::/10, so this is
+        // already blocked, but pin the behaviour so a refactor cannot
+        // accidentally route this through the ULA allowlist branch.
+        assert_blocked_ip("http://[fe80::a9fe:a9fe]/latest/meta-data");
     }
 
     #[test]
@@ -964,9 +990,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_cidr_contains_prefix_zero_matches_everything() {
-        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4".parse().unwrap()).unwrap());
-        assert!(cidr_contains("::/0", "2606:4700::1".parse().unwrap()).unwrap());
+    fn test_cidr_contains_prefix_zero_rejected() {
+        // The allowlist must not accept a /0 entry. Accepting it would
+        // silently widen the allowlist to every RFC1918 / ULA address.
+        // Operators who genuinely want every private IP should use
+        // UPSTREAM_ALLOW_PRIVATE_IPS=true explicitly.
+        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4".parse().unwrap()).is_err());
+        assert!(cidr_contains("::/0", "2606:4700::1".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_cidr_allowlist_prefix_zero_does_not_widen_to_rfc1918() {
+        // End-to-end: an operator who pastes 0.0.0.0/0 into the allowlist
+        // must not accidentally exempt every RFC1918 address. The bad
+        // entry is logged + skipped, and the IP remains blocked unless
+        // matched by some other (well-formed) entry or by the blanket
+        // UPSTREAM_ALLOW_PRIVATE_IPS toggle.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "0.0.0.0/0");
+        assert_blocked_ip("http://10.0.0.5/x");
+        assert_blocked_ip("http://192.168.1.1/x");
     }
 
     #[test]
