@@ -171,6 +171,19 @@ pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
 ///   block. IPv6 own-properties (loopback, link-local, etc.) are
 ///   evaluated *first* so `::1` is correctly classified as IPv6 loopback
 ///   rather than IPv4 alias `0.0.0.1`.
+///
+/// Private-IP allowlist (issue #976): operators on corporate networks
+/// with no public internet may need to point upstreams at internal
+/// mirrors. Two opt-in escape hatches:
+///
+/// - `UPSTREAM_ALLOW_PRIVATE_IPS=true` — allow all RFC1918 + IPv6
+///   unique-local. Cloud metadata IPs (169.254.169.254, 192.0.0.192,
+///   100.100.100.200) and loopback / link-local / unspecified remain
+///   blocked, since those are SSRF targets, not "internal mirrors".
+/// - `UPSTREAM_PRIVATE_IP_ALLOWLIST=10.0.0.0/8,192.168.7.0/24` — more
+///   precise: only the listed CIDRs are exempted. Same metadata /
+///   loopback hard-blocks apply. Wins over the blanket toggle if both
+///   are set (allowlist is strictly more restrictive).
 pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -178,18 +191,31 @@ pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
-    if v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-    {
+/// IPs that remain blocked even when the private-IP allowlist is on.
+/// These are SSRF / metadata-server targets, not "internal mirrors".
+/// Operators who genuinely need to reach loopback or link-local from
+/// the server itself can run a local proxy on a non-loopback interface
+/// and point upstreams at that.
+fn is_hard_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() {
         return true;
     }
     let octets = v4.octets();
     if CLOUD_METADATA_IPS.contains(&octets) {
         return true;
+    }
+    false
+}
+
+fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    // Hard blocks first: metadata IPs and loopback are never unblocked
+    // by the private-IP allowlist toggle.
+    if is_hard_blocked_ipv4(v4) {
+        return true;
+    }
+    let octets = v4.octets();
+    if v4.is_private() {
+        return !private_ip_allowed(std::net::IpAddr::V4(v4));
     }
     if cgnat_block_enabled()
         && octets[0] == 100
@@ -211,7 +237,9 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
         return true;
     }
     if segs[0] & IPV6_UNIQUE_LOCAL_MASK == IPV6_UNIQUE_LOCAL_PREFIX {
-        return true;
+        // Unique-local (fc00::/7) is the IPv6 equivalent of RFC1918.
+        // Honor the same allowlist as IPv4 private addresses.
+        return !private_ip_allowed(std::net::IpAddr::V6(v6));
     }
     // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
     // forms must obey the IPv4 rules so attackers cannot bypass them
@@ -223,6 +251,101 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
         return is_blocked_ipv4(v4);
     }
     false
+}
+
+/// Whether the operator has opted the given private IP into the
+/// upstream allowlist. Returns false (i.e. block) by default. Order:
+///
+/// 1. If `UPSTREAM_PRIVATE_IP_ALLOWLIST` is set, only IPs inside one
+///    of those CIDRs are exempted. The blanket toggle is ignored.
+/// 2. Otherwise, `UPSTREAM_ALLOW_PRIVATE_IPS=true` exempts all
+///    RFC1918 + IPv6 unique-local addresses.
+///
+/// Metadata IPs and loopback are checked separately and are never
+/// reachable through this path (see `is_hard_blocked_ipv4`).
+fn private_ip_allowed(ip: std::net::IpAddr) -> bool {
+    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
+        let trimmed = list.trim();
+        if !trimmed.is_empty() {
+            return cidr_list_contains(trimmed, ip);
+        }
+    }
+    std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
+        .unwrap_or(false)
+}
+
+/// Parse a comma-separated CIDR list and return true if `ip` lies in
+/// any entry. Malformed entries are skipped with a warning so a typo
+/// in one CIDR does not silently widen the allowlist. Both `10.0.0.0/8`
+/// and a bare IP `10.1.2.3` are accepted (the latter as a /32 or /128).
+fn cidr_list_contains(list: &str, ip: std::net::IpAddr) -> bool {
+    for raw in list.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match cidr_contains(entry, ip) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(reason) => {
+                tracing::warn!(
+                    target: "security",
+                    cidr = entry,
+                    reason = %reason,
+                    "UPSTREAM_PRIVATE_IP_ALLOWLIST entry ignored (malformed)"
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Check a single CIDR entry. Accepts `a.b.c.d/N`, `a.b.c.d`, IPv6
+/// `xxxx::/N`, or `xxxx::`. Returns `Err` for malformed input so the
+/// caller can log it rather than silently dropping the entry.
+fn cidr_contains(entry: &str, ip: std::net::IpAddr) -> std::result::Result<bool, &'static str> {
+    let (addr_str, prefix_str) = match entry.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (entry, None),
+    };
+    let net: std::net::IpAddr = addr_str.parse().map_err(|_| "invalid IP")?;
+    // Bare-IP entries: match family and full address.
+    if prefix_str.is_none() {
+        return Ok(net == ip);
+    }
+    let prefix: u8 = prefix_str.unwrap().parse().map_err(|_| "invalid prefix")?;
+    match (net, ip) {
+        (std::net::IpAddr::V4(net4), std::net::IpAddr::V4(ip4)) => {
+            if prefix > 32 {
+                return Err("ipv4 prefix > 32");
+            }
+            Ok(ipv4_in_prefix(net4, ip4, prefix))
+        }
+        (std::net::IpAddr::V6(net6), std::net::IpAddr::V6(ip6)) => {
+            if prefix > 128 {
+                return Err("ipv6 prefix > 128");
+            }
+            Ok(ipv6_in_prefix(net6, ip6, prefix))
+        }
+        _ => Ok(false), // mixed family: never matches
+    }
+}
+
+fn ipv4_in_prefix(net: std::net::Ipv4Addr, ip: std::net::Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask: u32 = u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0);
+    (u32::from(net) & mask) == (u32::from(ip) & mask)
+}
+
+fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask: u128 = u128::MAX.checked_shl(128 - prefix as u32).unwrap_or(0);
+    (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
 /// Whether to block the entire `100.64.0.0/10` CGNAT range. Off by
@@ -629,5 +752,236 @@ mod tests {
     fn test_is_blocked_url_passes_public_address() {
         let url = reqwest::Url::parse("https://crates.io/api/v1/crates/serde").unwrap();
         assert!(is_blocked_url(&url).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #976: opt-in private-IP allowlist for upstream URLs.
+    // Tests serialize on ENV_LOCK because they mutate env vars.
+    // -----------------------------------------------------------------------
+
+    /// Take the env lock and snapshot any allowlist-related vars so the
+    /// test restores them on drop. Pattern matches `test_cgnat_block_when_opted_in`.
+    struct AllowlistGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_allow: Option<String>,
+        prev_list: Option<String>,
+    }
+
+    impl AllowlistGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let g = Self {
+                _lock: lock,
+                prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
+                prev_list: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
+            };
+            std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+            g
+        }
+    }
+
+    impl Drop for AllowlistGuard {
+        fn drop(&mut self) {
+            match &self.prev_allow {
+                Some(v) => std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", v),
+                None => std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS"),
+            }
+            match &self.prev_list {
+                Some(v) => std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", v),
+                None => std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_allow_private_ips_toggle_unblocks_rfc1918() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_url("http://10.0.0.5/x", "Upstream URL").is_ok(),
+            "10.0.0.5 must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
+        );
+        assert!(
+            validate_outbound_url("http://192.168.1.10/x", "Upstream URL").is_ok(),
+            "192.168.1.10 must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
+        );
+        assert!(
+            validate_outbound_url("http://172.16.5.5/x", "Upstream URL").is_ok(),
+            "172.16.5.5 must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_allow_private_ips_toggle_still_blocks_loopback() {
+        // The point of allowing private IPs is internal mirrors. Loopback
+        // is the server itself; opening it would re-introduce SSRF to
+        // localhost services (admin endpoints, etc.).
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert_blocked_ip("http://127.0.0.1:9090");
+        assert_blocked_ip("http://[::1]:8080/api");
+    }
+
+    #[test]
+    fn test_allow_private_ips_toggle_still_blocks_metadata() {
+        // AWS / Oracle / Alibaba metadata IPs are the canonical SSRF
+        // target. They must NEVER be unblocked, even with the toggle.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert_blocked_ip("http://169.254.169.254/latest/meta-data");
+        assert_blocked_ip("http://192.0.0.192/opc/v2/instance");
+        assert_blocked_ip("http://100.100.100.200/latest/meta-data");
+        // IPv4-mapped IPv6 bypass must also stay closed.
+        assert_blocked_ip("http://[::ffff:169.254.169.254]/latest/meta-data");
+    }
+
+    #[test]
+    fn test_allow_private_ips_still_blocks_link_local() {
+        // 169.254.0.0/16 is link-local. Even with private IPs allowed,
+        // link-local must stay blocked because it overlaps the AWS
+        // metadata IP and is rarely a legitimate mirror target.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert_blocked_ip("http://169.254.5.5/x");
+    }
+
+    #[test]
+    fn test_allow_private_ips_off_by_default() {
+        // Issue #976 reporter's exact case: 10.0.0.0 with no env vars
+        // set must still be rejected (default-deny).
+        let _g = AllowlistGuard::new();
+        assert_blocked_ip("http://10.0.0.0/x");
+    }
+
+    #[test]
+    fn test_allow_private_ips_unknown_value_treated_as_off() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "maybe");
+        assert_blocked_ip("http://10.0.0.5/x");
+    }
+
+    #[test]
+    fn test_allow_private_ipv6_unique_local() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_url("http://[fc00::1]/x", "Upstream URL").is_ok(),
+            "fc00::1 (ULA) must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_cidr_allowlist_exact_match() {
+        // Single explicit /32 host: only that one address is exempted.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "192.168.7.10/32");
+        assert!(validate_outbound_url("http://192.168.7.10/x", "Upstream URL").is_ok());
+        assert_blocked_ip("http://192.168.7.11/x");
+        assert_blocked_ip("http://10.0.0.1/x");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_subnet_match() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "10.0.0.0/8");
+        assert!(validate_outbound_url("http://10.0.0.1/x", "Upstream URL").is_ok());
+        assert!(validate_outbound_url("http://10.255.255.254/x", "Upstream URL").is_ok());
+        // Outside the allowlist subnet but still RFC1918 — still blocked.
+        assert_blocked_ip("http://192.168.1.1/x");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_takes_precedence_over_blanket_toggle() {
+        // If both are set, the allowlist wins because it is strictly
+        // narrower. This must hold so an operator who tightens from
+        // "all private" to "just these CIDRs" actually sees the change.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "10.50.0.0/16");
+        assert!(validate_outbound_url("http://10.50.1.2/x", "Upstream URL").is_ok());
+        // 192.168.x is private but NOT in the allowlist. The narrower
+        // list must win over the blanket toggle.
+        assert_blocked_ip("http://192.168.1.1/x");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_still_blocks_metadata_ip_in_range() {
+        // 169.254.169.254 is link-local. Even if an operator
+        // accidentally adds 169.254.0.0/16 to the allowlist, the
+        // metadata IP must NOT be reachable (it is hard-blocked, not
+        // gated through the allowlist).
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "169.254.0.0/16");
+        assert_blocked_ip("http://169.254.169.254/latest/meta-data");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_malformed_entries_ignored() {
+        // A typo in one entry must not silently widen the allowlist nor
+        // crash. The good entry still works; the bad one is skipped.
+        let _g = AllowlistGuard::new();
+        std::env::set_var(
+            "UPSTREAM_PRIVATE_IP_ALLOWLIST",
+            "not-an-ip, 10.0.0.0/77, 192.168.7.0/24",
+        );
+        assert!(validate_outbound_url("http://192.168.7.5/x", "Upstream URL").is_ok());
+        assert_blocked_ip("http://10.0.0.1/x");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_empty_string_treated_as_unset() {
+        // An empty / whitespace-only allowlist must not be confused for
+        // "block everything"; it should fall through to the blanket
+        // toggle (or default-deny if that's also off).
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "   ");
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(validate_outbound_url("http://10.0.0.5/x", "Upstream URL").is_ok());
+    }
+
+    #[test]
+    fn test_cidr_allowlist_ipv6_subnet() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "fd00::/8");
+        assert!(validate_outbound_url("http://[fd12::1]/x", "Upstream URL").is_ok());
+        // fc00::1 is in fc00::/7 but NOT in fd00::/8 (the second hex
+        // nibble differs). Must still be blocked.
+        assert_blocked_ip("http://[fc00::1]/x");
+    }
+
+    #[test]
+    fn test_cidr_allowlist_bare_ip_entry() {
+        // Bare-IP entries (no /N) act like /32 (IPv4) or /128 (IPv6).
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "10.0.0.1");
+        assert!(validate_outbound_url("http://10.0.0.1/x", "Upstream URL").is_ok());
+        assert_blocked_ip("http://10.0.0.2/x");
+    }
+
+    // -----------------------------------------------------------------------
+    // CIDR helper unit tests (cidr_contains, prefix-math edge cases).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cidr_contains_prefix_zero_matches_everything() {
+        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4".parse().unwrap()).unwrap());
+        assert!(cidr_contains("::/0", "2606:4700::1".parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn test_cidr_contains_mixed_family_never_matches() {
+        // An IPv4 entry must not match an IPv6 query and vice versa,
+        // otherwise an operator listing 10.0.0.0/8 would also exempt
+        // ::ffff:10.0.0.1 — already covered separately, but pinning
+        // the helper contract guards against accidental fix-by-removal.
+        assert!(!cidr_contains("10.0.0.0/8", "::1".parse().unwrap()).unwrap());
+        assert!(!cidr_contains("fc00::/7", "10.0.0.1".parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn test_cidr_contains_invalid_prefix_returns_error() {
+        assert!(cidr_contains("10.0.0.0/40", "10.0.0.1".parse().unwrap()).is_err());
+        assert!(cidr_contains("fc00::/200", "fc00::1".parse().unwrap()).is_err());
     }
 }

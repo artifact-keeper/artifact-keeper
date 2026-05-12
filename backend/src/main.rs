@@ -302,6 +302,35 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
 
+    // Issue #976: surface the upstream private-IP allowlist at boot so the
+    // posture is obvious in startup logs. Metadata IPs remain blocked
+    // unconditionally; the validator handles that. The warning is loud
+    // because relaxing the SSRF guard is a security tradeoff the operator
+    // owns.
+    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
+        let trimmed = list.trim();
+        if !trimmed.is_empty() {
+            tracing::warn!(
+                target: "security",
+                allowlist = %trimmed,
+                "UPSTREAM_PRIVATE_IP_ALLOWLIST is set; upstream URLs may now \
+                 target listed private CIDRs. Cloud metadata IPs and loopback \
+                 remain blocked. SSRF risk surface widened (issue #976)."
+            );
+        }
+    } else if matches!(
+        std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").as_deref(),
+        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE")
+    ) {
+        tracing::warn!(
+            target: "security",
+            "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \
+             RFC1918 / unique-local addresses. Cloud metadata IPs and loopback \
+             remain blocked. Prefer UPSTREAM_PRIVATE_IP_ALLOWLIST with explicit \
+             CIDRs for a narrower SSRF surface (issue #976)."
+        );
+    }
+
     // Create primary storage backend based on STORAGE_BACKEND config
     let primary_storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = match config
         .storage_backend
@@ -310,6 +339,21 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "s3" => {
             let s3 = artifact_keeper_backend::storage::s3::S3Backend::from_env().await?;
             tracing::info!("S3 storage backend initialized");
+            // Issue #981: run a single connectivity probe so users see
+            // the root cause (TLS, DNS, 403, region mismatch) at boot
+            // instead of "storage probe timed out" minutes later in a
+            // health log. Probe failure is a *warning* only: the user's
+            // setup may rely on lazy bucket-creation or an offline boot
+            // sequence, so we do not refuse to start.
+            match s3.startup_probe().await {
+                Ok(()) => tracing::info!("S3 connectivity probe succeeded"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "S3 connectivity probe failed at startup; the service will \
+                     continue starting but storage operations may fail until \
+                     this is fixed (issue #981)"
+                ),
+            }
             Arc::new(s3)
         }
         "azure" => {

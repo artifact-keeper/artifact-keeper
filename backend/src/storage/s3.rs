@@ -288,6 +288,92 @@ fn anonymous_s3_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Classify an `object_store::Error` from S3 into a human-readable
+/// diagnostic. Used by both the runtime `health_check` and the boot
+/// `startup_probe` so the operator sees the same actionable message in
+/// `/health` and in startup logs. Recognized cases (issue #981):
+///
+/// - **TLS / cert errors**: typically misconfigured `S3_ENDPOINT`
+///   (https against a host serving a self-signed cert or a different
+///   CN). Suggests `S3_CA_CERT_PATH` or `S3_INSECURE_TLS=true`.
+/// - **DNS / "no such host"**: the endpoint hostname does not resolve.
+/// - **Connection refused / timeout / unreachable**: network path
+///   broken or the wrong port.
+/// - **403 / Access Denied**: credentials present but lack the bucket
+///   permissions.
+/// - **404 / NoSuchBucket**: bucket name typo or wrong region.
+/// - **Region mismatch**: `BucketRegionError` or PermanentRedirect.
+/// - **Signature mismatch**: clock skew or wrong secret.
+///
+/// The original error string is appended as `caused by:` so the full
+/// message is still searchable in the logs.
+pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
+    let raw = err.to_string();
+    let l = raw.to_lowercase();
+
+    let category = if l.contains("certificate")
+        || l.contains("tls")
+        || l.contains("self-signed")
+        || l.contains("self signed")
+        || l.contains("unknownissuer")
+        || l.contains("invalidcertificate")
+    {
+        "S3 TLS / certificate error. The endpoint's certificate is not \
+         trusted by the container. Either mount a CA bundle and set \
+         S3_CA_CERT_PATH=/path/to/ca.pem, or (only for trusted internal \
+         networks) set S3_INSECURE_TLS=true. See docs at \
+         https://artifactkeeper.com/docs/deployment/s3 (issue #981)."
+    } else if l.contains("dns")
+        || l.contains("no such host")
+        || l.contains("name or service not known")
+        || l.contains("nodename nor servname")
+    {
+        "S3 DNS resolution failed. S3_ENDPOINT hostname does not resolve \
+         from inside the container. Check CoreDNS, /etc/resolv.conf, and \
+         the spelling of S3_ENDPOINT."
+    } else if l.contains("connection refused") {
+        "S3 connection refused. The endpoint host is up but nothing is \
+         listening on the configured port. Verify S3_ENDPOINT scheme and \
+         port (e.g. https://s3.example.com:9000) match the actual \
+         service."
+    } else if l.contains("network unreachable")
+        || l.contains("no route to host")
+        || l.contains("host unreachable")
+    {
+        "S3 network unreachable. No route from the container to the \
+         endpoint. Likely a NetworkPolicy, firewall, or egress rule."
+    } else if l.contains("timeout") || l.contains("timed out") {
+        "S3 connection timed out. Endpoint dropped packets or is behind \
+         a stalled proxy. If you use a custom CA, also confirm S3_CA_CERT_PATH \
+         is set so TLS does not fall back to system trust."
+    } else if l.contains("403") || l.contains("access denied") || l.contains("forbidden") {
+        "S3 access denied (403). Credentials are reaching the endpoint \
+         but lack permission on the bucket. Confirm S3_BUCKET, the IAM \
+         policy / bucket policy, and that S3_ACCESS_KEY_ID matches the \
+         intended principal."
+    } else if l.contains("nosuchbucket")
+        || (l.contains("404") && l.contains("bucket"))
+        || l.contains("the specified bucket does not exist")
+    {
+        "S3 bucket not found. Confirm S3_BUCKET exists and the region \
+         (S3_REGION) is correct for that bucket."
+    } else if l.contains("bucketregionerror")
+        || l.contains("permanentredirect")
+        || (l.contains("301") && l.contains("region"))
+    {
+        "S3 region mismatch. S3_REGION does not match the bucket's actual \
+         region. Set S3_REGION to the region the bucket lives in."
+    } else if l.contains("signaturedoesnotmatch") || l.contains("invalidaccesskeyid") {
+        "S3 signature rejected. Either S3_SECRET_ACCESS_KEY is wrong, or \
+         the container clock is skewed by more than 15 minutes from the \
+         S3 server (AWS SigV4 rejects skewed signatures)."
+    } else {
+        "S3 request failed"
+    };
+
+    format!("{}. caused by: {}", category, raw)
+}
+
 /// Generate the full S3 key with optional prefix.
 fn make_full_key(prefix: Option<&str>, key: &str) -> String {
     match prefix {
@@ -490,6 +576,38 @@ impl S3Backend {
              deployments and causes every storage request to time out (issue #871)."
                 .to_string(),
         ))
+    }
+
+    /// Run a startup connectivity probe so the operator sees the root
+    /// cause (TLS, DNS, connection refused, 403, ...) at boot instead of
+    /// a generic "storage probe timed out" 30 minutes later in a health
+    /// log. The probe is a single HEAD against a synthetic key; both
+    /// "object missing" and a successful HEAD count as connectivity OK.
+    ///
+    /// Failures are returned as `AppError::Storage` with a human-readable
+    /// diagnostic from [`classify_s3_error`]. Callers in `main.rs` choose
+    /// whether to fail-fast or warn-and-continue.
+    pub async fn startup_probe(&self) -> Result<()> {
+        // 10s is generous compared to the 5s health-endpoint budget, since
+        // a first-time TCP + TLS handshake against a slow corporate proxy
+        // can legitimately exceed 5s.
+        let probe = async {
+            let path: ObjectPath = ".health-probe".into();
+            self.store.head(&path).await
+        };
+        match tokio::time::timeout(Duration::from_secs(10), probe).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(object_store::Error::NotFound { .. })) => Ok(()),
+            Ok(Err(e)) => Err(AppError::Storage(classify_s3_error(&e))),
+            Err(_) => Err(AppError::Storage(
+                "S3 connectivity probe timed out after 10s. Network unreachable, \
+                 DNS resolution failed, or endpoint is dropping packets. Verify \
+                 S3_ENDPOINT is reachable from inside the container: \
+                 `kubectl exec -it <pod> -- curl -v $S3_ENDPOINT`. If TLS is \
+                 involved, also check the cert chain (issue #981)."
+                    .to_string(),
+            )),
+        }
     }
 
     /// Create new S3 backend from configuration
@@ -824,17 +942,7 @@ impl super::StorageBackend for S3Backend {
         match self.store.head(&path).await {
             Ok(_) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("Access Denied") {
-                    Err(AppError::Storage(format!(
-                        "S3 health check failed: access denied: {}",
-                        e
-                    )))
-                } else {
-                    Err(AppError::Storage(format!("S3 health check failed: {}", e)))
-                }
-            }
+            Err(e) => Err(AppError::Storage(classify_s3_error(&e))),
         }
     }
 
@@ -2514,6 +2622,122 @@ mod tests {
         let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
         // Not asserting success because the mock may not perfectly satisfy
         // the object_store S3 multi-delete protocol, but the branch is exercised.
+    }
+
+    // ---- classify_s3_error: issue #981 diagnostic classifier ----
+    //
+    // These tests synthesize `object_store::Error::Generic` because the
+    // real error shapes (TLS, DNS, ...) are produced deep inside reqwest
+    // and not constructible in unit tests. The classifier only inspects
+    // the display string, so a Generic with the right source text
+    // covers every branch.
+
+    fn generic_err(msg: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: msg.to_string().into(),
+        }
+    }
+
+    #[test]
+    fn test_classify_tls_certificate_error() {
+        let e = generic_err("invalid peer certificate: UnknownIssuer");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("TLS / certificate error"), "got: {msg}");
+        assert!(
+            msg.contains("S3_CA_CERT_PATH"),
+            "must suggest CA bundle: {msg}"
+        );
+        assert!(msg.contains("caused by:"), "must keep raw source: {msg}");
+    }
+
+    #[test]
+    fn test_classify_self_signed_error() {
+        let e = generic_err("error: self-signed certificate");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("TLS / certificate error"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_dns_error() {
+        let e = generic_err("dns error: no such host (s3.invalid.example)");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("DNS resolution failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_connection_refused() {
+        let e = generic_err("error sending request: connection refused");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("connection refused"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_network_unreachable() {
+        let e = generic_err("network unreachable");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("network unreachable"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_timeout() {
+        // Mirrors the exact `transport error of kind Timeout` log line
+        // in issue #981.
+        let e = generic_err("Encountered transport error of kind Timeout");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(
+            msg.contains("S3_CA_CERT_PATH"),
+            "should mention CA fallback hint for timeout: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied_403() {
+        let e = generic_err("Client error with status 403 Forbidden: Access Denied");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("access denied (403)"), "got: {msg}");
+        assert!(
+            msg.contains("S3_BUCKET"),
+            "must reference IAM/bucket policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_no_such_bucket() {
+        let e = generic_err("NoSuchBucket: The specified bucket does not exist");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("bucket not found"), "got: {msg}");
+        assert!(msg.contains("S3_REGION"), "must mention region: {msg}");
+    }
+
+    #[test]
+    fn test_classify_region_mismatch() {
+        let e = generic_err("BucketRegionError: bucket is in us-west-2");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("region mismatch"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_signature_mismatch() {
+        let e = generic_err("SignatureDoesNotMatch: clock skew");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("signature rejected"), "got: {msg}");
+        assert!(msg.contains("clock"), "must mention clock skew: {msg}");
+    }
+
+    #[test]
+    fn test_classify_unknown_error_fallthrough() {
+        // An unrecognized error must NOT be misclassified into a wrong
+        // bucket; it should fall through to the generic "S3 request
+        // failed" label and still preserve the raw source.
+        let e = generic_err("some entirely new failure mode");
+        let msg = classify_s3_error(&e);
+        assert!(msg.starts_with("S3 request failed"), "got: {msg}");
+        assert!(
+            msg.contains("some entirely new failure mode"),
+            "must keep raw text: {msg}"
+        );
     }
 }
 
