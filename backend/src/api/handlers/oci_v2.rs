@@ -4958,8 +4958,7 @@ mod token_lockout_regression_tests {
             .await
             .expect("update password_hash");
 
-        let storage_dir =
-            std::env::temp_dir().join(format!("oci-pwd-fallback-{}", Uuid::new_v4()));
+        let storage_dir = std::env::temp_dir().join(format!("oci-pwd-fallback-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
 
