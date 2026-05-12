@@ -115,20 +115,14 @@ impl ImageScanner {
     }
 
     /// Extract an image reference from the artifact path.
-    /// OCI paths look like: v2/<name>/manifests/<reference>
+    /// OCI paths look like: v2/<name>/manifests/<reference>. Parsing is
+    /// shared with `GrypeScanner::build_registry_image_ref` via
+    /// `parse_oci_manifest_path` so both scanners agree on what counts as
+    /// a well-formed image artifact (#1160).
     fn extract_image_ref(artifact: &Artifact) -> Option<String> {
-        let path = artifact.path.trim_start_matches('/');
-        if let Some(rest) = path.strip_prefix("v2/") {
-            // v2/<name>/manifests/<ref>
-            if let Some(idx) = rest.find("/manifests/") {
-                let name = &rest[..idx];
-                let reference = &rest[idx + "/manifests/".len()..];
-                if !name.is_empty() && !reference.is_empty() {
-                    return Some(format!("{}:{}", name, reference));
-                }
-            }
-        }
-        None
+        let (name, reference) =
+            crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+        Some(format!("{}:{}", name, reference))
     }
 
     /// Number of `/healthz` attempts before declaring the Trivy server down.

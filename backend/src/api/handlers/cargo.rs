@@ -1098,6 +1098,17 @@ async fn try_remote_index(
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
 /// resolution honours `index_upstream_url` config overrides for the proxy
 /// URL, which the shared helper does not know about.
+///
+/// Aggregation semantics (matches helm/conda/cran/rubygems and #1143):
+///
+/// * Visit every member in priority order rather than stopping at the first
+///   member that has data. A virtual cargo repo with both a Local fork and a
+///   Remote upstream must surface versions from both, not just the first.
+/// * Within a single response, dedupe NDJSON entries by `(name, vers)`. When
+///   the same `(name, vers)` appears in more than one member, the entry from
+///   the higher-priority member (earlier in the iteration order) wins, which
+///   matches the artifact-listing precedence used elsewhere.
+#[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1142,7 +1153,13 @@ async fn try_virtual_index(
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
-    // Iterate members in priority order. For each member, pick the lookup
+    // Accumulate NDJSON entries across all members. Use a LinkedHashMap-style
+    // ordered set keyed by version so that:
+    //   * iteration order = first-seen order = priority order;
+    //   * a `(name, vers)` already inserted by a higher-priority member is
+    //     not overwritten by a lower-priority member's entry.
+    //
+    // Visit every member in priority order. For each member, pick the lookup
     // strategy that matches its type:
     //
     // * Remote members go straight through the proxy (ProxyService consults
@@ -1157,7 +1174,18 @@ async fn try_virtual_index(
     // * Local and Staging members have no proxy cache; the artifacts table is
     //   the authoritative source for the crates they host. We build the index
     //   from their rows exactly as we do for the top-level hosted case.
-    for member in &members {
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Visit non-Remote (Local/Staging) members before Remote members so a
+    // locally-published crate version cannot be shadowed by an upstream
+    // entry of the same `(name, vers)`. This mirrors the supply-chain
+    // protection applied to Hex package_info in this same PR (#973) and
+    // closes the gap where a Remote member configured at higher priority
+    // could pre-empt a Local member's authoritative entry.
+    let ordered_members = order_members_local_first(&members);
+
+    for member in ordered_members {
         match member.repo_type {
             RepositoryType::Remote => {
                 let (Some(proxy), Some(upstream_url)) =
@@ -1166,12 +1194,10 @@ async fn try_virtual_index(
                     continue;
                 };
 
-                let base_url = index_url_overrides
-                    .get(&member.id)
-                    .cloned()
-                    .unwrap_or_else(|| upstream_url.clone());
+                let base_url =
+                    resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
 
-                if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch(
                     proxy,
                     member.id,
                     &member.key,
@@ -1180,8 +1206,7 @@ async fn try_virtual_index(
                 )
                 .await
                 {
-                    index_cache_set(index_cache, cache_key.to_string(), content.clone());
-                    return Some(Ok(index_response(content, content_type)));
+                    merge_index_lines(&content, &mut aggregated, &mut seen_versions);
                 }
             }
             RepositoryType::Local | RepositoryType::Staging => {
@@ -1193,6 +1218,7 @@ async fn try_virtual_index(
                     LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
                     WHERE a.repository_id = $1
                       AND a.name = $2
+                      AND a.version IS NOT NULL
                       AND a.is_deleted = false
                     ORDER BY a.created_at ASC
                     "#,
@@ -1206,23 +1232,15 @@ async fn try_virtual_index(
                     Vec::new()
                 });
 
-                if !rows.is_empty() {
-                    let lines: Vec<String> = rows
-                        .iter()
-                        .map(|row| {
-                            let vers: Option<String> = row.get("version");
-                            let vers = vers.as_deref().unwrap_or("0.0.0");
-                            let cksum: String = row.get("checksum_sha256");
-                            let meta: Option<serde_json::Value> = row.get("metadata");
-                            build_index_entry(name_lower, vers, &cksum, meta.as_ref())
-                        })
-                        .collect();
-                    let body = bytes::Bytes::from(lines.join("\n"));
-                    index_cache_set(index_cache, cache_key.to_string(), body.clone());
-                    return Some(Ok(index_response(
-                        body,
-                        Some("application/json".to_string()),
-                    )));
+                for row in &rows {
+                    let vers: Option<String> = row.get("version");
+                    let Some(vers) = vers else { continue };
+                    if !seen_versions.insert(vers.clone()) {
+                        continue;
+                    }
+                    let cksum: String = row.get("checksum_sha256");
+                    let meta: Option<serde_json::Value> = row.get("metadata");
+                    aggregated.push(build_index_entry(name_lower, &vers, &cksum, meta.as_ref()));
                 }
             }
             RepositoryType::Virtual => {
@@ -1233,10 +1251,114 @@ async fn try_virtual_index(
         }
     }
 
-    Some(Err(AppError::NotFound(
-        "Artifact not found in any member repository".to_string(),
-    )
-    .into_response()))
+    finalize_virtual_index_aggregation(aggregated).map(|maybe_body| match maybe_body {
+        Ok(body) => {
+            index_cache_set(index_cache, cache_key.to_string(), body.clone());
+            Ok(index_response(body, Some("application/json".to_string())))
+        }
+        Err(resp) => Err(resp),
+    })
+}
+
+/// Order virtual repo members so non-Remote members come before Remote
+/// members, preserving the original priority ordering within each group.
+///
+/// Pure function so the supply-chain-shadowing rule can be unit-tested
+/// without standing up a real virtual-repo configuration. Non-Remote-first
+/// ordering prevents an upstream from shadowing a locally-published crate
+/// version even when the admin configures the Remote member at a higher
+/// raw priority than the Local member (#1143).
+///
+/// Matches the equivalent helper in `hex.rs` so the two formats apply the
+/// same supply-chain protection. Keeping a local copy (rather than sharing
+/// via `proxy_helpers`) avoids cross-module churn for a 6-line function;
+/// the followup to consolidate is tracked in the review notes.
+fn order_members_local_first(
+    members: &[crate::models::repository::Repository],
+) -> Vec<&crate::models::repository::Repository> {
+    let mut ordered: Vec<&crate::models::repository::Repository> =
+        Vec::with_capacity(members.len());
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote),
+    );
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote),
+    );
+    ordered
+}
+
+/// Pick the upstream base URL to use when fetching a virtual member's
+/// sparse-index NDJSON. An entry in `repository_config.index_upstream_url`
+/// overrides the member's primary `upstream_url`, so an admin can point
+/// e.g. a github.com Cargo registry at a separate index host without
+/// editing the artifact upstream. Pure to keep tested without DB.
+fn resolve_remote_index_base_url(
+    overrides: &HashMap<uuid::Uuid, String>,
+    member_id: uuid::Uuid,
+    fallback_upstream_url: &str,
+) -> String {
+    overrides
+        .get(&member_id)
+        .cloned()
+        .unwrap_or_else(|| fallback_upstream_url.to_string())
+}
+
+/// Decide what `try_virtual_index` should return given the aggregated
+/// NDJSON lines collected from every member. Returns `Some(Ok(body))`
+/// when there are entries to serve, `Some(Err(404 response))` when no
+/// member contributed anything. Returning `None` is reserved for the
+/// "skip the virtual path entirely" pre-check before aggregation; this
+/// helper does not produce it.
+#[allow(clippy::result_large_err)]
+fn finalize_virtual_index_aggregation(aggregated: Vec<String>) -> Option<Result<Bytes, Response>> {
+    if aggregated.is_empty() {
+        return Some(Err(AppError::NotFound(
+            "Artifact not found in any member repository".to_string(),
+        )
+        .into_response()));
+    }
+    Some(Ok(Bytes::from(aggregated.join("\n"))))
+}
+
+/// Merge sparse-index NDJSON lines from one member into the running
+/// aggregate, skipping any line whose `vers` field has already been
+/// contributed by a higher-priority member. Lines that fail to parse as
+/// JSON or are missing `vers` are preserved at the cost of dedup so the
+/// client still sees them, matching the helm/conda merge behaviour for
+/// malformed upstream data.
+fn merge_index_lines(
+    content: &[u8],
+    aggregated: &mut Vec<String>,
+    seen_versions: &mut std::collections::HashSet<String>,
+) {
+    let text = match std::str::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("vers").and_then(|x| x.as_str()).map(String::from))
+        {
+            Some(vers) => {
+                if seen_versions.insert(vers) {
+                    aggregated.push(line.to_string());
+                }
+            }
+            None => {
+                // Unparseable line: keep it so we don't silently drop data,
+                // but don't track it in the dedup set.
+                aggregated.push(line.to_string());
+            }
+        }
+    }
 }
 
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
@@ -1391,6 +1513,207 @@ mod tests {
             "links": null,
             "rust_version": "1.70.0"
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_index_lines (virtual repo NDJSON aggregation, #1143)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_index_lines_first_member_wins_on_collision() {
+        // Local member already contributed serde 1.0.0; the upstream's
+        // serde 1.0.0 line must not overwrite it. Higher-priority
+        // member's `cksum` is preserved.
+        let mut aggregated: Vec<String> =
+            vec![r#"{"name":"serde","vers":"1.0.0","cksum":"LOCAL"}"#.to_string()];
+        let mut seen: std::collections::HashSet<String> =
+            ["1.0.0".to_string()].into_iter().collect();
+        let upstream = b"{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"UPSTREAM\"}\n{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"UPSTREAM\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        // 1.0.0 stays as LOCAL, 1.0.1 added from upstream.
+        assert_eq!(aggregated.len(), 2);
+        assert!(aggregated[0].contains("LOCAL"));
+        assert!(aggregated[1].contains("1.0.1"));
+        assert!(seen.contains("1.0.0"));
+        assert!(seen.contains("1.0.1"));
+    }
+
+    #[test]
+    fn test_merge_index_lines_skips_blank_lines() {
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"\n\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}\n\n";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_index_lines_keeps_unparseable_lines() {
+        // A malformed NDJSON line (not JSON, no `vers`) is preserved
+        // verbatim so we don't silently drop upstream data.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"not-json\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0], "not-json");
+    }
+
+    #[test]
+    fn test_merge_index_lines_handles_invalid_utf8() {
+        // A non-UTF-8 body is a no-op rather than a panic.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80];
+        merge_index_lines(&bytes, &mut aggregated, &mut seen);
+        assert!(aggregated.is_empty());
+        assert!(seen.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_remote_index_base_url (#1143)
+    //
+    // Pure helper for the virtual-index Remote-member path: picks the
+    // `repository_config.index_upstream_url` override when present, else
+    // falls back to the member's primary `upstream_url`. Exercising it
+    // directly avoids spinning up a DB just to verify the precedence
+    // table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_remote_index_base_url_uses_override_when_present() {
+        let id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://override.example/index");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_falls_back_to_upstream_when_no_override() {
+        let id = uuid::Uuid::new_v4();
+        let overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_override_only_applies_to_matching_member() {
+        // Override is registered for *another* member's id; the current
+        // member should still get its primary upstream URL.
+        let target_id = uuid::Uuid::new_v4();
+        let other_id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(other_id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, target_id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    // -----------------------------------------------------------------------
+    // finalize_virtual_index_aggregation (#1143)
+    //
+    // Decides between an aggregated NDJSON body and a 404 when no member
+    // contributed any line. The pre-cache step happens in the caller so
+    // this helper is purely a body-or-not-found decision.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_body_when_lines_present() {
+        let lines = vec![
+            r#"{"name":"foo","vers":"1.0.0"}"#.to_string(),
+            r#"{"name":"foo","vers":"1.0.1"}"#.to_string(),
+        ];
+        let out = finalize_virtual_index_aggregation(lines)
+            .expect("Some(_) when called from aggregation path");
+        let body = out.expect("Ok(body) when lines were aggregated");
+        // Lines are joined with `\n` (no trailing newline added).
+        let text = std::str::from_utf8(&body).expect("utf-8 NDJSON");
+        assert!(text.contains("1.0.0"));
+        assert!(text.contains("1.0.1"));
+        assert!(text.contains('\n'));
+    }
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_404_when_empty() {
+        let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
+        let resp = out.expect_err("empty aggregation must surface as 404");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // order_members_local_first (cargo virtual-index shadowing guard, #1143)
+    //
+    // Mirrors the equivalent hex.rs tests: Local/Staging members must
+    // precede Remote members in the iteration so a Remote-hosted crate
+    // version cannot pre-empt a locally-published `(name, vers)`.
+    // -----------------------------------------------------------------------
+
+    fn make_cargo_member(
+        repo_type: RepositoryType,
+        key: &str,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Cargo,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: String::new(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_puts_local_before_remote() {
+        // Admin configured Remote at higher raw priority. The helper must
+        // still surface Local first so an upstream `serde 1.0.0` cannot
+        // shadow a locally-published `serde 1.0.0`.
+        let m1 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m2 = make_cargo_member(RepositoryType::Local, "internal-fork");
+        let members = vec![m1, m2];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "internal-fork");
+        assert_eq!(ordered[1].key, "crates-io");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_preserves_within_group_order() {
+        // Within each group, original input order is preserved so
+        // configured priority still matters when there is no shadowing
+        // conflict to resolve.
+        let m1 = make_cargo_member(RepositoryType::Staging, "stage");
+        let m2 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m3 = make_cargo_member(RepositoryType::Local, "fork");
+        let m4 = make_cargo_member(RepositoryType::Remote, "mirror");
+        let members = vec![m1, m2, m3, m4];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "stage");
+        assert_eq!(ordered[1].key, "fork");
+        assert_eq!(ordered[2].key, "crates-io");
+        assert_eq!(ordered[3].key, "mirror");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_empty_input() {
+        let members: Vec<crate::models::repository::Repository> = Vec::new();
+        let ordered = order_members_local_first(&members);
+        assert!(ordered.is_empty());
     }
 
     // -----------------------------------------------------------------------

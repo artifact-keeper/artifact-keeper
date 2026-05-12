@@ -397,6 +397,27 @@ impl<'a> DebianProxy<'a> {
         content_type: &'static str,
         repo: &RepoInfo,
     ) -> Result<(), Response> {
+        // Virtual repos: try each Remote member in priority order so a
+        // virtual APT repo can serve dists metadata when its top-level
+        // type is `virtual` (#1147). Local/Staging members produce
+        // their dists metadata locally, handled by the caller's
+        // post-`dists()` fallthrough, so we only need to handle Remote.
+        if repo.repo_type == RepositoryType::Virtual {
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            if let Some(resp) = try_virtual_dists(
+                self.state,
+                repo.id,
+                self.repo_key,
+                &upstream_path,
+                content_type,
+            )
+            .await?
+            {
+                return Err(resp);
+            }
+            return Ok(());
+        }
+
         if repo.repo_type != RepositoryType::Remote {
             return Ok(());
         }
@@ -408,15 +429,210 @@ impl<'a> DebianProxy<'a> {
         let (content, upstream_ct) =
             proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
                 .await?;
-        Err(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                upstream_ct.unwrap_or_else(|| content_type.to_string()),
+        Err(build_dists_response(content, upstream_ct, content_type))
+    }
+
+    /// Variant of `dists` that also detects whether the upstream content
+    /// changed since the last cached copy. When it has, sibling Packages
+    /// caches under the same distribution are invalidated so subsequent
+    /// `apt-get update` requests refetch them and the Release SHA-256
+    /// list matches what apt sees (#1147).
+    ///
+    /// Used by the Release / InRelease handlers, where stale Packages
+    /// caches manifest as `Hash Sum mismatch` errors on the client.
+    async fn dists_detecting_change(
+        &self,
+        suffix: &str,
+        content_type: &'static str,
+        repo: &RepoInfo,
+    ) -> Result<(), Response> {
+        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+
+        // Virtual: iterate Remote members. Whichever member serves the
+        // Release also owns the sibling Packages caches we may need to
+        // invalidate, so we run the change-detection probe against that
+        // specific member before returning.
+        if repo.repo_type == RepositoryType::Virtual {
+            if let Some(resp) = try_virtual_dists_detecting_change(
+                self.state,
+                repo.id,
+                self.repo_key,
+                self.distribution,
+                &upstream_path,
+                content_type,
             )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap())
+            .await?
+            {
+                return Err(resp);
+            }
+            return Ok(());
+        }
+
+        if repo.repo_type != RepositoryType::Remote {
+            return Ok(());
+        }
+        let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return Ok(()),
+        };
+
+        let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, self.repo_key, upstream_url);
+        let (content, upstream_ct, changed) = proxy
+            .fetch_dists_detecting_change(&pseudo_repo, &upstream_path)
+            .await
+            .map_err(map_proxy_err)?;
+
+        if let Some(text) = release_invalidation_payload(changed, &content) {
+            proxy
+                .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
+                .await;
+        }
+
+        Err(build_dists_response(content, upstream_ct, content_type))
+    }
+}
+
+/// Pure helper that builds the HTTP response for a successful dists
+/// fetch (either through the direct-Remote path or after a Virtual
+/// member match). Extracted so the Content-Type fallback and length
+/// header construction can be exercised without async runtime or DB.
+fn build_dists_response(
+    content: Bytes,
+    upstream_ct: Option<String>,
+    default_content_type: &str,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap()
+}
+
+/// Pure helper that decides whether a Remote member should be tried
+/// for the current dists request. Returns the upstream URL when the
+/// member is eligible, `None` otherwise. Extracted so the
+/// member-filter predicate is unit-testable without DB access.
+fn remote_member_upstream(member: &crate::models::repository::Repository) -> Option<&str> {
+    if member.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    member.upstream_url.as_deref()
+}
+
+/// Pure helper that decides whether an upstream Release body should
+/// trigger sibling-Packages cache invalidation (#1147). Returns the
+/// decoded UTF-8 body when the caller should invalidate, `None` when
+/// the body either didn't change or isn't valid UTF-8. Factoring this
+/// out makes the change-detection branch testable without a real
+/// proxy fetch.
+fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
+    if !changed {
+        return None;
+    }
+    std::str::from_utf8(content).ok()
+}
+
+/// Iterate the virtual repo's Remote members for `upstream_path` and
+/// return the first successful response.
+async fn try_virtual_dists(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    upstream_path: &str,
+    default_content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    let _ = virtual_repo_key;
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    for member in &members {
+        let Some(upstream_url) = remote_member_upstream(member) else {
+            continue;
+        };
+        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
+            .await
+        {
+            Ok((content, upstream_ct)) => {
+                return Ok(Some(build_dists_response(
+                    content,
+                    upstream_ct,
+                    default_content_type,
+                )));
+            }
+            Err(_) => {
+                // Try the next member.
+                continue;
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Change-detection variant of [`try_virtual_dists`]. Used for
+/// Release/InRelease so that any upstream change invalidates the matching
+/// member's sibling `Packages*` caches before the client tries to fetch
+/// them (#1147).
+async fn try_virtual_dists_detecting_change(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    distribution: &str,
+    upstream_path: &str,
+    default_content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    let _ = virtual_repo_key;
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    for member in &members {
+        let Some(upstream_url) = remote_member_upstream(member) else {
+            continue;
+        };
+        let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
+        match proxy
+            .fetch_dists_detecting_change(&pseudo_repo, upstream_path)
+            .await
+        {
+            Ok((content, upstream_ct, changed)) => {
+                if let Some(text) = release_invalidation_payload(changed, &content) {
+                    proxy
+                        .invalidate_dist_packages_cache(&member.key, distribution, text)
+                        .await;
+                }
+                return Ok(Some(build_dists_response(
+                    content,
+                    upstream_ct,
+                    default_content_type,
+                )));
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+fn map_proxy_err(e: crate::error::AppError) -> Response {
+    let (status, msg) = proxy_err_status_and_message(&e);
+    (status, msg).into_response()
+}
+
+/// Pure helper that decides the HTTP status and message for an
+/// `AppError` returned from `ProxyService::fetch_dists_detecting_change`.
+/// Factored out of [`map_proxy_err`] so the mapping table can be unit
+/// tested without constructing an `axum::Response`.
+fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, String) {
+    match e {
+        crate::error::AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+        other => (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream fetch failed: {}", other),
+        ),
     }
 }
 
@@ -438,7 +654,7 @@ async fn release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("Release", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -460,7 +676,7 @@ async fn in_release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("InRelease", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -492,6 +708,9 @@ async fn release_gpg(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    // Release.gpg is the detached signature of Release. We do not need
+    // change-detection here because the matching Release fetch (called
+    // by apt before Release.gpg) already drove invalidation.
     proxy
         .dists("Release.gpg", "application/pgp-signature", &repo)
         .await?;
@@ -760,6 +979,23 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
+    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+
+    // Virtual repos: walk Remote members in priority order so a Virtual
+    // APT repo can serve i18n / Translation / dep11 / Sources etc. just
+    // like Release/Packages handlers (#1147).
+    if repo.repo_type == RepositoryType::Virtual {
+        let resp = try_virtual_dists(
+            &state,
+            repo.id,
+            &repo_key,
+            &upstream_path,
+            "text/plain; charset=utf-8",
+        )
+        .await?;
+        return resp.ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
     if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
@@ -769,7 +1005,6 @@ async fn dists_proxy_catchall(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
-    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
     let (content, upstream_ct) =
         proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
 
@@ -1277,6 +1512,227 @@ async fn upload_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // proxy_err_status_and_message (#1147)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_err_status_not_found_maps_to_404() {
+        let err = crate::error::AppError::NotFound("missing".to_string());
+        let (status, msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(msg, "missing");
+    }
+
+    #[test]
+    fn test_proxy_err_status_storage_maps_to_502() {
+        let err = crate::error::AppError::Storage("io error".to_string());
+        let (status, msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(msg.starts_with("Upstream fetch failed"));
+    }
+
+    #[test]
+    fn test_proxy_err_status_validation_maps_to_502() {
+        let err = crate::error::AppError::Validation("invalid path".to_string());
+        let (status, _msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_proxy_err_status_internal_maps_to_502() {
+        let err = crate::error::AppError::Internal("boom".to_string());
+        let (status, _msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_proxy_err wrapper (#1147)
+    //
+    // The wrapper is a one-liner over `proxy_err_status_and_message` plus
+    // `into_response()`, but its branches still count as changed lines.
+    // Exercising it here keeps the public surface covered.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_proxy_err_not_found_produces_404_response() {
+        let resp = map_proxy_err(crate::error::AppError::NotFound("missing".to_string()));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_proxy_err_other_errors_produce_502_response() {
+        let resp = map_proxy_err(crate::error::AppError::Storage("io".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = map_proxy_err(crate::error::AppError::Validation("v".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = map_proxy_err(crate::error::AppError::Internal("i".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_dists_response (#1147)
+    //
+    // The pure response builder shared by the dists() / dists_detecting_change()
+    // / try_virtual_dists() / try_virtual_dists_detecting_change() paths.
+    // Verifies the Content-Type fallback and length header.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dists_response_uses_upstream_content_type_when_present() {
+        let body = Bytes::from_static(b"Origin: Debian\n");
+        let resp = build_dists_response(
+            body.clone(),
+            Some("application/octet-stream".to_string()),
+            "text/plain; charset=utf-8",
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            body.len().to_string()
+        );
+    }
+
+    #[test]
+    fn test_build_dists_response_falls_back_to_default_content_type() {
+        let body = Bytes::from_static(b"abc");
+        let resp = build_dists_response(body, None, "text/plain; charset=utf-8");
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn test_build_dists_response_empty_body_reports_zero_length() {
+        let resp = build_dists_response(Bytes::new(), None, "text/plain; charset=utf-8");
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_member_upstream (#1147)
+    //
+    // Pure predicate used by the virtual dispatchers to decide whether to
+    // try a member. Covers each branch (non-Remote, Remote without URL,
+    // Remote with URL).
+    // -----------------------------------------------------------------------
+
+    fn test_member(
+        repo_type: RepositoryType,
+        upstream: Option<&str>,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: "m".to_string(),
+            name: "m".to_string(),
+            description: None,
+            format: RepositoryFormat::Debian,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/m".to_string(),
+            upstream_url: upstream.map(|s| s.to_string()),
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::LocalOnly,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_local_member() {
+        let m = test_member(RepositoryType::Local, Some("https://upstream.test"));
+        assert!(
+            remote_member_upstream(&m).is_none(),
+            "Local members never get proxied for dists"
+        );
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_staging_member() {
+        let m = test_member(RepositoryType::Staging, Some("https://upstream.test"));
+        assert!(remote_member_upstream(&m).is_none());
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_remote_without_url() {
+        let m = test_member(RepositoryType::Remote, None);
+        assert!(
+            remote_member_upstream(&m).is_none(),
+            "A Remote member with no upstream_url is a misconfiguration; \
+             skip rather than panic."
+        );
+    }
+
+    #[test]
+    fn test_remote_member_upstream_returns_url_for_valid_remote() {
+        let m = test_member(RepositoryType::Remote, Some("https://deb.debian.org"));
+        assert_eq!(remote_member_upstream(&m), Some("https://deb.debian.org"));
+    }
+
+    // -----------------------------------------------------------------------
+    // release_invalidation_payload (#1147)
+    //
+    // Pure helper that gates sibling-Packages cache invalidation on both
+    // the change flag AND UTF-8 decodability of the body.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_invalidation_payload_skips_when_unchanged() {
+        // Even a perfectly valid Release body must not trigger cache
+        // invalidation when the upstream content was identical to the
+        // cached copy. Otherwise apt-get update would needlessly
+        // churn sibling caches on every poll.
+        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
+        assert!(release_invalidation_payload(false, release).is_none());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_returns_text_when_changed() {
+        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
+        let got = release_invalidation_payload(true, release);
+        assert!(got.is_some());
+        assert!(got.unwrap().contains("main/binary-amd64/Packages"));
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_skips_non_utf8_body() {
+        // A malicious or corrupted upstream that serves binary garbage
+        // under the `Release` URL must not crash the handler; the
+        // invalidation step is silently skipped.
+        let garbage: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
+        assert!(release_invalidation_payload(true, garbage).is_none());
+    }
 
     // -----------------------------------------------------------------------
     // Router construction

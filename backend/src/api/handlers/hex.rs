@@ -108,8 +108,36 @@ async fn package_info(
             }
         }
 
-        // Virtual: iterate members in priority order, proxy from first remote that has it.
+        // Virtual: check every member's `artifacts` table (local or remote
+        // cache) before falling back to remote upstream proxy. The previous
+        // implementation called `resolve_virtual_metadata` directly, which
+        // only iterates Remote members and never sees packages published
+        // to a local/staging member (#973).
+        //
+        // Pass order:
+        //   1. All non-Remote members' DBs (locally-hosted packages win).
+        //   2. All Remote members' DBs (already-cached pull-through hits).
+        //   3. Remote upstream proxy for any remaining members.
+        // This ordering blocks an upstream from shadowing a locally
+        // published name. Local-first lookup also avoids an unnecessary
+        // network round-trip when the package is already known to a member.
         if repo.repo_type == RepositoryType::Virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+            // Pass 1+2: any member that already has artifact rows for this name.
+            // Non-Remote members run first so they shadow Remote upstreams; this
+            // matches the supply-chain-attack guard documented on PR #974.
+            let ordered_members = order_members_local_first(&members);
+
+            for member in ordered_members {
+                if let Some(resp) =
+                    fetch_package_info_from_member(&state, member, &repo_key, &name).await?
+                {
+                    return Ok(resp);
+                }
+            }
+
+            // Pass 3: fall through to remote proxy for un-cached packages.
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
@@ -512,16 +540,143 @@ async fn list_versions(
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
 
-/// Query distinct package names from all local (non-remote) virtual members.
+/// Order virtual repo members so non-Remote members come before Remote
+/// members, preserving the original priority ordering within each group.
+///
+/// Pure function so the supply-chain-shadowing rule from PR #974 can be
+/// unit-tested without standing up a real virtual-repo configuration.
+/// Non-Remote-first ordering prevents an upstream from shadowing a
+/// locally-published package name (#973).
+fn order_members_local_first(members: &[Repository]) -> Vec<&Repository> {
+    let mut ordered: Vec<&Repository> = Vec::with_capacity(members.len());
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote),
+    );
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote),
+    );
+    ordered
+}
+
+/// Build a `/hex/<repo>/packages/<name>` JSON response from artifact rows
+/// in a single member repo. Returns `Ok(None)` if the member has no
+/// artifacts for `name`, so the caller can advance to the next member.
+///
+/// Tarball URLs are emitted against the *virtual* repo key (not the member
+/// key) so subsequent `mix deps.get` fetches stay routed through the same
+/// virtual endpoint the client originally asked for.
+async fn fetch_package_info_from_member(
+    state: &SharedState,
+    member: &Repository,
+    virtual_repo_key: &str,
+    name: &str,
+) -> Result<Option<Response>, Response> {
+    use sqlx::Row;
+
+    // Uses runtime `sqlx::query` (not `query!`) so we avoid adding a
+    // `.sqlx/` offline cache entry for the lowercased-name lookup.
+    let rows = sqlx::query(
+        "SELECT a.id, a.version, a.checksum_sha256 \
+         FROM artifacts a \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC",
+    )
+    .bind(member.id)
+    .bind(name)
+    .fetch_all(&state.db)
+    .await
+    .map_err(super::db_err)?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let artifact_ids: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<uuid::Uuid, _>("id").ok())
+        .collect();
+
+    let release_rows: Vec<(Option<String>, String)> = rows
+        .iter()
+        .map(|r| {
+            let version: Option<String> = r.try_get("version").ok();
+            let checksum: String = r.try_get("checksum_sha256").unwrap_or_default();
+            (version, checksum)
+        })
+        .collect();
+
+    let download_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = ANY($1)",
+        &artifact_ids
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let json = build_package_info_json(virtual_repo_key, name, &release_rows, download_count);
+    Ok(Some(package_info_response(&json)))
+}
+
+/// Pure helper that serializes a hex `/packages/<name>` JSON value into
+/// the final HTTP response. Extracted from
+/// [`fetch_package_info_from_member`] so the Content-Type and status
+/// can be exercised without a database.
+fn package_info_response(json: &serde_json::Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(json).unwrap()))
+        .unwrap()
+}
+
+/// Build the `/hex/<repo>/packages/<name>` JSON payload from a list of
+/// (version, checksum) pairs and a precomputed download count.
+///
+/// Pure transformation factored out so the tarball URL formatting and
+/// release-array shape can be unit-tested without a database.
+fn build_package_info_json(
+    virtual_repo_key: &str,
+    name: &str,
+    release_rows: &[(Option<String>, String)],
+    download_count: i64,
+) -> serde_json::Value {
+    let releases: Vec<serde_json::Value> = release_rows
+        .iter()
+        .map(|(version, checksum)| {
+            let v = version.clone().unwrap_or_default();
+            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", virtual_repo_key, name, v);
+            serde_json::json!({
+                "version": v,
+                "url": tarball_url,
+                "checksum": checksum,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "name": name,
+        "releases": releases,
+        "downloads": download_count,
+    })
+}
+
+/// Query distinct package names from every virtual member's artifacts table.
+///
+/// Includes Remote members because cached pull-through packages are recorded
+/// as `artifacts` rows by `ProxyService`, and a virtual repo's `/names`
+/// index must surface those alongside locally hosted ones (#973).
 async fn query_local_member_names(
     db: &PgPool,
     members: &[Repository],
 ) -> Result<Vec<String>, Response> {
     let mut all_names = Vec::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let names = sqlx::query_scalar!(
             r#"
         SELECT DISTINCT name
@@ -546,8 +701,11 @@ async fn query_local_member_names(
     Ok(all_names)
 }
 
-/// Query name/version pairs from all local (non-remote) virtual members,
+/// Query name/version pairs from every virtual member's artifacts table,
 /// grouped by package name.
+///
+/// Includes Remote members because their proxy cache populates `artifacts`
+/// rows on pull-through (#973).
 async fn query_local_member_versions(
     db: &PgPool,
     members: &[Repository],
@@ -555,9 +713,6 @@ async fn query_local_member_versions(
     let mut packages: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let artifacts = sqlx::query!(
             r#"
         SELECT name, version
@@ -746,6 +901,186 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // order_members_local_first (#973 supply-chain-shadowing rule)
+    // -----------------------------------------------------------------------
+
+    fn make_member(repo_type: RepositoryType, key: &str) -> Repository {
+        use crate::models::repository::{ReplicationPriority, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Hex,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: String::new(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_order_members_local_first_puts_local_before_remote() {
+        let m1 = make_member(RepositoryType::Remote, "remote-1");
+        let m2 = make_member(RepositoryType::Local, "local-1");
+        let m3 = make_member(RepositoryType::Remote, "remote-2");
+        let members = vec![m1, m2, m3];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "local-1");
+        assert_eq!(ordered[1].key, "remote-1");
+        assert_eq!(ordered[2].key, "remote-2");
+    }
+
+    #[test]
+    fn test_order_members_local_first_preserves_priority_within_group() {
+        // Multiple non-Remote members keep their original relative order;
+        // same for Remote members.
+        let m1 = make_member(RepositoryType::Staging, "stage");
+        let m2 = make_member(RepositoryType::Remote, "remote-high");
+        let m3 = make_member(RepositoryType::Local, "local");
+        let m4 = make_member(RepositoryType::Remote, "remote-low");
+        let members = vec![m1, m2, m3, m4];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "stage");
+        assert_eq!(ordered[1].key, "local");
+        assert_eq!(ordered[2].key, "remote-high");
+        assert_eq!(ordered[3].key, "remote-low");
+    }
+
+    #[test]
+    fn test_order_members_local_first_empty_input() {
+        let members: Vec<Repository> = Vec::new();
+        let ordered = order_members_local_first(&members);
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn test_order_members_local_first_all_remote() {
+        let members = vec![
+            make_member(RepositoryType::Remote, "r1"),
+            make_member(RepositoryType::Remote, "r2"),
+        ];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].key, "r1");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_package_info_json (#973)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_package_info_json_emits_virtual_key_tarball_urls() {
+        // The tarball URL must reference the virtual repo's key, not the
+        // member repo's key, so subsequent `mix deps.get` fetches stay
+        // routed through the same virtual endpoint.
+        let release_rows = vec![
+            (Some("1.7.0".to_string()), "sha-1".to_string()),
+            (Some("1.7.1".to_string()), "sha-2".to_string()),
+        ];
+        let json = build_package_info_json("hex-virtual", "phoenix", &release_rows, 42);
+        assert_eq!(json["name"].as_str(), Some("phoenix"));
+        assert_eq!(json["downloads"].as_i64(), Some(42));
+        let releases = json["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 2);
+        assert_eq!(
+            releases[0]["url"].as_str(),
+            Some("/hex/hex-virtual/tarballs/phoenix-1.7.0.tar")
+        );
+        assert_eq!(releases[0]["checksum"].as_str(), Some("sha-1"));
+        assert_eq!(releases[1]["version"].as_str(), Some("1.7.1"));
+    }
+
+    #[test]
+    fn test_build_package_info_json_handles_empty_releases() {
+        let json = build_package_info_json("v", "lonely", &[], 0);
+        assert_eq!(json["releases"].as_array().unwrap().len(), 0);
+        assert_eq!(json["downloads"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn test_build_package_info_json_missing_version_becomes_empty_string() {
+        // Defensive against rows where `a.version IS NULL` (shouldn't
+        // happen for Hex but the DB doesn't constrain it).
+        let release_rows = vec![(None, "sha".to_string())];
+        let json = build_package_info_json("v", "p", &release_rows, 0);
+        let r = &json["releases"][0];
+        assert_eq!(r["version"].as_str(), Some(""));
+        assert_eq!(r["url"].as_str(), Some("/hex/v/tarballs/p-.tar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // package_info_response (#973)
+    //
+    // Pure helper that finalises a hex `/packages/<name>` JSON body into
+    // an HTTP response. Covers the JSON serialization + Content-Type
+    // wiring without needing a DB-backed handler call.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_info_response_uses_json_content_type() {
+        let json = build_package_info_json(
+            "v",
+            "p",
+            &[(Some("1.0.0".to_string()), "sha".to_string())],
+            7,
+        );
+        let resp = package_info_response(&json);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_package_info_response_body_round_trips_through_serde_json() {
+        // The body must serialize the JSON value exactly (no extra
+        // wrapping). We collect the body bytes and re-parse, then
+        // assert structural equality on the round-tripped value.
+        let release_rows = vec![
+            (Some("1.0.0".to_string()), "sha-a".to_string()),
+            (Some("1.1.0".to_string()), "sha-b".to_string()),
+        ];
+        let json = build_package_info_json("hex-virt", "logger", &release_rows, 99);
+        let resp = package_info_response(&json);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(parsed["name"].as_str(), Some("logger"));
+        assert_eq!(parsed["downloads"].as_i64(), Some(99));
+        assert_eq!(parsed["releases"].as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn test_order_members_local_first_all_local() {
+        let members = vec![
+            make_member(RepositoryType::Local, "l1"),
+            make_member(RepositoryType::Staging, "s1"),
+        ];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].key, "l1");
+        assert_eq!(ordered[1].key, "s1");
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)

@@ -38,6 +38,18 @@ pub trait StorageBackend: Send + Sync {
     /// Check if content exists
     async fn exists(&self, key: &str) -> Result<bool>;
 
+    /// Return the storage backend's opaque ETag for `key`, or `Ok(None)`
+    /// when the backend has no ETag concept (filesystem) or the object is
+    /// missing. Used by the proxy cache fast-path revalidation (#1051) to
+    /// detect tampering before signing a presigned URL. Default
+    /// implementation returns `Ok(None)` so legacy mock backends keep
+    /// compiling and the fast path simply skips revalidation, matching
+    /// pre-#1051 behavior for filesystem and test backends.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Delete content by key
     async fn delete(&self, key: &str) -> Result<()>;
 
@@ -325,6 +337,9 @@ macro_rules! impl_storage_wrapper {
             async fn exists(&self, key: &str) -> Result<bool> {
                 crate::storage::StorageBackend::exists(&self.inner, key).await
             }
+            async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+                crate::storage::StorageBackend::head_etag(&self.inner, key).await
+            }
             async fn delete(&self, key: &str) -> Result<()> {
                 crate::storage::StorageBackend::delete(&self.inner, key).await
             }
@@ -493,6 +508,13 @@ impl StorageService {
     /// Check if key exists
     pub async fn exists(&self, key: &str) -> Result<bool> {
         self.backend.exists(key).await
+    }
+
+    /// Return the backend's opaque ETag for `key`. Used by the proxy
+    /// cache fast-path revalidation (#1051). See
+    /// [`StorageBackend::head_etag`] for the per-backend contract.
+    pub async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        self.backend.head_etag(key).await
     }
 
     /// Delete content
