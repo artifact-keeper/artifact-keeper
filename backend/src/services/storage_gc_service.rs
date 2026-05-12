@@ -902,4 +902,110 @@ mod tests {
         assert_eq!(result.artifacts_removed, 0);
         assert_eq!(result.bytes_freed, 0);
     }
+
+    /// End-to-end variant of the manifest-survival test: run GC with
+    /// `dry_run = false` so the entire delete path executes (storage delete
+    /// + promotion_approvals + artifacts hard-delete) and assert the
+    /// physical manifest file is still on disk afterward.
+    ///
+    /// The dry-run tests above prove the SQL filter is correct; this proves
+    /// the filter is also honored by the code path that actually deletes
+    /// files. Without this, a future refactor of the delete loop could
+    /// regress the fix and the dry-run tests would still pass.
+    #[tokio::test]
+    async fn test_run_gc_live_keeps_oci_manifest_referenced_by_tag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let image = "gc-image-live";
+        let tag = "latest";
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let storage_key = format!("oci-manifests/{}", digest);
+        let manifest_body = Bytes::from_static(
+            b"{\"schemaVersion\":2,\"mediaType\":\
+              \"application/vnd.oci.image.manifest.v1+json\",\"config\":{},\"layers\":[]}",
+        );
+
+        // Materialize the manifest in the filesystem backend so the GC
+        // delete path has a real file to operate on.
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, manifest_body.clone())
+            .await
+            .expect("write manifest to storage");
+        assert!(
+            storage.exists(&storage_key).await.expect("exists check"),
+            "manifest must exist before GC runs"
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (
+                repository_id, name, tag, manifest_digest, manifest_content_type
+            )
+            VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(image)
+        .bind(tag)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert oci tag");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $9,
+                $6, 'application/vnd.oci.image.manifest.v1+json', $7, $8, true
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.repo_id)
+        .bind(format!("v2/{}/manifests/{}", image, tag))
+        .bind(format!("{}:{}", image, tag))
+        .bind(tag)
+        .bind("c".repeat(64))
+        .bind(&storage_key)
+        .bind(fixture.user_id)
+        .bind(manifest_body.len() as i64)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert soft-deleted oci manifest artifact");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let file_still_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            result.storage_keys_deleted, 0,
+            "live GC must not delete a manifest referenced by oci_tags"
+        );
+        assert_eq!(result.artifacts_removed, 0);
+        assert!(
+            file_still_exists,
+            "manifest file must remain on disk after a live GC pass when oci_tags references it"
+        );
+    }
 }
