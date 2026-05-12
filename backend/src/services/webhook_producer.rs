@@ -38,8 +38,7 @@ use crate::services::event_bus::{DomainEvent, EventBus};
 pub fn map_event_type(event_type: &str) -> Option<&'static str> {
     match event_type {
         // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
-        // the artifact_uploaded webhook. Mirrors the alias in
-        // notification_dispatcher::map_event_type.
+        // the artifact_uploaded webhook. Same alias as email_dispatcher.
         "artifact.created" | "artifact.uploaded" => Some("artifact_uploaded"),
         "artifact.deleted" => Some("artifact_deleted"),
         "repository.created" => Some("repository_created"),
@@ -283,7 +282,7 @@ mod tests {
     #[test]
     fn test_map_artifact_created_aliases_uploaded() {
         // The EventBus uses ".created"; the webhook system uses "uploaded".
-        // This alias mirrors notification_dispatcher::map_event_type.
+        // The same alias also lives in email_dispatcher::map_event_type.
         assert_eq!(
             map_event_type("artifact.created"),
             Some("artifact_uploaded")

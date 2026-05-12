@@ -39,13 +39,8 @@ impl TrivyFsScanner {
     /// Container image manifests are handled by `ImageScanner`; everything
     /// else that looks like a scannable package is handled here.
     pub fn is_applicable(artifact: &Artifact) -> bool {
-        let ct = &artifact.content_type;
         // Skip OCI / Docker image manifests — those belong to ImageScanner.
-        if ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || artifact.path.contains("/manifests/")
-        {
+        if crate::services::scanner_service::is_oci_image_artifact(artifact) {
             return false;
         }
 

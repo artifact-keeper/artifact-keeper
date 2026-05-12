@@ -107,13 +107,11 @@ impl ImageScanner {
         }
     }
 
-    /// Check if this artifact is an OCI/Docker image manifest.
+    /// Check if this artifact is an OCI/Docker image manifest. Thin wrapper
+    /// around the shared [`crate::services::scanner_service::is_oci_image_artifact`]
+    /// helper so the predicate has one source of truth.
     fn is_container_image(artifact: &Artifact) -> bool {
-        let ct = &artifact.content_type;
-        ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || artifact.path.contains("/manifests/")
+        crate::services::scanner_service::is_oci_image_artifact(artifact)
     }
 
     /// Extract an image reference from the artifact path.
