@@ -3600,62 +3600,52 @@ mod tests {
 
     const STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming(";
 
-    #[test]
-    fn test_maven_remote_fetch_uses_streaming_helper_1183() {
-        let src = include_str!("maven.rs");
-        assert!(
-            src.contains(STREAMING_CALL_TOKEN),
-            "maven handler MUST call proxy_fetch_streaming for the remote \
-             catch-all download (#1183). A revert to proxy_fetch would \
-             re-introduce the OOM regression closed by #895/#1181."
-        );
+    /// One pin test per handler. Kept as separate `#[test]` functions
+    /// (rather than a single loop) so a CI failure points directly at
+    /// the regressing handler. The macro keeps the surface area small
+    /// and stops the five near-identical functions from tripping the
+    /// 3% duplication gate.
+    macro_rules! streaming_pin_test {
+        ($name:ident, $module_file:literal, $what:literal) => {
+            #[test]
+            fn $name() {
+                let src = include_str!($module_file);
+                assert!(
+                    src.contains(STREAMING_CALL_TOKEN),
+                    "{} handler MUST call `{}` for {} (#1183). A revert \
+                     to the buffered `proxy_fetch` helper would re-introduce \
+                     the OOM regression closed by #895/#1181.",
+                    $module_file,
+                    STREAMING_CALL_TOKEN,
+                    $what,
+                );
+            }
+        };
     }
 
-    #[test]
-    fn test_goproxy_remote_fetch_uses_streaming_helper_1183() {
-        let src = include_str!("goproxy.rs");
-        assert!(
-            src.contains(STREAMING_CALL_TOKEN),
-            "goproxy handler MUST call proxy_fetch_streaming for the \
-             remote `@v/<ver>.zip` download (#1183). A revert to \
-             proxy_fetch would re-introduce the OOM regression closed \
-             by #895/#1181."
-        );
-    }
-
-    #[test]
-    fn test_gitlfs_remote_fetch_uses_streaming_helper_1183() {
-        let src = include_str!("gitlfs.rs");
-        assert!(
-            src.contains(STREAMING_CALL_TOKEN),
-            "gitlfs handler MUST call proxy_fetch_streaming for the \
-             remote blob download (#1183). LFS exists for large \
-             binaries; a revert to proxy_fetch would re-introduce the \
-             OOM regression closed by #895/#1181."
-        );
-    }
-
-    #[test]
-    fn test_alpine_remote_fetch_uses_streaming_helper_1183() {
-        let src = include_str!("alpine.rs");
-        assert!(
-            src.contains(STREAMING_CALL_TOKEN),
-            "alpine handler MUST call proxy_fetch_streaming for the \
-             remote `.apk` download (#1183). A revert to proxy_fetch \
-             would re-introduce the OOM regression closed by \
-             #895/#1181."
-        );
-    }
-
-    #[test]
-    fn test_debian_remote_fetch_uses_streaming_helper_1183() {
-        let src = include_str!("debian.rs");
-        assert!(
-            src.contains(STREAMING_CALL_TOKEN),
-            "debian handler MUST call proxy_fetch_streaming for the \
-             remote pool `.deb` download (#1183). A revert to \
-             proxy_fetch would re-introduce the OOM regression closed \
-             by #895/#1181."
-        );
-    }
+    streaming_pin_test!(
+        test_maven_remote_fetch_uses_streaming_helper_1183,
+        "maven.rs",
+        "the remote catch-all download"
+    );
+    streaming_pin_test!(
+        test_goproxy_remote_fetch_uses_streaming_helper_1183,
+        "goproxy.rs",
+        "the remote `@v/<ver>.zip` download"
+    );
+    streaming_pin_test!(
+        test_gitlfs_remote_fetch_uses_streaming_helper_1183,
+        "gitlfs.rs",
+        "the remote LFS blob download (large binaries)"
+    );
+    streaming_pin_test!(
+        test_alpine_remote_fetch_uses_streaming_helper_1183,
+        "alpine.rs",
+        "the remote `.apk` download"
+    );
+    streaming_pin_test!(
+        test_debian_remote_fetch_uses_streaming_helper_1183,
+        "debian.rs",
+        "the remote pool `.deb` download"
+    );
 }
