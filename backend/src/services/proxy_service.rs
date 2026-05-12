@@ -83,6 +83,55 @@ struct CacheMetadataTemplate {
 /// so the client sees no extra latency.
 const TEE_CHANNEL_DEPTH: usize = 64;
 
+/// Validate the upstream response status code for the streaming path.
+/// Extracted from [`ProxyService::read_upstream_response_streaming`] so
+/// the status-classification logic can be unit-tested without a real
+/// `reqwest::Response`.
+///
+/// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
+///   as a real "upstream doesn't have it" signal, not a backend failure)
+/// * Other non-2xx → `AppError::Storage` (transient/upstream-misconfig
+///   error; bubbles to the client as 500/5xx)
+/// * 2xx → `Ok(())`
+fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(AppError::NotFound(format!(
+            "Artifact not found at upstream: {}",
+            url
+        )));
+    }
+    if !status.is_success() {
+        return Err(AppError::Storage(format!(
+            "Upstream returned error status {}: {}",
+            status, url
+        )));
+    }
+    Ok(())
+}
+
+/// Extract `(content_type, etag, content_length)` from an upstream
+/// response's headers. Extracted from
+/// [`ProxyService::read_upstream_response_streaming`] so the header-
+/// parsing rules (in particular the `Content-Length` parse-and-coerce
+/// to `u64`) can be unit-tested without a real `reqwest::Response`.
+fn extract_streaming_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let etag = headers
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    (content_type, etag, content_length)
+}
+
 /// Tee an upstream byte stream into a returned client stream AND a
 /// background storage writer that populates the proxy cache. The
 /// returned stream yields the same chunks the upstream produced, in
@@ -1060,35 +1109,8 @@ impl ProxyService {
         response: reqwest::Response,
         url: &str,
     ) -> Result<UpstreamStream> {
-        let status = response.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(AppError::NotFound(format!(
-                "Artifact not found at upstream: {}",
-                url
-            )));
-        }
-        if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let content_length = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+        validate_upstream_status(response.status(), url)?;
+        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
 
         let body = response.bytes_stream().map(|r| {
             r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
@@ -3334,6 +3356,112 @@ mod tests {
             "expected expires_at - cached_at ~= 7200s, got {}s",
             ttl_seen
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_upstream_status: pure status-classification logic
+    // extracted from read_upstream_response_streaming so the truth
+    // table is testable without a real reqwest::Response. #895.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_upstream_status_2xx_is_ok() {
+        validate_upstream_status(StatusCode::OK, "http://x").expect("200 must pass");
+        validate_upstream_status(StatusCode::PARTIAL_CONTENT, "http://x")
+            .expect("206 (partial content) is 2xx and must pass");
+        validate_upstream_status(StatusCode::NO_CONTENT, "http://x").expect("204 must pass");
+    }
+
+    #[test]
+    fn test_validate_upstream_status_404_is_not_found() {
+        match validate_upstream_status(StatusCode::NOT_FOUND, "http://up/x") {
+            Err(AppError::NotFound(msg)) => assert!(msg.contains("http://up/x")),
+            other => panic!(
+                "404 MUST classify as NotFound so callers handle it as a \
+                 real cache-miss signal, not a 5xx-class backend failure; \
+                 got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_5xx_is_storage_error() {
+        match validate_upstream_status(StatusCode::INTERNAL_SERVER_ERROR, "http://up/x") {
+            Err(AppError::Storage(msg)) => {
+                assert!(msg.contains("500"));
+                assert!(msg.contains("http://up/x"));
+            }
+            other => panic!("500 must map to AppError::Storage; got {:?}", other),
+        }
+        match validate_upstream_status(StatusCode::BAD_GATEWAY, "http://up/x") {
+            Err(AppError::Storage(_)) => {}
+            other => panic!("502 must map to AppError::Storage; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_4xx_other_is_storage_error() {
+        // Non-404 4xx (e.g. 401 if it slipped past the retry path, or
+        // 403 from a misconfigured private mirror) must NOT be mistaken
+        // for a cache miss. Falls through to Storage class.
+        match validate_upstream_status(StatusCode::FORBIDDEN, "http://up/x") {
+            Err(AppError::Storage(_)) => {}
+            other => panic!("403 must map to AppError::Storage; got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_streaming_headers: pure header parsing. Verifies the
+    // Content-Length parse-or-skip behaviour and the etag/content-type
+    // round-trip without a reqwest::Response. #895.
+    // -----------------------------------------------------------------------
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn test_extract_streaming_headers_full_set() {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-deb"));
+        h.insert(ETAG, HeaderValue::from_static("\"abc123\""));
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("12345"));
+        let (ct, etag, len) = extract_streaming_headers(&h);
+        assert_eq!(ct.as_deref(), Some("application/x-deb"));
+        assert_eq!(etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(len, Some(12345));
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_empty() {
+        let h = HeaderMap::new();
+        let (ct, etag, len) = extract_streaming_headers(&h);
+        assert!(ct.is_none());
+        assert!(etag.is_none());
+        assert!(len.is_none());
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_non_numeric_content_length_yields_none() {
+        // A misbehaving upstream that returned a non-numeric
+        // Content-Length must not panic or default to 0; the proxy
+        // simply drops the value and the outbound response falls
+        // back to chunked transfer encoding.
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
+        let (_, _, len) = extract_streaming_headers(&h);
+        assert!(len.is_none());
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_non_utf8_etag_is_dropped() {
+        // HTTP headers are sometimes non-UTF8 bytes (broken
+        // upstreams). The parser silently drops them rather than
+        // erroring; the outbound response simply omits the etag.
+        let mut h = HeaderMap::new();
+        let bad = HeaderValue::from_bytes(b"\xff\xfe").unwrap();
+        h.insert(ETAG, bad);
+        let (_, etag, _) = extract_streaming_headers(&h);
+        assert!(etag.is_none());
     }
 
     /// Pin StreamingFetchResult's content_length passthrough. The
