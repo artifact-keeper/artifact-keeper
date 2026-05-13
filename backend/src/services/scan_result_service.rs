@@ -2516,6 +2516,18 @@ mod tests {
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
 
+        /// Serializes the `cleanup_stuck_scans_*` tests against each other.
+        /// All four touch `pg_try_advisory_xact_lock(STUCK_SCAN_LOCK_ID)`,
+        /// and `cleanup_stuck_scans_skips_when_advisory_lock_held` holds the
+        /// lock for the duration of its assertions. Under `cargo llvm-cov`
+        /// the instrumented binary is slow enough that parallel tests
+        /// invoking the janitor see the held lock and silently return 0,
+        /// breaking their reap-count assertions. The mutex below forces the
+        /// four tests to run sequentially so only one of them interacts
+        /// with the advisory lock at a time. Other unrelated tests in the
+        /// suite are unaffected.
+        static CLEANUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
         async fn insert_test_repo(pool: &PgPool) -> Uuid {
             let id = Uuid::new_v4();
             let key = format!("scan-svc-{}", id.as_simple());
@@ -3335,6 +3347,7 @@ mod tests {
         /// the batched audit INSERT in the same transaction.
         #[tokio::test]
         async fn cleanup_stuck_scans_writes_audit_row_in_same_transaction() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -3397,6 +3410,7 @@ mod tests {
         /// deployments.
         #[tokio::test]
         async fn cleanup_stuck_scans_skips_when_advisory_lock_held() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -3465,6 +3479,7 @@ mod tests {
         /// every audit row exists and carries the system actor.
         #[tokio::test]
         async fn cleanup_stuck_scans_batched_audit_insert_lands_all_rows() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -3505,6 +3520,7 @@ mod tests {
         /// rows, one tick reaps at most 2.
         #[tokio::test]
         async fn cleanup_stuck_scans_respects_configured_reap_limit() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
