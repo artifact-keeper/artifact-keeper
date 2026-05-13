@@ -204,34 +204,51 @@ async fn download_tarball(
 
     let filename = tarball_file.trim_start_matches('/');
 
-    let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
-            Some(a) => a,
-            None => {
-                let upstream_path = format!("tarballs/{}", filename);
-                // Remote: no Content-Disposition; Virtual: include filename.
-                let cd_filename = if repo.repo_type == RepositoryType::Virtual {
-                    Some(filename)
-                } else {
-                    None
-                };
-                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
-                    &state,
-                    &repo,
-                    proxy_helpers::DownloadResponseOpts {
-                        upstream_path: &upstream_path,
-                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
-                        default_content_type: "application/octet-stream",
-                        content_disposition_filename: cd_filename,
-                    },
-                )
-                .await?
-                {
-                    return Ok(resp);
-                }
-                return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
+    let artifact = match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename)
+        .await?
+    {
+        Some(a) => a,
+        None => {
+            let upstream_path = format!("tarballs/{}", filename);
+
+            // Virtual: if any non-Remote member already owns this package
+            // name, an upstream Remote member must NOT be allowed to serve
+            // a tarball for it. Otherwise a malicious upstream that pushes
+            // a package named `phoenix` shadows the operator's locally
+            // published `phoenix`. The metadata side of this guard
+            // (`/packages/{name}`) is enforced by `order_members_local_first`
+            // in `package_info`; this is the matching guard on the bytes
+            // side. Forward-ported from PR #974 (#973).
+            if repo.repo_type == RepositoryType::Virtual
+                && virtual_local_owns_tarball_name(&state.db, repo.id, filename).await?
+            {
+                return serve_virtual_tarball_local_only(&state, repo.id, &upstream_path, filename)
+                    .await;
             }
-        };
+
+            // Remote: no Content-Disposition; Virtual: include filename.
+            let cd_filename = if repo.repo_type == RepositoryType::Virtual {
+                Some(filename)
+            } else {
+                None
+            };
+            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                &state,
+                &repo,
+                proxy_helpers::DownloadResponseOpts {
+                    upstream_path: &upstream_path,
+                    virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                    default_content_type: "application/octet-stream",
+                    content_disposition_filename: cd_filename,
+                },
+            )
+            .await?
+            {
+                return Ok(resp);
+            }
+            return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
+        }
+    };
 
     proxy_helpers::serve_local_artifact(
         &state,
@@ -242,6 +259,110 @@ async fn download_tarball(
         Some(filename),
     )
     .await
+}
+
+/// Parse the package name out of a hex tarball filename.
+///
+/// Hex tarballs are stored as `<name>-<version>.tar`. The package name itself
+/// may contain dashes (`my-package-1.4.0.tar`), so the split is "first `-`
+/// followed by an ASCII digit". Returns `None` if the filename does not end
+/// in `.tar` or has no version-looking suffix.
+fn package_name_from_tarball_filename(filename: &str) -> Option<String> {
+    let without_ext = filename.strip_suffix(".tar")?;
+    for (i, _) in without_ext.match_indices('-') {
+        if without_ext
+            .get(i + 1..)
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Some(without_ext[..i].to_string());
+        }
+    }
+    None
+}
+
+/// Returns true if any non-Remote member of a virtual repo has an artifact
+/// row matching the package name parsed from a tarball filename. When true,
+/// the caller must block an upstream Remote member from satisfying the
+/// download (supply-chain name-shadowing guard, #973 / PR #974).
+///
+/// Falls back to `false` if the filename does not parse as a hex tarball.
+async fn virtual_local_owns_tarball_name(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    filename: &str,
+) -> Result<bool, Response> {
+    let Some(pkg_name) = package_name_from_tarball_filename(filename) else {
+        return Ok(false);
+    };
+
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+    {
+        if proxy_helpers::find_artifact_by_name_lowercase(db, member.id, &pkg_name)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Serve a tarball download from a virtual repo's non-Remote members only,
+/// suppressing any upstream proxy attempt. Used by the name-shadowing guard
+/// in `download_tarball` (#973 / PR #974).
+async fn serve_virtual_tarball_local_only(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    upstream_path: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let db = state.db.clone();
+    let state_arc = state.clone();
+    let suffix = filename.to_string();
+
+    let (content, content_type) = proxy_helpers::resolve_virtual_download(
+        &state.db,
+        // Explicit None: any Remote member would route to upstream, which is
+        // exactly what the shadowing guard must block. Local members fall
+        // through to `local_fetch_by_path_suffix` regardless of proxy state.
+        None,
+        virtual_repo_id,
+        upstream_path,
+        move |member_id, location| {
+            let db = db.clone();
+            let state = state_arc.clone();
+            let suffix = suffix.clone();
+            async move {
+                proxy_helpers::local_fetch_by_path_suffix(
+                    &db, &state, member_id, &location, &suffix,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(
+            axum::http::header::CONTENT_LENGTH,
+            content.len().to_string(),
+        )
+        .body(Body::from(content))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,6 +1903,73 @@ mod tests {
         assert_eq!(result[0]["name"], "absinthe");
         assert_eq!(result[1]["name"], "jason");
         assert_eq!(result[2]["name"], "zlib");
+    }
+
+    // -----------------------------------------------------------------------
+    // package_name_from_tarball_filename (#973 / PR #974 shadowing guard)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_name_from_tarball_filename_simple_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("phoenix-1.4.0.tar"),
+            Some("phoenix".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_dashed_name() {
+        // The first `-` is followed by `p` (not a digit), so the parser must
+        // advance to the second `-` which is followed by `1`. This is the
+        // load-bearing case for hex names like `my-package-2.0.0`.
+        assert_eq!(
+            package_name_from_tarball_filename("my-package-2.0.0.tar"),
+            Some("my-package".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_no_extension() {
+        assert_eq!(package_name_from_tarball_filename("phoenix-1.4.0"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_no_version_separator() {
+        assert_eq!(package_name_from_tarball_filename("phoenix.tar"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_dash_not_followed_by_digit() {
+        // `phoenix-html` has a dash, but no digit follows — there is no
+        // version, so the filename does not parse as a tarball.
+        assert_eq!(package_name_from_tarball_filename("phoenix-html.tar"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_version_with_prerelease() {
+        // SemVer pre-release (`1.0.0-rc.1`) starts with a digit so the
+        // parser picks the right `-`.
+        assert_eq!(
+            package_name_from_tarball_filename("phoenix-1.0.0-rc.1.tar"),
+            Some("phoenix".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_empty_name() {
+        // `-1.0.0.tar` has the version-looking suffix but the name is empty.
+        // Returning `Some("")` is consistent with the parser contract; the
+        // caller (`virtual_local_owns_tarball_name`) does a name lookup that
+        // will yield false for empty input.
+        assert_eq!(
+            package_name_from_tarball_filename("-1.0.0.tar"),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_empty_string() {
+        assert_eq!(package_name_from_tarball_filename(""), None);
     }
 
     // -----------------------------------------------------------------------
