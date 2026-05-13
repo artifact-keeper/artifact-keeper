@@ -1064,7 +1064,10 @@ async fn token(
                     //   2. docker login -u <ci-user> -p <access_token>  (this path)
                     //   3. docker push ...
                     // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service.validate_access_token_async(&credentials.1).await {
+                    match auth_service
+                        .validate_access_token_async(&credentials.1)
+                        .await
+                    {
                         Ok(claims) => {
                             let user = match sqlx::query_as::<_, User>(
                                 "SELECT * FROM users WHERE id = $1",
@@ -1175,7 +1178,11 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
 
         // Final fallback: accept AK JWT access token in the Basic password field.
         // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
-        if auth_service.validate_access_token_async(&password).await.is_ok() {
+        if auth_service
+            .validate_access_token_async(&password)
+            .await
+            .is_ok()
+        {
             return version_check_ok();
         }
     }
@@ -4137,7 +4144,6 @@ mod tests {
     }
 
     fn build_test_state(config: crate::config::Config, pool: sqlx::PgPool) -> SharedState {
-
         let storage_root = std::env::temp_dir().join(format!("ak-oci-v2-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
 
@@ -4150,12 +4156,7 @@ mod tests {
             "filesystem".to_string(),
         ));
 
-        Arc::new(crate::api::AppState::new(
-            config,
-            pool,
-            storage,
-            registry,
-        ))
+        Arc::new(crate::api::AppState::new(config, pool, storage, registry))
     }
 
     fn mint_access_jwt(secret: &str, username: &str) -> String {
