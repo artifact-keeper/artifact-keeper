@@ -336,20 +336,43 @@ async fn virtual_local_owns_tarball_name(
     };
 
     let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
-
-    for member in members
+    let non_remote_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-    {
-        if proxy_helpers::find_artifact_by_name_lowercase(db, member.id, &pkg_name)
-            .await?
-            .is_some()
-        {
-            return Ok(true);
-        }
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
     }
 
-    Ok(false)
+    // Single-query existence check across every non-Remote member. The
+    // previous N-query loop scaled linearly with member count; replacing it
+    // with `repository_id = ANY($1)` keeps the guard at one round trip
+    // regardless of virtual fan-out. `LIMIT 1` short-circuits at the first
+    // matching row inside Postgres.
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+                              WHERE repository_id = ANY($1) \
+                                AND is_deleted = false \
+                                AND LOWER(name) = LOWER($2) \
+                              LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(&pkg_name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            event = "shadowing_guard_db_error",
+            virtual_repo_id = %virtual_repo_id,
+            error = %e,
+            "stuck-shadowing-guard DB query failed; failing closed to 500",
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+    })?;
+
+    Ok(exists.is_some())
 }
 
 /// Serve a tarball download from a virtual repo's non-Remote members only,
@@ -2023,6 +2046,12 @@ mod tests {
         assert_eq!(package_name_from_tarball_filename("../-1.0.0.tar"), None);
         assert_eq!(
             package_name_from_tarball_filename("phoenix/../-1.0.0.tar"),
+            None
+        );
+        // Double-encoded variant: axum percent-decodes once, so `%25`
+        // becomes `%` and the validator then rejects the `%` character.
+        assert_eq!(
+            package_name_from_tarball_filename("..%252f-1.0.0.tar"),
             None
         );
     }
