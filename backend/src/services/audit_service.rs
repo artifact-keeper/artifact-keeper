@@ -70,6 +70,9 @@ pub enum AuditAction {
     // covers both `GET /sbom/:id` and `GET /sbom/by-artifact/:artifact_id`.
     SbomGenerated,
     SbomRead,
+
+    // Scanning / janitors
+    ScanReaped,
 }
 
 impl AuditAction {
@@ -114,6 +117,7 @@ impl AuditAction {
             AuditAction::EmailSubscriptionDeleted => "EMAIL_SUBSCRIPTION_DELETED",
             AuditAction::SbomGenerated => "SBOM_GENERATED",
             AuditAction::SbomRead => "SBOM_READ",
+            AuditAction::ScanReaped => "SCAN_REAPED",
         }
     }
 }
@@ -130,6 +134,7 @@ pub enum ResourceType {
     Backup,
     Setting,
     Plugin,
+    ScanResult,
 }
 
 impl ResourceType {
@@ -144,6 +149,7 @@ impl ResourceType {
             ResourceType::Backup => "backup",
             ResourceType::Setting => "setting",
             ResourceType::Plugin => "plugin",
+            ResourceType::ScanResult => "scan_result",
         }
     }
 }
@@ -182,6 +188,13 @@ impl AuditEntry {
         self
     }
 
+    /// Attach an arbitrary JSON payload to this audit entry's `details` column.
+    ///
+    /// Reserved key: `details.actor`. System-initiated audit emitters use this
+    /// to advertise themselves to SIEM filters (e.g. `"system:stuck_scan_janitor"`
+    /// in #1063). Callers MUST NOT populate `details.actor` from user-controlled
+    /// input, doing so would let an attacker spoof system-actor entries in
+    /// downstream queries. Use the `user_id` column for human actors.
     pub fn details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self
@@ -501,6 +514,11 @@ mod tests {
         assert_eq!(AuditAction::SbomRead.as_str(), "SBOM_READ");
     }
 
+    #[test]
+    fn test_audit_action_as_str_scanning() {
+        assert_eq!(AuditAction::ScanReaped.as_str(), "SCAN_REAPED");
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -516,6 +534,7 @@ mod tests {
         assert_eq!(ResourceType::Backup.as_str(), "backup");
         assert_eq!(ResourceType::Setting.as_str(), "setting");
         assert_eq!(ResourceType::Plugin.as_str(), "plugin");
+        assert_eq!(ResourceType::ScanResult.as_str(), "scan_result");
     }
 
     // -----------------------------------------------------------------------

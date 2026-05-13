@@ -2609,6 +2609,8 @@ mod tests {
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
                 lifecycle_check_interval_secs: 60,
+                stuck_scan_threshold_secs: 1800,
+                stuck_scan_check_interval_secs: 600,
                 allow_local_admin_login: false,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,

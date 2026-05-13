@@ -1,5 +1,7 @@
 //! Service for managing scan results and findings.
 
+use std::time::Duration;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -8,6 +10,14 @@ use crate::models::security::{
     DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
     Severity,
 };
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+
+/// Maximum rows the stuck-scan janitor reaps in a single tick. Bounds memory
+/// for the `UPDATE ... RETURNING` payload and the audit-emission loop so a
+/// post-upgrade backlog drains across successive ticks rather than in one
+/// large batch. A long-stuck backlog on a normally-healthy install is small;
+/// this only matters for pathological cases (deploy after a long outage).
+const STUCK_SCAN_REAP_LIMIT: i64 = 1000;
 
 /// Inventory persistence outcome for a scan_result row (#1157, #1188-R1).
 ///
@@ -164,6 +174,35 @@ pub(crate) fn build_dashboard_summary(
     }
 }
 
+/// Build the `details` JSON payload for a `SCAN_REAPED` audit entry (#1063).
+///
+/// Pure: takes the reaped row's identifiers and timestamps and returns the
+/// `serde_json::Value` ready to attach to an `AuditEntry`. Kept separate
+/// from `cleanup_stuck_scans` so the details schema (field names, system-
+/// actor marker, JSON shape) can be locked down by unit tests without
+/// needing a Postgres connection. SIEM rules in production parse these
+/// fields, so accidental renames are a silent regression we want a fast
+/// guard on.
+pub(crate) fn build_scan_reaped_audit_details(
+    scan_id: Uuid,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    started_at: impl serde::Serialize,
+    reaped_at: impl serde::Serialize,
+    threshold_secs: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scan_id": scan_id,
+        "artifact_id": artifact_id,
+        "repository_id": repository_id,
+        "started_at": started_at,
+        "reaped_at": reaped_at,
+        "threshold_secs": threshold_secs,
+        "reason": "stuck_running_janitor",
+        "actor": "system:stuck_scan_janitor",
+    })
+}
+
 pub struct ScanResultService {
     db: PgPool,
 }
@@ -171,6 +210,117 @@ pub struct ScanResultService {
 impl ScanResultService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stuck-scan janitor (#1015, #1061, #1063)
+    // -----------------------------------------------------------------------
+
+    /// Reap scan_results rows wedged in `status='running'` past the supplied
+    /// threshold. Pre-allocated rows can get stuck if the scan worker crashes
+    /// (OOM, pod evicted, panic, deploy mid-scan) before reaching its terminal
+    /// UPDATE; those rows then accumulate forever and pollute dashboards
+    /// (issue #1015).
+    ///
+    /// Transitions matching rows to `status='failed'`, sets `completed_at` to
+    /// now, and writes a diagnostic `error_message`. Rows already in a terminal
+    /// state (`completed`, `failed`) are not touched, so this is safe to run
+    /// concurrently with an in-flight scan that completes mid-tick.
+    ///
+    /// Emits one `SCAN_REAPED` audit-log entry per reaped row (#1063) so a
+    /// running -> failed transition is visible to operators investigating an
+    /// incident. Audit-log writes are best-effort: a failure to record the
+    /// event is logged at warn level but does not roll back the reap, since
+    /// leaving the row wedged in `running` is the worse outcome. Within the
+    /// audit retention window, operators should reconcile audit entries
+    /// against `scan_results` rows whose `error_message` begins with
+    /// `janitor:`. Together these are the in-DB evidence pair.
+    ///
+    /// Durability caveats: neither half of the pair is a long-term
+    /// compliance store:
+    ///   * `audit_log.action='SCAN_REAPED'` entries are deleted by the
+    ///     `audit_retention_days` retention sweep (default 90 days, see
+    ///     `AuditService::cleanup`).
+    ///   * The `scan_results` row itself is `ON DELETE CASCADE` from
+    ///     `artifacts` and `repositories`, so deleting a repo destroys
+    ///     its reaped-row evidence independently of audit retention.
+    ///
+    /// For SOC 2 / FedRAMP / ISO 27001 long-term retention requirements,
+    /// export `SCAN_REAPED` audit entries to durable SIEM storage.
+    ///
+    /// Each tick caps reap count at [`STUCK_SCAN_REAP_LIMIT`] rows via
+    /// `FOR UPDATE SKIP LOCKED` so a deploy-day backlog drains across
+    /// successive ticks instead of in one large in-memory batch, and so
+    /// concurrent janitor replicas do not block on each other.
+    ///
+    /// Returns the count of rows reaped.
+    pub async fn cleanup_stuck_scans(&self, stuck_threshold: Duration) -> Result<u64> {
+        // Cap at i64::MAX seconds so the cast is well-defined for any sane
+        // threshold; in practice operators configure minutes or hours here.
+        let secs = stuck_threshold.as_secs().min(i64::MAX as u64) as i64;
+        let error_message = format!(
+            "janitor: scan worker did not complete within {}s (stuck in 'running')",
+            secs
+        );
+
+        let reaped = sqlx::query!(
+            r#"
+            WITH reap AS (
+                SELECT id FROM scan_results
+                WHERE status = 'running'
+                  AND started_at IS NOT NULL
+                  AND started_at < NOW() - make_interval(secs => $2::double precision)
+                ORDER BY started_at
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE scan_results
+            SET status = 'failed',
+                error_message = $1,
+                completed_at = NOW()
+            WHERE id IN (SELECT id FROM reap)
+            RETURNING id, artifact_id, repository_id, started_at, completed_at
+            "#,
+            error_message,
+            secs as f64,
+            STUCK_SCAN_REAP_LIMIT,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if reaped.is_empty() {
+            return Ok(0);
+        }
+
+        // Per-row audit emission (#1063). A scan transitioning running -> failed
+        // without operator action is security-relevant: an in-flight vulnerability
+        // scan never completed, so the artifact may have undisclosed CVEs.
+        // Operators looking at the audit log to investigate an incident need to
+        // see this transition rather than only the prometheus counter.
+        let audit = AuditService::new(self.db.clone());
+        for row in &reaped {
+            let details = build_scan_reaped_audit_details(
+                row.id,
+                row.artifact_id,
+                row.repository_id,
+                row.started_at,
+                row.completed_at,
+                secs,
+            );
+            let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+                .resource(row.id)
+                .details(details);
+            if let Err(e) = audit.log(entry).await {
+                tracing::warn!(
+                    scan_id = %row.id,
+                    error = %e,
+                    "stuck-scan janitor: failed to write audit log entry for reaped scan",
+                );
+            }
+        }
+
+        Ok(reaped.len() as u64)
     }
 
     // -----------------------------------------------------------------------
@@ -1921,6 +2071,172 @@ mod tests {
         // updated.is_some() == true means the row was in 'running' state and
         // the UPDATE fired; the caller proceeds with the findings INSERT.
         assert!(!convert_should_noop(true));
+    }
+
+    // =======================================================================
+    // build_scan_reaped_audit_details (extracted pure function, #1063)
+    //
+    // SIEM rules in production parse the `details` JSON shape, so accidental
+    // field renames are a silent regression. These tests lock the schema.
+    // =======================================================================
+
+    fn sample_reaped_details(threshold_secs: i64) -> (Uuid, Uuid, Uuid, serde_json::Value) {
+        let scan_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(45);
+        let reaped_at = chrono::Utc::now();
+        let details = build_scan_reaped_audit_details(
+            scan_id,
+            artifact_id,
+            repository_id,
+            Some(started_at),
+            Some(reaped_at),
+            threshold_secs,
+        );
+        (scan_id, artifact_id, repository_id, details)
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_row_ids() {
+        let (scan_id, artifact_id, repository_id, details) = sample_reaped_details(1800);
+        assert_eq!(
+            details["scan_id"].as_str(),
+            Some(scan_id.to_string().as_str()),
+            "scan_id must round-trip so operators can join back to scan_results"
+        );
+        assert_eq!(
+            details["artifact_id"].as_str(),
+            Some(artifact_id.to_string().as_str())
+        );
+        assert_eq!(
+            details["repository_id"].as_str(),
+            Some(repository_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_timestamps() {
+        let (_, _, _, details) = sample_reaped_details(1800);
+        assert!(
+            details.get("started_at").is_some() && !details["started_at"].is_null(),
+            "details.started_at must be populated when the row had a started_at"
+        );
+        assert!(
+            details.get("reaped_at").is_some() && !details["reaped_at"].is_null(),
+            "details.reaped_at must be populated"
+        );
+        assert_eq!(details["threshold_secs"], 1800);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_marks_system_actor() {
+        // SIEM/SOAR rules distinguish janitor-initiated reaps from human-
+        // initiated state changes by `details.actor` and `details.reason`.
+        // Renaming or dropping either is a security-relevant regression.
+        let (_, _, _, details) = sample_reaped_details(900);
+        assert_eq!(details["reason"], "stuck_running_janitor");
+        assert_eq!(details["actor"], "system:stuck_scan_janitor");
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_null_timestamps_serialize() {
+        // sqlx returns started_at / completed_at as Option<DateTime>; an
+        // Option::None must serialize as JSON null rather than panic, so a
+        // race where completed_at hasn't been set is recorded honestly.
+        let details = build_scan_reaped_audit_details(
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            None::<chrono::DateTime<chrono::Utc>>,
+            None::<chrono::DateTime<chrono::Utc>>,
+            3600,
+        );
+        assert!(details["started_at"].is_null());
+        assert!(details["reaped_at"].is_null());
+        assert_eq!(details["threshold_secs"], 3600);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_threshold_value() {
+        // threshold_secs roundtrips so an audit reader can correlate the
+        // reaped row's started_at-vs-reaped_at gap against the threshold
+        // that was in effect at the time of the reap.
+        let details = build_scan_reaped_audit_details(
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now()),
+            i64::MAX,
+        );
+        assert_eq!(details["threshold_secs"], i64::MAX);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_has_exactly_expected_fields() {
+        // Future field additions are fine, but they must come with explicit
+        // test updates rather than slipping in unnoticed. Operators relying
+        // on the audit schema (or downstream SIEM/SOAR rules that parse it)
+        // need a single source of truth for the allowed shape.
+        let (_, _, _, details) = sample_reaped_details(120);
+        let obj = details.as_object().expect("details must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "actor",
+                "artifact_id",
+                "reaped_at",
+                "reason",
+                "repository_id",
+                "scan_id",
+                "started_at",
+                "threshold_secs",
+            ],
+        );
+    }
+
+    // =======================================================================
+    // cleanup_stuck_scans (#1015) — janitor entry point exercises function
+    // body and the i64::MAX clamp on the seconds cast. Uses an unreachable
+    // PgPool: pool exists but every SQL execute returns a connection error
+    // which is mapped to AppError::Database. Gives lib-level coverage of
+    // cast/clamp/format/sqlx::query!/map_err lines without standing up
+    // Postgres in CI.
+    // =======================================================================
+
+    fn unreachable_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
+            .expect("connect_lazy never fails for a syntactically valid URL")
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_returns_database_error_on_connection_failure() {
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service.cleanup_stuck_scans(Duration::from_secs(1800)).await;
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_handles_zero_threshold() {
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service.cleanup_stuck_scans(Duration::from_secs(0)).await;
+        // Without a real database the SQL execute fails; what matters here is
+        // that the zero-threshold path successfully constructs the query
+        // (no panic in the cast/format) before hitting the connection error.
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_clamps_overflow_threshold() {
+        // Duration::MAX would overflow an i64-seconds cast without the
+        // explicit `.min(i64::MAX as u64)` clamp; this test exercises that
+        // saturating branch.
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service.cleanup_stuck_scans(Duration::MAX).await;
+        assert!(matches!(result, Err(AppError::Database(_))));
     }
 
     // =======================================================================

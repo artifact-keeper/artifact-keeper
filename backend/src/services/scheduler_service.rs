@@ -16,6 +16,7 @@ use crate::services::backup_service::{BackupService, BackupType, CreateBackupReq
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
+use crate::services::scan_result_service::ScanResultService;
 use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
@@ -193,6 +194,47 @@ pub fn spawn_all(
                     }
                     Err(e) => {
                         tracing::warn!("Lifecycle policy execution failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Stuck-scan janitor (every `stuck_scan_check_interval_secs`, default 10 min).
+    //
+    // Pre-allocated `scan_results` rows can be left wedged in `status='running'`
+    // when the scan worker crashes mid-flight (OOM, pod evicted, panic, deploy
+    // mid-scan). Without this sweep they accumulate forever, polluting
+    // dashboards and the dedup path. Reaps rows whose `started_at` predates
+    // `stuck_scan_threshold_secs` (issue #1015).
+    {
+        let db = db.clone();
+        let threshold_secs = config.stuck_scan_threshold_secs;
+        let check_secs = config.stuck_scan_check_interval_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            let service = ScanResultService::new(db);
+            let mut ticker = interval(Duration::from_secs(check_secs));
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Sweeping for stuck 'running' scan_results rows");
+
+                match service
+                    .cleanup_stuck_scans(Duration::from_secs(threshold_secs))
+                    .await
+                {
+                    Ok(reaped) if reaped > 0 => {
+                        tracing::info!(
+                            "Stuck-scan janitor: reaped {} orphaned scan_results rows (threshold: {}s)",
+                            reaped,
+                            threshold_secs,
+                        );
+                        metrics_service::record_cleanup("stuck_scans", reaped);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Stuck-scan janitor sweep failed: {}", e);
                     }
                 }
             }
@@ -409,16 +451,16 @@ pub fn spawn_all(
                 }
             });
             tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
+                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
             );
         } else {
             tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
+                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
             );
         }
     } else {
         tracing::info!(
-            "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
+            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
         );
     }
     // Download-ticket cleanup (every 10 minutes).
@@ -452,7 +494,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup"
     );
 }
 
