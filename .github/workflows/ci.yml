@@ -460,6 +460,7 @@ jobs:
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
+            --test stuck_scan_janitor_tests \
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             -- --ignored --test-threads=1
