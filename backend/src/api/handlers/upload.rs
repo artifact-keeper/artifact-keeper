@@ -1563,19 +1563,19 @@ mod tests {
         //    key (proves we no longer use the broken "uploads/<repo_id>/..."
         //    layout, regression for #1168 part 3).
         //
-        // FilesystemStorage::key_to_path prepends the first 2 chars of the
-        // sanitized key as a sharding prefix on top of the base path, so the
-        // on-disk layout becomes `<base>/<shard>/<key>` where `<shard>` is
-        // the first 2 chars of `<hash[:2]>/<hash[2:4]>/<full-hash>` -- i.e.
-        // `hash[:2]` again. We assert the bytes land there with the right
+        // The storage key produced by `storage_key_from_checksum` is
+        // hierarchical (`<hash[:2]>/<hash[2:4]>/<full-hash>`). For hierarchical
+        // keys, `FilesystemStorage::key_to_path` does NOT prepend an extra
+        // shard prefix (see #1073): keys containing `/` already distribute
+        // themselves across directories, so the on-disk layout is simply
+        // `<base>/<key>`. We assert the bytes land there with the right
         // content, and as a safety net, also verify the legacy "uploads/..."
         // path from before #1168 does NOT exist.
         let expected_key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
                 &checksum,
             );
-        let shard = &expected_key[..2];
-        let on_disk_path = f.storage_dir.join(shard).join(&expected_key);
+        let on_disk_path = f.storage_dir.join(&expected_key);
         assert!(
             on_disk_path.exists(),
             "expected hashed bytes at {} (issue #1168 part 3)",
