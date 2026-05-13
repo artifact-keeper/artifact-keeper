@@ -11,6 +11,50 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Minimum reap-threshold for the stuck-scan janitor.
+///
+/// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
+/// tick (the SQL becomes `started_at < NOW() - interval '0'`), reaping
+/// healthy in-flight scans. A 60 s floor still lets operators configure
+/// very aggressive reaping for fast-scan workloads while rejecting the
+/// degenerate-zero misconfiguration.
+const STUCK_SCAN_THRESHOLD_FLOOR_SECS: u64 = 60;
+
+/// Minimum tick interval for the stuck-scan janitor.
+///
+/// `tokio::time::interval(Duration::from_secs(0))` panics, so a zero value
+/// kills the spawned scheduler task at startup with no operator-visible
+/// signal beyond a tokio panic in logs. A 30 s floor is well below the
+/// 600 s default and matches the cadence of the existing lifecycle
+/// scheduler.
+const STUCK_SCAN_INTERVAL_FLOOR_SECS: u64 = 30;
+
+fn clamp_stuck_scan_threshold(value: u64) -> u64 {
+    if value < STUCK_SCAN_THRESHOLD_FLOOR_SECS {
+        tracing::warn!(
+            value,
+            floor = STUCK_SCAN_THRESHOLD_FLOOR_SECS,
+            "STUCK_SCAN_THRESHOLD_SECS below floor; clamping to floor"
+        );
+        STUCK_SCAN_THRESHOLD_FLOOR_SECS
+    } else {
+        value
+    }
+}
+
+fn clamp_stuck_scan_interval(value: u64) -> u64 {
+    if value < STUCK_SCAN_INTERVAL_FLOOR_SECS {
+        tracing::warn!(
+            value,
+            floor = STUCK_SCAN_INTERVAL_FLOOR_SECS,
+            "STUCK_SCAN_CHECK_INTERVAL_SECS below floor; clamping to floor"
+        );
+        STUCK_SCAN_INTERVAL_FLOOR_SECS
+    } else {
+        value
+    }
+}
+
 /// Default cap for concurrent bcrypt-bound auth operations.
 ///
 /// bcrypt-cost-12 is CPU-bound and takes roughly 100-300 ms per verify; once
@@ -587,8 +631,14 @@ impl Config {
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
-            stuck_scan_threshold_secs: env_parse("STUCK_SCAN_THRESHOLD_SECS", 1800),
-            stuck_scan_check_interval_secs: env_parse("STUCK_SCAN_CHECK_INTERVAL_SECS", 600),
+            stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
+                "STUCK_SCAN_THRESHOLD_SECS",
+                1800,
+            )),
+            stuck_scan_check_interval_secs: clamp_stuck_scan_interval(env_parse(
+                "STUCK_SCAN_CHECK_INTERVAL_SECS",
+                600,
+            )),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
@@ -886,6 +936,52 @@ mod tests {
         let result: u64 = env_parse("__TEST_ENV_PARSE_EMPTY__", 99);
         assert_eq!(result, 99);
         env::remove_var("__TEST_ENV_PARSE_EMPTY__");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stuck-scan clamps (#1015 hardening)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_stuck_scan_threshold_below_floor_clamps_to_floor() {
+        assert_eq!(
+            clamp_stuck_scan_threshold(0),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+        assert_eq!(
+            clamp_stuck_scan_threshold(STUCK_SCAN_THRESHOLD_FLOOR_SECS - 1),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_threshold_at_or_above_floor_passes_through() {
+        assert_eq!(
+            clamp_stuck_scan_threshold(STUCK_SCAN_THRESHOLD_FLOOR_SECS),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+        assert_eq!(clamp_stuck_scan_threshold(1800), 1800);
+        assert_eq!(clamp_stuck_scan_threshold(86400), 86400);
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_interval_below_floor_clamps_to_floor() {
+        // The headline reason for the floor: tokio::time::interval(Duration::ZERO)
+        // panics, which would silently kill the spawned scheduler task.
+        assert_eq!(clamp_stuck_scan_interval(0), STUCK_SCAN_INTERVAL_FLOOR_SECS);
+        assert_eq!(
+            clamp_stuck_scan_interval(STUCK_SCAN_INTERVAL_FLOOR_SECS - 1),
+            STUCK_SCAN_INTERVAL_FLOOR_SECS
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_interval_at_or_above_floor_passes_through() {
+        assert_eq!(
+            clamp_stuck_scan_interval(STUCK_SCAN_INTERVAL_FLOOR_SECS),
+            STUCK_SCAN_INTERVAL_FLOOR_SECS
+        );
+        assert_eq!(clamp_stuck_scan_interval(600), 600);
     }
 
     // -----------------------------------------------------------------------

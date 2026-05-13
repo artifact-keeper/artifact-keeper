@@ -29,9 +29,19 @@
 -- backlog should size the upgrade window using the SQL count in the
 -- CHANGELOG pre-upgrade-check section.
 --
+-- The index INCLUDEs `id` so the inner CTE in `cleanup_stuck_scans`
+-- (`SELECT id FROM scan_results WHERE status='running' AND started_at IS NOT
+-- NULL AND started_at < <cutoff> ORDER BY started_at LIMIT 1000`) can be
+-- satisfied as an index-only scan on the visibility-map-warm path, avoiding
+-- ~1000 random heap fetches per tick during a backlog drain. The outer
+-- UPDATE still does PK lookups (and needs a row lock for FOR UPDATE), so
+-- INCLUDE does not eliminate heap I/O entirely, but it removes the
+-- candidate-selection heap traffic.
+--
 -- Idempotent via IF NOT EXISTS so re-running on an already-migrated DB is
 -- a no-op.
 
 CREATE INDEX IF NOT EXISTS idx_scan_results_running_started
   ON scan_results (started_at)
+  INCLUDE (id)
   WHERE status = 'running';
