@@ -1998,4 +1998,117 @@ mod tests {
             "23505 without constraint name must not be Conflict, got {mapped:?}"
         );
     }
+
+    // =========================================================================
+    // DB-backed tests for the ak-4q87 transaction-wrapped `create` path.
+    //
+    // These exercise the begin/commit/rollback arms that pure unit tests can't
+    // reach. They use `tdh::try_pool()` to opt into a real Postgres connection
+    // when DATABASE_URL is set, and skip silently otherwise. The coverage CI
+    // job provisions Postgres and runs migrations, so these tests instrument
+    // the transaction body during the lib-coverage measurement.
+    // =========================================================================
+
+    mod db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        fn make_create_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
+            CreateRepositoryRequest {
+                key: format!("acs-repo-{suffix}"),
+                name: format!("acs repo {suffix}"),
+                description: None,
+                format,
+                repo_type: RepositoryType::Local,
+                storage_backend: "filesystem".to_string(),
+                storage_path: format!("/tmp/acs-{suffix}"),
+                upstream_url: None,
+                is_public: false,
+                quota_bytes: None,
+                format_key: None,
+            }
+        }
+
+        async fn cleanup_repo(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        /// Happy-path: create commits the INSERT inside a transaction and
+        /// the resulting repo is visible after the commit.
+        #[tokio::test]
+        async fn test_create_commits_insert_in_transaction() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let req = make_create_req(&suffix, RepositoryFormat::Generic);
+            let repo = service.create(req).await.expect("create should commit");
+            assert_eq!(repo.key, format!("acs-repo-{suffix}"));
+
+            // Visible to a fresh fetch through the same pool: confirms commit
+            // landed (a non-committed INSERT would be invisible to a new
+            // connection because the transaction would have rolled back on
+            // drop).
+            let fetched = service.get_by_key(&repo.key).await.expect("fetched");
+            assert_eq!(fetched.id, repo.id);
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// `format_key` set: exercises the inner UPDATE + commit branch.
+        #[tokio::test]
+        async fn test_create_with_format_key_commits_inner_update() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.format_key = Some("wasm:custom-handler".to_string());
+            let repo = service
+                .create(req)
+                .await
+                .expect("create with format_key should commit");
+
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT format_key FROM repositories WHERE id = $1")
+                    .bind(repo.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch format_key");
+            assert_eq!(stored.as_deref(), Some("wasm:custom-handler"));
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Duplicate key: the second `create` rolls back its own (failed)
+        /// INSERT and returns the row created by the first.
+        #[tokio::test]
+        async fn test_create_duplicate_key_returns_existing_via_rollback() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let first = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("first create");
+
+            let second = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("duplicate create should idempotently return existing");
+            assert_eq!(
+                second.id, first.id,
+                "duplicate-key path must return the row created by the first call"
+            );
+
+            cleanup_repo(&pool, first.id).await;
+        }
+    }
 }
