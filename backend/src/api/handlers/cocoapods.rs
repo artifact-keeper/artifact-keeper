@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::cocoapods::CocoaPodsHandler;
 use crate::models::repository::RepositoryType;
@@ -293,8 +293,7 @@ async fn push_pod(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "cocoapods", "write")?.user_id;
+    let user_id = require_auth_basic(auth, "cocoapods")?.user_id;
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 

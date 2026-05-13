@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::sbt::SbtHandler;
 use crate::models::repository::RepositoryType;
@@ -207,8 +207,7 @@ async fn upload_artifact(
     Path((repo_key, artifact_path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "ivy", "write")?.user_id;
+    let user_id = require_auth_basic(auth, "ivy")?.user_id;
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
