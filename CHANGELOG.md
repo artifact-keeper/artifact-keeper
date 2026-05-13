@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Pre-upgrade check
+
+- **Stuck-scan janitor will reap accumulated `running` rows on first tick** (#1015, #1062) -- this release introduces a background janitor that transitions `scan_results` rows wedged in `status='running'` past the configured `STUCK_SCAN_THRESHOLD_SECS` (default 1800s / 30 min) to `status='failed'`. On long-running installs predating this release, previously-stuck rows from crashed scan workers (OOM, pod evicted, deploy mid-scan) will flip to `failed` in batches of up to 1000 rows per janitor tick (the per-tick cap bounds memory and audit-log write volume). With the default `STUCK_SCAN_CHECK_INTERVAL_SECS=600`, a backlog of N stuck rows therefore takes roughly `ceil(N / 1000) * (STUCK_SCAN_CHECK_INTERVAL_SECS / 60)` minutes per replica to fully drain. Multiple janitor-running replicas drain proportionally faster (the cap is per-replica, per-tick). Operators with a large backlog who want to accelerate the drain can lower `STUCK_SCAN_CHECK_INTERVAL_SECS` for one or two ticks after deploy and revert. Alerting on `status='failed'` deltas should expect this drain (one or many ticks depending on backlog size) at upgrade and tune accordingly.
+
+  Count the rows that will be reaped before upgrading:
+
+  ```sql
+  SELECT count(*) FROM scan_results
+  WHERE status = 'running'
+    AND started_at < now() - interval '30 min';
+  ```
+
+  The same count also approximates migration `105_partial_index_running_scans.sql`'s ACCESS EXCLUSIVE lock duration on `scan_results`. The partial index is built non-concurrently (forced by sqlx's per-migration transaction wrapper), and the build scan touches every `running` row that exists at migration time. New `scan_results` inserts block on that lock for the build's duration. On installs with a small backlog the build is sub-second; on installs with hundreds of thousands of historical stuck rows the build can take seconds-to-tens-of-seconds. Plan the upgrade window using the count above.
+
+  Each reap also writes one `SCAN_REAPED` entry to `audit_log` (#1063) carrying the `scan_id`, `artifact_id`, `repository_id`, `started_at`, `reaped_at`, and `threshold_secs` so the burst is auditable. Note that `audit_log` entries are subject to the `audit_retention_days` retention sweep (default 90 days), and the `scan_results` row itself is `ON DELETE CASCADE` from `artifacts`/`repositories`; for long-term compliance retention, export `SCAN_REAPED` entries to durable SIEM storage rather than relying on either table as the long-term source of truth. Artifacts whose vulnerability scan was reaped this way are now visible to operators investigating an incident; rescan with `POST /api/v1/security/artifacts/{id}/rescan` if the scan never reported findings.
+
 ### Added
 
+- **Stuck-scan janitor** (#1015) -- new `ScanResultService::cleanup_stuck_scans` background job registered in `scheduler_service::spawn_all` (90s startup delay, 600s default cadence) transitions `scan_results` rows wedged in `status='running'` past `STUCK_SCAN_THRESHOLD_SECS` (default 1800) to `status='failed'`. Configurable via `STUCK_SCAN_THRESHOLD_SECS` and `STUCK_SCAN_CHECK_INTERVAL_SECS` env vars. Emits the existing `ak_cleanup_items_removed_total{type="stuck_scans"}` counter. Forward-ported from `release/1.1.x` PR #1064.
+- **Stuck-scan janitor partial index** (#1061) -- migration `105_partial_index_running_scans.sql` adds `idx_scan_results_running_started ON scan_results (started_at) WHERE status = 'running'`. The janitor sweep added in #1015 filters on `status='running'` without a `repository_id` predicate, which would degrade on installs with very large `scan_results` tables. The partial index only contains in-flight rows so the planner goes straight to the candidates. `CREATE INDEX CONCURRENTLY` is intentionally not used because `sqlx::migrate` runs each migration in a transaction; in-flight rows are bounded by the janitor itself so the synchronous build is short.
+- **Audit-event emission on stuck-scan reap** (#1063) -- `ScanResultService::cleanup_stuck_scans` now writes one `SCAN_REAPED` entry to `audit_log` per reaped row, capturing `scan_id`, `artifact_id`, `repository_id`, `started_at`, `reaped_at`, `threshold_secs`, and `reason='stuck_running_janitor'` in the `details` JSON column. Previously the janitor emitted only the `ak_cleanup_items_removed_total{type="stuck_scans"}` counter, so operators investigating an incident could not tell which vulnerability scans never completed. Audit writes are best-effort: a failure to record the event is logged at warn level but does not roll back the reap, since leaving the row wedged in `running` is the worse outcome. Adds `AuditAction::ScanReaped` and `ResourceType::ScanResult`.
 - **Auth: download-ticket consumer middleware** (#930) -- the `?ticket=<v>` query parameter minted by `POST /api/v1/auth/ticket` is now accepted as a fallback authenticator on read routes (`auth_middleware`, `optional_auth_middleware`, and `repo_visibility_middleware`). Tickets are single-use, expire after 30 seconds, are restricted to GET/HEAD methods, and only authenticate the request whose URL path matches the ticket's bound `resource_path`. Useful for browser anchor-tag downloads and `EventSource` SSE streams where `Authorization` headers cannot be set.
 
 ### Fixed
