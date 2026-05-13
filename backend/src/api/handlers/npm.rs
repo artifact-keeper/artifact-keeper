@@ -819,9 +819,38 @@ async fn serve_tarball(
         let upath = upstream_path.clone();
         let pkg = package_name.to_string();
         let fname = filename.to_string();
+
+        // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+        // If a non-Remote member of this Virtual repo owns the npm
+        // package name, block Remote members from satisfying the
+        // download. The `package_name` parameter is the npm-canonical
+        // name (eg. `@types/node` or `lodash`) extracted by the router;
+        // `artifacts.name` stores the same shape, so a direct case-
+        // insensitive comparison is what `virtual_non_remote_owns_name`
+        // performs. Passing `None` to `resolve_virtual_download` is the
+        // load-bearing security primitive: see hex.rs's
+        // `serve_virtual_tarball_local_only` for the rationale on why
+        // any refactor here must keep this `None`.
+        //
+        // Fail-closed: skip the guard for names that fail
+        // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
+        // Such names cannot reach `artifacts.name` so the guard would
+        // always return false; skipping it spares the DB an existence
+        // check on every malformed request.
+        let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
+            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name).await?
+        } else {
+            false
+        };
+        let proxy_for_virtual = if local_owns {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
+
         let (content, content_type) = proxy_helpers::resolve_virtual_download(
             &state.db,
-            state.proxy_service.as_deref(),
+            proxy_for_virtual,
             repo.id,
             &upstream_path,
             |member_id, location| {

@@ -258,6 +258,7 @@ async fn download_file(
                     virtual_lookup: proxy_helpers::VirtualLookup::ExactPath(&artifact_path),
                     default_content_type: "application/octet-stream",
                     content_disposition_filename: None,
+                    suppress_upstream_proxy: false,
                 },
             )
             .await?

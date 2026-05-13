@@ -438,6 +438,7 @@ async fn download_package(
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
                         default_content_type: default_ct,
                         content_disposition_filename: cd_filename,
+                        suppress_upstream_proxy: false,
                     },
                 )
                 .await?

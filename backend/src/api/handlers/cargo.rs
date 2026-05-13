@@ -845,9 +845,41 @@ async fn download(
                 let vname = name_lower.clone();
                 let vversion = version.clone();
                 let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+                // If a non-Remote member of this Virtual repo owns the
+                // crate name, block Remote members from satisfying the
+                // download. The guard runs on the case-folded crate name
+                // (`name_lower` is already lowercase). When the guard
+                // fires we pass `None` to `resolve_virtual_download` so
+                // Remote members fall to `VirtualMemberFetchStrategy::Skip`.
+                // The `None` argument is load-bearing: see the comment
+                // on `serve_virtual_tarball_local_only` in hex.rs for
+                // why any future refactor that threads a real proxy
+                // service through this branch would re-open the
+                // shadowing attack.
+                //
+                // Fail-closed: if the requested name does not parse as a
+                // valid crate name, do not run the guard. Bad names
+                // cannot reach `artifacts.name` (the publish path also
+                // rejects them) so the guard would always return false
+                // anyway, and skipping it spares the DB an existence
+                // check on every malformed request.
+                let local_owns = if crate::formats::cargo::is_valid_cargo_name(&name_lower) {
+                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &name_lower)
+                        .await?
+                } else {
+                    false
+                };
+                let proxy_for_virtual = if local_owns {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
+
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    proxy_for_virtual,
                     repo.id,
                     &upstream_path,
                     |member_id, location| {

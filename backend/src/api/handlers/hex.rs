@@ -25,7 +25,9 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
-use crate::formats::hex::HexHandler;
+use crate::formats::hex::{
+    is_valid_hex_package_name, package_name_from_tarball_filename, HexHandler,
+};
 use crate::models::repository::{Repository, RepositoryType};
 
 // ---------------------------------------------------------------------------
@@ -240,6 +242,12 @@ async fn download_tarball(
                     virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
                     default_content_type: "application/octet-stream",
                     content_disposition_filename: cd_filename,
+                    // Shadowing guard handled above by the explicit
+                    // `virtual_local_owns_tarball_name` branch + the
+                    // `serve_virtual_tarball_local_only` call. Reaching here
+                    // means no local member claims this name, so we can let
+                    // the standard proxy fan-out run.
+                    suppress_upstream_proxy: false,
                 },
             )
             .await?
@@ -261,65 +269,6 @@ async fn download_tarball(
     .await
 }
 
-/// Parse the package name out of a hex tarball filename.
-///
-/// Hex tarballs are stored as `<name>-<version>.tar`. The package name itself
-/// may contain dashes (`my-package-1.4.0.tar`), so the split is "first `-`
-/// followed by an ASCII digit". Returns `None` for any input that does not
-/// parse cleanly as a hex tarball filename per the hex.pm package-name spec
-/// (lowercase ASCII alphanumeric + underscore, starts with a letter, see
-/// <https://hex.pm/docs/publish>).
-///
-/// Fail-closed contract: this helper is the gate that decides whether the
-/// supply-chain shadowing guard fires. Every "maybe" outcome returns `None`
-/// rather than a partially-parsed name. Specifically rejected:
-/// - filenames not ending in `.tar` (case-insensitive)
-/// - filenames with no `-<digit>` version separator
-/// - empty package names (e.g. `-1.0.0.tar`)
-/// - names containing characters outside `[a-z0-9_]`
-/// - names starting with a non-letter (digits, underscore)
-///
-/// The case-insensitive extension match is load-bearing for the shadowing
-/// guard: without it, an attacker requests `phoenix-1.4.0.Tar` and the
-/// parser returns `None`, bypassing the guard (#973 / PR #974).
-fn package_name_from_tarball_filename(filename: &str) -> Option<String> {
-    let lowered = filename.to_ascii_lowercase();
-    let without_ext = lowered.strip_suffix(".tar")?;
-    for (i, _) in without_ext.match_indices('-') {
-        if without_ext
-            .get(i + 1..)
-            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
-        {
-            let candidate = &without_ext[..i];
-            if is_valid_hex_package_name(candidate) {
-                return Some(candidate.to_string());
-            }
-            return None;
-        }
-    }
-    None
-}
-
-/// Validate a candidate hex package name against the registry's accepted
-/// shape: `[a-z][a-z0-9_-]*`. Used by `package_name_from_tarball_filename`
-/// so the shadowing guard refuses to interpret traversal-shaped or
-/// homoglyph-shaped inputs as legitimate package names.
-///
-/// Allows internal `-` and `_` to match `HexHandler::parse_path`'s behavior
-/// (the upload-path side accepts dashed names like `ex-doc`). The first
-/// character must be a lowercase ASCII letter to prevent version-looking
-/// prefixes (`1.0.0-...`) from being parsed as names.
-fn is_valid_hex_package_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_lowercase() {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
 /// Returns true if any non-Remote member of a virtual repo has an artifact
 /// row matching the package name parsed from a tarball filename. When true,
 /// the caller must block an upstream Remote member from satisfying the
@@ -335,44 +284,11 @@ async fn virtual_local_owns_tarball_name(
         return Ok(false);
     };
 
-    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
-    let non_remote_ids: Vec<uuid::Uuid> = members
-        .iter()
-        .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
-        .collect();
-
-    if non_remote_ids.is_empty() {
-        return Ok(false);
-    }
-
-    // Single-query existence check across every non-Remote member. The
-    // previous N-query loop scaled linearly with member count; replacing it
-    // with `repository_id = ANY($1)` keeps the guard at one round trip
-    // regardless of virtual fan-out. `LIMIT 1` short-circuits at the first
-    // matching row inside Postgres.
-    let exists = sqlx::query(
-        "SELECT 1 FROM artifacts \
-                              WHERE repository_id = ANY($1) \
-                                AND is_deleted = false \
-                                AND LOWER(name) = LOWER($2) \
-                              LIMIT 1",
-    )
-    .bind(&non_remote_ids)
-    .bind(&pkg_name)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        tracing::error!(
-            event = "shadowing_guard_db_error",
-            virtual_repo_id = %virtual_repo_id,
-            error = %e,
-            "stuck-shadowing-guard DB query failed; failing closed to 500",
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
-    })?;
-
-    Ok(exists.is_some())
+    // Delegate to the cross-format primitive (#1217 follow-up, ak-hv3s).
+    // The hex-specific work is parsing the tarball filename into a
+    // package name; the DB lookup is shared with cargo / npm / pypi /
+    // maven / rubygems.
+    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name).await
 }
 
 /// Serve a tarball download restricted to the virtual repo's non-Remote
@@ -475,6 +391,23 @@ async fn publish_package(
         return Err((
             StatusCode::BAD_REQUEST,
             "Package name and version are required",
+        )
+            .into_response());
+    }
+
+    // Reject names that violate the hex.pm package-name spec (`[a-z][a-z0-9_-]*`)
+    // before they reach `storage_key` or `artifact_path`. Previously only
+    // emptiness was checked, so an attacker could publish a tarball whose
+    // `metadata.config` carried `../evil` or `Phoenix` (uppercase) and have
+    // the malformed name persist in storage. The download-side shadowing
+    // guard (#1217) already refused to interpret such names, but the upload
+    // side did not. Apply the same character-set gate the download parser
+    // uses so uploads and downloads agree on what counts as a valid hex
+    // package name. (#1217 audit follow-up, ak-xf8w.)
+    if !is_valid_hex_package_name(&pkg_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid hex package name: must match [a-z][a-z0-9_-]*",
         )
             .into_response());
     }
@@ -1968,180 +1901,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // package_name_from_tarball_filename (#973 / PR #974 shadowing guard)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_package_name_from_tarball_filename_simple_name() {
-        assert_eq!(
-            package_name_from_tarball_filename("phoenix-1.4.0.tar"),
-            Some("phoenix".to_string())
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_dashed_name() {
-        // The first `-` is followed by `p` (not a digit), so the parser must
-        // advance to the second `-` which is followed by `1`. This is the
-        // load-bearing case for hex names like `ex-doc-0.30.0` (a real
-        // package on hex.pm) and matches `HexHandler::parse_path`.
-        assert_eq!(
-            package_name_from_tarball_filename("my-package-2.0.0.tar"),
-            Some("my-package".to_string())
-        );
-        assert_eq!(
-            package_name_from_tarball_filename("ex-doc-0.30.0.tar"),
-            Some("ex-doc".to_string())
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_no_extension() {
-        assert_eq!(package_name_from_tarball_filename("phoenix-1.4.0"), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_no_version_separator() {
-        assert_eq!(package_name_from_tarball_filename("phoenix.tar"), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_dash_not_followed_by_digit() {
-        // `phoenix-html` has a dash, but no digit follows — there is no
-        // version, so the filename does not parse as a tarball.
-        assert_eq!(package_name_from_tarball_filename("phoenix-html.tar"), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_version_with_prerelease() {
-        // SemVer pre-release (`1.0.0-rc.1`) starts with a digit so the
-        // parser picks the right `-`.
-        assert_eq!(
-            package_name_from_tarball_filename("phoenix-1.0.0-rc.1.tar"),
-            Some("phoenix".to_string())
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_empty_name_rejected() {
-        // `-1.0.0.tar` has the version-looking suffix but the name is empty.
-        // The shadowing guard must fail closed: empty name returns None.
-        assert_eq!(package_name_from_tarball_filename("-1.0.0.tar"), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_empty_string() {
-        assert_eq!(package_name_from_tarball_filename(""), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_uppercase_extension() {
-        // Case-insensitive `.tar` is load-bearing for the shadowing guard;
-        // an attacker requesting `.Tar` must not skip the guard.
-        assert_eq!(
-            package_name_from_tarball_filename("phoenix-1.4.0.Tar"),
-            Some("phoenix".to_string())
-        );
-        assert_eq!(
-            package_name_from_tarball_filename("PHOENIX-1.4.0.TAR"),
-            Some("phoenix".to_string())
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_rejects_path_traversal() {
-        // Path-traversal-shaped names must be rejected by the hex name
-        // validator so an attacker cannot trick the guard into emitting
-        // a DB lookup for a forbidden identifier.
-        assert_eq!(package_name_from_tarball_filename("..%2f-1.0.0.tar"), None);
-        assert_eq!(package_name_from_tarball_filename("../-1.0.0.tar"), None);
-        assert_eq!(
-            package_name_from_tarball_filename("phoenix/../-1.0.0.tar"),
-            None
-        );
-        // Double-encoded variant: axum percent-decodes once, so `%25`
-        // becomes `%` and the validator then rejects the `%` character.
-        assert_eq!(
-            package_name_from_tarball_filename("..%252f-1.0.0.tar"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_rejects_unicode_homoglyphs() {
-        // Non-ASCII characters must be rejected: SQL `LOWER()` is ASCII-only
-        // and would otherwise produce a different result than the parser's
-        // ASCII lowercase, opening a homoglyph-shadowing attack.
-        // (Cyrillic "о" U+043E in place of Latin "o".)
-        assert_eq!(
-            package_name_from_tarball_filename("ph\u{043e}enix-1.0.0.tar"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_rejects_name_starting_with_digit() {
-        // Hex spec: names must start with `[a-z]`. A leading digit would
-        // make the parser confuse a version-looking prefix for a name.
-        assert_eq!(package_name_from_tarball_filename("1cool-1.0.tar"), None);
-        assert_eq!(
-            package_name_from_tarball_filename("1.0.0-package-2.0.0.tar"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_rejects_underscore_leading() {
-        assert_eq!(package_name_from_tarball_filename("_foo-1.0.0.tar"), None);
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_accepts_underscore_internal() {
-        // Internal underscores are allowed per hex spec `[a-z][a-z0-9_]*`.
-        assert_eq!(
-            package_name_from_tarball_filename("foo_bar-1.0.0.tar"),
-            Some("foo_bar".to_string())
-        );
-    }
-
-    #[test]
-    fn test_package_name_from_tarball_filename_rejects_special_chars() {
-        // Spaces, slashes, dots in the name must all be rejected.
-        assert_eq!(
-            package_name_from_tarball_filename("foo bar-1.0.0.tar"),
-            None
-        );
-        assert_eq!(
-            package_name_from_tarball_filename("foo.bar-1.0.0.tar"),
-            None
-        );
-        assert_eq!(
-            package_name_from_tarball_filename("foo+bar-1.0.0.tar"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_is_valid_hex_package_name_accepts_spec_compliant() {
-        assert!(is_valid_hex_package_name("phoenix"));
-        assert!(is_valid_hex_package_name("phoenix_live_view"));
-        assert!(is_valid_hex_package_name("ex-doc")); // dashes allowed
-        assert!(is_valid_hex_package_name("a"));
-        assert!(is_valid_hex_package_name("abc123"));
-    }
-
-    #[test]
-    fn test_is_valid_hex_package_name_rejects_invalid() {
-        assert!(!is_valid_hex_package_name("")); // empty
-        assert!(!is_valid_hex_package_name("1abc")); // leading digit
-        assert!(!is_valid_hex_package_name("_abc")); // leading underscore
-        assert!(!is_valid_hex_package_name("-abc")); // leading dash
-        assert!(!is_valid_hex_package_name("Phoenix")); // uppercase
-        assert!(!is_valid_hex_package_name("abc.def")); // dot
-        assert!(!is_valid_hex_package_name("abc def")); // space
-        assert!(!is_valid_hex_package_name("abc/def")); // slash (traversal)
-    }
-
+    // Note: parser/validator unit tests live in `crate::formats::hex` alongside
+    // the implementations they cover (moved as part of the #1217 audit
+    // follow-up, ak-niid). The DB-backed router tests below exercise the
+    // download-side shadowing guard end-to-end.
     // -----------------------------------------------------------------------
     // DB-backed router tests for the proxy_helpers-call paths.
     // -----------------------------------------------------------------------
