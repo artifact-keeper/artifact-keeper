@@ -391,6 +391,41 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # The integration suites under `backend/tests/` insert into real tables
+      # (users, api_tokens, repositories, ...) via the SQLx pool. The service
+      # container above starts an empty Postgres, so we MUST apply migrations
+      # before running tests or the suites panic with `relation "users" does
+      # not exist` (regression after #1190 added api_token_cache_flush_tests
+      # to this job). Matches the `coverage` job's pattern: sqlx-cli is
+      # pre-installed on the `ak-ci-runners` image (see
+      # artifact-keeper-iac/runner-images/rust/Dockerfile).
+      - name: Wait for Postgres
+        env:
+          PGPASSWORD: registry
+        run: |
+          set -euo pipefail
+          # The service container's --health-cmd already runs pg_isready
+          # internally, but GitHub Actions starts the step before health
+          # transitions to "healthy" on slower runners. A short readiness
+          # loop from the runner side avoids a flaky first connect. Uses a
+          # plain TCP probe via bash so we do not depend on postgresql-client
+          # being installed on the runner image.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              echo "Postgres reachable on attempt $i"
+              exit 0
+            fi
+            echo "  waiting for postgres... ($i/30)"
+            sleep 1
+          done
+          echo "ERROR: Postgres did not become reachable within 30s"
+          exit 1
+
+      - name: Run database migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+        run: sqlx migrate run --source backend/migrations
+
       # `-- --ignored` runs the postgres-backed integration suites under
       # `backend/tests/` that were silently skipped before (#1031). The job
       # provisions postgres but NOT a running HTTP backend, Meilisearch,
