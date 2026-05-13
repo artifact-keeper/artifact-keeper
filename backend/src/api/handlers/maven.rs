@@ -1175,10 +1175,28 @@ async fn serve_artifact(
                             // (`foo-1.0-20260101.120000-1.jar`). The client still asks
                             // for the `-SNAPSHOT` filename, so map that alias to the
                             // latest timestamped file before giving up.
-                            maven_local_fetch_snapshot(
+                            if let Ok(result) = maven_local_fetch_snapshot(
                                 &db,
                                 &state,
                                 member_id,
+                                &location,
+                                &artifact_path,
+                            )
+                            .await
+                            {
+                                return Ok(result);
+                            }
+
+                            // Final fallback: storage-direct for GAV-grouped secondary
+                            // files (.pom, .module, -sources.jar, .sha512, …) whose
+                            // bytes exist in storage at `maven/<path>` but do NOT have
+                            // their own `artifacts` row (the row lives under the
+                            // primary .jar/.aar). The maven local download handler
+                            // already does this fallback for hosted repos — without
+                            // mirroring it here, virtual downloads of secondary files
+                            // return 404 even though the bytes are in S3.
+                            proxy_helpers::maven_local_fetch_storage_fallback(
+                                &state,
                                 &location,
                                 &artifact_path,
                             )

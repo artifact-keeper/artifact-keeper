@@ -969,6 +969,49 @@ pub async fn local_fetch_by_path(
     Ok((content, Some(artifact.content_type)))
 }
 
+/// Maven-specific storage-direct fallback for virtual-repo downloads.
+///
+/// The Maven download handler (`handlers/maven.rs`) groups artifacts by
+/// GAV coordinate — only the primary file (typically the `.jar`/`.aar`)
+/// gets a row in `artifacts`, while the secondary files (`.pom`,
+/// `.module`, `-sources.jar`, `.sha512`, …) live on storage at the same
+/// path but **don't** have their own DB row. When such a request hits a
+/// **local** repo, the maven handler already has a storage-direct
+/// fallback (`maven.rs`: "For hosted repos, fall back to serving from
+/// storage directly"). When the same request hits a **virtual** repo,
+/// the resolution goes through [`resolve_virtual_download`] →
+/// [`local_fetch_by_path`], which is SQL-only — the secondary file
+/// returns `NotFound` and the virtual response is a 404 even though
+/// the bytes are sitting in S3 in the member local repo.
+///
+/// This helper mirrors the maven.rs storage-direct fallback so the
+/// virtual download path serves secondary files correctly. Mavenness
+/// is baked in via the hardcoded `maven/` storage-key prefix that the
+/// maven handlers use when persisting bytes.
+///
+/// Designed to be passed as a `local_fetch` callback for
+/// [`resolve_virtual_download`] in the maven handler — same return
+/// shape as [`local_fetch_by_path`] so the two compose with `Result`
+/// fallthrough.
+///
+/// No DB read, no quarantine check (there's no row to quarantine).
+/// Content-Type is inferred from the path extension by the caller
+/// (typical pattern: caller uses `content_type_for_path` on the
+/// outer path when this returns `None`).
+pub(crate) async fn maven_local_fetch_storage_fallback(
+    state: &AppState,
+    location: &StorageLocation,
+    artifact_path: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    let storage = state.storage_for_repo_or_500(location)?;
+    let storage_key = format!("maven/{}", artifact_path);
+    let content = storage
+        .get(&storage_key)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+    Ok((content, None))
+}
+
 /// Generic local artifact fetch by name and version.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_name_version(
@@ -3594,6 +3637,146 @@ mod tests {
                 .await
                 .expect("fetch suffix");
         assert_eq!(&content2[..], b"abc123");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── maven_local_fetch_storage_fallback ────────────────────────────
+    //
+    // Guards the fix for the virtual-download miss on Maven GAV-grouped
+    // secondary files (.pom, .module, -sources.jar, .sha512). Those
+    // files have bytes in storage at `maven/<path>` but no row in
+    // `artifacts` (the row lives under the primary .jar/.aar), so
+    // `local_fetch_by_path` returns NotFound and the virtual response
+    // is a 404 even though the bytes are right there.
+
+    #[tokio::test]
+    async fn test_maven_local_fetch_storage_fallback_hit() {
+        // Bytes-only at maven/<path>, no artifacts row — mirrors the
+        // GAV-grouping shape where a secondary file's content is on
+        // disk but only the primary file has a DB row.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        // Bytes live at `maven/<path>` — same storage-key convention
+        // the maven upload handler uses for every file it stores.
+        let bytes = Bytes::from_static(b"<project>pom-bytes</project>");
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "maven/com/example/foo/1.0/foo-1.0.pom",
+            bytes.clone(),
+        )
+        .await
+        .expect("put");
+        // Deliberately NO insert_artifact: this is what makes the row
+        // absent — exactly the shape that traps virtual lookups today.
+
+        let location = repo.storage_location();
+        let (content, ct) = maven_local_fetch_storage_fallback(
+            &state,
+            &location,
+            "com/example/foo/1.0/foo-1.0.pom",
+        )
+        .await
+        .expect("storage-fallback fetch");
+        assert_eq!(&content[..], &bytes[..]);
+        // The function returns None for content-type — the caller
+        // (resolve_virtual_download glue in maven.rs) fills it in via
+        // `content_type_for_path` on the outer request path.
+        assert!(ct.is_none());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_local_fetch_storage_fallback_miss_returns_not_found() {
+        // No artifacts row AND no bytes at maven/<path> — the function
+        // must surface NOT_FOUND (the same shape as `local_fetch_by_path`),
+        // so the resolve_virtual_download glue treats it as
+        // "this member doesn't have the file, try the next one".
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        let location = repo.storage_location();
+        let err = maven_local_fetch_storage_fallback(
+            &state,
+            &location,
+            "com/example/missing/1.0/missing-1.0.pom",
+        )
+        .await
+        .expect_err("expected NotFound for missing bytes");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_local_fetch_storage_fallback_ignores_non_maven_prefix() {
+        // Storage at `pypi/<path>` (different format prefix) must NOT
+        // be served by the maven fallback. This guards against a
+        // future refactor accidentally dropping the hardcoded `maven/`
+        // prefix and turning the fallback into a generic storage probe
+        // that could leak content across formats sharing the same
+        // backend.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        let bytes = Bytes::from_static(b"wrong-format-bytes");
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "pypi/com/example/foo/1.0/foo-1.0.pom",
+            bytes.clone(),
+        )
+        .await
+        .expect("put");
+
+        let location = repo.storage_location();
+        let err = maven_local_fetch_storage_fallback(
+            &state,
+            &location,
+            "com/example/foo/1.0/foo-1.0.pom",
+        )
+        .await
+        .expect_err("pypi-prefixed bytes should not be picked up by maven fallback");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
