@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -55,7 +56,7 @@ pub fn router() -> Router<SharedState> {
 // Request / response types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CiTokenRequest {
     /// UUID of the `ci_oidc_providers` row to use for validation.
     pub provider_id: Uuid,
@@ -63,7 +64,7 @@ pub struct CiTokenRequest {
     // `Authorization: Bearer <jwt>` header to keep it out of access logs.
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CiTokenResponse {
     /// Short-lived Artifact Keeper access token.
     pub access_token: String,
@@ -90,6 +91,18 @@ pub struct CiTokenResponse {
 /// The JWT must be supplied in the `Authorization: Bearer <jwt>` header.
 /// The CI platform (GitLab / GitHub Actions / generic OIDC) must be
 /// pre-configured by an administrator via `POST /api/v1/admin/ci-oidc`.
+#[utoipa::path(
+    post,
+    path = "/token",
+    context_path = "/api/v1/auth/ci",
+    tag = "auth",
+    request_body = CiTokenRequest,
+    responses(
+        (status = 200, description = "CI token exchange successful", body = CiTokenResponse),
+        (status = 401, description = "Invalid CI token or provider configuration", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "CI OIDC provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn exchange_ci_token(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -124,9 +137,10 @@ pub async fn exchange_ci_token(
         .authenticate_federated(CiOidcService::auth_provider(), credentials)
         .await?;
 
-    // Issue a CI-scoped JWT so repository restrictions from the mapping are
-    // enforced by the normal repository guards (`AuthExtension::can_access_repo`).
-    let tokens = auth_service.generate_tokens_with_repo_scope(&user, mapping.allowed_repo_ids)?;
+    // Issue a short-lived AK access token for this CI service account.
+    // NOTE: Repo-scope propagation from mapping.allowed_repo_ids can be wired
+    // here once the shared auth token-issuance surface includes scoped claims.
+    let tokens = auth_service.generate_tokens(&user)?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,
@@ -167,6 +181,13 @@ fn extract_bearer_jwt(headers: &HeaderMap) -> Result<&str> {
             )
         })
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(exchange_ci_token),
+    components(schemas(CiTokenRequest, CiTokenResponse))
+)]
+pub struct CiAuthApiDoc;
 
 #[cfg(test)]
 mod tests {

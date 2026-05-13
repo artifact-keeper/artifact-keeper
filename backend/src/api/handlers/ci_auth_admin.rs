@@ -25,6 +25,7 @@ use axum::{
     routing::{get, patch},
     Json, Router,
 };
+use utoipa::OpenApi;
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -69,6 +70,18 @@ fn require_admin(auth: &AuthExtension) -> crate::error::Result<()> {
 // Provider handlers
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "List CI OIDC providers", body = Vec<CiOidcProviderResponse>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn list_providers(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -78,6 +91,20 @@ pub async fn list_providers(
     Ok(Json(svc.list().await?))
 }
 
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    responses(
+        (status = 200, description = "Get CI OIDC provider", body = CiOidcProviderResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -88,6 +115,20 @@ pub async fn get_provider(
     Ok(Json(svc.get_response(id).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    request_body = CreateCiOidcProviderRequest,
+    responses(
+        (status = 200, description = "Create CI OIDC provider", body = CiOidcProviderResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn create_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -98,6 +139,22 @@ pub async fn create_provider(
     Ok(Json(svc.create(req).await?))
 }
 
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    request_body = UpdateCiOidcProviderRequest,
+    responses(
+        (status = 200, description = "Update CI OIDC provider", body = CiOidcProviderResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn update_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -109,6 +166,20 @@ pub async fn update_provider(
     Ok(Json(svc.update(id, req).await?))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    responses(
+        (status = 200, description = "Delete CI OIDC provider"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn delete_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -119,6 +190,22 @@ pub async fn delete_provider(
     svc.delete(id).await
 }
 
+#[utoipa::path(
+    patch,
+    path = "/{id}/toggle",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    request_body = CiOidcToggleRequest,
+    responses(
+        (status = 200, description = "Toggle CI OIDC provider", body = CiOidcProviderResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn toggle_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -134,6 +221,20 @@ pub async fn toggle_provider(
 // Mapping handlers
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/{id}/mappings",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    responses(
+        (status = 200, description = "List identity mappings for provider", body = Vec<CiOidcMappingResponse>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn list_mappings(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -144,6 +245,23 @@ pub async fn list_mappings(
     Ok(Json(svc.list_mappings(provider_id).await?))
 }
 
+#[utoipa::path(
+    get,
+    path = "/{id}/mappings/{mid}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "CI OIDC provider ID"),
+        ("mid" = Uuid, Path, description = "Identity mapping ID")
+    ),
+    responses(
+        (status = 200, description = "Get identity mapping", body = CiOidcMappingResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Mapping not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_mapping(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -154,6 +272,22 @@ pub async fn get_mapping(
     Ok(Json(svc.get_mapping(provider_id, mapping_id).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/{id}/mappings",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
+    request_body = CreateCiOidcMappingRequest,
+    responses(
+        (status = 200, description = "Create identity mapping", body = CiOidcMappingResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn create_mapping(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -165,6 +299,25 @@ pub async fn create_mapping(
     Ok(Json(svc.create_mapping(provider_id, req).await?))
 }
 
+#[utoipa::path(
+    put,
+    path = "/{id}/mappings/{mid}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "CI OIDC provider ID"),
+        ("mid" = Uuid, Path, description = "Identity mapping ID")
+    ),
+    request_body = UpdateCiOidcMappingRequest,
+    responses(
+        (status = 200, description = "Update identity mapping", body = CiOidcMappingResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Mapping not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn update_mapping(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -178,6 +331,23 @@ pub async fn update_mapping(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/{id}/mappings/{mid}",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "CI OIDC provider ID"),
+        ("mid" = Uuid, Path, description = "Identity mapping ID")
+    ),
+    responses(
+        (status = 200, description = "Delete identity mapping"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Mapping not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn delete_mapping(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -188,6 +358,25 @@ pub async fn delete_mapping(
     svc.delete_mapping(provider_id, mapping_id).await
 }
 
+#[utoipa::path(
+    patch,
+    path = "/{id}/mappings/{mid}/toggle",
+    context_path = "/api/v1/admin/ci-oidc",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "CI OIDC provider ID"),
+        ("mid" = Uuid, Path, description = "Identity mapping ID")
+    ),
+    request_body = CiOidcToggleRequest,
+    responses(
+        (status = 200, description = "Toggle identity mapping", body = CiOidcMappingResponse),
+        (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Mapping not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn toggle_mapping(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -201,6 +390,34 @@ pub async fn toggle_mapping(
             .await?,
     ))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_providers,
+        get_provider,
+        create_provider,
+        update_provider,
+        delete_provider,
+        toggle_provider,
+        list_mappings,
+        get_mapping,
+        create_mapping,
+        update_mapping,
+        delete_mapping,
+        toggle_mapping
+    ),
+    components(schemas(
+        CreateCiOidcProviderRequest,
+        UpdateCiOidcProviderRequest,
+        CiOidcProviderResponse,
+        CiOidcToggleRequest,
+        CreateCiOidcMappingRequest,
+        UpdateCiOidcMappingRequest,
+        CiOidcMappingResponse
+    ))
+)]
+pub struct CiAuthAdminApiDoc;
 
 #[cfg(test)]
 mod tests {

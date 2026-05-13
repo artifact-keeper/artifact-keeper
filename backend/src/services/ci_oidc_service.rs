@@ -23,6 +23,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::RwLock;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -69,7 +70,7 @@ pub struct CiOidcIdentityMapping {
 // API request / response types — providers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateCiOidcProviderRequest {
     pub name: String,
     pub provider_type: Option<String>,
@@ -78,7 +79,7 @@ pub struct CreateCiOidcProviderRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateCiOidcProviderRequest {
     pub name: Option<String>,
     pub provider_type: Option<String>,
@@ -87,7 +88,7 @@ pub struct UpdateCiOidcProviderRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct CiOidcProviderResponse {
     pub id: Uuid,
     pub name: String,
@@ -101,7 +102,7 @@ pub struct CiOidcProviderResponse {
 }
 
 /// Body for toggle endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CiOidcToggleRequest {
     pub enabled: bool,
 }
@@ -110,7 +111,7 @@ pub struct CiOidcToggleRequest {
 // API request / response types — identity mappings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateCiOidcMappingRequest {
     pub name: String,
     pub priority: Option<i32>,
@@ -119,7 +120,7 @@ pub struct CreateCiOidcMappingRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateCiOidcMappingRequest {
     pub name: Option<String>,
     pub priority: Option<i32>,
@@ -128,7 +129,7 @@ pub struct UpdateCiOidcMappingRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct CiOidcMappingResponse {
     pub id: Uuid,
     pub provider_id: Uuid,

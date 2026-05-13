@@ -137,6 +137,8 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
     doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
     doc.merge(super::handlers::smtp::SmtpApiDoc::openapi());
+    doc.merge(super::handlers::ci_auth::CiAuthApiDoc::openapi());
+    doc.merge(super::handlers::ci_auth_admin::CiAuthAdminApiDoc::openapi());
 
     doc
 }

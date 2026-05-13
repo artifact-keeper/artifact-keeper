@@ -2511,6 +2511,8 @@ mod tests {
             iat: now,
             exp: now + 300,
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
         encode(
             &Header::default(),

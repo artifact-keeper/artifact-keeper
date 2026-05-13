@@ -53,7 +53,6 @@ ALTER TYPE auth_provider ADD VALUE IF NOT EXISTS 'ci';
 --    (lower number = higher priority).  The first enabled mapping whose
 --    claim_filters all match the incoming JWT claims wins.  The matching
 --    mapping determines:
---      • which AK Role the resulting service account receives
 --      • an optional explicit repository scope (allowed_repo_ids)
 --      • a stable username derived from the mapping UUID
 -- ---------------------------------------------------------------------------
@@ -69,8 +68,6 @@ CREATE TABLE IF NOT EXISTS ci_oidc_identity_mappings (
     -- a single string (exact match) or an array of strings (any-of match).
     -- An empty object {} matches every JWT (catch-all).
     claim_filters    JSONB        NOT NULL DEFAULT '{}',
-    -- Optional AK Role to assign to the service account on login.
-    role_id          UUID         REFERENCES roles(id) ON DELETE SET NULL,
     -- Optional repository-scope restriction (further narrows Role access).
     -- NULL means the mapping does not restrict by repository.
     allowed_repo_ids UUID[],
@@ -81,3 +78,14 @@ CREATE TABLE IF NOT EXISTS ci_oidc_identity_mappings (
 
 CREATE INDEX IF NOT EXISTS idx_ci_oidc_mappings_provider_priority
     ON ci_oidc_identity_mappings (provider_id, priority);
+
+-- ---------------------------------------------------------------------------
+-- 4. Compatibility guard for mixed deployment histories
+--
+-- If `allowed_repo_ids` was removed on any existing environment by a prior
+-- migration variant, add it back. On fresh installs this is a no-op because
+-- the column is already created above.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE ci_oidc_identity_mappings
+	ADD COLUMN IF NOT EXISTS allowed_repo_ids UUID[];
