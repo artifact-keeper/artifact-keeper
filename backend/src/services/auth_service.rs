@@ -1636,21 +1636,33 @@ impl AuthService {
     /// Apply role mapping to a user in the database.
     ///
     /// Updates the user's is_admin flag and assigns roles based on the mapping.
+    ///
+    /// ak-4q87: the is_admin update, the wipe of existing roles, and the
+    /// reinstall of mapped roles all run in a single transaction so a mid-
+    /// way failure (e.g. a duplicate-key race on user_roles, or a connection
+    /// drop after the DELETE) cannot leave the user with no roles and no
+    /// is_admin update applied. The whole rebuild is atomic.
     pub async fn apply_role_mapping(&self, user_id: Uuid, mapping: &RoleMapping) -> Result<()> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         // Update is_admin flag (only if admin group mapping is configured)
         sqlx::query!(
             "UPDATE users SET is_admin = COALESCE($2, is_admin), updated_at = NOW() WHERE id = $1",
             user_id,
             mapping.is_admin
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Clear existing role assignments and add new ones
         // First, remove all current roles (for federated users, roles come from provider)
         sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1658,7 +1670,7 @@ impl AuthService {
         for role_name in &mapping.roles {
             // Look up role by name and assign if it exists
             let role = sqlx::query!("SELECT id FROM roles WHERE name = $1", role_name)
-                .fetch_optional(&self.db)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1668,11 +1680,15 @@ impl AuthService {
                     user_id,
                     role.id
                 )
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
             }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }

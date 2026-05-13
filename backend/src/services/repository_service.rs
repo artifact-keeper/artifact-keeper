@@ -343,7 +343,18 @@ impl RepositoryService {
             )));
         }
 
-        let repo = match sqlx::query_as!(
+        // ak-4q87: wrap INSERT + optional `format_key` UPDATE in a single
+        // transaction so a failure of the UPDATE rolls back the INSERT.
+        // Without this a WASM-plugin-handler repo could end up persisted
+        // without its custom format_key, leaving the row in an inconsistent
+        // state that the caller never sees committed.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let insert_result = sqlx::query_as!(
             Repository,
             r#"
             INSERT INTO repositories (
@@ -375,32 +386,42 @@ impl RepositoryService {
             req.is_public,
             req.quota_bytes,
         )
-        .fetch_one(&self.db)
-        .await
-        {
-            Ok(repo) => repo,
+        .fetch_one(&mut *tx)
+        .await;
+
+        let repo = match insert_result {
+            Ok(repo) => {
+                // Set custom format_key for WASM plugin handlers. Runs inside
+                // the same tx so an UPDATE failure rolls back the INSERT.
+                if let Some(ref fk) = req.format_key {
+                    sqlx::query("UPDATE repositories SET format_key = $1 WHERE id = $2")
+                        .bind(fk)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                repo
+            }
             Err(e) if is_duplicate_key_error(&e.to_string()) => {
-                // Another request created this repo concurrently. Return the
-                // existing row so callers see a successful, idempotent result
-                // instead of a 409 Conflict under high concurrency.
+                // Another request created this repo concurrently. Roll back
+                // our (failed) INSERT and return the existing row so callers
+                // see a successful, idempotent result instead of a 409.
                 tracing::debug!(
                     key = %req.key,
                     "Concurrent insert detected, returning existing repository"
                 );
+                let _ = tx.rollback().await;
                 self.get_by_key(&req.key).await?
             }
-            Err(e) => return Err(AppError::Database(e.to_string())),
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e.to_string()));
+            }
         };
-
-        // Set custom format_key for WASM plugin handlers
-        if let Some(ref fk) = req.format_key {
-            sqlx::query("UPDATE repositories SET format_key = $1 WHERE id = $2")
-                .bind(fk)
-                .bind(repo.id)
-                .execute(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-        }
 
         // Index repository in search engine (non-blocking)
         if let Some(ref search) = self.search_service {
@@ -663,12 +684,17 @@ impl RepositoryService {
     ///
     /// Cycle detection runs only when the candidate member is itself a
     /// virtual repository (non-virtual leaves cannot extend a cycle).
+    ///
+    /// When `priority` is `None`, the next priority value is computed as
+    /// `MAX(priority) + 1` *inside* the advisory-locked transaction so that
+    /// concurrent `add_virtual_member` calls cannot observe the same MAX
+    /// and assign duplicate priorities (ak-jhdq).
     pub async fn add_virtual_member(
         &self,
         virtual_repo_id: Uuid,
         member_repo_id: Uuid,
-        priority: i32,
-    ) -> Result<()> {
+        priority: Option<i32>,
+    ) -> Result<i32> {
         // Reject self-membership unconditionally before opening the
         // transaction. The cycle check below would also catch this, but
         // the dedicated error message is more useful at the API boundary
@@ -743,6 +769,25 @@ impl RepositoryService {
             )));
         }
 
+        // Resolve priority inside the locked tx. ak-jhdq: doing the MAX read
+        // outside the tx allowed two concurrent POSTs to observe the same
+        // value and INSERT identical priorities. The advisory lock above
+        // already serializes membership mutations, so reading MAX here is
+        // race-free relative to other `add_virtual_member` tx.
+        let resolved_priority = match priority {
+            Some(p) => p,
+            None => {
+                let max: Option<i32> = sqlx::query_scalar(
+                    "SELECT MAX(priority) FROM virtual_repo_members WHERE virtual_repo_id = $1",
+                )
+                .bind(virtual_repo_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                max.unwrap_or(0) + 1
+            }
+        };
+
         sqlx::query(
             r#"
             INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
@@ -751,7 +796,7 @@ impl RepositoryService {
         )
         .bind(virtual_repo_id)
         .bind(member_repo_id)
-        .bind(priority)
+        .bind(resolved_priority)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -762,7 +807,7 @@ impl RepositoryService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(())
+        Ok(resolved_priority)
     }
 
     /// Return true if inserting the edge

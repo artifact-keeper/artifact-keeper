@@ -82,13 +82,13 @@ async fn duplicate_add_virtual_member_returns_conflict_not_500() {
     let svc = RepositoryService::new(pool.clone());
 
     // First insert succeeds.
-    svc.add_virtual_member(virtual_id, member_id, 1)
+    svc.add_virtual_member(virtual_id, member_id, Some(1))
         .await
         .expect("first add_virtual_member must succeed");
 
     // Second insert must produce AppError::Conflict (NOT Database/500).
     let err = svc
-        .add_virtual_member(virtual_id, member_id, 2)
+        .add_virtual_member(virtual_id, member_id, Some(2))
         .await
         .expect_err("second add_virtual_member must fail");
 
@@ -126,4 +126,64 @@ async fn duplicate_add_virtual_member_returns_conflict_not_500() {
     );
 
     cleanup(&pool, virtual_id, member_id).await;
+}
+
+/// ak-jhdq: when two concurrent POSTs to `add_virtual_member` arrive
+/// with `priority = None`, the service must assign distinct priorities,
+/// not the same MAX+1 value. The advisory lock taken inside the service
+/// transaction serialises the MAX read with the INSERT.
+#[tokio::test]
+#[ignore]
+async fn concurrent_add_virtual_member_assigns_distinct_priorities() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this integration test");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("failed to connect to database");
+
+    let suffix = Uuid::new_v4();
+    let virtual_key = format!("test-virt-race-{}", suffix);
+    let member_a_key = format!("test-member-a-{}", suffix);
+    let member_b_key = format!("test-member-b-{}", suffix);
+
+    let virtual_id = insert_repo(&pool, &virtual_key, "virtual", "generic").await;
+    let member_a = insert_repo(&pool, &member_a_key, "local", "generic").await;
+    let member_b = insert_repo(&pool, &member_b_key, "local", "generic").await;
+
+    let svc_a = RepositoryService::new(pool.clone());
+    let svc_b = RepositoryService::new(pool.clone());
+
+    // Two concurrent auto-priority adds: each computes MAX(priority)+1
+    // inside the same advisory-locked tx, so the second one must observe
+    // the first one's INSERT and assign the next value.
+    let (a_res, b_res) = tokio::join!(
+        svc_a.add_virtual_member(virtual_id, member_a, None),
+        svc_b.add_virtual_member(virtual_id, member_b, None),
+    );
+
+    let a_prio = a_res.expect("add member a");
+    let b_prio = b_res.expect("add member b");
+
+    assert_ne!(
+        a_prio, b_prio,
+        "concurrent auto-priority inserts must produce distinct priorities"
+    );
+    let mut prios = [a_prio, b_prio];
+    prios.sort();
+    assert_eq!(
+        prios,
+        [1, 2],
+        "first auto-priority is 1, second is 2, even under contention"
+    );
+
+    sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+        .bind(virtual_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+        .bind(&[virtual_id, member_a, member_b][..])
+        .execute(&pool)
+        .await
+        .ok();
 }

@@ -48,14 +48,14 @@ const CONFIG_CACHE_TTL_SECS: u64 = 3600;
 
 /// Thread-safe cache for upstream registry `config.json` download URL (`dl` field).
 /// Key: upstream base URL. Value: resolved `dl` URL + insertion time.
-type ConfigCache = std::sync::Arc<std::sync::RwLock<HashMap<String, (String, Instant)>>>;
+type ConfigCache = std::sync::Arc<tokio::sync::RwLock<HashMap<String, (String, Instant)>>>;
 
 /// Module-level cache for upstream `config.json` download URLs.
 static UPSTREAM_CONFIG_CACHE: once_cell::sync::Lazy<ConfigCache> =
-    once_cell::sync::Lazy::new(|| std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())));
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())));
 
-fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
-    let c = cache.read().ok()?;
+async fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
+    let c = cache.read().await;
     let (bytes, at) = c.get(key)?;
     if at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS {
         Some(bytes.clone())
@@ -64,17 +64,14 @@ fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
     }
 }
 
-fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
-    if let Ok(mut c) = cache.write() {
-        c.retain(|_, (_, at)| at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS);
-        c.insert(key, (bytes, Instant::now()));
-    }
+async fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
+    let mut c = cache.write().await;
+    c.retain(|_, (_, at)| at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS);
+    c.insert(key, (bytes, Instant::now()));
 }
 
-fn index_cache_invalidate(cache: &IndexCache, key: &str) {
-    if let Ok(mut c) = cache.write() {
-        c.remove(key);
-    }
+async fn index_cache_invalidate(cache: &IndexCache, key: &str) {
+    cache.write().await.remove(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +79,8 @@ fn index_cache_invalidate(cache: &IndexCache, key: &str) {
 // ---------------------------------------------------------------------------
 
 /// Look up the cached `dl` URL for an upstream registry base URL.
-fn config_cache_get(base_url: &str) -> Option<String> {
-    let c = UPSTREAM_CONFIG_CACHE.read().ok()?;
+async fn config_cache_get(base_url: &str) -> Option<String> {
+    let c = UPSTREAM_CONFIG_CACHE.read().await;
     let (dl_url, at) = c.get(base_url)?;
     if at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS {
         Some(dl_url.clone())
@@ -93,11 +90,10 @@ fn config_cache_get(base_url: &str) -> Option<String> {
 }
 
 /// Store a resolved `dl` URL for an upstream base URL.
-fn config_cache_set(base_url: String, dl_url: String) {
-    if let Ok(mut c) = UPSTREAM_CONFIG_CACHE.write() {
-        c.retain(|_, (_, at)| at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS);
-        c.insert(base_url, (dl_url, Instant::now()));
-    }
+async fn config_cache_set(base_url: String, dl_url: String) {
+    let mut c = UPSTREAM_CONFIG_CACHE.write().await;
+    c.retain(|_, (_, at)| at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS);
+    c.insert(base_url, (dl_url, Instant::now()));
 }
 
 /// Fetch the upstream registry's `config.json` and extract the `dl` field.
@@ -123,7 +119,7 @@ async fn resolve_upstream_dl_url(
         .or(repo.upstream_url.as_deref())?;
 
     // Check the cache first.
-    if let Some(cached) = config_cache_get(base_url) {
+    if let Some(cached) = config_cache_get(base_url).await {
         return Some(cached);
     }
 
@@ -138,7 +134,7 @@ async fn resolve_upstream_dl_url(
     let dl_url = config.get("dl")?.as_str()?.to_string();
 
     // Cache the resolved dl URL.
-    config_cache_set(base_url.to_string(), dl_url.clone());
+    config_cache_set(base_url.to_string(), dl_url.clone()).await;
 
     Some(dl_url)
 }
@@ -247,7 +243,8 @@ async fn resolve_cargo_repo(
     // Check the shared repo cache first.  The repo_visibility_middleware
     // populates this cache before handlers run, so on most requests this
     // returns immediately with 0 DB queries.
-    if let Ok(cache) = repo_cache.read() {
+    {
+        let cache = repo_cache.read().await;
         if let Some((entry, at)) = cache.get(repo_key) {
             if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
                 let fmt = entry.format.to_lowercase();
@@ -307,7 +304,8 @@ async fn resolve_cargo_repo(
     let index_upstream_url: Option<String> = repo.get("index_upstream_url");
 
     // Populate cache so subsequent requests from this handler path are fast.
-    if let Ok(mut cache) = repo_cache.write() {
+    {
+        let mut cache = repo_cache.write().await;
         cache.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
         cache.insert(
             repo_key.to_string(),
@@ -349,12 +347,13 @@ async fn config_json(
     let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Check repo visibility from the cache (populated by resolve_cargo_repo).
-    let is_private = !state
-        .repo_cache
-        .read()
-        .ok()
-        .and_then(|c| c.get(&repo_key).map(|(r, _)| r.is_public))
-        .unwrap_or(true);
+    let is_private = {
+        let cache = state.repo_cache.read().await;
+        !cache
+            .get(&repo_key)
+            .map(|(r, _)| r.is_public)
+            .unwrap_or(true)
+    };
 
     // Determine the base URL from reverse-proxy / Host headers.
     let base_url = proxy_helpers::request_base_url(&headers);
@@ -709,7 +708,7 @@ async fn publish(
     .await?;
 
     // Invalidate the index cache for this crate so the next fetch sees the new version.
-    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower));
+    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
 
     // Also invalidate any virtual repos that include this hosted repo.
     let virtual_keys: Vec<String> = sqlx::query_scalar(
@@ -723,7 +722,7 @@ async fn publish(
     .unwrap_or_default();
 
     for vkey in &virtual_keys {
-        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower));
+        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
     }
 
     info!(
@@ -1071,10 +1070,13 @@ async fn try_remote_index(
     let index_path = cargo_sparse_index_path_upstream(name_lower);
     let result = proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, &index_path).await;
 
-    Some(result.map(|(content, content_type)| {
-        index_cache_set(index_cache, cache_key.to_string(), content.clone());
-        index_response(content, content_type)
-    }))
+    Some(match result {
+        Ok((content, content_type)) => {
+            index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
+            Ok(index_response(content, content_type))
+        }
+        Err(e) => Err(e),
+    })
 }
 
 /// Try to resolve a crate index from a virtual repo's member repositories.
@@ -1251,13 +1253,17 @@ async fn try_virtual_index(
         }
     }
 
-    finalize_virtual_index_aggregation(aggregated).map(|maybe_body| match maybe_body {
-        Ok(body) => {
-            index_cache_set(index_cache, cache_key.to_string(), body.clone());
-            Ok(index_response(body, Some("application/json".to_string())))
+    match finalize_virtual_index_aggregation(aggregated) {
+        Some(Ok(body)) => {
+            index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
+            Some(Ok(index_response(
+                body,
+                Some("application/json".to_string()),
+            )))
         }
-        Err(resp) => Err(resp),
-    })
+        Some(Err(resp)) => Some(Err(resp)),
+        None => None,
+    }
 }
 
 /// Order virtual repo members so non-Remote members come before Remote
@@ -1373,7 +1379,7 @@ async fn serve_index(
     let cache_key = format!("{}:{}", repo_key, name_lower);
 
     // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
-    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key) {
+    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
         return Ok(index_response(cached, Some("application/json".to_string())));
     }
 
@@ -1454,7 +1460,7 @@ async fn serve_index(
         .collect();
 
     let body = bytes::Bytes::from(lines.join("\n"));
-    index_cache_set(&state.index_cache, cache_key, body.clone());
+    index_cache_set(&state.index_cache, cache_key, body.clone()).await;
     Ok(index_response(body, Some("application/json".to_string())))
 }
 
@@ -2704,78 +2710,85 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_index_cache() -> IndexCache {
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
         Arc::new(RwLock::new(HashMap::new()))
     }
 
-    #[test]
-    fn test_index_cache_get_empty_cache_returns_none() {
+    #[tokio::test]
+    async fn test_index_cache_get_empty_cache_returns_none() {
         let cache = make_index_cache();
-        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+        assert!(index_cache_get(&cache, "myrepo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_get_unknown_key_returns_none() {
+    #[tokio::test]
+    async fn test_index_cache_get_unknown_key_returns_none() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"some index data");
-        index_cache_set(&cache, "myrepo:tokio".to_string(), data);
-        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+        index_cache_set(&cache, "myrepo:tokio".to_string(), data).await;
+        assert!(index_cache_get(&cache, "myrepo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_set_and_get_roundtrip() {
+    #[tokio::test]
+    async fn test_index_cache_set_and_get_roundtrip() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}");
-        index_cache_set(&cache, "myrepo:serde".to_string(), data.clone());
-        let result = index_cache_get(&cache, "myrepo:serde").expect("should be in cache");
+        index_cache_set(&cache, "myrepo:serde".to_string(), data.clone()).await;
+        let result = index_cache_get(&cache, "myrepo:serde")
+            .await
+            .expect("should be in cache");
         assert_eq!(result, data);
     }
 
-    #[test]
-    fn test_index_cache_set_overwrites_existing_entry() {
+    #[tokio::test]
+    async fn test_index_cache_set_overwrites_existing_entry() {
         let cache = make_index_cache();
         let v1 = Bytes::from_static(b"version 1 data");
         let v2 = Bytes::from_static(b"version 2 data");
-        index_cache_set(&cache, "repo:crate".to_string(), v1);
-        index_cache_set(&cache, "repo:crate".to_string(), v2.clone());
-        let result = index_cache_get(&cache, "repo:crate").expect("should be in cache");
+        index_cache_set(&cache, "repo:crate".to_string(), v1).await;
+        index_cache_set(&cache, "repo:crate".to_string(), v2.clone()).await;
+        let result = index_cache_get(&cache, "repo:crate")
+            .await
+            .expect("should be in cache");
         assert_eq!(result, v2);
     }
 
-    #[test]
-    fn test_index_cache_invalidate_removes_key() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_removes_key() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"data");
-        index_cache_set(&cache, "repo:serde".to_string(), data);
-        assert!(index_cache_get(&cache, "repo:serde").is_some());
-        index_cache_invalidate(&cache, "repo:serde");
-        assert!(index_cache_get(&cache, "repo:serde").is_none());
+        index_cache_set(&cache, "repo:serde".to_string(), data).await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_some());
+        index_cache_invalidate(&cache, "repo:serde").await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_invalidate_missing_key_is_noop() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_missing_key_is_noop() {
         let cache = make_index_cache();
         // Should not panic on a cache miss.
-        index_cache_invalidate(&cache, "repo:nonexistent");
-        assert!(index_cache_get(&cache, "repo:nonexistent").is_none());
+        index_cache_invalidate(&cache, "repo:nonexistent").await;
+        assert!(index_cache_get(&cache, "repo:nonexistent").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_invalidate_leaves_other_keys_intact() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_leaves_other_keys_intact() {
         let cache = make_index_cache();
         index_cache_set(
             &cache,
             "repo:serde".to_string(),
             Bytes::from_static(b"serde"),
-        );
+        )
+        .await;
         index_cache_set(
             &cache,
             "repo:tokio".to_string(),
             Bytes::from_static(b"tokio"),
-        );
-        index_cache_invalidate(&cache, "repo:serde");
-        assert!(index_cache_get(&cache, "repo:serde").is_none());
-        assert!(index_cache_get(&cache, "repo:tokio").is_some());
+        )
+        .await;
+        index_cache_invalidate(&cache, "repo:serde").await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_none());
+        assert!(index_cache_get(&cache, "repo:tokio").await.is_some());
     }
 
     #[test]
@@ -2787,51 +2800,59 @@ mod tests {
         assert_eq!(key, "cargo-proxy:serde_json");
     }
 
-    #[test]
-    fn test_index_cache_key_uses_lowercase_crate_name() {
+    #[tokio::test]
+    async fn test_index_cache_key_uses_lowercase_crate_name() {
         // Verify that upper-case input is folded before building the key,
         // matching what serve_index does with `crate_name.to_lowercase()`.
         let cache = make_index_cache();
         let data = Bytes::from_static(b"data");
         let lower_key = "repo:serde".to_string();
-        index_cache_set(&cache, lower_key, data.clone());
+        index_cache_set(&cache, lower_key, data.clone()).await;
         // A lookup with the pre-lowercased key must hit.
-        assert!(index_cache_get(&cache, "repo:serde").is_some());
+        assert!(index_cache_get(&cache, "repo:serde").await.is_some());
         // A lookup with a mixed-case key does NOT hit (the caller is responsible
         // for lowercasing before building the key).
-        assert!(index_cache_get(&cache, "repo:Serde").is_none());
+        assert!(index_cache_get(&cache, "repo:Serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_set_lazy_eviction_preserves_fresh_entries() {
+    #[tokio::test]
+    async fn test_index_cache_set_lazy_eviction_preserves_fresh_entries() {
         // After a set+get cycle the entry must still be retrievable: the
         // lazy eviction in index_cache_set only removes *expired* entries,
         // never fresh ones.
         let cache = make_index_cache();
         let data = Bytes::from_static(b"fresh");
-        index_cache_set(&cache, "repo:crate-a".to_string(), data.clone());
+        index_cache_set(&cache, "repo:crate-a".to_string(), data.clone()).await;
         // Trigger eviction pass by setting another entry.
-        index_cache_set(&cache, "repo:crate-b".to_string(), Bytes::from_static(b"b"));
+        index_cache_set(&cache, "repo:crate-b".to_string(), Bytes::from_static(b"b")).await;
         // The first entry must still be present.
         assert_eq!(
-            index_cache_get(&cache, "repo:crate-a").expect("should still be cached"),
+            index_cache_get(&cache, "repo:crate-a")
+                .await
+                .expect("should still be cached"),
             data
         );
     }
 
-    #[test]
-    fn test_index_cache_multiple_repos_isolated() {
+    #[tokio::test]
+    async fn test_index_cache_multiple_repos_isolated() {
         // Entries for different repo keys must not collide.
         let cache = make_index_cache();
         let data_a = Bytes::from_static(b"repo-a data");
         let data_b = Bytes::from_static(b"repo-b data");
-        index_cache_set(&cache, "repo-a:serde".to_string(), data_a.clone());
-        index_cache_set(&cache, "repo-b:serde".to_string(), data_b.clone());
-        assert_eq!(index_cache_get(&cache, "repo-a:serde").unwrap(), data_a);
-        assert_eq!(index_cache_get(&cache, "repo-b:serde").unwrap(), data_b);
-        index_cache_invalidate(&cache, "repo-a:serde");
-        assert!(index_cache_get(&cache, "repo-a:serde").is_none());
-        assert!(index_cache_get(&cache, "repo-b:serde").is_some());
+        index_cache_set(&cache, "repo-a:serde".to_string(), data_a.clone()).await;
+        index_cache_set(&cache, "repo-b:serde".to_string(), data_b.clone()).await;
+        assert_eq!(
+            index_cache_get(&cache, "repo-a:serde").await.unwrap(),
+            data_a
+        );
+        assert_eq!(
+            index_cache_get(&cache, "repo-b:serde").await.unwrap(),
+            data_b
+        );
+        index_cache_invalidate(&cache, "repo-a:serde").await;
+        assert!(index_cache_get(&cache, "repo-a:serde").await.is_none());
+        assert!(index_cache_get(&cache, "repo-b:serde").await.is_some());
     }
 
     #[test]
@@ -2852,32 +2873,33 @@ mod tests {
         assert_eq!(cache_control, &format!("max-age={}", INDEX_CACHE_TTL_SECS));
     }
 
-    #[test]
-    fn test_index_cache_concurrent_access() {
-        // Arc<RwLock<HashMap>> must allow concurrent reads and writes from
-        // multiple threads without panicking or losing data.
-        use std::thread;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_index_cache_concurrent_access() {
+        // Arc<tokio::sync::RwLock<HashMap>> must allow concurrent reads and
+        // writes from multiple tasks without panicking, losing data, or
+        // blocking the runtime worker threads (ak-2q98).
         let cache = make_index_cache();
-        let threads: Vec<_> = (0..8)
-            .map(|i| {
-                let c = cache.clone();
-                thread::spawn(move || {
-                    let key = format!("repo:crate-{}", i);
-                    let data = Bytes::from(format!("data-{}", i).into_bytes());
-                    index_cache_set(&c, key.clone(), data.clone());
-                    let result = index_cache_get(&c, &key);
-                    assert!(result.is_some());
-                    assert_eq!(result.unwrap(), data);
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("repo:crate-{}", i);
+                let data = Bytes::from(format!("data-{}", i).into_bytes());
+                index_cache_set(&c, key.clone(), data.clone()).await;
+                let result = index_cache_get(&c, &key).await;
+                assert!(result.is_some());
+                assert_eq!(result.unwrap(), data);
+            }));
         }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+        let guard = cache.read().await;
+        assert_eq!(guard.len(), 16);
     }
 
-    #[test]
-    fn test_virtual_repo_invalidation_pattern() {
+    #[tokio::test]
+    async fn test_virtual_repo_invalidation_pattern() {
         // Simulates the multi-key invalidation that publish performs:
         // invalidate the hosted repo's entry AND each virtual repo that
         // aggregates it.
@@ -2891,36 +2913,44 @@ mod tests {
             &cache,
             format!("{}:{}", hosted_key, crate_name),
             Bytes::from_static(b"hosted-index"),
-        );
+        )
+        .await;
         for vk in &virtual_keys {
             index_cache_set(
                 &cache,
                 format!("{}:{}", vk, crate_name),
                 Bytes::from_static(b"virtual-index"),
-            );
+            )
+            .await;
         }
 
         // Invalidate (mirrors the publish handler).
-        index_cache_invalidate(&cache, &format!("{}:{}", hosted_key, crate_name));
+        index_cache_invalidate(&cache, &format!("{}:{}", hosted_key, crate_name)).await;
         for vk in &virtual_keys {
-            index_cache_invalidate(&cache, &format!("{}:{}", vk, crate_name));
+            index_cache_invalidate(&cache, &format!("{}:{}", vk, crate_name)).await;
         }
 
         // All three entries must be gone.
-        assert!(index_cache_get(&cache, &format!("{}:{}", hosted_key, crate_name)).is_none());
+        assert!(
+            index_cache_get(&cache, &format!("{}:{}", hosted_key, crate_name))
+                .await
+                .is_none()
+        );
         for vk in &virtual_keys {
-            assert!(index_cache_get(&cache, &format!("{}:{}", vk, crate_name)).is_none());
+            assert!(index_cache_get(&cache, &format!("{}:{}", vk, crate_name))
+                .await
+                .is_none());
         }
     }
 
-    #[test]
-    fn test_index_cache_binary_content_round_trip() {
+    #[tokio::test]
+    async fn test_index_cache_binary_content_round_trip() {
         // The cache stores raw Bytes; arbitrary byte sequences (not just UTF-8
         // JSON) must be returned unchanged.
         let cache = make_index_cache();
         let binary_data = Bytes::from(vec![0u8, 1, 2, 127, 128, 255, b'"', b'\n']);
-        index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone());
-        let result = index_cache_get(&cache, "repo:binary-crate").unwrap();
+        index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone()).await;
+        let result = index_cache_get(&cache, "repo:binary-crate").await.unwrap();
         assert_eq!(result, binary_data);
     }
 
@@ -3027,32 +3057,34 @@ mod tests {
     // config_cache_get / config_cache_set
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_cache_miss_returns_none() {
-        assert!(config_cache_get("https://nonexistent.example.com").is_none());
+    #[tokio::test]
+    async fn test_config_cache_miss_returns_none() {
+        assert!(config_cache_get("https://nonexistent.example.com")
+            .await
+            .is_none());
     }
 
-    #[test]
-    fn test_config_cache_set_and_get_roundtrip() {
+    #[tokio::test]
+    async fn test_config_cache_set_and_get_roundtrip() {
         let base = format!(
             "https://test-roundtrip-{}.example.com",
             uuid::Uuid::new_v4()
         );
         let dl = "https://dl.example.com/api/v1/crates".to_string();
-        config_cache_set(base.clone(), dl.clone());
-        let result = config_cache_get(&base).expect("should be in cache");
+        config_cache_set(base.clone(), dl.clone()).await;
+        let result = config_cache_get(&base).await.expect("should be in cache");
         assert_eq!(result, dl);
     }
 
-    #[test]
-    fn test_config_cache_overwrites_previous_value() {
+    #[tokio::test]
+    async fn test_config_cache_overwrites_previous_value() {
         let base = format!(
             "https://test-overwrite-{}.example.com",
             uuid::Uuid::new_v4()
         );
-        config_cache_set(base.clone(), "https://old.example.com/dl".to_string());
-        config_cache_set(base.clone(), "https://new.example.com/dl".to_string());
-        let result = config_cache_get(&base).unwrap();
+        config_cache_set(base.clone(), "https://old.example.com/dl".to_string()).await;
+        config_cache_set(base.clone(), "https://new.example.com/dl".to_string()).await;
+        let result = config_cache_get(&base).await.unwrap();
         assert_eq!(result, "https://new.example.com/dl");
     }
 
