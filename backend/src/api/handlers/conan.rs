@@ -33,7 +33,7 @@ use tracing::info;
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -1031,7 +1031,8 @@ async fn recipe_file_upload(
     // lets us run the resolve-then-auth-then-validate sequence cleanly.
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
-    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path =
@@ -1725,7 +1726,8 @@ async fn package_file_upload(
     // See `recipe_file_upload` for the full rationale (issue #990).
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
-    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path = package_artifact_path(

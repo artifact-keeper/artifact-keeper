@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -438,7 +438,8 @@ async fn upload_object(
     Path((repo_key, oid)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -745,7 +746,8 @@ async fn create_lock(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: CreateLockRequest = serde_json::from_slice(&body).map_err(|e| {
@@ -907,7 +909,8 @@ async fn verify_locks(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Parse request body (optional, may be empty)
@@ -996,7 +999,8 @@ async fn delete_lock(
     Path((repo_key, lock_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let force = if body.is_empty() {

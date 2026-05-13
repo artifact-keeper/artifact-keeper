@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -387,7 +387,8 @@ async fn new_upload_url(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "pub")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
     let _repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
     let upload_url = format!("/pub/{}/api/packages/versions/newUpload", repo_key);
@@ -413,7 +414,8 @@ async fn upload_package(
     Path(repo_key): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "pub")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 

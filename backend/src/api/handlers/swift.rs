@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::swift::SwiftHandler;
 use crate::models::repository::RepositoryType;
@@ -610,7 +610,8 @@ async fn publish_release_from_wildcard(
     body: Bytes,
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
-    let user_id = require_auth_basic(auth, "swift")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "swift", "write")?.user_id;
     publish_release(
         state, repo_key, scope, name, version, user_id, headers, body,
     )

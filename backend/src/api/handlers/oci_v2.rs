@@ -271,6 +271,22 @@ async fn authenticate_oci(
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<crate::services::auth_service::Claims, ()> {
+    authenticate_oci_with_scopes(db, config, headers)
+        .await
+        .map(|(claims, _)| claims)
+}
+
+/// Authenticate an OCI request and also return the API-token scopes if the
+/// caller presented one. Returns `(claims, None)` when the caller authenticated
+/// via JWT or password (no scope restriction), and `(claims, Some(scopes))`
+/// when they presented an API token. Used by write/delete handlers that must
+/// enforce GHSA-vvc3-h39c-mrq5 scope gating (`pull,push` for writes,
+/// `pull,push,delete` for destructive operations).
+async fn authenticate_oci_with_scopes(
+    db: &PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), ()> {
     let credential = extract_oci_credential(headers).ok_or(())?;
 
     match credential {
@@ -279,10 +295,29 @@ async fn authenticate_oci(
             // Replica-safe (#1173): same rationale as the auth middleware. A
             // Bearer token presented to OCI must be rejected if the user's
             // credentials changed on a peer replica after the token was minted.
-            auth_service
-                .validate_access_token_async(&token)
-                .await
-                .map_err(|_| ())
+            //
+            // First, try as a JWT access token. JWTs carry no scope claim and
+            // are minted only via interactive login flows, so they are not
+            // restricted here.
+            if let Ok(claims) = auth_service.validate_access_token_async(&token).await {
+                return Ok((claims, None));
+            }
+            // Otherwise, accept a raw API token in the Bearer slot (common
+            // for `docker login --password-stdin` with API token). Surface
+            // the scopes so the caller can enforce GHSA-vvc3-h39c-mrq5.
+            if let Ok(validation) = auth_service.validate_api_token(&token).await {
+                let scopes = validation.scopes.clone();
+                let claims = auth_service
+                    .generate_tokens(&validation.user)
+                    .map_err(|_| ())
+                    .and_then(|tokens| {
+                        auth_service
+                            .validate_access_token(&tokens.access_token)
+                            .map_err(|_| ())
+                    })?;
+                return Ok((claims, Some(scopes)));
+            }
+            Err(())
         }
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
@@ -299,33 +334,60 @@ async fn authenticate_oci(
             // auth is ignored when an API token validates (matching the
             // /v2/token behavior): the token itself identifies the user.
             if let Ok(validation) = auth_service.validate_api_token(&password).await {
-                return auth_service
+                let scopes = validation.scopes.clone();
+                let claims = auth_service
                     .generate_tokens(&validation.user)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
                             .validate_access_token(&tokens.access_token)
                             .map_err(|_| ())
-                    });
+                    })?;
+                return Ok((claims, Some(scopes)));
             }
 
             // Fall through to username/password authentication. Re-generate
             // short-lived claims so downstream code has a consistent Claims
             // value regardless of the authentication method.
             if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
-                return auth_service
+                let claims = auth_service
                     .generate_tokens(&user)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
                             .validate_access_token(&tokens.access_token)
                             .map_err(|_| ())
-                    });
+                    })?;
+                return Ok((claims, None));
             }
 
             Err(())
         }
     }
+}
+
+/// Verify that the resolved OCI credential scopes (if any) grant the given
+/// permission. Returns `false` if an API token is present but lacks the
+/// requested scope. Implements the same logic as
+/// `AuthExtension::has_scope`: `*` and `admin` count as wildcards, and a
+/// `None` scopes set (JWT / password) passes through.
+fn oci_scopes_grant(scopes: &Option<Vec<String>>, required: &str) -> bool {
+    match scopes {
+        None => true,
+        Some(s) => s.iter().any(|x| x == required || x == "*" || x == "admin"),
+    }
+}
+
+/// Build a 403 Forbidden response when an API-token scope check fails on
+/// an OCI write/delete path. See GHSA-vvc3-h39c-mrq5.
+fn oci_forbidden_scope(required: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from(format!(
+            "Token does not have required scope: {}",
+            required
+        )))
+        .unwrap()
 }
 
 /// Build a Docker/OCI scope string for a repository resource.
@@ -1322,10 +1384,16 @@ async fn handle_start_upload(
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
-    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
+    // GHSA-vvc3-h39c-mrq5: a read-scoped API token must not be accepted
+    // for an OCI blob upload (`docker push`). Enforce the write scope.
+    if !oci_scopes_grant(&token_scopes, "write") {
+        return oci_forbidden_scope("write");
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -1450,11 +1518,16 @@ async fn handle_patch_upload(
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
-    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
     let _ = claims;
+    // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
+    if !oci_scopes_grant(&token_scopes, "write") {
+        return oci_forbidden_scope("write");
+    }
 
     let session_id: Uuid = match uuid_str.parse() {
         Ok(id) => id,
@@ -1547,11 +1620,16 @@ async fn handle_complete_upload(
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
-    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
     let _ = claims;
+    // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
+    if !oci_scopes_grant(&token_scopes, "write") {
+        return oci_forbidden_scope("write");
+    }
 
     let digest = match digest_query {
         Some(d) => d.to_string(),
@@ -1894,10 +1972,16 @@ async fn handle_put_manifest(
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
-    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
+    // GHSA-vvc3-h39c-mrq5: PUT manifest is the final step of `docker push`.
+    if !oci_scopes_grant(&token_scopes, "write") {
+        return oci_forbidden_scope("write");
+    }
+    let _ = claims;
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -2804,11 +2888,17 @@ async fn handle_delete_manifest(
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
-    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
     let _ = claims;
+    // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
+    // delete scope on API tokens. JWT/password callers pass through.
+    if !oci_scopes_grant(&token_scopes, "delete") {
+        return oci_forbidden_scope("delete");
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -3036,6 +3126,82 @@ mod tests {
     fn test_oci_error_internal() {
         let resp = oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "oops");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-vvc3-h39c-mrq5: OCI write/delete scope enforcement. The OCI
+    // protocol path skips the AuthExtension middleware and uses Basic auth
+    // straight from the Docker/Podman client. authenticate_oci_with_scopes
+    // surfaces the API-token scopes so the write handlers can reject
+    // read-scoped tokens. These tests cover the scope-check predicate in
+    // isolation; the integration with handle_put_manifest /
+    // handle_delete_manifest is exercised by the existing handler tests
+    // (which run only with DATABASE_URL set).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oci_scopes_grant_none_passes() {
+        // JWT and password-authenticated callers have `None` scopes and must
+        // pass through (they are not scope-restricted).
+        assert!(oci_scopes_grant(&None, "write"));
+        assert!(oci_scopes_grant(&None, "delete"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_exact_match() {
+        let scopes = Some(vec!["write".to_string()]);
+        assert!(oci_scopes_grant(&scopes, "write"));
+        assert!(!oci_scopes_grant(&scopes, "delete"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_wildcard() {
+        let scopes = Some(vec!["*".to_string()]);
+        assert!(oci_scopes_grant(&scopes, "write"));
+        assert!(oci_scopes_grant(&scopes, "delete"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_admin() {
+        let scopes = Some(vec!["admin".to_string()]);
+        assert!(oci_scopes_grant(&scopes, "write"));
+        assert!(oci_scopes_grant(&scopes, "delete"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_read_only_rejected_on_write() {
+        // This is the exact GHSA-vvc3-h39c-mrq5 case: a read-scoped service
+        // account token must not be accepted for `docker push`.
+        let scopes = Some(vec!["read".to_string()]);
+        assert!(!oci_scopes_grant(&scopes, "write"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_write_token_rejected_on_delete() {
+        // Destructive operations need the delete scope, not just write.
+        let scopes = Some(vec!["write".to_string()]);
+        assert!(!oci_scopes_grant(&scopes, "delete"));
+    }
+
+    #[test]
+    fn test_oci_scopes_grant_empty_scopes_rejected() {
+        let scopes = Some(vec![]);
+        assert!(!oci_scopes_grant(&scopes, "write"));
+    }
+
+    #[tokio::test]
+    async fn test_oci_forbidden_scope_status_and_body() {
+        // The body string is part of the contract; clients (and clients of
+        // clients) parse it to know whether they hit an auth wall.
+        let resp = oci_forbidden_scope("write");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(
+            s.contains("Token does not have required scope: write"),
+            "unexpected body: {}",
+            s
+        );
     }
 
     // -----------------------------------------------------------------------
