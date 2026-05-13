@@ -265,19 +265,59 @@ async fn download_tarball(
 ///
 /// Hex tarballs are stored as `<name>-<version>.tar`. The package name itself
 /// may contain dashes (`my-package-1.4.0.tar`), so the split is "first `-`
-/// followed by an ASCII digit". Returns `None` if the filename does not end
-/// in `.tar` or has no version-looking suffix.
+/// followed by an ASCII digit". Returns `None` for any input that does not
+/// parse cleanly as a hex tarball filename per the hex.pm package-name spec
+/// (lowercase ASCII alphanumeric + underscore, starts with a letter, see
+/// <https://hex.pm/docs/publish>).
+///
+/// Fail-closed contract: this helper is the gate that decides whether the
+/// supply-chain shadowing guard fires. Every "maybe" outcome returns `None`
+/// rather than a partially-parsed name. Specifically rejected:
+/// - filenames not ending in `.tar` (case-insensitive)
+/// - filenames with no `-<digit>` version separator
+/// - empty package names (e.g. `-1.0.0.tar`)
+/// - names containing characters outside `[a-z0-9_]`
+/// - names starting with a non-letter (digits, underscore)
+///
+/// The case-insensitive extension match is load-bearing for the shadowing
+/// guard: without it, an attacker requests `phoenix-1.4.0.Tar` and the
+/// parser returns `None`, bypassing the guard (#973 / PR #974).
 fn package_name_from_tarball_filename(filename: &str) -> Option<String> {
-    let without_ext = filename.strip_suffix(".tar")?;
+    let lowered = filename.to_ascii_lowercase();
+    let without_ext = lowered.strip_suffix(".tar")?;
     for (i, _) in without_ext.match_indices('-') {
         if without_ext
             .get(i + 1..)
             .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
         {
-            return Some(without_ext[..i].to_string());
+            let candidate = &without_ext[..i];
+            if is_valid_hex_package_name(candidate) {
+                return Some(candidate.to_string());
+            }
+            return None;
         }
     }
     None
+}
+
+/// Validate a candidate hex package name against the registry's accepted
+/// shape: `[a-z][a-z0-9_-]*`. Used by `package_name_from_tarball_filename`
+/// so the shadowing guard refuses to interpret traversal-shaped or
+/// homoglyph-shaped inputs as legitimate package names.
+///
+/// Allows internal `-` and `_` to match `HexHandler::parse_path`'s behavior
+/// (the upload-path side accepts dashed names like `ex-doc`). The first
+/// character must be a lowercase ASCII letter to prevent version-looking
+/// prefixes (`1.0.0-...`) from being parsed as names.
+fn is_valid_hex_package_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Returns true if any non-Remote member of a virtual repo has an artifact
@@ -321,7 +361,6 @@ async fn serve_virtual_tarball_local_only(
     upstream_path: &str,
     filename: &str,
 ) -> Result<Response, Response> {
-    let db = state.db.clone();
     let state_arc = state.clone();
     let suffix = filename.to_string();
 
@@ -334,12 +373,11 @@ async fn serve_virtual_tarball_local_only(
         virtual_repo_id,
         upstream_path,
         move |member_id, location| {
-            let db = db.clone();
             let state = state_arc.clone();
             let suffix = suffix.clone();
             async move {
                 proxy_helpers::local_fetch_by_path_suffix(
-                    &db, &state, member_id, &location, &suffix,
+                    &state.db, &state, member_id, &location, &suffix,
                 )
                 .await
             }
@@ -347,22 +385,12 @@ async fn serve_virtual_tarball_local_only(
     )
     .await?;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-        )
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(
-            axum::http::header::CONTENT_LENGTH,
-            content.len().to_string(),
-        )
-        .body(Body::from(content))
-        .unwrap())
+    Ok(proxy_helpers::build_download_response(
+        content,
+        content_type,
+        "application/octet-stream",
+        Some(filename),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,10 +1949,15 @@ mod tests {
     fn test_package_name_from_tarball_filename_dashed_name() {
         // The first `-` is followed by `p` (not a digit), so the parser must
         // advance to the second `-` which is followed by `1`. This is the
-        // load-bearing case for hex names like `my-package-2.0.0`.
+        // load-bearing case for hex names like `ex-doc-0.30.0` (a real
+        // package on hex.pm) and matches `HexHandler::parse_path`.
         assert_eq!(
             package_name_from_tarball_filename("my-package-2.0.0.tar"),
             Some("my-package".to_string())
+        );
+        assert_eq!(
+            package_name_from_tarball_filename("ex-doc-0.30.0.tar"),
+            Some("ex-doc".to_string())
         );
     }
 
@@ -1956,20 +1989,117 @@ mod tests {
     }
 
     #[test]
-    fn test_package_name_from_tarball_filename_empty_name() {
+    fn test_package_name_from_tarball_filename_empty_name_rejected() {
         // `-1.0.0.tar` has the version-looking suffix but the name is empty.
-        // Returning `Some("")` is consistent with the parser contract; the
-        // caller (`virtual_local_owns_tarball_name`) does a name lookup that
-        // will yield false for empty input.
-        assert_eq!(
-            package_name_from_tarball_filename("-1.0.0.tar"),
-            Some(String::new())
-        );
+        // The shadowing guard must fail closed: empty name returns None.
+        assert_eq!(package_name_from_tarball_filename("-1.0.0.tar"), None);
     }
 
     #[test]
     fn test_package_name_from_tarball_filename_empty_string() {
         assert_eq!(package_name_from_tarball_filename(""), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_uppercase_extension() {
+        // Case-insensitive `.tar` is load-bearing for the shadowing guard;
+        // an attacker requesting `.Tar` must not skip the guard.
+        assert_eq!(
+            package_name_from_tarball_filename("phoenix-1.4.0.Tar"),
+            Some("phoenix".to_string())
+        );
+        assert_eq!(
+            package_name_from_tarball_filename("PHOENIX-1.4.0.TAR"),
+            Some("phoenix".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_rejects_path_traversal() {
+        // Path-traversal-shaped names must be rejected by the hex name
+        // validator so an attacker cannot trick the guard into emitting
+        // a DB lookup for a forbidden identifier.
+        assert_eq!(package_name_from_tarball_filename("..%2f-1.0.0.tar"), None);
+        assert_eq!(package_name_from_tarball_filename("../-1.0.0.tar"), None);
+        assert_eq!(
+            package_name_from_tarball_filename("phoenix/../-1.0.0.tar"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_rejects_unicode_homoglyphs() {
+        // Non-ASCII characters must be rejected: SQL `LOWER()` is ASCII-only
+        // and would otherwise produce a different result than the parser's
+        // ASCII lowercase, opening a homoglyph-shadowing attack.
+        // (Cyrillic "о" U+043E in place of Latin "o".)
+        assert_eq!(
+            package_name_from_tarball_filename("ph\u{043e}enix-1.0.0.tar"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_rejects_name_starting_with_digit() {
+        // Hex spec: names must start with `[a-z]`. A leading digit would
+        // make the parser confuse a version-looking prefix for a name.
+        assert_eq!(package_name_from_tarball_filename("1cool-1.0.tar"), None);
+        assert_eq!(
+            package_name_from_tarball_filename("1.0.0-package-2.0.0.tar"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_rejects_underscore_leading() {
+        assert_eq!(package_name_from_tarball_filename("_foo-1.0.0.tar"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_accepts_underscore_internal() {
+        // Internal underscores are allowed per hex spec `[a-z][a-z0-9_]*`.
+        assert_eq!(
+            package_name_from_tarball_filename("foo_bar-1.0.0.tar"),
+            Some("foo_bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_filename_rejects_special_chars() {
+        // Spaces, slashes, dots in the name must all be rejected.
+        assert_eq!(
+            package_name_from_tarball_filename("foo bar-1.0.0.tar"),
+            None
+        );
+        assert_eq!(
+            package_name_from_tarball_filename("foo.bar-1.0.0.tar"),
+            None
+        );
+        assert_eq!(
+            package_name_from_tarball_filename("foo+bar-1.0.0.tar"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_valid_hex_package_name_accepts_spec_compliant() {
+        assert!(is_valid_hex_package_name("phoenix"));
+        assert!(is_valid_hex_package_name("phoenix_live_view"));
+        assert!(is_valid_hex_package_name("ex-doc")); // dashes allowed
+        assert!(is_valid_hex_package_name("a"));
+        assert!(is_valid_hex_package_name("abc123"));
+    }
+
+    #[test]
+    fn test_is_valid_hex_package_name_rejects_invalid() {
+        assert!(!is_valid_hex_package_name("")); // empty
+        assert!(!is_valid_hex_package_name("1abc")); // leading digit
+        assert!(!is_valid_hex_package_name("_abc")); // leading underscore
+        assert!(!is_valid_hex_package_name("-abc")); // leading dash
+        assert!(!is_valid_hex_package_name("Phoenix")); // uppercase
+        assert!(!is_valid_hex_package_name("abc.def")); // dot
+        assert!(!is_valid_hex_package_name("abc def")); // space
+        assert!(!is_valid_hex_package_name("abc/def")); // slash (traversal)
     }
 
     // -----------------------------------------------------------------------
