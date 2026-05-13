@@ -3736,6 +3736,108 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_embeds_access_repo_scope() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-{suffix}"),
+            username: format!("ci_scope_{suffix}"),
+            email: format!("ci_scope_{suffix}@test.local"),
+            display_name: Some("CI Scoped User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+        };
+        let expected_scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, expected_scope.clone())
+            .await
+            .expect("federated scoped auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, expected_scope);
+
+        let refresh_claims = service
+            .decode_token(&tokens.refresh_token)
+            .expect("decode refresh")
+            .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_none_is_unrestricted() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-none-{suffix}"),
+            username: format!("ci_none_{suffix}"),
+            email: format!("ci_none_{suffix}@test.local"),
+            display_name: Some("CI Unrestricted User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+        };
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, None)
+            .await
+            .expect("federated auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
     // -----------------------------------------------------------------------
     // #1173: DB-backed credential-invalidation check.
     //
