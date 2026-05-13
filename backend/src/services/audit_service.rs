@@ -192,11 +192,59 @@ impl AuditEntry {
     ///
     /// Reserved key: `details.actor`. System-initiated audit emitters use this
     /// to advertise themselves to SIEM filters (e.g. `"system:stuck_scan_janitor"`
-    /// in #1063). Callers MUST NOT populate `details.actor` from user-controlled
-    /// input, doing so would let an attacker spoof system-actor entries in
-    /// downstream queries. Use the `user_id` column for human actors.
+    /// in #1063). To prevent an attacker who controls part of a caller's
+    /// `details` payload from spoofing a system actor in the audit stream
+    /// (PR #1212 audit, finding H1), we enforce the contract here rather than
+    /// trusting every caller: any `"actor"` key present in the supplied
+    /// `Object` is stripped before storage and the strip is logged at error
+    /// level so the offending call site is visible in production logs.
+    /// System emitters that legitimately need to set `details.actor` must
+    /// call [`AuditEntry::system_actor`] after `.details(...)`; that
+    /// method bypasses the user-input path and is the only sanctioned way
+    /// to populate the field.
     pub fn details(mut self, details: serde_json::Value) -> Self {
-        self.details = Some(details);
+        let sanitized = match details {
+            serde_json::Value::Object(mut map) => {
+                if map.remove("actor").is_some() {
+                    tracing::error!(
+                        "AuditEntry::details received an 'actor' key from a caller; \
+                         stripping to prevent system-actor spoofing. Use \
+                         AuditEntry::system_actor() for system-initiated entries."
+                    );
+                }
+                serde_json::Value::Object(map)
+            }
+            other => other,
+        };
+        self.details = Some(sanitized);
+        self
+    }
+
+    /// Set `details.actor` to a fixed system-actor label.
+    ///
+    /// System-initiated emitters (background janitors, periodic schedulers,
+    /// internal reconciliation jobs) advertise themselves in the audit
+    /// stream via `details.actor` so SIEM rules can distinguish them from
+    /// human-initiated state changes keyed off `user_id`. This setter
+    /// bypasses the user-input strip in [`AuditEntry::details`] and is the
+    /// only sanctioned path for writing the reserved key. The supplied
+    /// label is taken from a static / build-time string in the caller, not
+    /// from request input.
+    ///
+    /// If `.details(...)` was not called first, this seeds an Object with
+    /// just the actor key. If `.details(...)` was called with a non-Object
+    /// value, that value is replaced (the schema requires an Object for
+    /// `actor` to live in).
+    pub fn system_actor(mut self, label: &'static str) -> Self {
+        let mut map = match self.details.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        map.insert(
+            "actor".to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
+        self.details = Some(serde_json::Value::Object(map));
         self
     }
 
@@ -208,6 +256,46 @@ impl AuditEntry {
     pub fn correlation(mut self, correlation_id: Uuid) -> Self {
         self.correlation_id = correlation_id;
         self
+    }
+
+    // -----------------------------------------------------------------------
+    // crate-internal accessors so batched-INSERT call sites (e.g. the
+    // stuck-scan janitor in `scan_result_service`, PR #1212 audit M1) can
+    // read the post-sanitization fields off a builder without going
+    // through the per-row `log()` path. Read-only by design: the only way
+    // to construct the underlying values is the public builder API.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn user_id(&self) -> Option<Uuid> {
+        self.user_id
+    }
+
+    pub(crate) fn action(&self) -> AuditAction {
+        self.action
+    }
+
+    pub(crate) fn resource_type(&self) -> ResourceType {
+        self.resource_type
+    }
+
+    pub(crate) fn resource_id(&self) -> Option<Uuid> {
+        self.resource_id
+    }
+
+    pub(crate) fn details_ref(&self) -> Option<&serde_json::Value> {
+        self.details.as_ref()
+    }
+
+    // `ip_address` not yet used by a batched call site; kept symmetric so
+    // future system emitters (e.g. periodic lifecycle scheduler) can write
+    // an originating IP via the same accessor surface.
+    #[allow(dead_code)]
+    pub(crate) fn ip_address(&self) -> Option<IpAddr> {
+        self.ip_address
+    }
+
+    pub(crate) fn correlation_id(&self) -> Uuid {
+        self.correlation_id
     }
 }
 
@@ -573,6 +661,151 @@ mod tests {
         let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
             .details(details.clone());
         assert_eq!(entry.details, Some(details));
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1212 audit, finding H1: `details(...)` strips user-supplied
+    // `actor` so a future call site that forwards partially user-controlled
+    // JSON cannot spoof a system actor in the audit stream. `system_actor()`
+    // is the only sanctioned writer of the reserved key.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_entry_details_strips_user_supplied_actor_key() {
+        let supplied = serde_json::json!({
+            "actor": "system:fake_janitor",
+            "subscription_id": "abc-123",
+        });
+        let entry =
+            AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting).details(supplied);
+        let details = entry.details.expect("details populated");
+        let obj = details
+            .as_object()
+            .expect("details remains an Object after strip");
+        assert!(
+            !obj.contains_key("actor"),
+            "details(...) must strip user-supplied actor; H1 enforcement"
+        );
+        assert_eq!(
+            obj.get("subscription_id"),
+            Some(&serde_json::Value::String("abc-123".to_string())),
+            "other keys must round-trip after the strip"
+        );
+    }
+
+    #[test]
+    fn test_audit_entry_details_passes_non_object_values_through() {
+        // Non-Object values cannot carry a key, so the strip is a no-op.
+        let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .details(serde_json::json!("a scalar string"));
+        assert_eq!(
+            entry.details,
+            Some(serde_json::Value::String("a scalar string".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_audit_entry_details_strips_actor_even_when_only_key() {
+        let entry = AuditEntry::new(AuditAction::SettingChanged, ResourceType::Setting)
+            .details(serde_json::json!({"actor": "system:fake"}));
+        let obj = entry
+            .details
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("details remains an Object after strip");
+        assert!(obj.is_empty());
+    }
+
+    #[test]
+    fn test_audit_entry_system_actor_sets_actor_key() {
+        let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+            .details(serde_json::json!({"reason": "stuck_running_janitor"}))
+            .system_actor("system:stuck_scan_janitor");
+        let obj = entry
+            .details
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("details Object after system_actor");
+        assert_eq!(
+            obj.get("actor"),
+            Some(&serde_json::Value::String(
+                "system:stuck_scan_janitor".to_string()
+            ))
+        );
+        assert_eq!(
+            obj.get("reason"),
+            Some(&serde_json::Value::String(
+                "stuck_running_janitor".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_audit_entry_system_actor_seeds_object_when_no_details_set() {
+        // `system_actor()` without a prior `.details(...)` still produces a
+        // valid Object with just the actor; callers that have no payload
+        // (e.g. heartbeat-style audit entries) get a clean shape.
+        let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+            .system_actor("system:stuck_scan_janitor");
+        let obj = entry
+            .details
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("details Object seeded by system_actor");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("actor"),
+            Some(&serde_json::Value::String(
+                "system:stuck_scan_janitor".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_audit_entry_system_actor_overrides_stripped_actor() {
+        // A user-supplied `actor` is stripped in `.details(...)`; the
+        // janitor's subsequent `.system_actor()` is the only path that
+        // can write the reserved key. Composed in order, the final value
+        // is exactly what `system_actor` set.
+        let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+            .details(serde_json::json!({
+                "actor": "spoofed:attacker",
+                "reason": "stuck_running_janitor",
+            }))
+            .system_actor("system:stuck_scan_janitor");
+        let obj = entry
+            .details
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("details Object");
+        assert_eq!(
+            obj.get("actor"),
+            Some(&serde_json::Value::String(
+                "system:stuck_scan_janitor".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_audit_entry_system_actor_replaces_non_object_details() {
+        // If `.details(...)` was set to a scalar, `system_actor()` cannot
+        // attach a key in place; the documented behaviour is to seed a
+        // fresh Object so the schema is consistent.
+        let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+            .details(serde_json::json!("scalar"))
+            .system_actor("system:stuck_scan_janitor");
+        let obj = entry
+            .details
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("details replaced with Object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("actor"),
+            Some(&serde_json::Value::String(
+                "system:stuck_scan_janitor".to_string()
+            ))
+        );
     }
 
     #[test]
