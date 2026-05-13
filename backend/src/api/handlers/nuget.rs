@@ -619,7 +619,7 @@ async fn push_package(
                 user.id
             } else if let Ok(validation) = auth_service.validate_api_token(&password).await {
                 validation.user.id
-            } else if let Ok(claims) = auth_service.validate_access_token(&password) {
+            } else if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
                 let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
                     .fetch_optional(&state.db)
@@ -979,6 +979,7 @@ mod tests {
             username: username.to_string(),
             email: format!("{}@example.test", username),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now,
             exp: now + 300,
             token_type: "access".to_string(),

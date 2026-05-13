@@ -327,7 +327,7 @@ async fn authenticate_oci(
             // Final fallback: accept a valid AK access token (JWT) as the Docker
             // password. Enables the CI/CD keyless push flow where the token from
             // the OIDC exchange is used directly as the Docker credential.
-            if let Ok(claims) = auth_service.validate_access_token(&password) {
+            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
                 if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
                     .fetch_one(db)
@@ -1064,7 +1064,7 @@ async fn token(
                     //   2. docker login -u <ci-user> -p <access_token>  (this path)
                     //   3. docker push ...
                     // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service.validate_access_token(&credentials.1) {
+                    match auth_service.validate_access_token_async(&credentials.1).await {
                         Ok(claims) => {
                             let user = match sqlx::query_as::<_, User>(
                                 "SELECT * FROM users WHERE id = $1",
@@ -1175,7 +1175,7 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
 
         // Final fallback: accept AK JWT access token in the Basic password field.
         // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
-        if auth_service.validate_access_token(&password).is_ok() {
+        if auth_service.validate_access_token_async(&password).await.is_ok() {
             return version_check_ok();
         }
     }
@@ -4124,6 +4124,20 @@ mod tests {
             ..crate::config::Config::default()
         };
 
+        build_test_state(config, lazy_pool())
+    }
+
+    fn test_state_with_secret_and_pool(secret: &str, pool: sqlx::PgPool) -> SharedState {
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        build_test_state(config, pool)
+    }
+
+    fn build_test_state(config: crate::config::Config, pool: sqlx::PgPool) -> SharedState {
+
         let storage_root = std::env::temp_dir().join(format!("ak-oci-v2-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
 
@@ -4138,7 +4152,7 @@ mod tests {
 
         Arc::new(crate::api::AppState::new(
             config,
-            lazy_pool(),
+            pool,
             storage,
             registry,
         ))
@@ -4151,6 +4165,7 @@ mod tests {
             username: username.to_string(),
             email: format!("{}@example.test", username),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now,
             exp: now + 300,
             token_type: "access".to_string(),
@@ -4197,8 +4212,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_check_accepts_basic_password_jwt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
-        let state = test_state_with_secret(secret);
+        let state = test_state_with_secret_and_pool(secret, pool);
         let jwt = mint_access_jwt(secret, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 

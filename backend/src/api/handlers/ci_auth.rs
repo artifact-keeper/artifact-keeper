@@ -131,16 +131,15 @@ pub async fn exchange_ci_token(
     // 4. Map CI claims + mapping to stable FederatedCredentials
     let credentials = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
 
-    // 5. Provision / sync the CI service account and generate tokens.
+    // 5. Provision / sync the CI service account and generate scoped tokens.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (user, _tokens) = auth_service
-        .authenticate_federated(CiOidcService::auth_provider(), credentials)
+    let (user, tokens) = auth_service
+        .authenticate_federated_with_scope(
+            CiOidcService::auth_provider(),
+            credentials,
+            mapping.allowed_repo_ids.clone(),
+        )
         .await?;
-
-    // Issue a short-lived AK access token for this CI service account.
-    // NOTE: Repo-scope propagation from mapping.allowed_repo_ids can be wired
-    // here once the shared auth token-issuance surface includes scoped claims.
-    let tokens = auth_service.generate_tokens(&user)?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,

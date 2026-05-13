@@ -119,7 +119,7 @@ impl From<Claims> for AuthExtension {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: claims.allowed_repo_ids,
         }
     }
 }
@@ -437,7 +437,7 @@ pub(crate) async fn try_resolve_auth(
             // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
             // package managers like Maven, pip/twine, and Helm send the AK access
             // token as the Basic auth password.
-            if let Ok(claims) = auth_service.validate_access_token(&password) {
+            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
                 return Some(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
@@ -1210,6 +1210,7 @@ mod tests {
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
@@ -1233,6 +1234,7 @@ mod tests {
             username: "regular".to_string(),
             email: "regular@example.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
@@ -2508,6 +2510,7 @@ mod tests {
             username: username.to_string(),
             email: format!("{}@example.test", username),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now,
             exp: now + 300,
             token_type: "access".to_string(),
@@ -2524,13 +2527,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
         let cfg = crate::config::Config {
             jwt_secret: secret.to_string(),
             ..crate::config::Config::default()
         };
 
-        let auth_service = AuthService::new(lazy_pool(), Arc::new(cfg));
+        let auth_service = AuthService::new(pool, Arc::new(cfg));
         let jwt = mint_access_jwt(secret, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
