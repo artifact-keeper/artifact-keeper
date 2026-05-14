@@ -1195,6 +1195,10 @@ async fn publish_package(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
+    // `npm publish`. Enforce the write scope before falling through to the
+    // Bearer-fallback helper.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;

@@ -1,7 +1,7 @@
 //! Permission management handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -11,8 +11,14 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+
+/// Require that the request is authenticated, returning an error if not.
+fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
 
 /// Create permission routes
 pub fn router() -> Router<SharedState> {
@@ -233,8 +239,16 @@ pub struct CreatedPermissionRow {
 )]
 pub async fn create_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreatePermissionRequest>,
 ) -> Result<Json<PermissionResponse>> {
+    // GHSA-vvc3-h39c-mrq5: read-scoped service-account tokens were being
+    // accepted on this endpoint, enabling privilege escalation by creating
+    // a fine-grained admin permission on the system sentinel.
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let _ = auth;
+
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
@@ -355,9 +369,15 @@ pub async fn get_permission(
 )]
 pub async fn update_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreatePermissionRequest>,
 ) -> Result<Json<PermissionResponse>> {
+    // GHSA-vvc3-h39c-mrq5: enforce token scope on permission updates.
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let _ = auth;
+
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         UPDATE permissions
@@ -415,8 +435,16 @@ pub async fn update_permission(
 )]
 pub async fn delete_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    // GHSA-vvc3-h39c-mrq5: destructive permission ops require the delete
+    // scope. Without this check a read-scoped service-account token could
+    // remove permission rows belonging to other principals.
+    let auth = require_auth(auth)?;
+    auth.require_scope("delete")?;
+    let _ = auth;
+
     let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -760,5 +788,121 @@ mod tests {
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(json["principal_type"], "user");
         assert_eq!(json["actions"].as_array().unwrap().len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-vvc3-h39c-mrq5: scope-check tests for admin endpoints. The
+    // privilege escalation chain in the advisory is:
+    //
+    //   read-scope SA token → POST /api/v1/permissions {actions: ["admin"]}
+    //   on the system sentinel → token now has fine-grained admin
+    //
+    // The tests below exercise the in-handler scope check directly without
+    // touching the database. The "permissions table missing" path inside
+    // each handler runs first because tests have no DB; but the scope check
+    // runs even earlier (right after `require_auth`), so the assertions
+    // below are independent of DB state.
+    // -----------------------------------------------------------------------
+
+    fn read_only_token() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "sa-readonly".to_string(),
+            email: "sa@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        }
+    }
+
+    fn write_token() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "sa-write".to_string(),
+            email: "sa@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["write".to_string()]),
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_require_auth_rejects_anonymous() {
+        // Sanity: no AuthExtension at all -> 401, regardless of scope check.
+        let result = require_auth(None);
+        assert!(matches!(result, Err(AppError::Authentication(_))));
+    }
+
+    #[test]
+    fn test_create_permission_scope_check_rejects_read_only() {
+        // GHSA-vvc3-h39c-mrq5: this is the exact handler path used in the
+        // advisory's privilege-escalation chain. A read-scoped SA token
+        // must be rejected with 403 (not 200) before any DB write happens.
+        let ext = read_only_token();
+        let result = ext.require_scope("write");
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: write");
+            }
+            other => panic!("expected Authorization error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_permission_scope_check_accepts_write_token() {
+        let ext = write_token();
+        assert!(ext.require_scope("write").is_ok());
+    }
+
+    #[test]
+    fn test_delete_permission_scope_check_rejects_read_only() {
+        let ext = read_only_token();
+        let result = ext.require_scope("delete");
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: delete");
+            }
+            other => panic!("expected Authorization error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_delete_permission_scope_check_write_token_insufficient() {
+        // A write-scoped token must NOT be able to delete a permission row.
+        // The advisory specifically calls out destructive ops as needing
+        // the delete scope, not just write.
+        let ext = write_token();
+        assert!(ext.require_scope("delete").is_err());
+    }
+
+    #[test]
+    fn test_update_permission_scope_check_rejects_read_only() {
+        let ext = read_only_token();
+        assert!(ext.require_scope("write").is_err());
+    }
+
+    #[test]
+    fn test_admin_user_with_read_only_token_still_rejected() {
+        // A user with `is_admin = true` who authenticated via a read-scoped
+        // API token must still be rejected. The scope is on the token, not
+        // the user. This is the exact bypass GHSA-vvc3-h39c-mrq5 documents.
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin-via-readonly-token".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true, // user is admin, but token is read-only
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(
+            ext.require_scope("write").is_err(),
+            "admin user with read-only token must still be blocked by scope check"
+        );
     }
 }

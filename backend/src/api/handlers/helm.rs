@@ -23,7 +23,7 @@ use sqlx::{PgPool, Row};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler, HelmIndex};
 use crate::models::repository::RepositoryType;
@@ -440,7 +440,8 @@ async fn upload_chart(
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "helm")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "helm", "write")?.user_id;
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -557,7 +558,8 @@ async fn delete_chart(
     Path((repo_key, name, version)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     // Authenticate
-    let _user_id = require_auth_basic(auth, "helm")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "helm", "delete")?.user_id;
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Find the artifact (using non-macro query)

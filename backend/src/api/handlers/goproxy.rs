@@ -320,6 +320,8 @@ async fn handle_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: reject read-scoped API tokens on PUT.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "goproxy")
             .await?;

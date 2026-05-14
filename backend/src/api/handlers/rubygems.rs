@@ -30,7 +30,7 @@ use std::io::Write as IoWrite;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::RubygemsHandler;
 use crate::models::repository::{Repository, RepositoryType};
@@ -254,7 +254,8 @@ async fn push_gem(
     body: Bytes,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "rubygems")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
