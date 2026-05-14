@@ -3373,9 +3373,11 @@ mod tests {
 
             // Exactly one audit row landed for this scan, and it carries
             // the system-actor label set via `AuditEntry::system_actor`.
-            let (count, details): (i64, serde_json::Value) = sqlx::query_as(
-                "SELECT COUNT(*)::bigint, COALESCE(MAX(details), '{}'::jsonb) \
-                 FROM audit_log WHERE resource_id = $1 AND action = 'SCAN_REAPED'",
+            // Postgres has no `max(jsonb)` aggregate, so we query count and
+            // details separately rather than collapsing the two.
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED'",
             )
             .bind(stuck_id)
             .fetch_one(&pool)
@@ -3385,6 +3387,14 @@ mod tests {
                 count, 1,
                 "exactly one SCAN_REAPED audit row per reaped scan"
             );
+            let details: serde_json::Value = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED' LIMIT 1",
+            )
+            .bind(stuck_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read audit details");
             assert_eq!(
                 details.get("actor").and_then(|v| v.as_str()),
                 Some(STUCK_SCAN_AUDIT_ACTOR),
