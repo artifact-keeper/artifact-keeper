@@ -23,7 +23,10 @@ WORKDIR /app
 # Source and target will be mounted at runtime
 EXPOSE 8080 9090
 
-RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser
+RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser \
+    && chown -R appuser:appuser /usr/local/cargo \
+    && mkdir -p /target /sccache \
+    && chown appuser:appuser /target /sccache /app
 USER appuser
 
 CMD ["cargo", "watch", "-x", "run --bin artifact-keeper"]

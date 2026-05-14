@@ -90,7 +90,7 @@ services:
     restart: unless-stopped
 
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.11.4
+    image: dependencytrack/apiserver:4.14.2
     container_name: artifact-keeper-dev-dtrack-api
     depends_on:
       postgres:
@@ -115,16 +115,10 @@ services:
       - dev_dtrack_data:/data
     ports:
       - "8092:8080"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/version"]
-      interval: 30s
-      timeout: 10s
-      start_period: 60s
-      retries: 5
     restart: unless-stopped
 
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    image: jaegertracing/all-in-one:1.62.0
     container_name: artifact-keeper-dev-jaeger
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
@@ -147,6 +141,8 @@ services:
       - dev_shared_config:/shared
     entrypoint: ["/bin/sh", "/init-dtrack.sh"]
     restart: "no"
+    healthcheck:
+      disable: true
 
   # Backend with hot-reload using cargo-watch
   backend:
@@ -227,17 +223,24 @@ services:
     ports:
       - "8080:8080"
       - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
     restart: unless-stopped
 
   # Web frontend with hot-reload using next dev
   # Set WEB_PATH env var if artifact-keeper-web is not at ../artifact-keeper-web
   web:
     build:
-      context: ${WEB_PATH:-/Users/khan/artifact-keeper-web}
+      context: ${WEB_PATH:-../artifact-keeper-web}
       dockerfile: Dockerfile.dev
     container_name: artifact-keeper-dev-web
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8080
       BACKEND_URL: http://backend:8080
@@ -245,13 +248,13 @@ services:
       WATCHPACK_POLLING: "true"
     volumes:
       # Mount source code for hot-reload
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/src:/app/src:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/public:/app/public:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/next.config.ts:/app/next.config.ts:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/tailwind.config.ts:/app/tailwind.config.ts:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/tsconfig.json:/app/tsconfig.json:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/components.json:/app/components.json:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/postcss.config.mjs:/app/postcss.config.mjs:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/src:/app/src:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/public:/app/public:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/next.config.ts:/app/next.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tailwind.config.ts:/app/tailwind.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tsconfig.json:/app/tsconfig.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/components.json:/app/components.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/postcss.config.mjs:/app/postcss.config.mjs:cached
       # Exclude node_modules (use container's own)
       - dev_web_node_modules:/app/node_modules
     ports:
