@@ -167,8 +167,9 @@ fi
 # Create a fresh API key. DT 4.x returns the unmasked secret in the
 # response body of this single call. There is no other way to retrieve it.
 echo "[dtrack-init] Generating new $DT_TEAM_NAME API key..."
-KEY_RESP=$(curl -sf -X POST "$DT_URL/api/v1/team/$TEAM_UUID/key" \
-  -H "Authorization: Bearer $TOKEN" || true)
+KEY_RESP=$(curl -sf -X PUT "$DT_URL/api/v1/team/$TEAM_UUID/key" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" || true)
 
 if [ -z "$KEY_RESP" ]; then
   echo "[dtrack-init] ERROR: POST /api/v1/team/$TEAM_UUID/key returned empty body" >&2
@@ -237,17 +238,16 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
-# Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
-echo "[dtrack-init] Enabling NVD API 2.0 vulnerability source..."
+echo "[dtrack-init] Enabling NVD REST API 2.0 mirroring..."
 NVD_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
   -X POST "$DT_URL/api/v1/configProperty" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"groupName":"vuln-source","propertyName":"nvd.feeds.url","propertyValue":"https://services.nvd.nist.gov/rest/json/cves/2.0"}')
+  -d '{"groupName":"vuln-source","propertyName":"nvd.api.enabled","propertyValue":"true"}')
 if [ "$NVD_RESULT" = "200" ]; then
-  echo "[dtrack-init] NVD API 2.0 source configured"
+  echo "[dtrack-init] NVD REST API 2.0 mirroring enabled"
 else
-  echo "[dtrack-init] WARNING: NVD config returned HTTP $NVD_RESULT (may already be set or unsupported)"
+  echo "[dtrack-init] WARNING: NVD API config returned HTTP $NVD_RESULT (may already be set)"
 fi
 
 # Drop a marker so operators can tell at a glance that bootstrap completed.
