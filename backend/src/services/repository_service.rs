@@ -343,7 +343,18 @@ impl RepositoryService {
             )));
         }
 
-        let repo = match sqlx::query_as!(
+        // ak-4q87: wrap INSERT + optional `format_key` UPDATE in a single
+        // transaction so a failure of the UPDATE rolls back the INSERT.
+        // Without this a WASM-plugin-handler repo could end up persisted
+        // without its custom format_key, leaving the row in an inconsistent
+        // state that the caller never sees committed.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let insert_result = sqlx::query_as!(
             Repository,
             r#"
             INSERT INTO repositories (
@@ -375,32 +386,42 @@ impl RepositoryService {
             req.is_public,
             req.quota_bytes,
         )
-        .fetch_one(&self.db)
-        .await
-        {
-            Ok(repo) => repo,
+        .fetch_one(&mut *tx)
+        .await;
+
+        let repo = match insert_result {
+            Ok(repo) => {
+                // Set custom format_key for WASM plugin handlers. Runs inside
+                // the same tx so an UPDATE failure rolls back the INSERT.
+                if let Some(ref fk) = req.format_key {
+                    sqlx::query("UPDATE repositories SET format_key = $1 WHERE id = $2")
+                        .bind(fk)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                repo
+            }
             Err(e) if is_duplicate_key_error(&e.to_string()) => {
-                // Another request created this repo concurrently. Return the
-                // existing row so callers see a successful, idempotent result
-                // instead of a 409 Conflict under high concurrency.
+                // Another request created this repo concurrently. Roll back
+                // our (failed) INSERT and return the existing row so callers
+                // see a successful, idempotent result instead of a 409.
                 tracing::debug!(
                     key = %req.key,
                     "Concurrent insert detected, returning existing repository"
                 );
+                let _ = tx.rollback().await;
                 self.get_by_key(&req.key).await?
             }
-            Err(e) => return Err(AppError::Database(e.to_string())),
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e.to_string()));
+            }
         };
-
-        // Set custom format_key for WASM plugin handlers
-        if let Some(ref fk) = req.format_key {
-            sqlx::query("UPDATE repositories SET format_key = $1 WHERE id = $2")
-                .bind(fk)
-                .bind(repo.id)
-                .execute(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-        }
 
         // Index repository in search engine (non-blocking)
         if let Some(ref search) = self.search_service {
@@ -663,12 +684,17 @@ impl RepositoryService {
     ///
     /// Cycle detection runs only when the candidate member is itself a
     /// virtual repository (non-virtual leaves cannot extend a cycle).
+    ///
+    /// When `priority` is `None`, the next priority value is computed as
+    /// `MAX(priority) + 1` *inside* the advisory-locked transaction so that
+    /// concurrent `add_virtual_member` calls cannot observe the same MAX
+    /// and assign duplicate priorities (ak-jhdq).
     pub async fn add_virtual_member(
         &self,
         virtual_repo_id: Uuid,
         member_repo_id: Uuid,
-        priority: i32,
-    ) -> Result<()> {
+        priority: Option<i32>,
+    ) -> Result<i32> {
         // Reject self-membership unconditionally before opening the
         // transaction. The cycle check below would also catch this, but
         // the dedicated error message is more useful at the API boundary
@@ -743,6 +769,25 @@ impl RepositoryService {
             )));
         }
 
+        // Resolve priority inside the locked tx. ak-jhdq: doing the MAX read
+        // outside the tx allowed two concurrent POSTs to observe the same
+        // value and INSERT identical priorities. The advisory lock above
+        // already serializes membership mutations, so reading MAX here is
+        // race-free relative to other `add_virtual_member` tx.
+        let resolved_priority = match priority {
+            Some(p) => p,
+            None => {
+                let max: Option<i32> = sqlx::query_scalar(
+                    "SELECT MAX(priority) FROM virtual_repo_members WHERE virtual_repo_id = $1",
+                )
+                .bind(virtual_repo_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                max.unwrap_or(0) + 1
+            }
+        };
+
         sqlx::query(
             r#"
             INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
@@ -751,7 +796,7 @@ impl RepositoryService {
         )
         .bind(virtual_repo_id)
         .bind(member_repo_id)
-        .bind(priority)
+        .bind(resolved_priority)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -762,7 +807,7 @@ impl RepositoryService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(())
+        Ok(resolved_priority)
     }
 
     /// Return true if inserting the edge
@@ -1952,5 +1997,118 @@ mod tests {
             matches!(mapped, AppError::Database(_)),
             "23505 without constraint name must not be Conflict, got {mapped:?}"
         );
+    }
+
+    // =========================================================================
+    // DB-backed tests for the ak-4q87 transaction-wrapped `create` path.
+    //
+    // These exercise the begin/commit/rollback arms that pure unit tests can't
+    // reach. They use `tdh::try_pool()` to opt into a real Postgres connection
+    // when DATABASE_URL is set, and skip silently otherwise. The coverage CI
+    // job provisions Postgres and runs migrations, so these tests instrument
+    // the transaction body during the lib-coverage measurement.
+    // =========================================================================
+
+    mod db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        fn make_create_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
+            CreateRepositoryRequest {
+                key: format!("acs-repo-{suffix}"),
+                name: format!("acs repo {suffix}"),
+                description: None,
+                format,
+                repo_type: RepositoryType::Local,
+                storage_backend: "filesystem".to_string(),
+                storage_path: format!("/tmp/acs-{suffix}"),
+                upstream_url: None,
+                is_public: false,
+                quota_bytes: None,
+                format_key: None,
+            }
+        }
+
+        async fn cleanup_repo(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        /// Happy-path: create commits the INSERT inside a transaction and
+        /// the resulting repo is visible after the commit.
+        #[tokio::test]
+        async fn test_create_commits_insert_in_transaction() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let req = make_create_req(&suffix, RepositoryFormat::Generic);
+            let repo = service.create(req).await.expect("create should commit");
+            assert_eq!(repo.key, format!("acs-repo-{suffix}"));
+
+            // Visible to a fresh fetch through the same pool: confirms commit
+            // landed (a non-committed INSERT would be invisible to a new
+            // connection because the transaction would have rolled back on
+            // drop).
+            let fetched = service.get_by_key(&repo.key).await.expect("fetched");
+            assert_eq!(fetched.id, repo.id);
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// `format_key` set: exercises the inner UPDATE + commit branch.
+        #[tokio::test]
+        async fn test_create_with_format_key_commits_inner_update() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.format_key = Some("wasm:custom-handler".to_string());
+            let repo = service
+                .create(req)
+                .await
+                .expect("create with format_key should commit");
+
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT format_key FROM repositories WHERE id = $1")
+                    .bind(repo.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch format_key");
+            assert_eq!(stored.as_deref(), Some("wasm:custom-handler"));
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Duplicate key: the second `create` rolls back its own (failed)
+        /// INSERT and returns the row created by the first.
+        #[tokio::test]
+        async fn test_create_duplicate_key_returns_existing_via_rollback() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let first = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("first create");
+
+            let second = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("duplicate create should idempotently return existing");
+            assert_eq!(
+                second.id, first.id,
+                "duplicate-key path must return the row created by the first call"
+            );
+
+            cleanup_repo(&pool, first.id).await;
+        }
     }
 }

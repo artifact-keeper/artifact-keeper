@@ -877,7 +877,7 @@ pub async fn create_repository(
                         "Adding virtual member"
                     );
                     service
-                        .add_virtual_member(repo.id, member_repo.id, priority)
+                        .add_virtual_member(repo.id, member_repo.id, Some(priority))
                         .await?;
                 }
             }
@@ -1050,7 +1050,8 @@ pub async fn update_repository(
     // Invalidate the in-memory repo cache so that visibility changes take
     // effect immediately instead of waiting for the TTL to expire. Remove
     // both the old key and the new key (in case the key was renamed).
-    if let Ok(mut cache) = state.repo_cache.write() {
+    {
+        let mut cache = state.repo_cache.write().await;
         cache.remove(&key);
         cache.remove(&repo.key);
     }
@@ -1173,7 +1174,8 @@ pub async fn delete_repository(
     service.delete(repo.id).await?;
 
     // Remove the deleted repo from the in-memory cache.
-    if let Ok(mut cache) = state.repo_cache.write() {
+    {
+        let mut cache = state.repo_cache.write().await;
         cache.remove(&key);
     }
 
@@ -2396,24 +2398,11 @@ pub async fn add_virtual_member(
     let member_repo = service.get_by_key(&payload.member_key).await?;
     authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "add")?;
 
-    // Get current max priority if not specified
-    let priority = match payload.priority {
-        Some(p) => p,
-        None => {
-            let max: Option<i32> = sqlx::query_scalar(
-                "SELECT MAX(priority) FROM virtual_repo_members WHERE virtual_repo_id = $1",
-            )
-            .bind(virtual_repo.id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-            max.unwrap_or(0) + 1
-        }
-    };
-
+    // Resolve priority inside the service's advisory-locked transaction
+    // (ak-jhdq). Computing MAX(priority)+1 here, outside the tx, would let
+    // two concurrent POSTs observe the same value and INSERT duplicates.
     service
-        .add_virtual_member(virtual_repo.id, member_repo.id, priority)
+        .add_virtual_member(virtual_repo.id, member_repo.id, payload.priority)
         .await?;
 
     // Fetch the created member record

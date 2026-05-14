@@ -958,7 +958,8 @@ pub async fn repo_visibility_middleware(
     // request.  The cache is populated with full repo metadata so that
     // format-handler resolvers (e.g. resolve_cargo_repo) can reuse it
     // without issuing their own DB lookup.
-    let cached = vis_state.repo_cache.read().ok().and_then(|cache| {
+    let cached = {
+        let cache = vis_state.repo_cache.read().await;
         cache.get(repo_key).and_then(|(entry, at)| {
             if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
                 Some(entry.clone())
@@ -966,7 +967,7 @@ pub async fn repo_visibility_middleware(
                 None
             }
         })
-    });
+    };
 
     let repo = match cached {
         Some(r) => Some(r),
@@ -990,7 +991,7 @@ pub async fn repo_visibility_middleware(
             .ok()
             .flatten();
 
-            row.map(|r| {
+            if let Some(r) = row {
                 let entry = CachedRepo {
                     id: r.get("id"),
                     format: r.get("format"),
@@ -1002,12 +1003,15 @@ pub async fn repo_visibility_middleware(
                     index_upstream_url: r.get("index_upstream_url"),
                 };
                 // Populate the shared cache; evict stale entries on write.
-                if let Ok(mut cache) = vis_state.repo_cache.write() {
+                {
+                    let mut cache = vis_state.repo_cache.write().await;
                     cache.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
                     cache.insert(repo_key.to_string(), (entry.clone(), Instant::now()));
                 }
-                entry
-            })
+                Some(entry)
+            } else {
+                None
+            }
         }
     };
 
@@ -2978,15 +2982,15 @@ mod tests {
     // ever hitting the unreachable lazy DB pool.
     // -----------------------------------------------------------------------
 
-    fn make_vis_state(cached: Option<(String, CachedRepo)>) -> RepoVisibilityState {
+    async fn make_vis_state(cached: Option<(String, CachedRepo)>) -> RepoVisibilityState {
         let auth_service = make_test_auth_service();
         let pool = lazy_pool();
         let cache: RepoCache =
-            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         if let Some((key, entry)) = cached {
             cache
                 .write()
-                .unwrap()
+                .await
                 .insert(key, (entry, std::time::Instant::now()));
         }
         // PermissionService is constructed against the lazy pool: tests that
@@ -3039,7 +3043,7 @@ mod tests {
     async fn test_repo_visibility_pass_through_when_no_repo_key() {
         // A path with no repo segment short-circuits at the empty-key check,
         // before the cache is touched. Hitting `/` for example.
-        let state = make_vis_state(None);
+        let state = make_vis_state(None).await;
         let resp = run_through_visibility(state, empty_get("/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -3049,7 +3053,7 @@ mod tests {
         // Public repo + GET + no auth header: must pass through to the handler.
         let key = "myrepo";
         let cached = make_cached_repo(/* is_public */ true);
-        let state = make_vis_state(Some((key.to_string(), cached)));
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/myrepo/simple/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -3058,7 +3062,7 @@ mod tests {
     async fn test_repo_visibility_private_read_no_auth_returns_401() {
         let key = "private";
         let cached = make_cached_repo(/* is_public */ false);
-        let state = make_vis_state(Some((key.to_string(), cached)));
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/private/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3070,7 +3074,7 @@ mod tests {
         // strip the auth ext via `has_write_auth = ext.is_some() && !ticket`.
         let key = "myrepo";
         let cached = make_cached_repo(/* is_public */ true);
-        let state = make_vis_state(Some((key.to_string(), cached)));
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
         let req = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/pypi/myrepo/upload")
@@ -3087,7 +3091,7 @@ mod tests {
         // ticket-resolution attempt must not block legitimate anonymous reads.
         let key = "myrepo";
         let cached = make_cached_repo(/* is_public */ true);
-        let state = make_vis_state(Some((key.to_string(), cached)));
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp =
             run_through_visibility(state, empty_get("/pypi/myrepo/simple/?ticket=anything")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3100,7 +3104,7 @@ mod tests {
         // and the request is still anonymous, so the same 401 applies.
         let key = "private";
         let cached = make_cached_repo(/* is_public */ false);
-        let state = make_vis_state(Some((key.to_string(), cached)));
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
         let req = axum::http::Request::builder()
             .method(Method::PUT)
             .uri("/pypi/private/upload?ticket=abc")
