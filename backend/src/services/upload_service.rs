@@ -206,6 +206,14 @@ impl UploadService {
         file.set_len(p.total_size as u64).await?;
         drop(file);
 
+        // ak-4q87: wrap the session INSERT and the per-chunk placeholder
+        // INSERTs in one transaction. Without this, a failure midway through
+        // the chunk-row loop leaves an orphan `upload_sessions` row whose
+        // `total_chunks` count disagrees with the actual `upload_chunks`
+        // rows, and uploads against that session report partial-byte
+        // progress they can never complete.
+        let mut tx = p.db.begin().await?;
+
         let session = sqlx::query_as::<_, UploadSession>(
             r#"
             INSERT INTO upload_sessions
@@ -227,7 +235,7 @@ impl UploadService {
         .bind(total_chunks)
         .bind(p.checksum_sha256)
         .bind(temp_file_path.to_string_lossy().as_ref())
-        .fetch_one(p.db)
+        .fetch_one(&mut *tx)
         .await?;
 
         // Insert chunk placeholder rows
@@ -249,9 +257,11 @@ impl UploadService {
             .bind(i)
             .bind(offset)
             .bind(length)
-            .execute(p.db)
+            .execute(&mut *tx)
             .await?;
         }
+
+        tx.commit().await?;
 
         tracing::info!(
             "Created upload session {} for {} ({} bytes, {} chunks of {} bytes)",

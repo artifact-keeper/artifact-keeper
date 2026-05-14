@@ -332,6 +332,59 @@ impl RubygemsHandler {
     }
 }
 
+/// Parse the gem name out of a `<name>-<version>[-<platform>].gem` filename.
+///
+/// Returns `None` if the filename does not parse as a gem (no `.gem`
+/// extension, no version separator, or the resulting name fails
+/// [`is_valid_rubygems_name`]). The case-insensitive `.gem` extension match
+/// is load-bearing for the shadowing guard. Without it, an attacker
+/// requesting `rails-7.0.gem` vs `rails-7.0.GEM` could bypass the guard.
+///
+/// Cross-format shadowing guard primitive (#1217 follow-up, ak-hv3s).
+/// Mirrors the hex parser shape: parse with fail-closed semantics, then
+/// hand the result to [`crate::api::handlers::proxy_helpers::
+/// virtual_non_remote_owns_name`].
+pub(crate) fn package_name_from_gem_filename(filename: &str) -> Option<String> {
+    let lowered = filename.to_ascii_lowercase();
+    let without_ext = lowered.strip_suffix(".gem")?;
+    for (i, _) in without_ext.match_indices('-') {
+        if without_ext
+            .get(i + 1..)
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            let candidate = &without_ext[..i];
+            if is_valid_rubygems_name(candidate) {
+                return Some(candidate.to_string());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Validate a gem name. RubyGems names match `[A-Za-z0-9._-]+` and may
+/// not start with `.` or `-`. The shadowing guard lowercases via Postgres
+/// `LOWER()`, so we restrict to ASCII to avoid homoglyph attacks where
+/// SQL `LOWER()` and Rust `to_ascii_lowercase` disagree.
+///
+/// We deliberately reject the dot character even though it is permitted
+/// by the spec: real gem names in the top-million almost never contain
+/// dots and accepting them would let `..` slip through the path-traversal
+/// gate. Operators publishing dot-named gems will hit the validator on
+/// download; they can upload, just not benefit from the shadowing guard
+/// on the dot-name. The fail-closed default returns `None` (no guard
+/// fires) for dot-named filenames so behavior matches pre-#1217.
+pub(crate) fn is_valid_rubygems_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 impl Default for RubygemsHandler {
     fn default() -> Self {
         Self::new()
@@ -993,5 +1046,88 @@ summary: A summary
     #[test]
     fn test_rubygems_handler_default() {
         let _handler = RubygemsHandler;
+    }
+
+    // ------------------------------------------------------------------
+    // package_name_from_gem_filename / is_valid_rubygems_name
+    // (#1217 follow-up, ak-hv3s shadowing guard)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_package_name_from_gem_filename_simple() {
+        assert_eq!(
+            package_name_from_gem_filename("rails-7.0.8.gem"),
+            Some("rails".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_hyphenated_name() {
+        assert_eq!(
+            package_name_from_gem_filename("aws-sdk-s3-1.140.0.gem"),
+            Some("aws-sdk-s3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_uppercase_extension() {
+        // Load-bearing case-insensitive match: an attacker requesting
+        // `RAILS-7.gem` vs `rails-7.gem` must not bypass the guard.
+        assert_eq!(
+            package_name_from_gem_filename("rails-7.0.gem"),
+            Some("rails".to_string())
+        );
+        assert_eq!(
+            package_name_from_gem_filename("RAILS-7.0.GEM"),
+            Some("rails".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_no_extension() {
+        assert_eq!(package_name_from_gem_filename("rails-7.0.8"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_empty_name_rejected() {
+        assert_eq!(package_name_from_gem_filename("-7.0.0.gem"), None);
+        assert_eq!(package_name_from_gem_filename(""), None);
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_rejects_path_traversal() {
+        // The path-traversal-shaped names must not parse as gem names.
+        assert_eq!(package_name_from_gem_filename("../-1.0.0.gem"), None);
+        assert_eq!(package_name_from_gem_filename("a/b-1.0.0.gem"), None);
+        assert_eq!(package_name_from_gem_filename("..%2f-1.0.0.gem"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_gem_filename_rejects_unicode() {
+        // Non-ASCII names must be rejected so SQL `LOWER()` (ASCII-only)
+        // does not produce a different result than the parser's ASCII
+        // lowercasing.
+        assert_eq!(
+            package_name_from_gem_filename("rails\u{043e}-7.0.gem"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_valid_rubygems_name_accepts_real_world_gems() {
+        assert!(is_valid_rubygems_name("rails"));
+        assert!(is_valid_rubygems_name("aws-sdk-s3"));
+        assert!(is_valid_rubygems_name("nokogiri"));
+        assert!(is_valid_rubygems_name("rubocop_rake"));
+        assert!(is_valid_rubygems_name("a"));
+    }
+
+    #[test]
+    fn test_is_valid_rubygems_name_rejects_invalid() {
+        assert!(!is_valid_rubygems_name(""));
+        assert!(!is_valid_rubygems_name("-rails"));
+        assert!(!is_valid_rubygems_name(".rails"));
+        assert!(!is_valid_rubygems_name("rails space"));
+        assert!(!is_valid_rubygems_name("rails/slash"));
     }
 }

@@ -8,7 +8,7 @@ use cron::Schedule;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::services::analytics_service::AnalyticsService;
@@ -28,6 +28,19 @@ struct GaugeStats {
     pub artifacts: i64,
     pub storage: i64,
     pub users: i64,
+}
+
+/// Per-replica startup-delay jitter (PR #1212 audit, M2).
+///
+/// Returns a `Duration` equal to `base_secs + uniform(0, 30)` seconds.
+/// Multiple replicas spawned by the same Helm release start within a
+/// few milliseconds of each other and would otherwise fire their first
+/// tick at the same instant; the jitter spreads them across a 30 s
+/// window so audit-log writes and metric upticks de-synchronize, even
+/// in the legitimate case where the advisory lock briefly contends.
+fn jittered_startup_delay(base_secs: u64) -> Duration {
+    let jitter = rand::random::<u64>() % 30;
+    Duration::from_secs(base_secs.saturating_add(jitter))
 }
 
 /// Spawn all background scheduler tasks.
@@ -207,21 +220,30 @@ pub fn spawn_all(
     // mid-scan). Without this sweep they accumulate forever, polluting
     // dashboards and the dedup path. Reaps rows whose `started_at` predates
     // `stuck_scan_threshold_secs` (issue #1015).
+    //
+    // Multi-replica safety (PR #1212 audit, H3): `cleanup_stuck_scans_with_limit`
+    // takes `pg_try_advisory_xact_lock(STUCK_SCAN_LOCK_ID)` inside the
+    // reap transaction so only one replica writes audit rows per tick. The
+    // startup delay is jittered (M2) so replicas do not contend on the
+    // very first tick. `MissedTickBehavior::Delay` keeps the cadence
+    // honest when a tick takes longer than the interval (large backlog).
     {
         let db = db.clone();
         let threshold_secs = config.stuck_scan_threshold_secs;
         let check_secs = config.stuck_scan_check_interval_secs;
+        let reap_limit = config.stuck_scan_reap_limit;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(90)).await;
+            tokio::time::sleep(jittered_startup_delay(90)).await;
             let service = ScanResultService::new(db);
             let mut ticker = interval(Duration::from_secs(check_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
                 ticker.tick().await;
                 tracing::debug!("Sweeping for stuck 'running' scan_results rows");
 
                 match service
-                    .cleanup_stuck_scans(Duration::from_secs(threshold_secs))
+                    .cleanup_stuck_scans_with_limit(Duration::from_secs(threshold_secs), reap_limit)
                     .await
                 {
                     Ok(reaped) if reaped > 0 => {

@@ -1,0 +1,52 @@
+-- Migration: functional LOWER(name) index on artifacts for case-insensitive
+-- name lookups (#1217 audit follow-up, ak-wgzr).
+--
+-- Several handlers compare `LOWER(name) = LOWER($n)` so the registry's
+-- case-insensitive package-name semantics match how upstreams treat them.
+-- The shadowing guard added in #1217 is the hottest such lookup: every
+-- virtual-repo download for hex (and, with this PR, cargo / npm / pypi /
+-- maven / rubygems) issues a per-request existence check across the virtual
+-- repo's non-Remote members keyed on case-folded name. The other heavy
+-- callers are `find_artifact_by_name_lowercase` in proxy_helpers (used by
+-- every metadata endpoint that resolves a package by name) and the
+-- per-format `package_info` queries.
+--
+-- The existing `idx_artifacts_repo_name_version` covers
+-- `(repository_id, name, version)` but is not sargable against
+-- `LOWER(name) = LOWER($2)`. Postgres falls back to a sequential scan when
+-- the predicate is a function of the indexed column, which on installs
+-- with large `artifacts` tables degrades the shadowing guard from O(1) to
+-- O(n) per download. This functional index makes the guard sargable.
+--
+-- The `WHERE is_deleted = false` partial predicate keeps the index small
+-- because every caller of this query path filters on `is_deleted = false`.
+-- Tombstoned artifacts do not need to live in the index. The `LIMIT 1`
+-- short-circuit in the shadowing-guard SQL completes within the partial
+-- index without touching any soft-deleted rows.
+--
+-- CREATE INDEX CONCURRENTLY is intentionally not used here: sqlx::migrate
+-- runs each migration file inside a transaction, and CONCURRENTLY is
+-- rejected inside a transaction block. The non-concurrent build takes
+-- ACCESS EXCLUSIVE on `artifacts` for the duration of the build, so inserts
+-- to `artifacts` (i.e. new artifact uploads) will block until it finishes.
+-- On installs with millions of artifact rows, plan the upgrade window
+-- accordingly: estimate the build by counting `is_deleted = false` rows.
+--
+-- Operators who cannot accept the lock window can skip this migration and
+-- create the index out of band against a quiescent table:
+--
+--   CREATE INDEX CONCURRENTLY idx_artifacts_repo_lower_name
+--     ON artifacts (repository_id, LOWER(name))
+--     WHERE is_deleted = false;
+--
+-- Functionality continues to work without the index; the shadowing guard
+-- falls back to a sequential scan. The index is purely a query-plan
+-- accelerator.
+--
+-- Idempotent via IF NOT EXISTS so re-running on an already-migrated DB
+-- (e.g. operators who created the index out of band before applying this
+-- migration) is a no-op.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_repo_lower_name
+  ON artifacts (repository_id, LOWER(name))
+  WHERE is_deleted = false;

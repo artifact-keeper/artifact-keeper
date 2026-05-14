@@ -161,6 +161,116 @@ impl Default for NpmHandler {
     }
 }
 
+/// Validate an npm package name against the registry's accepted shape.
+///
+/// npm names are case-insensitive, must be lowercase, may contain
+/// hyphens, dots, and underscores, and may be prefixed by `@scope/`.
+/// Length is bounded to 214 bytes per npm's published validator. The
+/// shadowing guard restricts to ASCII because SQL `LOWER()` is
+/// ASCII-only, so a unicode-homoglyph name would case-fold differently
+/// in Postgres and Rust, opening a homoglyph-shadowing attack.
+///
+/// `@scope/name` shape is preserved: the slash is a permitted scope
+/// separator, but it must appear at most once and be flanked by valid
+/// scope and name segments. A bare `@`, multiple slashes, or empty
+/// segments are rejected.
+///
+/// Cross-format shadowing guard primitive (#1217 follow-up, ak-hv3s).
+pub(crate) fn is_valid_npm_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 214 {
+        return false;
+    }
+    // Scoped name: `@scope/name`
+    if let Some(rest) = name.strip_prefix('@') {
+        let mut split = rest.splitn(2, '/');
+        let scope = split.next().unwrap_or("");
+        let pkg = split.next().unwrap_or("");
+        if scope.is_empty() || pkg.is_empty() {
+            return false;
+        }
+        return is_valid_npm_segment(scope) && is_valid_npm_segment(pkg);
+    }
+    is_valid_npm_segment(name)
+}
+
+/// Validate a single scope or unscoped npm name segment.
+/// Must start with a lowercase letter or digit; allow `-`, `_`, `.`
+/// internally. Path-traversal characters (`/`, `..`, `%`) and any
+/// uppercase/non-ASCII characters are rejected.
+fn is_valid_npm_segment(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
+}
+
+/// Parse the package name out of an npm tarball URL path.
+///
+/// The two shapes are:
+///   - `<name>/-/<name>-<version>.tgz`
+///   - `@<scope>/<name>/-/<name>-<version>.tgz`
+///
+/// The package name we hand to the shadowing guard is the full name
+/// (`@scope/name` or `name`): that is what the upstream registry
+/// considers the package identity and what `artifacts.name` stores.
+/// Returns `None` for any input that does not parse cleanly per
+/// [`is_valid_npm_name`].
+///
+/// Cross-format shadowing guard primitive (#1217 follow-up, ak-hv3s).
+///
+/// The current npm download handler reads the package name from the URL
+/// path parameters and feeds it straight to `virtual_non_remote_owns_name`.
+/// This path-based parser is the symmetric primitive kept for future
+/// call sites that arrive only with a tarball URL (eg. webhook payloads,
+/// background revalidation jobs) and matches the shape of the hex /
+/// rubygems / cargo parsers so all five formats look alike to a reader.
+#[allow(dead_code)]
+pub(crate) fn package_name_from_tarball_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let parts: Vec<&str> = path.split('/').collect();
+
+    // The trailing segment must look like a tarball: non-empty and ending
+    // in `.tgz` (case-insensitive). Without this, paths like `foo/-/`
+    // would be accepted with `foo` as the name even though no tarball is
+    // actually being requested.
+    let last = parts.last().copied().unwrap_or("");
+    if last.is_empty() || !last.to_ascii_lowercase().ends_with(".tgz") {
+        return None;
+    }
+
+    // Scoped: ["@scope", "name", "-", "<file>.tgz"]
+    if parts.len() >= 4 && parts[0].starts_with('@') && parts[2] == "-" {
+        let scope = parts[0].strip_prefix('@')?;
+        let name = parts[1];
+        if scope.is_empty() || name.is_empty() {
+            return None;
+        }
+        let candidate = format!(
+            "@{}/{}",
+            scope.to_ascii_lowercase(),
+            name.to_ascii_lowercase()
+        );
+        if is_valid_npm_name(&candidate) {
+            return Some(candidate);
+        }
+        return None;
+    }
+
+    // Unscoped: ["name", "-", "<file>.tgz"]
+    if parts.len() >= 3 && parts[1] == "-" {
+        let candidate = parts[0].to_ascii_lowercase();
+        if is_valid_npm_name(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 #[async_trait]
 impl FormatHandler for NpmHandler {
     fn format(&self) -> RepositoryFormat {
@@ -800,5 +910,89 @@ mod tests {
         assert_eq!(parsed.name, "test");
         assert_eq!(parsed.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
         assert_eq!(parsed.maintainers.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // is_valid_npm_name / package_name_from_tarball_path
+    // (#1217 follow-up, ak-hv3s shadowing guard)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_npm_name_accepts_real_world() {
+        assert!(is_valid_npm_name("lodash"));
+        assert!(is_valid_npm_name("express"));
+        assert!(is_valid_npm_name("body-parser"));
+        assert!(is_valid_npm_name("source.map"));
+        assert!(is_valid_npm_name("@types/node"));
+        assert!(is_valid_npm_name("@angular/core"));
+        assert!(is_valid_npm_name("a"));
+    }
+
+    #[test]
+    fn test_is_valid_npm_name_rejects_invalid() {
+        assert!(!is_valid_npm_name(""));
+        assert!(!is_valid_npm_name("@/foo")); // empty scope
+        assert!(!is_valid_npm_name("@scope/")); // empty pkg
+        assert!(!is_valid_npm_name("@scope")); // no slash
+        assert!(!is_valid_npm_name("Foo")); // uppercase
+        assert!(!is_valid_npm_name("foo bar")); // space
+        assert!(!is_valid_npm_name("foo/bar")); // unscoped slash
+        assert!(!is_valid_npm_name("../foo")); // traversal
+                                               // 215 chars
+        let too_long = "a".repeat(215);
+        assert!(!is_valid_npm_name(&too_long));
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_unscoped() {
+        assert_eq!(
+            package_name_from_tarball_path("lodash/-/lodash-4.17.21.tgz"),
+            Some("lodash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_hyphenated() {
+        assert_eq!(
+            package_name_from_tarball_path("body-parser/-/body-parser-1.20.2.tgz"),
+            Some("body-parser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_scoped() {
+        assert_eq!(
+            package_name_from_tarball_path("@types/node/-/node-20.0.0.tgz"),
+            Some("@types/node".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_uppercase_lowered() {
+        // npm lower-cases names; the guard must lower the candidate so
+        // it matches what `artifacts.name` stores and what SQL `LOWER()`
+        // produces.
+        assert_eq!(
+            package_name_from_tarball_path("LODASH/-/lodash-4.17.21.tgz"),
+            Some("lodash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_rejects_malformed() {
+        assert_eq!(package_name_from_tarball_path(""), None);
+        assert_eq!(package_name_from_tarball_path("foo"), None);
+        assert_eq!(package_name_from_tarball_path("foo/-/"), None);
+        // Path traversal in the name segment must be rejected.
+        assert_eq!(package_name_from_tarball_path("../-/foo-1.0.tgz"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_path_rejects_unicode_homoglyphs() {
+        // Cyrillic 'о' homoglyph must not parse.
+        assert_eq!(
+            package_name_from_tarball_path("l\u{043e}dash/-/lodash-4.17.21.tgz"),
+            None
+        );
     }
 }

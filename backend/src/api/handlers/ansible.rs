@@ -316,6 +316,7 @@ async fn download_collection(
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
                         default_content_type: "application/octet-stream",
                         content_disposition_filename: None,
+                        suppress_upstream_proxy: false,
                     },
                 )
                 .await?

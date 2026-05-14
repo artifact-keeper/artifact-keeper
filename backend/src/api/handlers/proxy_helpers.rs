@@ -1111,6 +1111,41 @@ pub struct DownloadResponseOpts<'a> {
     /// Filename to include in the `Content-Disposition: attachment` header.
     /// `None` omits the header.
     pub content_disposition_filename: Option<&'a str>,
+    /// Block Remote members of a Virtual repo from satisfying this download.
+    ///
+    /// When `true`, `try_remote_or_virtual_download` passes `proxy_service:
+    /// None` through to [`resolve_virtual_download`], which causes
+    /// [`virtual_member_fetch_strategy`] to return `Skip` for every Remote
+    /// member. This is the supply-chain name-shadowing guard from #1217 /
+    /// PR #974: a Virtual member that owns a given package name locally
+    /// must shadow any upstream Remote member that claims the same name.
+    /// Format handlers compute this flag by combining a per-format
+    /// filename-to-package-name parser with [`virtual_non_remote_owns_name`].
+    ///
+    /// Has no effect for Remote or hosted repos; only Virtual repos
+    /// consult this field.
+    pub suppress_upstream_proxy: bool,
+}
+
+impl<'a> DownloadResponseOpts<'a> {
+    /// Convenience constructor: build options for a download that does NOT
+    /// activate the cross-format shadowing guard. Equivalent to setting
+    /// `suppress_upstream_proxy: false`. Use this for paths that have no
+    /// format-specific package name to gate on (eg. raw metadata files).
+    pub fn new(
+        upstream_path: &'a str,
+        virtual_lookup: VirtualLookup<'a>,
+        default_content_type: &'a str,
+        content_disposition_filename: Option<&'a str>,
+    ) -> Self {
+        Self {
+            upstream_path,
+            virtual_lookup,
+            default_content_type,
+            content_disposition_filename,
+            suppress_upstream_proxy: false,
+        }
+    }
 }
 
 /// Classification of the action [`try_remote_or_virtual_download`] should
@@ -1138,6 +1173,76 @@ pub(crate) fn classify_remote_or_virtual(repo_type: &str) -> RemoteOrVirtualActi
     } else {
         RemoteOrVirtualAction::Hosted
     }
+}
+
+/// Returns true if any non-Remote member of `virtual_repo_id` owns an
+/// artifact whose `name` case-insensitively matches `package_name`.
+///
+/// This is the cross-format primitive behind the supply-chain
+/// name-shadowing guard introduced for hex in PR #1217 and extended to
+/// cargo / npm / pypi / maven / rubygems by the audit follow-up
+/// (ak-hv3s). When this returns true, the caller must block any Remote
+/// member of the same Virtual repo from satisfying the download for
+/// `package_name`. Otherwise a malicious upstream that pushes a
+/// package whose name an operator has already published locally would
+/// shadow the operator's intended artifact.
+///
+/// Callers wire this into [`DownloadResponseOpts::suppress_upstream_proxy`]
+/// so the existing `try_remote_or_virtual_download` plumbing can act on
+/// the result without each format handler having to call
+/// [`resolve_virtual_download`] with an explicit `None` proxy.
+///
+/// The query is a single round trip across every non-Remote member id
+/// using `repository_id = ANY($1)` and a `LIMIT 1` short-circuit. It is
+/// sargable against the functional `idx_artifacts_repo_lower_name`
+/// partial index added by migration 106 (ak-wgzr). The `is_deleted =
+/// false` predicate matches the partial-index WHERE clause exactly so
+/// the planner uses the index.
+///
+/// Fails closed: a database error returns 500 rather than allowing the
+/// caller to proceed without the guard. Returns false (allow proxy
+/// fan-out) on the benign "no non-Remote members" case so virtual repos
+/// that contain only upstream proxies behave exactly as they did
+/// before this guard existed.
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_name(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+                              WHERE repository_id = ANY($1) \
+                                AND is_deleted = false \
+                                AND LOWER(name) = LOWER($2) \
+                              LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(package_name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            event = "shadowing_guard_db_error",
+            virtual_repo_id = %virtual_repo_id,
+            error = %e,
+            "cross-format shadowing-guard DB query failed; failing closed to 500",
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+    })?;
+
+    Ok(exists.is_some())
 }
 
 /// Try the proxy and virtual fallbacks for a download miss.
@@ -1177,13 +1282,25 @@ pub async fn try_remote_or_virtual_download(
 
     if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Virtual {
         let db = state.db.clone();
+        // Shadowing guard: when the caller already determined that a
+        // non-Remote member of this virtual repo owns the requested
+        // package name, blank out the proxy service so Remote members are
+        // Skip'd by `virtual_member_fetch_strategy`. The `None` argument
+        // is load-bearing: see the comment on `DownloadResponseOpts::
+        // suppress_upstream_proxy` and on `serve_virtual_tarball_local_only`
+        // in api/handlers/hex.rs for the security rationale.
+        let proxy_for_virtual = if opts.suppress_upstream_proxy {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
         let (content, content_type) = match opts.virtual_lookup {
             VirtualLookup::PathSuffix(suffix) => {
                 let suffix = suffix.to_string();
                 let state_arc = state.clone();
                 resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
                     move |member_id, location| {
@@ -1203,7 +1320,7 @@ pub async fn try_remote_or_virtual_download(
                 let state_arc = state.clone();
                 resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
                     move |member_id, location| {
@@ -2565,10 +2682,12 @@ mod tests {
             virtual_lookup: VirtualLookup::PathSuffix("foo.tgz"),
             default_content_type: "application/x-tar",
             content_disposition_filename: Some("foo.tgz"),
+            suppress_upstream_proxy: false,
         };
         assert_eq!(opts.upstream_path, "pkg/v1/foo.tgz");
         assert_eq!(opts.default_content_type, "application/x-tar");
         assert_eq!(opts.content_disposition_filename, Some("foo.tgz"));
+        assert!(!opts.suppress_upstream_proxy);
     }
 
     #[test]
@@ -2578,8 +2697,38 @@ mod tests {
             virtual_lookup: VirtualLookup::ExactPath("/some/path"),
             default_content_type: "application/octet-stream",
             content_disposition_filename: None,
+            suppress_upstream_proxy: false,
         };
         assert!(opts.content_disposition_filename.is_none());
+    }
+
+    #[test]
+    fn test_download_response_opts_new_helper_defaults_suppress_to_false() {
+        // The ergonomic constructor matches the previous five-field shape
+        // and leaves shadowing-suppression off by default.
+        let opts = DownloadResponseOpts::new(
+            "pkg/v1/bar.tgz",
+            VirtualLookup::PathSuffix("bar.tgz"),
+            "application/x-tar",
+            Some("bar.tgz"),
+        );
+        assert_eq!(opts.upstream_path, "pkg/v1/bar.tgz");
+        assert!(!opts.suppress_upstream_proxy);
+        assert_eq!(opts.content_disposition_filename, Some("bar.tgz"));
+    }
+
+    #[test]
+    fn test_download_response_opts_suppress_upstream_proxy_toggle() {
+        // The shadowing-guard flag is independent of the rest of the struct
+        // and reaches `try_remote_or_virtual_download` verbatim.
+        let opts = DownloadResponseOpts {
+            upstream_path: "pkg/v1/baz.tgz",
+            virtual_lookup: VirtualLookup::PathSuffix("baz.tgz"),
+            default_content_type: "application/octet-stream",
+            content_disposition_filename: None,
+            suppress_upstream_proxy: true,
+        };
+        assert!(opts.suppress_upstream_proxy);
     }
 
     // ── parse_multipart_file_with_json tests ────────────────────────────
@@ -2858,6 +3007,7 @@ mod tests {
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
+                stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
@@ -3464,6 +3614,7 @@ mod tests {
             virtual_lookup: VirtualLookup::PathSuffix("any.tgz"),
             default_content_type: "application/octet-stream",
             content_disposition_filename: None,
+            suppress_upstream_proxy: false,
         };
         let result = try_remote_or_virtual_download(&state, &repo, opts)
             .await
@@ -3492,12 +3643,13 @@ mod tests {
             upstream_url: Some("https://upstream.example.test".to_string()),
         };
 
-        // state.proxy_service is None — should short-circuit to Ok(None).
+        // state.proxy_service is None: should short-circuit to Ok(None).
         let opts = DownloadResponseOpts {
             upstream_path: "any/path",
             virtual_lookup: VirtualLookup::PathSuffix("any.tgz"),
             default_content_type: "application/octet-stream",
             content_disposition_filename: None,
+            suppress_upstream_proxy: false,
         };
         let result = try_remote_or_virtual_download(&state, &repo, opts)
             .await
@@ -3531,11 +3683,12 @@ mod tests {
             virtual_lookup: VirtualLookup::ExactPath("any/path"),
             default_content_type: "application/octet-stream",
             content_disposition_filename: None,
+            suppress_upstream_proxy: false,
         };
         let result = try_remote_or_virtual_download(&state, &repo, opts)
             .await
             .expect("ok");
-        assert!(result.is_none(), "no upstream URL → Ok(None)");
+        assert!(result.is_none(), "no upstream URL: Ok(None)");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }

@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
@@ -1146,9 +1146,41 @@ async fn serve_artifact(
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
                 let artifact_path = path.to_string();
+
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+                // Maven `artifacts.name` stores `coords.artifact_id` (the
+                // artifactId component of GAV; see the publish-path
+                // around line 1634). To run the guard we have to parse
+                // the GAV out of the request path. The guard fires
+                // whenever a non-Remote member already owns the
+                // artifactId case-insensitively; this is strictly a
+                // safety net rather than an authority check, because
+                // different groupIds may legitimately share an
+                // artifactId. The trade-off is preferable to leaving
+                // the shadowing attack open. If the path fails to parse
+                // as a Maven coordinate (eg. dynamic metadata.xml
+                // requests reach this branch from earlier fall-through),
+                // skip the guard rather than block the request.
+                let local_owns = match MavenHandler::parse_coordinates(path) {
+                    Ok(coords) => {
+                        proxy_helpers::virtual_non_remote_owns_name(
+                            &state.db,
+                            repo.id,
+                            &coords.artifact_id,
+                        )
+                        .await?
+                    }
+                    Err(_) => false,
+                };
+                let proxy_for_virtual = if local_owns {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
+
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    proxy_for_virtual,
                     repo.id,
                     path,
                     |member_id, location| {
@@ -1536,7 +1568,9 @@ async fn upload(
     Path((repo_key, path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "maven")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
+    // this push endpoint. Require the write scope before doing any work.
+    let user_id = require_auth_basic_scope(auth, "maven", "write")?.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos

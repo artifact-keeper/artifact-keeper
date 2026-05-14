@@ -30,9 +30,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -396,23 +396,23 @@ mod tests {
         assert_eq!(REPO_CACHE_TTL_SECS, 60);
     }
 
-    #[test]
-    fn test_repo_cache_insert_and_lookup() {
+    #[tokio::test]
+    async fn test_repo_cache_insert_and_lookup() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let repo = make_cached_repo();
         cache
             .write()
-            .unwrap()
+            .await
             .insert("my-repo".to_string(), (repo.clone(), Instant::now()));
 
-        let guard = cache.read().unwrap();
+        let guard = cache.read().await;
         let (entry, at) = guard.get("my-repo").unwrap();
         assert_eq!(entry.id, repo.id);
         assert!(at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
     }
 
-    #[test]
-    fn test_repo_cache_eviction_on_write() {
+    #[tokio::test]
+    async fn test_repo_cache_eviction_on_write() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let repo = make_cached_repo();
 
@@ -420,17 +420,17 @@ mod tests {
         let expired_at = Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
         cache
             .write()
-            .unwrap()
+            .await
             .insert("stale".to_string(), (repo.clone(), expired_at));
 
         // Insert a fresh entry and run eviction.
         {
-            let mut w = cache.write().unwrap();
+            let mut w = cache.write().await;
             w.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
             w.insert("fresh".to_string(), (repo, Instant::now()));
         }
 
-        let guard = cache.read().unwrap();
+        let guard = cache.read().await;
         assert!(
             guard.get("stale").is_none(),
             "stale entry should be evicted"
@@ -438,17 +438,17 @@ mod tests {
         assert!(guard.get("fresh").is_some(), "fresh entry should remain");
     }
 
-    #[test]
-    fn test_repo_cache_miss_returns_none() {
+    #[tokio::test]
+    async fn test_repo_cache_miss_returns_none() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
-        let guard = cache.read().unwrap();
+        let guard = cache.read().await;
         assert!(guard.get("nonexistent").is_none());
     }
 
-    #[test]
-    fn test_index_cache_type_construction() {
+    #[tokio::test]
+    async fn test_index_cache_type_construction() {
         let cache: IndexCache = Arc::new(RwLock::new(HashMap::new()));
-        assert!(cache.read().unwrap().is_empty());
+        assert!(cache.read().await.is_empty());
     }
 
     #[test]
@@ -460,48 +460,48 @@ mod tests {
         assert!(!repo.is_public);
     }
 
-    #[test]
-    fn test_repo_cache_invalidation_by_key_removal() {
+    #[tokio::test]
+    async fn test_repo_cache_invalidation_by_key_removal() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let repo = make_cached_repo();
         cache
             .write()
-            .unwrap()
+            .await
             .insert("my-remote".to_string(), (repo, Instant::now()));
-        assert!(cache.read().unwrap().contains_key("my-remote"));
+        assert!(cache.read().await.contains_key("my-remote"));
 
         // Simulate cache invalidation on repo update: remove the key.
-        cache.write().unwrap().remove("my-remote");
+        cache.write().await.remove("my-remote");
         assert!(
-            !cache.read().unwrap().contains_key("my-remote"),
+            !cache.read().await.contains_key("my-remote"),
             "entry should be removed after invalidation"
         );
     }
 
-    #[test]
-    fn test_repo_cache_invalidation_preserves_other_entries() {
+    #[tokio::test]
+    async fn test_repo_cache_invalidation_preserves_other_entries() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let repo = make_cached_repo();
         cache
             .write()
-            .unwrap()
+            .await
             .insert("repo-a".to_string(), (repo.clone(), Instant::now()));
         cache
             .write()
-            .unwrap()
+            .await
             .insert("repo-b".to_string(), (repo, Instant::now()));
 
         // Invalidate only repo-a.
-        cache.write().unwrap().remove("repo-a");
-        assert!(!cache.read().unwrap().contains_key("repo-a"));
+        cache.write().await.remove("repo-a");
+        assert!(!cache.read().await.contains_key("repo-a"));
         assert!(
-            cache.read().unwrap().contains_key("repo-b"),
+            cache.read().await.contains_key("repo-b"),
             "other entries should remain after targeted invalidation"
         );
     }
 
-    #[test]
-    fn test_repo_cache_visibility_toggle() {
+    #[tokio::test]
+    async fn test_repo_cache_visibility_toggle() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let private_repo = CachedRepo {
             is_public: false,
@@ -509,36 +509,74 @@ mod tests {
         };
         cache
             .write()
-            .unwrap()
+            .await
             .insert("my-cache".to_string(), (private_repo, Instant::now()));
 
         // Verify it's private.
         {
-            let guard = cache.read().unwrap();
+            let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
             assert!(!entry.is_public);
         }
 
         // Simulate update: remove old entry, insert updated one.
-        cache.write().unwrap().remove("my-cache");
+        cache.write().await.remove("my-cache");
         let public_repo = CachedRepo {
             is_public: true,
             ..make_cached_repo()
         };
         cache
             .write()
-            .unwrap()
+            .await
             .insert("my-cache".to_string(), (public_repo, Instant::now()));
 
         // Verify the change is visible immediately.
         {
-            let guard = cache.read().unwrap();
+            let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
             assert!(
                 entry.is_public,
                 "cache should reflect the updated visibility immediately"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent access exercise (ak-2q98): with tokio::sync::RwLock the
+    // cache supports concurrent reads/writes from many tasks without
+    // blocking the runtime, regardless of which order they arrive in.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_repo_cache_concurrent_access() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("repo-{}", i % 8);
+                let repo = CachedRepo {
+                    id: Uuid::new_v4(),
+                    format: "cargo".to_string(),
+                    repo_type: "hosted".to_string(),
+                    upstream_url: None,
+                    storage_path: format!("/data/{}", key),
+                    storage_backend: "filesystem".to_string(),
+                    is_public: i % 2 == 0,
+                    index_upstream_url: None,
+                };
+                c.write().await.insert(key.clone(), (repo, Instant::now()));
+                // Hold a read guard briefly to interleave readers + writers.
+                let read = c.read().await;
+                assert!(read.contains_key(&key));
+            }));
+        }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+        let guard = cache.read().await;
+        // 8 distinct keys after 32 inserts.
+        assert_eq!(guard.len(), 8);
     }
 
     // -- redact_sensitive_params --
