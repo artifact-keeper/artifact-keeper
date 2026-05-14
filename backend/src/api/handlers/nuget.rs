@@ -596,6 +596,8 @@ async fn push_package(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: enforce write scope before doing anything else.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
     let user_id = match auth {
         Some(ext) => ext.user_id,
         None => {

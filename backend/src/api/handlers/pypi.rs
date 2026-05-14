@@ -27,7 +27,7 @@ use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
@@ -995,7 +995,8 @@ async fn upload(
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "pypi")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "pypi", "write")?.user_id;
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos

@@ -37,7 +37,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::incus::IncusHandler;
 
@@ -617,7 +617,8 @@ async fn upload_image(
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     body: Body,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -694,7 +695,8 @@ async fn delete_image(
     Extension(auth): Extension<Option<AuthExtension>>,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -767,7 +769,8 @@ async fn start_chunked_upload(
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     body: Body,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -844,7 +847,8 @@ async fn upload_chunk(
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
     body: Body,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let session = get_session(&state.db, session_id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
@@ -889,7 +893,8 @@ async fn complete_chunked_upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let session = get_session(&state.db, session_id).await?;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
@@ -988,7 +993,8 @@ async fn cancel_chunked_upload(
     Extension(auth): Extension<Option<AuthExtension>>,
     AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "incus")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
     let session = get_session(&state.db, session_id).await?;
 
     // Delete temp file

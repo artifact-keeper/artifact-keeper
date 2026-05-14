@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
@@ -1536,7 +1536,9 @@ async fn upload(
     Path((repo_key, path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "maven")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
+    // this push endpoint. Require the write scope before doing any work.
+    let user_id = require_auth_basic_scope(auth, "maven", "write")?.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
