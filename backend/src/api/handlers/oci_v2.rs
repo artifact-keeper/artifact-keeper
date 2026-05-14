@@ -378,7 +378,8 @@ async fn authenticate_oci_with_scopes(
                             auth_service
                                 .validate_access_token(&tokens.access_token)
                                 .map_err(|_| ())
-                        });
+                        })
+                        .map(|claims| (claims, None));
                 }
             }
 
