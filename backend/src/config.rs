@@ -197,6 +197,15 @@ pub struct Config {
     /// `running` rows. Default 600 (10 minutes).
     pub stuck_scan_check_interval_secs: u64,
 
+    /// Maximum rows the stuck-scan janitor reaps per tick.
+    ///
+    /// Operators with a large post-outage backlog can tune this up so the
+    /// queue drains faster; environments with a small workload can tune
+    /// it down so a single tick costs less. Clamped to `[1, 10_000]` at
+    /// startup (see [`crate::services::scan_result_service::clamp_stuck_scan_reap_limit`]).
+    /// Env var: `STUCK_SCAN_REAP_LIMIT`. Default: 1000. PR #1212 audit M1.
+    pub stuck_scan_reap_limit: i64,
+
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
     pub max_upload_size_bytes: u64,
@@ -421,6 +430,7 @@ redacted_debug!(Config {
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
+    show stuck_scan_reap_limit,
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show metrics_port,
@@ -504,6 +514,7 @@ impl Default for Config {
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
+            stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
@@ -639,6 +650,11 @@ impl Config {
                 "STUCK_SCAN_CHECK_INTERVAL_SECS",
                 600,
             )),
+            stuck_scan_reap_limit:
+                crate::services::scan_result_service::clamp_stuck_scan_reap_limit(env_parse(
+                    "STUCK_SCAN_REAP_LIMIT",
+                    1000,
+                )),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
