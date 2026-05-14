@@ -157,6 +157,58 @@ pub fn require_auth_basic(
     })
 }
 
+/// Like [`require_auth_basic`] but additionally enforces the given API-token
+/// scope. JWT and password-authenticated sessions (anything without
+/// `is_api_token = true`) pass through unchanged because they are not scope
+/// restricted. API tokens must carry the requested scope or `*`/`admin`,
+/// otherwise this returns a 403 with body
+/// `Token does not have required scope: <scope>`.
+///
+/// Format handlers should call this instead of `require_auth_basic` for any
+/// write/delete path (publish, upload, delete) so a read-scoped service
+/// account token cannot push or destroy artifacts. See GHSA-vvc3-h39c-mrq5.
+#[allow(clippy::result_large_err)]
+pub fn require_auth_basic_scope(
+    auth: Option<AuthExtension>,
+    realm: &str,
+    scope: &str,
+) -> std::result::Result<AuthExtension, Response> {
+    let ext = require_auth_basic(auth, realm)?;
+    if !ext.has_scope(scope) {
+        return Err(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(axum::body::Body::from(format!(
+                "Token does not have required scope: {}",
+                scope
+            )))
+            .unwrap());
+    }
+    Ok(ext)
+}
+
+/// Enforce a scope check on an already-resolved auth context, returning a
+/// 403 `Response` if the scope is missing. Use for write/delete paths that
+/// authenticate via [`require_auth_with_bearer_fallback`] or other helpers
+/// returning `Response` errors. See GHSA-vvc3-h39c-mrq5.
+#[allow(clippy::result_large_err)]
+pub fn require_scope_response(
+    auth: Option<&AuthExtension>,
+    scope: &str,
+) -> std::result::Result<(), Response> {
+    if let Some(ext) = auth {
+        if !ext.has_scope(scope) {
+            return Err(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from(format!(
+                    "Token does not have required scope: {}",
+                    scope
+                )))
+                .unwrap());
+        }
+    }
+    Ok(())
+}
+
 /// Extract credentials from a Bearer token that contains base64-encoded user:pass.
 ///
 /// Some package managers (npm, cargo, goproxy) send Bearer tokens that are
@@ -1372,6 +1424,132 @@ mod tests {
     fn test_require_scope_denied() {
         let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
         assert!(ext.require_scope("write:artifacts").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-vvc3-h39c-mrq5: scope enforcement helpers used by format and
+    // admin handlers to reject read-scoped API tokens on write/delete paths.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_require_auth_basic_scope_missing_auth_returns_401() {
+        let result = require_auth_basic_scope(None, "maven", "write");
+        let err = result.expect_err("missing auth must error");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_require_auth_basic_scope_jwt_passes() {
+        // JWT sessions (is_api_token = false) must pass the scope gate.
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "jwtuser".to_string(),
+            email: "jwt@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        let result = require_auth_basic_scope(Some(ext), "maven", "write");
+        assert!(result.is_ok(), "JWT sessions must not be scope-gated");
+    }
+
+    #[test]
+    fn test_require_auth_basic_scope_read_token_rejected_on_write() {
+        // Read-scoped API token must be rejected with 403 on a write path,
+        // not authenticated and then denied at the data layer. This is the
+        // exact scenario from GHSA-vvc3-h39c-mrq5.
+        let ext = make_api_token_ext(vec!["read".to_string()], None);
+        let result = require_auth_basic_scope(Some(ext), "maven", "write");
+        let err = result.expect_err("read-only token must be rejected");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_require_auth_basic_scope_write_token_accepted_on_write() {
+        let ext = make_api_token_ext(vec!["write".to_string()], None);
+        let result = require_auth_basic_scope(Some(ext.clone()), "maven", "write");
+        let returned = result.expect("write-scoped token must pass");
+        assert_eq!(returned.user_id, ext.user_id);
+    }
+
+    #[test]
+    fn test_require_auth_basic_scope_wildcard_accepts_any() {
+        let ext = make_api_token_ext(vec!["*".to_string()], None);
+        assert!(require_auth_basic_scope(Some(ext.clone()), "maven", "write").is_ok());
+        assert!(require_auth_basic_scope(Some(ext), "maven", "delete").is_ok());
+    }
+
+    #[test]
+    fn test_require_auth_basic_scope_admin_accepts_any() {
+        // The token-level "admin" scope is a wildcard, separate from the
+        // user's is_admin flag (which is on the user, not the token).
+        let ext = make_api_token_ext(vec!["admin".to_string()], None);
+        assert!(require_auth_basic_scope(Some(ext), "maven", "write").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_require_auth_basic_scope_returns_expected_body() {
+        // The body string is part of the contract: tests across the format
+        // handler suite assert on it for the read-only-token case.
+        let ext = make_api_token_ext(vec!["read".to_string()], None);
+        let err = require_auth_basic_scope(Some(ext), "maven", "write").expect_err("must err");
+        let body = axum::body::to_bytes(err.into_body(), 4096).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("Token does not have required scope: write"),
+            "unexpected body: {}",
+            body_str
+        );
+    }
+
+    #[test]
+    fn test_require_scope_response_no_auth_passes() {
+        // Format handlers that fall back to Bearer-as-basic credentials may
+        // receive `None` from the middleware. The helper must not 403 those
+        // since they have no API-token scope to check.
+        let result = require_scope_response(None, "write");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_require_scope_response_read_token_rejected() {
+        let ext = make_api_token_ext(vec!["read".to_string()], None);
+        let result = require_scope_response(Some(&ext), "write");
+        let err = result.expect_err("read-only token must be rejected");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_require_scope_response_jwt_passes() {
+        // JWT extension (no scopes set, is_api_token = false) must pass.
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "jwtuser".to_string(),
+            email: "jwt@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(require_scope_response(Some(&ext), "write").is_ok());
+        assert!(require_scope_response(Some(&ext), "delete").is_ok());
+    }
+
+    #[test]
+    fn test_require_scope_response_write_token_passes_write() {
+        let ext = make_api_token_ext(vec!["write".to_string()], None);
+        assert!(require_scope_response(Some(&ext), "write").is_ok());
+    }
+
+    #[test]
+    fn test_require_scope_response_write_token_rejected_on_delete() {
+        // A write-scoped token must not be sufficient for delete operations.
+        let ext = make_api_token_ext(vec!["write".to_string()], None);
+        let err = require_scope_response(Some(&ext), "delete").expect_err("write != delete scope");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 
     // -----------------------------------------------------------------------
