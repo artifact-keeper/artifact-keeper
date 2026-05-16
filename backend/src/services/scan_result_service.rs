@@ -477,10 +477,17 @@ impl ScanResultService {
         // Operators looking at the audit log to investigate an incident need to
         // see this transition rather than only the prometheus counter.
         //
-        // Demoted from per-row `?` to a warn-and-continue path: a database
-        // failure here would also fail the reap commit on rollback, but we
-        // log the row count explicitly so operators see the audit gap if it
-        // happens.
+        // Wrapped in a SAVEPOINT so an audit-INSERT failure (e.g. a CHECK
+        // constraint, a transient index error) does not poison the parent
+        // transaction. PostgreSQL aborts the whole transaction on the first
+        // statement error, after which `COMMIT` silently downgrades to
+        // `ROLLBACK` — without the savepoint, a broken audit insert would
+        // leave the reaped rows wedged in 'running', defeating the janitor.
+        sqlx::query("SAVEPOINT audit_emit")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         let audit_result = sqlx::query(
             r#"
             INSERT INTO audit_log
@@ -504,17 +511,28 @@ impl ScanResultService {
         .await;
 
         match audit_result {
-            Ok(_) => {}
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT audit_emit")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            }
             Err(e) => {
                 // Batched insert failed: log loudly so operators see the
-                // gap, but commit the reap anyway (leaving rows wedged in
-                // 'running' is worse than a missing audit row).
+                // gap, then unwind the savepoint so the parent transaction
+                // is usable again and the reap UPDATE can still commit
+                // (leaving rows wedged in 'running' is worse than a missing
+                // audit row).
                 tracing::warn!(
                     reaped = reaped.len(),
                     error = %e,
                     "stuck-scan janitor: batched audit-log INSERT failed; reap will still commit"
                 );
                 crate::services::metrics_service::record_cleanup("stuck_scans_audit_failed", 1);
+                sqlx::query("ROLLBACK TO SAVEPOINT audit_emit")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
             }
         }
 
