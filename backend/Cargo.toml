@@ -103,7 +103,7 @@ clap.workspace = true
 async-trait = "0.1"
 async-stream = "0.3"
 hex = "0.4"
-rand = "0.9"
+rand = "0.10"
 
 # Format parsing
 quick-xml = { version = "0.39", features = ["serialize"] }
