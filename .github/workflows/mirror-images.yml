@@ -32,6 +32,9 @@ jobs:
             target: ghcr.io/artifact-keeper/ci-mirror/rust:1.75-slim
 
     steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
       - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
@@ -39,10 +42,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Mirror image to GHCR
+      - name: Mirror image to GHCR (preserve multi-arch manifest)
+        # `buildx imagetools create` copies the full OCI index — every platform
+        # manifest the upstream image publishes — without re-pulling layers per
+        # platform. This is required so downstream multi-arch builds
+        # (e.g. docker-publish.yml builds linux/amd64 + linux/arm64) can resolve
+        # the correct arch manifest from the mirror.
         run: |
-          docker pull ${{ matrix.image }}
-          echo "FROM ${{ matrix.image }}" | docker build \
-            --label "org.opencontainers.image.source=https://github.com/artifact-keeper/artifact-keeper" \
-            -t ${{ matrix.target }} -
-          docker push ${{ matrix.target }}
+          docker buildx imagetools create \
+            --tag ${{ matrix.target }} \
+            ${{ matrix.image }}
