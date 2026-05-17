@@ -28,7 +28,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::cran::CranHandler;
 use crate::models::repository::RepositoryType;
@@ -212,6 +212,7 @@ async fn download_package(
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(&filename),
                         default_content_type: "application/octet-stream",
                         content_disposition_filename: None,
+                        suppress_upstream_proxy: false,
                     },
                 )
                 .await?
@@ -308,7 +309,8 @@ async fn upload_package(
     Path((repo_key, filename)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "cran")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "cran", "write")?.user_id;
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 

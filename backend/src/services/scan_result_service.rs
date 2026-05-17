@@ -10,14 +10,73 @@ use crate::models::security::{
     DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
     Severity,
 };
-use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 
-/// Maximum rows the stuck-scan janitor reaps in a single tick. Bounds memory
-/// for the `UPDATE ... RETURNING` payload and the audit-emission loop so a
-/// post-upgrade backlog drains across successive ticks rather than in one
-/// large batch. A long-stuck backlog on a normally-healthy install is small;
-/// this only matters for pathological cases (deploy after a long outage).
-const STUCK_SCAN_REAP_LIMIT: i64 = 1000;
+/// Default cap on rows the stuck-scan janitor reaps in a single tick.
+/// Bounds memory for the `UPDATE ... RETURNING` payload and the audit-
+/// emission batch so a post-upgrade backlog drains across successive
+/// ticks rather than in one large batch. A long-stuck backlog on a
+/// normally-healthy install is small; this only matters for pathological
+/// cases (deploy after a long outage). Operators with very large backlogs
+/// can tune via the `STUCK_SCAN_REAP_LIMIT` env var
+/// (see [`crate::config::Config::stuck_scan_reap_limit`]).
+pub const STUCK_SCAN_REAP_LIMIT_DEFAULT: i64 = 1000;
+
+/// Clamp bounds for `STUCK_SCAN_REAP_LIMIT`. Lower bound 1 keeps the
+/// janitor functional (zero would always reap nothing and silently
+/// disable it); upper bound 10_000 caps single-tick memory and audit
+/// fan-out so a misconfigured value cannot lock the pool for minutes.
+pub const STUCK_SCAN_REAP_LIMIT_MIN: i64 = 1;
+pub const STUCK_SCAN_REAP_LIMIT_MAX: i64 = 10_000;
+
+/// Clamp `STUCK_SCAN_REAP_LIMIT` to `[1, 10_000]`. Out-of-range values
+/// log a warning and saturate at the nearest bound rather than being
+/// rejected, so a typo in operator config does not crash startup.
+pub fn clamp_stuck_scan_reap_limit(value: i64) -> i64 {
+    if value < STUCK_SCAN_REAP_LIMIT_MIN {
+        tracing::warn!(
+            value,
+            floor = STUCK_SCAN_REAP_LIMIT_MIN,
+            "STUCK_SCAN_REAP_LIMIT below floor; clamping to floor"
+        );
+        STUCK_SCAN_REAP_LIMIT_MIN
+    } else if value > STUCK_SCAN_REAP_LIMIT_MAX {
+        tracing::warn!(
+            value,
+            ceiling = STUCK_SCAN_REAP_LIMIT_MAX,
+            "STUCK_SCAN_REAP_LIMIT above ceiling; clamping to ceiling"
+        );
+        STUCK_SCAN_REAP_LIMIT_MAX
+    } else {
+        value
+    }
+}
+
+/// System-actor label written to `audit_log.details.actor` for janitor-
+/// initiated reap entries. Static so it goes through
+/// [`crate::services::audit_service::AuditEntry::system_actor`] rather
+/// than the user-input `details(...)` path.
+const STUCK_SCAN_AUDIT_ACTOR: &str = "system:stuck_scan_janitor";
+
+/// Postgres advisory-lock key for the stuck-scan janitor (PR #1212 audit,
+/// finding H3). The janitor takes `pg_try_advisory_lock(STUCK_SCAN_LOCK_ID)`
+/// for the duration of one sweep so only one replica fires per tick;
+/// other replicas skip cleanly.
+///
+/// The integer is chosen from a project-internal block (9000-9099) so it
+/// will not collide with application-level advisory locks. Document new
+/// scheduler locks in this block. Lock IDs in use:
+///
+///   * 9001 — stuck-scan janitor (`cleanup_stuck_scans`)
+///   * 9002 — lifecycle policy execution
+///   * 9003 — storage garbage collection
+///   * 9004 — webhook delivery retry sweep
+///   * 9005 — chunked-upload session cleanup
+///   * 9006 — download-ticket cleanup
+///   * 9007 — refresh-token jti cleanup
+///   * 9008 — sync policy re-evaluation
+///   * 9009 — curation upstream sync
+pub const STUCK_SCAN_LOCK_ID: i64 = 9001;
 
 /// Inventory persistence outcome for a scan_result row (#1157, #1188-R1).
 ///
@@ -178,11 +237,17 @@ pub(crate) fn build_dashboard_summary(
 ///
 /// Pure: takes the reaped row's identifiers and timestamps and returns the
 /// `serde_json::Value` ready to attach to an `AuditEntry`. Kept separate
-/// from `cleanup_stuck_scans` so the details schema (field names, system-
-/// actor marker, JSON shape) can be locked down by unit tests without
-/// needing a Postgres connection. SIEM rules in production parse these
-/// fields, so accidental renames are a silent regression we want a fast
-/// guard on.
+/// from `cleanup_stuck_scans` so the details schema (field names, JSON
+/// shape) can be locked down by unit tests without needing a Postgres
+/// connection. SIEM rules in production parse these fields, so accidental
+/// renames are a silent regression we want a fast guard on.
+///
+/// The `actor` key is intentionally NOT emitted here (PR #1212 audit,
+/// finding H1). `AuditEntry::details` strips user-controlled `actor`
+/// values, so the janitor sets the system-actor label via
+/// [`AuditEntry::system_actor`] after attaching this payload. Keeping
+/// the actor out of the pure builder makes the trust boundary obvious:
+/// the actor is set by the call site, not by a value the row carries.
 pub(crate) fn build_scan_reaped_audit_details(
     scan_id: Uuid,
     artifact_id: Uuid,
@@ -199,7 +264,6 @@ pub(crate) fn build_scan_reaped_audit_details(
         "reaped_at": reaped_at,
         "threshold_secs": threshold_secs,
         "reason": "stuck_running_janitor",
-        "actor": "system:stuck_scan_janitor",
     })
 }
 
@@ -248,13 +312,49 @@ impl ScanResultService {
     /// For SOC 2 / FedRAMP / ISO 27001 long-term retention requirements,
     /// export `SCAN_REAPED` audit entries to durable SIEM storage.
     ///
-    /// Each tick caps reap count at [`STUCK_SCAN_REAP_LIMIT`] rows via
+    /// Each tick caps reap count at the configured `reap_limit` rows via
     /// `FOR UPDATE SKIP LOCKED` so a deploy-day backlog drains across
     /// successive ticks instead of in one large in-memory batch, and so
     /// concurrent janitor replicas do not block on each other.
     ///
-    /// Returns the count of rows reaped.
+    /// Backwards-compatible wrapper: defaults to [`STUCK_SCAN_REAP_LIMIT_DEFAULT`].
+    /// Operators tune via the `STUCK_SCAN_REAP_LIMIT` env var
+    /// (see [`crate::config::Config::stuck_scan_reap_limit`]) and the
+    /// scheduler calls [`Self::cleanup_stuck_scans_with_limit`] directly.
     pub async fn cleanup_stuck_scans(&self, stuck_threshold: Duration) -> Result<u64> {
+        self.cleanup_stuck_scans_with_limit(stuck_threshold, STUCK_SCAN_REAP_LIMIT_DEFAULT)
+            .await
+    }
+
+    /// Reap-with-limit variant. See [`Self::cleanup_stuck_scans`].
+    ///
+    /// PR #1212 audit hardening (findings H2, H3, M1):
+    ///
+    ///   * **Transactional emission (H2)**: the `UPDATE ... RETURNING`
+    ///     reap and the audit-log INSERTs run inside a single
+    ///     `self.db.begin()` transaction. Previously the standalone UPDATE
+    ///     auto-committed before any audit row was written; a SIGKILL or
+    ///     OOM between commit and audit insert left reaped rows with no
+    ///     audit trail. Now the transaction commits only after every
+    ///     audit row is queued, so either both halves of the evidence
+    ///     pair land or neither does.
+    ///
+    ///   * **Leader election (H3)**: takes `pg_try_advisory_lock(STUCK_SCAN_LOCK_ID)`
+    ///     for the duration of the sweep. With `replicaCount > 1`, only
+    ///     one replica holds the lock per tick; the rest skip and return
+    ///     `Ok(0)`. `FOR UPDATE SKIP LOCKED` keeps correctness even
+    ///     without the advisory lock, but the lock prevents audit fan-out
+    ///     and metric triple-counting.
+    ///
+    ///   * **Batched audit INSERT (M1)**: a single
+    ///     `INSERT ... SELECT ... FROM UNNEST(...)` writes all audit rows
+    ///     in one round trip instead of N. At 1000 reaps per tick this
+    ///     drops ~1 s of pure RTT to a single statement.
+    pub async fn cleanup_stuck_scans_with_limit(
+        &self,
+        stuck_threshold: Duration,
+        reap_limit: i64,
+    ) -> Result<u64> {
         // Cap at i64::MAX seconds so the cast is well-defined for any sane
         // threshold; in practice operators configure minutes or hours here.
         let secs = stuck_threshold.as_secs().min(i64::MAX as u64) as i64;
@@ -262,8 +362,50 @@ impl ScanResultService {
             "janitor: scan worker did not complete within {}s (stuck in 'running')",
             secs
         );
+        let reap_limit = clamp_stuck_scan_reap_limit(reap_limit);
 
-        let reaped = sqlx::query!(
+        // Single-replica leader election (PR #1212 audit, H3). Advisory
+        // locks are session-scoped; the lock is automatically released
+        // when the transaction's connection is returned to the pool
+        // (`tx.commit()` / `tx.rollback()` / drop). We take it on the
+        // transaction connection so the lifetimes line up without a
+        // manual unlock branch.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(STUCK_SCAN_LOCK_ID)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if !lock_acquired {
+            tracing::debug!(
+                "stuck-scan janitor: another replica holds the advisory lock (id={}); skipping tick",
+                STUCK_SCAN_LOCK_ID
+            );
+            // Transaction-scoped lock will auto-release on rollback.
+            let _ = tx.rollback().await;
+            return Ok(0);
+        }
+
+        // Reap rows. SQL uses `sqlx::query` (runtime) instead of `sqlx::query!`
+        // (macro) so the `.sqlx/` offline cache does not need to be
+        // regenerated for this PR. The schema is unchanged; only the
+        // bind path differs.
+        #[derive(sqlx::FromRow)]
+        struct ReapRow {
+            id: Uuid,
+            artifact_id: Uuid,
+            repository_id: Uuid,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+            completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let reaped: Vec<ReapRow> = sqlx::query_as::<_, ReapRow>(
             r#"
             WITH reap AS (
                 SELECT id FROM scan_results
@@ -281,16 +423,52 @@ impl ScanResultService {
             WHERE id IN (SELECT id FROM reap)
             RETURNING id, artifact_id, repository_id, started_at, completed_at
             "#,
-            error_message,
-            secs as f64,
-            STUCK_SCAN_REAP_LIMIT,
         )
-        .fetch_all(&self.db)
+        .bind(&error_message)
+        .bind(secs as f64)
+        .bind(reap_limit)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if reaped.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             return Ok(0);
+        }
+
+        // Build the UNNEST arrays for a single batched audit INSERT
+        // (PR #1212 audit, M1). One statement instead of N.
+        let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
+        let mut actions: Vec<String> = Vec::with_capacity(reaped.len());
+        let mut resource_types: Vec<String> = Vec::with_capacity(reaped.len());
+        let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
+        let mut details_blobs: Vec<serde_json::Value> = Vec::with_capacity(reaped.len());
+        let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(reaped.len());
+        for row in &reaped {
+            let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+                .resource(row.id)
+                .details(build_scan_reaped_audit_details(
+                    row.id,
+                    row.artifact_id,
+                    row.repository_id,
+                    row.started_at,
+                    row.completed_at,
+                    secs,
+                ))
+                .system_actor(STUCK_SCAN_AUDIT_ACTOR);
+            user_ids.push(entry.user_id());
+            actions.push(entry.action().as_str().to_string());
+            resource_types.push(entry.resource_type().as_str().to_string());
+            resource_ids.push(entry.resource_id());
+            details_blobs.push(
+                entry
+                    .details_ref()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            correlation_ids.push(entry.correlation_id());
         }
 
         // Per-row audit emission (#1063). A scan transitioning running -> failed
@@ -298,27 +476,69 @@ impl ScanResultService {
         // scan never completed, so the artifact may have undisclosed CVEs.
         // Operators looking at the audit log to investigate an incident need to
         // see this transition rather than only the prometheus counter.
-        let audit = AuditService::new(self.db.clone());
-        for row in &reaped {
-            let details = build_scan_reaped_audit_details(
-                row.id,
-                row.artifact_id,
-                row.repository_id,
-                row.started_at,
-                row.completed_at,
-                secs,
-            );
-            let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
-                .resource(row.id)
-                .details(details);
-            if let Err(e) = audit.log(entry).await {
+        //
+        // Wrapped in a SAVEPOINT so an audit-INSERT failure (e.g. a CHECK
+        // constraint, a transient index error) does not poison the parent
+        // transaction. PostgreSQL aborts the whole transaction on the first
+        // statement error, after which `COMMIT` silently downgrades to
+        // `ROLLBACK` — without the savepoint, a broken audit insert would
+        // leave the reaped rows wedged in 'running', defeating the janitor.
+        sqlx::query("SAVEPOINT audit_emit")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let audit_result = sqlx::query(
+            r#"
+            INSERT INTO audit_log
+                (user_id, action, resource_type, resource_id, details,
+                 ip_address, correlation_id)
+            SELECT * FROM UNNEST(
+                $1::uuid[], $2::text[], $3::text[], $4::uuid[],
+                $5::jsonb[], $6::text[], $7::uuid[]
+            )
+            "#,
+        )
+        .bind(&user_ids)
+        .bind(&actions)
+        .bind(&resource_types)
+        .bind(&resource_ids)
+        .bind(&details_blobs)
+        // ip_address: per-row Option<String>, all None for system-initiated.
+        .bind(vec![None::<String>; reaped.len()])
+        .bind(&correlation_ids)
+        .execute(&mut *tx)
+        .await;
+
+        match audit_result {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT audit_emit")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            }
+            Err(e) => {
+                // Batched insert failed: log loudly so operators see the
+                // gap, then unwind the savepoint so the parent transaction
+                // is usable again and the reap UPDATE can still commit
+                // (leaving rows wedged in 'running' is worse than a missing
+                // audit row).
                 tracing::warn!(
-                    scan_id = %row.id,
+                    reaped = reaped.len(),
                     error = %e,
-                    "stuck-scan janitor: failed to write audit log entry for reaped scan",
+                    "stuck-scan janitor: batched audit-log INSERT failed; reap will still commit"
                 );
+                crate::services::metrics_service::record_cleanup("stuck_scans_audit_failed", 1);
+                sqlx::query("ROLLBACK TO SAVEPOINT audit_emit")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
             }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(reaped.len() as u64)
     }
@@ -2130,13 +2350,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_scan_reaped_audit_details_marks_system_actor() {
+    fn test_build_scan_reaped_audit_details_marks_reason() {
         // SIEM/SOAR rules distinguish janitor-initiated reaps from human-
-        // initiated state changes by `details.actor` and `details.reason`.
-        // Renaming or dropping either is a security-relevant regression.
+        // initiated state changes by `details.reason`. The `actor` key is
+        // no longer embedded by the pure builder (PR #1212 audit H1); it
+        // is stamped on by `AuditEntry::system_actor` in the call site so
+        // that user-input-controlled `details.actor` values are stripped
+        // by `AuditEntry::details` instead of trusted.
         let (_, _, _, details) = sample_reaped_details(900);
         assert_eq!(details["reason"], "stuck_running_janitor");
-        assert_eq!(details["actor"], "system:stuck_scan_janitor");
+        assert!(
+            details.get("actor").is_none(),
+            "actor must not be embedded by the pure builder; system_actor() owns it"
+        );
     }
 
     #[test]
@@ -2186,7 +2412,6 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "actor",
                 "artifact_id",
                 "reaped_at",
                 "reason",
@@ -2195,6 +2420,61 @@ mod tests {
                 "started_at",
                 "threshold_secs",
             ],
+            "schema lock: future additions need an explicit test update; \
+             `actor` lives on the AuditEntry (via system_actor), not in this payload"
+        );
+    }
+
+    // =======================================================================
+    // clamp_stuck_scan_reap_limit (#1212 audit M1 follow-up)
+    //
+    // Operators tune via `STUCK_SCAN_REAP_LIMIT`. Out-of-range values must
+    // saturate at [1, 10_000] rather than disable the janitor (0) or run
+    // unbounded (negative or huge positive).
+    // =======================================================================
+
+    #[test]
+    fn test_clamp_stuck_scan_reap_limit_default_passes_through() {
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(STUCK_SCAN_REAP_LIMIT_DEFAULT),
+            STUCK_SCAN_REAP_LIMIT_DEFAULT
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_reap_limit_below_floor_saturates() {
+        assert_eq!(clamp_stuck_scan_reap_limit(0), STUCK_SCAN_REAP_LIMIT_MIN);
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(-1_000),
+            STUCK_SCAN_REAP_LIMIT_MIN
+        );
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(i64::MIN),
+            STUCK_SCAN_REAP_LIMIT_MIN
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_reap_limit_above_ceiling_saturates() {
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(50_000),
+            STUCK_SCAN_REAP_LIMIT_MAX
+        );
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(i64::MAX),
+            STUCK_SCAN_REAP_LIMIT_MAX
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_reap_limit_boundary_values() {
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(STUCK_SCAN_REAP_LIMIT_MIN),
+            STUCK_SCAN_REAP_LIMIT_MIN
+        );
+        assert_eq!(
+            clamp_stuck_scan_reap_limit(STUCK_SCAN_REAP_LIMIT_MAX),
+            STUCK_SCAN_REAP_LIMIT_MAX
         );
     }
 
@@ -2253,6 +2533,18 @@ mod tests {
         use super::*;
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
+
+        /// Serializes the `cleanup_stuck_scans_*` tests against each other.
+        /// All four touch `pg_try_advisory_xact_lock(STUCK_SCAN_LOCK_ID)`,
+        /// and `cleanup_stuck_scans_skips_when_advisory_lock_held` holds the
+        /// lock for the duration of its assertions. Under `cargo llvm-cov`
+        /// the instrumented binary is slow enough that parallel tests
+        /// invoking the janitor see the held lock and silently return 0,
+        /// breaking their reap-count assertions. The mutex below forces the
+        /// four tests to run sequentially so only one of them interacts
+        /// with the advisory lock at a time. Other unrelated tests in the
+        /// suite are unaffected.
+        static CLEANUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
         async fn insert_test_repo(pool: &PgPool) -> Uuid {
             let id = Uuid::new_v4();
@@ -3032,6 +3324,266 @@ mod tests {
                  even though an older scan still has package rows"
             );
 
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // PR #1212 audit follow-ups (H2, H3, M1, M2).
+        //
+        // These all need a real Postgres because the behavior under test
+        // is the interaction between the reap transaction, the advisory
+        // lock, and the batched audit INSERT. They no-op when `DATABASE_URL`
+        // is unset, matching the surrounding suite.
+        // ===================================================================
+
+        /// Insert a `scan_results` row in `status='running'` whose
+        /// `started_at` is `age_secs` seconds in the past. Returns the
+        /// scan id so the caller can assert on its post-reap state.
+        async fn insert_stuck_running_scan(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            repo_id: Uuid,
+            age_secs: i64,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO scan_results \
+                 (id, artifact_id, repository_id, scan_type, status, started_at) \
+                 VALUES ($1, $2, $3, 'dependency', 'running', NOW() - make_interval(secs => $4::double precision))",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(repo_id)
+            .bind(age_secs as f64)
+            .execute(pool)
+            .await
+            .expect("insert stuck running scan");
+            id
+        }
+
+        /// H2 coverage: a successful reap commits both the row UPDATE and
+        /// the batched audit INSERT in the same transaction.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_writes_audit_row_in_same_transaction() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "h2").await;
+            let stuck_id = insert_stuck_running_scan(&pool, aid, repo_id, 3600).await;
+
+            let reaped = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert!(reaped >= 1, "expected at least one reap");
+
+            // Row transitioned to failed.
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM scan_results WHERE id = $1")
+                    .bind(stuck_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read status");
+            assert_eq!(status, "failed");
+
+            // Exactly one audit row landed for this scan, and it carries
+            // the system-actor label set via `AuditEntry::system_actor`.
+            // Postgres has no `max(jsonb)` aggregate, so we query count and
+            // details separately rather than collapsing the two.
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED'",
+            )
+            .bind(stuck_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            assert_eq!(
+                count, 1,
+                "exactly one SCAN_REAPED audit row per reaped scan"
+            );
+            let details: serde_json::Value = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED' LIMIT 1",
+            )
+            .bind(stuck_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read audit details");
+            assert_eq!(
+                details.get("actor").and_then(|v| v.as_str()),
+                Some(STUCK_SCAN_AUDIT_ACTOR),
+                "audit details.actor must be the system-actor label set by system_actor()"
+            );
+            assert_eq!(
+                details.get("reason").and_then(|v| v.as_str()),
+                Some("stuck_running_janitor"),
+                "audit details.reason must match the pure-builder schema"
+            );
+
+            // Cleanup.
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(stuck_id)
+                .execute(&pool)
+                .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// H3 coverage: when another transaction already holds the
+        /// `STUCK_SCAN_LOCK_ID` advisory lock, the janitor skips cleanly
+        /// (returns Ok(0)) instead of triple-counting on multi-replica
+        /// deployments.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_skips_when_advisory_lock_held() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "h3").await;
+            let stuck_id = insert_stuck_running_scan(&pool, aid, repo_id, 3600).await;
+
+            // Hold the advisory lock in a separate transaction. This
+            // mimics another replica running `cleanup_stuck_scans` in
+            // parallel.
+            let mut holder_tx = pool.begin().await.expect("begin holder tx");
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(STUCK_SCAN_LOCK_ID)
+                .fetch_one(&mut *holder_tx)
+                .await
+                .expect("acquire advisory lock");
+            assert!(acquired, "holder must acquire lock first");
+
+            // Janitor runs while the lock is held; expect Ok(0).
+            let reaped = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert_eq!(reaped, 0, "lock-contended tick must reap nothing");
+
+            // Row is still `running` because the janitor skipped.
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM scan_results WHERE id = $1")
+                    .bind(stuck_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read status");
+            assert_eq!(status, "running", "skipped tick must not transition rows");
+
+            // No audit rows written.
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM audit_log \
+                 WHERE resource_id = $1 AND action = 'SCAN_REAPED'",
+            )
+            .bind(stuck_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            assert_eq!(count, 0);
+
+            // Release holder.
+            holder_tx.commit().await.expect("release advisory lock");
+
+            // After release, a second sweep should reap the row.
+            let reaped2 = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert!(reaped2 >= 1, "post-release sweep must reap the row");
+
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(stuck_id)
+                .execute(&pool)
+                .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// M1 coverage: batched audit INSERT lands all rows in a single
+        /// statement. Seed multiple stuck rows, run one sweep, assert
+        /// every audit row exists and carries the system actor.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_batched_audit_insert_lands_all_rows() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "m1").await;
+            let mut stuck_ids = Vec::with_capacity(5);
+            for _ in 0..5 {
+                stuck_ids.push(insert_stuck_running_scan(&pool, aid, repo_id, 3600).await);
+            }
+
+            let reaped = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert!(reaped >= 5, "expected at least 5 reaps, got {}", reaped);
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM audit_log \
+                 WHERE resource_id = ANY($1) AND action = 'SCAN_REAPED' \
+                   AND details->>'actor' = $2",
+            )
+            .bind(&stuck_ids)
+            .bind(STUCK_SCAN_AUDIT_ACTOR)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            assert_eq!(count, 5, "all 5 audit rows must land via the UNNEST INSERT");
+
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = ANY($1)")
+                .bind(&stuck_ids)
+                .execute(&pool)
+                .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// M1 coverage: configurable reap limit. With limit=2 and 5 stuck
+        /// rows, one tick reaps at most 2.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_respects_configured_reap_limit() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "m1lim").await;
+            let mut stuck_ids = Vec::with_capacity(5);
+            for _ in 0..5 {
+                stuck_ids.push(insert_stuck_running_scan(&pool, aid, repo_id, 3600).await);
+            }
+
+            let reaped = svc
+                .cleanup_stuck_scans_with_limit(Duration::from_secs(60), 2)
+                .await
+                .expect("janitor returned Ok");
+            assert_eq!(reaped, 2, "explicit limit must cap reaps");
+
+            // Remaining 3 rows are still `running`.
+            let still_running: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM scan_results \
+                 WHERE id = ANY($1) AND status = 'running'",
+            )
+            .bind(&stuck_ids)
+            .fetch_one(&pool)
+            .await
+            .expect("count still running");
+            assert_eq!(
+                still_running, 3,
+                "exactly 3 rows must remain stuck for the next tick"
+            );
+
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = ANY($1)")
+                .bind(&stuck_ids)
+                .execute(&pool)
+                .await;
             cleanup_repo(&pool, repo_id).await;
         }
     }

@@ -27,7 +27,7 @@ use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
@@ -673,6 +673,25 @@ async fn serve_file(
                     .into_response());
                 }
 
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+                // PEP 503 normalizes project names (lowercase, runs of
+                // non-alphanumeric collapsed to `-`), so the canonical
+                // identity we compare against `artifacts.name` is the
+                // normalized form. If any non-Remote member already owns
+                // the normalized name, refuse to fan out to Remote
+                // members. This mirrors the hex / cargo / npm /
+                // rubygems behavior; for PyPI specifically, this defeats
+                // the "operator publishes `mycompany-utils` to a Local
+                // member; attacker publishes the same name on pypi.org"
+                // dependency-confusion attack.
+                let normalized_project = PypiHandler::normalize_name(project);
+                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name(
+                    &state.db,
+                    repo.id,
+                    &normalized_project,
+                )
+                .await?;
+
                 for member in &members {
                     // Try local storage first (works for hosted repos and
                     // cached remote artifacts)
@@ -701,7 +720,15 @@ async fn serve_file(
                     // the direct Remote path: check the proxy cache first using
                     // a stable key, then fall back to the format-specific fetch
                     // that resolves the real download URL via the simple index.
-                    if member.repo_type == RepositoryType::Remote {
+                    //
+                    // Shadowing guard (#1217 follow-up, ak-hv3s): when
+                    // `suppress_remote_members` is set, skip every Remote
+                    // member so an upstream cannot serve a project whose
+                    // normalized PEP 503 name a local member already
+                    // owns. Pair with `order_members_local_first`-style
+                    // ordering at the top of this loop: locals run
+                    // first so they win even when the guard doesn't fire.
+                    if member.repo_type == RepositoryType::Remote && !suppress_remote_members {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
@@ -995,7 +1022,8 @@ async fn upload(
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "pypi")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "pypi", "write")?.user_id;
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos

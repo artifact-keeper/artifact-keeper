@@ -220,6 +220,65 @@ impl Default for CargoHandler {
     }
 }
 
+/// Parse the crate name out of a `<name>-<version>.crate` filename.
+///
+/// Returns `None` if the filename does not parse as a crate (no `.crate`
+/// extension, no version separator, name fails [`is_valid_cargo_name`]).
+/// Used by the cross-format shadowing guard (#1217 follow-up, ak-hv3s):
+/// the result is fed to [`crate::api::handlers::proxy_helpers::
+/// virtual_non_remote_owns_name`] so a virtual repo cannot let an
+/// upstream Remote member serve a `.crate` whose name a local member
+/// already owns.
+///
+/// The current cargo download handler reads the crate name from the URL
+/// path parameters and feeds it straight to `virtual_non_remote_owns_name`.
+/// This filename-based parser is the symmetric primitive kept for future
+/// call sites that arrive only with a `.crate` filename (eg. background
+/// revalidation jobs) and matches the shape of the hex / rubygems / npm
+/// parsers so all five formats look alike to a reader.
+#[allow(dead_code)]
+pub(crate) fn package_name_from_crate_filename(filename: &str) -> Option<String> {
+    let lowered = filename.to_ascii_lowercase();
+    let without_ext = lowered.strip_suffix(".crate")?;
+    for (i, _) in without_ext.match_indices('-') {
+        if without_ext
+            .get(i + 1..)
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            let candidate = &without_ext[..i];
+            if is_valid_cargo_name(candidate) {
+                return Some(candidate.to_string());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Validate a crate name against the cargo registry-name spec
+/// (`[a-zA-Z][a-zA-Z0-9_-]*`, at most 64 bytes). Case-insensitive
+/// because the shadowing guard runs the candidate through SQL `LOWER()`.
+///
+/// Cargo's own validator also rejects reserved names (`std`, `core`,
+/// etc.) but we deliberately do not replicate that list here: an
+/// operator publishing such a name is opting into the consequences, and
+/// false positives in the validator weaken (not strengthen) the
+/// shadowing guard. The validator only needs to reject path-traversal-
+/// shaped inputs, homoglyphs, and other obviously malformed identifiers.
+pub(crate) fn is_valid_cargo_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 #[async_trait]
 impl FormatHandler for CargoHandler {
     fn format(&self) -> RepositoryFormat {
@@ -1066,5 +1125,93 @@ members = ["crate-a"]
     fn test_extract_cargo_toml_empty() {
         let result = CargoHandler::extract_cargo_toml(b"");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // package_name_from_crate_filename / is_valid_cargo_name
+    // (#1217 follow-up, ak-hv3s shadowing guard)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_package_name_from_crate_filename_simple() {
+        assert_eq!(
+            package_name_from_crate_filename("serde-1.0.197.crate"),
+            Some("serde".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_hyphenated_name() {
+        assert_eq!(
+            package_name_from_crate_filename("serde-derive-1.0.197.crate"),
+            Some("serde-derive".to_string())
+        );
+        assert_eq!(
+            package_name_from_crate_filename("tokio-stream-0.1.15.crate"),
+            Some("tokio-stream".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_uppercase_extension() {
+        // Case-insensitive `.crate` is load-bearing for the guard.
+        assert_eq!(
+            package_name_from_crate_filename("SERDE-1.0.crate"),
+            Some("serde".to_string())
+        );
+        assert_eq!(
+            package_name_from_crate_filename("serde-1.0.CRATE"),
+            Some("serde".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_no_extension() {
+        assert_eq!(package_name_from_crate_filename("serde-1.0.197"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_rejects_path_traversal() {
+        assert_eq!(package_name_from_crate_filename("../-1.0.0.crate"), None);
+        assert_eq!(package_name_from_crate_filename("a/b-1.0.0.crate"), None);
+        assert_eq!(package_name_from_crate_filename("..%2f-1.0.0.crate"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_rejects_unicode() {
+        // Cyrillic 'о' homoglyph must not parse: SQL `LOWER()` is ASCII-only.
+        assert_eq!(
+            package_name_from_crate_filename("s\u{0435}rde-1.0.0.crate"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_crate_filename_empty_name_rejected() {
+        assert_eq!(package_name_from_crate_filename("-1.0.0.crate"), None);
+        assert_eq!(package_name_from_crate_filename(""), None);
+    }
+
+    #[test]
+    fn test_is_valid_cargo_name_accepts_real_world() {
+        assert!(is_valid_cargo_name("serde"));
+        assert!(is_valid_cargo_name("serde-derive"));
+        assert!(is_valid_cargo_name("rand_chacha"));
+        assert!(is_valid_cargo_name("Tokio")); // mixed case allowed
+        assert!(is_valid_cargo_name("a"));
+    }
+
+    #[test]
+    fn test_is_valid_cargo_name_rejects_invalid() {
+        assert!(!is_valid_cargo_name("")); // empty
+        assert!(!is_valid_cargo_name("1cool")); // leading digit
+        assert!(!is_valid_cargo_name("_serde")); // leading underscore
+        assert!(!is_valid_cargo_name("-serde")); // leading dash
+        assert!(!is_valid_cargo_name("serde.derive")); // dot
+        assert!(!is_valid_cargo_name("serde derive")); // space
+        assert!(!is_valid_cargo_name("serde/derive")); // slash (traversal)
+                                                       // 65 chars
+        let too_long = "a".repeat(65);
+        assert!(!is_valid_cargo_name(&too_long));
     }
 }

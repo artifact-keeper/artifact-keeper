@@ -30,7 +30,7 @@ use std::io::Write as IoWrite;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::RubygemsHandler;
 use crate::models::repository::{Repository, RepositoryType};
@@ -214,6 +214,28 @@ async fn download_gem(
                 } else {
                     None
                 };
+
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s):
+                // if any non-Remote member of a Virtual repo already owns
+                // this gem name, block Remote members from satisfying the
+                // download so an upstream cannot shadow a locally
+                // published gem. Parses the gem name out of the filename
+                // and short-circuits to `false` if the filename does not
+                // look like a gem (no guard, fall through to normal proxy
+                // behavior). The same partial `idx_artifacts_repo_lower_name`
+                // index added by migration 106 backs the query.
+                let suppress_upstream = if repo.repo_type == RepositoryType::Virtual {
+                    match crate::formats::rubygems::package_name_from_gem_filename(filename) {
+                        Some(pkg) => {
+                            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &pkg)
+                                .await?
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
                     &repo,
@@ -222,6 +244,7 @@ async fn download_gem(
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
                         default_content_type: "application/octet-stream",
                         content_disposition_filename: cd_filename,
+                        suppress_upstream_proxy: suppress_upstream,
                     },
                 )
                 .await?
@@ -254,7 +277,8 @@ async fn push_gem(
     body: Bytes,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "rubygems")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 

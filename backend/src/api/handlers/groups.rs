@@ -262,6 +262,10 @@ pub async fn create_group(
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
     let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: gate on API-token scope before consulting the
+    // fine-grained permission table. A read-scoped service-account token
+    // must not be able to create groups even if its user has admin perms.
+    auth.require_scope("write")?;
 
     // Fine-grained permission check: non-admins need "admin" on the system sentinel.
     if !auth.is_admin {
@@ -422,6 +426,8 @@ pub async fn update_group(
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
     let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: require the write scope on the token.
+    auth.require_scope("write")?;
 
     // Fine-grained permission check: non-admins need "admin" on the target group.
     if !auth.is_admin {
@@ -495,6 +501,8 @@ pub async fn delete_group(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: deletion needs the delete scope.
+    auth.require_scope("delete")?;
 
     // Fine-grained permission check: non-admins need "admin" on the target group.
     if !auth.is_admin {
@@ -555,6 +563,8 @@ pub async fn add_members(
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: enforce write scope on token.
+    auth.require_scope("write")?;
 
     // Fine-grained permission check: non-admins need "admin" on the target group.
     if !auth.is_admin {
@@ -615,6 +625,8 @@ pub async fn remove_members(
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: removing members is destructive; require delete scope.
+    auth.require_scope("delete")?;
 
     // Fine-grained permission check: non-admins need "admin" on the target group.
     if !auth.is_admin {

@@ -23,9 +23,11 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
-use crate::formats::hex::HexHandler;
+use crate::formats::hex::{
+    is_valid_hex_package_name, package_name_from_tarball_filename, HexHandler,
+};
 use crate::models::repository::{Repository, RepositoryType};
 
 // ---------------------------------------------------------------------------
@@ -204,34 +206,57 @@ async fn download_tarball(
 
     let filename = tarball_file.trim_start_matches('/');
 
-    let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
-            Some(a) => a,
-            None => {
-                let upstream_path = format!("tarballs/{}", filename);
-                // Remote: no Content-Disposition; Virtual: include filename.
-                let cd_filename = if repo.repo_type == RepositoryType::Virtual {
-                    Some(filename)
-                } else {
-                    None
-                };
-                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
-                    &state,
-                    &repo,
-                    proxy_helpers::DownloadResponseOpts {
-                        upstream_path: &upstream_path,
-                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
-                        default_content_type: "application/octet-stream",
-                        content_disposition_filename: cd_filename,
-                    },
-                )
-                .await?
-                {
-                    return Ok(resp);
-                }
-                return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
+    let artifact = match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename)
+        .await?
+    {
+        Some(a) => a,
+        None => {
+            let upstream_path = format!("tarballs/{}", filename);
+
+            // Virtual: if any non-Remote member already owns this package
+            // name, an upstream Remote member must NOT be allowed to serve
+            // a tarball for it. Otherwise a malicious upstream that pushes
+            // a package named `phoenix` shadows the operator's locally
+            // published `phoenix`. The metadata side of this guard
+            // (`/packages/{name}`) is enforced by `order_members_local_first`
+            // in `package_info`; this is the matching guard on the bytes
+            // side. Forward-ported from PR #974 (#973).
+            if repo.repo_type == RepositoryType::Virtual
+                && virtual_local_owns_tarball_name(&state.db, repo.id, filename).await?
+            {
+                return serve_virtual_tarball_local_only(&state, repo.id, &upstream_path, filename)
+                    .await;
             }
-        };
+
+            // Remote: no Content-Disposition; Virtual: include filename.
+            let cd_filename = if repo.repo_type == RepositoryType::Virtual {
+                Some(filename)
+            } else {
+                None
+            };
+            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                &state,
+                &repo,
+                proxy_helpers::DownloadResponseOpts {
+                    upstream_path: &upstream_path,
+                    virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                    default_content_type: "application/octet-stream",
+                    content_disposition_filename: cd_filename,
+                    // Shadowing guard handled above by the explicit
+                    // `virtual_local_owns_tarball_name` branch + the
+                    // `serve_virtual_tarball_local_only` call. Reaching here
+                    // means no local member claims this name, so we can let
+                    // the standard proxy fan-out run.
+                    suppress_upstream_proxy: false,
+                },
+            )
+            .await?
+            {
+                return Ok(resp);
+            }
+            return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
+        }
+    };
 
     proxy_helpers::serve_local_artifact(
         &state,
@@ -244,6 +269,79 @@ async fn download_tarball(
     .await
 }
 
+/// Returns true if any non-Remote member of a virtual repo has an artifact
+/// row matching the package name parsed from a tarball filename. When true,
+/// the caller must block an upstream Remote member from satisfying the
+/// download (supply-chain name-shadowing guard, #973 / PR #974).
+///
+/// Falls back to `false` if the filename does not parse as a hex tarball.
+async fn virtual_local_owns_tarball_name(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    filename: &str,
+) -> Result<bool, Response> {
+    let Some(pkg_name) = package_name_from_tarball_filename(filename) else {
+        return Ok(false);
+    };
+
+    // Delegate to the cross-format primitive (#1217 follow-up, ak-hv3s).
+    // The hex-specific work is parsing the tarball filename into a
+    // package name; the DB lookup is shared with cargo / npm / pypi /
+    // maven / rubygems.
+    proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, &pkg_name).await
+}
+
+/// Serve a tarball download restricted to the virtual repo's non-Remote
+/// members by passing `proxy_service: None` to `resolve_virtual_download`.
+///
+/// **Security invariant**: the `None` proxy argument is load-bearing, not
+/// a performance optimization or a default. `resolve_virtual_download`
+/// passes that argument through `virtual_member_fetch_strategy`, which
+/// returns `Skip` for Remote members whenever the proxy service is None.
+/// That `Skip` is exactly what prevents an upstream from satisfying a
+/// download whose package name a local member already owns. Any future
+/// refactor that threads a real proxy service through this call would
+/// silently re-open the supply-chain shadowing attack from #973 / PR
+/// #974. Pair with `virtual_local_owns_tarball_name` (download side)
+/// and `order_members_local_first` (metadata side, see `package_info`).
+async fn serve_virtual_tarball_local_only(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    upstream_path: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let state_arc = state.clone();
+    let suffix = filename.to_string();
+
+    let (content, content_type) = proxy_helpers::resolve_virtual_download(
+        &state.db,
+        // Explicit None: any Remote member would route to upstream, which is
+        // exactly what the shadowing guard must block. Local members fall
+        // through to `local_fetch_by_path_suffix` regardless of proxy state.
+        None,
+        virtual_repo_id,
+        upstream_path,
+        move |member_id, location| {
+            let state = state_arc.clone();
+            let suffix = suffix.clone();
+            async move {
+                proxy_helpers::local_fetch_by_path_suffix(
+                    &state.db, &state, member_id, &location, &suffix,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+
+    Ok(proxy_helpers::build_download_response(
+        content,
+        content_type,
+        "application/octet-stream",
+        Some(filename),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // POST /hex/{repo_key}/publish -- Publish package (raw tarball body)
 // ---------------------------------------------------------------------------
@@ -254,7 +352,8 @@ async fn publish_package(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "hex")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "hex", "write")?.user_id;
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -292,6 +391,23 @@ async fn publish_package(
         return Err((
             StatusCode::BAD_REQUEST,
             "Package name and version are required",
+        )
+            .into_response());
+    }
+
+    // Reject names that violate the hex.pm package-name spec (`[a-z][a-z0-9_-]*`)
+    // before they reach `storage_key` or `artifact_path`. Previously only
+    // emptiness was checked, so an attacker could publish a tarball whose
+    // `metadata.config` carried `../evil` or `Phoenix` (uppercase) and have
+    // the malformed name persist in storage. The download-side shadowing
+    // guard (#1217) already refused to interpret such names, but the upload
+    // side did not. Apply the same character-set gate the download parser
+    // uses so uploads and downloads agree on what counts as a valid hex
+    // package name. (#1217 audit follow-up, ak-xf8w.)
+    if !is_valid_hex_package_name(&pkg_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid hex package name: must match [a-z][a-z0-9_-]*",
         )
             .into_response());
     }
@@ -1785,6 +1901,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Note: parser/validator unit tests live in `crate::formats::hex` alongside
+    // the implementations they cover (moved as part of the #1217 audit
+    // follow-up, ak-niid). The DB-backed router tests below exercise the
+    // download-side shadowing guard end-to-end.
+    // -----------------------------------------------------------------------
     // DB-backed router tests for the proxy_helpers-call paths.
     // -----------------------------------------------------------------------
 
@@ -1862,5 +1983,105 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Shadowing-guard end-to-end tests (#973 / PR #974). These exercise
+    // `virtual_local_owns_tarball_name` + `serve_virtual_tarball_local_only`
+    // through the router, which the unit tests on the parser alone cannot.
+    // -----------------------------------------------------------------------
+
+    /// Virtual hex repo with a Local member that owns `phoenix`: a GET for
+    /// `phoenix-1.0.0.tar` must serve the local bytes, NOT attempt an
+    /// upstream proxy fetch. Without the shadowing guard, the request would
+    /// either fall through to `resolve_virtual_download` and be served from
+    /// the configured priority order (which may prefer Remote), or 404.
+    #[tokio::test]
+    async fn test_hex_tarball_virtual_shadowing_guard_serves_local() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_repo_id, _local_key, local_storage_dir) =
+            tdh::create_repo(&pool, "local", "hex").await;
+        let (virtual_repo_id, virtual_key, _virtual_storage_dir) =
+            tdh::create_repo(&pool, "virtual", "hex").await;
+        let state = tdh::build_state(pool.clone(), local_storage_dir.to_str().unwrap());
+
+        // Link the local repo as a member of the virtual repo so the guard
+        // sees a non-Remote member that owns the `phoenix` name.
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_repo_id)
+        .bind(local_repo_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+
+        let local_repo =
+            tdh::make_repo_info(local_repo_id, "local-hex", &local_storage_dir, "hex", None);
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &local_repo,
+            "hex/phoenix/1.0.0/phoenix-1.0.0.tar",
+            "phoenix/1.0.0/phoenix-1.0.0.tar",
+            "phoenix",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"local-phoenix-bytes"),
+            user_id,
+        )
+        .await;
+
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/phoenix-1.0.0.tar", virtual_key)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "guard must serve from local member");
+        assert_eq!(&body[..], b"local-phoenix-bytes");
+
+        tdh::cleanup(&pool, virtual_repo_id, user_id).await;
+        tdh::cleanup(&pool, local_repo_id, user_id).await;
+    }
+
+    /// Virtual hex repo with no non-Remote members: the guard's
+    /// `non_remote_ids.is_empty()` short-circuit must fire so the request
+    /// falls through to the existing `try_remote_or_virtual_download`
+    /// path. Without configured upstream, that yields a 404 rather than
+    /// a 500 (which would indicate the guard accidentally errored).
+    #[tokio::test]
+    async fn test_hex_tarball_virtual_no_non_remote_members_passes_guard() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (virtual_repo_id, virtual_key, virtual_storage_dir) =
+            tdh::create_repo(&pool, "virtual", "hex").await;
+        let state = tdh::build_state(pool.clone(), virtual_storage_dir.to_str().unwrap());
+
+        // Virtual repo has zero members. The guard should see an empty
+        // non_remote_ids vec and short-circuit to Ok(false), then the
+        // outer download path falls through to try_remote_or_virtual_download
+        // which returns NOT_FOUND because there's no proxy service.
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/nothing-1.0.0.tar", virtual_key)),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "empty-members guard must return 404, not 500"
+        );
+
+        tdh::cleanup(&pool, virtual_repo_id, user_id).await;
     }
 }
