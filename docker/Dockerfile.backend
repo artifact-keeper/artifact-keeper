@@ -152,7 +152,10 @@ FROM ghcr.io/anchore/grype:v0.111.1 AS grype-bin
 # Populates the Grype DB at build time so the image works on egress-restricted
 # networks (e.g. ARC runner pods) without a first-scan network fetch from
 # grype.anchore.io. See artifact-keeper#1001.
-FROM alpine:3.23 AS grype-db-seed
+#
+# Uses the GHCR mirror (maintained by .github/workflows/mirror-images.yml) to
+# avoid Docker Hub anonymous-pull rate limits that intermittently break CI.
+FROM ghcr.io/artifact-keeper/ci-mirror/alpine:3.23 AS grype-db-seed
 RUN apk add --no-cache ca-certificates
 COPY --from=grype-bin /grype /usr/local/bin/grype
 ENV GRYPE_DB_CACHE_DIR=/grype-db

@@ -22,6 +22,8 @@ jobs:
             target: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
           - image: alpine:3.19
             target: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+          - image: alpine:3.23
+            target: ghcr.io/artifact-keeper/ci-mirror/alpine:3.23
           - image: python:3.12-slim
             target: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
           - image: node:20-slim
