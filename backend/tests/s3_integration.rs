@@ -82,6 +82,49 @@ async fn test_put_and_get() {
     println!("Cleanup ok");
 }
 
+// Regression test for the large-object upload bug: `put()` of an object
+// larger than the multipart threshold must use S3 multipart, not a single
+// PUT. A single PUT is one HTTP request bounded by the client request
+// timeout, so large/slow uploads failed with STORAGE_ERROR. Multipart
+// uploads produce an ETag of the form "<md5>-<partcount>"; a single PUT
+// produces a plain 32-hex MD5 with no dash. Pre-fix this assertion fails
+// (plain ETag); post-fix it passes (dashed multipart ETag).
+#[tokio::test]
+#[ignore]
+async fn test_large_put_uses_multipart() {
+    if skip_unless_configured().is_none() {
+        println!("Skipping: S3 not configured");
+        return;
+    }
+    let prefix = test_prefix();
+    let backend = make_backend(&prefix, false).await;
+
+    let key = "test-large-multipart.bin";
+    let size = 20 * 1024 * 1024; // 20 MiB, above the 16 MiB multipart threshold
+    let content = Bytes::from(vec![0u8; size]);
+
+    backend
+        .put(key, content.clone())
+        .await
+        .expect("large put failed");
+
+    let etag = backend
+        .head_etag(key)
+        .await
+        .expect("head_etag failed")
+        .expect("etag present");
+    assert!(
+        etag.contains('-'),
+        "expected multipart ETag (<md5>-<parts>) for a >16 MiB object, got {etag}"
+    );
+
+    let got = backend.get(key).await.expect("get failed");
+    assert_eq!(got.len(), size, "round-trip size mismatch");
+
+    backend.delete(key).await.expect("delete failed");
+    println!("large multipart put ok: {key} etag={etag}");
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_exists_and_not_exists() {

@@ -20,6 +20,12 @@
 //! For HTTP connection pool tuning:
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
 //! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
+//! - S3_REQUEST_TIMEOUT_SECS: Per-request timeout in seconds. 0 (default)
+//!   keeps object_store's built-in timeout (~30s). Raise it for slow on-prem
+//!   S3 backends where a large single request legitimately takes longer.
+//!
+//! Large objects (> 16 MiB) are uploaded via S3 multipart automatically, so a
+//! single slow PUT can no longer exceed the client request timeout.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -424,6 +430,35 @@ pub struct S3Backend {
     disable_multi_delete: bool,
 }
 
+/// Objects at or below this size go through a single `put`; larger objects
+/// use multipart so each part is a small request that cannot blow past the
+/// client request timeout (the original cause of `STORAGE_ERROR` on big
+/// uploads to slow S3-compatible backends).
+const S3_MULTIPART_PUT_THRESHOLD: usize = 16 * 1024 * 1024;
+
+/// Whether a buffered `put` of `len` bytes should use multipart upload.
+fn should_multipart_put(len: usize) -> bool {
+    len > S3_MULTIPART_PUT_THRESHOLD
+}
+
+/// Upload `content` as one object via S3 multipart. Each part is a small
+/// request, so a large object can no longer exceed the per-request timeout
+/// (the original large-upload failure). Generic over the store so it is
+/// unit-testable with an in-memory backend.
+async fn multipart_put(store: &dyn ObjectStore, path: &ObjectPath, content: Bytes) -> Result<()> {
+    let upload = store
+        .put_multipart(path)
+        .await
+        .map_err(|e| AppError::Storage(format!("Failed to start multipart upload: {}", e)))?;
+    let mut write = WriteMultipart::new(upload);
+    write.put(content);
+    write
+        .finish()
+        .await
+        .map_err(|e| AppError::Storage(format!("Failed to complete multipart upload: {}", e)))?;
+    Ok(())
+}
+
 impl S3Backend {
     fn build_store(
         config: &S3Config,
@@ -433,6 +468,17 @@ impl S3Backend {
         let mut client_opts = object_store::ClientOptions::new()
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
             .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+
+        // Optional per-request timeout override. object_store's default
+        // (~30s) aborts slow large single PUTs against on-prem S3; multipart
+        // (below) fixes the common case, this is the escape hatch for the rest.
+        if let Some(secs) = std::env::var("S3_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+        {
+            client_opts = client_opts.with_timeout(Duration::from_secs(secs));
+        }
 
         if config
             .endpoint
@@ -783,6 +829,16 @@ impl super::StorageBackend for S3Backend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
+
+        // A single object_store `put` is one HTTP request bounded by the
+        // client request timeout; a slow multi-GB PUT to an on-prem S3
+        // backend exceeds it ("transport error of kind Timeout"). Large
+        // objects go through multipart so every part is a small request.
+        if should_multipart_put(content.len()) {
+            multipart_put(&self.store, &path, content).await?;
+            tracing::debug!(key = %key, "S3 multipart put object successful");
+            return Ok(());
+        }
 
         self.store.put(&path, content.into()).await.map_err(|e| {
             tracing::error!(key = %key, error = %e, "S3 put_object failed");
@@ -1166,6 +1222,70 @@ impl S3Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- multipart threshold ---
+
+    #[test]
+    fn test_should_multipart_put_threshold() {
+        assert!(!should_multipart_put(0));
+        assert!(!should_multipart_put(1024));
+        // Boundary: exactly at the threshold stays single-PUT.
+        assert!(!should_multipart_put(S3_MULTIPART_PUT_THRESHOLD));
+        // One byte over must switch to multipart (the regression).
+        assert!(should_multipart_put(S3_MULTIPART_PUT_THRESHOLD + 1));
+        assert!(should_multipart_put(2 * 1024 * 1024 * 1024));
+    }
+
+    // Exercises the multipart code path put() takes for large objects,
+    // offline via the in-memory object store (covers multipart_put under
+    // `cargo llvm-cov --lib`; the real-S3 ETag assertion lives in the
+    // s3_integration regression test).
+    #[tokio::test]
+    async fn test_multipart_put_roundtrip_in_memory() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+
+        let store = InMemory::new();
+        let path = Path::from("multipart-test-object");
+        let data = bytes::Bytes::from(vec![0xABu8; S3_MULTIPART_PUT_THRESHOLD + 4096]);
+
+        multipart_put(&store, &path, data.clone())
+            .await
+            .expect("multipart_put failed");
+
+        let got = store
+            .get(&path)
+            .await
+            .expect("get failed")
+            .bytes()
+            .await
+            .expect("bytes failed");
+        assert_eq!(got, data, "round-trip mismatch");
+    }
+
+    // Covers the S3_REQUEST_TIMEOUT_SECS -> with_timeout branch in
+    // build_store. Constructing the client is offline (no network), so this
+    // runs under `cargo test --lib`.
+    #[test]
+    fn test_s3_request_timeout_env_is_applied() {
+        let saved = std::env::var("S3_REQUEST_TIMEOUT_SECS").ok();
+        std::env::set_var("S3_REQUEST_TIMEOUT_SECS", "7");
+
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:1".to_string()),
+            None,
+        );
+        let built = S3Backend::build_store(&config, Some("ak"), Some("sk"));
+
+        match saved {
+            Some(v) => std::env::set_var("S3_REQUEST_TIMEOUT_SECS", v),
+            None => std::env::remove_var("S3_REQUEST_TIMEOUT_SECS"),
+        }
+
+        assert!(built.is_ok(), "build_store failed: {:?}", built.err());
+    }
 
     // --- free function tests: make_full_key ---
 
