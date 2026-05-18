@@ -226,8 +226,23 @@ impl ArtifactService {
             ));
         }
 
-        // Calculate checksum
+        // Calculate checksums.
+        //
+        // We persist SHA-256, SHA-1, and MD5 so that the checksum-search
+        // endpoint can locate an artifact by any of the three (registry
+        // clients lean heavily on SHA-1 and MD5 for legacy reasons: Maven
+        // central distributes .sha1 sidecar files, PyPI publishes MD5
+        // digests in package metadata, etc.). Prior to this change only
+        // SHA-256 was written, so SHA-1 / MD5 lookups always returned
+        // empty results. See fix/search-checksum-sha1-md5-case.
+        //
+        // All three are stored as lowercase hex (the `{:x}` format
+        // specifier in `calculate_*` produces lowercase) so the search
+        // handler's `to_lowercase()` normalization of the input parameter
+        // yields a direct byte-wise match against the column.
         let checksum_sha256 = Self::calculate_sha256(&data);
+        let checksum_sha1 = Self::calculate_sha1(&data);
+        let checksum_md5 = Self::calculate_md5(&data);
         let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
 
         // Build artifact info for plugin hooks (before artifact is created)
@@ -274,20 +289,29 @@ impl ArtifactService {
             self.storage.put(&storage_key, data).await?;
         }
 
-        // Create artifact record
+        // Create artifact record.
+        //
+        // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
+        // lockstep with sha256 -- otherwise an artifact whose content was
+        // replaced would still expose the *old* sha1/md5 via the
+        // checksum-search endpoint, which would point dedup-by-checksum
+        // clients at the wrong artifact.
         let artifact = sqlx::query_as!(
             Artifact,
             r#"
             INSERT INTO artifacts (
                 repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key, uploaded_by
+                checksum_sha256, checksum_sha1, checksum_md5,
+                content_type, storage_key, uploaded_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = EXCLUDED.name,
                 version = EXCLUDED.version,
                 size_bytes = EXCLUDED.size_bytes,
                 checksum_sha256 = EXCLUDED.checksum_sha256,
+                checksum_sha1 = EXCLUDED.checksum_sha1,
+                checksum_md5 = EXCLUDED.checksum_md5,
                 content_type = EXCLUDED.content_type,
                 storage_key = EXCLUDED.storage_key,
                 uploaded_by = EXCLUDED.uploaded_by,
@@ -306,6 +330,8 @@ impl ArtifactService {
             version,
             size_bytes,
             checksum_sha256,
+            checksum_sha1,
+            checksum_md5,
             content_type,
             storage_key,
             uploaded_by
