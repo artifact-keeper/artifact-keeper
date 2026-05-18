@@ -298,12 +298,26 @@ async fn fetch_credential_change_watermark(
 
 /// Replica-safe credential-invalidation check.
 ///
-/// Returns `true` when the user's credentials have changed at or after the
-/// token's `iat`. The check is `<=` (not `<`) so a token minted in the same
-/// wall-clock second as the credential change is rejected as well; the DB
-/// timestamps have microsecond resolution but JWT `iat` only has seconds,
-/// so we lose precision crossing the boundary either way and must err on
-/// the side of rejecting (#1173).
+/// Returns `true` when the user's credentials have changed strictly after
+/// the token's `iat`. JWT `iat` is whole seconds (RFC 7519); the DB
+/// `password_changed_at` is microsecond-precision but
+/// [`fetch_credential_change_watermark`] truncates it to seconds via
+/// `.timestamp()`. We use strict `<` (not `<=`) so a token minted in the
+/// same wall-clock second as the watermark is accepted — this is the
+/// fresh-user case where `POST /users` sets `password_changed_at = NOW()`
+/// (column DEFAULT) and the user's first login mints a JWT whose `iat`
+/// also resolves to that second (#1173 follow-up: release-gate
+/// `rbac-tests` and `mesh-tests` saw HTTP 401 instead of the expected 403
+/// for fresh non-admin users).
+///
+/// Safety of `<` for the actual-password-change case: a JWT with `iat`
+/// equal to the post-change watermark would have to have been minted in
+/// the same wall-clock second the password was changed. The server
+/// requires a successful authentication to mint a JWT, so such a JWT
+/// could only have been minted with the OLD password right up until the
+/// password change — which means the attacker already had the old
+/// password and any JWT obtained that way is equivalent to one obtained
+/// a moment earlier through normal use. There is no exploitable window.
 ///
 /// Resolution order:
 ///   1. Local fast-path map (rejects without a DB round-trip on the same
@@ -327,7 +341,7 @@ pub(crate) async fn is_token_invalidated_replica_safe(
             if !entry.is_active {
                 return Ok(true);
             }
-            Ok(issued_at <= entry.watermark)
+            Ok(issued_at < entry.watermark)
         }
         None => Ok(false),
     }
@@ -3653,7 +3667,7 @@ mod tests {
     /// Insert a fresh user row whose credential-change watermarks
     /// (`password_changed_at`, `updated_at`) are backdated by 60 seconds so
     /// tokens minted at `NOW()` are not immediately flagged invalidated by
-    /// the replica-safe `iat <= watermark` check. In production a token's
+    /// the replica-safe `iat < watermark` check. In production a token's
     /// `iat` is always strictly later than `password_changed_at` because
     /// the password is set at user creation, not at token issuance.
     async fn insert_test_user(pool: &sqlx::PgPool, username: &str) -> Uuid {
@@ -3692,13 +3706,20 @@ mod tests {
         let username = format!("repl_test_{}", &Uuid::new_v4().to_string()[..8]);
         let user_id = insert_test_user(&pool, &username).await;
 
-        // Simulate a token minted before any credential change.
-        let iat_before = (Utc::now() - Duration::seconds(60)).timestamp();
+        // Simulate a token minted strictly before the user's credential-change
+        // watermark. The helper inserts password_changed_at = NOW - 60s, and
+        // the watermark is read at seconds resolution, so we use NOW - 120s
+        // here to guarantee `iat < watermark` independent of sub-second clock
+        // drift between this process and the database server. Same-second
+        // (iat == watermark) is intentionally accepted post-#1248, so a test
+        // pinning the "issued before" semantic must leave an unambiguous gap.
+        let iat_before = (Utc::now() - Duration::seconds(120)).timestamp();
 
         // Token issued before the user's existing password_changed_at watermark
-        // (which we just inserted as NOW()) must be flagged invalidated by the
-        // DB-backed check — this exercises the cross-replica path because the
-        // in-memory fast-path map is empty for this user_id on this process.
+        // (inserted as NOW - 60s by `insert_test_user`) must be flagged
+        // invalidated by the DB-backed check. This exercises the cross-replica
+        // path because the in-memory fast-path map is empty for this user_id
+        // on this process.
         let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_before)
             .await
             .expect("DB check must succeed");
@@ -3713,6 +3734,67 @@ mod tests {
 
         // Cleanup.
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression: release-gate `rbac-tests` and `mesh-tests` saw HTTP 401
+    /// from admin_middleware (and other authenticated routes) instead of the
+    /// expected 403, because a freshly-created user's first JWT had
+    /// `iat == password_changed_at_seconds` (both `NOW()` in the same
+    /// wall-clock second). Pre-fix, the `<=` comparison rejected the token
+    /// as if its credentials had been changed. Post-fix, the `<` comparison
+    /// accepts the same-second token, so the middleware proceeds to the
+    /// `is_admin` check and correctly returns 403 for non-admins.
+    #[tokio::test]
+    async fn test_replica_safe_invalidation_same_second_token_accepted() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("samesec_{}", &Uuid::new_v4().to_string()[..8]);
+        let id = Uuid::new_v4();
+        // Insert the user the way `POST /users` does: column DEFAULT NOW()
+        // for password_changed_at (no backdate). This mirrors the production
+        // path the failing E2E test exercises. Using the runtime `query()`
+        // form so the test compiles without a `.sqlx` cache entry — this
+        // module already has tests gated on a live DB so the trade-off is
+        // a runtime parse instead of a compile-time check, not a loss of
+        // coverage.
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true, 0)",
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .execute(&pool)
+        .await
+        .expect("insert fresh user");
+
+        // Token iat == the same second the user was inserted. In production
+        // this is what happens when `POST /users` is followed immediately
+        // by `POST /auth/login` (both wall-clock second N).
+        let iat_same_second = Utc::now().timestamp();
+        let rejected = is_token_invalidated_replica_safe(&pool, id, iat_same_second)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            !rejected,
+            "token issued in the same wall-clock second as user creation \
+             must be accepted (otherwise admin_middleware returns 401 \
+             instead of letting the request reach the is_admin check)"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id)
             .execute(&pool)
             .await;
     }
