@@ -83,8 +83,8 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
 /// workspace deps so we use a UUID-suffixed path under /tmp; the dir
 /// is created lazily by `FilesystemStorage::put`.
 fn make_service(pool: PgPool) -> (ArtifactService, std::path::PathBuf) {
-    let storage_root = std::env::temp_dir()
-        .join(format!("ak-checksum-test-{}", Uuid::new_v4().as_simple()));
+    let storage_root =
+        std::env::temp_dir().join(format!("ak-checksum-test-{}", Uuid::new_v4().as_simple()));
     let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> =
         Arc::new(FilesystemStorage::new(storage_root.clone()));
     (ArtifactService::new(pool, storage), storage_root)
@@ -203,7 +203,8 @@ async fn test_upload_persists_sha256_sha1_and_md5() {
         ("md5", cols.checksum_md5.as_deref().unwrap()),
     ] {
         assert!(
-            val.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            val.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "{label} must be lowercase hex; got {val:?}",
         );
     }
