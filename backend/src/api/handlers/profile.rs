@@ -73,8 +73,19 @@ async fn create_access_token(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateAccessTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
-    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let scopes = payload.scopes.unwrap_or_else(|| vec!["read".to_string()]);
+
+    // Refuse admin-class scopes from non-admin callers. Without this
+    // check, any logged-in user can mint a token with `*` or `admin`
+    // and bypass every scope-only authorization gate via
+    // `scopes_grant_access` (which short-circuits on those two values).
+    // Other admin-only scopes (`delete:artifacts`, `delete:repositories`,
+    // `write:users`) cover destructive/admin-class operations — see
+    // `token_service::ADMIN_ONLY_SCOPES`.
+    crate::services::token_service::enforce_admin_only_scopes(&scopes, auth.is_admin)
+        .map_err(crate::error::AppError::Authorization)?;
+
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
         .generate_api_token(auth.user_id, &payload.name, scopes, payload.expires_in_days)
         .await?;

@@ -748,6 +748,15 @@ pub async fn create_api_token(
         ));
     }
 
+    // Refuse admin-class scopes from non-admin callers. See
+    // `token_service::ADMIN_ONLY_SCOPES` for the policy rationale —
+    // mirrors the same enforcement on the sibling endpoint
+    // `POST /api/v1/profile/access-tokens` so a non-admin can't reach
+    // either route to mint a token with `*`/`admin`/`delete:*`/
+    // `write:users`.
+    crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
+        .map_err(AppError::Authorization)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
@@ -1965,5 +1974,252 @@ mod tests {
         // Response should contain exactly the message field
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("message"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admin-only token-scope enforcement tests
+//
+// Live demonstration: against an in-cluster deployment of AK 1.1.9, a
+// non-admin user successfully minted tokens with scopes `["admin"]`,
+// `["*"]`, `["delete:artifacts"]`, `["delete:repositories"]`, AND even
+// a nonsense `["totally-bogus"]` — every call returned 200. The `*` and
+// `admin` scopes are particularly dangerous because they short-circuit
+// `scopes_grant_access` to `true` for any required scope, so a non-admin
+// holding such a token bypasses every scope-only authorization gate in
+// the server.
+//
+// Tests below pin the policy implemented in this PR.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admin_scope_policy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    fn build_users_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        // Mount the users router with a bare `Extension<AuthExtension>`
+        // layer (the production middleware chain produces this shape;
+        // `tdh::router_with_auth` wraps it in `Option`, which doesn't
+        // match the bare extractor on these handlers). Mirrors the
+        // `upload_router_with_auth` test helper pattern.
+        router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    /// Compact fixture: pool + state + non-admin user_id + username. Skips
+    /// cleanly without `DATABASE_URL` via `tdh::try_pool`.
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Each ADMIN_ONLY_SCOPES entry submitted alone by a non-admin must
+    /// be refused at the handler. Iterates so a future addition (or
+    /// removal) to the policy list is automatically covered.
+    #[tokio::test]
+    async fn non_admin_cannot_mint_admin_only_scopes_on_users_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username); // is_admin: false
+
+        for admin_scope in crate::services::token_service::ADMIN_ONLY_SCOPES {
+            let app = build_users_app(state.clone(), auth.clone());
+            let body = json!({
+                "name": format!("probe-{}", admin_scope),
+                "scopes": [admin_scope],
+                "expires_in_days": 30_i64,
+            })
+            .to_string();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{}/tokens", user_id))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body_bytes) = tdh::send(app, req).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin minting token with admin-class scope {:?} MUST 403; got {} body: {}",
+                admin_scope,
+                status,
+                String::from_utf8_lossy(&body_bytes),
+            );
+        }
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Non-admin minting a token with a routine, non-admin scope list
+    /// MUST still succeed — the policy is targeted, not a blanket lock.
+    #[tokio::test]
+    async fn non_admin_can_still_mint_safe_scopes_on_users_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_users_app(state, auth);
+
+        let body = json!({
+            "name": "safe-scope-token",
+            "scopes": ["read:artifacts", "write:artifacts", "read:repositories"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin with safe scopes MUST succeed; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// A non-admin must not smuggle an admin-only scope past the check
+    /// by burying it inside a list of otherwise-safe scopes.
+    #[tokio::test]
+    async fn non_admin_cannot_smuggle_admin_scope_in_a_mixed_list() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_users_app(state, auth);
+
+        let body = json!({
+            "name": "smuggle-attempt",
+            "scopes": ["read:artifacts", "write:artifacts", "admin"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin smuggling 'admin' in a safe-looking scope list MUST 403"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Admin callers retain the ability to grant the entire policy
+    /// surface. We assert against an admin-flagged AuthExtension so the
+    /// policy doesn't accidentally lock everyone out — including the
+    /// people who legitimately need to provision admin-class tokens
+    /// (e.g. for CI service accounts).
+    #[tokio::test]
+    async fn admin_can_mint_admin_only_scopes_on_users_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_admin = true;
+        let app = build_users_app(state, auth);
+
+        let body = json!({
+            "name": "admin-token",
+            "scopes": ["admin"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin minting an admin-scoped token MUST succeed; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    // ── Sibling endpoint: profile::create_access_token ──────────────────
+    //
+    // The same policy must apply to `POST /api/v1/profile/access-tokens`,
+    // otherwise the user just routes around the users.rs gate. One test
+    // proves the wiring is in place there too; the unit-level policy
+    // coverage in `token_service::tests::enforce_admin_only_scopes*` is
+    // independent of which handler invokes the helper.
+
+    fn build_profile_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        crate::api::handlers::profile::router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_mint_admin_scope_on_profile_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_profile_app(state, auth);
+
+        let body = json!({
+            "name": "profile-smuggle",
+            "scopes": ["*"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/access-tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin minting `*` token on /profile/access-tokens MUST 403 (sibling enforcement to users.rs)"
+        );
+
+        cleanup(&pool, user_id).await;
     }
 }
