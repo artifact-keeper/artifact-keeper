@@ -322,25 +322,50 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User management routes require admin privileges. Password-mutating
-        // routes ride a stricter per-user rate-limit bucket (#1026) on top
-        // of admin auth; the bcrypt-verify in `change_password` is a
-        // CPU-DoS vector and a victim-JWT bearer would otherwise burn
-        // ~`api/min` password guesses through this endpoint.
+        // User-management routes are split by authorization model — see #1257.
+        //
+        // * `admin_router`        : admin-only (list/create/update/delete/role mgmt).
+        //                           Wrapped in `admin_middleware`; handlers also
+        //                           hold an `if !auth.is_admin` guard as
+        //                           defense in depth.
+        // * `self_or_admin_router`: routes whose handlers enforce
+        //                           `if auth.user_id != id && !auth.is_admin`
+        //                           (own user record + own API tokens).
+        //                           Wrapped in `auth_middleware`; mounting
+        //                           these under `admin_middleware` (as the
+        //                           pre-split single router did) made the
+        //                           handler-level self check dead code and
+        //                           403'd every non-admin self-action.
+        // * `password_router`     : password-mutating routes on the stricter
+        //                           per-user rate-limit bucket (#1026).
+        //                           `change_password` is self-or-admin;
+        //                           `reset_password` and
+        //                           `force_password_change` are admin-only.
+        //                           Outer layer is `auth_middleware`; the
+        //                           admin-only handlers gate themselves
+        //                           internally so they remain admin-only.
         .nest(
             "/users",
-            handlers::users::router()
-                .merge(
-                    handlers::users::password_router().layer(middleware::from_fn_with_state(
-                        password_change_rate_limit_state,
-                        rate_limit_middleware,
-                    )),
-                )
-                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+            handlers::users::admin_router()
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     admin_middleware,
-                )),
+                ))
+                .merge(handlers::users::self_or_admin_router().layer(
+                    middleware::from_fn_with_state(auth_service.clone(), auth_middleware),
+                ))
+                .merge(
+                    handlers::users::password_router()
+                        .layer(middleware::from_fn_with_state(
+                            password_change_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn_with_state(
+                            auth_service.clone(),
+                            auth_middleware,
+                        )),
+                )
+                .layer(DefaultBodyLimit::max(1024 * 1024)), // 1 MB
         )
         // Profile routes (authenticated user context) with auth middleware
         .nest(
