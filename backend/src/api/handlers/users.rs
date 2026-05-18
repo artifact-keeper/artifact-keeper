@@ -2365,23 +2365,26 @@ mod router_split_tests {
     /// the bcrypt token-hash step — the token *value* is never read here,
     /// only its `id` — and use a placeholder for `token_hash` to avoid the
     /// CPU-bound bcrypt step on every test run.
+    ///
+    /// Uses the runtime `sqlx::query` (not the `query!` macro) so this
+    /// helper doesn't need a `.sqlx/` offline cache entry of its own;
+    /// CI builds with `SQLX_OFFLINE=true` and we don't want to add a
+    /// cached query for a test-only INSERT shape.
     async fn seed_api_token(pool: &sqlx::PgPool, user_id: Uuid, prefix: &str) -> Uuid {
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes, expires_at)
-            VALUES ($1, $2, $3, $4, $5, NULL)
-            RETURNING id
-            "#,
-            user_id,
-            format!("seed-{}", prefix),
-            "placeholder-hash-not-validated-by-revoke-path",
-            prefix,
-            &Vec::<String>::new(),
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL) \
+             RETURNING id",
         )
+        .bind(user_id)
+        .bind(format!("seed-{}", prefix))
+        .bind("placeholder-hash-not-validated-by-revoke-path")
+        .bind(prefix)
+        .bind(Vec::<String>::new())
         .fetch_one(pool)
         .await
         .expect("seed api_token row");
-        row.id
+        row.0
     }
 
     // ── self_or_admin_router: token list / revoke coverage ────────────
