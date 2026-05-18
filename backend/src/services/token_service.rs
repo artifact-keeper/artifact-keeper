@@ -115,6 +115,60 @@ pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(),
     Ok(())
 }
 
+/// Scopes that grant elevated, admin-class capabilities and may not be
+/// embedded in a token issued by a non-admin caller. The restriction is
+/// purely on token issuance — a non-admin can still hold such a token if
+/// an admin minted it for them.
+///
+/// Includes:
+///   * `admin`, `*` — short-circuit any scope check via
+///     [`scopes_grant_access`]. A non-admin minting one of these would
+///     have a token that satisfies every scope-only authorization gate
+///     (anywhere the request is API-token-authenticated and the
+///     authorization decision rests solely on the token's scope set).
+///   * `delete:artifacts`, `delete:repositories` — destructive
+///     scope-gated operations.
+///   * `write:users` — user-management write capability.
+///
+/// `write:artifacts` and `write:repositories` are deliberately NOT on
+/// this list: artifact publishing is a routine non-admin action and
+/// repository creation is sometimes delegated to non-admin users via
+/// permission grants. If your deployment wants to lock those down,
+/// add them in a follow-up alongside a configurable policy knob.
+pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
+    "admin",
+    "*",
+    "delete:artifacts",
+    "delete:repositories",
+    "write:users",
+];
+
+/// Enforce that a non-admin caller may not grant any admin-class scope
+/// from [`ADMIN_ONLY_SCOPES`] to a token.
+///
+/// Returns `Ok(())` when the caller is admin, or when none of the
+/// requested scopes are admin-class. Otherwise returns `Err` naming the
+/// first admin-class scope encountered so the caller can produce an
+/// actionable error message.
+pub(crate) fn enforce_admin_only_scopes(
+    scopes: &[String],
+    caller_is_admin: bool,
+) -> std::result::Result<(), String> {
+    if caller_is_admin {
+        return Ok(());
+    }
+    for scope in scopes {
+        if ADMIN_ONLY_SCOPES.contains(&scope.as_str()) {
+            return Err(format!(
+                "Scope '{}' is admin-only and cannot be granted by a non-admin caller. \
+                 Admin-only scopes: {:?}",
+                scope, ADMIN_ONLY_SCOPES,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Determine if a token is expired given an optional expiration timestamp.
 pub(crate) fn is_token_expired(expires_at: Option<DateTime<Utc>>) -> bool {
     expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
@@ -679,6 +733,88 @@ mod tests {
     fn test_validate_scopes_partial_match_fails() {
         let scopes = vec!["read:artifact".to_string()]; // missing 's'
         assert!(validate_scopes_pure(&scopes).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_admin_only_scopes (privilege-escalation gate on token issuance)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_enforce_admin_only_scopes_admin_caller_always_allowed() {
+        // An admin may grant any scope. Sanity-check across the full
+        // ADMIN_ONLY_SCOPES list plus an arbitrary non-listed scope.
+        for s in ADMIN_ONLY_SCOPES {
+            let scopes = vec![(*s).to_string()];
+            assert!(
+                enforce_admin_only_scopes(&scopes, true).is_ok(),
+                "admin must be allowed to grant {}",
+                s
+            );
+        }
+        let mixed = vec!["read:artifacts".to_string(), "admin".to_string()];
+        assert!(enforce_admin_only_scopes(&mixed, true).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_blocked_on_each_admin_scope() {
+        // Each ADMIN_ONLY_SCOPES entry, taken alone, must be refused.
+        // Asserting each in turn pins the policy so a future change that
+        // accidentally drops one (e.g. removes `delete:repositories`)
+        // forces an explicit decision via this test.
+        for s in ADMIN_ONLY_SCOPES {
+            let scopes = vec![(*s).to_string()];
+            let res = enforce_admin_only_scopes(&scopes, false);
+            assert!(res.is_err(), "non-admin granting {} must be refused", s);
+            assert!(
+                res.as_ref().unwrap_err().contains(s),
+                "error must name the offending scope ({})",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_with_safe_scopes_allowed() {
+        // Routine non-admin scopes pass.
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+            "read:repositories".to_string(),
+            "write:repositories".to_string(),
+            "read:users".to_string(),
+        ];
+        assert!(enforce_admin_only_scopes(&scopes, false).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_with_admin_scope_mixed_in_blocked() {
+        // A single admin-only entry anywhere in the list MUST trip the
+        // refusal; a non-admin can't smuggle `admin` past us by burying
+        // it among safe scopes.
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+            "admin".to_string(), // ← the smuggled one
+        ];
+        let res = enforce_admin_only_scopes(&scopes, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("admin"));
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_empty_scopes_allowed() {
+        let scopes: Vec<String> = vec![];
+        assert!(enforce_admin_only_scopes(&scopes, false).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_wildcard_blocked_for_non_admin() {
+        // `*` short-circuits `scopes_grant_access` to true on every
+        // required-scope check, so it MUST be admin-only.
+        let scopes = vec!["*".to_string()];
+        let res = enforce_admin_only_scopes(&scopes, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains('*'));
     }
 
     // -----------------------------------------------------------------------
