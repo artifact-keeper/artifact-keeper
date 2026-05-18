@@ -322,18 +322,28 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User management routes require admin privileges. Password-mutating
-        // routes ride a stricter per-user rate-limit bucket (#1026) on top
-        // of auth; the bcrypt-verify in `change_password` is a CPU-DoS vector
-        // and a victim-JWT bearer would otherwise burn ~`api/min` password
-        // guesses through this endpoint.
+        // User-management routes are split across two `/users` nests by
+        // authorization model. The combined story spans #1250 (self-service
+        // password change must reach a non-admin's own user-id) and #1257
+        // (the same split is needed for the token CRUD + GET /:id paths,
+        // which the admin_middleware was 403'ing for non-admin self-action).
         //
-        // Self-service `POST /:id/password` is split out of the admin nest so
-        // a non-admin can change their OWN password (release-gate
-        // `tests/auth/test-jwt-after-password-change.sh` regression: "password
-        // change returned 403"). The handler itself enforces self-vs-admin
-        // authorization, so widening the middleware here does not let a
-        // non-admin alter someone else's password.
+        //   * auth_middleware nest (first nest below):
+        //     - `self_password_router`   : POST /:id/password
+        //                                  (rate-limited, #1026)
+        //     - `self_or_admin_router`   : GET /:id, GET/POST /:id/tokens,
+        //                                  DELETE /:id/tokens/:token_id
+        //     Each handler enforces `auth.user_id != id && !auth.is_admin`
+        //     (or `change_password`'s ownership check), so widening the
+        //     middleware here does NOT let one non-admin act on another.
+        //     Defense-in-depth `if !auth.is_admin` guards are present on
+        //     the admin handlers in the second nest below.
+        //
+        //   * admin_middleware nest (second nest):
+        //     - `router`                 : list / create / update / delete /
+        //                                  role-management
+        //     - `admin_password_router`  : reset / force-change
+        //                                  (rate-limited, #1026)
         .nest(
             "/users",
             handlers::users::self_password_router()
@@ -341,6 +351,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     password_change_rate_limit_state.clone(),
                     rate_limit_middleware,
                 ))
+                .merge(handlers::users::self_or_admin_router())
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
