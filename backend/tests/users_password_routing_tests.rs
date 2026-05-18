@@ -26,14 +26,14 @@
 //! password-mutation rate limit (#1026) to main reintroduced the bug.
 //!
 //! Fix: split the combined `password_router` into
-//! [`self_password_router`] (just `/:id/password`, mounted under
-//! `auth_middleware`) and [`admin_password_router`] (`/:id/password/reset`
-//! + `/:id/force-password-change`, kept under `admin_middleware`). The
-//! `change_password` handler retains its ownership check
-//! (`auth.user_id == id` OR `auth.is_admin`) and the required-current-
-//! password verification, so the split does NOT widen who can mutate
-//! someone else's password — only who can reach the handler for their
-//! own user ID.
+//! [`self_password_router`] — just `/:id/password`, mounted under
+//! `auth_middleware` — and [`admin_password_router`] (carrying
+//! `/:id/password/reset` and `/:id/force-password-change`, kept under
+//! `admin_middleware`). The `change_password` handler retains its
+//! ownership check (`auth.user_id == id` OR `auth.is_admin`) and the
+//! required-current-password verification, so the split does NOT
+//! widen who can mutate someone else's password — only who can reach
+//! the handler for their own user ID.
 //!
 //! End-to-end coverage (OLD-JWT rejection after a successful self-service
 //! password change) lives in `tests/auth/test-jwt-after-password-change.sh`,
