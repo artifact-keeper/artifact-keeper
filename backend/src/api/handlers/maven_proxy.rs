@@ -15,11 +15,11 @@
 //!   those secondary files. Enforces three gates internally so the
 //!   fallback can't bypass quarantine / soft-delete policy.
 //!
-//! As other formats hit the same primary+companion shape (Debian
-//! `.deb` + `.changes` + `.dsc`, RPM `.rpm` + `.src.rpm`, NuGet `.nupkg`
-//! + `.snupkg`, Helm `.tgz` + `.tgz.prov`), they should follow this same
-//! `handlers/<format>_proxy.rs` pattern rather than piling format-specific
-//! logic into `proxy_helpers.rs`.
+//! As other formats hit the same primary+companion shape — Debian
+//! (`.deb`, `.changes`, `.dsc`), RPM (`.rpm`, `.src.rpm`), NuGet
+//! (`.nupkg`, `.snupkg`), Helm (`.tgz`, `.tgz.prov`) — they should
+//! follow this same `handlers/<format>_proxy.rs` pattern rather than
+//! piling format-specific logic into `proxy_helpers.rs`.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -40,9 +40,9 @@ use crate::storage::StorageLocation;
 /// **deliberately excluded** from this list. Primary files always have
 /// their own row in `artifacts` (and therefore go through the
 /// SQL-backed `proxy_helpers::local_fetch_by_path`); allowing the
-/// storage fallback to serve a primary would silently bypass quarantine
-/// + soft-delete gating on the primary's own row. The allowlist scopes
-/// the fallback to its documented purpose.
+/// storage fallback to serve a primary would silently bypass the
+/// quarantine and soft-delete gating on the primary's own row. The
+/// allowlist scopes the fallback to its documented purpose.
 const MAVEN_SECONDARY_FILE_EXTENSIONS: &[&str] = &[
     ".pom",
     ".module",
