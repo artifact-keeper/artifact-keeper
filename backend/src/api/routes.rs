@@ -324,17 +324,39 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // User management routes require admin privileges. Password-mutating
         // routes ride a stricter per-user rate-limit bucket (#1026) on top
-        // of admin auth; the bcrypt-verify in `change_password` is a
-        // CPU-DoS vector and a victim-JWT bearer would otherwise burn
-        // ~`api/min` password guesses through this endpoint.
+        // of auth; the bcrypt-verify in `change_password` is a CPU-DoS vector
+        // and a victim-JWT bearer would otherwise burn ~`api/min` password
+        // guesses through this endpoint.
+        //
+        // Self-service `POST /:id/password` is split out of the admin nest so
+        // a non-admin can change their OWN password (release-gate
+        // `tests/auth/test-jwt-after-password-change.sh` regression: "password
+        // change returned 403"). The handler itself enforces self-vs-admin
+        // authorization, so widening the middleware here does not let a
+        // non-admin alter someone else's password.
+        .nest(
+            "/users",
+            handlers::users::self_password_router()
+                .layer(middleware::from_fn_with_state(
+                    password_change_rate_limit_state.clone(),
+                    rate_limit_middleware,
+                ))
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+        )
         .nest(
             "/users",
             handlers::users::router()
                 .merge(
-                    handlers::users::password_router().layer(middleware::from_fn_with_state(
-                        password_change_rate_limit_state,
-                        rate_limit_middleware,
-                    )),
+                    handlers::users::admin_password_router().layer(
+                        middleware::from_fn_with_state(
+                            password_change_rate_limit_state,
+                            rate_limit_middleware,
+                        ),
+                    ),
                 )
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(

@@ -21,12 +21,15 @@ use crate::services::auth_service::{
 use crate::services::password_policy::PasswordPolicyConfig;
 use std::sync::atomic::Ordering;
 
-/// Create user routes that should ride the standard API rate-limit bucket.
+/// Admin-only user-management routes.
 ///
-/// Password-mutating routes are intentionally excluded; mount them via
-/// [`password_router`] with the tighter `rate_limit_password_change_*` bucket
-/// (#1026). The handler itself enforces the self-vs-admin authorization
-/// check, so this split is purely about rate limiting, not access control.
+/// Password-mutating routes are intentionally excluded; they live in
+/// [`self_password_router`] (which mounts behind `auth_middleware` so a
+/// non-admin can change their OWN password) and [`admin_password_router`]
+/// (which keeps `admin_middleware` for reset / force-change). The
+/// `change_password` handler still enforces the self-vs-admin ownership
+/// check internally, so the split is safe: the only effect is that a
+/// non-admin can reach the handler for their own user ID.
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
@@ -37,15 +40,41 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
 }
 
-/// Password-mutating user routes, separated out so callers can attach a
-/// stricter rate limit (#1026). `POST /:id/password` verifies the current
-/// password via bcrypt, so an attacker holding a victim's JWT can otherwise
-/// grind ~`rate_limit_api_per_window` guesses per window through this
-/// endpoint - far weaker than `/auth/login`'s `auth_rate_limit_state` bucket.
-/// Default: 5 attempts per 15 minutes per user.
-pub fn password_router() -> Router<SharedState> {
+/// Self-service password change.
+///
+/// `POST /:id/password` is the route a non-admin uses to rotate their own
+/// password (used by the forced-must-change-password flow on first login,
+/// and by `tests/auth/test-jwt-after-password-change.sh`). The handler
+/// enforces the self-vs-admin ownership check (`auth.user_id == id` OR
+/// `auth.is_admin`) and requires the current password, so mounting this
+/// router under `auth_middleware` instead of `admin_middleware` does not
+/// let one user mutate another's credentials.
+///
+/// The route is split out of [`admin_password_router`] for routing-layer
+/// reasons (release-gate `tests/auth/test-jwt-after-password-change.sh`
+/// regression "password change returned 403"): on `main`, the entire
+/// password-changing surface had been merged into [`router`] and gated by
+/// `admin_middleware`, so a non-admin's request never reached the handler.
+///
+/// The rate-limit bucket attached at the route layer remains
+/// `rate_limit_password_change_*` (#1026). `POST /:id/password` verifies
+/// the current password via bcrypt, which is a CPU-DoS vector if a
+/// victim's JWT bearer can grind through it; the stricter per-user limit
+/// (default 5 attempts / 15 min) caps that vector below the global
+/// `rate_limit_api_per_window`.
+pub fn self_password_router() -> Router<SharedState> {
+    Router::new().route("/:id/password", post(change_password))
+}
+
+/// Admin-only password administration routes (reset, force-change).
+///
+/// These remain behind `admin_middleware` because they let an
+/// administrator mutate someone else's credentials without proving
+/// knowledge of the current password. The route-layer rate-limit bucket
+/// (`rate_limit_password_change_*`) still applies for consistency with
+/// [`self_password_router`] and to keep the per-user attempt cap aligned.
+pub fn admin_password_router() -> Router<SharedState> {
     Router::new()
-        .route("/:id/password", post(change_password))
         .route("/:id/password/reset", post(reset_password))
         .route("/:id/force-password-change", post(force_password_change))
 }
