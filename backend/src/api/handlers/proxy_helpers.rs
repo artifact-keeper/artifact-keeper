@@ -969,7 +969,6 @@ pub async fn local_fetch_by_path(
     Ok((content, Some(artifact.content_type)))
 }
 
-
 /// Generic local artifact fetch by name and version.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_name_version(
@@ -3753,7 +3752,6 @@ mod tests {
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
-
 
     // ── virtual_member_fetch_strategy tests ────────────────────────────
     //

@@ -254,13 +254,8 @@ mod tests {
     /// Stand up a fresh local-maven repo plus an AppState rooted at the
     /// same storage dir. Matches the helper-fixture shape used elsewhere
     /// in `proxy_helpers::mod tests`.
-    async fn maven_fixture() -> Option<(
-        sqlx::PgPool,
-        crate::api::SharedState,
-        Uuid,
-        RepoInfo,
-        Uuid,
-    )> {
+    async fn maven_fixture() -> Option<(sqlx::PgPool, crate::api::SharedState, Uuid, RepoInfo, Uuid)>
+    {
         let pool = db_helpers::try_pool().await?;
         let (user_id, _username) = db_helpers::create_user(&pool).await;
         let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
@@ -379,7 +374,12 @@ mod tests {
                 maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
                     .await
                     .unwrap_or_else(|_| panic!("must serve secondary extension {}", suffix));
-            assert_eq!(&content[..], &payload[..], "round-trip mismatch for {}", suffix);
+            assert_eq!(
+                &content[..],
+                &payload[..],
+                "round-trip mismatch for {}",
+                suffix
+            );
         }
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -405,10 +405,9 @@ mod tests {
             )
             .await
             .expect("put");
-            let err =
-                maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
-                    .await
-                    .expect_err(&format!("primary {} must be refused", primary_ext));
+            let err = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
+                .await
+                .expect_err(&format!("primary {} must be refused", primary_ext));
             assert_eq!(err.status(), StatusCode::NOT_FOUND);
         }
 
