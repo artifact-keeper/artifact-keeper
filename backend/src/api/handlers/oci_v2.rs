@@ -857,6 +857,28 @@ async fn try_upstream_fetch(
     state: &SharedState,
     path_suffix: &str,
 ) -> Option<(Bytes, Option<String>)> {
+    try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
+}
+
+/// Variant of [`try_upstream_fetch`] that forwards the client's `Accept`
+/// header to the upstream registry.
+///
+/// Required for manifest GET/HEAD: OCI registries drive content negotiation
+/// off the `Accept` header on the same `manifests/<reference>` URL, so a
+/// proxy that strips the header forces the upstream into its default
+/// representation. For multi-arch images on Docker Hub that picks the OCI
+/// image index, but other registries (Harbor, GHCR with older configs,
+/// JFrog) respond with 404 when the requested media type is missing from
+/// `Accept`. Forwarding the original header preserves the end-to-end
+/// content-negotiation chain and prevents those spurious 404s (#586 cont.).
+///
+/// Blob fetches pass `None` and exercise the unchanged code path.
+async fn try_upstream_fetch_with_accept(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    path_suffix: &str,
+    accept: Option<&str>,
+) -> Option<(Bytes, Option<String>)> {
     if repo.repo_type != RepositoryType::Remote {
         return None;
     }
@@ -864,9 +886,31 @@ async fn try_upstream_fetch(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
-    proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-        .await
-        .ok()
+    proxy_helpers::proxy_fetch_with_accept(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        accept,
+    )
+    .await
+    .ok()
+}
+
+/// Extract a sanitised `Accept` header value suitable for forwarding to an
+/// upstream OCI registry.
+///
+/// Returns `None` when the request did not carry an `Accept`, when the
+/// header value is empty, or when it failed UTF-8 validation. Callers
+/// should fall through to the no-accept-header path so the upstream
+/// applies its default representation rather than refusing the request.
+fn forwarded_accept_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Build an OCI registry response from proxied upstream content.
@@ -1832,9 +1876,17 @@ async fn handle_head_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
+    // For remote repos, try fetching manifest from upstream. Forward the
+    // client's `Accept` header so the upstream registry returns the manifest
+    // representation the client can actually consume (#586 cont.).
+    let accept = forwarded_accept_header(headers);
+    if let Some((content, ct)) = try_upstream_fetch_with_accept(
+        &repo,
+        state,
+        &format!("manifests/{}", reference),
+        accept.as_deref(),
+    )
+    .await
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -1934,9 +1986,17 @@ async fn handle_get_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
+    // For remote repos, try fetching manifest from upstream. Forward the
+    // client's `Accept` header so the upstream registry returns the manifest
+    // representation the client can actually consume (#586 cont.).
+    let accept = forwarded_accept_header(headers);
+    if let Some((content, ct)) = try_upstream_fetch_with_accept(
+        &repo,
+        state,
+        &format!("manifests/{}", reference),
+        accept.as_deref(),
+    )
+    .await
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -3126,6 +3186,85 @@ mod tests {
     fn test_oci_error_internal() {
         let resp = oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "oops");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // forwarded_accept_header: client `Accept` propagation to upstream
+    //
+    // Regression coverage for the OCI manifest 404 reported in release-gate
+    // `format-tests (containers)` on test-oci-remote.sh. The proxy used to
+    // strip the client's `Accept` before issuing the upstream GET, which
+    // forced Docker Hub and similar registries to pick a default
+    // representation that does not always match what the client can parse.
+    // The helper must return:
+    //   * `None` when the header is absent (no upstream forwarding required)
+    //   * `Some(trimmed)` for a present, well-formed UTF-8 value (must round-
+    //     trip the comma-separated media type list the OCI client sends)
+    //   * `None` for an empty / whitespace-only value (forwarding `""`
+    //     produces a worse response than omitting the header entirely on
+    //     several registries, including JFrog and Harbor)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forwarded_accept_header_missing_returns_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(forwarded_accept_header(&headers), None);
+    }
+
+    #[test]
+    fn test_forwarded_accept_header_passthrough_oci_manifest_list() {
+        // Real `Accept` value sent by `docker pull` and reproduced verbatim
+        // in test-oci-remote.sh. Must be forwarded byte-for-byte.
+        let value = "application/vnd.docker.distribution.manifest.v2+json, \
+                     application/vnd.docker.distribution.manifest.list.v2+json, \
+                     application/vnd.oci.image.index.v1+json, \
+                     application/vnd.oci.image.manifest.v1+json";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_str(value).expect("valid header value"),
+        );
+        assert_eq!(forwarded_accept_header(&headers), Some(value.to_string()));
+    }
+
+    #[test]
+    fn test_forwarded_accept_header_trims_surrounding_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("   application/vnd.oci.image.manifest.v1+json   "),
+        );
+        assert_eq!(
+            forwarded_accept_header(&headers),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_forwarded_accept_header_empty_value_returns_none() {
+        // An empty Accept is worse than no Accept at all on some registries
+        // (JFrog returns 406 instead of falling back to the default
+        // representation). Treat empty / whitespace-only as absent so we
+        // exercise the same "no forwarding" code path.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("   "),
+        );
+        assert_eq!(forwarded_accept_header(&headers), None);
+    }
+
+    #[test]
+    fn test_forwarded_accept_header_non_utf8_returns_none() {
+        // HeaderMap stores raw bytes; opaque non-UTF-8 must not crash and
+        // must not be forwarded as garbage. The handler falls through to
+        // the no-accept-header path which matches the legacy behaviour.
+        let mut headers = HeaderMap::new();
+        let bytes: &[u8] = &[0xff, 0xfe, 0xfd];
+        if let Ok(val) = HeaderValue::from_bytes(bytes) {
+            headers.insert(axum::http::header::ACCEPT, val);
+            assert_eq!(forwarded_accept_header(&headers), None);
+        }
     }
 
     // -----------------------------------------------------------------------

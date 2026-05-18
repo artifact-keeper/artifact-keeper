@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -515,6 +515,32 @@ impl ProxyService {
         self.fetch_artifact_with_cache_path(repo, path, path).await
     }
 
+    /// Variant of [`Self::fetch_artifact`] that forwards a client-supplied
+    /// `Accept` header to the upstream request.
+    ///
+    /// OCI Distribution registries (notably Docker Hub) drive manifest format
+    /// negotiation off the client `Accept` header: the same `manifests/<ref>`
+    /// URL can resolve to a v2 image manifest, a Docker manifest list, an OCI
+    /// image index, or an OCI image manifest depending on what the caller
+    /// advertises. Stripping the header at the proxy boundary lets the
+    /// upstream pick whatever shape it prefers, which on some registries
+    /// surfaces as 404 / 406 when the stored object only carries a content
+    /// type the caller didn't ask for. Forwarding the original header
+    /// preserves the content-negotiation chain end to end.
+    ///
+    /// Blob fetches do NOT need this (blobs are content-addressable opaque
+    /// bytes), but routing them through this path with `accept = None` is
+    /// a no-op so the buffered fast path stays a single function.
+    pub async fn fetch_artifact_with_accept(
+        &self,
+        repo: &Repository,
+        path: &str,
+        accept: Option<&str>,
+    ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept(repo, path, path, accept)
+            .await
+    }
+
     /// Check whether an artifact is already present in the proxy cache
     /// under the given `path` (without contacting upstream).
     ///
@@ -651,6 +677,21 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
     ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept(repo, fetch_path, cache_path, None)
+            .await
+    }
+
+    /// Inner variant of [`Self::fetch_artifact_with_cache_path`] that also
+    /// forwards an optional `Accept` header to the upstream request. Used by
+    /// callers that need OCI content negotiation (manifest GETs). Pass
+    /// `None` to preserve the buffered-fetch behaviour exactly.
+    async fn fetch_artifact_with_cache_path_and_accept(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        accept: Option<&str>,
+    ) -> Result<(Bytes, Option<String>)> {
         if repo.repo_type != RepositoryType::Remote {
             return Err(AppError::Validation(
                 "Proxy operations only supported for remote repositories".to_string(),
@@ -674,7 +715,9 @@ impl ProxyService {
 
         // Fetch from upstream using the real fetch_path
         let full_url = Self::build_upstream_url(upstream_url, fetch_path);
-        let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
+        let upstream_result = self
+            .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
+            .await;
 
         match upstream_result {
             Ok(resp) => {
@@ -1233,7 +1276,31 @@ impl ProxyService {
     /// cached in memory with their advertised TTL so subsequent requests to
     /// the same registry/scope don't repeat the exchange.
     async fn fetch_from_upstream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamResponse> {
-        tracing::info!("Fetching artifact from upstream: {}", url);
+        self.fetch_from_upstream_with_accept(url, repo_id, None)
+            .await
+    }
+
+    /// Variant of [`Self::fetch_from_upstream`] that adds an `Accept` header
+    /// to both the initial request and the post-token-exchange retry.
+    ///
+    /// OCI manifest fetches need this so the upstream registry returns the
+    /// content type the caller actually understands. Without an `Accept`
+    /// header Docker Hub picks a default representation (typically the
+    /// OCI image index for multi-arch images) but other registries respond
+    /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
+    /// Mirroring the client's `Accept` upstream removes that source of
+    /// silent content-type mismatches and the spurious 404s they trigger.
+    async fn fetch_from_upstream_with_accept(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<UpstreamResponse> {
+        tracing::info!(
+            "Fetching artifact from upstream: {} (accept={:?})",
+            url,
+            accept
+        );
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
@@ -1241,6 +1308,9 @@ impl ProxyService {
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        if let Some(accept_value) = accept {
+            request = request.header(ACCEPT, accept_value);
         }
 
         let response = request
@@ -1279,7 +1349,10 @@ impl ProxyService {
                     // Basic credentials were already forwarded to the token
                     // endpoint in obtain_bearer_token(); adding them here
                     // would produce two Authorization headers.
-                    let retry_request = self.http_client.get(url).bearer_auth(&token);
+                    let mut retry_request = self.http_client.get(url).bearer_auth(&token);
+                    if let Some(accept_value) = accept {
+                        retry_request = retry_request.header(ACCEPT, accept_value);
+                    }
 
                     let retry_response = retry_request.send().await.map_err(|e| {
                         AppError::Storage(format!(
@@ -4787,5 +4860,159 @@ SHA256:
         }
         let total: usize = pieces.iter().map(|p| p.len()).sum();
         assert_eq!(total, big.len(), "client must receive every byte");
+    }
+
+    // -----------------------------------------------------------------------
+    // Accept-header forwarding (OCI manifest content negotiation).
+    //
+    // Regression coverage for the manifest-pull 404 reported on
+    // tests/formats/test-oci-remote.sh. fetch_artifact stripped the client's
+    // `Accept` before the upstream GET, which on Docker-Hub-like registries
+    // forced the default representation and on JFrog / Harbor surfaced as
+    // 404 / 406 outright. fetch_artifact_with_accept must propagate it.
+    //
+    // Both tests below need a live `DATABASE_URL` because
+    // `ProxyService::fetch_from_upstream_with_accept` calls
+    // `load_upstream_auth` before issuing the HTTP request. They no-op on
+    // CI runners that don't expose the test DB, mirroring the rest of the
+    // proxy-service suite.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_artifact_with_accept_forwards_header_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let manifest_body =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+        let accept_value = "application/vnd.oci.image.manifest.v1+json, \
+                            application/vnd.docker.distribution.manifest.v2+json";
+
+        // The matcher only fires when the request carries the exact Accept
+        // header. If proxy_service strips/drops it the mock returns 404 via
+        // the wiremock default and the assertion below catches the regression.
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/manifests/3.20"))
+            .and(header("accept", accept_value))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(manifest_body.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("accept-fwd-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "test-accept-fwd".to_string(),
+            name: "test-accept-fwd".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = proxy
+            .fetch_artifact_with_accept(
+                &repo,
+                "v2/library/alpine/manifests/3.20",
+                Some(accept_value),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (body, ct) = result.expect(
+            "fetch_artifact_with_accept must succeed when the upstream mock \
+             only responds 200 to the requested Accept header; a failure here \
+             means the proxy stripped or rewrote the header",
+        );
+        assert_eq!(&body[..], manifest_body.as_ref());
+        assert_eq!(
+            ct.as_deref(),
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_artifact_with_accept_none_matches_legacy_behaviour() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        // No Accept matcher — covers the blob/index fetch path that does NOT
+        // need content negotiation. Behaviour must be identical to the
+        // pre-#1219 fetch_artifact call.
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/blobs/sha256:abcd1234"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"blob-bytes".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("accept-none-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "test-accept-none".to_string(),
+            name: "test-accept-none".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = proxy
+            .fetch_artifact_with_accept(&repo, "v2/library/alpine/blobs/sha256:abcd1234", None)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (body, _) = result.expect("blob fetch with accept=None must succeed");
+        assert_eq!(&body[..], b"blob-bytes");
     }
 }
