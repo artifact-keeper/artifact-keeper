@@ -81,6 +81,28 @@ pub struct GrypeArtifact {
 // Scanner implementation
 // ---------------------------------------------------------------------------
 
+/// Cap a captured subprocess stream at `max` bytes for inclusion in an error
+/// message. Keeps the *tail* (most recent output) because Grype's failure
+/// reason is typically the last line it logs before exiting. Adds a
+/// `…[truncated]` marker so the caller can tell the message was clipped.
+///
+/// Returns an owned `String` so the result is safe to interpolate into
+/// `format!`. The `s` argument is a `Cow<str>` flavor from
+/// `String::from_utf8_lossy`, so an as-ref accepts both arms.
+fn truncate_stream(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Slice on a char boundary to avoid panicking on a multibyte split.
+    // `floor_char_boundary` is unstable, so walk manually.
+    let start = s.len().saturating_sub(max);
+    let mut boundary = start;
+    while boundary < s.len() && !s.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    format!("…[truncated]{}", &s[boundary..])
+}
+
 /// Resolve the registry host string Grype's `registry:` mode targets. The
 /// first non-empty source wins, in priority order:
 ///   1. `AK_GRYPE_REGISTRY_HOST` — explicit override (full URL accepted).
@@ -167,9 +189,34 @@ impl GrypeScanner {
     /// Run grype against an arbitrary target string (e.g. `dir:/path`,
     /// `registry:host/name:tag`). Centralized so both modes share output
     /// parsing and "binary not installed" handling.
+    ///
+    /// Two behaviors worth calling out:
+    ///
+    /// 1. We do **not** pass `-q`. Grype's `-q` flag suppresses *all* logging,
+    ///    including the messages it writes on a DB-load/refresh failure. With
+    ///    `-q`, an exit-1 failure surfaces to the caller as `"Grype scan
+    ///    failed (exit status: 1): "` with an empty stderr slot — which is
+    ///    exactly what release-gate #1001-followup reported. Letting Grype
+    ///    log to stderr keeps the JSON report on stdout (Grype separates
+    ///    structured output from logging) while preserving a useful error
+    ///    payload on the failure path.
+    ///
+    /// 2. We pin the DB-update-related env vars defensively. Grype defaults
+    ///    `db.auto-update=true` and `db.validate-age=true`. With those
+    ///    defaults, after the pre-seeded DB ages past `db.max-allowed-built-
+    ///    age` (5 days), Grype tries to fetch a fresh copy from
+    ///    grype.anchore.io, which fails in network-restricted environments
+    ///    (ARC runner pods, release-gate jobs) and exits 1. The Dockerfile
+    ///    also sets these vars, but injecting them here means the scanner
+    ///    keeps working under deployment configs that wipe inherited env
+    ///    (Helm charts, k8s `env:` blocks that replace rather than append).
+    ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
     async fn run_grype_target(&self, target: &str) -> Result<GrypeReport> {
         let output = tokio::process::Command::new("grype")
-            .args([target, "-o", "json", "-q"])
+            .args([target, "-o", "json"])
+            .env("GRYPE_DB_AUTO_UPDATE", "false")
+            .env("GRYPE_DB_VALIDATE_AGE", "false")
+            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false")
             .output()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to execute Grype: {}", e)))?;
@@ -179,9 +226,17 @@ impl GrypeScanner {
             if stderr.contains("not found") || stderr.contains("No such file") {
                 return Err(AppError::Internal("Grype binary not available".to_string()));
             }
+            // Include a stdout tail too: Grype writes its progress/ETUI to
+            // stderr, but a hard failure during JSON encoding can leave a
+            // partial payload on stdout that is the only clue to the cause.
+            // Cap each stream at 4 KiB so a runaway log does not produce a
+            // megabyte-class AppError message.
+            let stderr_tail = truncate_stream(&stderr, 4096);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_tail = truncate_stream(&stdout, 4096);
             return Err(AppError::Internal(format!(
-                "Grype scan failed ({}): {}",
-                output.status, stderr
+                "Grype scan failed ({}): stderr={:?} stdout={:?}",
+                output.status, stderr_tail, stdout_tail
             )));
         }
 
@@ -783,5 +838,119 @@ mod tests {
         );
 
         std::env::remove_var("PEER_PUBLIC_ENDPOINT");
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_stream: stderr/stdout payload framing in subprocess error
+    // messages. Regression guard for the diagnostic-improvement half of the
+    // #1001-followup fix (PR linked to #1002 / commit 23d9743). Without
+    // these, an `AppError::Internal` carrying multi-megabyte grype log
+    // output could blow up downstream consumers that interpolate the error
+    // into a JSON field (audit log, scan_results.error_message column).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_stream_returns_input_when_under_limit() {
+        let s = "short message";
+        assert_eq!(truncate_stream(s, 4096), "short message");
+    }
+
+    #[test]
+    fn test_truncate_stream_preserves_tail_when_over_limit() {
+        // 100 'a's followed by a distinctive ending. With max=10, only the
+        // tail should be kept (the failure reason is the last thing logged).
+        let s = format!("{}END", "a".repeat(100));
+        let out = truncate_stream(&s, 10);
+        assert!(
+            out.ends_with("END"),
+            "tail must be preserved so the actual failure line survives; got {:?}",
+            out
+        );
+        assert!(
+            out.starts_with("…[truncated]"),
+            "truncation marker must be present: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_handles_multibyte_split() {
+        // A multibyte UTF-8 char (Greek capital alpha, 2 bytes) repeated
+        // enough to force a truncation point in the middle of one. The
+        // function must not panic and must produce valid UTF-8.
+        let s: String = "\u{0391}".repeat(20); // 40 bytes
+        let out = truncate_stream(&s, 15);
+        // Result must be valid UTF-8 (String type guarantees this) and the
+        // boundary walk must have advanced past any partial multibyte.
+        assert!(
+            out.is_char_boundary(0) && out.is_char_boundary(out.len()),
+            "truncate_stream must not split inside a UTF-8 multibyte sequence"
+        );
+        assert!(out.contains("[truncated]"));
+    }
+
+    /// The fix removes `-q` from the grype invocation so DB-fetch / DB-load
+    /// failures surface in stderr. Verifying the *exact* arg vector is the
+    /// most direct regression guard against a future refactor that
+    /// reintroduces `-q` and silences the next #1001-class failure.
+    ///
+    /// This test reads the source file rather than instrumenting the
+    /// subprocess invocation because `run_grype_target` is private to the
+    /// module and the only externally visible behavior here is the args we
+    /// pass. Reading the source is acceptable for a single-line invariant.
+    #[test]
+    fn test_grype_invocation_does_not_pass_quiet_flag() {
+        let src = include_str!("grype_scanner.rs");
+        // Find the args() line for the grype subprocess. There is exactly
+        // one in this module (run_grype_target).
+        let args_line = src
+            .lines()
+            .find(|l| l.contains(".args([target, \"-o\", \"json\""))
+            .expect(
+                "run_grype_target must invoke grype with .args([target, \"-o\", \"json\", ...]); \
+                 the arg-vector shape changed and this test needs updating",
+            );
+        assert!(
+            !args_line.contains("\"-q\"") && !args_line.contains("\"--quiet\""),
+            "Grype must be invoked WITHOUT -q / --quiet so DB-load and \
+             DB-refresh failures appear in stderr. See artifact-keeper#1001 \
+             and the followup that traced 'Grype scan failed (exit status: \
+             1): ' with an empty stderr slot back to this flag. Offending \
+             line: {}",
+            args_line
+        );
+    }
+
+    /// Regression guard for the env-var defaults applied to the grype
+    /// subprocess. The Dockerfile sets these too, but a Helm chart or k8s
+    /// deployment that *replaces* the container env (rather than appending)
+    /// would lose the Dockerfile values. Pinning them at the `Command`
+    /// level keeps the scanner working under either deployment shape.
+    #[test]
+    fn test_grype_invocation_pins_db_auto_update_env_vars() {
+        let src = include_str!("grype_scanner.rs");
+
+        for (var, why) in [
+            (
+                "GRYPE_DB_AUTO_UPDATE",
+                "would let Grype refetch the DB and fail in egress-restricted envs (#1001)",
+            ),
+            (
+                "GRYPE_DB_VALIDATE_AGE",
+                "would let Grype reject the seeded DB once it ages past 5 days (#1001 followup)",
+            ),
+            (
+                "GRYPE_CHECK_FOR_APP_UPDATE",
+                "would let Grype phone home for self-updates and add a network dependency",
+            ),
+        ] {
+            assert!(
+                src.contains(&format!(".env(\"{}\", \"false\")", var)),
+                "run_grype_target must pin {}=\"false\" at the subprocess level; \
+                 removing it {}",
+                var,
+                why
+            );
+        }
     }
 }

@@ -180,11 +180,24 @@ COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
 WORKDIR /app
 USER 1001
 
+# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
+# defaults, Grype at scan time checks the pre-seeded DB's build timestamp; if
+# it is older than `db.max-allowed-built-age` (5 days), Grype refuses to use
+# it and tries to download a fresh copy from grype.anchore.io. In the
+# network-restricted environments PR #1002 (#1001) was meant to fix (ARC
+# runner pods, release-gate jobs), that fetch fails and Grype exits 1 with
+# no stderr (because the scanner invocation passes `-q`). We disable both
+# knobs so the seeded DB is honored for the full image lifetime; the DB is
+# refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
+# and PR #1002 (commit 23d9743) which added the seed stage.
 ENV RUST_LOG=info \
     DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
     GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    GRYPE_DB_AUTO_UPDATE=false \
+    GRYPE_DB_VALIDATE_AGE=false \
+    GRYPE_CHECK_FOR_APP_UPDATE=false \
     HOST=0.0.0.0 \
     PORT=8080
 
