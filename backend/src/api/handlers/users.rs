@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,18 +21,35 @@ use crate::services::auth_service::{
 use crate::services::password_policy::PasswordPolicyConfig;
 use std::sync::atomic::Ordering;
 
-/// Create user routes that should ride the standard API rate-limit bucket.
+/// Admin-only user-management routes. Mount under `admin_middleware`.
 ///
-/// Password-mutating routes are intentionally excluded; mount them via
-/// [`password_router`] with the tighter `rate_limit_password_change_*` bucket
-/// (#1026). The handler itself enforces the self-vs-admin authorization
-/// check, so this split is purely about rate limiting, not access control.
-pub fn router() -> Router<SharedState> {
+/// Every handler in this set also calls `if !auth.is_admin { 403 }` as
+/// defense in depth, so the middleware and the handler form two
+/// independent layers of admin-gating. If a future refactor moves a route
+/// between this and [`self_or_admin_router`], the handler-level guard
+/// still applies — see #1257 for the bug that motivated the split.
+pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
-        .route("/:id", get(get_user).patch(update_user).delete(delete_user))
+        .route("/:id", patch(update_user).delete(delete_user))
         .route("/:id/roles", get(get_user_roles).post(assign_role))
         .route("/:id/roles/:role_id", delete(revoke_role))
+}
+
+/// User routes that may be self-served by the caller or, alternatively,
+/// performed by an admin against another user. Mount under
+/// `auth_middleware` (NOT `admin_middleware`) so non-admins can act on
+/// their own user record.
+///
+/// Each handler enforces `if auth.user_id != id && !auth.is_admin { 403 }`
+/// internally; mounting these under `admin_middleware` (as the legacy
+/// single-router topology did pre-#1257) made those checks dead code
+/// and 403'd every non-admin self-action — including `POST
+/// /api/v1/users/<self-id>/tokens` (the "Create API key" flow) which is
+/// what surfaced the bug.
+pub fn self_or_admin_router() -> Router<SharedState> {
+    Router::new()
+        .route("/:id", get(get_user))
         .route("/:id/tokens", get(list_user_tokens).post(create_api_token))
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
 }
@@ -43,6 +60,17 @@ pub fn router() -> Router<SharedState> {
 /// grind ~`rate_limit_api_per_window` guesses per window through this
 /// endpoint - far weaker than `/auth/login`'s `auth_rate_limit_state` bucket.
 /// Default: 5 attempts per 15 minutes per user.
+///
+/// Mount under `auth_middleware` (NOT `admin_middleware`). Each handler
+/// enforces its own authorization:
+///
+/// * `change_password` (`POST /:id/password`) — self-or-admin
+/// * `reset_password` (`POST /:id/password/reset`) — admin-only
+/// * `force_password_change` (`POST /:id/force-password-change`) — admin-only
+///
+/// Pre-#1257 this router was wrapped in `admin_middleware`, which dead-
+/// coded `change_password`'s self-or-admin path: a non-admin holding a
+/// valid JWT could not change their own password through the API.
 pub fn password_router() -> Router<SharedState> {
     Router::new()
         .route("/:id/password", post(change_password))
@@ -153,8 +181,15 @@ pub(crate) fn user_to_response(user: User) -> AdminUserResponse {
 )]
 pub async fn list_users(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListUsersQuery>,
 ) -> Result<Json<UserListResponse>> {
+    // Defense-in-depth admin gate. Production traffic goes through
+    // `admin_middleware` first; this guard ensures the route stays safe
+    // if someone moves it between routers in the future. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -323,8 +358,15 @@ pub async fn create_user(
 )]
 pub async fn get_user(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AdminUserResponse>> {
+    // Self-or-admin: a user may read their own record; anyone else needs admin.
+    if auth.user_id != id && !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Cannot view other users' records".to_string(),
+        ));
+    }
     let user = sqlx::query_as!(
         User,
         r#"
@@ -370,6 +412,12 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<AdminUserResponse>> {
+    // Defense-in-depth admin gate. Production traffic also passes
+    // through `admin_middleware`; this guard is what keeps the route
+    // safe if someone reroutes it. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     // When an admin deactivates a user, immediately invalidate every cached
     // API-token and JWT for that user. Without this, a compromised account
     // would keep authenticating against any AuthService instance whose
@@ -455,6 +503,10 @@ pub async fn delete_user(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    // Defense-in-depth admin gate. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     // Prevent self-deletion
     if auth.user_id == id {
         return Err(AppError::Validation("Cannot delete yourself".to_string()));
@@ -524,8 +576,13 @@ pub struct RoleListResponse {
 )]
 pub async fn get_user_roles(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RoleListResponse>> {
+    // Defense-in-depth admin gate. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     let roles = sqlx::query!(
         r#"
         SELECT r.id, r.name, r.description, r.permissions
@@ -575,10 +632,14 @@ pub struct AssignRoleRequest {
 )]
 pub async fn assign_role(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<AssignRoleRequest>,
 ) -> Result<()> {
+    // Defense-in-depth admin gate. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     sqlx::query!(
         r#"
         INSERT INTO user_roles (user_id, role_id)
@@ -613,9 +674,13 @@ pub async fn assign_role(
 )]
 pub async fn revoke_role(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((user_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
+    // Defense-in-depth admin gate. See #1257.
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     let result = sqlx::query!(
         "DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2",
         user_id,
@@ -1965,5 +2030,499 @@ mod tests {
         // Response should contain exactly the message field
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("message"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router-split regression tests (#1257)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod router_split_tests {
+    //! Regression tests for #1257.
+    //!
+    //! Pre-fix, the entire `/users` nest was wrapped in `admin_middleware`
+    //! and the per-handler `if auth.user_id != id && !auth.is_admin` checks
+    //! were dead code — non-admin users got 403 on every `/users/<self-id>/...`
+    //! call. After splitting `router()` into `admin_router()` and
+    //! `self_or_admin_router()`, the handler-level guards become
+    //! load-bearing. These tests pin both halves of that contract:
+    //!
+    //!   * `self_or_admin_router()` handlers allow self-action and reject
+    //!     non-self for non-admins.
+    //!   * `admin_router()` handlers refuse a non-admin caller even when
+    //!     the outer `admin_middleware` is not in the chain (defense in
+    //!     depth — see the `if !auth.is_admin` guards added in this PR).
+    //!
+    //! All tests skip cleanly when `DATABASE_URL` is unset (`try_pool`
+    //! returns `None`), matching the rest of the DB-backed test suite.
+    //! `Extension::<AuthExtension>(auth)` is injected directly (not via
+    //! `tdh::router_with_auth`, which wraps it in `Option`) because the
+    //! handlers use the bare extractor — same trick as `upload.rs`'s
+    //! `upload_router_with_auth` test helper.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    fn build_self_or_admin_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        self_or_admin_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    fn build_admin_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        admin_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    fn build_password_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        password_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    /// Skip-friendly fixture: returns (pool, state, non_admin_user) or
+    /// `None` when DATABASE_URL is unset. The temp-storage path is unused
+    /// by the routes under test but `build_state` requires one.
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username))
+    }
+
+    async fn delete_user_row(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    // ── self_or_admin_router: regression coverage ─────────────────────
+
+    /// Pre-#1257: this returned 403 from `admin_middleware` before the
+    /// handler ran. Post-fix, the handler runs and creates the token.
+    #[tokio::test]
+    async fn non_admin_can_create_own_api_token() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let body = json!({
+            "name": "self-token",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin self-creating their own API token MUST NOT 403 (#1257); body: {}",
+            String::from_utf8_lossy(&body_bytes),
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 on happy-path create; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_create_tokens_for_another_user() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _target_name) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let body = json!({
+            "name": "other-token",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin attempting to mint tokens for another user MUST 403 (handler-level guard at users.rs:create_api_token)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_can_read_own_user_record() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}", user_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin reading their own user record MUST succeed (#1257)"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_read_another_user_record() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin reading another user's record MUST 403 (handler-level guard at users.rs:get_user)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    // ── admin_router: defense-in-depth handler guards ─────────────────
+
+    /// Mounted via `admin_router()` only (no `admin_middleware` in the
+    /// chain) so this exercises the in-handler `if !auth.is_admin` guard
+    /// added in #1257. Pre-PR, the route relied solely on the router-level
+    /// middleware — if a future refactor moves the route between sub-
+    /// routers it would silently expose. The handler guard is the
+    /// independent second layer.
+    #[tokio::test]
+    async fn admin_handler_list_users_rejects_non_admin() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "list_users MUST 403 a non-admin even without admin_middleware in front of it (#1257 defense in depth)"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn admin_handler_update_user_rejects_non_admin() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_admin_app(state, auth);
+
+        let body = json!({"is_admin": true}).to_string();
+        let req = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/{}", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "update_user MUST 403 a non-admin even without admin_middleware (#1257); a non-admin must not be able to escalate by PATCHing their own row"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn admin_handler_delete_user_rejects_non_admin() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "delete_user MUST 403 a non-admin even without admin_middleware (#1257)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    // ── password_router: change_password reachable for self ───────────
+
+    /// Pre-#1257 `change_password` (`POST /:id/password`) was blocked by
+    /// `admin_middleware` for non-admins even though its handler-level
+    /// guard at users.rs:834 is exactly `if auth.user_id != id &&
+    /// !auth.is_admin`. After the split, `password_router` rides
+    /// `auth_middleware` and the handler decides. We can't drive the full
+    /// password-policy validation here (the test password gets bcrypt'd
+    /// against a row with `password_hash='unused'`), so we only assert
+    /// the negative invariant: NOT 403. The exact non-403 status the
+    /// handler returns (4xx for wrong current password, etc.) is not the
+    /// security property under test.
+    #[tokio::test]
+    async fn non_admin_can_reach_change_password_for_self() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_password_app(state, auth);
+
+        let body = json!({
+            "current_password": "irrelevant",
+            "new_password": "NewPassw0rd!",
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/password", user_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin reaching change_password for self MUST NOT 403 (#1257) — handler may legitimately reject the body, but it must not be admin-gated"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// Seed an `api_tokens` row directly so the revoke tests have a real
+    /// token id to target. Mirrors the canonical INSERT shape used by
+    /// `auth_service::generate_api_token` (auth_service.rs:1358). We bypass
+    /// the bcrypt token-hash step — the token *value* is never read here,
+    /// only its `id` — and use a placeholder for `token_hash` to avoid the
+    /// CPU-bound bcrypt step on every test run.
+    ///
+    /// Uses the runtime `sqlx::query` (not the `query!` macro) so this
+    /// helper doesn't need a `.sqlx/` offline cache entry of its own;
+    /// CI builds with `SQLX_OFFLINE=true` and we don't want to add a
+    /// cached query for a test-only INSERT shape.
+    async fn seed_api_token(pool: &sqlx::PgPool, user_id: Uuid, prefix: &str) -> Uuid {
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL) \
+             RETURNING id",
+        )
+        .bind(user_id)
+        .bind(format!("seed-{}", prefix))
+        .bind("placeholder-hash-not-validated-by-revoke-path")
+        .bind(prefix)
+        .bind(Vec::<String>::new())
+        .fetch_one(pool)
+        .await
+        .expect("seed api_token row");
+        row.0
+    }
+
+    // ── self_or_admin_router: token list / revoke coverage ────────────
+
+    #[tokio::test]
+    async fn non_admin_can_list_own_api_tokens() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", user_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin listing their own tokens MUST succeed (#1257); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_list_another_users_tokens() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin listing another user's tokens MUST 403 (handler-level guard at users.rs:list_user_tokens)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_can_revoke_own_api_token() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let token_id = seed_api_token(&pool, user_id, "self-rev").await;
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", user_id, token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin revoking their own token MUST succeed (#1257); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_revoke_another_users_token() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let token_id = seed_api_token(&pool, target_id, "x-rev-x").await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", target_id, token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin revoking another user's token MUST 403 (handler-level guard at users.rs:revoke_api_token)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    // ── password_router: cross-user negative coverage ─────────────────
+
+    #[tokio::test]
+    async fn non_admin_cannot_change_another_users_password() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_password_app(state, auth);
+
+        let body = json!({
+            "current_password": "irrelevant",
+            "new_password": "NewPassw0rd!",
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/password", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin changing another user's password MUST 403 (handler-level guard at users.rs:change_password)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
     }
 }
