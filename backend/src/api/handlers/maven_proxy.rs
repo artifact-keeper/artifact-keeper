@@ -489,10 +489,18 @@ mod tests {
         )
         .await
         .expect_err("quarantined primary must hold back its companions");
-        // check_quarantine_row maps via AppError::Forbidden / 451 /
-        // 404 depending on policy; accept any refusal status.
+        // `check_quarantine_row` delegates to
+        // `quarantine_service::check_download_allowed`, which returns
+        // `AppError::Conflict` (409) when `quarantine_status = 'quarantined'`
+        // and `quarantine_until` is in the past or NULL. Other policies
+        // (`Forbidden` / 451 / 404) are reachable in other code paths
+        // (e.g. tenant-policy plug-ins), so accept any of those too —
+        // what matters for this SECURITY test is that the companion
+        // .pom is NOT served, regardless of which refusal status the
+        // current policy returns.
         assert!(
-            err.status() == StatusCode::FORBIDDEN
+            err.status() == StatusCode::CONFLICT
+                || err.status() == StatusCode::FORBIDDEN
                 || err.status() == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
                 || err.status() == StatusCode::NOT_FOUND,
             "expected a refusal status, got {}",
