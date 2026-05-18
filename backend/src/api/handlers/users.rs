@@ -2478,6 +2478,171 @@ mod router_split_tests {
 
         delete_user_row(&pool, user_id).await;
     }
+
+    /// Seed an `api_tokens` row directly so the revoke tests have a real
+    /// token id to target. Mirrors the canonical INSERT shape used by
+    /// `auth_service::generate_api_token` (auth_service.rs:1358). We bypass
+    /// the bcrypt token-hash step — the token *value* is never read here,
+    /// only its `id` — and use a placeholder for `token_hash` to avoid the
+    /// CPU-bound bcrypt step on every test run.
+    async fn seed_api_token(pool: &sqlx::PgPool, user_id: Uuid, prefix: &str) -> Uuid {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes, expires_at)
+            VALUES ($1, $2, $3, $4, $5, NULL)
+            RETURNING id
+            "#,
+            user_id,
+            format!("seed-{}", prefix),
+            "placeholder-hash-not-validated-by-revoke-path",
+            prefix,
+            &Vec::<String>::new(),
+        )
+        .fetch_one(pool)
+        .await
+        .expect("seed api_token row");
+        row.id
+    }
+
+    // ── self_or_admin_router: token list / revoke coverage ────────────
+
+    #[tokio::test]
+    async fn non_admin_can_list_own_api_tokens() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", user_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin listing their own tokens MUST succeed (#1257); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_list_another_users_tokens() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin listing another user's tokens MUST 403 (handler-level guard at users.rs:list_user_tokens)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_can_revoke_own_api_token() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let token_id = seed_api_token(&pool, user_id, "self-rev").await;
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", user_id, token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin revoking their own token MUST succeed (#1257); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_revoke_another_users_token() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let token_id = seed_api_token(&pool, target_id, "x-rev-x").await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", target_id, token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin revoking another user's token MUST 403 (handler-level guard at users.rs:revoke_api_token)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    // ── password_router: cross-user negative coverage ─────────────────
+
+    #[tokio::test]
+    async fn non_admin_cannot_change_another_users_password() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(caller_id, &caller_name);
+        let app = build_password_app(state, auth);
+
+        let body = json!({
+            "current_password": "irrelevant",
+            "new_password": "NewPassw0rd!",
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/password", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin changing another user's password MUST 403 (handler-level guard at users.rs:change_password)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
