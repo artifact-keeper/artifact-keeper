@@ -1995,4 +1995,100 @@ mod tests {
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("message"));
     }
+
+    // -----------------------------------------------------------------------
+    // Password-router split — pins the three router constructors so the
+    // coverage gate has something to count for the routing-only change.
+    // The full behavior (non-admin can change own password, cannot change
+    // another user's, cannot reach reset/force-change) is exercised by
+    // `backend/tests/users_password_routing_tests.rs` against a live DB.
+    // -----------------------------------------------------------------------
+
+    /// Visit the path string of every leaf route in an axum `Router` and
+    /// collect them. Used by the router-shape tests below to assert that
+    /// the split routers contain exactly the routes they should and
+    /// nothing else.
+    ///
+    /// Implementation note: axum doesn't expose its internal route table,
+    /// so we exercise the routers by constructing them and inspecting the
+    /// Debug repr. The Debug output of `Router` includes the path strings
+    /// of every route via the inner `MethodRouter` tree. This is brittle
+    /// across axum versions but stable inside a single semver cycle, and
+    /// the alternative (booting a real server) would defeat the
+    /// no-DB-required goal of these tests.
+    fn router_paths(router: &Router<SharedState>) -> String {
+        // Debug repr includes every registered path; we just grep for the
+        // specific routes we care about.
+        format!("{:?}", router)
+    }
+
+    #[test]
+    fn test_self_password_router_contains_change_route() {
+        let r = self_password_router();
+        let dbg = router_paths(&r);
+        assert!(
+            dbg.contains("/:id/password"),
+            "self_password_router must expose POST /:id/password; got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_self_password_router_does_not_contain_reset_route() {
+        // SECURITY: the self-service router must not carry the admin
+        // reset/force-change endpoints. If it did, mounting it under
+        // `auth_middleware` (the whole point of the split) would expose
+        // those admin-only operations to any authenticated user.
+        let r = self_password_router();
+        let dbg = router_paths(&r);
+        assert!(
+            !dbg.contains("/password/reset"),
+            "self_password_router must NOT contain /password/reset"
+        );
+        assert!(
+            !dbg.contains("/force-password-change"),
+            "self_password_router must NOT contain /force-password-change"
+        );
+    }
+
+    #[test]
+    fn test_admin_password_router_contains_reset_and_force_routes() {
+        let r = admin_password_router();
+        let dbg = router_paths(&r);
+        assert!(
+            dbg.contains("/:id/password/reset"),
+            "admin_password_router must expose /:id/password/reset; got {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("/:id/force-password-change"),
+            "admin_password_router must expose /:id/force-password-change; got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_admin_password_router_does_not_contain_self_change_route() {
+        // The admin router carries reset + force-change but NOT the
+        // self-service change endpoint. Splitting them is the whole
+        // reason this fix exists; collapsing them would re-introduce
+        // the regression.
+        let r = admin_password_router();
+        let dbg = router_paths(&r);
+        // The self-service route ends with "/password" (no further
+        // path segment); the admin reset route is "/password/reset".
+        // We check that the admin router has reset but NOT the bare
+        // "/password" route.
+        assert!(dbg.contains("/password/reset"));
+        // Substring match alone isn't enough (`/password/reset` contains
+        // `/password`); check by counting occurrences of `/password\"`
+        // (the path closer in axum's Debug repr) and asserting it only
+        // shows up as part of `/password/reset` and not as a standalone.
+        let bare_count = dbg.matches("\"/:id/password\"").count();
+        assert_eq!(
+            bare_count, 0,
+            "admin_password_router must NOT carry the self-service /:id/password route; got {}",
+            dbg
+        );
+    }
 }

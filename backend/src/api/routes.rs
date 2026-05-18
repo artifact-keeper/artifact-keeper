@@ -350,14 +350,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/users",
             handlers::users::router()
-                .merge(
-                    handlers::users::admin_password_router().layer(
-                        middleware::from_fn_with_state(
-                            password_change_rate_limit_state,
-                            rate_limit_middleware,
-                        ),
+                .merge(handlers::users::admin_password_router().layer(
+                    middleware::from_fn_with_state(
+                        password_change_rate_limit_state,
+                        rate_limit_middleware,
                     ),
-                )
+                ))
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),

@@ -70,8 +70,7 @@ fn make_test_config() -> Config {
 }
 
 fn build_state(pool: PgPool, cfg: Config) -> SharedState {
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(FilesystemStorage::new(&cfg.storage_path));
+    let storage: Arc<dyn StorageBackend> = Arc::new(FilesystemStorage::new(&cfg.storage_path));
     let registry = Arc::new(StorageRegistry::new(
         std::collections::HashMap::new(),
         "filesystem".to_string(),
@@ -205,8 +204,7 @@ async fn non_admin_can_change_own_password_routes_through_auth_middleware() {
     let user_id = insert_user(&pool, "self-pw").await;
 
     let cfg = make_test_config();
-    let auth_service =
-        Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
+    let auth_service = Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
     let state = build_state(pool.clone(), cfg);
 
     let token = mint_user_jwt(&auth_service, user_id, /*is_admin=*/ false);
@@ -272,8 +270,7 @@ async fn non_admin_cannot_change_other_users_password() {
     let target_id = insert_user(&pool, "target").await;
 
     let cfg = make_test_config();
-    let auth_service =
-        Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
+    let auth_service = Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
     let state = build_state(pool.clone(), cfg);
 
     let token = mint_user_jwt(&auth_service, caller_id, /*is_admin=*/ false);
@@ -332,8 +329,7 @@ async fn non_admin_cannot_reach_password_reset_endpoint() {
     let user_id = insert_user(&pool, "reset-test").await;
 
     let cfg = make_test_config();
-    let auth_service =
-        Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
+    let auth_service = Arc::new(AuthService::new(pool.clone(), Arc::new(cfg.clone())));
     let state = build_state(pool.clone(), cfg);
 
     let token = mint_user_jwt(&auth_service, user_id, /*is_admin=*/ false);
