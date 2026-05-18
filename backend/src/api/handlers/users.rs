@@ -64,10 +64,9 @@ pub fn self_or_admin_router() -> Router<SharedState> {
 /// Mount under `auth_middleware` (NOT `admin_middleware`). Each handler
 /// enforces its own authorization:
 ///
-/// * `change_password` (`POST /:id/password`)             — self-or-admin
-/// * `reset_password` (`POST /:id/password/reset`)        — admin-only
-/// * `force_password_change` (`POST /:id/force-password-change`)
-///                                                        — admin-only
+/// * `change_password` (`POST /:id/password`) — self-or-admin
+/// * `reset_password` (`POST /:id/password/reset`) — admin-only
+/// * `force_password_change` (`POST /:id/force-password-change`) — admin-only
 ///
 /// Pre-#1257 this router was wrapped in `admin_middleware`, which dead-
 /// coded `change_password`'s self-or-admin path: a non-admin holding a
