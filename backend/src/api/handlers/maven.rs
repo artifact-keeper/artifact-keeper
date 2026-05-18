@@ -1202,12 +1202,61 @@ async fn serve_artifact(
                                 return Ok(result);
                             }
 
-                            // Fallback: SNAPSHOT alias resolution (#839).
+                            // Fallback A: SNAPSHOT alias resolution (#839).
                             // Maven deploys store SNAPSHOTs under timestamped filenames
                             // (`foo-1.0-20260101.120000-1.jar`). The client still asks
                             // for the `-SNAPSHOT` filename, so map that alias to the
                             // latest timestamped file before giving up.
-                            maven_local_fetch_snapshot(
+                            //
+                            // For SNAPSHOT paths we ALWAYS stop here — never fall
+                            // through to the storage-direct fallback below. The
+                            // storage path is keyed by the literal `-SNAPSHOT`
+                            // string the client sent, but SNAPSHOT bytes on disk
+                            // live under the timestamped filename — so the storage
+                            // probe would either 404 cleanly (best case) or, if
+                            // member A happens to carry a stale snapshot of a
+                            // different artifact at the same -SNAPSHOT path, serve
+                            // that stale byte stream instead of advancing the
+                            // virtual-resolution loop to member B. Confine the
+                            // SNAPSHOT codepath to its dedicated helper.
+                            let is_snapshot = artifact_path.contains("-SNAPSHOT");
+                            if is_snapshot {
+                                return maven_local_fetch_snapshot(
+                                    &db,
+                                    &state,
+                                    member_id,
+                                    &location,
+                                    &artifact_path,
+                                )
+                                .await;
+                            }
+                            if let Ok(result) = maven_local_fetch_snapshot(
+                                &db,
+                                &state,
+                                member_id,
+                                &location,
+                                &artifact_path,
+                            )
+                            .await
+                            {
+                                return Ok(result);
+                            }
+
+                            // Fallback B: storage-direct for GAV-grouped secondary
+                            // files (.pom, .module, -sources.jar, .sha512, …) whose
+                            // bytes exist in storage at `maven/<path>` but do NOT
+                            // have their own `artifacts` row (the row lives under
+                            // the primary .jar/.aar). The helper enforces three
+                            // gates internally: (1) the path's extension must be a
+                            // known secondary file, (2) a live primary must exist
+                            // in the same GAV directory, (3) the primary must not
+                            // be quarantined or soft-deleted. So unlike the
+                            // hosted-repo storage fallback at `maven.rs` lines
+                            // 1264-1284 (which this PR does NOT touch but which has
+                            // the same quarantine-bypass issue tracked separately),
+                            // the virtual-side fallback honors the primary's policy
+                            // state.
+                            crate::api::handlers::maven_proxy::maven_local_fetch_storage_fallback(
                                 &db,
                                 &state,
                                 member_id,
