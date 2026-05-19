@@ -228,10 +228,14 @@ async fn run_through_admin_middleware(app: Router, bearer: &str) -> StatusCode {
     .status()
 }
 
-/// Primary regression: a fresh non-admin user created via the production
-/// `create_user` INSERT pattern (post-fix, with the 2s backdate on
-/// `password_changed_at`) must reach the `is_admin` branch of
-/// `admin_middleware` and be rejected with 403, not 401.
+/// Primary regression: a fresh non-admin user created with a
+/// deterministically-past `password_changed_at` (2-second backdate, used
+/// here only to remove clock-skew flake against the DB) must reach the
+/// `is_admin` branch of `admin_middleware` and be rejected with 403, not
+/// 401. The 2-second backdate is a TEST artifact for determinism — the
+/// production `create_user` handler does NOT backdate. The cache-conflation
+/// scenario the production handler trips is covered by
+/// `two_sequential_admin_requests_with_fresh_jwt_both_return_403` below.
 #[tokio::test]
 #[ignore]
 async fn non_admin_jwt_minted_immediately_after_user_creation_returns_403() {
@@ -275,14 +279,14 @@ async fn non_admin_jwt_minted_immediately_after_user_creation_returns_403() {
 /// is rejected with 401. This is the pre-fix shape and the bug the
 /// release-gate test surfaces.
 ///
-/// We keep this test green by ASSERTING the 401 (i.e., the broken
-/// behaviour). That pins two invariants simultaneously:
-///   1. The `iat <= watermark` boundary semantics from #1173 are intact
-///      (so future refactors can't silently flip it to `<` and break
-///      revocation across the seconds boundary).
-///   2. The fix to `create_user` (backdating the watermark) is precisely
-///      what avoids the bug — the only difference between this test and
-///      the one above is the `password_changed_at` value.
+/// We keep this test green by ASSERTING the 401 (i.e., the rejection
+/// of a JWT issued strictly before the watermark). That pins the
+/// invariant that the replica-safe check still rejects pre-watermark
+/// tokens — important to lock so a future refactor can't silently
+/// weaken the #1173 protection. The watermark is set to NOW + 1h
+/// rather than NOW so the test is deterministic against clock skew;
+/// the semantic under test (`iat < watermark` rejects) is the same as
+/// the real password-rotation case.
 #[tokio::test]
 #[ignore]
 async fn boundary_pin_jwt_iat_equal_to_watermark_is_rejected() {

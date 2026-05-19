@@ -190,6 +190,24 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
 /// rejected too (1-second JWT `iat` resolution race; fixes the boundary
 /// bug at the old line 152).
 ///
+/// Callers
+/// -------
+/// * [`AuthService::validate_access_token`] (sync entry point with no
+///   DB access): consults this map directly; the `<=` boundary
+///   semantics above are the load-bearing guarantee.
+/// * gRPC `auth_interceptor` test-mode branch (no DB pool wired): same
+///   sync-only role.
+///
+/// [`is_token_invalidated_replica_safe`] intentionally does NOT call
+/// this helper. The replica-safe path goes through
+/// [`fetch_credential_change_watermark`] which serves the SAME
+/// `invalidation_map` as a 5-second DB-result cache, and the strict `<`
+/// comparator (post-#1248) must win over the `<=` here. Mixing the two
+/// produced a release-gate regression on `v1.2.0-rc.1` where the first
+/// admin request from a fresh non-admin user passed and every
+/// subsequent request inside the cache window was rejected by the
+/// conflated `<=`. Keep this distinction when adding new callers.
+///
 /// In multi-replica deployments this is best-effort: an invalidation fired
 /// on replica A is not visible to replica B until `validate_token` /
 /// `refresh_tokens` consults the DB via [`is_user_credentials_changed_db`].
