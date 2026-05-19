@@ -2194,14 +2194,23 @@ mod router_split_tests {
             .layer(AxumExtension::<AuthExtension>(auth))
     }
 
+    // Upstream kept the admin user-management router named `router()`
+    // (rather than `admin_router()`). #1250 also split the legacy
+    // single `password_router()` into `self_password_router()` (auth-
+    // middleware mount, contains POST /:id/password) and
+    // `admin_password_router()` (admin-middleware mount, contains
+    // /password/reset + /force-password-change). The tests below
+    // target the self-change route exclusively — that's the one the
+    // bug-repro flow uses — so the password test app is built from
+    // `self_password_router()`.
     fn build_admin_app(state: SharedState, auth: AuthExtension) -> axum::Router {
-        admin_router()
+        router()
             .with_state(state)
             .layer(AxumExtension::<AuthExtension>(auth))
     }
 
     fn build_password_app(state: SharedState, auth: AuthExtension) -> axum::Router {
-        password_router()
+        self_password_router()
             .with_state(state)
             .layer(AxumExtension::<AuthExtension>(auth))
     }
