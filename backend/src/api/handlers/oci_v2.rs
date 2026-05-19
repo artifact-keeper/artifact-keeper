@@ -3247,10 +3247,7 @@ mod tests {
         // representation). Treat empty / whitespace-only as absent so we
         // exercise the same "no forwarding" code path.
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::ACCEPT,
-            HeaderValue::from_static("   "),
-        );
+        headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("   "));
         assert_eq!(forwarded_accept_header(&headers), None);
     }
 
