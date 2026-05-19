@@ -869,6 +869,229 @@ async fn try_upstream_fetch(
         .ok()
 }
 
+/// Adapt a `Repository` row (from `fetch_virtual_members`) to the lightweight
+/// `OciRepoInfo` view used by the OCI handler helpers. The `image` field is
+/// the image path inside the virtual repo — members share that addressing.
+fn member_as_oci_repo_info(
+    member: &crate::models::repository::Repository,
+    image: &str,
+) -> OciRepoInfo {
+    OciRepoInfo {
+        id: member.id,
+        key: member.key.clone(),
+        location: member.storage_location(),
+        repo_type: member.repo_type.as_str().to_string(),
+        upstream_url: member.upstream_url.clone(),
+        is_public: member.is_public,
+        image: image.to_string(),
+    }
+}
+
+/// Try resolving a manifest reference against a single hosted member's
+/// `oci_tags` + storage. Returns `Some((data, content_type, digest))` on hit.
+async fn try_member_manifest_local(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    image: &str,
+    reference: &str,
+) -> Option<(Bytes, String, String)> {
+    let row = if is_digest_reference(reference) {
+        sqlx::query!(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags \
+             WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+            member.id,
+            reference
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| (t.manifest_digest, t.manifest_content_type))
+    } else {
+        sqlx::query!(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags \
+             WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            member.id,
+            image,
+            reference
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| (t.manifest_digest, t.manifest_content_type))
+    };
+
+    let (manifest_digest, content_type) = row?;
+    let storage = state.storage_for_repo(&member.storage_location()).ok()?;
+    let data = storage
+        .get(&manifest_storage_key(&manifest_digest))
+        .await
+        .ok()?;
+    Some((data, content_type, manifest_digest))
+}
+
+/// Iterate virtual members in priority order and return the first manifest
+/// hit (hosted DB lookup first per member, then remote upstream fetch).
+async fn resolve_virtual_manifest(
+    state: &SharedState,
+    virtual_repo: &OciRepoInfo,
+    reference: &str,
+    include_body: bool,
+) -> Response {
+    let members = match proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if members.is_empty() {
+        return oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            "virtual repository has no members",
+        );
+    }
+
+    for member in &members {
+        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
+        {
+            if let Some((data, content_type, digest)) =
+                try_member_manifest_local(state, member, &virtual_repo.image, reference).await
+            {
+                let body = if include_body {
+                    Body::from(data.clone())
+                } else {
+                    Body::empty()
+                };
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Docker-Content-Digest", &digest)
+                    .header(CONTENT_LENGTH, data.len().to_string())
+                    .header(CONTENT_TYPE, content_type)
+                    .body(body)
+                    .unwrap();
+            }
+            continue;
+        }
+
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+
+        let member_info = member_as_oci_repo_info(member, &virtual_repo.image);
+        if let Some((content, ct)) =
+            try_upstream_fetch(&member_info, state, &format!("manifests/{}", reference)).await
+        {
+            let digest = cache_manifest_or_compute_digest(
+                state,
+                &member_info,
+                &virtual_repo.image,
+                reference,
+                &content,
+                ct.as_deref(),
+            )
+            .await;
+            return build_oci_proxy_response(
+                &content,
+                ct,
+                &digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                include_body,
+            );
+        }
+    }
+
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "MANIFEST_UNKNOWN",
+        "manifest not found in any virtual repository member",
+    )
+}
+
+/// Try resolving a blob against a single hosted member's `oci_blobs` + storage.
+async fn try_member_blob_local(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    digest: &str,
+) -> Option<(Bytes, i64)> {
+    let row = sqlx::query!(
+        "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        member.id,
+        digest
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()?;
+
+    let storage = state.storage_for_repo(&member.storage_location()).ok()?;
+    let data = storage.get(&row.storage_key).await.ok()?;
+    Some((data, row.size_bytes))
+}
+
+/// Iterate virtual members in priority order and return the first blob hit.
+async fn resolve_virtual_blob(
+    state: &SharedState,
+    virtual_repo: &OciRepoInfo,
+    digest: &str,
+    include_body: bool,
+) -> Response {
+    let members = match proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if members.is_empty() {
+        return oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            "virtual repository has no members",
+        );
+    }
+
+    for member in &members {
+        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
+        {
+            if let Some((data, size)) = try_member_blob_local(state, member, digest).await {
+                let body = if include_body {
+                    Body::from(data)
+                } else {
+                    Body::empty()
+                };
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Docker-Content-Digest", digest)
+                    .header(CONTENT_LENGTH, size.to_string())
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(body)
+                    .unwrap();
+            }
+            continue;
+        }
+
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+
+        let member_info = member_as_oci_repo_info(member, &virtual_repo.image);
+        if let Some((content, ct)) =
+            try_upstream_fetch(&member_info, state, &format!("blobs/{}", digest)).await
+        {
+            return build_oci_proxy_response(
+                &content,
+                ct,
+                digest,
+                "application/octet-stream",
+                include_body,
+            );
+        }
+    }
+
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "BLOB_UNKNOWN",
+        "blob not found in any virtual repository member",
+    )
+}
+
 /// Build an OCI registry response from proxied upstream content.
 ///
 /// Used by both blob and manifest proxy handlers to avoid duplicating the
@@ -1250,6 +1473,12 @@ async fn handle_head_blob(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
+    // Virtual repos delegate to per-member resolution; their own oci_blobs
+    // table is empty and try_upstream_fetch only handles Remote.
+    if repo.repo_type == RepositoryType::Virtual {
+        return resolve_virtual_blob(state, &repo, digest, false).await;
+    }
+
     // Check oci_blobs table
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -1322,6 +1551,11 @@ async fn handle_get_blob(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(&host, Some(&scope));
+    }
+
+    // Virtual repos delegate to per-member resolution.
+    if repo.repo_type == RepositoryType::Virtual {
+        return resolve_virtual_blob(state, &repo, digest, true).await;
     }
 
     let blob = sqlx::query!(
@@ -1785,6 +2019,11 @@ async fn handle_head_manifest(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
+    // Virtual repos delegate to per-member resolution.
+    if repo.repo_type == RepositoryType::Virtual {
+        return resolve_virtual_manifest(state, &repo, reference, false).await;
+    }
+
     // Reference can be a tag or a digest. Look up locally first.
     let local_result: Option<(String, String)> = if is_digest_reference(reference) {
         sqlx::query!(
@@ -1886,6 +2125,11 @@ async fn handle_get_manifest(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(&host, Some(&scope));
+    }
+
+    // Virtual repos delegate to per-member resolution.
+    if repo.repo_type == RepositoryType::Virtual {
+        return resolve_virtual_manifest(state, &repo, reference, true).await;
     }
 
     let local_result: Option<(String, String)> = if is_digest_reference(reference) {
@@ -5267,6 +5511,485 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+
+    // -----------------------------------------------------------------------
+    // member_as_oci_repo_info: virtual member → OciRepoInfo adapter
+    // -----------------------------------------------------------------------
+
+    fn fake_member_repo(
+        key: &str,
+        repo_type: crate::models::repository::RepositoryType,
+        upstream_url: Option<&str>,
+        is_public: bool,
+    ) -> crate::models::repository::Repository {
+        let now = chrono::Utc::now();
+        crate::models::repository::Repository {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: crate::models::repository::RepositoryFormat::Docker,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: format!("/data/{}", key),
+            upstream_url: upstream_url.map(str::to_string),
+            is_public,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::LocalOnly,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_member_as_oci_repo_info_local() {
+        let member = fake_member_repo(
+            "konflux-step-images",
+            crate::models::repository::RepositoryType::Local,
+            None,
+            true,
+        );
+        let info = member_as_oci_repo_info(&member, "library/nginx");
+
+        assert_eq!(info.id, member.id);
+        assert_eq!(info.key, "konflux-step-images");
+        assert_eq!(info.repo_type, "local");
+        assert!(info.upstream_url.is_none());
+        assert!(info.is_public);
+        assert_eq!(info.image, "library/nginx");
+        assert_eq!(info.location.backend, "filesystem");
+        assert_eq!(info.location.path, "/data/konflux-step-images");
+    }
+
+    #[test]
+    fn test_member_as_oci_repo_info_remote() {
+        let member = fake_member_repo(
+            "docker-hub",
+            crate::models::repository::RepositoryType::Remote,
+            Some("https://registry-1.docker.io"),
+            true,
+        );
+        let info = member_as_oci_repo_info(&member, "nginx");
+
+        assert_eq!(info.repo_type, "remote");
+        assert_eq!(
+            info.upstream_url.as_deref(),
+            Some("https://registry-1.docker.io")
+        );
+        // The adapter must round-trip the comparison helpers used in
+        // try_upstream_fetch — these are the very checks that decide whether
+        // upstream proxying runs at all.
+        assert!(info.repo_type == RepositoryType::Remote);
+        assert!(info.repo_type != RepositoryType::Local);
+        assert!(info.repo_type != RepositoryType::Virtual);
+    }
+
+    #[test]
+    fn test_member_as_oci_repo_info_preserves_image_path() {
+        // The virtual handler addresses members by the *virtual* image path
+        // (e.g. `org/team/app`). The adapter must copy it verbatim so the
+        // downstream local-lookup and upstream-proxy code paths see the same
+        // value that the original `resolve_repo` produced.
+        let member = fake_member_repo(
+            "m",
+            crate::models::repository::RepositoryType::Local,
+            None,
+            false,
+        );
+        let info = member_as_oci_repo_info(&member, "team/app");
+        assert_eq!(info.image, "team/app");
+        assert!(!info.is_public);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual repository resolution for OCI manifests and blobs. DB-backed
+// because the flow is a SELECT-iterate-merge over `repositories`,
+// `virtual_repo_members`, `oci_tags`/`oci_blobs`, plus a real filesystem
+// read against the member's storage backend.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod virtual_resolution_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use sha2::{Digest, Sha256};
+
+    /// Insert a `virtual_repo_members` row linking `virtual_id` to
+    /// `member_id` at the given priority.
+    async fn link_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("link member");
+    }
+
+    /// Seed an `oci_tags` row plus the manifest blob on the member's
+    /// filesystem storage so `resolve_virtual_manifest` can find it.
+    async fn seed_manifest(
+        pool: &PgPool,
+        repo_id: Uuid,
+        storage_dir: &std::path::Path,
+        image: &str,
+        tag: &str,
+        content: &[u8],
+        content_type: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let digest = format!("sha256:{:x}", hasher.finalize());
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .bind(&digest)
+        .bind(content_type)
+        .execute(pool)
+        .await
+        .expect("insert oci_tags");
+
+        let manifest_dir = storage_dir.join("oci-manifests");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        std::fs::write(manifest_dir.join(&digest), content).expect("write manifest blob");
+
+        digest
+    }
+
+    /// Seed an `oci_blobs` row plus the actual blob on the member's
+    /// filesystem storage.
+    async fn seed_blob(
+        pool: &PgPool,
+        repo_id: Uuid,
+        storage_dir: &std::path::Path,
+        content: &[u8],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let digest = format!("sha256:{:x}", hasher.finalize());
+        let storage_key = format!("oci-blobs/{}", digest);
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(content.len() as i64)
+        .bind(&storage_key)
+        .execute(pool)
+        .await
+        .expect("insert oci_blobs");
+
+        let blob_dir = storage_dir.join("oci-blobs");
+        std::fs::create_dir_all(&blob_dir).expect("create blob dir");
+        std::fs::write(blob_dir.join(&digest), content).expect("write blob");
+
+        digest
+    }
+
+    /// Build an `OciRepoInfo` view of a freshly-created virtual repository
+    /// with the given image path.
+    fn virtual_info(virtual_id: Uuid, virtual_key: &str, image: &str) -> OciRepoInfo {
+        OciRepoInfo {
+            id: virtual_id,
+            key: virtual_key.to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: "/unused-virtual-storage".to_string(),
+            },
+            repo_type: "virtual".to_string(),
+            upstream_url: None,
+            is_public: true,
+            image: image.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_manifest_returns_404_when_no_members() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let state = tdh::build_state(pool.clone(), v_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_manifest(&state, &info, "latest", true).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Cleanup
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(v_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&v_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_manifest_finds_tag_in_hosted_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let (m_id, _m_key, m_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        link_member(&pool, v_id, m_id, 0).await;
+
+        let manifest_body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[]}"#;
+        let expected_digest = seed_manifest(
+            &pool,
+            m_id,
+            &m_dir,
+            "alpine",
+            "latest",
+            manifest_body,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+
+        let state = tdh::build_state(pool.clone(), m_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_manifest(&state, &info, "latest", true).await;
+        let status = resp.status();
+        let digest_hdr = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .map(|v| v.to_str().unwrap().to_string());
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+
+        // Cleanup before asserting so a stuck row doesn't survive a panic.
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[v_id, m_id][..])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&m_dir);
+        let _ = std::fs::remove_dir_all(&v_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(digest_hdr.as_deref(), Some(expected_digest.as_str()));
+        assert_eq!(
+            ct.as_deref(),
+            Some("application/vnd.oci.image.manifest.v1+json")
+        );
+        assert_eq!(body.as_ref(), manifest_body.as_ref());
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_manifest_head_omits_body() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let (m_id, _m_key, m_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        link_member(&pool, v_id, m_id, 0).await;
+
+        let manifest_body = b"{\"x\":1}";
+        let _ = seed_manifest(
+            &pool,
+            m_id,
+            &m_dir,
+            "alpine",
+            "latest",
+            manifest_body,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+
+        let state = tdh::build_state(pool.clone(), m_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_manifest(&state, &info, "latest", false).await;
+        let status = resp.status();
+        let len_hdr = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[v_id, m_id][..])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&m_dir);
+        let _ = std::fs::remove_dir_all(&v_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        // Content-Length still reflects the real manifest size (per OCI spec).
+        assert_eq!(len_hdr.as_deref(), Some("7"));
+        // Body is empty for HEAD requests.
+        assert!(body.is_empty(), "HEAD must not include a response body");
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_manifest_falls_through_to_next_member_on_miss() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        // First (priority 0) member is empty — no oci_tags row. Second
+        // (priority 1) member holds the manifest. The iterator must skip
+        // the miss and return the hit.
+        let (m_empty_id, _, m_empty_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let (m_hit_id, _, m_hit_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        link_member(&pool, v_id, m_empty_id, 0).await;
+        link_member(&pool, v_id, m_hit_id, 1).await;
+
+        let manifest_body = b"manifest-bytes";
+        let _ = seed_manifest(
+            &pool,
+            m_hit_id,
+            &m_hit_dir,
+            "nginx",
+            "1",
+            manifest_body,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+
+        let state = tdh::build_state(pool.clone(), m_hit_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "nginx");
+
+        let resp = resolve_virtual_manifest(&state, &info, "1", true).await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[v_id, m_empty_id, m_hit_id][..])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&m_empty_dir);
+        let _ = std::fs::remove_dir_all(&m_hit_dir);
+        let _ = std::fs::remove_dir_all(&v_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), manifest_body.as_ref());
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_blob_returns_404_when_no_members() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let state = tdh::build_state(pool.clone(), v_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_blob(
+            &state,
+            &info,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(v_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&v_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_blob_finds_digest_in_hosted_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let (m_id, _, m_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        link_member(&pool, v_id, m_id, 0).await;
+
+        let blob_content = b"\x1f\x8b\x08fake-layer-bytes";
+        let digest = seed_blob(&pool, m_id, &m_dir, blob_content).await;
+
+        let state = tdh::build_state(pool.clone(), m_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_blob(&state, &info, &digest, true).await;
+        let status = resp.status();
+        let digest_hdr = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[v_id, m_id][..])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&m_dir);
+        let _ = std::fs::remove_dir_all(&v_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(digest_hdr.as_deref(), Some(digest.as_str()));
+        assert_eq!(body.as_ref(), blob_content.as_ref());
+    }
+
+    #[tokio::test]
+    async fn resolve_virtual_blob_head_omits_body() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (v_id, v_key, v_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        let (m_id, _, m_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        link_member(&pool, v_id, m_id, 0).await;
+
+        let blob_content = b"abc";
+        let digest = seed_blob(&pool, m_id, &m_dir, blob_content).await;
+
+        let state = tdh::build_state(pool.clone(), m_dir.to_str().unwrap());
+        let info = virtual_info(v_id, &v_key, "alpine");
+
+        let resp = resolve_virtual_blob(&state, &info, &digest, false).await;
+        let status = resp.status();
+        let len_hdr = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[v_id, m_id][..])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&m_dir);
+        let _ = std::fs::remove_dir_all(&v_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(len_hdr.as_deref(), Some("3"));
+        assert!(body.is_empty());
     }
 }
 
