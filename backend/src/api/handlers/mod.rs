@@ -100,6 +100,8 @@ pub mod auth;
 pub mod builds;
 pub mod cargo;
 pub mod chef;
+pub mod ci_auth;
+pub mod ci_auth_admin;
 pub mod cocoapods;
 pub mod composer;
 pub mod conan;

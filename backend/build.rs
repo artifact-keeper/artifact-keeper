@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
         .out_dir(&out_dir)
-        .compile_protos(&["proto/sbom.proto"], &["proto"])?;
+        .compile_protos(&["proto/sbom.proto"], &["proto", "/usr/local/include"])?;
 
     let git_sha = std::env::var("GIT_SHA")
         .ok()
