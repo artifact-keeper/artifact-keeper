@@ -104,6 +104,8 @@ async-trait = "0.1"
 async-stream = "0.3"
 hex = "0.4"
 rand = "0.9"
+rand08 = { package = "rand", version = "0.8" }
+pgp = "0.14.2"
 
 # Format parsing
 quick-xml = { version = "0.39", features = ["serialize"] }

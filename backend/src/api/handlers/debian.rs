@@ -26,7 +26,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -315,50 +314,6 @@ async fn generate_release_content(
     );
 
     Ok(release)
-}
-
-// ---------------------------------------------------------------------------
-// PGP armor helpers
-// ---------------------------------------------------------------------------
-
-/// Wrap a raw signature in PGP detached signature armor format.
-fn pgp_armor_signature(signature: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    // Wrap base64 at 76 characters per line (PGP convention)
-    let wrapped: Vec<&str> = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-    format!(
-        "-----BEGIN PGP SIGNATURE-----\n\
-         \n\
-         {}\n\
-         -----END PGP SIGNATURE-----\n",
-        wrapped.join("\n"),
-    )
-}
-
-/// Produce a GPG-style clearsigned document from content and signature.
-fn pgp_clearsign(content: &str, signature: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let wrapped: Vec<&str> = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-    format!(
-        "-----BEGIN PGP SIGNED MESSAGE-----\n\
-         Hash: SHA256\n\
-         \n\
-         {content}\
-         -----BEGIN PGP SIGNATURE-----\n\
-         \n\
-         {sig}\n\
-         -----END PGP SIGNATURE-----\n",
-        content = content,
-        sig = wrapped.join("\n"),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -682,15 +637,17 @@ async fn in_release_file(
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, release.as_bytes())
+    let body = signing_svc
+        .sign_openpgp_cleartext(repo.id, &release)
         .await
-        .unwrap_or(None);
-
-    let body = match signature {
-        Some(sig) => pgp_clearsign(&release, &sig),
-        None => release,
-    };
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to sign InRelease: {}", e),
+            )
+                .into_response()
+        })?
+        .unwrap_or(release);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -719,19 +676,22 @@ async fn release_gpg(
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let signature = signing_svc
-        .sign_data(repo.id, release.as_bytes())
+        .sign_openpgp_detached(repo.id, release.as_bytes())
         .await
-        .unwrap_or(None);
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to sign Release.gpg: {}", e),
+            )
+                .into_response()
+        })?;
 
     match signature {
-        Some(sig) => {
-            let armored = pgp_armor_signature(&sig);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/pgp-signature")
-                .body(Body::from(armored))
-                .unwrap())
-        }
+        Some(armored) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/pgp-signature")
+            .body(Body::from(armored))
+            .unwrap()),
         None => Err((
             StatusCode::NOT_FOUND,
             "No signing key configured for this repository",
@@ -1915,59 +1875,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pgp_armor_signature
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_armor_signature_basic() {
-        let sig_data = b"test signature data";
-        let armored = pgp_armor_signature(sig_data);
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-        let b64 = base64::engine::general_purpose::STANDARD.encode(sig_data);
-        assert!(armored.contains(&b64));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_empty() {
-        let armored = pgp_armor_signature(b"");
-        assert!(armored.contains("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.contains("-----END PGP SIGNATURE-----"));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_long_data_wraps() {
-        let sig_data = vec![0u8; 100];
-        let armored = pgp_armor_signature(&sig_data);
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-    }
-
-    // -----------------------------------------------------------------------
-    // pgp_clearsign
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_clearsign_basic() {
-        let content = "Origin: artifact-keeper\nSuite: stable\n";
-        let sig_data = b"signature";
-        let result = pgp_clearsign(content, sig_data);
-        assert!(result.starts_with("-----BEGIN PGP SIGNED MESSAGE-----\n"));
-        assert!(result.contains("Hash: SHA256\n"));
-        assert!(result.contains(content));
-        assert!(result.contains("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(result.contains("-----END PGP SIGNATURE-----\n"));
-    }
-
-    #[test]
-    fn test_pgp_clearsign_preserves_content() {
-        let content = "Line 1\nLine 2\nLine 3\n";
-        let sig = b"sig";
-        let result = pgp_clearsign(content, sig);
-        assert!(result.contains("Line 1\nLine 2\nLine 3\n"));
-    }
-
-    // -----------------------------------------------------------------------
     // Upstream path construction for APT remote proxy (#674)
     // -----------------------------------------------------------------------
 
@@ -2332,5 +2239,123 @@ mod tests {
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).unwrap();
         assert_eq!(decompressed, text.as_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure helpers added alongside the OpenPGP signing flow (#1236). These
+    // are the path-shape parsers and string builders that the Debian
+    // handlers exercise before they touch the DB or storage; locking them
+    // down keeps the per-PR coverage gate above the 70% floor and pins
+    // exact behavior so a future refactor of the dists/* route shape (or
+    // the `binary-{arch}` segment convention) shows up as a test break.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_deb_filename_standard() {
+        let info = parse_deb_filename("hello_2.10-2_amd64.deb").expect("standard shape parses");
+        assert_eq!(info.name, "hello");
+        assert_eq!(info.version, "2.10-2");
+        assert_eq!(info.arch, "amd64");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_missing_deb_suffix() {
+        // No .deb suffix at all -- strip_suffix returns None.
+        assert!(parse_deb_filename("hello_2.10-2_amd64").is_none());
+    }
+
+    #[test]
+    fn test_parse_deb_filename_only_two_segments() {
+        // Two underscores would be required; this has one.
+        assert!(parse_deb_filename("hello_amd64.deb").is_none());
+    }
+
+    #[test]
+    fn test_parse_deb_filename_version_may_contain_underscores() {
+        // splitn(3) caps at three pieces, so any extra underscores in
+        // segment 3 become part of the `arch` field. This pins the
+        // splitn behaviour so a future refactor that bumps the split
+        // depth shows up as an explicit test break.
+        let info = parse_deb_filename("pkg_1.0_amd64_extra.deb").expect("splitn yields 3 segments");
+        assert_eq!(info.name, "pkg");
+        assert_eq!(info.version, "1.0");
+        assert_eq!(info.arch, "amd64_extra");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_present() {
+        assert_eq!(strip_binary_arch_prefix("binary-amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_absent() {
+        // Without the binary- prefix the input is returned unchanged.
+        assert_eq!(strip_binary_arch_prefix("amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_only_prefix() {
+        // Edge case: the prefix is the entire input.
+        assert_eq!(strip_binary_arch_prefix("binary-"), "");
+    }
+
+    #[test]
+    fn test_packages_index_suffix_plain() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", ""),
+            "main/binary-amd64/Packages"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_compressed() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", "gz"),
+            "main/binary-amd64/Packages.gz"
+        );
+        assert_eq!(
+            packages_index_suffix("contrib", "binary-arm64", "xz"),
+            "contrib/binary-arm64/Packages.xz"
+        );
+    }
+
+    #[test]
+    fn test_parse_packages_request_wrong_segment_count() {
+        // Two segments -- caller should fall through to the upstream
+        // proxy, not handle it as a Packages request.
+        assert!(parse_packages_request("main/Packages").is_none());
+        // Four segments.
+        assert!(parse_packages_request("main/binary-amd64/extra/Packages").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_missing_binary_prefix() {
+        // Middle segment must start with "binary-"; "src-" is a real
+        // Debian segment but is not handled here.
+        assert!(parse_packages_request("main/src-amd64/Sources").is_none());
+        assert!(parse_packages_request("main/amd64/Packages").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_unknown_extension() {
+        // Anything other than Packages / Packages.gz / Packages.xz
+        // is None so the caller proxies to upstream.
+        assert!(parse_packages_request("main/binary-amd64/Packages.bz2").is_none());
+        assert!(parse_packages_request("main/binary-amd64/Release").is_none());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_changed() {
+        // Non-empty bytes + changed -> Some(snippet) so the caller emits
+        // a webhook payload. Empty bytes still returns Some but with the
+        // empty string.
+        let payload = release_invalidation_payload(true, b"foo bar baz");
+        assert!(payload.is_some());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_unchanged_is_none() {
+        // changed = false -> None; no webhook fires.
+        assert!(release_invalidation_payload(false, b"any content").is_none());
     }
 }

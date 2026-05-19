@@ -63,15 +63,18 @@ for r in repos:
     fi
 }
 
-# Create a signing key for a repo: api_create_signing_key
-# Uses $REPO_ID, exports $SIGNING_KEY_ID
+# Create a signing key for a repo: api_create_signing_key [key_type]
+# Uses $REPO_ID, exports $SIGNING_KEY_ID. key_type defaults to rsa for
+# existing system-package tests; Debian passes gpg so apt receives real
+# OpenPGP Release metadata signatures.
 api_create_signing_key() {
-    log "Creating RSA-4096 signing key for repo $REPO_ID..."
+    local key_type="${1:-rsa}"
+    log "Creating $key_type RSA-4096 signing key for repo $REPO_ID..."
     local resp
     resp=$(curl -sf -X POST "$BACKEND_URL/api/v1/signing/keys" \
         -H "Authorization: Bearer $TOKEN" \
         -H 'Content-Type: application/json' \
-        -d "{\"name\":\"e2e-signing-key\",\"key_type\":\"rsa\",\"algorithm\":\"rsa4096\",\"repository_id\":\"$REPO_ID\"}")
+        -d "{\"name\":\"e2e-signing-key\",\"key_type\":\"$key_type\",\"algorithm\":\"rsa4096\",\"repository_id\":\"$REPO_ID\"}")
     SIGNING_KEY_ID=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null) \
         || SIGNING_KEY_ID=$(echo "$resp" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     [ -n "$SIGNING_KEY_ID" ] || fail "Failed to create signing key"
@@ -92,11 +95,11 @@ api_configure_signing() {
 }
 
 # Full setup: login + create repo + create key + configure signing
-# Usage: setup_signed_repo <repo_key> <format>
+# Usage: setup_signed_repo <repo_key> <format> [key_type]
 setup_signed_repo() {
     api_login
     api_create_repo "$1" "$2"
-    api_create_signing_key
+    api_create_signing_key "${3:-rsa}"
     api_configure_signing
 }
 
