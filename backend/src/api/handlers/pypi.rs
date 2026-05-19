@@ -342,12 +342,11 @@ async fn simple_project(
                     .unwrap());
             }
         }
-        // For virtual repos, iterate through members in priority order.
-        // Local/staging members are queried via DB; remote members use proxy.
+        // For virtual repos, iterate through ALL members and union their
+        // entries — both local DB rows and remote proxy responses — so a
+        // package that exists partially in a local member doesn't shadow
+        // the rest of upstream. See #1230.
         if repo.repo_type == RepositoryType::Virtual {
-            // Per-member upstream_url adjustment happens inside the loop below
-            // so each remote member can carry its own `…/simple` suffix without
-            // polluting siblings.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
             if members.is_empty() {
@@ -357,9 +356,10 @@ async fn simple_project(
                 );
             }
 
+            let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
+            let mut remote_response: Option<(Bytes, Option<String>)> = None;
+
             for member in &members {
-                // For local and staging repos, query the DB for matching
-                // artifacts, the same way we do for the top-level repo.
                 if member.repo_type == RepositoryType::Local
                     || member.repo_type == RepositoryType::Staging
                 {
@@ -381,29 +381,26 @@ async fn simple_project(
                     .await
                     .map_err(map_db_err)?;
 
-                    if !member_rows.is_empty() {
-                        let member_artifacts: Vec<SimpleProjectArtifact> = member_rows
-                            .into_iter()
-                            .map(|a| SimpleProjectArtifact {
-                                path: a.path,
-                                version: a.version,
-                                size_bytes: a.size_bytes,
-                                checksum_sha256: a.checksum_sha256,
-                                metadata: a.metadata,
-                            })
-                            .collect();
-                        return build_simple_project_response(
-                            &headers,
-                            &repo_key,
-                            &normalized,
-                            &member_artifacts,
-                        );
-                    }
+                    local_artifacts.extend(member_rows.into_iter().map(|a| {
+                        SimpleProjectArtifact {
+                            path: a.path,
+                            version: a.version,
+                            size_bytes: a.size_bytes,
+                            checksum_sha256: a.checksum_sha256,
+                            metadata: a.metadata,
+                        }
+                    }));
                     continue;
                 }
 
-                // For remote repos, proxy the simple index from upstream.
                 if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                // Only take the first remote response; multiple remote
+                // members in one virtual is rare, and merging two upstream
+                // /simple/<pkg>/ listings deterministically is out of scope
+                // for this fix.
+                if remote_response.is_some() {
                     continue;
                 }
                 let Some(ref upstream_url) = member.upstream_url else {
@@ -426,21 +423,7 @@ async fn simple_project(
 
                 match result {
                     Ok((content, content_type)) => {
-                        let ct =
-                            content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
-                        let body = if ct.contains("text/html") {
-                            let html = String::from_utf8_lossy(&content);
-                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
-                            Body::from(rewritten)
-                        } else {
-                            Body::from(content)
-                        };
-
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, ct)
-                            .body(body)
-                            .unwrap());
+                        remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
                         debug!(
@@ -451,10 +434,46 @@ async fn simple_project(
                 }
             }
 
-            return Err(AppError::NotFound(
-                "Package not found in any member repository".to_string(),
-            )
-            .into_response());
+            // Render the union.
+            match (local_artifacts.is_empty(), remote_response) {
+                (true, None) => {
+                    return Err(AppError::NotFound(
+                        "Package not found in any member repository".to_string(),
+                    )
+                    .into_response());
+                }
+                (false, None) => {
+                    return build_simple_project_response(
+                        &headers,
+                        &repo_key,
+                        &normalized,
+                        &local_artifacts,
+                    );
+                }
+                (_, Some((content, content_type))) => {
+                    let ct =
+                        content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                    let body = if ct.contains("text/html") {
+                        let html = String::from_utf8_lossy(&content);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let merged = merge_local_into_remote_simple_html(
+                            &rewritten,
+                            &repo_key,
+                            &normalized,
+                            &local_artifacts,
+                        );
+                        Body::from(merged)
+                    } else {
+                        Body::from(content)
+                    };
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .body(body)
+                        .unwrap());
+                }
+            }
         }
 
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -569,6 +588,68 @@ fn build_simple_project_response(
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap())
+}
+
+/// Splice local-member entries into a remote-member PEP 503 HTML response so
+/// the union is visible through the virtual repo. Entries already present in
+/// the remote response (matched by filename, the anchor's inner text per
+/// PEP 503) are skipped to preserve idempotence when the same file exists in
+/// both members.
+fn merge_local_into_remote_simple_html(
+    remote_html: &str,
+    repo_key: &str,
+    normalized: &str,
+    local: &[SimpleProjectArtifact],
+) -> String {
+    if local.is_empty() {
+        return remote_html.to_string();
+    }
+
+    static ANCHOR_FILENAME: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?s)<a\s[^>]*>([^<]+)</a>").unwrap());
+    let existing: std::collections::HashSet<&str> = ANCHOR_FILENAME
+        .captures_iter(remote_html)
+        .map(|c| c.get(1).unwrap().as_str().trim())
+        .collect();
+
+    let mut local_lines = String::new();
+    for a in local {
+        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(filename) {
+            continue;
+        }
+        let url = format!(
+            "/pypi/{}/simple/{}/{}#sha256={}",
+            repo_key, normalized, filename, a.checksum_sha256
+        );
+        let requires_python = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pkg_info"))
+            .and_then(|pi| pi.get("requires_python"))
+            .and_then(|v| v.as_str());
+        let rp_attr = requires_python
+            .map(|rp| format!(" data-requires-python=\"{}\"", html_escape(rp)))
+            .unwrap_or_default();
+        local_lines.push_str(&format!(
+            "<a href=\"{}\"{}>{}</a><br/>\n",
+            url, rp_attr, filename
+        ));
+    }
+
+    if local_lines.is_empty() {
+        return remote_html.to_string();
+    }
+
+    if let Some(idx) = remote_html.rfind("</body>") {
+        let mut out = String::with_capacity(remote_html.len() + local_lines.len());
+        out.push_str(&remote_html[..idx]);
+        out.push_str(&local_lines);
+        out.push_str(&remote_html[idx..]);
+        out
+    } else {
+        format!("{}{}", remote_html, local_lines)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2849,5 +2930,133 @@ mod tests {
         // (simple_root uses BTreeSet). This test documents the contract.
         let count = html.matches("/pypi/pypi-virtual/simple/flask/").count();
         assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_local_into_remote_simple_html — #1230 virtual union behavior
+    // -----------------------------------------------------------------------
+
+    fn remote_html_with(entries: &[(&str, Option<&str>)]) -> String {
+        let mut s = String::from(
+            "<!DOCTYPE html>\n<html>\n<head>\n\
+             <meta name=\"pypi:repository-version\" content=\"1.0\"/>\n\
+             <title>Links for pkg</title>\n</head>\n<body>\n\
+             <h1>Links for pkg</h1>\n",
+        );
+        for (filename, rp) in entries {
+            let rp_attr = rp
+                .map(|v| format!(" data-requires-python=\"{}\"", v))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "<a href=\"/pypi/v/simple/pkg/{}\"{}>{}</a><br/>\n",
+                filename, rp_attr, filename
+            ));
+        }
+        s.push_str("</body>\n</html>\n");
+        s
+    }
+
+    #[test]
+    fn test_merge_local_appends_entries_absent_from_remote() {
+        // Reproducer for #1230: local member has versions upstream does not
+        // (or in our prod case, upstream has versions the local subset
+        // shadows — symmetric situation, same fix). The merged response
+        // must contain entries from both sides.
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", Some("&gt;=3.8"))]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "ffeeddccbbaa99887766554433221100".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+
+        assert!(merged.contains("pkg-1.0.0.tar.gz"), "remote entry preserved");
+        assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"), "local entry spliced in");
+        assert!(
+            merged.contains("/pypi/virt/simple/pkg/pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100"),
+            "local URL uses the virtual repo key and carries the sha256 fragment"
+        );
+        // Spliced before </body> so the document is still well-formed.
+        let body_idx = merged.find("</body>").expect("</body> still present");
+        let local_idx = merged.find("pkg-2.0.0-py3-none-any.whl").unwrap();
+        assert!(local_idx < body_idx, "local entries must precede </body>");
+    }
+
+    #[test]
+    fn test_merge_local_skips_filenames_already_in_remote() {
+        // If a file with the same filename exists in both members, the
+        // remote entry wins (idempotence — no duplicate <a> emitted).
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let count = merged.matches("pkg-1.0.0.tar.gz</a>").count();
+        assert_eq!(count, 1, "filename present exactly once after dedupe");
+        // The local sha256 must NOT appear — the remote entry is canonical.
+        assert!(
+            !merged.contains("sha256=0000000000000000000000000000000000000000000000000000000000000000"),
+            "local sha256 not spliced in when filename dedupes against remote"
+        );
+    }
+
+    #[test]
+    fn test_merge_empty_local_returns_remote_unchanged() {
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[]);
+        assert_eq!(merged, remote);
+    }
+
+    #[test]
+    fn test_merge_emits_data_requires_python_attribute() {
+        let remote = remote_html_with(&[]);
+        let metadata = serde_json::json!({
+            "pkg_info": { "requires_python": ">=3.10,<3.14" }
+        });
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-3.0.0.tar.gz".to_string(),
+            version: Some("3.0.0".to_string()),
+            size_bytes: 256,
+            checksum_sha256: "deadbeef".to_string(),
+            metadata: Some(metadata),
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(
+            merged.contains("data-requires-python=\"&gt;=3.10,&lt;3.14\""),
+            "requires_python is HTML-escaped: {}",
+            merged
+        );
+    }
+
+    #[test]
+    fn test_merge_handles_remote_html_without_body_close() {
+        // Defensive: if upstream omits </body> (malformed but seen in the
+        // wild on some private indexes) the helper appends rather than
+        // dropping local entries.
+        let remote = String::from(
+            "<!DOCTYPE html>\n<html>\n<head></head>\n<body>\n\
+             <a href=\"/pypi/v/simple/pkg/pkg-1.0.0.tar.gz\">pkg-1.0.0.tar.gz</a><br/>\n",
+        );
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "cafebabe".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(merged.contains("pkg-1.0.0.tar.gz"));
+        assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
     }
 }
