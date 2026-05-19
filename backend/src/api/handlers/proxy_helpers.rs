@@ -354,6 +354,28 @@ pub async fn proxy_fetch(
         .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
+/// Variant of [`proxy_fetch`] that forwards an `Accept` header to the upstream.
+///
+/// Used by OCI manifest GET/HEAD where the upstream registry needs the
+/// client's `Accept` to pick the right manifest representation. `accept = None`
+/// produces a request identical to [`proxy_fetch`], so blob fetches and other
+/// non-negotiated paths can route through this helper without behaviour change.
+pub async fn proxy_fetch_with_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+) -> Result<(Bytes, Option<String>), Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    proxy_service
+        .fetch_artifact_with_accept(&repo, path, accept)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
 /// body in memory (#895). Returns an axum [`Response`] whose body is a
 /// stream the framework drives directly from the upstream HTTP response,
