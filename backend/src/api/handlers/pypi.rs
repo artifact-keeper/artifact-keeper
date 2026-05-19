@@ -451,8 +451,7 @@ async fn simple_project(
                     );
                 }
                 (_, Some((content, content_type))) => {
-                    let ct =
-                        content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                    let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
                     let body = if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
@@ -2973,8 +2972,14 @@ mod tests {
 
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
 
-        assert!(merged.contains("pkg-1.0.0.tar.gz"), "remote entry preserved");
-        assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"), "local entry spliced in");
+        assert!(
+            merged.contains("pkg-1.0.0.tar.gz"),
+            "remote entry preserved"
+        );
+        assert!(
+            merged.contains("pkg-2.0.0-py3-none-any.whl"),
+            "local entry spliced in"
+        );
         assert!(
             merged.contains("/pypi/virt/simple/pkg/pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100"),
             "local URL uses the virtual repo key and carries the sha256 fragment"
@@ -3004,7 +3009,9 @@ mod tests {
         assert_eq!(count, 1, "filename present exactly once after dedupe");
         // The local sha256 must NOT appear — the remote entry is canonical.
         assert!(
-            !merged.contains("sha256=0000000000000000000000000000000000000000000000000000000000000000"),
+            !merged.contains(
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+            ),
             "local sha256 not spliced in when filename dedupes against remote"
         );
     }
