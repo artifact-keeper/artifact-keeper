@@ -1721,66 +1721,38 @@ impl ProxyService {
             .put(metadata_key, Bytes::from(metadata_json))
             .await?;
 
-        // Record the cached artifact in the database so it shows up in
-        // repository listings and storage size calculations.
-        let normalized_path = artifact_path.trim_start_matches('/');
-        let artifact_name = normalized_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(normalized_path);
-        let ct = metadata
-            .content_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        let size = content.len() as i64;
-        let format = sqlx::query_scalar::<_, RepositoryFormat>(
-            "SELECT format FROM repositories WHERE id = $1",
-        )
-        .bind(repository_id)
-        .fetch_optional(&self.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(RepositoryFormat::Generic);
-        let version = extract_version_from_path(&format, normalized_path);
-
-        if let Err(e) = sqlx::query(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                version = COALESCE(EXCLUDED.version, artifacts.version),
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                is_deleted = false,
-                updated_at = NOW()
-            "#,
-        )
-        .bind(repository_id)
-        .bind(normalized_path)
-        .bind(artifact_name)
-        .bind(&version)
-        .bind(size)
-        .bind(&checksum)
-        .bind(&ct)
-        .bind(cache_key)
-        .execute(&self.db)
-        .await
-        {
-            // Log the error but don't fail the cache operation. The content is
-            // already stored and usable; the DB record is a best-effort addition
-            // for listing/size purposes.
-            tracing::warn!(
-                "Failed to record cached artifact in database for {}: {}",
-                cache_key,
-                e
-            );
-        }
+        // Proxy-cached content is intentionally NOT recorded in the
+        // `artifacts` table (issue #1278). The previous behaviour inserted
+        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
+        // alongside the global-backend write above, which caused every
+        // subsequent format-handler read to take the
+        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
+        // path -- a per-repo `FilesystemStorage` rooted at
+        // `repo.storage_path` that resolves to a doubled-prefix path
+        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
+        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
+        // object-store backends were unaffected because their registry
+        // shares the same instance regardless of `location.path`.
+        //
+        // The cached body and metadata sidecar are still on disk under
+        // `self.storage` (the global default). The format-handler hot path
+        // already checks the proxy cache via `proxy_check_cache`
+        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
+        // falling through to the upstream fetch, so cache hits are served
+        // through that path with no `artifacts` row needed. Reads through
+        // the global backend match the writes above.
+        //
+        // Tradeoff: proxy-cached items no longer surface in the
+        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
+        // counted toward `storage_used_bytes`. That UX/accounting gap is
+        // tracked separately; correctness (no more 500s on cached reads)
+        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
+        // versions stay in `artifacts` and continue to surface in
+        // listings until they are explicitly invalidated, which is a
+        // graceful degradation, not a regression.
+        let _ = repository_id;
+        let _ = artifact_path;
+        let _ = checksum;
 
         tracing::debug!(
             "Cached artifact {} ({} bytes, expires at {})",
@@ -1903,6 +1875,13 @@ impl ProxyService {
 /// function delegates to format-specific parsing logic and returns `None`
 /// for metadata files, index pages, or paths where the version cannot be
 /// determined.
+///
+/// Currently unused: the previous caller in `cache_artifact` was removed
+/// when proxy-cached items stopped being inserted into the `artifacts`
+/// table (issue #1278). Kept around because the version-extraction logic
+/// is broadly useful and tests still exercise it; if a future cache
+/// listing/UX feature wants per-version metadata it should call this.
+#[allow(dead_code)]
 pub(crate) fn extract_version_from_path(format: &RepositoryFormat, path: &str) -> Option<String> {
     let path = path.trim_start_matches('/');
 
@@ -5051,5 +5030,54 @@ SHA256:
 
         let (body, _) = result.expect("blob fetch with accept=None must succeed");
         assert_eq!(&body[..], b"blob-bytes");
+    }
+
+    /// Source-level pin for #1278: `cache_artifact` must NOT insert into
+    /// the `artifacts` table. The pre-fix path inserted a row with
+    /// `storage_key = "proxy-cache/<repo_key>/.../__content__"`, which
+    /// then drove `serve_file`'s read through `state.storage_for_repo`
+    /// against a doubled-prefix path and returned HTTP 500 on every
+    /// cached read after the first on filesystem backends.
+    ///
+    /// This meta-test reads the on-disk source of this file and asserts
+    /// the `cache_artifact` function body contains no `INSERT INTO
+    /// artifacts` text. It fails loudly if a future refactor restores
+    /// the insert. The mechanism mirrors the file-text meta-tests
+    /// already used in `auth_service.rs` and `repositories.rs`. If a
+    /// future feature wants proxy-cached items listed alongside hosted
+    /// artifacts, build it via a separate `proxy_cache_artifacts` view
+    /// or table, not by re-inserting here.
+    #[test]
+    fn test_cache_artifact_does_not_insert_into_artifacts_table() {
+        let source = include_str!("proxy_service.rs");
+        let fn_marker = "async fn cache_artifact(";
+        let fn_start = source
+            .find(fn_marker)
+            .expect("cache_artifact function must exist");
+
+        // Walk to the closing `}` at column 0 that ends the function body.
+        // The codebase consistently formats item-level closers at column
+        // zero (see `cargo fmt` enforcement in CI), so a literal `"\n    }\n"`
+        // (four spaces of impl-block indent + line break) marks the end.
+        let after_start = &source[fn_start..];
+        let fn_end_rel = after_start
+            .find("\n    }\n")
+            .expect("cache_artifact must terminate with a column-4 closing brace");
+        let fn_body = &after_start[..fn_end_rel];
+
+        assert!(
+            !fn_body
+                .to_ascii_uppercase()
+                .contains("INSERT INTO ARTIFACTS"),
+            "cache_artifact MUST NOT INSERT INTO artifacts (#1278). \
+             Pre-fix the proxy cache would record proxy-cached items as \
+             first-class artifacts with `storage_key = \"proxy-cache/...\"`, \
+             which drove every subsequent handler-side \
+             `storage_for_repo(repo.storage_location()).get(&artifact.storage_key)` \
+             read into a doubled-prefix path that 500'd on filesystem backends. \
+             Cached items live on disk under `self.storage` and are served \
+             via `proxy_check_cache` -- they MUST NOT be reintroduced into \
+             the `artifacts` table without an explicit storage-routing redesign."
+        );
     }
 }
