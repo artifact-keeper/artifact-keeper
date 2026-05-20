@@ -1026,9 +1026,19 @@ pub async fn local_fetch_by_name_version(
     Ok((content, Some(artifact.content_type)))
 }
 
-/// Generic local artifact fetch by path suffix (LIKE match).
-/// Used for handlers like npm that query by filename suffix. `path_suffix`
-/// is escaped internally; callers pass raw user input, not pre-escaped.
+/// Generic local artifact fetch by trailing filename.
+/// Used for handlers like npm that query by filename suffix only.
+///
+/// Looks up via the denormalized `filename` column (added in migration
+/// `108_artifacts_filename_index.sql`) so the planner can use the
+/// `idx_artifacts_repo_filename` composite B-tree partial index. Prior
+/// to that migration the query was a leading-wildcard
+/// `path LIKE '%/' || $2`, which the planner had to seq-scan within
+/// the repo's row range — fine on small repos, 3-6 s per call on
+/// populated ones. See #1266 for the prod logs that motivated the
+/// denormalization.
+///
+/// Callers pass the bare filename (e.g. `pkg-1.0.0.tgz`), not a path.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -1038,11 +1048,11 @@ pub async fn local_fetch_by_path_suffix(
 ) -> Result<(Bytes, Option<String>), Response> {
     let path: String = sqlx::query_scalar(
         "SELECT path FROM artifacts \
-         WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\' AND is_deleted = false \
+         WHERE repository_id = $1 AND filename = $2 AND is_deleted = false \
          LIMIT 1",
     )
     .bind(repo_id)
-    .bind(super::escape_like_literal(path_suffix))
+    .bind(path_suffix)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
@@ -1509,16 +1519,20 @@ pub struct LocalArtifactHit {
     pub storage_key: String,
 }
 
-/// Look up a single artifact by trailing filename match within a repository.
+/// Look up a single artifact by trailing filename within a repository.
 ///
-/// Runs `SELECT ... WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\'`
-/// against `repository_id`, escaping `path_suffix` against `%` / `_` / `\`.
+/// Runs `SELECT ... WHERE repository_id = $1 AND filename = $2` against the
+/// denormalized `filename` column (added in migration
+/// `108_artifacts_filename_index.sql`), which is `STORED GENERATED` from
+/// `regexp_replace(path, '^.*/', '')` so it self-maintains on every
+/// INSERT/UPDATE. The composite partial index
+/// `idx_artifacts_repo_filename (repository_id, filename) WHERE is_deleted = false`
+/// turns this lookup into an index-only scan, removing the leading-wildcard
+/// LIKE seq-scan that was the hot-path latency source (see #1266).
+///
 /// Returns `Ok(Some(hit))` on match, `Ok(None)` on miss, or `Err(response)`
-/// on database failure.
-///
-/// Replaces the duplicated `sqlx::query! r#"... LIKE '%/' || $2 ESCAPE '\'
-/// LIMIT 1 "#` boilerplate that every filename-keyed format download handler
-/// otherwise repeats.
+/// on database failure. Callers pass the bare filename (e.g. `pkg-1.0.0.tgz`),
+/// not a path.
 #[allow(clippy::result_large_err)]
 pub async fn find_local_by_filename_suffix(
     db: &PgPool,
@@ -1530,11 +1544,11 @@ pub async fn find_local_by_filename_suffix(
         "SELECT id, storage_key FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
-           AND path LIKE '%/' || $2 ESCAPE '\\' \
+           AND filename = $2 \
          LIMIT 1",
     )
     .bind(repository_id)
-    .bind(super::escape_like_literal(path_suffix))
+    .bind(path_suffix)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?;
