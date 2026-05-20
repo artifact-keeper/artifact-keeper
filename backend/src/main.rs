@@ -1512,7 +1512,9 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
         {}\
         \n\
           File:      {}\n\
-          Read it:   docker exec artifact-keeper-backend cat {}\n\
+          Read it by exec'ing into the artifact-keeper backend container:\n\
+            Docker:      docker exec artifact-keeper-backend cat {}\n\
+            Kubernetes:  kubectl exec deploy/artifact-keeper-backend -- cat {}\n\
         \n\
           The API is LOCKED until you change this password.\n\
           Open the web UI and log in -- you will be redirected to\n\
@@ -1524,6 +1526,7 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
         \n\
         ===========================================================",
         password_line,
+        password_file.display(),
         password_file.display(),
         password_file.display(),
     );
