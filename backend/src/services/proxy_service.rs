@@ -26,8 +26,14 @@ use crate::services::storage_service::StorageService;
 /// Default cache TTL in seconds (24 hours)
 pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 
-/// HTTP client timeout in seconds
-const HTTP_TIMEOUT_SECS: u64 = 60;
+/// TCP connection establishment timeout in seconds.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Per-read idle timeout in seconds. If no new bytes arrive from
+/// upstream within this window the request is considered stalled.
+/// Unlike `.timeout()` this does NOT cap the total transfer duration,
+/// so large files over slow links are not prematurely killed.
+const READ_TIMEOUT_SECS: u64 = 60;
 
 /// Response from an upstream registry fetch.
 struct UpstreamResponse {
@@ -494,8 +500,8 @@ impl ProxyService {
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
-            .connect_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .read_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
             .user_agent("artifact-keeper-proxy/1.0")
             .build()
             .expect("Failed to create HTTP client");
@@ -2537,8 +2543,9 @@ mod tests {
     }
 
     #[test]
-    fn test_http_timeout_is_60_seconds() {
-        assert_eq!(HTTP_TIMEOUT_SECS, 60);
+    fn test_timeout_constants() {
+        assert_eq!(CONNECT_TIMEOUT_SECS, 10);
+        assert_eq!(READ_TIMEOUT_SECS, 60);
     }
 
     // =======================================================================
