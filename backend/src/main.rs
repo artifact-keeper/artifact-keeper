@@ -176,7 +176,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     } else {
         tracing::info!("Running database migrations...");
         repair_legacy_073_checksum(&db_pool).await?;
-        sqlx::migrate!("./migrations").run(&db_pool).await?;
+        // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
+        // or backfill UPDATEs) take longer than the per-query
+        // `statement_timeout` that operators commonly set on their Postgres
+        // parameter group as an app-query safeguard (10 s on AWS RDS for many
+        // tunings). Acquire a dedicated connection and raise the timeouts
+        // session-locally so the migration runner doesn't share fate with
+        // production query limits. The SET is per-session and is wiped when
+        // the connection is dropped — global limits for normal app queries
+        // are unaffected.
+        let mut conn = db_pool.acquire().await?;
+        sqlx::query("SET statement_timeout = '30min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET lock_timeout = '5min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::migrate!("./migrations").run(&mut *conn).await?;
         tracing::info!("Database migrations complete");
     }
 
