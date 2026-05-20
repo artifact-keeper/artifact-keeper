@@ -190,6 +190,24 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
 /// rejected too (1-second JWT `iat` resolution race; fixes the boundary
 /// bug at the old line 152).
 ///
+/// Callers
+/// -------
+/// * [`AuthService::validate_access_token`] (sync entry point with no
+///   DB access): consults this map directly; the `<=` boundary
+///   semantics above are the load-bearing guarantee.
+/// * gRPC `auth_interceptor` test-mode branch (no DB pool wired): same
+///   sync-only role.
+///
+/// [`is_token_invalidated_replica_safe`] intentionally does NOT call
+/// this helper. The replica-safe path goes through
+/// [`fetch_credential_change_watermark`] which serves the SAME
+/// `invalidation_map` as a 5-second DB-result cache, and the strict `<`
+/// comparator (post-#1248) must win over the `<=` here. Mixing the two
+/// produced a release-gate regression on `v1.2.0-rc.1` where the first
+/// admin request from a fresh non-admin user passed and every
+/// subsequent request inside the cache window was rejected by the
+/// conflated `<=`. Keep this distinction when adding new callers.
+///
 /// In multi-replica deployments this is best-effort: an invalidation fired
 /// on replica A is not visible to replica B until `validate_token` /
 /// `refresh_tokens` consults the DB via [`is_user_credentials_changed_db`].
@@ -320,18 +338,29 @@ async fn fetch_credential_change_watermark(
 /// a moment earlier through normal use. There is no exploitable window.
 ///
 /// Resolution order:
-///   1. Local fast-path map (rejects without a DB round-trip on the same
-///      replica that fired the invalidation).
-///   2. DB watermark (rejects across every replica, regardless of which one
-///      processed the password / TOTP / deactivation change).
+///   1. DB watermark, served from the in-memory cache when fresh
+///      (`CREDENTIAL_DB_CACHE_TTL_SECS`) and otherwise via a Postgres
+///      lookup. The cache is the SAME `invalidation_map` written by
+///      [`invalidate_user_tokens`], so an explicit invalidation on this
+///      replica becomes visible on the very next call without a DB
+///      round-trip.
+///
+/// The sync `is_token_invalidated` fast-path is intentionally NOT
+/// consulted here. It uses `<=` semantics, which is correct for the
+/// `validate_access_token` (sync) entry point but conflicts with the
+/// strict `<` used at line `Ok(issued_at < entry.watermark)` below.
+/// Calling it first caused a release-gate regression: the first admin
+/// request from a fresh non-admin user passed (cache empty → DB → cache
+/// populated with the user's `password_changed_at`), and every
+/// subsequent request within the 5s TTL hit the sync map and was
+/// rejected by `<=` even though the async path would have accepted it
+/// (#1248 follow-up; `rbac-tests` saw "first endpoint 403, all
+/// subsequent endpoints 401" against `v1.2.0-rc.1`).
 pub(crate) async fn is_token_invalidated_replica_safe(
     db: &PgPool,
     user_id: Uuid,
     issued_at: i64,
 ) -> Result<bool> {
-    if is_token_invalidated(user_id, issued_at) {
-        return Ok(true);
-    }
     match fetch_credential_change_watermark(db, user_id).await? {
         Some(entry) => {
             // Reject every token (regardless of iat) when the user has been
