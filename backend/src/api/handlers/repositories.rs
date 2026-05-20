@@ -447,6 +447,50 @@ fn validate_cache_ttl(secs: i64) -> bool {
     (1..=2_592_000).contains(&secs)
 }
 
+/// Reject `POST /api/v1/repositories` requests that create a virtual repo
+/// with no members.
+///
+/// Such repos are unusable: every fetch returns
+/// `404 Resource not found: Virtual repository has no members`. Pre-fix
+/// (#1279) the create handler tolerated both broken shapes silently:
+///
+///   * `member_repos` field omitted entirely. Operators who naturally
+///     typed `members: [...]` (the more intuitive name) had their input
+///     dropped by serde because the struct field is `member_repos`, not
+///     `members`, and `CreateRepositoryRequest` does not enable
+///     `deny_unknown_fields`. Result: `member_repos == None`.
+///   * `member_repos: []` (empty array). Result:
+///     `member_repos == Some(vec![])`.
+///
+/// Both shapes produced a successfully-created repo whose every fetch
+/// returned 404. The error surfaces minutes later when someone actually
+/// tries to use the repo, which is the worst possible discoverability.
+///
+/// This validator returns a `400 Bad Request` at create time, naming
+/// the expected field shape and pointing operators at the dedicated
+/// `PUT /repositories/{key}/members` endpoint for post-create updates.
+/// Non-virtual repo_types pass through unchanged.
+fn validate_virtual_repo_member_count(
+    repo_key: &str,
+    repo_type: &RepositoryType,
+    member_repos: Option<&[CreateVirtualMemberInput]>,
+) -> Result<()> {
+    if *repo_type != RepositoryType::Virtual {
+        return Ok(());
+    }
+    let count = member_repos.map_or(0, <[_]>::len);
+    if count == 0 {
+        return Err(AppError::Validation(format!(
+            "Virtual repository '{}' requires at least one member. Provide \
+             `member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]` \
+             in the request body. Use `PUT /api/v1/repositories/{}/members` \
+             after creation to update the member list. (#1279)",
+            repo_key, repo_key
+        )));
+    }
+    Ok(())
+}
+
 /// Reject `cache_ttl` writes against repositories whose proxy code path will
 /// never read the value back. Only Remote (proxy) repositories consume the
 /// `cache_ttl_secs` row written by `set_cache_ttl`; writing it for Local,
@@ -793,6 +837,10 @@ pub async fn create_repository(
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
+    // Validate up-front that virtual repos arrive with at least one member.
+    // See `validate_virtual_repo_member_count` for the rationale (#1279).
+    validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
+
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
         None => state.config.storage_backend.clone(),
@@ -858,41 +906,31 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
-    // Add virtual repository members if provided
+    // Add virtual repository members. The up-front validation above
+    // guarantees `member_repos` is `Some(non-empty)` whenever
+    // `repo_type == Virtual`, so the empty / None arms are unreachable.
     if repo_type == RepositoryType::Virtual {
-        match &payload.member_repos {
-            Some(member_inputs) if !member_inputs.is_empty() => {
-                tracing::info!(
-                    repo_key = %repo.key,
-                    member_count = member_inputs.len(),
-                    "Adding virtual repository members during creation"
-                );
-                for (idx, input) in member_inputs.iter().enumerate() {
-                    let member_repo = service.get_by_key(&input.repo_key).await?;
-                    let priority = resolve_member_priority(input.priority, idx);
-                    tracing::debug!(
-                        virtual_repo = %repo.key,
-                        member_key = %input.repo_key,
-                        priority = priority,
-                        "Adding virtual member"
-                    );
-                    service
-                        .add_virtual_member(repo.id, member_repo.id, Some(priority))
-                        .await?;
-                }
-            }
-            Some(_empty) => {
-                tracing::debug!(
-                    repo_key = %repo.key,
-                    "Virtual repo created with empty member_repos array"
-                );
-            }
-            None => {
-                tracing::debug!(
-                    repo_key = %repo.key,
-                    "Virtual repo created without member_repos field"
-                );
-            }
+        let member_inputs = payload
+            .member_repos
+            .as_deref()
+            .expect("member_repos non-empty validated above");
+        tracing::info!(
+            repo_key = %repo.key,
+            member_count = member_inputs.len(),
+            "Adding virtual repository members during creation"
+        );
+        for (idx, input) in member_inputs.iter().enumerate() {
+            let member_repo = service.get_by_key(&input.repo_key).await?;
+            let priority = resolve_member_priority(input.priority, idx);
+            tracing::debug!(
+                virtual_repo = %repo.key,
+                member_key = %input.repo_key,
+                priority = priority,
+                "Adding virtual member"
+            );
+            service
+                .add_virtual_member(repo.id, member_repo.id, Some(priority))
+                .await?;
         }
     }
 
@@ -6118,6 +6156,121 @@ mod tests {
             range_check_call,
             type_idx,
             range_idx,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual repo member validation (#1279)
+    // -----------------------------------------------------------------------
+
+    fn member(repo_key: &str, priority: i32) -> CreateVirtualMemberInput {
+        CreateVirtualMemberInput {
+            repo_key: repo_key.to_string(),
+            priority,
+        }
+    }
+
+    /// Non-virtual repos pass through the validator unchanged, regardless of
+    /// whether `member_repos` is set. Defensive: callers should not pass
+    /// `member_repos` for non-virtual types, but the validator must be a
+    /// no-op for them either way.
+    #[test]
+    fn test_validate_virtual_repo_member_count_noop_for_non_virtual() {
+        for rt in [
+            RepositoryType::Local,
+            RepositoryType::Remote,
+            RepositoryType::Staging,
+        ] {
+            assert!(
+                validate_virtual_repo_member_count("my-repo", &rt, None).is_ok(),
+                "{:?} with no members must be Ok",
+                &rt
+            );
+            assert!(
+                validate_virtual_repo_member_count("my-repo", &rt, Some(&[])).is_ok(),
+                "{:?} with empty members must be Ok",
+                &rt
+            );
+        }
+    }
+
+    /// A virtual repo with no `member_repos` field at all (the shape that
+    /// happens when an operator types `members: [...]` because the struct
+    /// uses `member_repos` and doesn't `deny_unknown_fields`) must 400 with
+    /// an actionable message.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_none() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None)
+            .expect_err("None members must reject");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("requires at least one member"),
+                    "message should explain the requirement; got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("member_repos"),
+                    "message should name the expected field `member_repos`; got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("pypi"),
+                    "message should echo the offending repo key; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected AppError::Validation, got {:?}", other),
+        }
+    }
+
+    /// A virtual repo created with `member_repos: []` is also unusable. The
+    /// validator must reject this with the same Validation error class as
+    /// the None case so the handler returns 400 (not 500) in both shapes.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_empty() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
+            .expect_err("empty members must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// A virtual repo with one or more members passes validation. Pin both
+    /// the single-member and multi-member cases.
+    #[test]
+    fn test_validate_virtual_repo_member_count_accepts_non_empty() {
+        let one = [member("pypi-local", 1)];
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&one))
+                .is_ok()
+        );
+        let two = [member("pypi-local", 1), member("pypi-remote", 2)];
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&two))
+                .is_ok()
+        );
+    }
+
+    /// Pin the silent-drop deserialization behaviour the validator
+    /// compensates for. If a future PR adds `#[serde(deny_unknown_fields)]`
+    /// to `CreateRepositoryRequest` (the proper hardening), this test will
+    /// fail and signal that the validator can be tightened or rewritten.
+    /// Until then this test documents the trap.
+    #[test]
+    fn test_create_request_silently_drops_unknown_members_field() {
+        let body = serde_json::json!({
+            "key": "pypi",
+            "name": "PyPI Virtual",
+            "format": "pypi",
+            "repo_type": "virtual",
+            "members": ["pypi-local", "pypi-remote"]
+        });
+        let parsed: CreateRepositoryRequest =
+            serde_json::from_value(body).expect("deserialize should succeed");
+        assert!(
+            parsed.member_repos.is_none(),
+            "`members:` (wrong field name) must currently land as None in `member_repos`. \
+             If this fails, deny_unknown_fields was likely added and the validator can \
+             be simplified."
         );
     }
 }
