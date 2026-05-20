@@ -1,42 +1,60 @@
--- Denormalize a `filename` column on `artifacts` so format handlers can
--- look up artifacts by trailing filename in O(log n) instead of a
--- leading-wildcard LIKE seq-scan.
+-- Functional index on `reverse(path)` with `text_pattern_ops` so the
+-- planner can use the index for the leading-wildcard suffix-match
+-- query that `proxy_helpers::find_local_by_filename_suffix` and
+-- `local_fetch_by_path_suffix` run on the artifact-resolve hot path.
 --
--- Hot path is `proxy_helpers::find_local_by_filename_suffix` and
--- `local_fetch_by_path_suffix`, used by every format that resolves an
--- artifact by filename without knowing the full path (cran, rpm,
--- helm, puppet, hex, ansible, rubygems, pypi). Before this change
--- those helpers run `path LIKE '%/' || $2 ESCAPE '\\'`, which the
--- leading wildcard makes un-indexable — Postgres seq-scans every
--- live row in the repo to find the match. On a populated
--- `artifacts` table (10⁶+ rows) each call costs 3-6 s, and under
--- concurrent resolver load the per-request tail latency tips past
--- pip's 15 s timeout. See #1266 for the prod logs.
+-- Before this change the helpers run
 --
--- The new column is `GENERATED ALWAYS AS (regexp_replace(path, '^.*/', '')) STORED`
--- so it self-maintains on every INSERT/UPDATE and there's no
--- application-side population work. The partial index
--- `(repository_id, filename) WHERE is_deleted = false` matches the
--- exact WHERE clause every helper uses, so the planner can do an
--- index-only scan when the data is hot.
+--   path LIKE '%/' || $2 ESCAPE '\\'
 --
--- Migration cost on a deployment with 10⁶ artifacts: the STORED
--- column ADD requires a table rewrite (~1-2 min on ~1 GB of table
--- bytes, depending on storage). Operators whose RDS parameter group
--- enforces a low `statement_timeout` (10-30 s is common) need to
+-- which the leading `%/` makes un-indexable. The planner can use
+-- `idx_artifacts_repo_path (repository_id, path)` to bound the scan
+-- to the repo's row range, but within that range it still seq-scans
+-- every live row to evaluate the LIKE predicate. On a populated
+-- `artifacts` table (10⁶+ rows) the cost is 3-6 s per call; under
+-- concurrent resolver load it tips past pip's 15 s timeout. See
+-- #1266 for the prod logs.
+--
+-- The standard rewrite for un-indexable suffix LIKEs is to reverse
+-- both the indexed expression and the pattern, which turns the
+-- leading-wildcard predicate into a *left-anchored* prefix LIKE
+-- that `text_pattern_ops` can index:
+--
+--   -- query reshape
+--   WHERE reverse(path) LIKE <reverse('/' || $2)> || '%' ESCAPE '\\'
+--
+-- The original suffix-match semantic is preserved 1:1 — any
+-- multi-segment suffix (`foo/bar/file.tgz`) the original LIKE
+-- could match, this index + query still matches.
+--
+-- Why a functional `reverse(path)` index over the alternative
+-- shapes:
+--   * Preserves the original semantic exactly, unlike a
+--     denormalized `filename` column which would narrow the
+--     predicate to basename-equality only.
+--   * No table rewrite. A STORED GENERATED column requires
+--     Postgres to compute + store the value for every existing
+--     row (full table-data rewrite, ~1-2 min on 10⁶ rows). A
+--     functional index only requires an index build over the same
+--     rows, leaving the table untouched.
+--   * Lower per-write cost. No extra column to write on every
+--     INSERT/UPDATE, no extra ~30-50 bytes/row of storage; just
+--     the B-tree maintenance.
+--
+-- Migration cost on a deployment with 10⁶ artifacts: a single
+-- seq-scan + B-tree insert per row. Without
+-- `CREATE INDEX CONCURRENTLY` the operation holds `ACCESS
+-- EXCLUSIVE` on the table for the duration. Operators whose RDS
+-- parameter group enforces a low `statement_timeout` need to
 -- either:
---   1. Bump `statement_timeout` for the migration session — #1269
---      raises it to 30 min session-locally; once that PR ships, no
---      operator action is needed.
---   2. Apply this migration out-of-band per the runbook playbook
---      (build the column / index separately with `SET
---      statement_timeout = 0`, then insert the row into
---      `_sqlx_migrations` with the canonical sha384 checksum).
+--   1. Bump `statement_timeout` for the migration session via
+--      #1269 (raises it to 30 min session-locally just for the
+--      migration runner). Once that ships, no operator action is
+--      needed.
+--   2. Build the index out-of-band with `CREATE INDEX CONCURRENTLY`
+--      + `SET statement_timeout = 0`, then mark this migration
+--      applied in `_sqlx_migrations` per the runbook playbook.
 
-ALTER TABLE artifacts
-  ADD COLUMN filename TEXT
-  GENERATED ALWAYS AS (regexp_replace(path, '^.*/', '')) STORED;
-
-CREATE INDEX IF NOT EXISTS idx_artifacts_repo_filename
-  ON artifacts (repository_id, filename)
+CREATE INDEX IF NOT EXISTS idx_artifacts_repo_reverse_path
+  ON artifacts (repository_id, reverse(path) text_pattern_ops)
   WHERE is_deleted = false;
