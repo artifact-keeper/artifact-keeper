@@ -8,11 +8,11 @@
 # Bug #978: Dependency-Track 4.x no longer exposes existing key material on
 # `GET /api/v1/team`. Only `maskedKey` is returned for previously-created
 # keys. The unmasked key is only ever returned in the response body of
-# `POST /api/v1/team/<uuid>/key`. We must therefore *create* a fresh key
+# `PUT /api/v1/team/<uuid>/key`. We must therefore *create* a fresh key
 # and capture the response, rather than try to read an existing one.
 #
 # Idempotence strategy: on each run we delete the publicId we previously
-# minted (recorded in PUBLIC_ID_MARKER) and then POST a new one. This keeps
+# minted (recorded in PUBLIC_ID_MARKER) and then PUT a new one. This keeps
 # the team to a single active key across reruns and prevents accumulation
 # across helm upgrades.
 #
@@ -112,7 +112,7 @@ fi
 echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
 
 # Rotate: delete the publicId we previously minted (tracked in
-# PUBLIC_ID_MARKER), then POST a new one below.
+# PUBLIC_ID_MARKER), then PUT a new one below.
 #
 # Safety rail: if the team has publicIds we did NOT mint, those may belong
 # to operator-attached integrations (CI scanners, dashboards, webhooks).
@@ -167,11 +167,11 @@ fi
 # Create a fresh API key. DT 4.x returns the unmasked secret in the
 # response body of this single call. There is no other way to retrieve it.
 echo "[dtrack-init] Generating new $DT_TEAM_NAME API key..."
-KEY_RESP=$(curl -sf -X POST "$DT_URL/api/v1/team/$TEAM_UUID/key" \
+KEY_RESP=$(curl -sf -X PUT "$DT_URL/api/v1/team/$TEAM_UUID/key" \
   -H "Authorization: Bearer $TOKEN" || true)
 
 if [ -z "$KEY_RESP" ]; then
-  echo "[dtrack-init] ERROR: POST /api/v1/team/$TEAM_UUID/key returned empty body" >&2
+  echo "[dtrack-init] ERROR: PUT /api/v1/team/$TEAM_UUID/key returned empty body" >&2
   exit 1
 fi
 
