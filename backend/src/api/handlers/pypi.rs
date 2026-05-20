@@ -23,6 +23,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::future::Future;
 use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
@@ -792,10 +793,27 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            get_remote_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || async move {
+                fetch_from_pypi_remote(proxy, repo.id, repo_key, upstream_url, project, filename)
+                    .await
+            })
+            .await?
+        } else {
+            storage
+                .get(&artifact.storage_key)
+                .await
+                .map_err(map_storage_err)?
+        }
+    } else {
+        storage
+            .get(&artifact.storage_key)
+            .await
+            .map_err(map_storage_err)?
+    };
 
     // Record download statistics for locally-stored artifacts only.
     // Proxied and virtual-repo fetches go through build_file_response()
@@ -818,6 +836,28 @@ async fn serve_file(
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
         .body(Body::from(content))
         .unwrap())
+}
+
+async fn get_remote_cached_or_refetch<F, Fut>(
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    match storage.get(storage_key).await {
+        Ok(content) => Ok(content),
+        Err(AppError::NotFound(_)) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
+            );
+            refetch().await
+        }
+        Err(e) => Err(map_storage_err(e)),
+    }
 }
 
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
@@ -2402,6 +2442,59 @@ mod tests {
         assert_eq!(
             resp.headers().get(CONTENT_LENGTH).unwrap(),
             &data.len().to_string()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_remote_cached_or_refetch
+    // -----------------------------------------------------------------------
+
+    struct MissingStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MissingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
+        let storage = MissingStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"refetched-bytes"))
+                }
+            },
+        )
+        .await
+        .expect("refetch should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "missing proxy-cache entry should trigger exactly one upstream refetch"
         );
     }
 
