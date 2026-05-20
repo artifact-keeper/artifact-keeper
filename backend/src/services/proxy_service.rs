@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
+use crate::services::metrics_service::record_proxy_cache_lookup;
 use crate::services::proxy_hydration::{
     BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
 };
@@ -524,6 +525,21 @@ struct RegistryTokenResponse {
 /// transport error; the caller then writes the sidecar without a pin and
 /// fast-path revalidation falls back to pre-#1051 existence-only
 /// semantics for that entry.
+/// Extract the repository key from a proxy-cache storage key for the
+/// Prometheus `repository` label. Cache keys are formatted by
+/// `cache_storage_key` as `proxy-cache/<repo_key>/<path>/__content__`;
+/// the metadata sidecar uses the same prefix. If the key doesn't match
+/// this shape (e.g. caller passed a non-cache key), we fall back to
+/// `"unknown"` so the counter stays low-cardinality and never panics on
+/// a malformed input. Used by `record_proxy_cache_lookup` callsites.
+fn repo_key_from_cache_key(cache_key: &str) -> &str {
+    cache_key
+        .strip_prefix("proxy-cache/")
+        .and_then(|s| s.split('/').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -629,6 +645,17 @@ impl CacheStore {
         metadata_key: &str,
         allow_stale: bool,
     ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
+        // Only the FRESH lookup (`allow_stale == false`) is counted: that is
+        // the single per-request cache-read decision the original PR
+        // instrumented on `get_cached_artifact`. The stale fallback
+        // (`allow_stale == true`) is a *second* body read that only runs
+        // after the fresh read already recorded a `miss_*`/`error` outcome
+        // for the same request (via `revalidate_stale`), so counting it too
+        // would double-count. The repo label is derived from the cache_key
+        // prefix; see `repo_key_from_cache_key`.
+        let repo_label = repo_key_from_cache_key(cache_key);
+
         // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
         // propagates it via `?` to match the original behavior precisely.
         let metadata = if allow_stale {
@@ -639,13 +666,22 @@ impl CacheStore {
         } else {
             match self.load_metadata(metadata_key).await {
                 Ok(Some(m)) => m,
-                Ok(None) => return Ok(None),
+                Ok(None) => {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        metadata_key = %metadata_key,
+                        "Proxy cache miss: metadata sidecar absent"
+                    );
+                    record_proxy_cache_lookup(repo_label, "miss_no_metadata");
+                    return Ok(None);
+                }
                 Err(e) => {
                     tracing::warn!(
                         metadata_key = %metadata_key,
                         error = %e,
                         "proxy cache metadata read failed; treating as miss and refetching upstream"
                     );
+                    record_proxy_cache_lookup(repo_label, "error");
                     return Ok(None);
                 }
             }
@@ -653,7 +689,12 @@ impl CacheStore {
 
         // Fresh reads enforce the expiry gate; the stale fallback skips it.
         if !allow_stale && Utc::now() > metadata.expires_at {
-            tracing::debug!("Cache expired for {}", cache_key);
+            tracing::debug!(
+                cache_key = %cache_key,
+                expires_at = %metadata.expires_at,
+                "Proxy cache miss: entry expired"
+            );
+            record_proxy_cache_lookup(repo_label, "miss_expired");
             return Ok(None);
         }
 
@@ -672,11 +713,12 @@ impl CacheStore {
                         );
                     } else {
                         tracing::warn!(
-                            "Cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
+                            cache_key = %cache_key,
+                            expected = %metadata.checksum_sha256,
+                            actual = %actual_checksum,
+                            "Proxy cache miss: checksum mismatch (cache will be refilled)"
                         );
+                        record_proxy_cache_lookup(repo_label, "miss_checksum_mismatch");
                     }
                     return Ok(None);
                 }
@@ -688,11 +730,21 @@ impl CacheStore {
                         metadata.expires_at
                     );
                 } else {
-                    tracing::debug!("Cache hit for {}", cache_key);
+                    tracing::debug!(cache_key = %cache_key, "Proxy cache hit");
+                    record_proxy_cache_lookup(repo_label, "hit");
                 }
                 Ok(Some((content, metadata.content_type)))
             }
-            Err(AppError::NotFound(_)) => Ok(None),
+            Err(AppError::NotFound(_)) => {
+                if !allow_stale {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        "Proxy cache miss: content object absent (metadata existed)"
+                    );
+                    record_proxy_cache_lookup(repo_label, "miss_no_content");
+                }
+                Ok(None)
+            }
             // B6 (coalescing 502 leak): a transient storage read error here
             // (e.g. a waiter reading the cache body while the single-flight
             // leader is mid-write, or a partially-written / poisoned entry)
@@ -713,6 +765,7 @@ impl CacheStore {
                         error = %e,
                         "proxy cache read failed; treating as miss and refetching upstream"
                     );
+                    record_proxy_cache_lookup(repo_label, "error");
                     Ok(None)
                 }
             }
@@ -9828,5 +9881,52 @@ SHA256:
             b"jar-bytes",
             "immutable streaming hit must serve cached bytes with no upstream contact"
         );
+    }
+
+    // ---- repo_key_from_cache_key (observability label extraction) ------
+
+    #[test]
+    fn test_repo_key_from_cache_key_content_key() {
+        assert_eq!(
+            repo_key_from_cache_key(
+                "proxy-cache/pypi-remote/simple/click/click-8.0.0-py3-none-any.whl/__content__"
+            ),
+            "pypi-remote"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_metadata_key() {
+        assert_eq!(
+            repo_key_from_cache_key(
+                "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__cache_meta__.json"
+            ),
+            "npm-remote"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_handles_dashes_and_underscores() {
+        // Repo keys can include hyphens, underscores, and dots per
+        // `validate_repository_key`. The split-by-`/` extractor should
+        // preserve them verbatim.
+        assert_eq!(
+            repo_key_from_cache_key("proxy-cache/my_repo-v1.2/a/b/__content__"),
+            "my_repo-v1.2"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_non_proxy_key_fallbacks_to_unknown() {
+        // Defensive: if a caller hands us a non-proxy-cache key, the
+        // function returns "unknown" instead of panicking so the
+        // counter cardinality stays bounded.
+        assert_eq!(
+            repo_key_from_cache_key("maven/org/example/lib/1.0/lib-1.0.jar"),
+            "unknown"
+        );
+        assert_eq!(repo_key_from_cache_key(""), "unknown");
+        assert_eq!(repo_key_from_cache_key("proxy-cache/"), "unknown");
+        assert_eq!(repo_key_from_cache_key("proxy-cache//foo"), "unknown");
     }
 }

@@ -27,6 +27,36 @@ pub fn record_artifact_download(repo_key: &str, format: &str) {
     counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
 }
 
+/// Record a proxy-cache lookup. `result` is a stable low-cardinality
+/// string describing the outcome, used as a Prometheus label:
+///
+///   * `hit` -- valid cached body returned to the caller
+///   * `miss_no_metadata` -- the metadata sidecar was absent (first
+///     request for this key, OR sidecar was evicted/deleted out of band)
+///   * `miss_expired` -- metadata loaded but `expires_at` was in the past
+///   * `miss_no_content` -- metadata existed but the content object was
+///     gone (typical eviction race; cache will refill on the next miss)
+///   * `miss_checksum_mismatch` -- content loaded but its sha256 did not
+///     match the recorded sidecar checksum; cache self-heals on the next
+///     write but this should be very rare and indicates either backend
+///     corruption or a content rewrite by a sibling writer
+///   * `error` -- the storage backend returned a non-NotFound error
+///     (network, ACL, KMS) so the lookup couldn't determine hit-or-miss
+///
+/// Operators investigating "why is the cache not working" can chart
+/// `rate(ak_proxy_cache_lookups_total[5m])` by `result` and see exactly
+/// which branch is responsible for slow repeat requests. The repository
+/// label keeps cardinality bounded by the operator's repo count, which
+/// matches the existing `ak_artifact_downloads_total` shape.
+pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
+    counter!(
+        "ak_proxy_cache_lookups_total",
+        "repository" => repo_key.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a backup event.
 pub fn record_backup(backup_type: &str, success: bool, duration_secs: f64) {
     let status = if success { "success" } else { "failure" };
