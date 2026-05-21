@@ -115,6 +115,34 @@ fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     Ok(auth)
 }
 
+/// Authorize the caller for a repo-tokens endpoint and resolve the target
+/// repository. Returns the validated `(auth, repo)` pair on success.
+///
+/// This collapses the three-step pre-amble shared by every handler in this
+/// module: `require_repo_write`, `RepositoryService::get_by_key`, and the
+/// per-caller `can_access_repo` visibility check. The `NotFound` (rather
+/// than `Forbidden`) response on visibility failure is intentional: it
+/// prevents an unauthorized caller from probing repository existence.
+async fn authorize_repo_for_tokens(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+) -> Result<(AuthExtension, crate::models::repository::Repository)> {
+    let auth = require_repo_write(auth)?;
+
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(key).await?;
+
+    if !auth.can_access_repo(repo.id) {
+        return Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            key
+        )));
+    }
+
+    Ok((auth, repo))
+}
+
 // ---------------------------------------------------------------------------
 // Row types for unchecked queries
 // ---------------------------------------------------------------------------
@@ -158,17 +186,7 @@ pub async fn list_repo_tokens(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepoTokenListResponse>> {
-    let auth = require_repo_write(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     let rows: Vec<TokenRow> = sqlx::query_as(
         r#"
@@ -241,17 +259,7 @@ pub async fn create_repo_token(
     Path(key): Path<String>,
     Json(payload): Json<CreateRepoTokenRequest>,
 ) -> Result<Json<CreateRepoTokenResponse>> {
-    let auth = require_repo_write(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     // Validate inputs
     validate_scopes_pure(&payload.scopes).map_err(AppError::Validation)?;
@@ -330,17 +338,7 @@ pub async fn get_repo_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, token_id)): Path<(String, Uuid)>,
 ) -> Result<Json<RepoTokenResponse>> {
-    let auth = require_repo_write(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     let row: TokenRow = sqlx::query_as(
         r#"
@@ -409,17 +407,7 @@ pub async fn revoke_repo_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, token_id)): Path<(String, Uuid)>,
 ) -> Result<axum::http::StatusCode> {
-    let auth = require_repo_write(auth)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     // Verify the token belongs to this repository
     let exists: Option<(Uuid,)> = sqlx::query_as(
@@ -823,6 +811,24 @@ mod admin_scope_policy_tests {
             .await;
     }
 
+    /// Build a `POST /{repo_key}/tokens` request with the given token name
+    /// and scopes. Centralizing this avoids repeating the Request::builder
+    /// chain across every admin-scope policy test.
+    fn post_repo_token_request(repo_key: &str, name: &str, scopes: &[&str]) -> Request<Body> {
+        let body = json!({
+            "name": name,
+            "scopes": scopes,
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     /// Each ADMIN_ONLY_SCOPES entry, submitted alone by a non-admin with
     /// the delegatable `write:repositories` scope, must be refused at the
     /// handler. Iterating means a future addition to the policy list is
@@ -840,18 +846,11 @@ mod admin_scope_policy_tests {
 
         for admin_scope in crate::services::token_service::ADMIN_ONLY_SCOPES {
             let app = build_app(state.clone(), auth.clone());
-            let body = json!({
-                "name": format!("probe-{}", admin_scope),
-                "scopes": [admin_scope],
-                "expires_in_days": 30_i64,
-            })
-            .to_string();
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri(format!("/{}/tokens", repo_key))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap();
+            let req = post_repo_token_request(
+                &repo_key,
+                &format!("probe-{}", admin_scope),
+                &[admin_scope],
+            );
             let (status, body_bytes) = tdh::send(app, req).await;
 
             assert_eq!(
@@ -879,18 +878,11 @@ mod admin_scope_policy_tests {
         auth.scopes = Some(vec!["write:repositories".to_string()]);
         let app = build_app(state, auth);
 
-        let body = json!({
-            "name": "smuggle-attempt",
-            "scopes": ["read:artifacts", "write:artifacts", "*"],
-            "expires_in_days": 30_i64,
-        })
-        .to_string();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(format!("/{}/tokens", repo_key))
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
+        let req = post_repo_token_request(
+            &repo_key,
+            "smuggle-attempt",
+            &["read:artifacts", "write:artifacts", "*"],
+        );
         let (status, _) = tdh::send(app, req).await;
 
         assert_eq!(
@@ -914,18 +906,7 @@ mod admin_scope_policy_tests {
         auth.is_admin = true;
         let app = build_app(state, auth);
 
-        let body = json!({
-            "name": "admin-repo-token",
-            "scopes": ["delete:artifacts"],
-            "expires_in_days": 30_i64,
-        })
-        .to_string();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(format!("/{}/tokens", repo_key))
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
+        let req = post_repo_token_request(&repo_key, "admin-repo-token", &["delete:artifacts"]);
         let (status, body_bytes) = tdh::send(app, req).await;
 
         assert_eq!(
