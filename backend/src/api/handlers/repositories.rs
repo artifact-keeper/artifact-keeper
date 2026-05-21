@@ -2156,7 +2156,7 @@ pub async fn download_artifact(
                 let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
                     .unwrap_or_else(|| path.clone());
 
-                let response = proxy_helpers::proxy_fetch_streaming(
+                Ok(proxy_helpers::proxy_fetch_streaming(
                     proxy,
                     repo.id,
                     &key,
@@ -2165,8 +2165,8 @@ pub async fn download_artifact(
                     "application/octet-stream",
                 )
                 .await
-                .unwrap_or_else(|err_resp| err_resp);
-                Ok(response.into_response())
+                .unwrap_or_else(|e| e)
+                .into_response())
             } else {
                 Err(AppError::NotFound("Artifact not found".to_string()))
             }
