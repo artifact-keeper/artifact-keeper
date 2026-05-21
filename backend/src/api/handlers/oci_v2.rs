@@ -2,7 +2,6 @@
 //!
 //! Implements the minimum endpoints required for `docker login`, `docker push`,
 //! and `docker pull` per the OCI Distribution Specification.
-//!
 // TODO(#553): OCI errors use a spec-mandated JSON envelope (oci_error fn) and
 // cannot be converted to AppError without breaking Docker/OCI client compat.
 // Consider wrapping oci_error to also log via tracing for consistency.
@@ -748,6 +747,175 @@ fn normalize_docker_image(image: &str, upstream_url: &str) -> String {
     }
 }
 
+fn candidate_upstream_images(image: &str, upstream_url: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    let normalized = normalize_docker_image(image, upstream_url);
+    if !normalized.is_empty() {
+        candidates.push(normalized);
+    }
+
+    if !image.is_empty() && !candidates.iter().any(|candidate| candidate == image) {
+        candidates.push(image.to_string());
+    }
+
+    if let Some(stripped) = image.strip_prefix("library/") {
+        if !stripped.is_empty() && !candidates.iter().any(|candidate| candidate == stripped) {
+            candidates.push(stripped.to_string());
+        }
+    } else if !image.contains('/') {
+        let with_library = format!("library/{}", image);
+        if !candidates.iter().any(|candidate| candidate == &with_library) {
+            candidates.push(with_library);
+        }
+    }
+
+    candidates
+}
+
+enum VirtualBlobResolution {
+    Local {
+        size_bytes: i64,
+        storage_key: String,
+        member: crate::models::repository::Repository,
+    },
+    Remote {
+        content: Bytes,
+        content_type: Option<String>,
+    },
+}
+
+async fn resolve_virtual_blob(
+    state: &SharedState,
+    repo_id: Uuid,
+    image_name: &str,
+    digest: &str,
+) -> Option<VirtualBlobResolution> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
+        .await
+        .ok()?;
+
+    for member in &members {
+        let local = sqlx::query!(
+            "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+            member.id,
+            digest
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(blob) = local {
+            return Some(VirtualBlobResolution::Local {
+                size_bytes: blob.size_bytes,
+                storage_key: blob.storage_key,
+                member: member.clone(),
+            });
+        }
+
+        if member.repo_type == RepositoryType::Remote {
+            if let (Some(proxy), Some(upstream_url)) =
+                (&state.proxy_service, member.upstream_url.as_deref())
+            {
+                for image in candidate_upstream_images(image_name, upstream_url) {
+                    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await
+                    {
+                        return Some(VirtualBlobResolution::Remote {
+                            content,
+                            content_type,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn resolve_virtual_manifest(
+    state: &SharedState,
+    repo_id: Uuid,
+    image_name: &str,
+    reference: &str,
+    accept: Option<&str>,
+) -> Option<(String, Option<String>, Bytes)> {
+    let is_digest_ref = is_digest_reference(reference);
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
+        .await
+        .ok()?;
+
+    for member in &members {
+        let local = if is_digest_ref {
+            sqlx::query!(
+                "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+                member.id,
+                reference
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+        } else {
+            sqlx::query!(
+                "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+                member.id,
+                image_name,
+                reference
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+        };
+
+        if let Some((manifest_digest, content_type)) = local {
+            let manifest_key = manifest_storage_key(&manifest_digest);
+            if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
+                if let Ok(data) = storage.get(&manifest_key).await {
+                    return Some((manifest_digest, content_type, data));
+                }
+            }
+        }
+
+        if member.repo_type == RepositoryType::Remote {
+            if let (Some(proxy), Some(upstream_url)) =
+                (&state.proxy_service, member.upstream_url.as_deref())
+            {
+                for image in candidate_upstream_images(image_name, upstream_url) {
+                    let upstream_path = format!("v2/{}/manifests/{}", image, reference);
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_with_accept(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                        accept,
+                    )
+                    .await
+                    {
+                        let digest = compute_sha256(&content);
+                        return Some((digest, content_type, content));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Check whether `reference` looks like an OCI content-addressable digest
 /// rather than a human-readable tag. The grammar (from the OCI Distribution
 /// Spec) is:
@@ -1331,6 +1499,43 @@ async fn handle_head_blob(
         }
     }
 
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
+            return match resolution {
+                VirtualBlobResolution::Local { size_bytes, storage_key, member } => {
+                    let storage = match state.storage_for_repo(&member.storage_location()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return oci_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "INTERNAL_ERROR",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    if storage.exists(&storage_key).await.unwrap_or(false) {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Docker-Content-Digest", digest)
+                            .header(CONTENT_LENGTH, size_bytes.to_string())
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                    }
+                }
+                VirtualBlobResolution::Remote { content, content_type } => build_oci_proxy_response(
+                    &content,
+                    content_type,
+                    digest,
+                    "application/octet-stream",
+                    false,
+                ),
+            };
+        }
+    }
+
     // For remote repos, try fetching blob from upstream
     if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
@@ -1406,6 +1611,45 @@ async fn handle_get_blob(
         Ok(None) => {}
         Err(e) => {
             warn!("DB error reading blob: {}", e);
+        }
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
+            return match resolution {
+                VirtualBlobResolution::Local { storage_key, member, .. } => {
+                    let storage = match state.storage_for_repo(&member.storage_location()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return oci_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "INTERNAL_ERROR",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    match storage.get(&storage_key).await {
+                        Ok(data) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Docker-Content-Digest", digest)
+                            .header(CONTENT_LENGTH, data.len().to_string())
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .body(Body::from(data))
+                            .unwrap(),
+                        Err(e) => {
+                            warn!("Storage error reading virtual blob {}: {}", digest, e);
+                            oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                        }
+                    }
+                }
+                VirtualBlobResolution::Remote { content, content_type } => build_oci_proxy_response(
+                    &content,
+                    content_type,
+                    digest,
+                    "application/octet-stream",
+                    true,
+                ),
+            };
         }
     }
 
@@ -1880,6 +2124,21 @@ async fn handle_head_manifest(
     // client's `Accept` header so the upstream registry returns the manifest
     // representation the client can actually consume (#586 cont.).
     let accept = forwarded_accept_header(headers);
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some((manifest_digest, content_type, data)) =
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, accept.as_deref())
+                .await
+        {
+            return build_oci_proxy_response(
+                &data,
+                content_type,
+                &manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                false,
+            );
+        }
+    }
+
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -1990,6 +2249,21 @@ async fn handle_get_manifest(
     // client's `Accept` header so the upstream registry returns the manifest
     // representation the client can actually consume (#586 cont.).
     let accept = forwarded_accept_header(headers);
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some((manifest_digest, content_type, data)) =
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, accept.as_deref())
+                .await
+        {
+            return build_oci_proxy_response(
+                &data,
+                content_type,
+                &manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                true,
+            );
+        }
+    }
+
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -4998,6 +5272,30 @@ mod tests {
         assert_eq!(
             super::normalize_docker_image("nginx", "https://docker.io"),
             "library/nginx"
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_prefers_normalized_docker_hub_name() {
+        assert_eq!(
+            super::candidate_upstream_images("alpine", "https://registry-1.docker.io"),
+            vec!["library/alpine".to_string(), "alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_handles_library_prefix_variants() {
+        assert_eq!(
+            super::candidate_upstream_images("library/alpine", "https://registry-1.docker.io"),
+            vec!["library/alpine".to_string(), "alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_preserves_non_docker_hub_name() {
+        assert_eq!(
+            super::candidate_upstream_images("org/app", "https://ghcr.io"),
+            vec!["org/app".to_string()]
         );
     }
 
