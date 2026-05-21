@@ -3,6 +3,8 @@
 //! This module provides a client for interacting with JFrog Artifactory's REST API
 //! to fetch repositories, artifacts, users, groups, and permissions for migration.
 
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -565,6 +567,43 @@ impl ArtifactoryClient {
             .await
     }
 
+    async fn download_response_with_fallback(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<reqwest::Response, ArtifactoryError> {
+        let raw_url = format!("{}/{}/{}", self.config.base_url, repo_key, path);
+        let request = self.auth_request(self.client.get(&raw_url));
+        let response = request.send().await?;
+
+        if response.status().as_u16() != 404 {
+            return Ok(response);
+        }
+
+        let storage_info = match self.get_storage_info(repo_key, path).await {
+            Ok(info) => info,
+            Err(_) => return Ok(response),
+        };
+
+        let Some(download_uri) = storage_info.download_uri else {
+            return Ok(response);
+        };
+
+        if download_uri == raw_url {
+            return Ok(response);
+        }
+
+        tracing::debug!(
+            repo = %repo_key,
+            path = %path,
+            download_uri = %download_uri,
+            "Direct artifact download returned 404; retrying with Artifactory storage downloadUri"
+        );
+
+        let fallback_request = self.auth_request(self.client.get(download_uri));
+        fallback_request.send().await.map_err(ArtifactoryError::from)
+    }
+
     /// Get artifact properties
     pub async fn get_properties(
         &self,
@@ -581,10 +620,7 @@ impl ArtifactoryClient {
         repo_key: &str,
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
-        let url = format!("{}/{}/{}", self.config.base_url, repo_key, path);
-        let request = self.auth_request(self.client.get(&url));
-
-        let response = request.send().await?;
+        let response = self.download_response_with_fallback(repo_key, path).await?;
         let status = response.status();
 
         if status.is_success() {
@@ -602,6 +638,34 @@ impl ArtifactoryClient {
         }
     }
 
+    /// Download artifact as streaming chunks to avoid loading large payloads
+    /// fully into memory.
+    pub async fn download_artifact_stream(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<BoxStream<'static, Result<bytes::Bytes, ArtifactoryError>>, ArtifactoryError> {
+        let response = self.download_response_with_fallback(repo_key, path).await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(ArtifactoryError::from))
+                .boxed();
+            Ok(stream)
+        } else if status.as_u16() == 404 {
+            Err(ArtifactoryError::NotFound(format!(
+                "Artifact not found: {}/{}",
+                repo_key, path
+            )))
+        } else {
+            Err(ArtifactoryError::ApiError {
+                status: status.as_u16(),
+                message: "Failed to download artifact".into(),
+            })
+        }
+    }
     /// List all users
     pub async fn list_users(&self) -> Result<Vec<UserListItem>, ArtifactoryError> {
         self.get("/api/security/users").await
