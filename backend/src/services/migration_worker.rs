@@ -1706,26 +1706,6 @@ fn build_cache_skip_reason(err_msg: &str) -> String {
     )
 }
 
-#[allow(dead_code)] // Helper retained for upcoming Artifactory remote-cache resolution path; covered by unit tests.
-fn resolve_source_repo_key_from_listing(
-    repositories: &[crate::services::artifactory_client::RepositoryListItem],
-    target_repo_key: &str,
-    include_cached_remote: bool,
-) -> String {
-    if !include_cached_remote {
-        return target_repo_key.to_string();
-    }
-
-    let Some(target_repo) = repositories.iter().find(|repo| repo.key == target_repo_key) else {
-        return target_repo_key.to_string();
-    };
-
-    if !target_repo.repo_type.eq_ignore_ascii_case("remote") {
-        return target_repo_key.to_string();
-    }
-
-    format!("{}-cache", target_repo_key)
-}
 /// Extract the file name from an artifact path.
 /// Returns the portion after the last '/' separator, or the entire
 /// string if no separator is present.
@@ -1736,19 +1716,6 @@ pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repo_item(
-        key: &str,
-        repo_type: &str,
-    ) -> crate::services::artifactory_client::RepositoryListItem {
-        crate::services::artifactory_client::RepositoryListItem {
-            key: key.to_string(),
-            repo_type: repo_type.to_string(),
-            package_type: String::new(),
-            url: None,
-            description: None,
-        }
-    }
 
     #[test]
     fn test_conflict_resolution_from_str() {
@@ -1940,64 +1907,6 @@ mod tests {
             "cargo-cache",
             "requests/requests-2.28.0-py3-none-any.whl"
         ));
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_prefers_hidden_remote_cache_repo() {
-        let repositories = vec![repo_item("docker-remote", "REMOTE")];
-
-        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
-
-        assert_eq!(resolved, "docker-remote-cache");
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_uses_target_for_non_remote_repo() {
-        let repositories = vec![repo_item("docker-local", "LOCAL")];
-
-        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-local", true);
-
-        assert_eq!(resolved, "docker-local");
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_uses_target_when_repo_missing() {
-        let repositories = vec![repo_item("some-other-repo", "REMOTE")];
-
-        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
-
-        assert_eq!(resolved, "docker-remote");
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_returns_target_when_cached_remote_disabled() {
-        // include_cached_remote = false short-circuits the lookup regardless of
-        // whether the repo exists and regardless of its type.
-        let repositories = vec![repo_item("docker-remote", "REMOTE")];
-
-        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", false);
-
-        assert_eq!(resolved, "docker-remote");
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_returns_target_when_cached_remote_disabled_and_missing() {
-        // include_cached_remote = false also short-circuits when no listing entry
-        // is found, exercising the early-return branch before the .find() call.
-        let resolved = resolve_source_repo_key_from_listing(&[], "docker-remote", false);
-
-        assert_eq!(resolved, "docker-remote");
-    }
-
-    #[test]
-    fn test_resolve_source_repo_key_matches_remote_case_insensitively() {
-        // The remote-type comparison is case-insensitive (some Artifactory
-        // versions report "remote" rather than "REMOTE").
-        let repositories = vec![repo_item("docker-remote", "remote")];
-
-        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
-
-        assert_eq!(resolved, "docker-remote-cache");
     }
 
     // -----------------------------------------------------------------------
