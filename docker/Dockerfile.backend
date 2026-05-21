@@ -162,7 +162,7 @@ ENV GRYPE_DB_CACHE_DIR=/grype-db
 RUN mkdir -p /grype-db && grype db update && grype db status
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
