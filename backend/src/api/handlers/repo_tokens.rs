@@ -263,12 +263,13 @@ pub async fn create_repo_token(
         ));
     }
 
-    // Non-admin users cannot request the "admin" scope
-    if !auth.is_admin && payload.scopes.iter().any(|s| s == "admin") {
-        return Err(AppError::Authorization(
-            "Only administrators can create tokens with the 'admin' scope".to_string(),
-        ));
-    }
+    // Refuse admin-class scopes from non-admin callers. The legacy check
+    // only blocked the literal "admin" scope, leaving non-admins able to
+    // mint `*`, `delete:artifacts`, `delete:repositories`, and
+    // `write:users` via this repo-scoped endpoint. See
+    // `token_service::ADMIN_ONLY_SCOPES` for the policy list and rationale.
+    crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
+        .map_err(AppError::Authorization)?;
 
     // Generate the token
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
@@ -768,5 +769,173 @@ mod tests {
         let debug = format!("{:?}", row);
         assert!(debug.contains("debug-test"));
         assert!(debug.contains("TokenRow"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admin-only token-scope enforcement tests (repo-scoped token endpoint)
+//
+// Sibling of `users::admin_scope_policy_tests` and the profile-endpoint
+// test. The same policy must apply to
+// `POST /api/v1/repositories/:key/tokens`, otherwise a non-admin with
+// `write:repositories` (a delegatable scope) can pivot here to mint a
+// token with `*` / `delete:artifacts` / `delete:repositories` /
+// `write:users` and bypass every scope-only authorization gate.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admin_scope_policy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    /// Build the repo-tokens router with the production middleware chain's
+    /// `Option<AuthExtension>` extractor shape.
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        repo_tokens_router()
+            .with_state(state)
+            .layer(AxumExtension::<Option<AuthExtension>>(Some(auth)))
+    }
+
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (_repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username, repo_key))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, repo_key: &str) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(repo_key)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Each ADMIN_ONLY_SCOPES entry, submitted alone by a non-admin with
+    /// the delegatable `write:repositories` scope, must be refused at the
+    /// handler. Iterating means a future addition to the policy list is
+    /// covered automatically.
+    #[tokio::test]
+    async fn non_admin_cannot_mint_admin_only_scopes_on_repo_tokens_endpoint() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        // Caller is a non-admin API token with write:repositories so it
+        // passes `require_repo_write` and reaches the policy gate.
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+
+        for admin_scope in crate::services::token_service::ADMIN_ONLY_SCOPES {
+            let app = build_app(state.clone(), auth.clone());
+            let body = json!({
+                "name": format!("probe-{}", admin_scope),
+                "scopes": [admin_scope],
+                "expires_in_days": 30_i64,
+            })
+            .to_string();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{}/tokens", repo_key))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body_bytes) = tdh::send(app, req).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin minting repo token with admin-class scope {:?} MUST 403; got {} body: {}",
+                admin_scope,
+                status,
+                String::from_utf8_lossy(&body_bytes),
+            );
+        }
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// A non-admin must not smuggle an admin-only scope through this
+    /// endpoint by burying it in a list of otherwise-safe scopes.
+    #[tokio::test]
+    async fn non_admin_cannot_smuggle_admin_scope_in_a_mixed_list_repo_endpoint() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "smuggle-attempt",
+            "scopes": ["read:artifacts", "write:artifacts", "*"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin smuggling '*' on /repositories/{{key}}/tokens MUST 403"
+        );
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// Admin callers retain the ability to grant admin-class scopes on
+    /// repository-scoped tokens (e.g. for CI service accounts that need to
+    /// purge artifacts during release rollback).
+    #[tokio::test]
+    async fn admin_can_mint_admin_only_scopes_on_repo_tokens_endpoint() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_admin = true;
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "admin-repo-token",
+            "scopes": ["delete:artifacts"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin minting a delete-scoped repo token MUST succeed; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        cleanup(&pool, user_id, &repo_key).await;
     }
 }
