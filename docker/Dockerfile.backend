@@ -1,6 +1,6 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
-FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rust-base
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
@@ -63,7 +63,7 @@ RUN if [ -n "${APP_VERSION}" ]; then \
     fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up upgrade pulls
