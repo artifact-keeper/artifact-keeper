@@ -298,6 +298,8 @@ pub(crate) fn content_type_for_artifact(artifact_path: &str) -> &'static str {
         "application/x-xz"
     } else if artifact_path.ends_with(".tar.gz") {
         "application/gzip"
+    } else if artifact_path.ends_with(".tar.zst") {
+        "application/zstd"
     } else {
         "application/octet-stream"
     }
@@ -309,6 +311,8 @@ pub(crate) fn content_type_for_download(filename: &str) -> &'static str {
         "application/x-xz"
     } else if filename.ends_with(".tar.gz") {
         "application/gzip"
+    } else if filename.ends_with(".tar.zst") {
+        "application/zstd"
     } else if filename.ends_with(".json") {
         "application/json"
     } else {
@@ -326,6 +330,8 @@ pub(crate) fn simplestreams_ftype(filename: &str) -> &str {
         "incus.tar.xz"
     } else if filename.ends_with(".tar.gz") {
         "incus.tar.gz"
+    } else if filename.ends_with(".tar.zst") {
+        "incus.tar.zst"
     } else {
         filename
     }
@@ -1869,6 +1875,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_content_type_for_artifact_tar_zst() {
+        assert_eq!(
+            content_type_for_artifact("ubuntu/20240215/incus.tar.zst"),
+            "application/zstd"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // content_type_for_download
     // -----------------------------------------------------------------------
@@ -1948,6 +1962,19 @@ mod tests {
     #[test]
     fn test_simplestreams_ftype_tar_gz() {
         assert_eq!(simplestreams_ftype("incus.tar.gz"), "incus.tar.gz");
+    }
+
+    #[test]
+    fn test_simplestreams_ftype_tar_zst() {
+        assert_eq!(simplestreams_ftype("incus.tar.zst"), "incus.tar.zst");
+    }
+
+    #[test]
+    fn test_content_type_for_download_tar_zst() {
+        assert_eq!(
+            content_type_for_download("incus.tar.zst"),
+            "application/zstd"
+        );
     }
 
     #[test]

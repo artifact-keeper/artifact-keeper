@@ -62,17 +62,21 @@ impl IncusHandler {
     /// Classify an image filename into its type.
     fn classify_file(filename: &str) -> Result<IncusFileType> {
         match filename {
-            "incus.tar.xz" | "lxd.tar.xz" => Ok(IncusFileType::UnifiedTarball),
-            "metadata.tar.xz" | "meta.tar.xz" => Ok(IncusFileType::MetadataTarball),
+            "incus.tar.xz" | "incus.tar.gz" | "incus.tar.zst" | "lxd.tar.xz"
+            | "lxd.tar.gz" | "lxd.tar.zst" => Ok(IncusFileType::UnifiedTarball),
+            "metadata.tar.xz" | "metadata.tar.gz" | "metadata.tar.zst" | "meta.tar.xz"
+            | "meta.tar.gz" | "meta.tar.zst" => Ok(IncusFileType::MetadataTarball),
             "rootfs.squashfs" => Ok(IncusFileType::RootfsSquashfs),
             "rootfs.img" => Ok(IncusFileType::RootfsQcow2),
-            f if f.ends_with(".tar.xz") || f.ends_with(".tar.gz") => {
+            // `incus export --compression=zstd` is a native incus option and
+            // produces `.tar.zst`; accept it alongside xz and gzip.
+            f if f.ends_with(".tar.xz") || f.ends_with(".tar.gz") || f.ends_with(".tar.zst") => {
                 Ok(IncusFileType::UnifiedTarball)
             }
             f if f.ends_with(".squashfs") => Ok(IncusFileType::RootfsSquashfs),
             f if f.ends_with(".qcow2") || f.ends_with(".img") => Ok(IncusFileType::RootfsQcow2),
             _ => Err(AppError::Validation(format!(
-                "Unsupported Incus image file: {}. Expected .tar.xz, .squashfs, .qcow2, or .img",
+                "Unsupported Incus image file: {}. Expected .tar.xz, .tar.gz, .tar.zst, .squashfs, .qcow2, or .img",
                 filename
             ))),
         }
@@ -134,9 +138,14 @@ impl IncusHandler {
         // Chain the magic bytes back with the rest of the reader
         let full_reader = std::io::Cursor::new(magic[..n].to_vec()).chain(reader);
 
-        // Try xz first (magic: FD 37 7A 58 5A), then gzip
+        // Try xz first (FD 37 7A 58 5A), then zstd (28 B5 2F FD), then gzip.
         let decompressor: Box<dyn Read> = if magic.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
             Box::new(xz2::read::XzDecoder::new(full_reader))
+        } else if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+            match zstd::Decoder::new(full_reader) {
+                Ok(d) => Box::new(d),
+                Err(_) => return None,
+            }
         } else {
             Box::new(GzDecoder::new(full_reader))
         };
@@ -420,6 +429,32 @@ properties:
     #[test]
     fn test_lxd_compat_tarball() {
         let info = IncusHandler::parse_path("product/v1/lxd.tar.xz").unwrap();
+        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+    }
+
+    #[test]
+    fn test_parse_unified_tarball_zstd() {
+        let info = IncusHandler::parse_path("ubuntu-noble/20240215/incus.tar.zst").unwrap();
+        assert_eq!(info.product, Some("ubuntu-noble".to_string()));
+        assert_eq!(info.version, Some("20240215".to_string()));
+        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+    }
+
+    #[test]
+    fn test_parse_unified_tarball_gzip() {
+        let info = IncusHandler::parse_path("ubuntu-noble/20240215/incus.tar.gz").unwrap();
+        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+    }
+
+    #[test]
+    fn test_parse_metadata_tarball_zstd() {
+        let info = IncusHandler::parse_path("alpine-edge/20240301/metadata.tar.zst").unwrap();
+        assert_eq!(info.file_type, IncusFileType::MetadataTarball);
+    }
+
+    #[test]
+    fn test_lxd_compat_tarball_zstd() {
+        let info = IncusHandler::parse_path("product/v1/lxd.tar.zst").unwrap();
         assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
     }
 
