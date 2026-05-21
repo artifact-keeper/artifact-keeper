@@ -1026,9 +1026,22 @@ pub async fn local_fetch_by_name_version(
     Ok((content, Some(artifact.content_type)))
 }
 
-/// Generic local artifact fetch by path suffix (LIKE match).
-/// Used for handlers like npm that query by filename suffix. `path_suffix`
-/// is escaped internally; callers pass raw user input, not pre-escaped.
+/// Generic local artifact fetch by trailing path-suffix (LIKE match).
+/// Used for handlers like npm that query by filename suffix.
+///
+/// Preserves the original suffix-LIKE semantic (`path LIKE '%/' || $2`)
+/// but rewrites it to a *left-anchored* LIKE on `reverse(path)`, which
+/// the functional index `idx_artifacts_repo_reverse_path` (added in
+/// migration `108_artifacts_filename_index.sql`) can serve as an
+/// index-only scan. See #1266 for the prod logs that motivated the
+/// rewrite — the original leading-wildcard form was un-indexable and
+/// seq-scanned the whole repo (3-6 s per call on populated tables).
+///
+/// The path-suffix is reversed in Rust BEFORE the LIKE-metachar
+/// escape so the resulting escape character (backslash) sits ahead of
+/// the metachar in the reversed pattern, which is the correct shape
+/// for Postgres's `ESCAPE '\\'` semantics. Reversing AFTER escaping
+/// would put the backslash on the wrong side of the metachar.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -1036,19 +1049,44 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
+    let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let path: String = sqlx::query_scalar(
         "SELECT path FROM artifacts \
-         WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\' AND is_deleted = false \
+         WHERE repository_id = $1 \
+           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
+           AND is_deleted = false \
          LIMIT 1",
     )
     .bind(repo_id)
-    .bind(super::escape_like_literal(path_suffix))
+    .bind(&reversed_pattern)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
     local_fetch_by_path(db, state, repo_id, location, &path).await
+}
+
+/// Build the reversed-+-escaped LIKE prefix for a path-suffix query
+/// against the functional `reverse(path) text_pattern_ops` index.
+///
+/// Given `path_suffix = "pkg-1.0.0.tgz"`, returns the reversed form
+/// of `/pkg-1.0.0.tgz` with any `%` / `_` / `\` characters escaped so
+/// they match literally under `ESCAPE '\\'`. The leading `/` is part
+/// of the original suffix-LIKE's semantic ("path ends with `/<X>`")
+/// and is preserved in the reversed pattern.
+///
+/// Reverse-then-escape (not escape-then-reverse) is deliberate: the
+/// escape char (`\`) must end up ON THE LEFT of the special char in
+/// the reversed string so Postgres recognises it as an escape; doing
+/// it the other way puts the `\` on the wrong side and the special
+/// char would still be treated as a wildcard.
+fn reverse_suffix_for_like(path_suffix: &str) -> String {
+    let mut with_slash = String::with_capacity(path_suffix.len() + 1);
+    with_slash.push('/');
+    with_slash.push_str(path_suffix);
+    let reversed: String = with_slash.chars().rev().collect();
+    super::escape_like_literal(&reversed)
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the
@@ -1509,16 +1547,20 @@ pub struct LocalArtifactHit {
     pub storage_key: String,
 }
 
-/// Look up a single artifact by trailing filename match within a repository.
+/// Look up a single artifact by trailing path-suffix within a
+/// repository.
 ///
-/// Runs `SELECT ... WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\'`
-/// against `repository_id`, escaping `path_suffix` against `%` / `_` / `\`.
-/// Returns `Ok(Some(hit))` on match, `Ok(None)` on miss, or `Err(response)`
-/// on database failure.
+/// Preserves the original suffix-LIKE semantic
+/// (`path LIKE '%/' || $2`) but rewrites it to a *left-anchored*
+/// LIKE on `reverse(path)`, which the functional index
+/// `idx_artifacts_repo_reverse_path` (added in migration
+/// `108_artifacts_filename_index.sql`) can serve as an index-only
+/// scan. See #1266 for the prod logs that motivated the rewrite —
+/// the original leading-wildcard form was un-indexable and
+/// seq-scanned the whole repo (3-6 s per call on populated tables).
 ///
-/// Replaces the duplicated `sqlx::query! r#"... LIKE '%/' || $2 ESCAPE '\'
-/// LIMIT 1 "#` boilerplate that every filename-keyed format download handler
-/// otherwise repeats.
+/// Returns `Ok(Some(hit))` on match, `Ok(None)` on miss, or
+/// `Err(response)` on database failure.
 #[allow(clippy::result_large_err)]
 pub async fn find_local_by_filename_suffix(
     db: &PgPool,
@@ -1526,15 +1568,16 @@ pub async fn find_local_by_filename_suffix(
     path_suffix: &str,
 ) -> Result<Option<LocalArtifactHit>, Response> {
     use sqlx::Row;
+    let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let row = sqlx::query(
         "SELECT id, storage_key FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
-           AND path LIKE '%/' || $2 ESCAPE '\\' \
+           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
          LIMIT 1",
     )
     .bind(repository_id)
-    .bind(super::escape_like_literal(path_suffix))
+    .bind(&reversed_pattern)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?;
@@ -1832,6 +1875,53 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
+
+    // ── reverse_suffix_for_like tests ───────────────────────────────
+
+    #[test]
+    fn test_reverse_suffix_for_like_plain_basename() {
+        // Simple filename: "/pkg-1.0.0.tgz" reversed = "zgt.0.0.1-gkp/"
+        assert_eq!(reverse_suffix_for_like("pkg-1.0.0.tgz"), "zgt.0.0.1-gkp/");
+    }
+
+    #[test]
+    fn test_reverse_suffix_for_like_multi_segment_suffix() {
+        // Multi-segment suffix preserves original suffix-LIKE semantic:
+        // "/foo/bar/file.tgz" reversed = "zgt.elif/rab/oof/"
+        assert_eq!(
+            reverse_suffix_for_like("foo/bar/file.tgz"),
+            "zgt.elif/rab/oof/"
+        );
+    }
+
+    #[test]
+    fn test_reverse_suffix_for_like_escapes_metachars_after_reverse() {
+        // Input with a LIKE metachar (%) must end up with the escape
+        // char (\) on the LEFT of the metachar in the reversed
+        // pattern so Postgres recognises it under `ESCAPE '\\'`.
+        // Input:      "ab%cd"          (literal % expected)
+        // "/" + in :  "/ab%cd"
+        // reversed :  "dc%ba/"
+        // escaped  :  "dc\%ba/"        (\ ahead of %, correct for ESCAPE)
+        assert_eq!(reverse_suffix_for_like("ab%cd"), "dc\\%ba/");
+    }
+
+    #[test]
+    fn test_reverse_suffix_for_like_escapes_underscore_and_backslash() {
+        // Same rule applies to _ and \. Reversing then escaping puts
+        // the escape char to the left of each metachar.
+        // Input:      "a_b\\c"
+        // "/" + in :  "/a_b\\c"
+        // reversed :  "c\\b_a/"
+        // escaped  :  "c\\\\b\\_a/"
+        assert_eq!(reverse_suffix_for_like("a_b\\c"), "c\\\\b\\_a/");
+    }
+
+    #[test]
+    fn test_reverse_suffix_for_like_empty_input_just_slash() {
+        // Empty suffix → reversed "/" → escaped "/"
+        assert_eq!(reverse_suffix_for_like(""), "/");
+    }
 
     // ── request_base_url tests ──────────────────────────────────────
 

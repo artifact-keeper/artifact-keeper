@@ -1,0 +1,60 @@
+-- Functional index on `reverse(path)` with `text_pattern_ops` so the
+-- planner can use the index for the leading-wildcard suffix-match
+-- query that `proxy_helpers::find_local_by_filename_suffix` and
+-- `local_fetch_by_path_suffix` run on the artifact-resolve hot path.
+--
+-- Before this change the helpers run
+--
+--   path LIKE '%/' || $2 ESCAPE '\\'
+--
+-- which the leading `%/` makes un-indexable. The planner can use
+-- `idx_artifacts_repo_path (repository_id, path)` to bound the scan
+-- to the repo's row range, but within that range it still seq-scans
+-- every live row to evaluate the LIKE predicate. On a populated
+-- `artifacts` table (10⁶+ rows) the cost is 3-6 s per call; under
+-- concurrent resolver load it tips past pip's 15 s timeout. See
+-- #1266 for the prod logs.
+--
+-- The standard rewrite for un-indexable suffix LIKEs is to reverse
+-- both the indexed expression and the pattern, which turns the
+-- leading-wildcard predicate into a *left-anchored* prefix LIKE
+-- that `text_pattern_ops` can index:
+--
+--   -- query reshape
+--   WHERE reverse(path) LIKE <reverse('/' || $2)> || '%' ESCAPE '\\'
+--
+-- The original suffix-match semantic is preserved 1:1 — any
+-- multi-segment suffix (`foo/bar/file.tgz`) the original LIKE
+-- could match, this index + query still matches.
+--
+-- Why a functional `reverse(path)` index over the alternative
+-- shapes:
+--   * Preserves the original semantic exactly, unlike a
+--     denormalized `filename` column which would narrow the
+--     predicate to basename-equality only.
+--   * No table rewrite. A STORED GENERATED column requires
+--     Postgres to compute + store the value for every existing
+--     row (full table-data rewrite, ~1-2 min on 10⁶ rows). A
+--     functional index only requires an index build over the same
+--     rows, leaving the table untouched.
+--   * Lower per-write cost. No extra column to write on every
+--     INSERT/UPDATE, no extra ~30-50 bytes/row of storage; just
+--     the B-tree maintenance.
+--
+-- Migration cost on a deployment with 10⁶ artifacts: a single
+-- seq-scan + B-tree insert per row. Without
+-- `CREATE INDEX CONCURRENTLY` the operation holds `ACCESS
+-- EXCLUSIVE` on the table for the duration. Operators whose RDS
+-- parameter group enforces a low `statement_timeout` need to
+-- either:
+--   1. Bump `statement_timeout` for the migration session via
+--      #1269 (raises it to 30 min session-locally just for the
+--      migration runner). Once that ships, no operator action is
+--      needed.
+--   2. Build the index out-of-band with `CREATE INDEX CONCURRENTLY`
+--      + `SET statement_timeout = 0`, then mark this migration
+--      applied in `_sqlx_migrations` per the runbook playbook.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_repo_reverse_path
+  ON artifacts (repository_id, reverse(path) text_pattern_ops)
+  WHERE is_deleted = false;
