@@ -1,7 +1,9 @@
 name: Require Linked Issue
 
+# Use pull_request_target so the workflow has a writable GITHUB_TOKEN on fork PRs.
+# Safe: workflow does not check out PR code; reads pr.body via event payload only.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -9,13 +11,17 @@ permissions:
   issues: read
   contents: read
 
+concurrency:
+  group: require-linked-issue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   require-linked-issue:
     name: Require linked issue in PR body
     runs-on: ubuntu-latest
     steps:
       - name: Check PR body for linked issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const BOT_MARKER = '<!-- require-linked-issue-bot -->';
@@ -33,7 +39,13 @@ jobs:
               return;
             }
 
-            const body = pr.body || '';
+            // Strip HTML comments, fenced code blocks, and inline code spans from the PR body
+            // before scanning for link keywords. This prevents contributors from "passing" the
+            // check by leaving a Closes #N reference inside a comment or code block.
+            const sanitizedBody = (pr.body || '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/```[\s\S]*?```/g, '')
+              .replace(/`[^`\n]*`/g, '');
 
             // Match Closes/Fixes/Resolves (all tense variants) followed by #N.
             // Allows optional owner/repo prefix to be tolerant, but only same-repo refs satisfy the requirement.
@@ -44,7 +56,7 @@ jobs:
 
             const candidates = [];
             let m;
-            while ((m = linkRegex.exec(body)) !== null) {
+            while ((m = linkRegex.exec(sanitizedBody)) !== null) {
               const refOwner = m[2] || owner;
               const refRepo = m[3] || repo;
               const number = parseInt(m[4], 10);
@@ -59,6 +71,7 @@ jobs:
             );
 
             let validLink = null;
+            const notFoundRefs = [];
             for (const c of sameRepoCandidates) {
               try {
                 const { data: issue } = await github.rest.issues.get({
@@ -73,18 +86,23 @@ jobs:
                 validLink = { number: c.number, title: issue.title };
                 break;
               } catch (err) {
-                core.warning(`Could not verify #${c.number}: ${err.message}`);
+                if (err.status === 404) {
+                  notFoundRefs.push({ owner: c.owner, repo: c.repo, number: c.number });
+                  core.warning(`Referenced issue #${c.number} not found in ${c.owner}/${c.repo}.`);
+                } else {
+                  core.warning(`Could not verify #${c.number}: ${err.message}`);
+                }
               }
             }
 
-            // Look for an existing bot comment to keep things idempotent.
-            const { data: existingComments } = await github.rest.issues.listComments({
+            // Paginate so the bot's prior comment is found even on long-discussion PRs.
+            const allComments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
               issue_number: pr.number,
               per_page: 100,
             });
-            const priorBotComment = existingComments.find(
+            const priorBotComment = allComments.find(
               c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(BOT_MARKER)
             );
 
@@ -104,11 +122,23 @@ jobs:
             const templatePath = '.github/PULL_REQUEST_TEMPLATE.md';
             const templateUrl = `https://github.com/${owner}/${repo}/blob/main/${templatePath}`;
 
+            // If we got specific 404s, surface them so the contributor can correct the number directly.
+            let headline;
+            let detail;
+            if (notFoundRefs.length > 0) {
+              const ref = notFoundRefs[0];
+              headline = `Referenced issue #${ref.number} does not exist in ${ref.owner}/${ref.repo}`;
+              detail = `The PR body references issue #${ref.number} in \`${ref.owner}/${ref.repo}\`, but that issue could not be found. Check the number and edit the PR body to point at a real, open issue.`;
+            } else {
+              headline = 'Missing linked issue';
+              detail = 'This PR does not reference a tracking issue in its body. Every PR must link to an issue in this repository so we can trace work back to a planned change.';
+            }
+
             const commentBody = [
               BOT_MARKER,
-              '### Missing linked issue',
+              `### ${headline}`,
               '',
-              'This PR does not reference a tracking issue in its body. Every PR must link to an issue in this repository so we can trace work back to a planned change.',
+              detail,
               '',
               '**How to fix**',
               '',
@@ -144,4 +174,9 @@ jobs:
               core.info('Posted missing-link bot comment.');
             }
 
-            core.setFailed('PR body must reference a tracking issue (e.g. "Closes #123"). See the bot comment for details.');
+            if (notFoundRefs.length > 0) {
+              const ref = notFoundRefs[0];
+              core.setFailed(`Referenced issue #${ref.number} does not exist in ${ref.owner}/${ref.repo}. Check the number and edit the PR body.`);
+            } else {
+              core.setFailed('PR body must reference a tracking issue (e.g. "Closes #123"). See the bot comment for details.');
+            }
