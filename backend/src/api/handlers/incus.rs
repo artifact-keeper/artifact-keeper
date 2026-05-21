@@ -912,7 +912,7 @@ async fn complete_chunked_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let session = get_session(&state.db, session_id).await?;
-    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append any final body data
