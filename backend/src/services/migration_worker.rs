@@ -817,6 +817,7 @@ impl MigrationWorker {
         )
     }
 
+
     /// Send a progress update through the channel, if one is configured
     #[allow(clippy::too_many_arguments)]
     async fn send_progress_update(
@@ -1084,6 +1085,20 @@ impl MigrationWorker {
                 package_type,
                 &temp_path,
             );
+
+        // Persist payload to temp file, then drop the in-memory Bytes so the
+        // subsequent storage.put_file uploads from the temp file rather than
+        // holding the entire artifact in memory alongside the file copy.
+        let mut file = tokio::fs::File::create(&temp_file_path).await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to create temp file: {}", e)))?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&artifact_data)
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to write to temp file: {}", e)))?;
+        file.sync_all().await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to sync temp file: {}", e)))?;
+        drop(file);
+        drop(artifact_data);
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -1996,8 +2011,11 @@ fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool 
         return true;
     }
 
-    // Cargo cache: auto-generated config.json
-    if repo_lower.contains("cargo") && artifact_path.ends_with("config.json") {
+    // Cargo cache: auto-generated registry-root config.json. Match the EXACT
+    // root path "config.json" (no slashes), not any nested path that happens
+    // to end with config.json, otherwise we would skip real crate artifacts
+    // that ship a config.json inside their tarball.
+    if repo_lower.contains("cargo") && artifact_path == "config.json" {
         return true;
     }
 
@@ -2199,14 +2217,22 @@ mod tests {
 
     #[test]
     fn test_should_skip_cache_only_artifact_cargo() {
-        // Cargo auto-generated config
+        // Cargo auto-generated registry-root config.json is skipped
         assert!(should_skip_cache_only_artifact(
             "cargo-remote-cache",
             "config.json"
         ));
-        assert!(should_skip_cache_only_artifact(
+        // Nested paths that happen to end with config.json are NOT registry
+        // metadata and must be migrated normally (Round 1 fix).
+        assert!(!should_skip_cache_only_artifact(
             "cargo-cache",
             "1/registry/config.json"
+        ));
+        // And a real crate tarball that happens to contain "config.json" as
+        // its file name should still migrate.
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-cache",
+            "crates/foo/foo-1.0.0/config.json"
         ));
     }
 

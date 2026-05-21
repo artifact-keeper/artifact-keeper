@@ -515,8 +515,14 @@ impl ArtifactoryClient {
         self.search_aql(&query).await
     }
 
-    /// List artifacts in a repository with date range filtering
-    pub async fn list_artifacts_with_date_filter(
+    /// List artifacts in a repository with date range filtering.
+    ///
+    /// Named `_impl` to avoid name-shadowing with the
+    /// `SourceRegistry::list_artifacts_with_date_filter` trait method this
+    /// type also implements. The trait impl below explicitly delegates
+    /// to this inherent function; if both were named identically the
+    /// trait method would recursively call itself.
+    pub async fn list_artifacts_with_date_filter_impl(
         &self,
         repo_key: &str,
         offset: i64,
@@ -551,7 +557,7 @@ impl ArtifactoryClient {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        self.list_artifacts_with_date_filter(repo_key, offset, limit, Some(since), None)
+        self.list_artifacts_with_date_filter_impl(repo_key, offset, limit, Some(since), None)
             .await
     }
 
@@ -589,6 +595,31 @@ impl ArtifactoryClient {
 
         if download_uri == raw_url {
             return Ok(response);
+        }
+
+        // SSRF guard: only send authenticated requests to hosts that match the
+        // configured Artifactory base_url. A malicious or misconfigured source
+        // could otherwise return an attacker-controlled downloadUri that
+        // exfiltrates our credentials. On mismatch, log a warning and surface
+        // the original 404 to the caller instead of issuing the request.
+        let base_host = reqwest::Url::parse(&self.config.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        let fallback_host = reqwest::Url::parse(&download_uri)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        match (base_host.as_deref(), fallback_host.as_deref()) {
+            (Some(base), Some(fb)) if base == fb => {}
+            _ => {
+                tracing::warn!(
+                    repo = %repo_key,
+                    path = %path,
+                    base_url = %self.config.base_url,
+                    download_uri = %download_uri,
+                    "Refusing to follow Artifactory downloadUri to a foreign host; returning original 404"
+                );
+                return Ok(response);
+            }
         }
 
         tracing::debug!(
@@ -735,7 +766,10 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         modified_after: Option<&str>,
         modified_before: Option<&str>,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        self.list_artifacts_with_date_filter(
+        // Explicitly call the inherent `_impl` method to avoid recursing
+        // into this trait method via method-resolution shadowing.
+        ArtifactoryClient::list_artifacts_with_date_filter_impl(
+            self,
             repo_key,
             offset,
             limit,
