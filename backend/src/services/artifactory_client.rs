@@ -647,6 +647,24 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         self.list_artifacts(repo_key, offset, limit).await
     }
 
+    async fn list_artifacts_with_date_filter(
+        &self,
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> Result<AqlResponse, ArtifactoryError> {
+        self.list_artifacts_with_date_filter(
+            repo_key,
+            offset,
+            limit,
+            modified_after,
+            modified_before,
+        )
+        .await
+    }
+
     async fn download_artifact(
         &self,
         repo_key: &str,
