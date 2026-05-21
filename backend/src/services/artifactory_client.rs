@@ -601,7 +601,10 @@ impl ArtifactoryClient {
         );
 
         let fallback_request = self.auth_request(self.client.get(download_uri));
-        fallback_request.send().await.map_err(ArtifactoryError::from)
+        fallback_request
+            .send()
+            .await
+            .map_err(ArtifactoryError::from)
     }
 
     /// Get artifact properties

@@ -488,9 +488,7 @@ impl MigrationWorker {
                     .await?;
 
                 // Log debug info for Docker manifests (especially helpful if they fail due to repo not being offline)
-                let is_docker_manifest = artifact_path.contains("/sha256__")
-                    && (artifact_path.ends_with("/manifest.json") || artifact_path.ends_with("/list.manifest.json"));
-                if is_docker_manifest {
+                if is_docker_manifest_path(&artifact_path) {
                     tracing::debug!(
                         repo = %repo_key,
                         path = %artifact_path,
@@ -645,12 +643,8 @@ impl MigrationWorker {
 
                 // Skip only when source reports not found right now.
                 // This keeps items eligible for future migration runs when cache entries become available.
-                if err_msg.contains("Artifact not found")
-                    && should_skip_cache_only_artifact(repo_key, artifact_path)
-                {
-                    let skip_reason = format!(
-                        "{err_msg} | Cache metadata/index artifact is currently unavailable from source. Skipped for this run only; rerun migration when source cache entry becomes available."
-                    );
+                if should_skip_failed_cache_artifact(&err_msg, repo_key, artifact_path) {
+                    let skip_reason = build_cache_skip_reason(&err_msg);
 
                     tracing::info!(
                         item_id = %item_id,
@@ -664,9 +658,7 @@ impl MigrationWorker {
                         .await?;
                     *skipped += 1;
                 } else {
-                    self.migration_service
-                        .fail_item(item_id, &err_msg)
-                        .await?;
+                    self.migration_service.fail_item(item_id, &err_msg).await?;
                     *failed += 1;
                 }
             }
@@ -727,7 +719,6 @@ impl MigrationWorker {
             actual.calculated_sha1.as_deref(),
         )
     }
-
 
     /// Send a progress update through the channel, if one is configured
     #[allow(clippy::too_many_arguments)]
@@ -1624,6 +1615,18 @@ pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
 }
 
+/// Detect Docker/OCI manifest paths laid out by Artifactory's filesystem
+/// layout (`.../sha256__<digest>/manifest.json` or `.../list.manifest.json`).
+///
+/// Used purely for logging context when initiating a download attempt of a
+/// manifest, since manifest downloads require the source repo to be offline
+/// for Artifactory to surface them via the storage API.
+fn is_docker_manifest_path(artifact_path: &str) -> bool {
+    artifact_path.contains("/sha256__")
+        && (artifact_path.ends_with("/manifest.json")
+            || artifact_path.ends_with("/list.manifest.json"))
+}
+
 /// Detect cache-only artifacts from Artifactory remote cache repositories.
 ///
 /// These are metadata/index files that exist in AQL but cannot be downloaded via HTTP
@@ -1639,17 +1642,18 @@ fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool 
     let path_lower = artifact_path.to_lowercase();
 
     // Docker/OCI: skip cache metadata manifests, not blob payloads.
-    if repo_lower.contains("docker") || repo_lower.contains("oci") {
-        if path_lower.contains("sha256__")
-            && (path_lower.ends_with("/manifest.json")
-                || path_lower.ends_with("/list.manifest.json"))
-        {
-            return true;
-        }
+    if (repo_lower.contains("docker") || repo_lower.contains("oci"))
+        && path_lower.contains("sha256__")
+        && (path_lower.ends_with("/manifest.json") || path_lower.ends_with("/list.manifest.json"))
+    {
+        return true;
     }
 
     // PyPI cache: simple index HTML files
-    if repo_lower.contains("pypi") && path_lower.starts_with(".pypi/") && path_lower.ends_with(".html") {
+    if repo_lower.contains("pypi")
+        && path_lower.starts_with(".pypi/")
+        && path_lower.ends_with(".html")
+    {
         return true;
     }
 
@@ -1670,16 +1674,39 @@ fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool 
         || path_lower.ends_with("contents.gz")
         || path_lower.ends_with("contents");
 
-    if is_deb_metadata && (repo_lower.contains("debian")
-        || repo_lower.contains("apt")
-        || repo_lower.contains("ubuntu")
-        || repo_lower.contains("bazel")) {
+    if is_deb_metadata
+        && (repo_lower.contains("debian")
+            || repo_lower.contains("apt")
+            || repo_lower.contains("ubuntu")
+            || repo_lower.contains("bazel"))
+    {
         return true;
     }
 
     false
 }
 
+/// Decide whether a failed transfer should be marked as skipped (versus
+/// failed) so the item stays eligible for a future migration run.
+///
+/// The combined predicate is intentionally narrow: only when the source
+/// reports the artifact as currently missing AND the (repo, path) pair
+/// matches the known cache-only metadata layout. Anything else surfaces
+/// as a hard failure so genuine outages stay visible.
+fn should_skip_failed_cache_artifact(err_msg: &str, repo_key: &str, artifact_path: &str) -> bool {
+    err_msg.contains("Artifact not found")
+        && should_skip_cache_only_artifact(repo_key, artifact_path)
+}
+
+/// Build the user-facing reason string recorded on migration items that
+/// were skipped because their cache entry is currently unavailable.
+fn build_cache_skip_reason(err_msg: &str) -> String {
+    format!(
+        "{err_msg} | Cache metadata/index artifact is currently unavailable from source. Skipped for this run only; rerun migration when source cache entry becomes available."
+    )
+}
+
+#[allow(dead_code)] // Helper retained for upcoming Artifactory remote-cache resolution path; covered by unit tests.
 fn resolve_source_repo_key_from_listing(
     repositories: &[crate::services::artifactory_client::RepositoryListItem],
     target_repo_key: &str,
@@ -1710,7 +1737,10 @@ pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn repo_item(key: &str, repo_type: &str) -> crate::services::artifactory_client::RepositoryListItem {
+    fn repo_item(
+        key: &str,
+        repo_type: &str,
+    ) -> crate::services::artifactory_client::RepositoryListItem {
         crate::services::artifactory_client::RepositoryListItem {
             key: key.to_string(),
             repo_type: repo_type.to_string(),
@@ -1851,24 +1881,48 @@ mod tests {
     #[test]
     fn test_should_skip_cache_only_artifact_pypi() {
         // PyPI cache HTML index files
-        assert!(should_skip_cache_only_artifact("pypi-remote-cache", ".pypi/invoke.html"));
-        assert!(should_skip_cache_only_artifact("pypi-cache", ".pypi/ipaddress.html"));
+        assert!(should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            ".pypi/invoke.html"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "pypi-cache",
+            ".pypi/ipaddress.html"
+        ));
     }
 
     #[test]
     fn test_should_skip_cache_only_artifact_cargo() {
         // Cargo auto-generated config
-        assert!(should_skip_cache_only_artifact("cargo-remote-cache", "config.json"));
-        assert!(should_skip_cache_only_artifact("cargo-cache", "1/registry/config.json"));
+        assert!(should_skip_cache_only_artifact(
+            "cargo-remote-cache",
+            "config.json"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "cargo-cache",
+            "1/registry/config.json"
+        ));
     }
 
     #[test]
     fn test_should_skip_cache_only_artifact_debian_metadata() {
         // Debian/Apt/Ubuntu repository metadata
-        assert!(should_skip_cache_only_artifact("debian-cache", "dists/focal/Release"));
-        assert!(should_skip_cache_only_artifact("ubuntu-cache", "dists/jammy/InRelease"));
-        assert!(should_skip_cache_only_artifact("apt-cache", "dists/bullseye/Packages.gz"));
-        assert!(should_skip_cache_only_artifact("bazel-cache", "dists/Contents.gz"));
+        assert!(should_skip_cache_only_artifact(
+            "debian-cache",
+            "dists/focal/Release"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "ubuntu-cache",
+            "dists/jammy/InRelease"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "apt-cache",
+            "dists/bullseye/Packages.gz"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "bazel-cache",
+            "dists/Contents.gz"
+        ));
     }
 
     #[test]
@@ -1892,11 +1946,7 @@ mod tests {
     fn test_resolve_source_repo_key_prefers_hidden_remote_cache_repo() {
         let repositories = vec![repo_item("docker-remote", "REMOTE")];
 
-        let resolved = resolve_source_repo_key_from_listing(
-            &repositories,
-            "docker-remote",
-            true,
-        );
+        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
 
         assert_eq!(resolved, "docker-remote-cache");
     }
@@ -1905,11 +1955,7 @@ mod tests {
     fn test_resolve_source_repo_key_uses_target_for_non_remote_repo() {
         let repositories = vec![repo_item("docker-local", "LOCAL")];
 
-        let resolved = resolve_source_repo_key_from_listing(
-            &repositories,
-            "docker-local",
-            true,
-        );
+        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-local", true);
 
         assert_eq!(resolved, "docker-local");
     }
@@ -1918,13 +1964,238 @@ mod tests {
     fn test_resolve_source_repo_key_uses_target_when_repo_missing() {
         let repositories = vec![repo_item("some-other-repo", "REMOTE")];
 
-        let resolved = resolve_source_repo_key_from_listing(
-            &repositories,
-            "docker-remote",
-            true,
-        );
+        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
 
         assert_eq!(resolved, "docker-remote");
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_returns_target_when_cached_remote_disabled() {
+        // include_cached_remote = false short-circuits the lookup regardless of
+        // whether the repo exists and regardless of its type.
+        let repositories = vec![repo_item("docker-remote", "REMOTE")];
+
+        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", false);
+
+        assert_eq!(resolved, "docker-remote");
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_returns_target_when_cached_remote_disabled_and_missing() {
+        // include_cached_remote = false also short-circuits when no listing entry
+        // is found, exercising the early-return branch before the .find() call.
+        let resolved = resolve_source_repo_key_from_listing(&[], "docker-remote", false);
+
+        assert_eq!(resolved, "docker-remote");
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_matches_remote_case_insensitively() {
+        // The remote-type comparison is case-insensitive (some Artifactory
+        // versions report "remote" rather than "REMOTE").
+        let repositories = vec![repo_item("docker-remote", "remote")];
+
+        let resolved = resolve_source_repo_key_from_listing(&repositories, "docker-remote", true);
+
+        assert_eq!(resolved, "docker-remote-cache");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_docker_manifest_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_docker_manifest_path_detects_single_arch_manifest() {
+        assert!(is_docker_manifest_path(
+            "library/nginx/sha256__abc123/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_detects_multi_arch_list_manifest() {
+        assert!(is_docker_manifest_path(
+            "library/nginx/sha256__abc123/list.manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_layer_payload() {
+        // sha256__ subdirectory but not a manifest filename
+        assert!(!is_docker_manifest_path(
+            "library/nginx/sha256__abc123/layer.tar"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_manifest_without_sha256_prefix() {
+        // manifest.json filename but no sha256__ marker upstream
+        assert!(!is_docker_manifest_path(
+            "library/nginx/latest/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_empty_path() {
+        assert!(!is_docker_manifest_path(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_skip_failed_cache_artifact + build_cache_skip_reason
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_matches_not_found_for_cache_metadata() {
+        // Real-world error string from Artifactory client wrapping a 404
+        let err = "Artifact not found: docker-remote-cache/library/nginx/sha256__abc/manifest.json";
+        assert!(should_skip_failed_cache_artifact(
+            err,
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_rejects_not_found_for_real_payload() {
+        // A 404 on an actual package payload is a real failure, not a cache skip
+        let err = "Artifact not found: pypi-remote-cache/wheel-0.46.2-py3-none-any.whl";
+        assert!(!should_skip_failed_cache_artifact(
+            err,
+            "pypi-remote-cache",
+            "wheel-0.46.2-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_rejects_non_not_found_errors() {
+        // Connection errors, 500s, etc. must surface as failures even on
+        // cache-metadata paths so genuine outages stay visible.
+        let err = "Connection refused while contacting source registry";
+        assert!(!should_skip_failed_cache_artifact(
+            err,
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_build_cache_skip_reason_preserves_underlying_error_message() {
+        let reason = build_cache_skip_reason("Artifact not found: foo/bar.json");
+        assert!(reason.starts_with("Artifact not found: foo/bar.json"));
+        assert!(reason.contains("currently unavailable from source"));
+        assert!(reason.contains("rerun migration"));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_skip_cache_only_artifact - additional branch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker_rejects_non_manifest_filenames() {
+        // Docker/OCI repo but path does not match the manifest filename
+        // pattern: must not be skipped (it is a real blob/payload).
+        assert!(!should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/config.json"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "oci-remote-cache",
+            "library/nginx/sha256__abc/blob.bin"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker_rejects_manifest_without_sha256_marker() {
+        // manifest.json filename but no sha256__ in the path: not a cache
+        // manifest, must not be skipped.
+        assert!(!should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "library/nginx/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi_rejects_non_html() {
+        // PyPI repo but the path is not an .html index file
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            ".pypi/wheel-0.46.2-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi_rejects_html_outside_pypi_prefix() {
+        // .html file but not inside the `.pypi/` cache directory
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            "docs/index.html"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_cargo_rejects_non_config_files() {
+        // Cargo repo but file is not config.json
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-remote-cache",
+            "1/r/registry.crate"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata_requires_known_repo_family() {
+        // Debian-style metadata filename but the repo key does not look like
+        // a debian/apt/ubuntu/bazel repo: must not be skipped.
+        assert!(!should_skip_cache_only_artifact(
+            "generic-remote-cache",
+            "dists/focal/Release"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "maven-remote-cache",
+            "dists/focal/Packages.gz"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata_covers_each_variant() {
+        // Walk every debian-metadata file extension the helper recognises so
+        // each branch of the `is_deb_metadata` chain is exercised.
+        let variants = [
+            "dists/focal/Release",
+            "dists/focal/Release.gpg",
+            "dists/focal/InRelease",
+            "dists/focal/main/binary-amd64/Packages.gz",
+            "dists/focal/main/binary-amd64/Packages.bz2",
+            "dists/focal/main/binary-amd64/Packages.xz",
+            "dists/focal/main/binary-amd64/Packages",
+            "dists/focal/main/binary-amd64/Packages.dir",
+            "dists/focal/Contents.gz",
+            "dists/focal/Contents",
+        ];
+        for path in variants {
+            assert!(
+                should_skip_cache_only_artifact("debian-remote-cache", path),
+                "expected debian metadata variant to be skippable: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_unknown_repo_unknown_path_returns_false() {
+        // Exercises the trailing `false` branch: no Docker/OCI, no PyPI,
+        // no Cargo, no debian-family rule applies.
+        assert!(!should_skip_cache_only_artifact(
+            "maven-remote-cache",
+            "com/example/lib/1.0/lib-1.0.jar"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_is_repo_key_case_insensitive() {
+        // The helper lowercases the repo key, so mixed-case keys still
+        // route into the docker branch.
+        assert!(should_skip_cache_only_artifact(
+            "Docker-Remote-Cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
     }
 
     #[test]
