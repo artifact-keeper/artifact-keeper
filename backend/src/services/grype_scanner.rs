@@ -245,23 +245,31 @@ impl GrypeScanner {
     }
 
     /// Convert Grype matches into `RawFinding` values.
+    ///
+    /// `affected_component` holds the bare package name. Earlier versions of
+    /// this method appended the artifact type in parentheses (e.g. `log4j-core
+    /// (java-archive)`), but #1311 aligned the image-scanner code path with
+    /// the filesystem-scanner contract from #903: cross-source join keys
+    /// (SBOM, CVE-mapping, UI) need the raw name, and any type information
+    /// belongs in a separate column rather than smuggled inside the name
+    /// string. Grype's JSON does not emit a package inventory block so the
+    /// type/target metadata is dropped here rather than persisted alongside
+    /// in a `RawPackage` row; the Trivy filesystem scanner that typically
+    /// runs alongside provides the inventory side of the contract.
     fn convert_findings(report: &GrypeReport) -> Vec<RawFinding> {
         report
             .matches
             .iter()
             .map(|m| {
-                let affected_component = Some(match &m.artifact.artifact_type {
-                    Some(t) => format!("{} ({})", m.artifact.name, t),
-                    None => m.artifact.name.clone(),
-                });
-
                 RawFinding {
                     severity: Severity::from_str_loose(&m.vulnerability.severity)
                         .unwrap_or(Severity::Info),
                     title: format!("{} in {}", m.vulnerability.id, m.artifact.name),
                     description: m.vulnerability.description.clone(),
                     cve_id: Some(m.vulnerability.id.clone()),
-                    affected_component,
+                    // Bare package name; matches scanner_service::convert_trivy_findings
+                    // so SBOM / CVE-mapping consumers can join on the raw name.
+                    affected_component: Some(m.artifact.name.clone()),
                     affected_version: Some(m.artifact.version.clone()),
                     fixed_version: m
                         .vulnerability
@@ -644,22 +652,67 @@ mod tests {
         assert_eq!(findings[0].cve_id, Some("CVE-2023-99999".to_string()));
         assert_eq!(findings[0].fixed_version, Some("2.0.0".to_string()));
         assert_eq!(findings[0].source, Some("grype".to_string()));
-        assert!(findings[0]
-            .affected_component
-            .as_ref()
-            .unwrap()
-            .contains("vulnerable-pkg"));
-        assert!(findings[0]
-            .affected_component
-            .as_ref()
-            .unwrap()
-            .contains("python"));
+        // #1311: affected_component is the bare package name, mirroring the
+        // filesystem-scanner contract from #903. The artifact type
+        // ("python") used to be appended in parentheses but is now dropped
+        // so SBOM / CVE-mapping consumers can join on the raw name.
+        assert_eq!(
+            findings[0].affected_component,
+            Some("vulnerable-pkg".to_string()),
+            "affected_component must be the bare package name, not '<name> (<type>)'"
+        );
         assert_eq!(findings[0].affected_version, Some("1.0.0".to_string()));
         assert!(findings[0]
             .source_url
             .as_ref()
             .unwrap()
             .contains("nvd.nist.gov"));
+    }
+
+    /// Regression test for #1311. Grype's image-scanner code path (via
+    /// registry mode #1160) historically wrapped `affected_component` as
+    /// `"<name> (<artifact_type>)"`, e.g. `"log4j-core (java-archive)"`.
+    /// PR #1150 standardized `scan_findings.affected_component` to the
+    /// bare package name across all scanners so SBOM CycloneDX/SPDX output
+    /// and the `scan_packages` join-table reconcile entries by raw name.
+    /// This test pins the bare-name format on a Grype finding that carries
+    /// a non-empty `artifact_type`, the exact shape that produced the bug.
+    #[test]
+    fn test_convert_findings_emits_bare_package_name_for_typed_artifact() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2021-44228".to_string(),
+                    severity: "Critical".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "log4j-core".to_string(),
+                    version: "2.14.1".to_string(),
+                    artifact_type: Some("java-archive".to_string()),
+                },
+            }],
+        };
+
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 1);
+        let component = findings[0]
+            .affected_component
+            .as_ref()
+            .expect("affected_component must be populated");
+        assert_eq!(
+            component, "log4j-core",
+            "affected_component must be the bare package name; got {:?} \
+             (the legacy '<name> (<type>)' format breaks SBOM and CVE-mapping joins, see #1311)",
+            component
+        );
+        assert!(
+            !component.contains('('),
+            "affected_component must not contain the artifact-type parenthetical (#1311); got {:?}",
+            component
+        );
     }
 
     #[test]
