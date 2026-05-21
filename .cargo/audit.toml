@@ -16,4 +16,14 @@ ignore = [
     # wasmtime advisories from the 2026-04-09 batch (RUSTSEC-2026-0086,
     # 0088, 0089, 0094, 0095, 0096) are resolved by the wasmtime 24 -> 36.0.7
     # upgrade tracked in issue #691. No wasmtime ignores needed.
+
+    # rand unsoundness: aliased mutable references when both `log` and
+    # `thread_rng` features are enabled and a custom logger reentrantly calls
+    # rand::rng() during reseed. Reaches us only via transitive deps
+    # (totp-rs, quinn-proto, object_store) that pin pre-fix rand versions
+    # (0.8.5, 0.9.2, 0.10.0; fixed in 0.8.6 / 0.9.3 / 0.10.1). We do not
+    # enable the `log` feature on `rand`, and our loggers do not call
+    # rand::rng(), so the unsound code path is unreachable from artifact-keeper.
+    # Re-evaluate once upstream deps bump their rand pins.
+    "RUSTSEC-2026-0097",
 ]
