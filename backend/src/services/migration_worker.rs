@@ -455,6 +455,27 @@ impl MigrationWorker {
                     continue;
                 }
 
+                // Check for duplicates in the artifacts table (cross-job support)
+                // This is checked BEFORE creating migration_item so we avoid tracking
+                // duplicates that already exist, which makes delta migrations work
+                let should_skip_duplicate = self
+                    .check_artifact_duplicate(
+                        &source_path,
+                        item_checksum.as_deref(),
+                        conflict_resolution,
+                    )
+                    .await?;
+
+                if should_skip_duplicate {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Skipping duplicate artifact (already exists with matching checksum)"
+                    );
+                    *skipped += 1;
+                    continue;
+                }
+
                 // Add migration item to database (or get existing one on resume)
                 let item_id = self
                     .add_migration_item(
@@ -465,6 +486,17 @@ impl MigrationWorker {
                         item_checksum.as_deref(),
                     )
                     .await?;
+
+                // Log debug info for Docker manifests (especially helpful if they fail due to repo not being offline)
+                let is_docker_manifest = artifact_path.contains("/sha256__")
+                    && (artifact_path.ends_with("/manifest.json") || artifact_path.ends_with("/list.manifest.json"));
+                if is_docker_manifest {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Attempting download of Docker manifest (requires source repo to be offline)"
+                    );
+                }
 
                 self.process_single_artifact(
                     item_id,
@@ -609,10 +641,34 @@ impl MigrationWorker {
                 .await?;
             }
             Err(e) => {
-                self.migration_service
-                    .fail_item(item_id, &e.to_string())
-                    .await?;
-                *failed += 1;
+                let err_msg = e.to_string();
+
+                // Skip only when source reports not found right now.
+                // This keeps items eligible for future migration runs when cache entries become available.
+                if err_msg.contains("Artifact not found")
+                    && should_skip_cache_only_artifact(repo_key, artifact_path)
+                {
+                    let skip_reason = format!(
+                        "{err_msg} | Cache metadata/index artifact is currently unavailable from source. Skipped for this run only; rerun migration when source cache entry becomes available."
+                    );
+
+                    tracing::info!(
+                        item_id = %item_id,
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Cache metadata/index artifact currently unavailable from source; skipping for this run and eligible on future runs"
+                    );
+
+                    self.migration_service
+                        .skip_item(item_id, &skip_reason)
+                        .await?;
+                    *skipped += 1;
+                } else {
+                    self.migration_service
+                        .fail_item(item_id, &err_msg)
+                        .await?;
+                    *failed += 1;
+                }
             }
         }
 
@@ -671,6 +727,7 @@ impl MigrationWorker {
             actual.calculated_sha1.as_deref(),
         )
     }
+
 
     /// Send a progress update through the channel, if one is configured
     #[allow(clippy::too_many_arguments)]
@@ -1567,6 +1624,81 @@ pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
 }
 
+/// Detect cache-only artifacts from Artifactory remote cache repositories.
+///
+/// These are metadata/index files that exist in AQL but cannot be downloaded via HTTP
+/// because they are:
+/// 1. Dynamically generated during cache revalidation
+/// 2. Index files (e.g., Debian Release files, Cargo config, PyPI index pages)
+/// 3. Expired cache entries that cannot be revalidated with upstream
+///
+/// Skipping these prevents failed migration items while preserving actual downloadable
+/// artifacts (packages, blobs, tarballs, etc.)
+fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool {
+    let repo_lower = repo_key.to_lowercase();
+    let path_lower = artifact_path.to_lowercase();
+
+    // Docker/OCI: skip cache metadata manifests, not blob payloads.
+    if repo_lower.contains("docker") || repo_lower.contains("oci") {
+        if path_lower.contains("sha256__")
+            && (path_lower.ends_with("/manifest.json")
+                || path_lower.ends_with("/list.manifest.json"))
+        {
+            return true;
+        }
+    }
+
+    // PyPI cache: simple index HTML files
+    if repo_lower.contains("pypi") && path_lower.starts_with(".pypi/") && path_lower.ends_with(".html") {
+        return true;
+    }
+
+    // Cargo cache: auto-generated config.json
+    if repo_lower.contains("cargo") && artifact_path.ends_with("config.json") {
+        return true;
+    }
+
+    // Debian/Apt/Ubuntu repository metadata and package indices
+    let is_deb_metadata = path_lower.ends_with("release")
+        || path_lower.ends_with("release.gpg")
+        || path_lower.ends_with("inrelease")
+        || path_lower.ends_with("packages.gz")
+        || path_lower.ends_with("packages.bz2")
+        || path_lower.ends_with("packages.xz")
+        || path_lower.ends_with("packages")
+        || path_lower.ends_with("packages.dir")
+        || path_lower.ends_with("contents.gz")
+        || path_lower.ends_with("contents");
+
+    if is_deb_metadata && (repo_lower.contains("debian")
+        || repo_lower.contains("apt")
+        || repo_lower.contains("ubuntu")
+        || repo_lower.contains("bazel")) {
+        return true;
+    }
+
+    false
+}
+
+fn resolve_source_repo_key_from_listing(
+    repositories: &[crate::services::artifactory_client::RepositoryListItem],
+    target_repo_key: &str,
+    include_cached_remote: bool,
+) -> String {
+    if !include_cached_remote {
+        return target_repo_key.to_string();
+    }
+
+    let Some(target_repo) = repositories.iter().find(|repo| repo.key == target_repo_key) else {
+        return target_repo_key.to_string();
+    };
+
+    if !target_repo.repo_type.eq_ignore_ascii_case("remote") {
+        return target_repo_key.to_string();
+    }
+
+    format!("{}-cache", target_repo_key)
+}
 /// Extract the file name from an artifact path.
 /// Returns the portion after the last '/' separator, or the entire
 /// string if no separator is present.
@@ -1577,6 +1709,16 @@ pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo_item(key: &str, repo_type: &str) -> crate::services::artifactory_client::RepositoryListItem {
+        crate::services::artifactory_client::RepositoryListItem {
+            key: key.to_string(),
+            repo_type: repo_type.to_string(),
+            package_type: String::new(),
+            url: None,
+            description: None,
+        }
+    }
 
     #[test]
     fn test_conflict_resolution_from_str() {
@@ -1691,6 +1833,98 @@ mod tests {
         let config = WorkerConfig::default();
         assert!(config.batch_size >= 100);
         assert!(config.batch_size <= 10_000);
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker() {
+        // Docker/OCI cache paths with sha256__
+        assert!(should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "anchore/grype/sha256__1a58983ca4abb6bd0b0ae9f171541ff67d8f6a15bfcc49203ab97f9d01d3294e/manifest.json"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "oci-cache",
+            "library/nginx/sha256__52e3/list.manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi() {
+        // PyPI cache HTML index files
+        assert!(should_skip_cache_only_artifact("pypi-remote-cache", ".pypi/invoke.html"));
+        assert!(should_skip_cache_only_artifact("pypi-cache", ".pypi/ipaddress.html"));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_cargo() {
+        // Cargo auto-generated config
+        assert!(should_skip_cache_only_artifact("cargo-remote-cache", "config.json"));
+        assert!(should_skip_cache_only_artifact("cargo-cache", "1/registry/config.json"));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata() {
+        // Debian/Apt/Ubuntu repository metadata
+        assert!(should_skip_cache_only_artifact("debian-cache", "dists/focal/Release"));
+        assert!(should_skip_cache_only_artifact("ubuntu-cache", "dists/jammy/InRelease"));
+        assert!(should_skip_cache_only_artifact("apt-cache", "dists/bullseye/Packages.gz"));
+        assert!(should_skip_cache_only_artifact("bazel-cache", "dists/Contents.gz"));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_allows_real_packages() {
+        // Non-cache artifacts should not be skipped
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-cache",
+            "13/2c/5e079cefe955ae58e5a052fe037c850ce493eb7269dedeb960237e78fb0f/wheel-0.46.2-py3-none-any.whl"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "docker-cache",
+            "library/nginx/sha256__52e3/layer.tar"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-cache",
+            "requests/requests-2.28.0-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_prefers_hidden_remote_cache_repo() {
+        let repositories = vec![repo_item("docker-remote", "REMOTE")];
+
+        let resolved = resolve_source_repo_key_from_listing(
+            &repositories,
+            "docker-remote",
+            true,
+        );
+
+        assert_eq!(resolved, "docker-remote-cache");
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_uses_target_for_non_remote_repo() {
+        let repositories = vec![repo_item("docker-local", "LOCAL")];
+
+        let resolved = resolve_source_repo_key_from_listing(
+            &repositories,
+            "docker-local",
+            true,
+        );
+
+        assert_eq!(resolved, "docker-local");
+    }
+
+    #[test]
+    fn test_resolve_source_repo_key_uses_target_when_repo_missing() {
+        let repositories = vec![repo_item("some-other-repo", "REMOTE")];
+
+        let resolved = resolve_source_repo_key_from_listing(
+            &repositories,
+            "docker-remote",
+            true,
+        );
+
+        assert_eq!(resolved, "docker-remote");
     }
 
     #[test]

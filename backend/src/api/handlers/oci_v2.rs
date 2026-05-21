@@ -1316,6 +1316,7 @@ async fn handle_head_blob(
                 }
             };
             if storage.exists(&b.storage_key).await.unwrap_or(false) {
+                tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: serving from migrated oci_blobs (CAS hit)");
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("Docker-Content-Digest", digest)
@@ -1324,8 +1325,11 @@ async fn handle_head_blob(
                     .body(Body::empty())
                     .unwrap();
             }
+            tracing::warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: oci_blobs row found but storage file missing - will proxy from upstream");
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::debug!(repo = %repo.key, digest = %digest, "HEAD blob: no oci_blobs row - will proxy from upstream");
+        }
         Err(e) => {
             warn!("DB error checking blob: {}", e);
         }
@@ -1390,6 +1394,7 @@ async fn handle_get_blob(
             };
             match storage.get(&b.storage_key).await {
                 Ok(data) => {
+                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: serving from migrated oci_blobs (CAS hit)");
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header("Docker-Content-Digest", digest)
@@ -1399,11 +1404,13 @@ async fn handle_get_blob(
                         .unwrap();
                 }
                 Err(e) => {
-                    warn!("Storage error reading blob {}: {}", digest, e);
+                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get failed - will proxy from upstream: {}", e);
                 }
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::debug!(repo = %repo.key, digest = %digest, "GET blob: no oci_blobs row - will proxy from upstream");
+        }
         Err(e) => {
             warn!("DB error reading blob: {}", e);
         }
@@ -1976,6 +1983,7 @@ async fn handle_get_manifest(
         let manifest_key = manifest_storage_key(&manifest_digest);
 
         if let Ok(data) = storage.get(&manifest_key).await {
+            tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: serving from migrated oci_tags (local hit)");
             return Response::builder()
                 .status(StatusCode::OK)
                 .header("Docker-Content-Digest", &manifest_digest)
@@ -1984,6 +1992,9 @@ async fn handle_get_manifest(
                 .body(Body::from(data))
                 .unwrap();
         }
+        tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, manifest_key = %manifest_key, "GET manifest: oci_tags row found but storage file missing - will proxy from upstream");
+    } else {
+        tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, "GET manifest: no oci_tags row - will proxy from upstream");
     }
 
     // For remote repos, try fetching manifest from upstream. Forward the
