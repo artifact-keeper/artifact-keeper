@@ -2149,41 +2149,24 @@ pub async fn download_artifact(
         )
             .into_response()),
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
-            // Try proxy for remote repositories
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                // Apply routing rules to rewrite the path before upstream fetch
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
                     .unwrap_or_else(|| path.clone());
 
-                let (content, content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &fetch_path)
-                        .await
-                        .map_err(|_| {
-                            AppError::NotFound("Artifact not found upstream".to_string())
-                        })?;
-
-                let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-                let filename = path.rsplit('/').next().unwrap_or(&path);
-
-                Ok((
-                    [
-                        (header::CONTENT_TYPE, ct),
-                        (
-                            header::CONTENT_DISPOSITION,
-                            format!("attachment; filename=\"{}\"", filename),
-                        ),
-                        (header::CONTENT_LENGTH, content.len().to_string()),
-                        (
-                            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                            "upstream".to_string(),
-                        ),
-                    ],
-                    content,
+                let response = proxy_helpers::proxy_fetch_streaming(
+                    proxy,
+                    repo.id,
+                    &key,
+                    upstream_url,
+                    &fetch_path,
+                    "application/octet-stream",
                 )
-                    .into_response())
+                .await
+                .unwrap_or_else(|err_resp| err_resp);
+                Ok(response.into_response())
             } else {
                 Err(AppError::NotFound("Artifact not found".to_string()))
             }
