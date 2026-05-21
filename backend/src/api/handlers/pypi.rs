@@ -2470,6 +2470,55 @@ mod tests {
         }
     }
 
+    /// Returns the configured bytes for any `get` call, simulating a healthy
+    /// proxy-cache hit on disk.
+    struct PresentStorage {
+        bytes: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for PresentStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(self.bytes.clone())
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns a non-`NotFound` storage error for every `get`, simulating an
+    /// underlying backend failure (permissions, I/O, etc.) that should NOT be
+    /// silently swallowed as a stale-cache miss.
+    struct BrokenStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for BrokenStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::Storage("permission denied".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
         let storage = MissingStorage;
@@ -2495,6 +2544,134 @@ mod tests {
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "missing proxy-cache entry should trigger exactly one upstream refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
+        // Happy path: cache hits should return the stored bytes verbatim and
+        // must NEVER invoke the upstream refetch closure.
+        let storage = PresentStorage {
+            bytes: Bytes::from_static(b"cached-wheel-bytes"),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"should-not-be-used"))
+                }
+            },
+        )
+        .await
+        .expect("cached read should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"cached-wheel-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a healthy cache hit must not trigger an upstream refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_propagates_non_notfound_storage_error() {
+        // A storage backend error that is NOT `NotFound` (e.g. permission
+        // denied, I/O error) must be surfaced as a 500 instead of silently
+        // re-fetching, otherwise we mask infra issues from operators.
+        let storage = BrokenStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"never-reached"))
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("non-NotFound storage errors must propagate");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-NotFound storage errors must not trigger a refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_surfaces_refetch_failure() {
+        // When the cache is stale AND the upstream refetch also fails, the
+        // upstream error response must reach the caller untouched so the
+        // client sees the correct upstream status (e.g. 502).
+        let storage = MissingStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(AppError::BadGateway("upstream timed out".to_string()).into_response())
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("refetch failures must propagate to caller");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stale-cache miss must attempt exactly one refetch even if it fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
+        // Edge case: a legitimately empty cached payload (zero bytes) is
+        // still a cache hit and must be returned without triggering a
+        // refetch. This guards against accidentally treating empty bodies
+        // as "missing".
+        let storage = PresentStorage {
+            bytes: Bytes::new(),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"unexpected"))
+                }
+            },
+        )
+        .await
+        .expect("empty cached payload should still be a hit");
+
+        assert!(content.is_empty());
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "empty cached payload is a cache hit, not a stale miss"
         );
     }
 
