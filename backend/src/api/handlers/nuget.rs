@@ -58,8 +58,12 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v3/flatcontainer/:id/:version/:filename",
             get(flatcontainer_download),
         )
-        // Push package (dotnet nuget push)
+        // Push package (dotnet nuget push).
+        // Register both with and without trailing slash because `dotnet nuget
+        // push` appends a trailing slash to the PackagePublish/2.0.0 URL
+        // discovered from the v3 service index.
         .route("/:repo_key/api/v2/package", put(push_package))
+        .route("/:repo_key/api/v2/package/", put(push_package))
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +757,25 @@ async fn push_package(
     )
     .execute(&state.db)
     .await;
+
+    // Populate packages / package_versions tables (best-effort) so the
+    // package shows up in the UI Packages tab. Mirrors npm.rs / pypi.rs.
+    let description = if nuspec.description.is_empty() {
+        None
+    } else {
+        Some(nuspec.description.as_str())
+    };
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &nuspec.id,
+            &version,
+            size_bytes,
+            &checksum,
+            description,
+            Some(serde_json::json!({ "format": "nuget" })),
+        )
+        .await;
 
     // Update repository timestamp.
     let _ = sqlx::query!(
