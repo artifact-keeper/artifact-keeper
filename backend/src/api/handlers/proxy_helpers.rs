@@ -9,12 +9,15 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::download_response::try_presigned_redirect;
+use crate::api::handlers::error_helpers::map_storage_err;
 use crate::api::AppState;
+use crate::error::AppError;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::proxy_service::ProxyService;
 use crate::storage::StorageLocation;
+use std::future::Future;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -636,6 +639,46 @@ pub async fn proxy_check_cache(
             );
             None
         }
+    }
+}
+
+/// Generic helper for remote proxy-backed cache reads.
+///
+/// Tries `storage.get(storage_key)`. If it returns `AppError::NotFound` the
+/// helper treats this as a stale/evicted cache entry and invokes the
+/// `refetch` closure to retrieve the bytes from upstream. The refetched bytes
+/// are written back to storage via a best-effort `put` so future requests hit
+/// the cache. Non-`NotFound` storage errors are propagated as 500 responses so
+/// operators see real backend failures.
+pub(crate) async fn get_cached_or_refetch<F, Fut>(
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    match storage.get(storage_key).await {
+        Ok(content) => Ok(content),
+        Err(AppError::NotFound(_)) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                "proxy cache entry is missing on disk; re-fetching from upstream"
+            );
+            let bytes = refetch().await?;
+            // Best-effort write-back: failures are logged but do not fail the
+            // current request.
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched proxy payload; subsequent requests will re-fetch from upstream"
+                );
+            }
+            Ok(bytes)
+        }
+        Err(e) => Err(map_storage_err(e)),
     }
 }
 

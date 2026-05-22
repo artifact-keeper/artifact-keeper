@@ -927,32 +927,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    match storage.get(storage_key).await {
-        Ok(content) => Ok(content),
-        Err(AppError::NotFound(_)) => {
-            tracing::warn!(
-                storage_key = %storage_key,
-                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
-            );
-            let bytes = refetch().await?;
-            // Best-effort write-back: persist the refetched payload so the
-            // next request hits the cache instead of re-traversing the
-            // simple index and re-downloading from upstream. Without this,
-            // N concurrent `uv` clients each issue a fresh upstream fetch
-            // for the same wheel (thundering herd; see PR #1283 review).
-            // We swallow write errors to keep serving the current request,
-            // but log them so operators can spot a broken backend.
-            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
-                tracing::warn!(
-                    storage_key = %storage_key,
-                    error = %e,
-                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
-                );
-            }
-            Ok(bytes)
-        }
-        Err(e) => Err(map_storage_err(e)),
-    }
+    proxy_helpers::get_cached_or_refetch(storage, storage_key, refetch).await
 }
 
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
