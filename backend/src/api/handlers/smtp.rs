@@ -23,6 +23,10 @@ pub struct SmtpApiDoc;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SmtpTestRequest {
     /// Recipient email address for the test message.
+    ///
+    /// Accepts `recipient` as an alias for backward compatibility with Web UI
+    /// versions <= 1.1.3, which send `{"recipient": "..."}`.
+    #[serde(alias = "recipient")]
     pub to: String,
 }
 
@@ -83,4 +87,33 @@ pub async fn send_test_email(
         success: true,
         message: format!("Test email sent to {}", req.to),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smtp_test_request_accepts_to_field() {
+        let body = r#"{"to":"user@example.com"}"#;
+        let req: SmtpTestRequest = serde_json::from_str(body).expect("should parse `to`");
+        assert_eq!(req.to, "user@example.com");
+    }
+
+    #[test]
+    fn smtp_test_request_accepts_recipient_alias() {
+        // Web UI 1.1.3 and earlier send `{"recipient": "..."}`. The backend
+        // must accept this for backward compatibility (issue #1332).
+        let body = r#"{"recipient":"user@example.com"}"#;
+        let req: SmtpTestRequest =
+            serde_json::from_str(body).expect("should parse `recipient` alias");
+        assert_eq!(req.to, "user@example.com");
+    }
+
+    #[test]
+    fn smtp_test_request_rejects_missing_field() {
+        let body = r#"{}"#;
+        let result: std::result::Result<SmtpTestRequest, _> = serde_json::from_str(body);
+        assert!(result.is_err());
+    }
 }
