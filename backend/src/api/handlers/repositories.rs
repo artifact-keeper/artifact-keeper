@@ -4823,10 +4823,7 @@ mod tests {
         // Pathological case: both sizes near i64::MAX should saturate
         // instead of wrapping to a negative number that the UI would
         // render as a nonsense size.
-        let row = docker_tag_row(
-            "application/vnd.oci.image.index.v1+json",
-            i64::MAX - 100,
-        );
+        let row = docker_tag_row("application/vnd.oci.image.index.v1+json", i64::MAX - 100);
         let mut children = std::collections::HashMap::new();
         children.insert("sha256:parentdigest".to_string(), 1_000);
 
