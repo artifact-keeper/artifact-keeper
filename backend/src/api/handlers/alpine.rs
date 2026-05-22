@@ -628,6 +628,37 @@ async fn download_package(
                 .body(Body::from(content))
                 .unwrap())
         }
+        Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
+            // Hosted artifact: file absent from storage. Serialise concurrent
+            // readers with a pg advisory lock and retry once. Returns 507 if
+            // the file is still missing after acquiring the lock.
+            let content = proxy_helpers::advisory_lock_retry_get(
+                &state.db,
+                artifact.id,
+                &artifact.storage_key,
+                &*storage,
+            )
+            .await?;
+
+            let _ = sqlx::query!(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+                artifact.id
+            )
+            .execute(&state.db)
+            .await;
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/vnd.alpine.package")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+                .body(Body::from(content))
+                .unwrap())
+        }
         Err(e) => {
             // Storage retrieval failed. For remote repos, the DB record may
             // have been created by the proxy cache with a storage key that

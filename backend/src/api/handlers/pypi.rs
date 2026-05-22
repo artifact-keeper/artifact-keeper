@@ -1109,10 +1109,23 @@ async fn serve_file(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            get_remote_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || async move {
-                fetch_from_pypi_remote(proxy, repo.id, repo_key, upstream_url, project, filename)
+            get_remote_cached_or_refetch(
+                &state.db,
+                artifact.id,
+                storage.as_ref(),
+                &artifact.storage_key,
+                || async move {
+                    fetch_from_pypi_remote(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                    )
                     .await
-            })
+                },
+            )
             .await?
         } else {
             storage
@@ -1151,6 +1164,8 @@ async fn serve_file(
 }
 
 async fn get_remote_cached_or_refetch<F, Fut>(
+    db: &PgPool,
+    artifact_id: uuid::Uuid,
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
     refetch: F,
@@ -1159,7 +1174,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    proxy_helpers::get_cached_or_refetch(storage, storage_key, refetch).await
+    proxy_helpers::get_cached_or_refetch(db, artifact_id, storage, storage_key, refetch).await
 }
 
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
@@ -1783,6 +1798,16 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn try_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()
+    }
 
     // -----------------------------------------------------------------------
     // pypi_upstream_url_and_path (#1130)
@@ -2840,19 +2865,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         let storage = MissingStorage::new();
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let content = super::get_remote_cached_or_refetch(&storage, storage_key, move || {
-            let refetch_calls_clone = refetch_calls_clone.clone();
-            async move {
-                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(Bytes::from_static(b"refetched-bytes"))
-            }
-        })
+        let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            storage_key,
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"refetched-bytes"))
+                }
+            },
+        )
         .await
         .expect("refetch should succeed");
 
@@ -2904,12 +2938,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_serves_payload_even_if_writeback_fails() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         // A best-effort write-back must NOT fail the current request. If the
         // disk is full or read-only the user still gets their wheel; the
         // next request will simply re-fetch from upstream until the backend
         // recovers.
         let storage = WriteFailingStorage;
         let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
             &storage,
             "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
             move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
@@ -2922,6 +2961,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         // Happy path: cache hits should return the stored bytes verbatim and
         // must NEVER invoke the upstream refetch closure.
         let storage = PresentStorage {
@@ -2931,6 +2973,8 @@ mod tests {
         let refetch_calls_clone = refetch_calls.clone();
 
         let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
             &storage,
             "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
             move || {
@@ -2954,6 +2998,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_propagates_non_notfound_storage_error() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         // A storage backend error that is NOT `NotFound` (e.g. permission
         // denied, I/O error) must be surfaced as a 500 instead of silently
         // re-fetching, otherwise we mask infra issues from operators.
@@ -2962,6 +3009,8 @@ mod tests {
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
             &storage,
             "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
             move || {
@@ -2985,6 +3034,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_surfaces_refetch_failure() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         // When the cache is stale AND the upstream refetch also fails, the
         // upstream error response must reach the caller untouched so the
         // client sees the correct upstream status (e.g. 502).
@@ -2993,6 +3045,8 @@ mod tests {
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
             &storage,
             "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
             move || {
@@ -3016,6 +3070,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
         // Edge case: a legitimately empty cached payload (zero bytes) is
         // still a cache hit and must be returned without triggering a
         // refetch. This guards against accidentally treating empty bodies
@@ -3027,6 +3084,8 @@ mod tests {
         let refetch_calls_clone = refetch_calls.clone();
 
         let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
             &storage,
             "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
             move || {

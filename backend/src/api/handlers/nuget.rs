@@ -569,27 +569,33 @@ async fn flatcontainer_download(
             let version = version.clone();
             let filename = filename.clone();
             let repo_key = repo_key.clone();
-            proxy_helpers::get_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || {
-                let package_id_lower = package_id_lower.clone();
-                let version = version.clone();
-                let filename = filename.clone();
-                let repo_key = repo_key.clone();
-                async move {
-                    let upstream_path = format!(
-                        "v3/flatcontainer/{}/{}/{}",
-                        package_id_lower, version, filename
-                    );
-                    let (bytes, _content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    Ok(bytes)
-                }
-            })
+            proxy_helpers::get_cached_or_refetch(
+                &state.db,
+                artifact.id,
+                storage.as_ref(),
+                &artifact.storage_key,
+                || {
+                    let package_id_lower = package_id_lower.clone();
+                    let version = version.clone();
+                    let filename = filename.clone();
+                    let repo_key = repo_key.clone();
+                    async move {
+                        let upstream_path = format!(
+                            "v3/flatcontainer/{}/{}/{}",
+                            package_id_lower, version, filename
+                        );
+                        let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &upstream_path,
+                        )
+                        .await?;
+                        Ok(bytes)
+                    }
+                },
+            )
             .await?
         } else {
             storage.get(&artifact.storage_key).await.map_err(|e| {
