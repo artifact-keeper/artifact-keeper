@@ -1305,6 +1305,91 @@ pub async fn virtual_non_remote_owns_name(
     Ok(exists.is_some())
 }
 
+/// Build the SQL `LIKE` pattern that matches every artifact path under
+/// a given Maven `groupId/artifactId/` directory.
+///
+/// Pure helper extracted so the prefix construction has unit-test
+/// coverage without a database. Returns `<group-path>/<artifactId>/%`,
+/// where the dot-to-slash conversion runs before LIKE-escaping so
+/// directory separators in the groupId are preserved, and `%`/`_`/`\`
+/// inside either input become literal characters. Use with
+/// `LIKE ... ESCAPE '\'`.
+pub(crate) fn maven_ga_like_pattern(group_id: &str, artifact_id: &str) -> String {
+    let group_path = group_id.replace('.', "/");
+    let mut prefix = String::with_capacity(group_path.len() + artifact_id.len() + 3);
+    prefix.push_str(&super::escape_like_literal(&group_path));
+    prefix.push('/');
+    prefix.push_str(&super::escape_like_literal(artifact_id));
+    prefix.push('/');
+    prefix.push('%');
+    prefix
+}
+
+/// Maven-aware shadowing guard: returns true if any non-Remote member of
+/// `virtual_repo_id` owns an artifact under the same groupId + artifactId
+/// directory prefix.
+///
+/// The generic [`virtual_non_remote_owns_name`] matches by `artifacts.name`
+/// alone, which for Maven is the artifactId component of the GAV. Two
+/// distinct Maven coordinates that happen to share an artifactId (eg.
+/// `com.foo:bar:1.0` vs. `com.baz:bar:1.0`) collide under the generic
+/// guard, suppressing legitimate remote resolution for any sibling
+/// groupId (#1287). Matching on the full groupId/artifactId path prefix
+/// instead means a local `com/example/mylib/common/...` artifact no
+/// longer shadows a remote `com/android/tools/common/...` lookup.
+///
+/// `group_path` must be the dot-replaced groupId (`com.foo` ->
+/// `com/foo`); the function appends `/<artifact_id>/` and runs a
+/// `path LIKE` against `artifacts.path`. The prefix is escaped to
+/// neutralise `%` / `_` / `\` so a crafted artifactId cannot widen the
+/// match. Uses the `(repository_id, path)` btree (`idx_artifacts_repo_path`).
+///
+/// Fails closed on DB error (matches `virtual_non_remote_owns_name`).
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_maven_ga(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    group_id: &str,
+    artifact_id: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let prefix = maven_ga_like_pattern(group_id, artifact_id);
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+                              WHERE repository_id = ANY($1) \
+                                AND is_deleted = false \
+                                AND path LIKE $2 ESCAPE '\\' \
+                              LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(&prefix)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            event = "shadowing_guard_db_error",
+            virtual_repo_id = %virtual_repo_id,
+            format = "maven",
+            error = %e,
+            "Maven shadowing-guard DB query failed; failing closed to 500",
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+    })?;
+
+    Ok(exists.is_some())
+}
+
 /// Try the proxy and virtual fallbacks for a download miss.
 ///
 /// Returns `Ok(Some(response))` if the artifact was served from upstream
@@ -1921,6 +2006,80 @@ mod tests {
     fn test_reverse_suffix_for_like_empty_input_just_slash() {
         // Empty suffix → reversed "/" → escaped "/"
         assert_eq!(reverse_suffix_for_like(""), "/");
+    }
+
+    // ── maven_ga_like_pattern tests (#1287) ─────────────────────────
+
+    #[test]
+    fn test_maven_ga_like_pattern_simple_groupid() {
+        // Regular groupId/artifactId pair: dots in groupId become
+        // path separators, then a `/<artifactId>/%` suffix is appended.
+        assert_eq!(
+            maven_ga_like_pattern("com.android.tools", "common"),
+            "com/android/tools/common/%"
+        );
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_distinguishes_groupids() {
+        // Two artifactIds that collide on `name` alone but live under
+        // different groupIds must produce distinct LIKE prefixes.
+        // This is the core property #1287 needs.
+        let foo = maven_ga_like_pattern("com.foo", "bar");
+        let baz = maven_ga_like_pattern("com.baz", "bar");
+        assert_ne!(foo, baz);
+        assert_eq!(foo, "com/foo/bar/%");
+        assert_eq!(baz, "com/baz/bar/%");
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_does_not_match_sibling_groupids() {
+        // `com.android.tools/common/...` must NOT be matched by a
+        // pattern derived from `com.example.mylib:common`. We assert
+        // the produced prefix is anchored at the full GA directory
+        // boundary.
+        let prefix = maven_ga_like_pattern("com.example.mylib", "common");
+        assert_eq!(prefix, "com/example/mylib/common/%");
+        // A path under a different groupId does not start with this
+        // prefix even though both share the `common` artifactId.
+        let unrelated_path = "com/android/tools/common/31.4.0/common-31.4.0.pom";
+        assert!(!unrelated_path.starts_with("com/example/mylib/common/"));
+        // Sanity: the matching local artifact path DOES start with it.
+        let local_path = "com/example/mylib/common/1.0.0/common-1.0.0.pom";
+        assert!(local_path.starts_with("com/example/mylib/common/"));
+        // And the LIKE suffix is open-ended.
+        assert!(prefix.ends_with('%'));
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_escapes_metachars() {
+        // A crafted artifactId containing `%` or `_` must not widen
+        // the LIKE match. Both inputs get escaped before being woven
+        // into the pattern.
+        assert_eq!(
+            maven_ga_like_pattern("a.b", "ev%il"),
+            "a/b/ev\\%il/%",
+            "% inside artifactId must be escaped"
+        );
+        assert_eq!(
+            maven_ga_like_pattern("a.b", "ev_il"),
+            "a/b/ev\\_il/%",
+            "_ inside artifactId must be escaped"
+        );
+        // `%` inside the groupId is also escaped (after the
+        // dot-to-slash conversion has already happened).
+        assert_eq!(
+            maven_ga_like_pattern("a%.b", "c"),
+            "a\\%/b/c/%",
+            "% inside groupId must be escaped"
+        );
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_escapes_backslash() {
+        // Backslashes get escaped so the ESCAPE '\' clause stays
+        // honest.
+        assert_eq!(maven_ga_like_pattern("a.b", "c\\d"), "a/b/c\\\\d/%");
     }
 
     // ── request_base_url tests ──────────────────────────────────────
