@@ -181,18 +181,23 @@ for fmt in "${STAGING_FORMATS[@]}"; do
 done
 
 # --- Test: Create virtual repos with members ---
+# Per #1281, POST /api/v1/repositories with repo_type=virtual must supply a
+# non-empty member_repos array at create time. The standalone members endpoint
+# still works for post-create updates and is exercised below as a 409 no-op
+# to keep that path covered.
 for fmt in "maven" "npm"; do
     VKEY="stress-${fmt}-virtual-${TIMESTAMP}"
     LKEY="stress-${fmt}-local-${TIMESTAMP}"
-    RESP=$(api_full POST "/api/v1/repositories" -d "{\"key\":\"$VKEY\",\"name\":\"Stress $fmt Virtual\",\"format\":\"$fmt\",\"repo_type\":\"virtual\"}")
+    RESP=$(api_full POST "/api/v1/repositories" \
+        -d "{\"key\":\"$VKEY\",\"name\":\"Stress $fmt Virtual\",\"format\":\"$fmt\",\"repo_type\":\"virtual\",\"member_repos\":[{\"repo_key\":\"$LKEY\",\"priority\":1}]}")
     CODE="${RESP%%|*}"
     if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
-        log_pass "Create $fmt virtual repo"
-        # Add member
+        log_pass "Create $fmt virtual repo with $LKEY member"
+        # Idempotent re-add to keep coverage on the standalone members endpoint
         MRESP=$(api_full POST "/api/v1/repositories/$VKEY/members" -d "{\"member_key\":\"$LKEY\",\"priority\":1}")
         MCODE="${MRESP%%|*}"
-        if [ "$MCODE" = "200" ] || [ "$MCODE" = "201" ]; then
-            log_pass "Add $LKEY as member of $VKEY"
+        if [ "$MCODE" = "200" ] || [ "$MCODE" = "201" ] || [ "$MCODE" = "409" ]; then
+            log_pass "Standalone add $LKEY -> $VKEY (idempotent, HTTP $MCODE)"
         else
             log_fail "Add virtual member: HTTP $MCODE - ${MRESP#*|}"
         fi
