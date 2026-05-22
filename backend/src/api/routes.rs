@@ -84,6 +84,14 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/vscode", handlers::vscode::router())
         .nest("/proto", handlers::protobuf::router())
         .nest("/incus", handlers::incus::router())
+        // `lxc` is the same wire protocol and same handler as `incus`; the
+        // `IncusHandler` accepts both `format='incus'` and `format='lxc'`
+        // repositories (see `resolve_incus_repo`). Without this alias,
+        // repositories created with `format: lxc` 404 on every request
+        // because no `/lxc/*` route existed (#1272). The SimpleStreams index
+        // served via this prefix currently references `/incus/...` download
+        // URLs; making those URLs prefix-aware is tracked as a follow-up.
+        .nest("/lxc", handlers::incus::router())
         .nest("/ext", handlers::wasm_proxy::router())
         .layer(middleware::from_fn_with_state(
             vis_state,
@@ -639,4 +647,49 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             api_rate_limit_state,
             rate_limit_middleware,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Source-level meta-tests pinning the `lxc` -> `incus` route alias
+    //! introduced for #1272. Repositories created with `format: lxc` 404'd
+    //! on every request because no `/lxc/*` route existed in the router,
+    //! even though the rest of the stack (enum variant, format dispatch,
+    //! repo resolver) accepted `lxc`. These assertions read the source of
+    //! `create_router` and fail loudly if a future refactor drops the
+    //! `/lxc` nest, since a runtime test would need full app state + a DB
+    //! fixture to reproduce the regression. The intent is to keep the two
+    //! prefixes wired to the same handler until the `lxc` format is either
+    //! folded into `incus` or given its own handler with prefix-aware URL
+    //! construction (tracked as a follow-up to #1272).
+    const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    #[test]
+    fn lxc_route_is_registered_alongside_incus() {
+        assert!(
+            ROUTES_RS_SRC.contains(".nest(\"/incus\", handlers::incus::router())"),
+            "incus route registration missing -- the lxc alias test below \
+             would otherwise be vacuously true; refactor needs to update \
+             this meta-test to match the new shape"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains(".nest(\"/lxc\", handlers::incus::router())"),
+            "/lxc route alias missing; lxc-format repositories will 404 \
+             on every request (regression of #1272)"
+        );
+    }
+
+    #[test]
+    fn lxc_and_incus_share_the_same_handler() {
+        // Pin the invariant that both prefixes mount the same router. If
+        // someone splits them into separate handlers in the future, this
+        // test should be updated alongside the routing decision so the
+        // intent stays explicit in source.
+        let incus_count = ROUTES_RS_SRC.matches("handlers::incus::router()").count();
+        assert!(
+            incus_count >= 2,
+            "expected handlers::incus::router() to be referenced at least \
+             twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
 }

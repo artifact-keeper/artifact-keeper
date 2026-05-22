@@ -7,7 +7,8 @@
 //! frame-by-frame, so memory stays flat regardless of image size.
 //! Both monolithic (single PUT) and chunked/resumable uploads are supported.
 //!
-//! Routes mounted at `/incus/{repo_key}/...`:
+//! Routes mounted at `/incus/{repo_key}/...` and (as an alias for repos
+//! created with `format: lxc`) `/lxc/{repo_key}/...`:
 //!   GET    /streams/v1/index.json              - SimpleStreams index
 //!   GET    /streams/v1/images.json             - SimpleStreams product catalog
 //!   GET    /images/{product}/{version}/{file}  - Download image file
