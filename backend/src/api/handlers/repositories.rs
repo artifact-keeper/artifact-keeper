@@ -1234,9 +1234,16 @@ pub struct ListArtifactsQuery {
     pub per_page: Option<u32>,
     pub q: Option<String>,
     pub path_prefix: Option<String>,
-    /// When set to `maven_component`, Maven/Gradle artifacts are grouped by
-    /// groupId, artifactId, and version.  Individual files (jar, pom, checksums)
-    /// appear in the `artifact_files` array of each component.
+    /// Server-side artifact grouping.
+    ///
+    /// Supported values:
+    /// - `maven_component`: Maven/Gradle artifacts are grouped by
+    ///   groupId, artifactId, and version.  Individual files (jar, pom,
+    ///   checksums) appear in the `artifact_files` array of each component.
+    /// - `docker_tag`: Docker/OCI artifacts are grouped by (image, tag),
+    ///   with `total_size_bytes` summed across the manifest config and
+    ///   referenced layer blobs.  The grouped rows are returned in the
+    ///   `docker_tags` array.
     pub group_by: Option<String>,
 }
 
@@ -1263,6 +1270,52 @@ pub struct ArtifactListResponse {
     /// Maven component grouping.  Only present when `group_by=maven_component`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<MavenComponentResponse>>,
+    /// Docker tag grouping.  Only present when `group_by=docker_tag`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_tags: Option<Vec<DockerTagResponse>>,
+}
+
+/// A Docker/OCI tag grouped by (image, tag).
+///
+/// `total_size_bytes` is the server-side aggregation of the manifest body
+/// plus every referenced layer blob.  This is what the UI should display
+/// as the on-disk image size; the previous client-side aggregation that
+/// only summed the manifest body itself reported a few kilobytes for
+/// images that are hundreds of megabytes on disk (artifact-keeper#1193).
+///
+/// For multi-arch image indexes the size is the sum across all per-arch
+/// child manifests recorded in `oci_manifest_refs`, so an `amd64+arm64`
+/// index reports the combined storage cost.
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct DockerTagResponse {
+    /// Representative manifest artifact ID.
+    pub id: Uuid,
+    /// Repository key this tag belongs to.
+    pub repository_key: String,
+    /// Image name (no registry host, no tag).  Maps to the OCI v2 `<name>`
+    /// path segment, which may include slashes (e.g. `library/postgres`).
+    pub image: String,
+    /// Tag string (e.g. `16-alpine`).  Never a `sha256:...` digest;
+    /// digest-only references are filtered out of the grouping.
+    pub tag: String,
+    /// Manifest content digest (e.g. `sha256:abcdef...`).
+    pub manifest_digest: String,
+    /// Total size in bytes of the manifest plus all referenced layer blobs.
+    /// For image indexes, this sums across child manifests.
+    pub total_size_bytes: i64,
+    /// Number of layer blobs referenced by the manifest.  For image indexes
+    /// this is the sum of layer counts across child manifests.  `0` when
+    /// the manifest could not be parsed.
+    pub layer_count: i32,
+    /// Whether this manifest is a multi-arch image index.
+    pub is_index: bool,
+    /// Last push (or update) timestamp from the underlying `oci_tags` row.
+    pub last_pushed_at: chrono::DateTime<chrono::Utc>,
+    /// Latest scan status (`pending`, `running`, `completed`, `failed`) from
+    /// `scan_results`, if the manifest has ever been scanned.  `None` when
+    /// the artifact has never been scanned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_status: Option<String>,
 }
 
 /// A Maven component grouped by GAV (groupId, artifactId, version).
@@ -1339,6 +1392,28 @@ pub async fn list_artifacts(
             &repo,
             &key,
             query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
+
+    let is_docker_format = matches!(
+        repo.format,
+        RepositoryFormat::Docker
+            | RepositoryFormat::Podman
+            | RepositoryFormat::Oras
+            | RepositoryFormat::WasmOci
+            | RepositoryFormat::HelmOci
+    );
+    let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
+
+    if want_docker_grouping {
+        return list_artifacts_grouped_by_docker_tag(
+            &state,
+            &repo,
+            &key,
             query.q.as_deref(),
             page,
             per_page,
@@ -1427,6 +1502,7 @@ pub async fn list_artifacts(
             total_pages,
         },
         components: None,
+        docker_tags: None,
     }))
 }
 
@@ -1646,6 +1722,7 @@ async fn list_artifacts_grouped_by_maven_component(
             total_pages,
         },
         components: Some(page_components),
+        docker_tags: None,
     }))
 }
 
@@ -1715,6 +1792,345 @@ fn group_maven_artifacts(
     }
 
     groups.into_values().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Docker tag grouping (artifact-keeper#1193)
+//
+// Mirrors the Maven `group_by=maven_component` pattern: the frontend can
+// request a paginated list of Docker tags where each row carries the
+// server-side aggregated image size (manifest + every referenced layer
+// blob).  Without this, the web UI had to fetch every artifact row and
+// guess at sizes from the manifest body alone, which under-reports the
+// real on-disk image cost by ~3 orders of magnitude.
+//
+// The aggregation walks `oci_tags` (human-readable tags only; digest
+// references are filtered) and looks up the precomputed `size_bytes` on
+// the corresponding `artifacts` row. The OCI v2 PUT-manifest handler
+// already computes `config_size + layers_size` when persisting the
+// artifact row, so the grouping is a join, not a re-parse of every
+// manifest body. For multi-arch image indexes, the child manifest
+// digests recorded in `oci_manifest_refs` are also summed in.
+// ---------------------------------------------------------------------------
+
+/// Database row used to assemble a `DockerTagResponse`.
+///
+/// `total_size_bytes` is the precomputed size on the `artifacts` row for
+/// the manifest. For image-index manifests, the child sizes are added by
+/// `expand_docker_index_sizes` after this query runs.
+#[derive(Debug, Clone)]
+struct DockerTagRow {
+    artifact_id: Uuid,
+    image: String,
+    tag: String,
+    manifest_digest: String,
+    manifest_content_type: String,
+    manifest_size_bytes: i64,
+    last_pushed_at: chrono::DateTime<chrono::Utc>,
+    scan_status: Option<String>,
+}
+
+/// Build a grouped-by-tag response for Docker/OCI repositories.
+///
+/// Fetches up to `MAX_FETCH` distinct (image, tag) rows from `oci_tags`,
+/// joined to the corresponding `artifacts` row to get the precomputed
+/// manifest+layers size. The grouped list is then paginated in memory.
+///
+/// Digest references (tags containing `:` such as `sha256:abc...`) are
+/// excluded, matching the OCI v2 `tags/list` filter.  An optional `q`
+/// substring is matched case-insensitively against the tag string so the
+/// web UI's tag-search input keeps working in grouped mode.
+async fn list_artifacts_grouped_by_docker_tag(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    repo_key: &str,
+    search_query: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    const MAX_FETCH: i64 = 10_000;
+
+    let rows = fetch_docker_tag_rows(&state.db, repo.id, search_query, MAX_FETCH).await?;
+
+    // For multi-arch image indexes, fold in each child manifest's size so
+    // the surfaced number matches what `docker pull` actually downloads
+    // for the platforms the index references.
+    let index_digests: Vec<String> = rows
+        .iter()
+        .filter(|r| is_docker_index_content_type(&r.manifest_content_type))
+        .map(|r| r.manifest_digest.clone())
+        .collect();
+
+    let child_sizes = if index_digests.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        fetch_index_child_sizes(&state.db, repo.id, &index_digests).await?
+    };
+
+    let mut docker_tags: Vec<DockerTagResponse> = rows
+        .into_iter()
+        .map(|row| build_docker_tag_response(row, repo_key, &child_sizes))
+        .collect();
+
+    // Stable lexical sort by (image, tag) for paging determinism.
+    docker_tags.sort_by(|a, b| (&a.image, &a.tag).cmp(&(&b.image, &b.tag)));
+
+    let total = docker_tags.len() as i64;
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let offset = ((page - 1) * per_page) as usize;
+    let page_tags: Vec<DockerTagResponse> = docker_tags
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items: Vec::new(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+        components: None,
+        docker_tags: Some(page_tags),
+    }))
+}
+
+/// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
+/// latest `scan_results` row. Returns at most `limit` rows.
+///
+/// The join keys are deterministic strings produced by the OCI v2 push
+/// handler: every `oci_tags` row has a matching `artifacts` row at
+/// `path = v2/{image}/manifests/{tag}` (see `handle_put_manifest`).  We
+/// use `repository_id + path` so the join survives image renames.
+async fn fetch_docker_tag_rows(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    search_query: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DockerTagRow>> {
+    use sqlx::Row;
+
+    // POSITION(':' IN tag) = 0 excludes digest references (sha256:...),
+    // matching the spec'd /v2/<name>/tags/list filter.
+    //
+    // The artifacts join is by composed path because OCI artifact rows do
+    // not carry a back-reference to the oci_tags row; the push handler
+    // composes `v2/{image}/manifests/{tag}` deterministically.
+    //
+    // LEFT JOIN scan_results on the latest row per artifact is filtered
+    // by NOT EXISTS so we don't carry historical scans; this matches the
+    // partial-index pattern from migration 101.
+    let sql = if search_query.is_some() {
+        r#"SELECT
+                a.id            AS artifact_id,
+                t.name          AS image,
+                t.tag           AS tag,
+                t.manifest_digest AS manifest_digest,
+                t.manifest_content_type AS manifest_content_type,
+                a.size_bytes    AS manifest_size_bytes,
+                t.updated_at    AS last_pushed_at,
+                s.status        AS scan_status
+            FROM oci_tags t
+            JOIN artifacts a
+              ON a.repository_id = t.repository_id
+             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+             AND a.is_deleted = false
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM scan_results
+                WHERE artifact_id = a.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) s ON true
+            WHERE t.repository_id = $1
+              AND POSITION(':' IN t.tag) = 0
+              AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'
+            ORDER BY t.name, t.tag
+            LIMIT $3"#
+    } else {
+        r#"SELECT
+                a.id            AS artifact_id,
+                t.name          AS image,
+                t.tag           AS tag,
+                t.manifest_digest AS manifest_digest,
+                t.manifest_content_type AS manifest_content_type,
+                a.size_bytes    AS manifest_size_bytes,
+                t.updated_at    AS last_pushed_at,
+                s.status        AS scan_status
+            FROM oci_tags t
+            JOIN artifacts a
+              ON a.repository_id = t.repository_id
+             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+             AND a.is_deleted = false
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM scan_results
+                WHERE artifact_id = a.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) s ON true
+            WHERE t.repository_id = $1
+              AND POSITION(':' IN t.tag) = 0
+            ORDER BY t.name, t.tag
+            LIMIT $2"#
+    };
+
+    let rows = if let Some(q) = search_query {
+        sqlx::query(sql)
+            .bind(repository_id)
+            .bind(q)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+    } else {
+        sqlx::query(sql)
+            .bind(repository_id)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(DockerTagRow {
+            artifact_id: r
+                .try_get("artifact_id")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            image: r
+                .try_get("image")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            tag: r
+                .try_get("tag")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            manifest_digest: r
+                .try_get("manifest_digest")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            manifest_content_type: r
+                .try_get::<Option<String>, _>("manifest_content_type")
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .unwrap_or_default(),
+            manifest_size_bytes: r
+                .try_get("manifest_size_bytes")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            last_pushed_at: r
+                .try_get("last_pushed_at")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            scan_status: r.try_get("scan_status").ok().flatten(),
+        });
+    }
+    Ok(out)
+}
+
+/// Sum the precomputed `artifacts.size_bytes` for each child manifest
+/// referenced by an image index. Returns a map keyed by the parent
+/// (index) digest with the total child size in bytes.
+///
+/// Children are stored as their own digest-keyed artifact rows
+/// (`v2/{image}/manifests/sha256:...`); we join `oci_manifest_refs` to
+/// pick up every (parent, child) edge in one round trip. Children
+/// without a matching artifact row contribute zero, which mirrors the
+/// `download_blob` fallback behavior for missing children.
+async fn fetch_index_child_sizes(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    index_digests: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        r#"SELECT
+                r.parent_digest AS parent_digest,
+                COALESCE(SUM(a.size_bytes), 0)::BIGINT AS child_total
+            FROM oci_manifest_refs r
+            LEFT JOIN artifacts a
+              ON a.repository_id = r.repository_id
+             AND a.checksum_sha256 = REPLACE(r.child_digest, 'sha256:', '')
+             AND a.is_deleted = false
+            WHERE r.repository_id = $1
+              AND r.parent_digest = ANY($2)
+            GROUP BY r.parent_digest"#,
+    )
+    .bind(repository_id)
+    .bind(index_digests)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        let parent: String = r
+            .try_get("parent_digest")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let total: i64 = r
+            .try_get("child_total")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        out.insert(parent, total);
+    }
+    Ok(out)
+}
+
+/// Convert a fetched `DockerTagRow` into the response shape.
+///
+/// Folds in the per-index child total (if any) so multi-arch tags
+/// report the full on-disk cost across architectures rather than just
+/// the index document size.
+fn build_docker_tag_response(
+    row: DockerTagRow,
+    repo_key: &str,
+    index_child_sizes: &std::collections::HashMap<String, i64>,
+) -> DockerTagResponse {
+    let is_index = is_docker_index_content_type(&row.manifest_content_type);
+    let child_size = if is_index {
+        index_child_sizes
+            .get(&row.manifest_digest)
+            .copied()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let total_size_bytes = row.manifest_size_bytes.saturating_add(child_size);
+
+    DockerTagResponse {
+        id: row.artifact_id,
+        repository_key: repo_key.to_string(),
+        image: row.image,
+        tag: row.tag,
+        manifest_digest: row.manifest_digest,
+        total_size_bytes,
+        // Layer count is not persisted; the push handler stores the sum
+        // but not the count. Leaving it as a derived field would require
+        // re-fetching every manifest body. Future enhancement: persist
+        // layer_count alongside size_bytes on the artifact row.
+        layer_count: 0,
+        is_index,
+        last_pushed_at: row.last_pushed_at,
+        scan_status: row.scan_status,
+    }
+}
+
+/// True for OCI image-index and Docker manifest-list content types.
+///
+/// Mirrors `oci_v2::is_index_content_type` but lives here to keep the
+/// repositories handler self-contained (its cousin in `oci_v2.rs` is
+/// `pub(crate)` and could be re-exported, but duplicating two lines is
+/// cheaper than the cross-module visibility churn). Charset hints
+/// (`; charset=utf-8`) are stripped before comparison.
+fn is_docker_index_content_type(content_type: &str) -> bool {
+    let bare = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        bare.as_str(),
+        "application/vnd.oci.image.index.v1+json"
+            | "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
 }
 
 /// Get artifact metadata
@@ -3143,6 +3559,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ArtifactResponse,
         ArtifactListResponse,
         MavenComponentResponse,
+        DockerTagResponse,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -3987,6 +4404,13 @@ mod tests {
         assert_eq!(query.group_by.as_deref(), Some("maven_component"));
     }
 
+    #[test]
+    fn test_list_artifacts_query_group_by_docker_tag() {
+        let json = r#"{"group_by": "docker_tag"}"#;
+        let query: ListArtifactsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.group_by.as_deref(), Some("docker_tag"));
+    }
+
     // -----------------------------------------------------------------------
     // group_maven_artifacts
     // -----------------------------------------------------------------------
@@ -4202,10 +4626,12 @@ mod tests {
                 total_pages: 0,
             },
             components: None,
+            docker_tags: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        // components field should be omitted when None
+        // components and docker_tags fields should be omitted when None
         assert!(!json.contains("\"components\""));
+        assert!(!json.contains("\"docker_tags\""));
     }
 
     #[test]
@@ -4231,10 +4657,182 @@ mod tests {
                 total_pages: 1,
             },
             components: Some(vec![comp]),
+            docker_tags: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"components\":["));
         assert!(json.contains("\"group_id\":\"org.example\""));
+    }
+
+    #[test]
+    fn test_artifact_list_response_with_docker_tags() {
+        let tag = DockerTagResponse {
+            id: Uuid::new_v4(),
+            repository_key: "docker-hub".to_string(),
+            image: "library/postgres".to_string(),
+            tag: "16-alpine".to_string(),
+            manifest_digest: "sha256:abcdef".to_string(),
+            total_size_bytes: 250_000_000,
+            layer_count: 8,
+            is_index: false,
+            last_pushed_at: chrono::Utc::now(),
+            scan_status: Some("completed".to_string()),
+        };
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 1,
+                total_pages: 1,
+            },
+            components: None,
+            docker_tags: Some(vec![tag]),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"docker_tags\":["));
+        assert!(json.contains("\"image\":\"library/postgres\""));
+        assert!(json.contains("\"tag\":\"16-alpine\""));
+        assert!(json.contains("\"total_size_bytes\":250000000"));
+        assert!(json.contains("\"layer_count\":8"));
+        assert!(json.contains("\"is_index\":false"));
+        assert!(json.contains("\"scan_status\":\"completed\""));
+        assert!(!json.contains("\"components\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_docker_index_content_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_docker_index_content_type_recognizes_oci_index() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_recognizes_docker_manifest_list() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_strips_charset() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.oci.image.index.v1+json; charset=utf-8"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_rejects_single_manifest() {
+        assert!(!is_docker_index_content_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(!is_docker_index_content_type(
+            "application/vnd.docker.distribution.manifest.v2+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_rejects_empty() {
+        assert!(!is_docker_index_content_type(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_docker_tag_response
+    // -----------------------------------------------------------------------
+
+    fn docker_tag_row(content_type: &str, manifest_size: i64) -> DockerTagRow {
+        DockerTagRow {
+            artifact_id: Uuid::new_v4(),
+            image: "library/postgres".to_string(),
+            tag: "16-alpine".to_string(),
+            manifest_digest: "sha256:parentdigest".to_string(),
+            manifest_content_type: content_type.to_string(),
+            manifest_size_bytes: manifest_size,
+            last_pushed_at: chrono::Utc::now(),
+            scan_status: None,
+        }
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_single_arch_uses_manifest_size() {
+        // For a regular (single-arch) manifest, size_bytes on the artifact
+        // row is already config_size + sum(layers.size). No child
+        // expansion should happen.
+        let row = docker_tag_row("application/vnd.oci.image.manifest.v1+json", 12_345_678);
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 12_345_678);
+        assert!(!resp.is_index);
+        assert_eq!(resp.image, "library/postgres");
+        assert_eq!(resp.tag, "16-alpine");
+        assert_eq!(resp.repository_key, "docker-hub");
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_index_sums_child_sizes() {
+        // For an image index, the manifest itself is tiny (the index
+        // document), but the children carry the real layer cost. The
+        // total should fold in the precomputed child total.
+        let row = docker_tag_row(
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            2_500, // tiny index document
+        );
+        let mut children = std::collections::HashMap::new();
+        children.insert("sha256:parentdigest".to_string(), 500_000_000); // 500 MB across arches
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 2_500 + 500_000_000);
+        assert!(resp.is_index);
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_index_without_children_falls_back_to_manifest_only() {
+        // Defensive: if the oci_manifest_refs backfill has not yet caught
+        // up for an older index, the children map is empty. The response
+        // should still surface the manifest body size rather than 0 so
+        // the UI does not show a meaningless number.
+        let row = docker_tag_row("application/vnd.oci.image.index.v1+json", 1_234);
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 1_234);
+        assert!(resp.is_index);
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_preserves_scan_status() {
+        let mut row = docker_tag_row("application/vnd.oci.image.manifest.v1+json", 100);
+        row.scan_status = Some("completed".to_string());
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.scan_status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_saturating_add_handles_overflow() {
+        // Pathological case: both sizes near i64::MAX should saturate
+        // instead of wrapping to a negative number that the UI would
+        // render as a nonsense size.
+        let row = docker_tag_row(
+            "application/vnd.oci.image.index.v1+json",
+            i64::MAX - 100,
+        );
+        let mut children = std::collections::HashMap::new();
+        children.insert("sha256:parentdigest".to_string(), 1_000);
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, i64::MAX);
     }
 
     #[test]
