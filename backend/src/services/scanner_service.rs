@@ -398,7 +398,21 @@ impl ScanWorkspace {
             || lower.ends_with(".egg")
     }
 
-    /// Extract an archive file into the given directory using system tools.
+    /// Extract an archive file into the given directory.
+    ///
+    /// Uses in-process Rust crates (`tar`, `flate2`, `zip`) rather than
+    /// shelling out to `tar`/`unzip`. This removes the runtime dependency
+    /// on system binaries (see issue #1243: the Alpine container image does
+    /// not ship a full `tar`, so npm `.tgz` extraction silently failed and
+    /// scans reported zero findings).
+    ///
+    /// Supported formats:
+    /// - `.tar.gz`, `.tgz`, `.crate` -- gzipped tar
+    /// - `.gem` -- plain tar (outer container; nested data.tar.gz is left as-is)
+    /// - `.zip`, `.whl`, `.jar`, `.war`, `.ear`, `.nupkg`, `.egg` -- zip archives
+    ///
+    /// CPU-bound work runs on a blocking task to avoid stalling the tokio
+    /// runtime when extracting large archives.
     pub async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
         let name = archive_path
             .file_name()
@@ -406,15 +420,14 @@ impl ScanWorkspace {
             .to_string_lossy()
             .to_lowercase();
 
-        let src = archive_path.to_string_lossy();
-        let dst = dest.to_string_lossy();
+        let src = archive_path.to_path_buf();
+        let dst = dest.to_path_buf();
 
-        let output =
+        let kind =
             if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-                tokio::process::Command::new("tar")
-                    .args(["xzf", &src, "-C", &dst])
-                    .output()
-                    .await
+                ArchiveKind::TarGz
+            } else if name.ends_with(".gem") {
+                ArchiveKind::Tar
             } else if name.ends_with(".zip")
                 || name.ends_with(".whl")
                 || name.ends_with(".jar")
@@ -423,32 +436,102 @@ impl ScanWorkspace {
                 || name.ends_with(".nupkg")
                 || name.ends_with(".egg")
             {
-                tokio::process::Command::new("unzip")
-                    .args(["-o", "-q", &src, "-d", &dst])
-                    .output()
-                    .await
-            } else if name.ends_with(".gem") {
-                tokio::process::Command::new("tar")
-                    .args(["xf", &src, "-C", &dst])
-                    .output()
-                    .await
+                ArchiveKind::Zip
             } else {
                 return Ok(());
             };
 
-        match output {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(AppError::Internal(format!(
-                "Archive extraction failed (exit {}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ))),
-            Err(e) => Err(AppError::Internal(format!(
-                "Failed to execute extraction command: {}",
-                e
-            ))),
-        }
+        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst))
+            .await
+            .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ArchiveKind {
+    /// gzip-compressed tar (.tar.gz, .tgz, .crate)
+    TarGz,
+    /// plain (uncompressed) tar (.gem)
+    Tar,
+    /// zip-based archive (.zip, .whl, .jar, etc.)
+    Zip,
+}
+
+fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result<()> {
+    let file = std::fs::File::open(src).map_err(|e| {
+        AppError::Internal(format!("Failed to open archive {}: {}", src.display(), e))
+    })?;
+
+    match kind {
+        ArchiveKind::TarGz => {
+            let decoder = flate2::read::GzDecoder::new(file);
+            unpack_tar(tar::Archive::new(decoder), dst)
+        }
+        ArchiveKind::Tar => unpack_tar(tar::Archive::new(file), dst),
+        ArchiveKind::Zip => unpack_zip(file, dst),
+    }
+}
+
+fn unpack_tar<R: std::io::Read>(mut archive: tar::Archive<R>, dst: &Path) -> Result<()> {
+    // Guard against path-traversal entries (`../etc/passwd`). The `tar`
+    // crate's `unpack` already refuses absolute paths and `..` components,
+    // but we re-enable the safety flags explicitly for clarity.
+    archive.set_overwrite(true);
+    archive.set_preserve_permissions(false);
+    archive
+        .unpack(dst)
+        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))
+}
+
+fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::Internal(format!("Failed to open zip archive: {}", e)))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AppError::Internal(format!("Failed to read zip entry {}: {}", i, e)))?;
+
+        // `enclosed_name` rejects absolute paths and any component containing
+        // `..`, so traversal attempts return None and are skipped.
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let out_path = dst.join(rel);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create zip dir {}: {}",
+                    out_path.display(),
+                    e
+                ))
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create zip parent {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let mut out = std::fs::File::create(&out_path).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to create zip output {}: {}",
+                out_path.display(),
+                e
+            ))
+        })?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| AppError::Internal(format!("Failed to write zip entry {}: {}", i, e)))?;
+    }
+
+    Ok(())
 }
 
 /// Handle a scan step failure: log a warning, clean up the workspace, and
@@ -3932,6 +4015,149 @@ mod tests {
         assert!(!ScanWorkspace::is_archive("Cargo.lock"));
         assert!(!ScanWorkspace::is_archive("package.json"));
         assert!(!ScanWorkspace::is_archive("foo.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ScanWorkspace::extract_archive (issue #1243)
+    //
+    // Regression coverage: previously these shelled out to `tar`/`unzip`,
+    // which silently failed on container images that don't ship those
+    // binaries (Alpine variant). The fix moved extraction in-process via
+    // the `tar`, `flate2`, and `zip` crates.
+    // -----------------------------------------------------------------------
+
+    /// Build an in-memory npm-shaped .tgz containing `package/package.json`
+    /// and `package/index.js`, write it to `dir/name`, return the path.
+    fn write_npm_tgz(dir: &Path, name: &str) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let pkg_json = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_ref()).unwrap();
+
+        let index_js = b"module.exports = function() { return 'hi'; };\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/index.js").unwrap();
+        header.set_size(index_js.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, index_js.as_ref()).unwrap();
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    fn write_simple_zip(dir: &Path, name: &str) -> PathBuf {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create zip");
+        let mut zw = zip::ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+        zw.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zw.start_file("com/example/App.class", opts).unwrap();
+        zw.write_all(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00]).unwrap();
+        zw.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_npm_tgz() {
+        // Regression for issue #1243: npm packages must extract without
+        // requiring the host `tar` binary.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&tgz, &dest)
+            .await
+            .expect("npm tgz should extract");
+
+        let pkg_json = dest.join("package").join("package.json");
+        let body = tokio::fs::read_to_string(&pkg_json).await.unwrap();
+        assert!(
+            body.contains("\"left-pad\""),
+            "package.json content: {}",
+            body
+        );
+        assert!(dest.join("package").join("index.js").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_crate_uses_targz() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // .crate files are gzipped tarballs, same wire format as .tgz.
+        let arc = write_npm_tgz(tmp.path(), "mycrate-0.1.0.crate");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&arc, &dest).await.unwrap();
+        assert!(dest.join("package").join("package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_zip_jar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let jar = write_simple_zip(tmp.path(), "app.jar");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&jar, &dest).await.unwrap();
+        assert!(dest.join("META-INF").join("MANIFEST.MF").exists());
+        assert!(dest.join("com").join("example").join("App.class").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_unknown_extension_is_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("readme.txt");
+        tokio::fs::write(&plain, b"hello").await.unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        // Should succeed without touching the destination.
+        ScanWorkspace::extract_archive(&plain, &dest).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&dest).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_corrupt_tgz_returns_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bad = tmp.path().join("broken.tgz");
+        tokio::fs::write(&bad, b"this is not a gzip stream")
+            .await
+            .unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        let err = ScanWorkspace::extract_archive(&bad, &dest)
+            .await
+            .expect_err("corrupt tgz should error");
+        match err {
+            AppError::Internal(msg) => assert!(
+                msg.contains("Tar extraction failed") || msg.contains("extraction"),
+                "unexpected error message: {}",
+                msg
+            ),
+            other => panic!("expected Internal error, got: {:?}", other),
+        }
     }
 
     // -----------------------------------------------------------------------
