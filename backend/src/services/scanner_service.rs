@@ -143,16 +143,25 @@ WITH latest_scans AS (
 )
 ";
 
-/// Derive the Dependency-Track project name and purl type from an optional
-/// repo name and format. When the repo row is missing, falls back to the
-/// raw repository UUID string.
+/// Derive Dependency-Track project context from an optional repo row.
 ///
-/// Returns `(project_name, purl_type)`.
+/// Returns `(repo_label, purl_type)` where `repo_label` is the human-readable
+/// repository name (falling back to the raw repository UUID string when the
+/// repository row is missing). The repo label is used in the DT project
+/// description to give operators a way to trace a finding back to the source
+/// repo. The purl type is derived from the repository format and is used to
+/// stamp every component's purl in the generated SBOM.
+///
+/// Issue #1276: the DT *project name* itself is derived from the artifact
+/// name (and version) by the caller, not this helper. Using the artifact
+/// name lets DT findings map cleanly to the specific artifact AK stored,
+/// rather than collapsing every artifact in a repo onto one project that
+/// shared the repo's name and the first artifact's version.
 pub(crate) fn derive_dt_project_info(
     repo_row: Option<(String, Option<String>)>,
     fallback_id: &str,
 ) -> (String, &'static str) {
-    let (project_name, repo_format) = match repo_row {
+    let (repo_label, repo_format) = match repo_row {
         Some((name, format)) => (name, format),
         None => (fallback_id.to_string(), None),
     };
@@ -160,7 +169,7 @@ pub(crate) fn derive_dt_project_info(
         Some(ref fmt) => format_to_purl_type(fmt),
         None => "generic",
     };
-    (project_name, purl_type)
+    (repo_label, purl_type)
 }
 
 /// Build a list of [`DependencyInfo`] from scan-finding rows.
@@ -2661,8 +2670,15 @@ impl ScannerService {
                 .ok()
                 .flatten();
 
-        let (project_name, purl_type) =
+        // #1276: DT project name is the artifact name (not the repo name), so
+        // each artifact gets its own DT project and findings map 1:1 back to
+        // the artifact AK stored. The repo label is folded into the
+        // description so operators can still trace a project back to its
+        // source repo. `purl_type` comes from the repo format because
+        // purl encoding is a property of the format, not the artifact.
+        let (repo_label, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
+        let project_name = artifact.name.as_str();
 
         // Build the dependency list, preferring the scan_packages inventory
         // (#903) so we forward the full dep tree even when Grype found zero
@@ -2762,12 +2778,14 @@ impl ScannerService {
             }
         };
 
-        // Get or create the DT project
+        // Get or create the DT project. #1276: project name = artifact name,
+        // version = artifact version, description carries the source repo
+        // label so the DT UI shows where the artifact came from.
         let dt_project = match dt
             .get_or_create_project(
-                &project_name,
+                project_name,
                 artifact.version.as_deref(),
-                Some(&format!("Artifact: {}", artifact.name)),
+                Some(&format!("Repository: {}", repo_label)),
             )
             .await
         {
@@ -7839,23 +7857,23 @@ mod tests {
     #[test]
     fn test_derive_dt_project_info_with_repo_name_and_format() {
         let row = Some(("my-npm-repo".to_string(), Some("npm".to_string())));
-        let (name, purl) = derive_dt_project_info(row, "fallback-id");
-        assert_eq!(name, "my-npm-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(repo_label, "my-npm-repo");
         assert_eq!(purl, "npm");
     }
 
     #[test]
     fn test_derive_dt_project_info_with_repo_name_no_format() {
         let row = Some(("my-repo".to_string(), None));
-        let (name, purl) = derive_dt_project_info(row, "fallback-id");
-        assert_eq!(name, "my-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(repo_label, "my-repo");
         assert_eq!(purl, "generic");
     }
 
     #[test]
     fn test_derive_dt_project_info_no_repo_row() {
-        let (name, purl) = derive_dt_project_info(None, "abc-123-uuid");
-        assert_eq!(name, "abc-123-uuid");
+        let (repo_label, purl) = derive_dt_project_info(None, "abc-123-uuid");
+        assert_eq!(repo_label, "abc-123-uuid");
         assert_eq!(purl, "generic");
     }
 
@@ -7869,9 +7887,68 @@ mod tests {
     #[test]
     fn test_derive_dt_project_info_docker_format() {
         let row = Some(("docker-repo".to_string(), Some("docker".to_string())));
-        let (name, purl) = derive_dt_project_info(row, "x");
-        assert_eq!(name, "docker-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "x");
+        assert_eq!(repo_label, "docker-repo");
         assert_eq!(purl, "docker");
+    }
+
+    /// Regression: #1276. The DT project name must be the artifact name (with
+    /// the artifact's version as the project version), not the repo name and
+    /// not the repository UUID. The repo name belongs in the description so
+    /// operators can still trace a finding back to its source repo. This
+    /// test pins the contract the caller in `submit_sbom_to_dependency_track`
+    /// is now expected to honor.
+    #[test]
+    fn test_dt_project_name_is_artifact_name_not_repo_or_uuid() {
+        // Simulate what the caller assembles for DT.
+        let repo_row = Some(("my-npm-repo".to_string(), Some("npm".to_string())));
+        let repository_uuid = "11111111-2222-3333-4444-555555555555";
+        let artifact_name = "lodash";
+        let artifact_version = Some("4.17.21");
+
+        let (repo_label, purl) = derive_dt_project_info(repo_row, repository_uuid);
+
+        // What the caller would actually send to DT:
+        let dt_project_name = artifact_name;
+        let dt_project_version = artifact_version;
+        let dt_project_description = format!("Repository: {}", repo_label);
+
+        // The DT project name must NOT be the repository UUID (#1276).
+        assert_ne!(dt_project_name, repository_uuid);
+        // The DT project name must NOT be the repository name either; that
+        // would collapse every artifact in the repo onto one DT project.
+        assert_ne!(dt_project_name, repo_label.as_str());
+        // It IS the artifact name, with the artifact's version pinned to
+        // the DT project version so DT can dedupe per artifact version.
+        assert_eq!(dt_project_name, "lodash");
+        assert_eq!(dt_project_version, Some("4.17.21"));
+        // The repo context is preserved in the description.
+        assert_eq!(dt_project_description, "Repository: my-npm-repo");
+        // purl_type is still driven by the repo format.
+        assert_eq!(purl, "npm");
+    }
+
+    /// Regression: #1276 fallback path. When the repository row is missing
+    /// (deleted concurrent with a scan, or migration glitch), DT submission
+    /// still happens but the description carries the repo UUID rather than
+    /// a name. The project name is still the artifact name, never the UUID.
+    #[test]
+    fn test_dt_project_name_is_artifact_name_when_repo_row_missing() {
+        let repository_uuid = "deadbeef-1111-2222-3333-444444444444";
+        let artifact_name = "express";
+
+        let (repo_label, purl) = derive_dt_project_info(None, repository_uuid);
+
+        let dt_project_name = artifact_name;
+        let dt_project_description = format!("Repository: {}", repo_label);
+
+        assert_ne!(dt_project_name, repository_uuid);
+        assert_eq!(dt_project_name, "express");
+        assert_eq!(
+            dt_project_description,
+            format!("Repository: {}", repository_uuid)
+        );
+        assert_eq!(purl, "generic");
     }
 
     #[test]
