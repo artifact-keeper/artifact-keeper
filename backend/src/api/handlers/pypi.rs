@@ -854,7 +854,22 @@ where
                 storage_key = %storage_key,
                 "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
             );
-            refetch().await
+            let bytes = refetch().await?;
+            // Best-effort write-back: persist the refetched payload so the
+            // next request hits the cache instead of re-traversing the
+            // simple index and re-downloading from upstream. Without this,
+            // N concurrent `uv` clients each issue a fresh upstream fetch
+            // for the same wheel (thundering herd; see PR #1283 review).
+            // We swallow write errors to keep serving the current request,
+            // but log them so operators can spot a broken backend.
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
+                );
+            }
+            Ok(bytes)
         }
         Err(e) => Err(map_storage_err(e)),
     }
@@ -2449,11 +2464,28 @@ mod tests {
     // get_remote_cached_or_refetch
     // -----------------------------------------------------------------------
 
-    struct MissingStorage;
+    /// Storage double that reports the entry as missing on every `get`, and
+    /// records every `put` so tests can assert the write-back path persists
+    /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
+    struct MissingStorage {
+        puts: std::sync::Mutex<Vec<(String, Bytes)>>,
+    }
+
+    impl MissingStorage {
+        fn new() -> Self {
+            Self {
+                puts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for MissingStorage {
-        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.puts
+                .lock()
+                .expect("puts mutex")
+                .push((key.to_string(), content));
             Ok(())
         }
 
@@ -2521,21 +2553,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
-        let storage = MissingStorage;
+        let storage = MissingStorage::new();
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let content = super::get_remote_cached_or_refetch(
-            &storage,
-            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__",
-            move || {
-                let refetch_calls_clone = refetch_calls_clone.clone();
-                async move {
-                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"refetched-bytes"))
-                }
-            },
-        )
+        let storage_key =
+            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
+        let content = super::get_remote_cached_or_refetch(&storage, storage_key, move || {
+            let refetch_calls_clone = refetch_calls_clone.clone();
+            async move {
+                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::from_static(b"refetched-bytes"))
+            }
+        })
         .await
         .expect("refetch should succeed");
 
@@ -2545,6 +2575,62 @@ mod tests {
             1,
             "missing proxy-cache entry should trigger exactly one upstream refetch"
         );
+
+        // PR #1283 thundering-herd fix: the refetched payload MUST be written
+        // back to storage under the same key, so the next caller hits the
+        // cache instead of re-traversing the simple index and re-downloading
+        // from upstream.
+        let puts = storage.puts.lock().expect("puts mutex");
+        assert_eq!(
+            puts.len(),
+            1,
+            "refetched payload must be persisted exactly once for the next request"
+        );
+        assert_eq!(puts[0].0, storage_key);
+        assert_eq!(puts[0].1, Bytes::from_static(b"refetched-bytes"));
+    }
+
+    /// Storage double whose `put` always fails. The handler must still
+    /// successfully serve the refetched bytes to the current caller; a
+    /// broken write-back is observability noise, not a fatal error for
+    /// this request.
+    struct WriteFailingStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for WriteFailingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Err(AppError::Storage("disk full".to_string()))
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_serves_payload_even_if_writeback_fails() {
+        // A best-effort write-back must NOT fail the current request. If the
+        // disk is full or read-only the user still gets their wheel; the
+        // next request will simply re-fetch from upstream until the backend
+        // recovers.
+        let storage = WriteFailingStorage;
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
+            move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
+        )
+        .await
+        .expect("write-back failures must not fail the current request");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-when-disk-full"));
     }
 
     #[tokio::test]
@@ -2615,7 +2701,7 @@ mod tests {
         // When the cache is stale AND the upstream refetch also fails, the
         // upstream error response must reach the caller untouched so the
         // client sees the correct upstream status (e.g. 502).
-        let storage = MissingStorage;
+        let storage = MissingStorage::new();
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
@@ -2673,6 +2759,141 @@ mod tests {
             0,
             "empty cached payload is a cache hit, not a stale miss"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // serve_file Remote-arm wiring (PR #1283: stale-cache refetch)
+    //
+    // The unit tests above exercise `get_remote_cached_or_refetch` in
+    // isolation. This DB-backed test pins the wiring at lines ~796-810 of
+    // serve_file: when the artifact row's `repo_type` is Remote and a
+    // proxy service is present, the handler must route the storage read
+    // through `get_remote_cached_or_refetch` (not a bare `storage.get`).
+    //
+    // We cover the cache-hit branch end-to-end: artifact row + on-disk
+    // payload both present. The refetch closure must not run; the bytes
+    // returned must come from storage; the response must be a well-formed
+    // PyPI download (correct content-type, content-disposition, length).
+    // The stale-cache branch is covered by the four `get_remote_cached_or_refetch`
+    // unit tests above (including writeback assertions); it cannot be
+    // driven end-to-end here because the SSRF guard at line 928 hard-blocks
+    // loopback as a resolved upstream file URL.
+    //
+    // Skips cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serve_file_remote_arm_routes_through_cached_or_refetch_helper() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let wheel_bytes: &[u8] = b"PK\x03\x04 cached-wheel-from-disk";
+        let filename = "wired-1.2.3-py3-none-any.whl";
+        let project = "wired";
+
+        // The wiring branch under test requires (a) a remote repo with an
+        // upstream_url AND (b) a proxy service on the state. We do NOT
+        // exercise upstream I/O in this test, so the upstream URL only
+        // needs to parse and pass SSRF (any public host works because
+        // nothing dials it).
+        let upstream = "https://upstream.example.test".to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Seed an artifact row + matching payload on disk. With the file
+        // present, `get_remote_cached_or_refetch` must short-circuit on
+        // the cache hit and return the bytes without invoking the refetch
+        // closure (the unit tests above pin that contract).
+        let storage_key = format!(
+            "proxy-cache/{}/simple/{}/{}",
+            fx.repo_key, project, filename
+        );
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        let repo_info = fx.repo_info("remote", Some(&upstream));
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &repo_info,
+            &storage_key,
+            Bytes::from_static(wheel_bytes),
+        )
+        .await
+        .expect("seed payload on disk");
+        let _artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind("1.2.3")
+        .bind(wheel_bytes.len() as i64)
+        .bind("test-wired")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed cached artifact row");
+
+        // Invoke serve_file directly. The Remote arm at lines ~796-810
+        // must construct a `get_remote_cached_or_refetch` call against
+        // the storage backend; the helper hits the cache and returns the
+        // wheel bytes; the handler wraps them in a PyPI download response.
+        let result = super::serve_file(&state, &repo_info, &fx.repo_key, project, filename).await;
+
+        // Clean up BEFORE asserting so a panic still leaves the DB clean.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!("serve_file Remote arm must serve cached payload, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("Content-Type")
+                .to_str()
+                .unwrap(),
+            "application/zip",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("Content-Length")
+                .to_str()
+                .unwrap(),
+            wheel_bytes.len().to_string(),
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(
+            &body_bytes[..],
+            wheel_bytes,
+            "wired Remote arm must serve the bytes returned by get_remote_cached_or_refetch"
+        );
+
+        cleanup().await;
     }
 
     // -----------------------------------------------------------------------
