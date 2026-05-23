@@ -7611,20 +7611,6 @@ mod tests {
         )
         .await;
 
-        // Cleanup before asserting so we always delete even on failure.
-        sqlx::query("DELETE FROM repositories WHERE key = $1")
-            .bind(&repo_key)
-            .execute(&pool)
-            .await
-            .ok();
-        cleanup_format_handler(&pool, &format_key).await;
-        sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .ok();
-        let _ = std::fs::remove_dir_all(&storage_dir);
-
         let Json(resp) = result.expect("create_repository with enabled plugin format must succeed");
         assert_eq!(
             resp.format, "generic",
@@ -7639,6 +7625,21 @@ mod tests {
                 .fetch_optional(&pool)
                 .await
                 .expect("query format_key");
+
+        // Cleanup after reading so we don't delete the row before asserting.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
         assert_eq!(
             stored.as_deref(),
             Some(format_key.as_str()),
