@@ -76,6 +76,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The 5 generated SDKs (TypeScript, Kotlin, Swift, Rust, Python) will lose the `notifications` tag, the `NotificationsApiDoc` schemas, and the three notification request/response types on the next API sync; downstream consumers should pin to a pre-v1.2.0 API tag or migrate before bumping.
   - Operator-visible log message changed: `Notification dispatcher started` is now `Email dispatcher started`; update any log-based alerting that keyed on the prior string.
 
+## [1.2.0-rc.2] - 2026-05-23
+
+Second release candidate for v1.2.0. Folds in ~40 PRs merged since rc.1, covering smoke-E2E CI breakage, the v1.1.9 -> v1.2.0 migration repair path, scanner archive extraction, format-handler bugs across Maven, PyPI, OCI, NuGet, Debian, Hex, Incus/LXC, CocoaPods, and several auth scope-enforcement fixes uncovered during the release-gate audit.
+
+### Sponsors
+
+Thank you to our sponsors for keeping Artifact Keeper development moving.
+
+- [@dragonpaw](https://github.com/dragonpaw) (Ash A.)
+- [@injectedfusion](https://github.com/injectedfusion) (Gabriel Rodriguez)
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+Community contributors who shipped fixes in this release candidate:
+
+- [@ThaSami](https://github.com/ThaSami) for the reverse-path functional index that makes suffix LIKE queries indexable (#1285), the migration session timeout fix (#1269), the MigrationService column-name corrections (#1268), PyPI virtual member union on `simple/<project>/` (#1267), the non-admin admin-scope escalation block (#1261), and the `/users` router split so non-admins can self-manage tokens (#1258)
+- [@dragonpaw](https://github.com/dragonpaw) for the Incus server-wide `STORAGE_PATH` staging fix (#1297) and runtime-agnostic admin-password retrieval docs (#1271)
+- [@danatri](https://github.com/danatri) for the JFrog 7.38.10 cache-artifact migration reliability fixes (#1295)
+- [@lesaux](https://github.com/lesaux) for the generic-proxy streaming fix (#1294)
+- [@joonhwan](https://github.com/joonhwan) for trailing-slash acceptance on NuGet push plus the packages index population (#1289)
+- [@axellpadilla](https://github.com/axellpadilla) for refetching stale PyPI proxy-cache hits instead of returning 500 (#1283)
+- [@junsung-cho](https://github.com/junsung-cho) for switching Dependency-Track API-key creation to PUT (#1270)
+- [@D13410N3](https://github.com/D13410N3) for real OpenPGP signatures on Debian repository metadata (#1236)
+- [@JojoMee](https://github.com/JojoMee) for the docker-compose file updates (#1231)
+
+### Security
+
+- **Non-admins can no longer grant admin-class scopes on token issuance** (#1261). The token-issuance path accepted any scope string the caller asked for without checking that the caller themselves held the scope they were granting, so a non-admin with a valid session could mint a personal access token carrying `admin` or `*` and chain into full admin. Token issuance now refuses any scope the caller does not already hold, with admin-class scopes (`admin`, `*`, write-on-system) gated explicitly. Existing tokens are not invalidated by this change; rotation is recommended on any token whose origin cannot be audited.
+- **`/users` router split so non-admin self-service paths no longer share admin middleware** (closes #1257, #1258). The router previously mounted both admin user-management endpoints and self-service endpoints (`/users/me/tokens`, `/users/me/password`) under the same admin-only middleware tree, which forced every self-service request through the admin gate and returned 403 for legitimate users. The router is now split into an `/admin/users` subtree for admin-managed operations and a `/users` subtree for self-service, each with the correct middleware. No protocol change; the previously-broken self-service paths now work as documented.
+
+### Fixed
+
+- **Smoke E2E virtual repo creation now supplies `member_repos`** (closes #1353, #1354). The smoke E2E suite created virtual repos without `member_repos`, which #1281 then started rejecting at create time with HTTP 400. The smoke suite now passes the required `member_repos` array, restoring green CI on the release gate.
+- **v1.1.9 -> v1.2.0 upgrade no longer aborts with `VersionMismatch(73)`** (closes #1277, #1335). Customers upgrading from v1.1.9 to v1.2.0-rc.1 hit a hard startup failure because the migration runner detected checksum drift between the on-disk `073_account_lockout.sql` and the version-73 row recorded in `_sqlx_migrations` from the legacy duplicate-073 window. The pre-migration repair step introduced in #1138 now also covers the v1.1.9-shipped checksum, so affected installs upgrade cleanly without operator intervention. See `backend/src/migration_repair.rs` for the exhaustive list of accepted prior checksums.
+- **Remaining buffered proxy fetches now stream** (closes #1215, #1334). A subset of proxy-fetch paths still buffered upstream responses fully before relaying to the client, defeating the streaming refactor that landed earlier in the v1.2.0 cycle. Those paths now stream end-to-end, capping per-request memory at the configured buffer size regardless of upstream artifact size.
+- **Grype-matched components included in `scan_packages` inventory** (closes #1273, #1333). Grype's component matches were recorded against `scan_findings` but never written to `scan_packages`, so the SBOM inventory view and `affected_component` -> `scan_packages` join surface showed empty package lists for Grype-only scans. Grype-matched components are now upserted into `scan_packages` alongside Trivy's, keyed by `(package_name, package_version, package_type)` with `source_target` populated from the scan input path.
+- **Scanner archive extraction uses the `tar` crate, not host `tar`** (closes #1243, #1330). Builds on the #722 refactor: the npm `.tgz` extraction path still shelled out to `Command::new("tar")`, so Alpine-based images (which do not install `tar`) silently fell through to scanning raw archive bytes. Extraction is now fully in-process via the `tar` crate on `spawn_blocking`, matching the path other archive formats already took.
+- **Generic proxy streaming** (#1294). Generic-format proxy fetches now stream upstream responses through to the client instead of buffering. Aligns the generic handler with the streaming guarantees other format handlers already provide.
+- **Dependency-Track project name uses the artifact name** (closes #1276, #1324). The DT project record was created with the repository key as its name, which collapsed every artifact in a repo onto one DT project and made findings ambiguous. The DT project name is now the artifact name; existing one-per-repo projects continue to work, new uploads create one project per artifact.
+- **Dependency-Track API-key creation uses PUT** (#1270). DT 4.13 changed the API-key creation endpoint from POST to PUT, so AK was returning 405 from the DT integration setup flow. The handler now issues PUT, matching the current DT API.
+- **Maven virtual local-member match honors `groupId`** (closes #1287, #1323). The virtual-repo download-side shadowing guard for Maven matched only on `artifactId`, so a local member's `com.example:utils` blocked an upstream `org.other:utils` even though the coordinates differ. The match now uses the full coordinates (`groupId:artifactId`), restoring the upstream fetch for non-shadowing requests.
+- **Multipart upload honors the custom artifact path** (closes #1237, #1322). Multipart `POST /repositories/{key}/artifacts` ignored the optional `path` field and always wrote to `<repo>/<filename>`, so operators using path-prefixed layouts (Maven-style `com/example/...`, generic `releases/2026/...`) had to PUT a second time to move the file. Multipart now respects `path` end-to-end, matching the single-PUT upload behavior.
+- **CocoaPods served podspec preserves every uploaded field** (closes #1286, #1321). The serve path round-tripped podspec JSON through a struct with only a fixed set of named fields, dropping `vendored_frameworks`, `xcconfig`, `requires_arc`, `swift_version`, `resource_bundles`, `subspecs`, and ~30 other linker-affecting fields. `PodSpec` now carries a `#[serde(flatten)] extra` catch-all so the served JSON is a faithful round-trip of the upload.
+- **`lxc`-format repositories respond on `/lxc/*`** (closes #1272, #1318). Repositories created with `format: lxc` 404'd on every request because `create_router` only mounted the Incus handler under `/incus`. The same `IncusHandler` router is now nested under `/lxc` as well, matching the `Lxc -> Incus` aliasing the rest of the stack already used.
+- **Image scanner emits bare package name** (closes #1311, #1312). The image-scanner code path emitted `affected_component` carrying the parenthetical target alongside the package name, contradicting #903 / #1150 which already established the bare-name convention everywhere else. The image scanner now matches, completing the rollout of #1159.
+- **Incus uses server-wide `STORAGE_PATH` for staging** (#1297). The Incus handler resolved its staging directory from `repo.storage_path`, which on filesystem deployments with per-repo storage paths pointed at a directory the handler did not own. Staging now uses the server-wide `STORAGE_PATH` like every other handler, fixing publish on filesystem backends with custom per-repo storage.
+- **JFrog 7.38.10 cache-artifact migration reliability** (#1295). The Artifactory 7.38.10 migrator's cache-artifact phase mis-handled responses that lacked an explicit `Content-Length`, causing intermittent migration failures. The phase now reads the response body to completion before recording the migrated artifact.
+- **NuGet push accepts trailing slash and populates packages index** (#1289). `PUT /nuget/{repo}/v3/registration5-semver1/` (with the trailing slash) returned 404 because the route was registered without the slash, and successful uploads did not refresh the `/v3/index.json` packages list. Both are fixed.
+- **PyPI refetches stale proxy-cache hits instead of returning 500** (#1283). When the proxy-cache had a stale entry for a PyPI project, the handler returned 500 instead of refetching upstream. The handler now treats stale entries as cache misses, refetches, and stores the fresh response.
+- **PyPI virtual members union on `simple/<project>/`** (#1267, #1230). Virtual PyPI repos previously returned only the first member's simple index for a given project; the handler now unions entries across all non-Remote members (Remote members fall back to the existing remote-fetch path).
+- **Functional `reverse(path)` index on `artifacts`** (closes #1266, #1285). Suffix-match queries (`WHERE path LIKE '%/Cargo.toml'`) were not sargable against the existing `path` btree, so they fell back to a sequential scan on installs with many artifacts. A new `idx_artifacts_reverse_path ON artifacts (reverse(path))` lets the planner answer suffix LIKEs as a prefix-match against the reversed text. Build cost is a single index pass at migration time; runtime cost is the existing planner choice.
+- **Migration session timeouts** (#1269). `sqlx migrate run` ran with the cluster's default `statement_timeout` and `lock_timeout`, which on installs with tuned-low defaults (5s) aborted long-running schema migrations partway through. The migration session now sets `statement_timeout=0` and `lock_timeout=0` for the duration of the migration run, restoring the previous "migrations are not subject to OLTP timeouts" behavior.
+- **MigrationService column names and NOT NULL columns** (#1268). Two recently-added migrations referenced columns that did not match the live schema (a leftover from a rename mid-PR) and omitted NOT NULL columns that the migration runner inserts into. Both are corrected; affected migrations were never executed against any production install because the runner rejected them at parse time.
+- **Repair sync fast-path on replica-safe credential check** (#1248 follow-up, #1265). The sync `is_token_invalidated` fast-path inside `is_token_invalidated_replica_safe` collided with the `fetch_credential_change_watermark` DB cache TTL on fresh non-admin users, returning 401 on every request after the first within the 5-second cache window. The sync fast-path is removed from the replica-safe entry point; the existing DB cache provides the same acceleration without the conflation. Adds the `two_sequential_admin_requests_with_fresh_jwt_both_return_403` regression test.
+- **Forward client `Accept` header to upstream on OCI manifest pulls** (#1256). The OCI manifest-pull proxy stripped the client's `Accept` header before relaying upstream, so upstreams that content-negotiate on manifest media type (OCI vs Docker v2 vs Docker v2.1) returned the wrong manifest, breaking `docker pull` against some Docker Hub images.
+- **Persist `sha1`/`md5` on upload and index for checksum lookup** (#1254). Per-upload `sha1` and `md5` were computed but only written to OpenSearch as metadata; the database row only carried `sha256`. Search-by-checksum on `sha1` or `md5` returned no results even when the artifact was indexed. Both checksums are now persisted on `artifacts` and indexed for lookup parity with `sha256`.
+- **Pin Grype DB auto-update and drop `-q`** (#1252). The Grype invocation passed `-q` and let Grype auto-update its vulnerability DB at scan time, which on offline / network-restricted installs aborted every scan with a DB-download error and on online installs masked the error behind the `-q` quiet flag. Auto-update is now pinned (`db.auto-update: false`) so the operator-curated DB is the source of truth, and `-q` is removed so errors surface in scan output.
+- **Self-service password change mounted under `/auth`, not `/admin`** (#1250). `POST /api/v1/users/me/password` was mounted under the admin router, so a non-admin user could not change their own password through the documented self-service path. The endpoint now lives under `/auth` where the rest of the self-service auth surface is mounted.
+- **Debian repository metadata uses real OpenPGP signatures** (#1236). The Debian handler emitted `Release.gpg` and `InRelease` carrying placeholder ASCII-armored blocks instead of real detached OpenPGP signatures over the `Release` file, so `apt update` aborted with `BADSIG` against any repository with `Signed-By` configured (the documented setup). The handler now signs `Release` with the repository's configured signing key, producing valid `Release.gpg` and inline-signed `InRelease`.
+- **Apply rustfmt to unblock v1.2.0-rc.2** (closes #1337, #1339). Mechanical `cargo fmt` pass over the tree to satisfy the rustfmt check gate after a batch of merges that landed slightly mis-formatted.
+- **Test-email endpoint accepts `recipient` alias** (closes #1332, #1338). `POST /api/v1/admin/smtp/test` rejected requests carrying `recipient` (the field name the web UI and docs advertised) because the handler only accepted `to`. The handler now accepts both, with `recipient` as the canonical name going forward.
+- **Reject virtual repo create with no members at 400** (closes #1279, #1281). `POST /api/v1/repositories` accepted virtual repos with no members at create time, then 404'd every subsequent fetch. The handler now returns `400 Bad Request` at create time, naming the expected `member_repos: [{repo_key, priority}, ...]` shape.
+- **Stop inserting proxy-cached items into `artifacts`** (closes #1278, #1280). `ProxyService::cache_artifact` previously wrote a row to `artifacts` for every proxy-cached item, which on filesystem backends produced a doubled-prefix storage key that 500'd on every subsequent read. The proxy hot path already serves cache hits via the storage layer directly, so the `artifacts` insert is removed.
+
+### Changed
+
+- **Server-side Docker tag aggregation** (closes #1193, #1336). The Docker tag listing page in the web UI previously fetched every manifest individually and aggregated tags client-side, which on repos with thousands of tags ran into request fan-out limits. Tag aggregation now happens on the backend via a single `GET /repositories/{key}/docker/tags?aggregate=true` endpoint that returns tag lists pre-grouped by digest. The legacy per-manifest path remains for clients that still need it.
+- **`AK_SSRF_ALLOW_PRIVATE_CIDRS` env var** (closes #1224, #1325). The SSRF guard rejected outbound requests to RFC1918 / loopback / link-local addresses unconditionally, which broke proxy-fetch against on-prem upstreams (a local Nexus / JFrog inside the same VPC). The new `AK_SSRF_ALLOW_PRIVATE_CIDRS` env var accepts a comma-separated allowlist of CIDR ranges that bypass the private-address check. The default is the empty list, preserving the previous behavior; operators must opt in explicitly.
+- **Enforce PR-issue link via GitHub Actions** (#1310). New repo workflow requires every PR to link a tracking issue via the `Closes #<n>` / `Fixes #<n>` footer. Aligns with the linked-issue rule already documented for releases.
+- **Docs note `affected_component` format change** (closes #1159, #1223). Adds an upgrade-notes entry making the v1.2.0 `affected_component` -> bare-name change explicit in the CHANGELOG and pointing integrations at `scan_packages.source_target`.
+- **Update docker-compose files** (#1231). Refreshes the bundled `docker-compose.local-dev.yml` and `docker-compose.demo.yml` to match the v1.2.0 image set, service names, and required env vars; clears two stale env keys that no longer have any effect.
+- **Runtime-agnostic admin password retrieval docs** (#1271). The first-time-setup docs previously assumed Docker as the runtime when telling operators how to retrieve the generated admin password; the new copy works for Docker, Podman, and Kubernetes deployments without rewording.
+
+### Dependencies
+
+- **Bump `wasmtime-wasi` to 36.0.10** (closes #1351, #1352). Picks up the upstream RUSTSEC-2026-0149 fix.
+- **Bump `ubi9/ubi` from 9.7 to 9.8** (#1293).
+- **Bump `ubi9/ubi-micro` from 9.7 to 9.8** (#1291).
+- **Bump `github/codeql-action` from 4.35.4 to 4.35.5** (#1292).
+- **Bump `actions/stale` from 10.2.0 to 10.3.0** (#1290).
+- **Bump `totp-rs` from 5.7.0 to 5.7.1** (#1227).
+- **Bump `mimalloc` from 0.1.48 to 0.1.51** (#1226).
+- **Bump `anchore/grype` from v0.111.1 to v0.112.0** (#1082).
+
 ## [1.1.10] - 2026-05-11
 
 ### Security
