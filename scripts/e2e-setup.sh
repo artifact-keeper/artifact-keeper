@@ -107,11 +107,18 @@ do
   KEY=$(echo "$HEAD" | cut -d: -f1)
   NAME=$(echo "$HEAD" | cut -d: -f2)
   FMT=$(echo "$HEAD" | cut -d: -f3)
-  # Build the member_repos JSON array from the comma-separated MEMBER:PRI list
+  # Build the member_repos JSON array from the comma-separated MEMBER:PRI list.
+  # POSIX-sh: split $TAIL on commas via IFS + `set --`, then iterate "$@".
+  # (Alpine's dash/busybox doesn't support `read -ra`, here-strings, or arrays.)
   MEMBERS_JSON="["
   FIRST=1
-  IFS=',' read -ra PAIRS <<< "$TAIL"
-  for pair in "${PAIRS[@]}"; do
+  OLD_IFS=$IFS
+  IFS=','
+  # Intentionally unquoted: word-splits $TAIL on comma into positional params.
+  # shellcheck disable=SC2086
+  set -- $TAIL
+  IFS=$OLD_IFS
+  for pair in "$@"; do
     MKEY="${pair%%:*}"
     PRI="${pair##*:}"
     if [ $FIRST -eq 1 ]; then
