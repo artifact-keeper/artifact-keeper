@@ -841,7 +841,39 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
-    let format = parse_format(&payload.format)?;
+    // Attempt static format resolution first. When the format string does not
+    // match any built-in variant, fall back to the `format_handlers` table so
+    // that WASM plugin formats (e.g. "myplugin") can be used on repo creation.
+    let (format, plugin_format_key) = match parse_format(&payload.format) {
+        Ok(f) => (f, None),
+        Err(_) => {
+            // Check whether the format string is a registered, enabled plugin
+            // format handler.
+            let format_lower = payload.format.to_lowercase();
+            let is_plugin: Option<bool> =
+                sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
+                    .bind(&format_lower)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+
+            match is_plugin {
+                Some(true) => (RepositoryFormat::Generic, Some(format_lower)),
+                Some(false) => {
+                    return Err(AppError::Validation(format!(
+                        "Plugin format handler '{}' is disabled. Enable it before creating repositories.",
+                        payload.format
+                    )));
+                }
+                None => {
+                    return Err(AppError::Validation(format!(
+                        "Invalid format: {}",
+                        payload.format
+                    )));
+                }
+            }
+        }
+    };
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
     // Validate up-front that virtual repos arrive with at least one member.
@@ -905,7 +937,10 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
-            format_key: payload.format_key,
+            // Plugin format key takes precedence over any explicit format_key
+            // in the payload: when a WASM plugin format was resolved above,
+            // `plugin_format_key` carries the canonical handler name.
+            format_key: plugin_format_key.or(payload.format_key),
         })
         .await?;
 
