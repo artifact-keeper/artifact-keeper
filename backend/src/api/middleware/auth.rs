@@ -60,6 +60,19 @@ pub struct AuthExtension {
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTicketAuth;
 
+/// Calling token's `iat` (issued-at) Unix-timestamp in seconds.
+///
+/// Inserted alongside [`AuthExtension`] by [`auth_middleware`] only when the
+/// caller authenticated with a JWT (Bearer or cookie). Absent for API-key,
+/// Basic, ticket, and service-account auth (where there is no JWT iat).
+///
+/// Used by handlers that perform credential-change invalidation
+/// (TOTP enable/disable, password change) to exempt the calling session's
+/// own token from being killed by the same operation it just performed.
+/// Issue #1370.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenIat(pub i64);
+
 impl AuthExtension {
     /// Check whether this auth context has a required scope.
     /// JWT sessions (non-API-token auth) always pass since they have no scope
@@ -369,7 +382,10 @@ pub async fn auth_middleware(
     // 401 message stays informative when only a ?ticket= was supplied.
     let had_header_credentials = !matches!(extracted, ExtractedToken::None);
 
-    let header_result: Result<AuthExtension, &'static str> = match extracted {
+    // Carry the JWT `iat` alongside the resolved AuthExtension so handlers
+    // performing credential-change invalidation (TOTP, password) can exempt
+    // the calling session's own token. Only populated on the JWT path.
+    let header_result: Result<(AuthExtension, Option<TokenIat>), &'static str> = match extracted {
         // Replica-safe access-token validation. The async variant consults the
         // DB credential-change watermark (#1173) so a password reset, TOTP
         // change, or deactivation on a peer replica is honoured here on the
@@ -379,16 +395,19 @@ pub async fn auth_middleware(
         // PR #1190 was supposed to close.
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => Ok(AuthExtension::from(claims)),
+                Ok(claims) => {
+                    let iat = TokenIat(claims.iat);
+                    Ok((AuthExtension::from(claims), Some(iat)))
+                }
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok(ext),
+                    Ok(ext) => Ok((ext, None)),
                     Err(_) => Err("Invalid or expired token"),
                 },
             }
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => Ok(ext),
+                Ok(ext) => Ok((ext, None)),
                 Err(_) => Err("Invalid or expired API token"),
             }
         }
@@ -396,7 +415,7 @@ pub async fn auth_middleware(
             None => Err("Invalid Basic auth credentials"),
             Some((username, password)) => {
                 match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
+                    Ok((user, _token_pair)) => Ok((AuthExtension::from(user), None)),
                     Err(_) => Err("Invalid credentials"),
                 }
             }
@@ -406,8 +425,11 @@ pub async fn auth_middleware(
     };
 
     let header_error = match header_result {
-        Ok(ext) => {
+        Ok((ext, token_iat)) => {
             request.extensions_mut().insert(ext);
+            if let Some(iat) = token_iat {
+                request.extensions_mut().insert(iat);
+            }
             return next.run(request).await;
         }
         Err(msg) => msg,
