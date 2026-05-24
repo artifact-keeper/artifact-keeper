@@ -37,6 +37,15 @@ use crate::storage::StorageBackend;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// TTL window (in days) for hash-based scan dedup lookups.
+///
+/// Both the cross-artifact reuse path (`find_reusable_scan`) and the
+/// same-artifact short-circuit path (`find_existing_scan_for_artifact`,
+/// added for #1373) use this window. Completed scans older than this
+/// no longer count as reusable, so we re-scan stale artifacts to pick
+/// up freshly-published advisories.
+pub(crate) const DEDUP_TTL_DAYS: i32 = 30;
+
 /// Sanitize a filename to its basename, stripping any directory components
 /// to prevent path traversal attacks. Returns `"artifact"` as a fallback
 /// when the input has no valid filename component.
@@ -292,14 +301,21 @@ pub(crate) fn checksum_log_prefix(checksum: &str) -> &str {
     &checksum[..8.min(checksum.len())]
 }
 
-/// Decide whether a reusable scan match should be skipped because it points at
-/// the same artifact we are currently scanning.
+/// Decide whether a reusable scan match points at the same artifact we are
+/// currently scanning (i.e. the artifact has already been scanned for these
+/// exact bytes).
 ///
 /// `find_reusable_scan` returns the most recent completed scan for a given
 /// `(checksum, scan_type)` pair. When the matched scan's `artifact_id` equals
-/// the current artifact's id, copying would be a no-op (we are reusing our
-/// own previous scan). The caller skips the reuse path in that case and runs
-/// a fresh scan instead.
+/// the current artifact's id, no further work is needed: the artifact already
+/// has a completed scan row for this scanner. The caller skips both the
+/// reuse-copy path AND the fresh-scan path, leaving the existing completed
+/// row in place.
+///
+/// Earlier behavior (pre-#1373) skipped only the reuse-copy path and fell
+/// through to running a fresh scan, which left two completed rows behind for
+/// what should have been a single logical scan. See issue #1373 for the
+/// release-gate failure that fix produced.
 pub(crate) fn should_skip_reuse_for_same_artifact(
     source_artifact_id: Uuid,
     current_artifact_id: Uuid,
@@ -2291,8 +2307,34 @@ impl ScannerService {
             return Ok(vec![]);
         }
 
+        // #1373: short-circuit when this artifact already has a completed
+        // scan for the same bytes + scan_type. Without this check, every
+        // trigger_scan call on an already-scanned artifact inserts a new
+        // `running` placeholder row that the worker then converts/completes,
+        // leaving two completed rows behind for what should be a single
+        // logical scan. The placeholder also lands in the trigger response
+        // with a fresh UUID, breaking the contract that identical bytes on
+        // the same artifact return the same scan_id.
+        //
+        // The check is per-scanner so a partially-completed scan set (e.g.
+        // trivy completed, grype still running from a prior trigger) still
+        // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
+            if let Ok(Some(existing)) = self
+                .scan_result_service
+                .find_existing_scan_for_artifact(
+                    artifact_id,
+                    &artifact.checksum_sha256,
+                    scanner.scan_type(),
+                    DEDUP_TTL_DAYS,
+                )
+                .await
+            {
+                prepared.push((scanner.scan_type().to_string(), existing.id));
+                continue;
+            }
+
             let row = self
                 .scan_result_service
                 .create_scan_result_with_checksum(
@@ -2394,7 +2436,6 @@ impl ScannerService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let checksum = &artifact.checksum_sha256;
-        const DEDUP_TTL_DAYS: i32 = 30;
         let mut prepared = prepared.unwrap_or_default();
 
         for scanner in &self.scanners {
@@ -2447,46 +2488,103 @@ impl ScannerService {
                 .find_reusable_scan(checksum, scanner.scan_type(), DEDUP_TTL_DAYS)
                 .await
             {
-                // Skip if the source scan is for the same artifact (already scanned)
-                if !should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
-                    let copied = match prepared_action {
-                        PreparedScanAction::Reuse(target_id) => {
-                            self.scan_result_service
+                // #1373: when the matched source scan is for THIS artifact,
+                // a completed scan for these exact bytes already exists. We
+                // must not run a fresh scan or copy results into a new row;
+                // either action would leave the artifact with two completed
+                // rows for one scan_type (the failing release-gate
+                // assertion `Per-artifact scan list contains exactly one
+                // completed scan`).
+                //
+                // Two sub-cases:
+                //
+                // 1. `prepared_action` is `Reuse(target_id)` where
+                //    target_id == source_scan.id. This is the normal path
+                //    after the #1373 short-circuit in
+                //    prepare_artifact_scan: the trigger handler returned
+                //    the existing scan id and we have nothing to do.
+                //
+                // 2. `prepared_action` is `Reuse(target_id)` where
+                //    target_id != source_scan.id. The placeholder was
+                //    inserted before the existing scan completed (race
+                //    between prepare and execute, or between two
+                //    concurrent trigger calls). We must NOT leave the
+                //    placeholder stuck in `running`; instead convert it
+                //    to a reused row pointing at the source so the
+                //    stuck-scan janitor never has to clean it up and the
+                //    polling client sees a deterministic terminal state.
+                //
+                // 3. `prepared_action` is `InsertFresh` (auto-scan-on-
+                //    upload). No placeholder was inserted yet, so we just
+                //    skip to the next scanner — the existing row already
+                //    represents the scan for these bytes.
+                if should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
+                    if let PreparedScanAction::Reuse(target_id) = prepared_action {
+                        if target_id != source_scan.id {
+                            // Race window: convert the orphan placeholder
+                            // into a reused-row pointing at the existing
+                            // completed scan. Best-effort: if the convert
+                            // fails the stuck-scan janitor will reap the
+                            // running row eventually.
+                            if let Err(e) = self
+                                .scan_result_service
                                 .convert_to_reused(target_id, source_scan.id, artifact_id)
                                 .await
+                            {
+                                warn!(
+                                    "Failed to convert orphan placeholder {} to reused row pointing at {}: {}",
+                                    target_id, source_scan.id, e
+                                );
+                            }
                         }
-                        PreparedScanAction::InsertFresh => {
-                            self.scan_result_service
-                                .copy_scan_results(
-                                    source_scan.id,
-                                    artifact_id,
-                                    artifact.repository_id,
-                                    scanner.scan_type(),
-                                    checksum,
-                                )
-                                .await
-                        }
-                    };
-                    match copied {
-                        Ok(reused) => {
-                            info!(
-                                "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
+                    }
+                    info!(
+                        "Skipping fresh scan for artifact {}: existing completed scan {} matches (scanner={}, hash={}..)",
+                        artifact_id,
+                        source_scan.id,
+                        scanner.name(),
+                        checksum_log_prefix(checksum),
+                    );
+                    continue;
+                }
+
+                let copied = match prepared_action {
+                    PreparedScanAction::Reuse(target_id) => {
+                        self.scan_result_service
+                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .await
+                    }
+                    PreparedScanAction::InsertFresh => {
+                        self.scan_result_service
+                            .copy_scan_results(
                                 source_scan.id,
                                 artifact_id,
-                                scanner.name(),
-                                checksum_log_prefix(checksum),
-                            );
-                            // Update quarantine status based on copied findings
-                            self.update_quarantine_status(artifact_id, reused.findings_count)
-                                .await?;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to copy scan results from {}: {}. Running fresh scan.",
-                                source_scan.id, e
-                            );
-                        }
+                                artifact.repository_id,
+                                scanner.scan_type(),
+                                checksum,
+                            )
+                            .await
+                    }
+                };
+                match copied {
+                    Ok(reused) => {
+                        info!(
+                            "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
+                            source_scan.id,
+                            artifact_id,
+                            scanner.name(),
+                            checksum_log_prefix(checksum),
+                        );
+                        // Update quarantine status based on copied findings
+                        self.update_quarantine_status(artifact_id, reused.findings_count)
+                            .await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to copy scan results from {}: {}. Running fresh scan.",
+                            source_scan.id, e
+                        );
                     }
                 }
             }
@@ -8462,6 +8560,15 @@ mod tests {
         let _ids = extract_scan_result_ids(&prepared);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].0, "trivy");
+    }
+
+    #[test]
+    fn test_dedup_ttl_days_is_30() {
+        // Pinned because both `find_reusable_scan` (cross-artifact dedup) and
+        // `find_existing_scan_for_artifact` (same-artifact short-circuit added
+        // for #1373) read this constant. A future tweak to the window should
+        // be a deliberate change with a CHANGELOG entry, not a silent edit.
+        assert_eq!(super::DEDUP_TTL_DAYS, 30);
     }
 
     #[test]

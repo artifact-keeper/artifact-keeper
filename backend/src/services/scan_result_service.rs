@@ -622,6 +622,58 @@ impl ScanResultService {
         Ok(result)
     }
 
+    /// Find an existing completed scan for THIS artifact_id with the given
+    /// checksum + scan_type within a TTL window.
+    ///
+    /// This is the short-circuit path for issue #1373: when a caller triggers
+    /// a scan on an artifact that already has a completed scan for the same
+    /// bytes, we must return the existing scan id rather than create a new
+    /// `running` placeholder row that goes on to run a redundant fresh scan
+    /// (or, worse, gets converted into an `is_reused=true` row that points at
+    /// the same artifact's own prior scan, leaving two completed rows for the
+    /// same artifact+scan_type pair).
+    ///
+    /// The query is scoped to a single `artifact_id` so it cannot return a
+    /// row belonging to a different artifact; cross-artifact dedup is the job
+    /// of `find_reusable_scan` and the `copy_scan_results` / `convert_to_reused`
+    /// path it feeds. This method only answers "has THIS artifact already been
+    /// scanned for these bytes?", which is the question `prepare_artifact_scan`
+    /// needs to answer before inserting a placeholder.
+    pub async fn find_existing_scan_for_artifact(
+        &self,
+        artifact_id: Uuid,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+    ) -> Result<Option<ScanResult>> {
+        let result = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
+            FROM scan_results
+            WHERE artifact_id = $1
+              AND checksum_sha256 = $2
+              AND scan_type = $3
+              AND status = 'completed'
+              AND completed_at > NOW() - ($4 || ' days')::interval
+            ORDER BY completed_at DESC
+            LIMIT 1
+            "#,
+            artifact_id,
+            checksum_sha256,
+            scan_type,
+            ttl_days.to_string(),
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
     /// Copy scan results from a source scan to a new artifact.
     /// Creates a new completed scan_result and duplicates all findings.
     pub async fn copy_scan_results(
