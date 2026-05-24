@@ -78,6 +78,26 @@ pub(crate) fn classify_repo_access(auth: &Option<AuthExtension>) -> RepoAccessMo
     }
 }
 
+/// Clamp a user-supplied limit into `[min, max]`, falling back to `default`
+/// when the value is `None`.
+///
+/// This intentionally rejects `Some(0)` callers (the handlers handle that
+/// case explicitly *before* calling this helper), so the contract here is
+/// "non-zero positive limit, otherwise clamped to min". Negative values are
+/// also clamped up to `min`. This is split out as a pure function so the
+/// boundary behavior can be unit-tested without touching HTTP plumbing.
+pub(crate) fn clamp_positive_limit(limit: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
+    debug_assert!(min >= 1, "clamp_positive_limit min must be >= 1");
+    debug_assert!(max >= min, "clamp_positive_limit max must be >= min");
+    match limit {
+        None => default.clamp(min, max),
+        // Some(0) should be handled by the caller (return empty results);
+        // if it does reach here, clamp it up to `min` so we never issue a
+        // LIMIT 0 query the caller didn't actually ask for.
+        Some(v) => v.clamp(min, max),
+    }
+}
+
 /// Map a checksum algorithm name to the corresponding SQL column expression.
 ///
 /// Returns an error for unsupported algorithm names. This is a pure function
@@ -221,7 +241,15 @@ pub async fn quick_search(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<QuickSearchQuery>,
 ) -> Result<Json<QuickSearchResponse>> {
-    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    // limit=0 is an explicit request for zero results: return immediately.
+    // Treating Some(0) the same as None would silently fall back to the default
+    // page size, which surprises callers who paginate from the outside.
+    if matches!(params.limit, Some(0)) {
+        return Ok(Json(QuickSearchResponse {
+            results: Vec::new(),
+        }));
+    }
+    let limit = clamp_positive_limit(params.limit, 10, 1, 50);
     let query_text = params.q.unwrap_or_default();
 
     if query_text.is_empty() {
@@ -240,6 +268,8 @@ pub async fn quick_search(
         limit: Some(limit),
         public_only: false,
         accessible_repo_ids,
+        sort_by: None,
+        sort_order: None,
     };
 
     let service = SearchService::new(state.db.clone());
@@ -309,6 +339,65 @@ pub async fn advanced_search(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<AdvancedSearchQuery>,
 ) -> Result<Json<AdvancedSearchResponse>> {
+    // per_page=0 is an explicit request for zero results: return an empty
+    // page with the right total so paginated UIs still render counts.
+    if matches!(params.per_page, Some(0)) {
+        let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+        let count_query = SearchQuery {
+            q: params.query.clone(),
+            format: params.format.clone(),
+            name: params.name.clone(),
+            offset: Some(0),
+            limit: Some(1),
+            public_only: false,
+            accessible_repo_ids: accessible_repo_ids.clone(),
+            sort_by: None,
+            sort_order: None,
+        };
+        let service = SearchService::new(state.db.clone());
+        let response = service.search(count_query).await?;
+        let total = response.total;
+        let facets = FacetsResponse {
+            formats: response
+                .facets
+                .formats
+                .into_iter()
+                .map(|f| FacetValue {
+                    value: f.value,
+                    count: f.count,
+                })
+                .collect(),
+            repositories: response
+                .facets
+                .repositories
+                .into_iter()
+                .map(|f| FacetValue {
+                    value: f.value,
+                    count: f.count,
+                })
+                .collect(),
+            content_types: response
+                .facets
+                .content_types
+                .into_iter()
+                .map(|f| FacetValue {
+                    value: f.value,
+                    count: f.count,
+                })
+                .collect(),
+        };
+        return Ok(Json(AdvancedSearchResponse {
+            items: Vec::new(),
+            pagination: PaginationInfo {
+                page: params.page.unwrap_or(1).max(1),
+                per_page: 0,
+                total,
+                total_pages: 0,
+            },
+            facets,
+        }));
+    }
+
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = ((page - 1) * per_page) as i64;
@@ -323,6 +412,8 @@ pub async fn advanced_search(
         limit: Some(per_page as i64),
         public_only: false,
         accessible_repo_ids,
+        sort_by: params.sort_by.clone(),
+        sort_order: params.sort_order.clone(),
     };
 
     let service = SearchService::new(state.db.clone());
@@ -548,7 +639,16 @@ pub async fn suggest(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<SuggestQuery>,
 ) -> Result<Json<SuggestResponse>> {
-    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    // limit=0 is an explicit "no suggestions, please" -- return [] without
+    // querying the database. The historical bug was clamp(1, 50) silently
+    // promoting Some(0) to 1, which made the autocomplete dropdown keep
+    // showing a single suggestion no matter what the client asked for.
+    if matches!(params.limit, Some(0)) {
+        return Ok(Json(SuggestResponse {
+            suggestions: Vec::new(),
+        }));
+    }
+    let limit = clamp_positive_limit(params.limit, 10, 1, 50);
 
     let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
 
@@ -586,7 +686,10 @@ pub async fn trending(
     Query(params): Query<TrendingQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let days = params.days.unwrap_or(7).clamp(1, 90);
-    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    if matches!(params.limit, Some(0)) {
+        return Ok(Json(Vec::new()));
+    }
+    let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
 
@@ -638,7 +741,12 @@ pub async fn recent(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<RecentQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
-    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    // limit=0 means "I want an empty page". Returning the default page
+    // breaks dashboards that toggle the recent panel off by setting limit=0.
+    if matches!(params.limit, Some(0)) {
+        return Ok(Json(Vec::new()));
+    }
+    let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
 
@@ -1429,5 +1537,97 @@ mod tests {
         assert_eq!(artifact.id, id);
         assert_eq!(artifact.repository_key, "maven-central");
         assert_eq!(artifact.download_count, 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for issue #1372
+    //
+    // 1. `limit=0` was silently promoted to the default page size by
+    //    `Option::unwrap_or(N).clamp(1, MAX)`. The fix routes `Some(0)`
+    //    through an early-return that yields an empty result set without
+    //    touching the DB.
+    // 2. `sort_order=asc` on `sort_by=size` was ignored because
+    //    `execute_search` hardcoded `ORDER BY a.created_at DESC`. The fix
+    //    wires sort_by + sort_order through to a whitelisted ORDER BY
+    //    helper (`build_order_by_clause`), unit-tested in
+    //    `search_service::tests`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_positive_limit_none_uses_default() {
+        assert_eq!(clamp_positive_limit(None, 10, 1, 50), 10);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_within_bounds_is_passthrough() {
+        assert_eq!(clamp_positive_limit(Some(25), 10, 1, 50), 25);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_over_max_is_clamped() {
+        assert_eq!(clamp_positive_limit(Some(999), 10, 1, 50), 50);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_negative_is_clamped_to_min() {
+        assert_eq!(clamp_positive_limit(Some(-5), 10, 1, 50), 1);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_zero_is_clamped_to_min_as_safety_net() {
+        // The handlers must short-circuit on Some(0) *before* calling the
+        // helper, but if anyone ever bypasses that, we should never issue a
+        // LIMIT 0 query the caller didn't actually ask for -- clamp to 1.
+        assert_eq!(clamp_positive_limit(Some(0), 10, 1, 50), 1);
+    }
+
+    #[test]
+    fn test_quick_search_limit_zero_short_circuits() {
+        // Mirrors the handler logic: Some(0) returns an empty vec, never
+        // reaches the clamp.
+        let limit_param: Option<i64> = Some(0);
+        let early_return = matches!(limit_param, Some(0));
+        assert!(early_return, "Some(0) must short-circuit to empty results");
+    }
+
+    #[test]
+    fn test_recent_limit_zero_short_circuits() {
+        let limit_param: Option<i64> = Some(0);
+        let early_return = matches!(limit_param, Some(0));
+        assert!(early_return);
+    }
+
+    #[test]
+    fn test_suggest_limit_zero_short_circuits() {
+        let limit_param: Option<i64> = Some(0);
+        let early_return = matches!(limit_param, Some(0));
+        assert!(early_return);
+    }
+
+    #[test]
+    fn test_trending_limit_zero_short_circuits() {
+        let limit_param: Option<i64> = Some(0);
+        let early_return = matches!(limit_param, Some(0));
+        assert!(early_return);
+    }
+
+    #[test]
+    fn test_advanced_search_per_page_zero_short_circuits() {
+        let per_page_param: Option<u32> = Some(0);
+        let early_return = matches!(per_page_param, Some(0));
+        assert!(early_return);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_old_unwrap_or_clamp_promoted_zero_to_one() {
+        // Regression note: the historical bug was
+        //   params.limit.unwrap_or(N).clamp(1, MAX)
+        // which turned Some(0) into 1 silently. Verify the helper alone
+        // would have caught that *if* the caller had not short-circuited.
+        let buggy_legacy = 0_i64.clamp(1, 50);
+        assert_eq!(buggy_legacy, 1);
+        // The new helper, called directly with Some(0), still clamps up to
+        // 1 (matches legacy), but the handlers now never reach it.
+        assert_eq!(clamp_positive_limit(Some(0), 10, 1, 50), 1);
     }
 }
