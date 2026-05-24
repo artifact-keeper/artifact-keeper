@@ -6,7 +6,7 @@ use axum::{
     http::{header, HeaderMap},
     response::IntoResponse,
     routing::get,
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +16,12 @@ use uuid::Uuid;
 
 use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
 use crate::api::dto::Pagination;
+// Use the crate-local `Json` extractor so any deserialization failure on a
+// request body surfaces as HTTP 400 + `{code: "VALIDATION_ERROR"}` instead of
+// Axum's default 422 + plain-text body. See #1368 and the module docs in
+// `crate::api::extractors`. The wrapper also implements `IntoResponse` so it
+// is a drop-in replacement on response types too.
+use crate::api::extractors::Json;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
