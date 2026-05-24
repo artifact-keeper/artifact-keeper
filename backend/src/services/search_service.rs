@@ -132,10 +132,10 @@ pub(crate) fn build_suggest_pattern(prefix: &str) -> String {
 ///
 /// Supported `sort_by` values:
 /// - `created_at` (default)
-/// - `name`        -> `a.name`
-/// - `size`        -> `a.size_bytes`  *** sort_order is now honored here ***
-/// - `downloads`   -> falls through to `a.created_at` for now (would need
-///                    a CTE; will land separately).
+/// - `name` -> `a.name`
+/// - `size` -> `a.size_bytes` (sort_order is now honored here)
+/// - `downloads` -> falls through to `a.created_at` for now (would need
+///   a CTE; will land separately).
 ///
 /// `sort_order` accepts `asc` / `desc` case-insensitively; anything else
 /// (including `None`) defaults to `desc`.
