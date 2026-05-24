@@ -15,10 +15,10 @@
 //! `auth-user-deactivation-revokes-tokens` (#1371) caught this.
 //!
 //! The fix makes `optional_auth_middleware` distinguish:
-//!   * `AuthOutcome::NoCredential`     -> continue anonymously (200)
-//!   * `AuthOutcome::Resolved(ext)`    -> continue with the extension
+//!   * `AuthOutcome::NoCredential`      -> continue anonymously (200)
+//!   * `AuthOutcome::Resolved(ext)`     -> continue with the extension
 //!   * `AuthOutcome::InvalidCredential` -> 401 (no rescue from anon or
-//!                                          ticket fallback)
+//!     ticket fallback)
 //!
 //! This integration test pins that behaviour end-to-end against a real DB:
 //! it mints a real API token, hits the route under
@@ -47,9 +47,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use artifact_keeper_backend::api::middleware::auth::{
-    optional_auth_middleware, AuthExtension,
-};
+use artifact_keeper_backend::api::middleware::auth::{optional_auth_middleware, AuthExtension};
 use artifact_keeper_backend::config::Config;
 use artifact_keeper_backend::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,

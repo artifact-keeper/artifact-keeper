@@ -3106,8 +3106,7 @@ mod tests {
         // anonymous.
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("not-a-real-jwt"))
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("not-a-real-jwt")).await;
         assert!(
             matches!(outcome, AuthOutcome::InvalidCredential),
             "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
