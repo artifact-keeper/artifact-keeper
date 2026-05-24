@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -329,7 +329,7 @@ async fn download_chart_via_index(
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
-                if let Ok((content, ct)) = proxy_helpers::local_fetch_by_path_suffix(
+                if let Ok(result) = proxy_helpers::local_fetch_by_path_suffix(
                     &state.db,
                     state,
                     member.id,
@@ -338,12 +338,22 @@ async fn download_chart_via_index(
                 )
                 .await
                 {
-                    return Ok(Some(proxy_helpers::build_download_response(
-                        content,
-                        ct,
-                        "application/gzip",
-                        Some(filename),
-                    )));
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            "Content-Type",
+                            result
+                                .content_type
+                                .unwrap_or_else(|| "application/gzip".to_string()),
+                        )
+                        .header(
+                            "Content-Disposition",
+                            format!("attachment; filename=\"{}\"", filename),
+                        );
+                    if let Some(size) = result.content_length {
+                        builder = builder.header(CONTENT_LENGTH, size.to_string());
+                    }
+                    return Ok(Some(builder.body(Body::from_stream(result.body)).unwrap()));
                 }
                 continue;
             }

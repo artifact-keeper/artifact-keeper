@@ -264,9 +264,17 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to open {}: {}", key, e)))?;
+        let file = fs::File::open(&path).await.map_err(|e| {
+            // #1016: a missing key MUST map to AppError::NotFound so callers
+            // (e.g. maven_proxy sibling fall-through, local hydration retry)
+            // see a 404, not a 500. Mirror the buffered `get`/`get_range`
+            // mapping; anything that is not a NotFound stays a Storage error.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
 
         let reader = BufReader::new(file);
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);

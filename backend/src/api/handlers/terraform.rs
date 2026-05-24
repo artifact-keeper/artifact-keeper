@@ -263,7 +263,7 @@ async fn download_module(
                 );
                 let vname = module_name.clone();
                 let vversion = version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -283,15 +283,16 @@ async fn download_module(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                let mut builder = Response::builder().status(StatusCode::OK).header(
+                    "Content-Type",
+                    result
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
             return Err(not_found);
         }
@@ -821,7 +822,7 @@ async fn download_provider(
                 );
                 let vname = provider_name.clone();
                 let vversion = version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -841,15 +842,16 @@ async fn download_provider(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                let mut builder = Response::builder().status(StatusCode::OK).header(
+                    "Content-Type",
+                    result
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
             return Err(not_found);
         }

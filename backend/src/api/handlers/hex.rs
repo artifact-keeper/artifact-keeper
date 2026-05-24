@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -313,7 +313,7 @@ async fn serve_virtual_tarball_local_only(
     let state_arc = state.clone();
     let suffix = filename.to_string();
 
-    let (content, content_type) = proxy_helpers::resolve_virtual_download(
+    let result = proxy_helpers::resolve_virtual_download(
         &state.db,
         // Explicit None: any Remote member would route to upstream, which is
         // exactly what the shadowing guard must block. Local members fall
@@ -334,12 +334,22 @@ async fn serve_virtual_tarball_local_only(
     )
     .await?;
 
-    Ok(proxy_helpers::build_download_response(
-        content,
-        content_type,
-        "application/octet-stream",
-        Some(filename),
-    ))
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            "Content-Type",
+            result
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        );
+    if let Some(size) = result.content_length {
+        builder = builder.header(CONTENT_LENGTH, size.to_string());
+    }
+    Ok(builder.body(Body::from_stream(result.body)).unwrap())
 }
 
 // ---------------------------------------------------------------------------

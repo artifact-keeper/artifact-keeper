@@ -613,7 +613,7 @@ async fn download_object(
                 let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
                 let path_clone = artifact_path.clone();
                 let upstream_path = format!("objects/{}", oid);
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -632,15 +632,16 @@ async fn download_object(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                let mut builder = Response::builder().status(StatusCode::OK).header(
+                    "Content-Type",
+                    result
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
 
             return Err(lfs_error_response(
@@ -658,12 +659,15 @@ async fn download_object(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Storage error: {}", e),
-        )
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Storage error: {}", e),
+            )
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -676,8 +680,8 @@ async fn download_object(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/octet-stream")
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

@@ -489,7 +489,7 @@ async fn download_archive(
                 let vversion = version.clone();
                 let upstream_path =
                     format!("dist/{}/{}/{}/{}.zip", vendor, package, version, reference);
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -511,19 +511,22 @@ async fn download_archive(
 
                 let filename = format!("{}-{}.zip", package, version);
 
-                return Ok(Response::builder()
+                let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(
                         CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/zip".to_string()),
+                        result
+                            .content_type
+                            .unwrap_or_else(|| "application/zip".to_string()),
                     )
                     .header(
                         "Content-Disposition",
                         format!("attachment; filename=\"{}\"", filename),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                    );
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
             return Err(not_found);
         }
@@ -538,13 +541,16 @@ async fn download_archive(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -563,9 +569,9 @@ async fn download_archive(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

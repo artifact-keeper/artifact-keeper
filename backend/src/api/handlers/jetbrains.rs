@@ -213,7 +213,7 @@ async fn download_plugin(
                 let upstream_path = format!("plugin/download/{}/{}", name, version);
                 let vname = name.clone();
                 let vversion = version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -233,15 +233,16 @@ async fn download_plugin(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                let mut builder = Response::builder().status(StatusCode::OK).header(
+                    "Content-Type",
+                    result
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
             return Err(not_found);
         }
@@ -255,13 +256,16 @@ async fn download_plugin(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -280,8 +284,8 @@ async fn download_plugin(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 
