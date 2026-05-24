@@ -172,19 +172,28 @@ async fn simple_root(
     .await
     .map_err(map_db_err)?;
 
-    let mut packages: Vec<String> = raw_names
-        .iter()
-        .map(|n| normalize_pep503(n))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut merged: std::collections::BTreeSet<String> =
+        raw_names.iter().map(|n| normalize_pep503(n)).collect();
+
+    // Remote repos: proxy the upstream /simple/ root and merge its package
+    // list into the response. Without this, a fresh Remote-only repo
+    // (proxy-cached artifacts no longer land in `artifacts`; see #1278/#1280)
+    // returns an empty root index even when the upstream advertises hundreds
+    // of packages. The fetched index is also cached via the proxy_service
+    // cache so subsequent requests hit the cache. (#1377)
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(names) =
+            fetch_remote_simple_root(&state, &repo.key, repo.id, &repo.upstream_url).await
+        {
+            merged.extend(names);
+        }
+    }
 
     // Virtual repos have no artifacts of their own. Aggregate package names
     // from all member repos so that the root index lists every package
     // available through the virtual endpoint.
-    if packages.is_empty() && repo.repo_type == RepositoryType::Virtual {
+    if merged.is_empty() && repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for member in &members {
             if member.repo_type == RepositoryType::Local
@@ -203,17 +212,88 @@ async fn simple_root(
                 .map_err(map_db_err)?;
 
                 merged.extend(member_raw.iter().map(|n| normalize_pep503(n)));
+            } else if member.repo_type == RepositoryType::Remote {
+                if let Some(names) =
+                    fetch_remote_simple_root(&state, &member.key, member.id, &member.upstream_url)
+                        .await
+                {
+                    merged.extend(names);
+                }
             }
-            // Remote member proxying for the root index is intentionally
-            // skipped: the upstream /simple/ can be very large and slow.
-            // Individual package lookups in simple_project() already proxy
-            // remote members on demand.
         }
-
-        packages = merged.into_iter().collect();
     }
 
+    let packages: Vec<String> = merged.into_iter().collect();
     build_simple_root_response(&headers, &repo_key, &packages)
+}
+
+/// Fetch the PEP 503 root index from a Remote repo's upstream URL and parse
+/// out the project names. Returns `None` when the proxy service is not
+/// configured, the upstream URL is missing, the fetch fails, or the response
+/// is not HTML the parser recognises.
+///
+/// The fetched bytes are cached by the proxy_service under cache_path
+/// `simple/`. Subsequent calls within the cache TTL return the cached body
+/// without re-hitting upstream, which keeps the root index responsive even
+/// when the upstream registry is slow or transiently down (#1377).
+async fn fetch_remote_simple_root(
+    state: &SharedState,
+    repo_key: &str,
+    repo_id: uuid::Uuid,
+    upstream_url: &Option<String>,
+) -> Option<Vec<String>> {
+    let upstream = upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
+    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+        proxy,
+        repo_id,
+        repo_key,
+        &effective_upstream,
+        &upstream_path,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => return None,
+    };
+
+    let html = String::from_utf8_lossy(&content);
+    Some(parse_simple_root_projects(&html))
+}
+
+/// Extract project names from an upstream PEP 503 root simple index.
+///
+/// The root index is a flat HTML list of `<a href="...">project-name</a>`
+/// entries. We prefer the link text (canonical project name) but fall back
+/// to the last non-empty segment of the href when the text is empty. All
+/// names are PEP 503 normalised so duplicates collapse before merging into
+/// the response.
+fn parse_simple_root_projects(html: &str) -> Vec<String> {
+    static A_TAG_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?is)<a\s+[^>]*?href="([^"]*)"[^>]*>([^<]*)</a>"#).unwrap());
+
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for caps in A_TAG_RE.captures_iter(html) {
+        let href = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let text = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        let name = if !text.is_empty() {
+            text.to_string()
+        } else {
+            // Fallback: take the last non-empty path segment from the href.
+            href.trim_end_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string()
+        };
+        let normalized = normalize_pep503(&name);
+        if !normalized.is_empty() {
+            out.insert(normalized);
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Render the simple root index (list of all packages) as either HTML (PEP 503)
@@ -3556,5 +3636,174 @@ mod tests {
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
         assert!(merged.contains("pkg-1.0.0.tar.gz"));
         assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1377 — Remote PyPI root simple-index proxy + cache.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_simple_root_projects_extracts_from_pep503_html() {
+        // Canonical PEP 503 root index shape: <a href="<project>/"><project></a>
+        let html = "<!DOCTYPE html><html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href=\"requests/\">requests</a>\
+                    <a href=\"my_pkg/\">My_Pkg</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // PEP 503 normalisation: lowercase + `_`/`.` collapsed to `-`.
+        assert_eq!(projects, vec!["flask", "my-pkg", "requests"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_falls_back_to_href_when_text_missing() {
+        // Some indexes emit the link without text content (Nexus). The
+        // parser must fall back to the trailing href segment so we do not
+        // silently drop entries.
+        let html = "<html><body><a href=\"numpy/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["numpy"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_empty_when_no_anchors() {
+        let projects = super::parse_simple_root_projects("<html><body>no links</body></html>");
+        assert!(projects.is_empty());
+    }
+
+    /// Regression: a Remote PyPI repo with NO local artifacts must proxy
+    /// upstream `/simple/` and return the upstream's package list. Before
+    /// #1377 this returned an empty index because `simple_root` only ever
+    /// queried the local `artifacts` table, and proxy-cached items no
+    /// longer create rows there (#1278 / #1280).
+    ///
+    /// Also covers the cache-roundtrip path: a second invocation must
+    /// reuse the proxy_service cache and produce the same package list
+    /// without re-hitting upstream.
+    #[tokio::test]
+    async fn test_simple_root_remote_proxies_and_caches_upstream_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let upstream_index = "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"/></head><body>\
+                              <a href=\"reltest-pkg/\">reltest-pkg</a>\
+                              <a href=\"flask/\">Flask</a>\
+                              </body></html>";
+
+        // Both /simple/ and /simple (without trailing slash) should be
+        // covered: the proxy fetch always lands on /simple/.
+        let hits_for_mock = hits.clone();
+        Mock::given(method("GET"))
+            .and(path("/simple/"))
+            .respond_with(move |_req: &wiremock::Request| {
+                hits_for_mock.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(upstream_index)
+            })
+            .mount(&mock_server)
+            .await;
+
+        // Re-point repo at the mock upstream.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let do_cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        // 1st call: HTML body must contain BOTH upstream packages and route
+        // their hrefs to the local repo (not the upstream URL).
+        let result = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root must succeed for Remote repo, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_str = std::str::from_utf8(&body_bytes).expect("utf8");
+        assert!(
+            body_str.contains(">reltest-pkg<"),
+            "root simple index must list 'reltest-pkg' from upstream (#1377): {body_str}"
+        );
+        assert!(
+            body_str.contains(">flask<"),
+            "root simple index must list 'flask' (normalised) from upstream: {body_str}"
+        );
+        assert!(
+            body_str.contains(&format!("/pypi/{}/simple/", fx.repo_key)),
+            "root simple index must point hrefs at the local repo, not the upstream: {body_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream hit exactly once on first call"
+        );
+
+        // 2nd call: proxy cache must satisfy this request without a fresh
+        // upstream HEAD/GET. Package list must still be the same.
+        let result2 = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response2 = match result2 {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root cache roundtrip must succeed, got {status}");
+            }
+        };
+        let body_bytes2 = axum::body::to_bytes(response2.into_body(), 1024 * 1024)
+            .await
+            .expect("body2");
+        let body_str2 = std::str::from_utf8(&body_bytes2).expect("utf82");
+        assert!(
+            body_str2.contains(">reltest-pkg<"),
+            "cached root simple index must still list 'reltest-pkg' (#1377): {body_str2}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream must NOT be hit again on a cache-roundtrip read"
+        );
+
+        do_cleanup().await;
     }
 }
