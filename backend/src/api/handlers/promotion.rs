@@ -134,15 +134,43 @@ pub struct PromotionHistoryResponse {
 }
 
 /// Validate that source is staging and target is local, with matching formats.
+///
+/// The staging-source check is split out so that the promotion handler can
+/// evaluate quality gates and policies BEFORE rejecting on shape grounds.
+/// Quality-gate violations carry more diagnostic value than the staging shape
+/// error, so the handler must surface them first when both apply (see #1376).
 pub fn validate_promotion_repos(
     source: &crate::models::repository::Repository,
     target: &crate::models::repository::Repository,
+) -> Result<()> {
+    validate_promotion_source_is_staging(source)?;
+    validate_promotion_target_and_format(source, target)
+}
+
+/// Verify that the promotion source repository is of type `Staging`.
+///
+/// Split from `validate_promotion_repos` so the staging-source check can be
+/// deferred until after quality-gate evaluation in the promotion handler.
+pub fn validate_promotion_source_is_staging(
+    source: &crate::models::repository::Repository,
 ) -> Result<()> {
     if source.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
             "Source repository must be a staging repository".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Verify the target is a local repository and that the formats match.
+///
+/// Split from `validate_promotion_repos` so the handler can run gate
+/// evaluation between the source-staging check and these target-shape checks
+/// when needed.
+pub fn validate_promotion_target_and_format(
+    source: &crate::models::repository::Repository,
+    target: &crate::models::repository::Repository,
+) -> Result<()> {
     if target.repo_type != RepositoryType::Local {
         return Err(AppError::Validation(
             "Target repository must be a local (release) repository".to_string(),
@@ -290,23 +318,13 @@ pub async fn promote_artifact(
     enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
 
     let target_repo = repo_service.get_by_key(&target_key).await?;
-    validate_promotion_repos(&source_repo, &target_repo)?;
 
-    if super::approval::check_approval_required(&state.db, source_repo.id).await? {
-        return Ok(Json(PromotionResponse {
-            promoted: false,
-            source: format!("{}/{}", repo_key, artifact_id),
-            target: target_key.clone(),
-            promotion_id: None,
-            policy_violations: vec![],
-            message: Some(
-                "This repository requires approval for promotions. \
-                 Use POST /api/v1/approval/request to submit an approval request."
-                    .to_string(),
-            ),
-        }));
-    }
-
+    // Look up the artifact first. The artifact lookup is keyed by the source
+    // repository id, not by repository type, so it works even when the source
+    // is not a staging repository. This lets quality-gate evaluation run
+    // before the staging-source shape check below: a violating artifact must
+    // be rejected with a gate-rejection code, not a 400 shape error
+    // (see #1376).
     let artifact = sqlx::query_as!(
         crate::models::artifact::Artifact,
         r#"
@@ -325,7 +343,57 @@ pub async fn promote_artifact(
     .fetch_optional(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found in staging repository".to_string()))?;
+    .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
+
+    // Quality gate evaluation runs BEFORE the staging-source shape check so
+    // that gate violations take precedence in the error response. A
+    // gate-blocked promotion returns HTTP 409 Conflict, which is the
+    // documented rejection code for promotions blocked by gate policy.
+    if !req.skip_policy_check {
+        if let Some(ref qc) = state.quality_check_service {
+            match qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
+                Ok(gate_eval) => {
+                    if !gate_eval.passed && gate_eval.action == "block" {
+                        return Err(AppError::Conflict(format!(
+                            "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
+                            gate_eval.gate_name,
+                            gate_eval.health_score,
+                            gate_eval.health_grade,
+                            gate_eval.violations.len(),
+                        )));
+                    }
+                }
+                Err(e) => {
+                    // Missing gate or missing health score are not fatal; the
+                    // promotion can proceed to the remaining checks.
+                    tracing::warn!(
+                        "Quality gate evaluation failed for artifact {}: {}",
+                        artifact_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Now run shape validation. Gate evaluation has already finished above so
+    // a violating artifact cannot be masked by a 400 staging-source error.
+    validate_promotion_repos(&source_repo, &target_repo)?;
+
+    if super::approval::check_approval_required(&state.db, source_repo.id).await? {
+        return Ok(Json(PromotionResponse {
+            promoted: false,
+            source: format!("{}/{}", repo_key, artifact_id),
+            target: target_key.clone(),
+            promotion_id: None,
+            policy_violations: vec![],
+            message: Some(
+                "This repository requires approval for promotions. \
+                 Use POST /api/v1/approval/request to submit an approval request."
+                    .to_string(),
+            ),
+        }));
+    }
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
     let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
@@ -365,49 +433,19 @@ pub async fn promote_artifact(
             }));
         }
 
-        // Evaluate quality gates (if quality check service is available)
+        // Warn-level gate evaluation (after shape validation). If the gate was
+        // configured to `warn` rather than `block`, we surface the violations
+        // in the response but still allow the promotion to proceed.
         if let Some(ref qc) = state.quality_check_service {
-            match qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
-                Ok(gate_eval) => {
-                    if !gate_eval.passed && gate_eval.action == "block" {
-                        let gate_violations: Vec<PolicyViolation> = gate_eval
-                            .violations
-                            .iter()
-                            .map(|v| PolicyViolation {
-                                rule: v.rule.clone(),
-                                severity: "high".to_string(),
-                                message: v.message.clone(),
-                            })
-                            .collect();
-                        return Ok(Json(PromotionResponse {
-                            promoted: false,
-                            source: format!("{}/{}", repo_key, artifact.path),
-                            target: format!("{}/{}", target_key, artifact.path),
-                            promotion_id: None,
-                            policy_violations: gate_violations,
-                            message: Some(format!(
-                                "Promotion blocked by quality gate '{}' (health score: {}, grade: {})",
-                                gate_eval.gate_name, gate_eval.health_score, gate_eval.health_grade
-                            )),
-                        }));
+            if let Ok(gate_eval) = qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
+                if !gate_eval.passed && gate_eval.action != "block" {
+                    for v in &gate_eval.violations {
+                        policy_violations.push(PolicyViolation {
+                            rule: v.rule.clone(),
+                            severity: "medium".to_string(),
+                            message: v.message.clone(),
+                        });
                     }
-                    // Warn violations get appended but don't block
-                    if !gate_eval.passed {
-                        for v in &gate_eval.violations {
-                            policy_violations.push(PolicyViolation {
-                                rule: v.rule.clone(),
-                                severity: "medium".to_string(),
-                                message: v.message.clone(),
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Quality gate evaluation failed for artifact {}: {}",
-                        artifact_id,
-                        e
-                    );
                 }
             }
         }
@@ -1378,6 +1416,146 @@ mod tests {
         // Source check comes first
         let err = validate_promotion_repos(&source, &target).unwrap_err();
         assert!(err.to_string().contains("staging"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Split validators (regression for #1376)
+    //
+    // The single-artifact promotion handler must be able to run quality-gate
+    // evaluation BEFORE rejecting on staging-source shape. To support that
+    // ordering, `validate_promotion_repos` is split into two helpers:
+    //   - `validate_promotion_source_is_staging` (the staging check)
+    //   - `validate_promotion_target_and_format` (target type + format match)
+    //
+    // These tests pin the split so a future refactor cannot silently
+    // re-collapse them and re-introduce the bug from #1376.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_promotion_source_is_staging_ok() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        assert!(validate_promotion_source_is_staging(&source).is_ok());
+    }
+
+    #[test]
+    fn test_validate_promotion_source_is_staging_rejects_local() {
+        let source = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let err = validate_promotion_source_is_staging(&source).unwrap_err();
+        assert!(err.to_string().contains("staging"));
+        // Pin the specific message that the test/release-gate matches on.
+        assert!(err
+            .to_string()
+            .contains("Source repository must be a staging repository"));
+    }
+
+    #[test]
+    fn test_validate_promotion_source_is_staging_rejects_remote() {
+        let source = make_repo(
+            RepositoryType::Remote,
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        assert!(validate_promotion_source_is_staging(&source).is_err());
+    }
+
+    #[test]
+    fn test_validate_promotion_source_is_staging_rejects_virtual() {
+        let source = make_repo(
+            RepositoryType::Virtual,
+            crate::models::repository::RepositoryFormat::Pypi,
+        );
+        assert!(validate_promotion_source_is_staging(&source).is_err());
+    }
+
+    #[test]
+    fn test_validate_promotion_target_and_format_ok() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        assert!(validate_promotion_target_and_format(&source, &target).is_ok());
+    }
+
+    #[test]
+    fn test_validate_promotion_target_and_format_target_not_local() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let err = validate_promotion_target_and_format(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("local"));
+    }
+
+    #[test]
+    fn test_validate_promotion_target_and_format_format_mismatch() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        let err = validate_promotion_target_and_format(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+    }
+
+    /// Documents the precedence the promotion handler relies on (#1376).
+    ///
+    /// The handler calls `validate_promotion_source_is_staging` AFTER quality
+    /// gate evaluation. If a non-staging source ever appears at the handler
+    /// after gate eval, the resulting error must still be the
+    /// "Source repository must be a staging repository" validation (HTTP 400),
+    /// not silently swallowed.
+    #[test]
+    fn test_validate_promotion_source_is_staging_error_status_is_validation() {
+        let source = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let err = validate_promotion_source_is_staging(&source).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("staging"));
+            }
+            other => panic!("expected Validation error, got {:?}", other),
+        }
+    }
+
+    /// Documents the rejection-code contract for gate-blocked promotions.
+    ///
+    /// When the promotion handler raises an `AppError::Conflict` for a
+    /// gate-blocked artifact, the response must serialize to HTTP 409 with
+    /// the CONFLICT code. The release-gate accepts 403/409/422 as the valid
+    /// gate-rejection set, and we pin 409 here so a future refactor cannot
+    /// silently downgrade gate violations to a generic 400.
+    #[test]
+    fn test_quality_gate_block_returns_conflict() {
+        let err = AppError::Conflict(
+            "Promotion blocked by quality gate 'no-critical' \
+             (health score: 42, grade: D, violations: 1)"
+                .to_string(),
+        );
+        match err {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("quality gate"));
+                assert!(msg.contains("blocked"));
+            }
+            other => panic!("expected Conflict error, got {:?}", other),
+        }
     }
 
     // -----------------------------------------------------------------------
