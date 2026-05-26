@@ -760,6 +760,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -774,6 +777,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://charts.helm.sh/stable".to_string()),
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -1129,6 +1135,9 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url),
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let result = download_chart_via_index(&state, &repo, "tc", "2.0.0", "tc-2.0.0.tgz").await;
@@ -1160,6 +1169,9 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
@@ -1183,6 +1195,9 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;

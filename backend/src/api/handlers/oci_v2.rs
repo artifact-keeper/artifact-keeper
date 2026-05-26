@@ -5018,7 +5018,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_token_is_non_empty() {
-        assert!(!ANONYMOUS_TOKEN.is_empty());
+        assert_ne!(ANONYMOUS_TOKEN, "");
     }
 
     // -----------------------------------------------------------------------

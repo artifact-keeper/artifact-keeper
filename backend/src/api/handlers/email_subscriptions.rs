@@ -45,6 +45,9 @@ const VALID_EVENT_TYPES: &[&str] = &[
     "repository.deleted",
     "license.violation",
     "vulnerability.detected",
+    "age_gate.queued",
+    "age_gate.approved",
+    "age_gate.rejected",
 ];
 
 pub fn router() -> Router<SharedState> {

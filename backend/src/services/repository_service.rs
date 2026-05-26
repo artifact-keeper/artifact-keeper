@@ -373,6 +373,7 @@ impl RepositoryService {
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
+                age_gate_enabled, age_gate_min_age_days,
                 created_at, updated_at
             "#,
             req.key,
@@ -456,6 +457,7 @@ impl RepositoryService {
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
+                age_gate_enabled, age_gate_min_age_days,
                 created_at, updated_at
             FROM repositories
             WHERE id = $1
@@ -485,6 +487,7 @@ impl RepositoryService {
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
+                age_gate_enabled, age_gate_min_age_days,
                 created_at, updated_at
             FROM repositories
             WHERE key = $1
@@ -529,6 +532,7 @@ impl RepositoryService {
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
+                age_gate_enabled, age_gate_min_age_days,
                 created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
@@ -606,6 +610,7 @@ impl RepositoryService {
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
+                age_gate_enabled, age_gate_min_age_days,
                 created_at, updated_at
             "#,
             id,
@@ -899,6 +904,7 @@ impl RepositoryService {
                 r.promotion_target_id, r.promotion_policy_id,
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
+                r.age_gate_enabled, r.age_gate_min_age_days,
                 r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -1033,6 +1039,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         }
@@ -1101,6 +1109,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         };

@@ -32,6 +32,9 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::upstream_metadata::UpstreamMetadataCache;
+use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -369,12 +372,16 @@ async fn get_package_metadata(
                 )
                 .await?;
 
-                return Ok(rewrite_and_respond(
+                return rewrite_and_respond_with_age_gate(
+                    state,
+                    &repo,
+                    package_name,
                     content,
                     content_type,
                     &base_url,
                     repo_key,
-                ));
+                )
+                .await;
             }
         }
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -427,12 +434,20 @@ async fn get_package_metadata(
 
             match result {
                 Ok((content, content_type)) => {
-                    return Ok(rewrite_and_respond(
+                    let params =
+                        crate::services::age_gate_service::AgeGateRepoParams::from_repository(
+                            member,
+                        );
+                    return rewrite_and_respond_with_age_gate_params(
+                        state,
+                        &params,
+                        package_name,
                         content,
                         content_type,
                         &base_url,
                         repo_key,
-                    ));
+                    )
+                    .await;
                 }
                 Err(_e) => {
                     debug!(
@@ -667,14 +682,145 @@ fn build_json_metadata_response(json_string: String) -> Response {
     build_ok_response("application/json", json_string)
 }
 
-/// Try to parse upstream content as JSON, rewrite tarball URLs, and return the
-/// rewritten metadata. Falls back to a raw passthrough if the content is not
-/// valid JSON. Used by both the remote and virtual metadata paths.
-fn rewrite_and_respond(
+/// Build the tarball filename for an npm package version.
+fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
+    if package_name.starts_with('@') {
+        let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
+        format!("{}-{}.tgz", short_name, version)
+    } else {
+        format!("{}-{}.tgz", package_name, version)
+    }
+}
+
+async fn npm_publish_time_for_version(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    version: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+        let encoded_name = encode_package_name_for_upstream(package_name);
+        if let Ok((content, _)) =
+            proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &encoded_name).await
+        {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
+                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+                return times.get(version).copied();
+            }
+        }
+    }
+    None
+}
+
+async fn apply_npm_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    filename: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let svc = match state.age_gate_service.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(None);
+    }
+
+    let version =
+        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, package_name)
+            .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
+    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
+    match svc
+        .check(&params, package_name, &version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id: _,
+            last_known_good: Some(lkg),
+        } => {
+            let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+            let encoded_name = encode_package_name_for_upstream(package_name);
+            let lkg_path = format!("{}/-/{}", encoded_name, lkg_filename);
+            Ok(Some((lkg_path, lkg_filename)))
+        }
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                package_name,
+                &version,
+                repo.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
+async fn rewrite_and_respond_with_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
     content: Bytes,
     content_type: Option<String>,
     base_url: &str,
     repo_key: &str,
+) -> Result<Response, Response> {
+    rewrite_and_respond_with_age_gate_params(
+        state,
+        &proxy_helpers::age_gate_params(repo),
+        package_name,
+        content,
+        content_type,
+        base_url,
+        repo_key,
+    )
+    .await
+}
+
+async fn rewrite_and_respond_with_age_gate_params(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package_name: &str,
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+) -> Result<Response, Response> {
+    let mut filtered = content.clone();
+    if let (Some(svc), Ok(mut json)) = (
+        state.age_gate_service.as_ref(),
+        serde_json::from_slice::<serde_json::Value>(&content),
+    ) {
+        if AgeGateService::is_applicable(params) {
+            svc.filter_npm_packument(params, package_name, &mut json)
+                .await
+                .map_err(|e| e.into_response())?;
+            filtered = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
+        }
+    }
+    Ok(rewrite_and_respond_inner(
+        filtered,
+        content_type,
+        base_url,
+        repo_key,
+        None,
+    ))
+}
+
+fn rewrite_and_respond_inner(
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+    _package_name: Option<&str>,
 ) -> Response {
     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
         rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
@@ -798,17 +944,22 @@ async fn serve_tarball(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            let mut fetch_path = upstream_path.clone();
+            let mut response_filename = filename.to_string();
+            if let Some((lkg_path, lkg_filename)) =
+                apply_npm_download_age_gate(state, &repo, package_name, filename).await?
+            {
+                fetch_path = lkg_path;
+                response_filename = lkg_filename;
+            }
+
             let (content, _content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
+                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &fetch_path)
                     .await?;
 
-            // The upstream registry may return application/octet-stream for
-            // npm tarballs, which also gets persisted by the proxy cache.
-            // Correct the cached artifact record so that SBOM generation and
-            // security scanners can identify the file as a gzip archive.
-            correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
+            correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
 
-            return Ok(build_tarball_response(content, filename, None));
+            return Ok(build_tarball_response(content, &response_filename, None));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
     }
@@ -1568,6 +1719,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

@@ -822,6 +822,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.storage_path, "/data/vscode-local");
         assert_eq!(repo.repo_type, "hosted");
@@ -839,6 +842,9 @@ mod tests {
             upstream_url: Some(
                 "https://marketplace.visualstudio.com/_apis/public/gallery".to_string(),
             ),
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());

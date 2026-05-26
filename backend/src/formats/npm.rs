@@ -105,7 +105,7 @@ impl NpmHandler {
         })
     }
 
-    fn extract_version_from_filename(filename: &str, name: &str) -> Result<String> {
+    pub fn extract_version_from_filename(filename: &str, name: &str) -> Result<String> {
         // Filename format: name-version.tgz
         let prefix = format!("{}-", name);
         let suffix = ".tgz";
