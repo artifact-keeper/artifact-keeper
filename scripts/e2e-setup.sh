@@ -94,23 +94,54 @@ do
 done
 
 echo "==> Creating virtual repositories..."
+# Per #1281, POST /api/v1/repositories with repo_type=virtual now requires a
+# non-empty member_repos array at create time. We embed the members inline.
+# Format: KEY:NAME:FMT|MEMBER1:PRI1,MEMBER2:PRI2
 for virtual in \
-  "npm-virtual:NPM Virtual:npm" \
-  "pypi-virtual:PyPI Virtual:pypi" \
-  "hex-virtual:Hex Virtual:hex"
+  "npm-virtual:NPM Virtual:npm|npm-local-e2e:1,npm-proxy:2" \
+  "pypi-virtual:PyPI Virtual:pypi|pypi-local-e2e:1,pypi-proxy:2" \
+  "hex-virtual:Hex Virtual:hex|hex-local-e2e:1,hex-proxy:2"
 do
-  KEY=$(echo "$virtual" | cut -d: -f1)
-  NAME=$(echo "$virtual" | cut -d: -f2)
-  FMT=$(echo "$virtual" | cut -d: -f3)
+  HEAD="${virtual%%|*}"
+  TAIL="${virtual#*|}"
+  KEY=$(echo "$HEAD" | cut -d: -f1)
+  NAME=$(echo "$HEAD" | cut -d: -f2)
+  FMT=$(echo "$HEAD" | cut -d: -f3)
+  # Build the member_repos JSON array from the comma-separated MEMBER:PRI list.
+  # POSIX-sh: split $TAIL on commas via IFS + `set --`, then iterate "$@".
+  # (Alpine's dash/busybox doesn't support `read -ra`, here-strings, or arrays.)
+  MEMBERS_JSON="["
+  FIRST=1
+  OLD_IFS=$IFS
+  IFS=','
+  # Intentionally unquoted: word-splits $TAIL on comma into positional params.
+  # shellcheck disable=SC2086
+  set -- $TAIL
+  IFS=$OLD_IFS
+  for pair in "$@"; do
+    MKEY="${pair%%:*}"
+    PRI="${pair##*:}"
+    if [ $FIRST -eq 1 ]; then
+      FIRST=0
+    else
+      MEMBERS_JSON="$MEMBERS_JSON,"
+    fi
+    MEMBERS_JSON="$MEMBERS_JSON{\"repo_key\":\"$MKEY\",\"priority\":$PRI}"
+  done
+  MEMBERS_JSON="$MEMBERS_JSON]"
   curl -sf -X POST "$REGISTRY_URL/api/v1/repositories" \
     -H "Authorization: Bearer $TOKEN" \
     -H 'Content-Type: application/json' \
-    -d "{\"key\":\"$KEY\",\"name\":\"$NAME\",\"format\":\"$FMT\",\"repo_type\":\"virtual\",\"is_public\":true}" \
+    -d "{\"key\":\"$KEY\",\"name\":\"$NAME\",\"format\":\"$FMT\",\"repo_type\":\"virtual\",\"is_public\":true,\"member_repos\":$MEMBERS_JSON}" \
     >/dev/null 2>&1 || true
-  echo "  - $KEY ($FMT virtual)"
+  echo "  - $KEY ($FMT virtual, members: $TAIL)"
 done
 
-echo "==> Wiring virtual repository members..."
+# Idempotent reconciliation. Members are wired at create time above, so each
+# of these calls is expected to return 409 (already a member). We keep them so
+# re-runs against an existing database, where the virtuals may pre-exist
+# without members for any reason, still converge on the right shape.
+echo "==> Reconciling virtual repository members (idempotent)..."
 for member in \
   "npm-virtual:npm-local-e2e:1" \
   "npm-virtual:npm-proxy:2" \
@@ -127,7 +158,6 @@ do
     -H 'Content-Type: application/json' \
     -d "{\"member_key\":\"$MKEY\",\"priority\":$PRI}" \
     >/dev/null 2>&1 || true
-  echo "  - $VKEY <- $MKEY (priority=$PRI)"
 done
 
 echo "==> Setup complete"
