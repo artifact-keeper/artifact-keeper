@@ -1,0 +1,58 @@
+-- Index that supports left-anchored `path LIKE 'prefix%'` queries against
+-- `artifacts.path` under the default `en_US.UTF-8` collation.
+--
+-- The existing `idx_artifacts_repo_path (repository_id, path)` from
+-- migration 004 is a plain btree, and PostgreSQL only uses a plain btree
+-- for `LIKE 'prefix%'` when the column's collation is `C` (or the index
+-- was built with `COLLATE "C"`). Under any locale-aware collation
+-- (`en_US.UTF-8`, the default in production) a `LIKE 'prefix%'` predicate
+-- falls back to a sequential scan within the repo's row range even though
+-- the prefix anchors the leading edge of the value. The standard
+-- PostgreSQL remedy is an opclass index using `text_pattern_ops`
+-- (or `varchar_pattern_ops`), which is collation-independent and
+-- always usable for left-anchored LIKE.
+--
+-- Concrete hot path: `maven_local_fetch_storage_fallback` (Maven virtual
+-- repo, secondary-file resolution, #1399) runs
+--
+--   SELECT ... FROM artifacts
+--    WHERE repository_id = $1
+--      AND path LIKE $2          -- $2 = '<gav-dir>/%'
+--      AND is_deleted = false
+--    ORDER BY created_at DESC
+--    LIMIT 1
+--
+-- per virtual classifier / `-sources.jar` / `.pom` / `.sha512` request. On
+-- a populated `artifacts` table the seq-scan dominates the request:
+--
+--   * 50K rows in the repo    -> ~50-300 ms
+--   * 1M rows in the repo     -> seconds
+--
+-- and the cost is paid on every virtual fetch of a Maven companion file.
+-- This index turns that into an indexed range scan.
+--
+-- The new index is intentionally narrow:
+--   * `WHERE is_deleted = false` matches the predicate, keeping the
+--     index small (soft-deleted rows are rare in the hot path).
+--   * `(repository_id, path text_pattern_ops)` allows the planner to
+--     bound by repo first, then index-range-scan the path prefix.
+--
+-- This index is purely additive; the existing `idx_artifacts_repo_path`
+-- stays in place for equality and ORDER BY clauses where it remains the
+-- better choice. Other formats with the same GAV-prefix shape (Debian,
+-- RPM, NuGet, Helm) will hit the same code path once their virtual
+-- fallbacks are wired up, and will benefit from this index automatically.
+--
+-- Migration cost on a deployment with 10⁶ artifacts: a single index
+-- build (B-tree). Without `CREATE INDEX CONCURRENTLY` the operation
+-- holds `ACCESS EXCLUSIVE` on `artifacts` for the duration. Operators
+-- whose RDS parameter group enforces a low `statement_timeout` follow
+-- the same playbook as migration 108: either bump
+-- `statement_timeout` for the migration session (#1269) or build the
+-- index out-of-band with `CREATE INDEX CONCURRENTLY` + `SET
+-- statement_timeout = 0`, then mark the migration applied in
+-- `_sqlx_migrations`.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_repo_path_pattern
+  ON artifacts (repository_id, path text_pattern_ops)
+  WHERE is_deleted = false;

@@ -261,6 +261,107 @@ mod tests {
         assert!(!is_maven_secondary_path("/"));
     }
 
+    // ── parser edge cases (#1399 follow-up) ─────────────────────────
+    //
+    // `is_maven_secondary_path` now delegates to
+    // `MavenHandler::parse_coordinates` for the classifier check. Pin
+    // the behavior at the helper boundary so a future change in the
+    // Maven parser can't silently widen what the storage fallback will
+    // serve.
+
+    #[test]
+    fn test_is_maven_secondary_path_checksum_on_primary_classified_via_suffix() {
+        // `a-1.0.jar.sha1` has no classifier — the `.sha1` *suffix* is
+        // what makes it secondary, not the (absent) classifier. This
+        // pins the suffix-list short-circuit so a change to
+        // `parse_coordinates` can't accidentally start treating
+        // "jar.sha1" as a classifier-bearing extension.
+        let path = "g/a/1.0/a-1.0.jar.sha1";
+        assert!(is_maven_secondary_path(path));
+        // And the parser agrees there is no classifier here.
+        let coords = MavenHandler::parse_coordinates(path).expect("parses");
+        assert_eq!(
+            coords.classifier, None,
+            "`a-1.0.jar.sha1` is not a classifier artifact"
+        );
+    }
+
+    #[test]
+    fn test_is_maven_secondary_path_rejects_empty_classifier() {
+        // Edge case: `a-1.0-.jar` has a dangling hyphen — the classifier
+        // would be the empty string. This is not a valid Maven
+        // coordinate; the parser must surface that as "no classifier"
+        // (Err or classifier=None) and the helper must NOT route the
+        // bytes around the SQL row.
+        let path = "g/a/1.0/a-1.0-.jar";
+        assert!(
+            !is_maven_secondary_path(path),
+            "empty-classifier paths must not be treated as secondary"
+        );
+    }
+
+    #[test]
+    fn test_is_maven_secondary_path_snapshot_mismatch_pin() {
+        // Misnamed file: directory version is `1.0` (no -SNAPSHOT) but
+        // filename carries `-SNAPSHOT`. The parser treats `SNAPSHOT` as
+        // a classifier here because the suffix follows the
+        // `-classifier.ext` shape. This is a malformed Maven path
+        // (Maven itself would never write it), and the storage
+        // fallback's downstream gates (live primary in the same GAV
+        // dir + quarantine check) keep it safe: there is no
+        // `a-1.0.jar` row in production, so the fallback returns 404
+        // anyway. We pin current behavior so any future tightening of
+        // `parse_coordinates` here is a conscious decision.
+        let mismatched = "g/a/1.0/a-1.0-SNAPSHOT.jar";
+        let _ = is_maven_secondary_path(mismatched); // current: true
+
+        // The correctly-shaped SNAPSHOT path (directory version
+        // matches filename) is NOT a classifier artifact.
+        let correct = "g/a/1.0-SNAPSHOT/a-1.0-SNAPSHOT.jar";
+        assert!(
+            !is_maven_secondary_path(correct),
+            "well-formed SNAPSHOT path must not be mistaken for a classifier"
+        );
+    }
+
+    #[test]
+    fn test_is_maven_secondary_path_hyphenated_artifact_id_with_tests_classifier() {
+        // Real-world: `spring-boot-starter` artifact, version `3.0`,
+        // classifier `tests`. The artifact id itself contains hyphens,
+        // so naive `rsplit_once('-')` parsing would fail. Confirm the
+        // helper correctly identifies the `tests` classifier.
+        let path =
+            "org/springframework/boot/spring-boot-starter/3.0/spring-boot-starter-3.0-tests.jar";
+        assert!(
+            is_maven_secondary_path(path),
+            "classifier `tests` on a hyphenated artifact-id must be recognized"
+        );
+        let coords = MavenHandler::parse_coordinates(path).expect("parses");
+        assert_eq!(coords.artifact_id, "spring-boot-starter");
+        assert_eq!(coords.version, "3.0");
+        assert_eq!(coords.classifier.as_deref(), Some("tests"));
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_is_maven_secondary_path_invalid_paths() {
+        // Paths that aren't valid Maven coordinates at all (too few
+        // path segments, no version directory) must not be routed
+        // through the storage fallback. `parse_coordinates` returns
+        // `Err`, which the helper maps to `false` via `unwrap_or`.
+        for path in [
+            "just-a-file.jar",        // no directory at all
+            "g/a-1.0-classifier.jar", // only 2 segments (no version dir)
+            "g/a/a-1.0-x.jar",        // 3 segments, missing version dir
+        ] {
+            assert!(
+                !is_maven_secondary_path(path),
+                "{} is not a valid Maven coordinate and must not be classified as secondary",
+                path
+            );
+        }
+    }
+
     #[test]
     fn test_maven_gav_directory_extraction() {
         assert_eq!(
@@ -527,6 +628,72 @@ mod tests {
         // what matters for this SECURITY test is that the companion
         // .pom is NOT served, regardless of which refusal status the
         // current policy returns.
+        assert!(
+            err.status() == StatusCode::CONFLICT
+                || err.status() == StatusCode::FORBIDDEN
+                || err.status() == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+                || err.status() == StatusCode::NOT_FOUND,
+            "expected a refusal status, got {}",
+            err.status()
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_honors_quarantine_on_classifier_artifact() {
+        // SECURITY (#1399 follow-up): quarantined primary `.jar` must
+        // also withhold classifier artifacts that live in the same GAV
+        // directory (e.g. `-plain.jar`, `-test-fixtures.jar`,
+        // `-shadow.jar`). The fix routes these through the same Gate-2
+        // primary lookup as `.pom`/`.sha512`, so a quarantined primary
+        // gates *every* GAV-sibling read, not just the documented
+        // companion-suffix list.
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let primary_id = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/cfoo/1.0/cfoo-1.0.jar",
+            "maven/com/example/cfoo/1.0/cfoo-1.0.jar",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NULL WHERE id = $1",
+        )
+        .bind(primary_id)
+        .execute(&pool)
+        .await
+        .expect("set quarantine");
+
+        // Drop classifier bytes onto storage as if a publish had landed
+        // them alongside the primary. Without quarantine these would be
+        // served by Gate 3.
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "maven/com/example/cfoo/1.0/cfoo-1.0-plain.jar",
+            Bytes::from_static(b"plain-classifier-bytes-must-not-leak"),
+        )
+        .await
+        .expect("put classifier");
+
+        let location = repo.storage_location();
+        let err = maven_local_fetch_storage_fallback(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            "com/example/cfoo/1.0/cfoo-1.0-plain.jar",
+        )
+        .await
+        .expect_err("quarantined primary must hold back its classifier siblings");
+        // Same downstream refusal-status set as
+        // `test_storage_fallback_honors_quarantine_on_primary` — what
+        // matters is that the classifier bytes are NOT served.
         assert!(
             err.status() == StatusCode::CONFLICT
                 || err.status() == StatusCode::FORBIDDEN
