@@ -2611,4 +2611,101 @@ mod tests {
         let publish_content_type = "application/gzip";
         assert_eq!(NPM_TARBALL_CONTENT_TYPE, publish_content_type);
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1377 — scoped tarball remote-proxy flow.
+    // -----------------------------------------------------------------------
+
+    /// Regression: a Remote npm repo must be able to fetch a scoped-package
+    /// tarball through the proxy. The upstream URL the proxy hits must be
+    /// `@scope%2Fpkg/-/{filename}` — the npm registry protocol requires the
+    /// scope separator to be percent-encoded, because some private
+    /// registries (Nexus, Verdaccio, GitHub Packages) reject the unencoded
+    /// form. The handler must also unwrap axum's path extractor correctly
+    /// so the test request `/repo/@scope/pkg/-/file.tgz` reaches
+    /// `download_scoped_tarball` (not the unscoped fallback).
+    #[tokio::test]
+    async fn test_remote_proxy_download_scoped_tarball_hits_encoded_upstream_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let tarball_bytes = b"\x1f\x8b\x08mock-scoped-tarball-bytes";
+
+        // Upstream must see the scope encoded as %2F. wiremock's `path`
+        // matcher receives the raw request path (after axum's transport
+        // decoded it), so we match the canonical npm-registry shape.
+        Mock::given(method("GET"))
+            .and(path("/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.as_ref()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Re-point the fixture's Remote repo at the mock upstream so the
+        // proxy_fetch call lands on wiremock instead of the placeholder URL.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        // Invoke the scoped-tarball handler directly. The router decodes
+        // `%2F` on the way in, so we feed the canonical (unencoded) path
+        // segments via the Path extractor.
+        let result = super::download_scoped_tarball(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "e2escope".to_string(),
+                "testpkg".to_string(),
+                "testpkg-1.0.0.tgz".to_string(),
+            )),
+        )
+        .await;
+
+        // Cleanup first so a panic does not leak DB state.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!(
+                    "Remote npm proxy must serve scoped tarball; \
+                     download_scoped_tarball returned {status} (issue #1377)"
+                );
+            }
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
+
+        cleanup().await;
+    }
 }
