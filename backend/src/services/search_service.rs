@@ -1206,4 +1206,73 @@ mod tests {
             "sort_order=asc and sort_order=desc on sort_by=size must produce different ORDER BY clauses (issue #1372)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SearchQuery::{sort_by, sort_order} -- new fields added in PR #1384.
+    // Pin the default + serde behavior so the wire contract is locked.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_query_default_sort_by_and_sort_order_are_none() {
+        let q = SearchQuery::default();
+        assert!(q.sort_by.is_none(), "default sort_by must be None");
+        assert!(q.sort_order.is_none(), "default sort_order must be None");
+    }
+
+    #[test]
+    fn test_search_query_deserializes_sort_by_and_sort_order() {
+        let json = r#"{"q": "x", "sort_by": "size", "sort_order": "asc"}"#;
+        let q: SearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.sort_by.as_deref(), Some("size"));
+        assert_eq!(q.sort_order.as_deref(), Some("asc"));
+    }
+
+    #[test]
+    fn test_search_query_deserializes_with_only_sort_by() {
+        // sort_order is independently optional -- not specifying it must
+        // leave the field None so the helper can fall back to DESC.
+        let json = r#"{"sort_by": "downloads"}"#;
+        let q: SearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.sort_by.as_deref(), Some("downloads"));
+        assert!(q.sort_order.is_none());
+    }
+
+    #[test]
+    fn test_search_query_deserializes_with_only_sort_order() {
+        // Mirror: passing sort_order without sort_by must still parse,
+        // even though the resulting query falls back to the default
+        // `created_at` field.
+        let json = r#"{"sort_order": "desc"}"#;
+        let q: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(q.sort_by.is_none());
+        assert_eq!(q.sort_order.as_deref(), Some("desc"));
+    }
+
+    #[test]
+    fn test_search_query_round_trip_through_build_order_by_clause() {
+        // Tie SearchQuery and build_order_by_clause together so a future
+        // refactor that renames either side surfaces immediately.
+        let q = SearchQuery {
+            sort_by: Some("size".to_string()),
+            sort_order: Some("asc".to_string()),
+            ..Default::default()
+        };
+        let clause = build_order_by_clause(q.sort_by.as_deref(), q.sort_order.as_deref()).unwrap();
+        assert!(clause.contains("a.size_bytes"));
+        assert!(clause.contains("ASC"));
+    }
+
+    #[test]
+    fn test_search_query_invalid_sort_by_surfaces_validation_error_through_helper() {
+        // Verify the integration shape end-to-end: SearchQuery with a bad
+        // sort_by, fed to build_order_by_clause, must return Validation.
+        let q = SearchQuery {
+            sort_by: Some("popularity".to_string()),
+            sort_order: Some("desc".to_string()),
+            ..Default::default()
+        };
+        let err = build_order_by_clause(q.sort_by.as_deref(), q.sort_order.as_deref())
+            .expect_err("unknown sort_by must propagate as Validation");
+        assert!(matches!(err, AppError::Validation(_)));
+    }
 }
