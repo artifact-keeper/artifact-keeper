@@ -169,6 +169,10 @@ pub struct Repository {
     pub curation_sync_interval_secs: i32,
     /// Curation: whether to pre-fetch approved package bytes
     pub curation_auto_fetch: bool,
+    /// Age gate: block proxy downloads of upstream versions younger than threshold
+    pub age_gate_enabled: bool,
+    /// Age gate: minimum package age in days before automatic pass-through
+    pub age_gate_min_age_days: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

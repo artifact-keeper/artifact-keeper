@@ -1701,6 +1701,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://registry.terraform.io".to_string()),
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.storage_path, "/data/terraform");
@@ -1720,6 +1723,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert!(info.upstream_url.is_none());
     }
