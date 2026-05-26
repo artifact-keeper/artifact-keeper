@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -25,7 +26,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::security::{RawFinding, RawPackage, ScanResult, Severity};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -36,6 +37,15 @@ use crate::storage::StorageBackend;
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// TTL window (in days) for hash-based scan dedup lookups.
+///
+/// Both the cross-artifact reuse path (`find_reusable_scan`) and the
+/// same-artifact short-circuit path (`find_existing_scan_for_artifact`,
+/// added for #1373) use this window. Completed scans older than this
+/// no longer count as reusable, so we re-scan stale artifacts to pick
+/// up freshly-published advisories.
+pub(crate) const DEDUP_TTL_DAYS: i32 = 30;
 
 /// Sanitize a filename to its basename, stripping any directory components
 /// to prevent path traversal attacks. Returns `"artifact"` as a fallback
@@ -292,19 +302,158 @@ pub(crate) fn checksum_log_prefix(checksum: &str) -> &str {
     &checksum[..8.min(checksum.len())]
 }
 
-/// Decide whether a reusable scan match should be skipped because it points at
-/// the same artifact we are currently scanning.
+/// Decide whether a reusable scan match points at the same artifact we are
+/// currently scanning (i.e. the artifact has already been scanned for these
+/// exact bytes).
 ///
 /// `find_reusable_scan` returns the most recent completed scan for a given
 /// `(checksum, scan_type)` pair. When the matched scan's `artifact_id` equals
-/// the current artifact's id, copying would be a no-op (we are reusing our
-/// own previous scan). The caller skips the reuse path in that case and runs
-/// a fresh scan instead.
+/// the current artifact's id, no further work is needed: the artifact already
+/// has a completed scan row for this scanner. The caller skips both the
+/// reuse-copy path AND the fresh-scan path, leaving the existing completed
+/// row in place.
+///
+/// Earlier behavior (pre-#1373) skipped only the reuse-copy path and fell
+/// through to running a fresh scan, which left two completed rows behind for
+/// what should have been a single logical scan. See issue #1373 for the
+/// release-gate failure that fix produced.
 pub(crate) fn should_skip_reuse_for_same_artifact(
     source_artifact_id: Uuid,
     current_artifact_id: Uuid,
 ) -> bool {
     source_artifact_id == current_artifact_id
+}
+
+/// Pure mirror of the SQL TTL predicate
+/// `completed_at > NOW() - ($ttl || ' days')::interval` used by both
+/// `find_existing_scan_for_artifact` (same-artifact short-circuit, #1373)
+/// and `find_reusable_scan` (cross-artifact reuse).
+///
+/// Returns `false` when:
+/// - `completed_at` is `None` (scan never finished; not eligible for dedup)
+/// - `ttl_days <= 0` (window collapsed to zero or negative; always stale)
+/// - `completed_at` is older than `now - ttl_days`
+///
+/// Returns `true` when `completed_at` is within the inclusive window
+/// `[now - ttl_days, now]`. We treat `completed_at == now - ttl_days` as
+/// still within the window so the Rust check is at worst one tick more
+/// permissive than the strict-`>` SQL form, which matches the bias in
+/// the rest of the codebase (we'd rather over-dedup than re-scan the
+/// same bytes twice).
+///
+/// This function is intentionally not called by production code: the
+/// actual TTL window lives in the SQL query so the database can use the
+/// index. The Rust mirror exists to pin the semantics in a way that is
+/// unit-testable (no DB round-trip) and to give future refactors that
+/// move the predicate into Rust a tested starting point.
+#[allow(dead_code)]
+pub(crate) fn is_within_dedup_ttl(
+    completed_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    ttl_days: i32,
+) -> bool {
+    if ttl_days <= 0 {
+        return false;
+    }
+    let Some(completed_at) = completed_at else {
+        return false;
+    };
+    let window = chrono::Duration::days(ttl_days as i64);
+    let cutoff = now - window;
+    completed_at >= cutoff
+}
+
+/// Outcome of consulting `find_existing_scan_for_artifact` for a single
+/// scanner inside `prepare_artifact_scan`.
+///
+/// Captures the branch the DB-bound caller must take after the query:
+/// either short-circuit and reuse the existing scan id in the trigger
+/// response (no new placeholder, no fresh scan), or fall through to
+/// inserting a new `running` placeholder. Splitting this out makes the
+/// branch unit-testable without a database and pins the contract that
+/// the existing-scan id (not a newly minted UUID) is what gets surfaced
+/// to clients on the dedup path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ShortCircuitDecision {
+    /// Reuse the existing scan's id directly. No placeholder row, no
+    /// fresh scan: the artifact already has a completed scan for these
+    /// bytes and this scanner.
+    UseExisting(Uuid),
+    /// No usable existing scan; the caller must insert a fresh
+    /// placeholder and queue the scan normally.
+    InsertPlaceholder,
+}
+
+/// Decide whether to short-circuit the prepare step for one scanner.
+///
+/// Wraps the `Option<&ScanResult>` returned by
+/// `ScanResultService::find_existing_scan_for_artifact`. Pulled out so
+/// the actual SQL stays thin (integration-tested) and the decision
+/// logic stays pure (unit-tested).
+///
+/// Pre-#1373, this branch did not exist: every prepare iteration
+/// inserted a placeholder unconditionally, which is what produced the
+/// duplicate completed rows the release gate caught.
+pub(crate) fn decide_short_circuit_from_existing(
+    existing: Option<&ScanResult>,
+) -> ShortCircuitDecision {
+    match existing {
+        Some(scan) => ShortCircuitDecision::UseExisting(scan.id),
+        None => ShortCircuitDecision::InsertPlaceholder,
+    }
+}
+
+/// Outcome of the same-artifact branch inside `scan_artifact_inner` when
+/// `find_reusable_scan` returns a row whose `artifact_id` matches the
+/// artifact currently being scanned.
+///
+/// Three sub-cases, matching the inline comment block at the call site:
+///
+/// 1. `prepared_action` is `InsertFresh`: no placeholder was inserted,
+///    so we just skip ([`SameArtifactAction::NoOp`]). The existing row
+///    already represents this scan.
+/// 2. `prepared_action` is `Reuse(target_id)` and `target_id ==
+///    source_scan.id`: the prepare step already short-circuited to the
+///    existing id (#1373 happy path); nothing to do
+///    ([`SameArtifactAction::NoOp`]).
+/// 3. `prepared_action` is `Reuse(target_id)` and `target_id !=
+///    source_scan.id`: race window. A placeholder was committed before
+///    the existing scan landed. Convert the orphan placeholder into a
+///    reused row pointing at the existing completed scan
+///    ([`SameArtifactAction::ConvertOrphanPlaceholder`]) so the
+///    stuck-scan janitor never has to reap it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SameArtifactAction {
+    /// Nothing to do; the existing completed scan already represents
+    /// this artifact's result for this scanner.
+    NoOp,
+    /// Convert `target_id` (the orphan placeholder) into a reused-row
+    /// pointing at `source_id` (the existing completed scan).
+    ConvertOrphanPlaceholder { target_id: Uuid, source_id: Uuid },
+}
+
+/// Decide what to do when `find_reusable_scan` matched our own artifact.
+///
+/// See [`SameArtifactAction`] for the three sub-cases. This function is
+/// pure: it does not touch the database or the scan_result_service; it
+/// only encodes the branch logic that lived inline before #1373.
+pub(crate) fn decide_same_artifact_action(
+    prepared_action: &PreparedScanAction,
+    source_scan_id: Uuid,
+) -> SameArtifactAction {
+    match prepared_action {
+        PreparedScanAction::InsertFresh => SameArtifactAction::NoOp,
+        PreparedScanAction::Reuse(target_id) => {
+            if *target_id == source_scan_id {
+                SameArtifactAction::NoOp
+            } else {
+                SameArtifactAction::ConvertOrphanPlaceholder {
+                    target_id: *target_id,
+                    source_id: source_scan_id,
+                }
+            }
+        }
+    }
 }
 
 /// Build the user-facing message for an artifact-level trigger response.
@@ -2291,18 +2440,49 @@ impl ScannerService {
             return Ok(vec![]);
         }
 
+        // #1373: short-circuit when this artifact already has a completed
+        // scan for the same bytes + scan_type. Without this check, every
+        // trigger_scan call on an already-scanned artifact inserts a new
+        // `running` placeholder row that the worker then converts/completes,
+        // leaving two completed rows behind for what should be a single
+        // logical scan. The placeholder also lands in the trigger response
+        // with a fresh UUID, breaking the contract that identical bytes on
+        // the same artifact return the same scan_id.
+        //
+        // The check is per-scanner so a partially-completed scan set (e.g.
+        // trivy completed, grype still running from a prior trigger) still
+        // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            let row = self
+            let existing = self
                 .scan_result_service
-                .create_scan_result_with_checksum(
+                .find_existing_scan_for_artifact(
                     artifact_id,
-                    artifact.repository_id,
+                    &artifact.checksum_sha256,
                     scanner.scan_type(),
-                    Some(&artifact.checksum_sha256),
+                    DEDUP_TTL_DAYS,
                 )
-                .await?;
-            prepared.push((scanner.scan_type().to_string(), row.id));
+                .await
+                .ok()
+                .flatten();
+
+            match decide_short_circuit_from_existing(existing.as_ref()) {
+                ShortCircuitDecision::UseExisting(id) => {
+                    prepared.push((scanner.scan_type().to_string(), id));
+                }
+                ShortCircuitDecision::InsertPlaceholder => {
+                    let row = self
+                        .scan_result_service
+                        .create_scan_result_with_checksum(
+                            artifact_id,
+                            artifact.repository_id,
+                            scanner.scan_type(),
+                            Some(&artifact.checksum_sha256),
+                        )
+                        .await?;
+                    prepared.push((scanner.scan_type().to_string(), row.id));
+                }
+            }
         }
 
         Ok(prepared)
@@ -2394,7 +2574,6 @@ impl ScannerService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let checksum = &artifact.checksum_sha256;
-        const DEDUP_TTL_DAYS: i32 = 30;
         let mut prepared = prepared.unwrap_or_default();
 
         for scanner in &self.scanners {
@@ -2447,46 +2626,107 @@ impl ScannerService {
                 .find_reusable_scan(checksum, scanner.scan_type(), DEDUP_TTL_DAYS)
                 .await
             {
-                // Skip if the source scan is for the same artifact (already scanned)
-                if !should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
-                    let copied = match prepared_action {
-                        PreparedScanAction::Reuse(target_id) => {
-                            self.scan_result_service
-                                .convert_to_reused(target_id, source_scan.id, artifact_id)
+                // #1373: when the matched source scan is for THIS artifact,
+                // a completed scan for these exact bytes already exists. We
+                // must not run a fresh scan or copy results into a new row;
+                // either action would leave the artifact with two completed
+                // rows for one scan_type (the failing release-gate
+                // assertion `Per-artifact scan list contains exactly one
+                // completed scan`).
+                //
+                // Two sub-cases:
+                //
+                // 1. `prepared_action` is `Reuse(target_id)` where
+                //    target_id == source_scan.id. This is the normal path
+                //    after the #1373 short-circuit in
+                //    prepare_artifact_scan: the trigger handler returned
+                //    the existing scan id and we have nothing to do.
+                //
+                // 2. `prepared_action` is `Reuse(target_id)` where
+                //    target_id != source_scan.id. The placeholder was
+                //    inserted before the existing scan completed (race
+                //    between prepare and execute, or between two
+                //    concurrent trigger calls). We must NOT leave the
+                //    placeholder stuck in `running`; instead convert it
+                //    to a reused row pointing at the source so the
+                //    stuck-scan janitor never has to clean it up and the
+                //    polling client sees a deterministic terminal state.
+                //
+                // 3. `prepared_action` is `InsertFresh` (auto-scan-on-
+                //    upload). No placeholder was inserted yet, so we just
+                //    skip to the next scanner — the existing row already
+                //    represents the scan for these bytes.
+                if should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
+                    match decide_same_artifact_action(&prepared_action, source_scan.id) {
+                        SameArtifactAction::NoOp => {}
+                        SameArtifactAction::ConvertOrphanPlaceholder {
+                            target_id,
+                            source_id,
+                        } => {
+                            // Race window: convert the orphan placeholder
+                            // into a reused-row pointing at the existing
+                            // completed scan. Best-effort: if the convert
+                            // fails the stuck-scan janitor will reap the
+                            // running row eventually.
+                            if let Err(e) = self
+                                .scan_result_service
+                                .convert_to_reused(target_id, source_id, artifact_id)
                                 .await
+                            {
+                                warn!(
+                                    "Failed to convert orphan placeholder {} to reused row pointing at {}: {}",
+                                    target_id, source_id, e
+                                );
+                            }
                         }
-                        PreparedScanAction::InsertFresh => {
-                            self.scan_result_service
-                                .copy_scan_results(
-                                    source_scan.id,
-                                    artifact_id,
-                                    artifact.repository_id,
-                                    scanner.scan_type(),
-                                    checksum,
-                                )
-                                .await
-                        }
-                    };
-                    match copied {
-                        Ok(reused) => {
-                            info!(
-                                "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
+                    }
+                    info!(
+                        "Skipping fresh scan for artifact {}: existing completed scan {} matches (scanner={}, hash={}..)",
+                        artifact_id,
+                        source_scan.id,
+                        scanner.name(),
+                        checksum_log_prefix(checksum),
+                    );
+                    continue;
+                }
+
+                let copied = match prepared_action {
+                    PreparedScanAction::Reuse(target_id) => {
+                        self.scan_result_service
+                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .await
+                    }
+                    PreparedScanAction::InsertFresh => {
+                        self.scan_result_service
+                            .copy_scan_results(
                                 source_scan.id,
                                 artifact_id,
-                                scanner.name(),
-                                checksum_log_prefix(checksum),
-                            );
-                            // Update quarantine status based on copied findings
-                            self.update_quarantine_status(artifact_id, reused.findings_count)
-                                .await?;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to copy scan results from {}: {}. Running fresh scan.",
-                                source_scan.id, e
-                            );
-                        }
+                                artifact.repository_id,
+                                scanner.scan_type(),
+                                checksum,
+                            )
+                            .await
+                    }
+                };
+                match copied {
+                    Ok(reused) => {
+                        info!(
+                            "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
+                            source_scan.id,
+                            artifact_id,
+                            scanner.name(),
+                            checksum_log_prefix(checksum),
+                        );
+                        // Update quarantine status based on copied findings
+                        self.update_quarantine_status(artifact_id, reused.findings_count)
+                            .await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to copy scan results from {}: {}. Running fresh scan.",
+                            source_scan.id, e
+                        );
                     }
                 }
             }
@@ -8462,6 +8702,282 @@ mod tests {
         let _ids = extract_scan_result_ids(&prepared);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].0, "trivy");
+    }
+
+    #[test]
+    fn test_dedup_ttl_days_is_30() {
+        // Pinned because both `find_reusable_scan` (cross-artifact dedup) and
+        // `find_existing_scan_for_artifact` (same-artifact short-circuit added
+        // for #1373) read this constant. A future tweak to the window should
+        // be a deliberate change with a CHANGELOG entry, not a silent edit.
+        assert_eq!(super::DEDUP_TTL_DAYS, 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1373 short-circuit predicates: is_within_dedup_ttl,
+    // decide_short_circuit_from_existing, decide_same_artifact_action.
+    //
+    // These are the pure decision helpers underpinning the same-artifact
+    // dedup short-circuit. The DB-coupled wrappers
+    // (`find_existing_scan_for_artifact`, `prepare_artifact_scan`,
+    // `scan_artifact_inner`) are exercised by the integration suite in
+    // `backend/tests/scan_dedup_short_circuit_tests.rs`; this section
+    // pins the logic that does not need a database.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal ScanResult for predicate tests. Only fields the
+    /// decision functions inspect are meaningful; everything else is
+    /// zero/default.
+    fn fake_scan_result(id: Uuid) -> ScanResult {
+        ScanResult {
+            id,
+            artifact_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            scan_type: "trivy".to_string(),
+            status: "completed".to_string(),
+            findings_count: 0,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            info_count: 0,
+            scanner_version: None,
+            error_message: None,
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            created_at: Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
+        }
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_just_completed_is_within() {
+        // A scan completed "now" must be inside any positive TTL window.
+        let now = Utc::now();
+        assert!(is_within_dedup_ttl(Some(now), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_one_day_old_is_within_30_day_window() {
+        let now = Utc::now();
+        let yesterday = now - chrono::Duration::days(1);
+        assert!(is_within_dedup_ttl(Some(yesterday), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_29_days_old_is_within_30_day_window() {
+        // Edge case: just inside the window.
+        let now = Utc::now();
+        let then = now - chrono::Duration::days(29);
+        assert!(is_within_dedup_ttl(Some(then), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_exactly_at_cutoff_is_within() {
+        // Boundary: `completed_at == now - ttl_days` should be treated
+        // as still inside the window (inclusive lower bound). Documents
+        // the deliberate one-tick-more-permissive bias vs the SQL `>`
+        // form.
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(30);
+        assert!(is_within_dedup_ttl(Some(cutoff), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_31_days_old_is_outside_30_day_window() {
+        let now = Utc::now();
+        let then = now - chrono::Duration::days(31);
+        assert!(!is_within_dedup_ttl(Some(then), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_far_past_is_outside() {
+        // A year old: not eligible for dedup at the production 30-day TTL.
+        let now = Utc::now();
+        let then = now - chrono::Duration::days(365);
+        assert!(!is_within_dedup_ttl(Some(then), now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_none_completed_at_is_outside() {
+        // `completed_at` is `None` for `running` / `failed` scans. Those
+        // are never eligible for the short-circuit.
+        let now = Utc::now();
+        assert!(!is_within_dedup_ttl(None, now, 30));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_zero_days_disables_window() {
+        // A misconfigured TTL of 0 should collapse the window to zero;
+        // nothing is considered fresh. Prevents accidental "scan once,
+        // dedup forever" if the constant is ever set to 0 by mistake.
+        let now = Utc::now();
+        assert!(!is_within_dedup_ttl(Some(now), now, 0));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_negative_days_disables_window() {
+        // Defensive: a negative TTL is nonsense, never match.
+        let now = Utc::now();
+        assert!(!is_within_dedup_ttl(Some(now), now, -1));
+    }
+
+    #[test]
+    fn test_is_within_dedup_ttl_future_completed_at_is_within() {
+        // Clock skew: a `completed_at` slightly in the future (e.g. from
+        // a DB replica with drift) should still count as within the
+        // window. Re-scanning on clock skew would be a worse outcome
+        // than reusing a too-fresh-looking row.
+        let now = Utc::now();
+        let future = now + chrono::Duration::minutes(5);
+        assert!(is_within_dedup_ttl(Some(future), now, 30));
+    }
+
+    #[test]
+    fn test_decide_short_circuit_from_existing_some_returns_use_existing() {
+        let id = Uuid::new_v4();
+        let scan = fake_scan_result(id);
+        let decision = decide_short_circuit_from_existing(Some(&scan));
+        assert_eq!(decision, ShortCircuitDecision::UseExisting(id));
+    }
+
+    #[test]
+    fn test_decide_short_circuit_from_existing_none_returns_insert_placeholder() {
+        let decision = decide_short_circuit_from_existing(None);
+        assert_eq!(decision, ShortCircuitDecision::InsertPlaceholder);
+    }
+
+    #[test]
+    fn test_decide_short_circuit_uses_scan_id_not_artifact_id() {
+        // Regression: the decision must surface the SCAN id, not the
+        // artifact id. Pre-#1373 the trigger response leaked a fresh
+        // placeholder UUID; the fix is meaningless if we ever return
+        // the wrong field here.
+        let scan_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let mut scan = fake_scan_result(scan_id);
+        scan.artifact_id = artifact_id;
+        assert_ne!(scan_id, artifact_id);
+        let decision = decide_short_circuit_from_existing(Some(&scan));
+        assert_eq!(decision, ShortCircuitDecision::UseExisting(scan_id));
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_insert_fresh_is_noop() {
+        // Auto-scan-on-upload path: no placeholder was committed, so we
+        // simply skip. The existing completed row already represents
+        // the scan.
+        let source_id = Uuid::new_v4();
+        let action = decide_same_artifact_action(&PreparedScanAction::InsertFresh, source_id);
+        assert_eq!(action, SameArtifactAction::NoOp);
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_reuse_matching_id_is_noop() {
+        // Happy path after the prepare-step short-circuit: the
+        // placeholder id IS the existing scan id, so nothing to do.
+        let id = Uuid::new_v4();
+        let action = decide_same_artifact_action(&PreparedScanAction::Reuse(id), id);
+        assert_eq!(action, SameArtifactAction::NoOp);
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_reuse_different_id_converts_orphan() {
+        // Race window: prepare-step inserted a placeholder before the
+        // existing scan landed. We must convert the orphan into a
+        // reused-row pointing at the source so the stuck-scan janitor
+        // never has to reap it.
+        let target_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        assert_ne!(target_id, source_id);
+        let action = decide_same_artifact_action(&PreparedScanAction::Reuse(target_id), source_id);
+        assert_eq!(
+            action,
+            SameArtifactAction::ConvertOrphanPlaceholder {
+                target_id,
+                source_id,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_carries_correct_ids() {
+        // Pin the field ordering: `target_id` is the placeholder we are
+        // converting; `source_id` is the existing completed scan we are
+        // pointing at. Reversing these would corrupt the scan history.
+        let target_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let action = decide_same_artifact_action(&PreparedScanAction::Reuse(target_id), source_id);
+        match action {
+            SameArtifactAction::ConvertOrphanPlaceholder {
+                target_id: t,
+                source_id: s,
+            } => {
+                assert_eq!(t, target_id);
+                assert_eq!(s, source_id);
+            }
+            _ => panic!("expected ConvertOrphanPlaceholder"),
+        }
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_nil_uuid_target_still_converts() {
+        // Defensive: even a nil-UUID placeholder (should never happen
+        // in production, but might appear in a test fixture or after a
+        // bad migration) must still be flagged for conversion if it
+        // differs from the source id. We must not silently leak the
+        // nil id.
+        let source_id = Uuid::new_v4();
+        let action =
+            decide_same_artifact_action(&PreparedScanAction::Reuse(Uuid::nil()), source_id);
+        assert_eq!(
+            action,
+            SameArtifactAction::ConvertOrphanPlaceholder {
+                target_id: Uuid::nil(),
+                source_id,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decide_same_artifact_action_both_nil_is_noop() {
+        // Pathological: target and source both nil. Treated as "same
+        // id" -> NoOp. Prevents an attempted convert_to_reused call
+        // with two nil UUIDs.
+        let action =
+            decide_same_artifact_action(&PreparedScanAction::Reuse(Uuid::nil()), Uuid::nil());
+        assert_eq!(action, SameArtifactAction::NoOp);
+    }
+
+    #[test]
+    fn test_short_circuit_decision_distinct_ids_are_distinct() {
+        // Sanity: two different scans short-circuit to different
+        // decisions. Catches an accidental `_` -> always-same-id
+        // pattern in a future refactor.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let s1 = fake_scan_result(id1);
+        let s2 = fake_scan_result(id2);
+        assert_ne!(
+            decide_short_circuit_from_existing(Some(&s1)),
+            decide_short_circuit_from_existing(Some(&s2)),
+        );
+    }
+
+    #[test]
+    fn test_same_artifact_action_debug_format_is_useful() {
+        // The enum is logged on the warn path; make sure Debug isn't
+        // accidentally `{ .. }`-elided.
+        let target_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let action = SameArtifactAction::ConvertOrphanPlaceholder {
+            target_id,
+            source_id,
+        };
+        let s = format!("{:?}", action);
+        assert!(s.contains(&target_id.to_string()) || s.contains("target_id"));
+        assert!(s.contains(&source_id.to_string()) || s.contains("source_id"));
     }
 
     #[test]
