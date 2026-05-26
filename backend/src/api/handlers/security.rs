@@ -350,17 +350,40 @@ pub struct CreatePolicyRequest {
     pub require_signature: bool,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Partial-update payload for `PUT /security/policies/{id}`.
+///
+/// Every field is `Option<T>` so clients can send any subset of mutable
+/// columns; omitted fields leave the existing row value untouched. The
+/// previous shape required all of `name`, `max_severity`, `block_unscanned`,
+/// `block_on_fail`, `is_enabled` on every call. That was incompatible with
+/// the release-gate `scan-policy-crud` test (and external callers) which
+/// PATCH a subset like `{max_severity, is_enabled}`; under the strict shape
+/// the request was rejected as a 422 and the boolean toggle silently never
+/// took effect on a follow-up GET. See #1374.
+///
+/// For `min_staging_hours` / `max_artifact_age_days` the field is the inner
+/// nullable `i32`; "not provided" leaves the column untouched. Explicit
+/// `null` to clear those columns is not currently supported; the release
+/// gate only mutates the bool/enum fields, so the narrower semantics are
+/// sufficient and we avoid an ambiguous JSON contract.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdatePolicyRequest {
-    pub name: String,
-    pub max_severity: String,
-    pub block_unscanned: bool,
-    pub block_on_fail: bool,
-    pub is_enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub max_severity: Option<String>,
+    #[serde(default)]
+    pub block_unscanned: Option<bool>,
+    #[serde(default)]
+    pub block_on_fail: Option<bool>,
+    #[serde(default)]
+    pub is_enabled: Option<bool>,
+    #[serde(default)]
     pub min_staging_hours: Option<i32>,
+    #[serde(default)]
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
-    pub require_signature: bool,
+    pub require_signature: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -857,11 +880,13 @@ async fn update_policy(
     Json(body): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
     let svc = PolicyService::new(state.db.clone());
+    // PUT is partial-update friendly: any field client omits is left at its
+    // current DB value via COALESCE in the service layer. See #1374.
     let p = svc
         .update_policy(
             id,
-            &body.name,
-            &body.max_severity,
+            body.name.as_deref(),
+            body.max_severity.as_deref(),
             body.block_unscanned,
             body.block_on_fail,
             body.is_enabled,
@@ -1670,9 +1695,11 @@ mod tests {
             "is_enabled": false,
         });
         let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.name, "updated-policy");
-        assert!(!req.is_enabled);
-        assert!(!req.require_signature);
+        assert_eq!(req.name.as_deref(), Some("updated-policy"));
+        assert_eq!(req.is_enabled, Some(false));
+        // require_signature was not in the payload; we expect None (== "leave alone"),
+        // never a synthesised `false` that would silently flip the persisted column.
+        assert_eq!(req.require_signature, None);
     }
 
     #[test]
@@ -1688,14 +1715,104 @@ mod tests {
             "require_signature": true,
         });
         let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.name, "full-update");
-        assert_eq!(req.max_severity, "low");
-        assert!(req.block_unscanned);
-        assert!(req.block_on_fail);
-        assert!(req.is_enabled);
+        assert_eq!(req.name.as_deref(), Some("full-update"));
+        assert_eq!(req.max_severity.as_deref(), Some("low"));
+        assert_eq!(req.block_unscanned, Some(true));
+        assert_eq!(req.block_on_fail, Some(true));
+        assert_eq!(req.is_enabled, Some(true));
         assert_eq!(req.min_staging_hours, Some(48));
         assert_eq!(req.max_artifact_age_days, Some(365));
-        assert!(req.require_signature);
+        assert_eq!(req.require_signature, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1374 regression: PUT must accept a partial body and surface every
+    // field that was sent. Previously the strict-shape DTO rejected
+    // `{max_severity, is_enabled}` as a 422 and the release-gate
+    // `scan-policy-crud` flow saw `is_enabled` come back unchanged on a
+    // follow-up GET (the observable "empty string" in the bash assertion).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_policy_request_partial_max_severity_and_is_enabled() {
+        // The exact shape the release-gate test sends. Without the partial-
+        // update fix this would fail to deserialise (missing `name`, etc.)
+        // and bubble up as a 422 from the handler.
+        let json = serde_json::json!({
+            "max_severity": "critical",
+            "is_enabled": false,
+        });
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+
+        // Both fields are observed -- the bug used to drop `is_enabled`.
+        assert_eq!(req.max_severity.as_deref(), Some("critical"));
+        assert_eq!(req.is_enabled, Some(false));
+
+        // Untouched fields stay None so the service-layer COALESCE keeps the
+        // existing DB value; they must NOT default to `false` / empty string.
+        assert!(req.name.is_none());
+        assert!(req.block_unscanned.is_none());
+        assert!(req.block_on_fail.is_none());
+        assert!(req.min_staging_hours.is_none());
+        assert!(req.max_artifact_age_days.is_none());
+        assert!(req.require_signature.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_request_empty_body_is_a_noop() {
+        // An empty body must parse cleanly so a no-op PUT does not 422.
+        // The COALESCE in `PolicyService::update_policy` then leaves the row
+        // unchanged; this is the regression boundary for #1374.
+        let json = serde_json::json!({});
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert!(req.name.is_none());
+        assert!(req.max_severity.is_none());
+        assert!(req.is_enabled.is_none());
+        assert!(req.block_unscanned.is_none());
+        assert!(req.block_on_fail.is_none());
+        assert!(req.require_signature.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_request_is_enabled_only() {
+        // The release-gate also exercises a single-field toggle of
+        // `is_enabled`. Make sure that path round-trips a `false` value
+        // (the bug was that bash saw an empty string here).
+        let json = serde_json::json!({ "is_enabled": false });
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.is_enabled, Some(false));
+        // A bare `is_enabled: false` PATCH must not synthesise other fields.
+        assert!(req.name.is_none());
+        assert!(req.max_severity.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_response_has_concrete_bool_for_is_enabled() {
+        // Closes the loop with the response contract: PolicyResponse must
+        // always emit `is_enabled` as a JSON boolean, never absent or null,
+        // so jq queries in the release gate cannot observe an empty string.
+        let p = PolicyResponse {
+            id: Uuid::nil(),
+            name: "p".to_string(),
+            repository_id: None,
+            max_severity: "critical".to_string(),
+            block_unscanned: true,
+            block_on_fail: true,
+            is_enabled: false,
+            min_staging_hours: None,
+            max_artifact_age_days: None,
+            require_signature: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(
+            json["is_enabled"].is_boolean(),
+            "is_enabled must be a JSON bool, got {}",
+            json["is_enabled"]
+        );
+        assert_eq!(json["is_enabled"], false);
+        assert_eq!(json["max_severity"], "critical");
     }
 
     #[test]

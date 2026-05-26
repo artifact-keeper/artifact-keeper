@@ -7422,4 +7422,151 @@ mod tests {
 
         fx.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // Virtual-repo /members + /cache-ttl sub-router registration (#1366)
+    // -----------------------------------------------------------------------
+    //
+    // Issue #1366 surfaced as 22 release-gate failures all reporting HTTP 404
+    // on `/api/v1/repositories/{key}/members` (and the sibling /cache-ttl
+    // route) for v1.2.0-rc.2. Investigation against the same commit
+    // (f81136eb) showed the routes are reachable end-to-end on a freshly
+    // built backend, so the source itself is not regressed -- the production
+    // failure was rooted elsewhere (likely a stale image / deploy artifact).
+    //
+    // These tests defend the router shape itself so a future refactor that
+    // accidentally drops one of the routes (the hypothesis the issue raised)
+    // would fail at `cargo test --workspace --lib` rather than slipping
+    // through to release-gate. The pattern matches the existing source-level
+    // regression for `/lxc` in `routes.rs::tests` (#1272): a runtime test
+    // would need a full DB + auth fixture which we already have elsewhere,
+    // but those tests cannot catch a route that was simply not registered
+    // (a missing route never reaches the handler under test). Source-level
+    // pins catch exactly that class of bug.
+    //
+    // Each assertion is built from `format!`d substrings so the test source
+    // itself does not satisfy the search if `include_str!` is replaced
+    // with a less specific lookup in a future refactor.
+    mod virtual_member_router_registration {
+        const SRC: &str = include_str!("repositories.rs");
+
+        fn router_fn_body() -> &'static str {
+            // Slice the `pub fn router()` body so route assertions do not
+            // accidentally match a route literal that appears inside a
+            // doc-comment or another function. The body starts at the
+            // signature and ends at the next top-level `pub` item.
+            let marker = "pub fn router() -> Router<SharedState> {";
+            let start = SRC
+                .find(marker)
+                .expect("repositories::router() definition must exist");
+            let after = &SRC[start..];
+            let end = after[1..]
+                .find("\npub ")
+                .map(|i| i + 1)
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+
+        #[test]
+        fn router_registers_members_get_post_put() {
+            // The combined route must include all three methods on a single
+            // `/:key/members` literal. Splitting them across multiple
+            // `.route()` calls is also valid axum, but the current shape is
+            // a single call -- if you change that, update this test in the
+            // same PR so the intent stays explicit.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            for method_handler in [
+                ("list_virtual_members", "get"),
+                ("add_virtual_member", "post"),
+                ("update_virtual_members", "put"),
+            ] {
+                let needle = format!("{}({})", method_handler.1, method_handler.0);
+                assert!(
+                    body.contains(&needle),
+                    "router() must bind {} via `{}` (regression of #1366)",
+                    method_handler.0,
+                    needle
+                );
+            }
+        }
+
+        #[test]
+        fn router_registers_members_delete_by_member_key() {
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}/:member_key\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the per-member delete route at {} (regression of #1366)",
+                path
+            );
+            let delete_handler = format!("delete({})", "remove_virtual_member");
+            assert!(
+                body.contains(&delete_handler),
+                "router() must bind remove_virtual_member via `{}` (regression of #1366)",
+                delete_handler
+            );
+        }
+
+        #[test]
+        fn router_registers_cache_ttl_put_and_get() {
+            // The release-gate failure for #1366 also flagged
+            // `PUT /repositories/{key}/cache-ttl` returning 404. cache-ttl is
+            // a sibling sub-resource of /members, so a regression that drops
+            // the virtual-member routes is likely to drop this one too. Pin
+            // both routes together so a single source-level read of
+            // `router()` covers the whole sub-router shape.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "cache-ttl");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            let put_handler = format!("put({})", "set_cache_ttl");
+            let get_handler = format!("get({})", "get_cache_ttl");
+            assert!(
+                body.contains(&put_handler),
+                "router() must bind set_cache_ttl via `{}` (regression of #1366)",
+                put_handler
+            );
+            assert!(
+                body.contains(&get_handler),
+                "router() must bind get_cache_ttl via `{}` (regression of #1366)",
+                get_handler
+            );
+        }
+
+        #[test]
+        fn router_fn_marker_resolves_so_the_above_tests_are_not_vacuous() {
+            // Belt-and-suspenders: if a future refactor renames `router()`
+            // or changes its signature, `router_fn_body()` would panic and
+            // the three tests above would fail noisily rather than passing
+            // a `false.contains(...)` against an empty slice.
+            let body = router_fn_body();
+            assert!(
+                body.starts_with("pub fn router() -> Router<SharedState> {"),
+                "router_fn_body() did not anchor on the expected signature; \
+                 the route assertions above may be vacuously true. Refactor \
+                 hint: update the `marker` literal in router_fn_body() to \
+                 match the new signature."
+            );
+            // Sanity check that the body is non-trivial. A bare stub
+            // implementation (e.g. `Router::new()` only) would silently
+            // make every contains() assertion above fail with a
+            // not-found-substring message, which is the right outcome, but
+            // we also assert here so the failure mode is obvious.
+            assert!(
+                body.len() > 200,
+                "router() body is suspiciously short ({} bytes); the route \
+                 assertions above may be testing an empty router",
+                body.len()
+            );
+        }
+    }
 }
