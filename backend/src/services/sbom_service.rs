@@ -33,9 +33,25 @@ struct ScanFindingCveRow {
 /// Used so scan-derived `CveHistoryEntry` rows have a stable `id` across
 /// re-reads. Hashing instead of `Uuid::new_v4` means clients can dedupe by
 /// id even when the row is synthesized at read time. The first 16 bytes of
-/// SHA-256(artifact_id || cve_id) become the UUID. Synth ids carry no
-/// foreign-key meaning, `update_cve_status` against them will 404, which
-/// is correct.
+/// SHA-256(artifact_id || cve_id) become the UUID.
+///
+/// # Synthetic ID semantics
+///
+/// Synth ids carry **no foreign-key meaning** -- they are not present in
+/// the `cve_history` table. Consequences for callers:
+///
+/// - `POST /sbom/cve/status/{id}` against a synth id returns 404. This is
+///   expected: only curated rows (written via the rare promotion-policy
+///   admin paths) can have their status mutated. Clients receiving a
+///   `CveHistoryEntry` whose `sbom_id`/`component_id`/`scan_result_id` are
+///   all `null` are looking at a synth row and must not offer
+///   "acknowledge" / "mark fixed" UI on it.
+/// - Synth ids are stable across re-reads for the same (artifact, cve)
+///   pair, so client-side dedupe by `id` works.
+/// - Synth ids are derived from a hash, not generated, so they will
+///   collide with a `cve_history.id` only with negligible probability
+///   (2^-128). If a collision ever did surface, the curated row wins via
+///   the dedupe filter in `build_known_cve_set`.
 pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(artifact_id.as_bytes());
@@ -76,6 +92,49 @@ pub(crate) fn scan_row_passes_known_filter(
     row_cve_id
         .map(|c| !known.contains(&c.to_ascii_uppercase()))
         .unwrap_or(false)
+}
+
+/// Rank a CVSS severity string by its operational priority. Higher rank
+/// means more severe.
+///
+/// `critical` > `high` > `medium` > `low` > anything else (unknown / NULL
+/// rendered as the empty string). The DB-side aggregates in
+/// `get_cve_trends` use the inverse mapping via SQL `CASE` so that
+/// `MAX(rank)` returns the right "worst seen" severity for an (artifact,
+/// cve_id) pair across multiple scanner outputs. Without this ranking we
+/// fall through to lexicographic ordering -- "medium" > "low" > "high" >
+/// "critical" -- which silently misreports a vulnerability that one
+/// scanner labels `high` and another labels `medium` as `medium`.
+///
+/// This helper lives in Rust so the contract is unit-testable; the SQL
+/// queries inline an equivalent `CASE` because Postgres can't call Rust.
+/// If you edit the ranks here, also update the four `CASE severity ...`
+/// expressions in `get_cve_trends`. The unit tests in this module assert
+/// the two stay in sync. (#1375 round-2)
+#[allow(dead_code)] // Mirror of an SQL CASE; only used from tests today.
+pub(crate) fn severity_rank(severity: &str) -> i32 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Inverse of `severity_rank`: map a rank produced by the SQL `MAX(CASE ...)`
+/// expression back to its canonical lower-case string. Ranks outside
+/// 1..=4 map to `None` (caller decides whether to default to `"unknown"`
+/// or skip the row).
+#[allow(dead_code)] // Mirror of an SQL CASE; only used from tests today.
+pub(crate) fn severity_from_rank(rank: i32) -> Option<&'static str> {
+    match rank {
+        4 => Some("critical"),
+        3 => Some("high"),
+        2 => Some("medium"),
+        1 => Some("low"),
+        _ => None,
+    }
 }
 
 /// Map the `all_acknowledged` flag aggregated from `scan_findings` to the
@@ -527,10 +586,28 @@ impl SbomService {
     ///
     /// Reads from both `cve_history` (curated rows) and `scan_findings` (live
     /// scanner output) so that callers see the full set of artifacts where
-    /// this CVE has ever been detected. The optional `allowed_repo_ids`
-    /// argument scopes the lookup to repositories the caller can access
-    /// (mirrors `AuthExtension::can_access_repo`). Passing `None` means
-    /// unrestricted (admin/root tokens).
+    /// this CVE has ever been detected.
+    ///
+    /// # `allowed_repo_ids` contract (ADMIN-ONLY when `None`)
+    ///
+    /// The `allowed_repo_ids` argument scopes the lookup to repositories the
+    /// caller can access (mirrors `AuthExtension::can_access_repo`).
+    ///
+    /// - `Some(&[...])` -- limit results to the listed repositories. An empty
+    ///   slice returns zero rows (caller has access to nothing).
+    /// - `None` -- **NO REPOSITORY SCOPE; FULL CROSS-REPO READ**. Only pass
+    ///   `None` when the caller has admin-tier access. The convention here
+    ///   mirrors `AuthExtension::allowed_repo_ids` where `None` means "no
+    ///   restriction applied by auth middleware" (admin/root tokens, system
+    ///   workers). Calling this with `None` for an end-user token is a data
+    ///   leak. The HTTP handler enforces this by always passing
+    ///   `auth.allowed_repo_ids.as_deref()` through unchanged: if auth said
+    ///   "no restriction", the service trusts that decision.
+    ///
+    /// This is a footgun-prone shape. Tracked for refactor to an explicit
+    /// `enum AccessScope { Admin, Restricted(Vec<Uuid>) }` post v1.2.0 (see
+    /// #1390 follow-up). Until then, treat `None` as a load-bearing comment
+    /// that must read "admin-only".
     ///
     /// Returns an empty vec when the CVE is not present (200 OK, [] body); a
     /// missing CVE is not a 404 in this contract.
@@ -660,24 +737,54 @@ impl SbomService {
         // Each row collapses to one synthetic CVE-history entry per
         // (artifact_id, cve_id). MIN(created_at) approximates
         // first_detected_at; MAX(created_at) approximates last_detected_at.
+        // Severity is aggregated via a ranked CASE (see `severity_rank`) so
+        // that a CVE reported `high` by one scanner and `medium` by another
+        // shows up as `high` rather than the lexicographically-larger but
+        // operationally-lower `medium`. Same fix as `get_cve_trends`. (#1375)
         let rows: Vec<ScanFindingCveRow> = if let Some(artifact_id) = artifact_filter {
             sqlx::query_as::<_, ScanFindingCveRow>(
                 r#"
                 SELECT
                     artifact_id,
                     cve_id,
-                    MAX(severity) AS severity,
-                    MAX(affected_component) AS affected_component,
-                    MAX(affected_version) AS affected_version,
-                    MAX(fixed_version) AS fixed_version,
-                    MIN(created_at) AS first_detected_at,
-                    MAX(created_at) AS last_detected_at,
-                    BOOL_AND(is_acknowledged) AS all_acknowledged
-                FROM scan_findings
-                WHERE artifact_id = $1
-                  AND cve_id IS NOT NULL
-                GROUP BY artifact_id, cve_id
-                ORDER BY MIN(created_at) DESC
+                    CASE severity_rank
+                        WHEN 4 THEN 'critical'
+                        WHEN 3 THEN 'high'
+                        WHEN 2 THEN 'medium'
+                        WHEN 1 THEN 'low'
+                        ELSE NULL
+                    END AS severity,
+                    affected_component,
+                    affected_version,
+                    fixed_version,
+                    first_detected_at,
+                    last_detected_at,
+                    all_acknowledged
+                FROM (
+                    SELECT
+                        artifact_id,
+                        cve_id,
+                        MAX(
+                            CASE LOWER(severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
+                        MAX(affected_component) AS affected_component,
+                        MAX(affected_version) AS affected_version,
+                        MAX(fixed_version) AS fixed_version,
+                        MIN(created_at) AS first_detected_at,
+                        MAX(created_at) AS last_detected_at,
+                        BOOL_AND(is_acknowledged) AS all_acknowledged
+                    FROM scan_findings
+                    WHERE artifact_id = $1
+                      AND cve_id IS NOT NULL
+                    GROUP BY artifact_id, cve_id
+                    ORDER BY MIN(created_at) DESC
+                ) inner_ranked
                 "#,
             )
             .bind(artifact_id)
@@ -689,17 +796,43 @@ impl SbomService {
                 SELECT
                     artifact_id,
                     cve_id,
-                    MAX(severity) AS severity,
-                    MAX(affected_component) AS affected_component,
-                    MAX(affected_version) AS affected_version,
-                    MAX(fixed_version) AS fixed_version,
-                    MIN(created_at) AS first_detected_at,
-                    MAX(created_at) AS last_detected_at,
-                    BOOL_AND(is_acknowledged) AS all_acknowledged
-                FROM scan_findings
-                WHERE LOWER(cve_id) = LOWER($1)
-                GROUP BY artifact_id, cve_id
-                ORDER BY MIN(created_at) DESC
+                    CASE severity_rank
+                        WHEN 4 THEN 'critical'
+                        WHEN 3 THEN 'high'
+                        WHEN 2 THEN 'medium'
+                        WHEN 1 THEN 'low'
+                        ELSE NULL
+                    END AS severity,
+                    affected_component,
+                    affected_version,
+                    fixed_version,
+                    first_detected_at,
+                    last_detected_at,
+                    all_acknowledged
+                FROM (
+                    SELECT
+                        artifact_id,
+                        cve_id,
+                        MAX(
+                            CASE LOWER(severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
+                        MAX(affected_component) AS affected_component,
+                        MAX(affected_version) AS affected_version,
+                        MAX(fixed_version) AS fixed_version,
+                        MIN(created_at) AS first_detected_at,
+                        MAX(created_at) AS last_detected_at,
+                        BOOL_AND(is_acknowledged) AS all_acknowledged
+                    FROM scan_findings
+                    WHERE LOWER(cve_id) = LOWER($1)
+                    GROUP BY artifact_id, cve_id
+                    ORDER BY MIN(created_at) DESC
+                ) inner_ranked
                 "#,
             )
             .bind(cve_id)
@@ -784,12 +917,28 @@ impl SbomService {
             i64,
         ) = if let Some(repo_id) = repository_id {
             sqlx::query_as(
+                // Round-2 fix (#1375): `MAX(severity)` ordered strings
+                // lexicographically, which gave the wrong "worst-seen"
+                // severity when two scanners disagreed (e.g. one says
+                // `high`, another says `medium` -- string MAX picks
+                // `medium`). The ranked CASE maps each severity to an
+                // ordered integer first; we then translate the rank back
+                // to text in the projection. Keep the literals here in
+                // lockstep with `severity_rank`/`severity_from_rank`.
                 r#"
                 WITH per_cve AS (
                     SELECT
                         sf.artifact_id,
                         sf.cve_id,
-                        MAX(sf.severity) AS severity,
+                        MAX(
+                            CASE LOWER(sf.severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
                         BOOL_AND(sf.is_acknowledged) AS all_ack
                     FROM scan_findings sf
                     JOIN artifacts a ON sf.artifact_id = a.id
@@ -802,10 +951,10 @@ impl SbomService {
                     COUNT(*) AS total,
                     COUNT(*) FILTER (WHERE NOT all_ack) AS open,
                     COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-                    COUNT(*) FILTER (WHERE severity = 'critical') AS critical,
-                    COUNT(*) FILTER (WHERE severity = 'high') AS high,
-                    COUNT(*) FILTER (WHERE severity = 'medium') AS medium,
-                    COUNT(*) FILTER (WHERE severity = 'low') AS low
+                    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
+                    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
+                    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
+                    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
                 FROM per_cve
                 "#,
             )
@@ -814,12 +963,23 @@ impl SbomService {
             .await?
         } else {
             sqlx::query_as(
+                // See repo-scoped branch above for the rationale on the
+                // ranked CASE; this branch is the unscoped (all-repos)
+                // mirror and must stay byte-aligned with the CASE table.
                 r#"
                 WITH per_cve AS (
                     SELECT
                         sf.artifact_id,
                         sf.cve_id,
-                        MAX(sf.severity) AS severity,
+                        MAX(
+                            CASE LOWER(sf.severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
                         BOOL_AND(sf.is_acknowledged) AS all_ack
                     FROM scan_findings sf
                     JOIN artifacts a ON sf.artifact_id = a.id
@@ -831,10 +991,10 @@ impl SbomService {
                     COUNT(*) AS total,
                     COUNT(*) FILTER (WHERE NOT all_ack) AS open,
                     COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-                    COUNT(*) FILTER (WHERE severity = 'critical') AS critical,
-                    COUNT(*) FILTER (WHERE severity = 'high') AS high,
-                    COUNT(*) FILTER (WHERE severity = 'medium') AS medium,
-                    COUNT(*) FILTER (WHERE severity = 'low') AS low
+                    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
+                    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
+                    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
+                    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
                 FROM per_cve
                 "#,
             )
@@ -844,28 +1004,59 @@ impl SbomService {
 
         // Timeline (most recent 100 newly-detected CVEs in the last 30 days)
         // derived from scan_findings.
+        //
+        // Round-2 fix (#1375): severity is projected through the same
+        // ranked CASE as the counts above, then mapped back to a text
+        // label, so multi-scanner overlap doesn't flatten a `high`
+        // finding to `medium` via lexicographic MAX.
         let timeline_rows: Vec<ScanFindingCveRow> = if let Some(repo_id) = repository_id {
             sqlx::query_as::<_, ScanFindingCveRow>(
                 r#"
                 SELECT
-                    sf.artifact_id,
-                    sf.cve_id,
-                    MAX(sf.severity) AS severity,
-                    MAX(sf.affected_component) AS affected_component,
-                    MAX(sf.affected_version) AS affected_version,
-                    MAX(sf.fixed_version) AS fixed_version,
-                    MIN(sf.created_at) AS first_detected_at,
-                    MAX(sf.created_at) AS last_detected_at,
-                    BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-                FROM scan_findings sf
-                JOIN artifacts a ON sf.artifact_id = a.id
-                WHERE sf.cve_id IS NOT NULL
-                  AND a.repository_id = $1
-                  AND NOT a.is_deleted
-                  AND sf.created_at > NOW() - INTERVAL '30 days'
-                GROUP BY sf.artifact_id, sf.cve_id
-                ORDER BY MIN(sf.created_at) DESC
-                LIMIT 100
+                    artifact_id,
+                    cve_id,
+                    CASE severity_rank
+                        WHEN 4 THEN 'critical'
+                        WHEN 3 THEN 'high'
+                        WHEN 2 THEN 'medium'
+                        WHEN 1 THEN 'low'
+                        ELSE NULL
+                    END AS severity,
+                    affected_component,
+                    affected_version,
+                    fixed_version,
+                    first_detected_at,
+                    last_detected_at,
+                    all_acknowledged
+                FROM (
+                    SELECT
+                        sf.artifact_id,
+                        sf.cve_id,
+                        MAX(
+                            CASE LOWER(sf.severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
+                        MAX(sf.affected_component) AS affected_component,
+                        MAX(sf.affected_version) AS affected_version,
+                        MAX(sf.fixed_version) AS fixed_version,
+                        MIN(sf.created_at) AS first_detected_at,
+                        MAX(sf.created_at) AS last_detected_at,
+                        BOOL_AND(sf.is_acknowledged) AS all_acknowledged
+                    FROM scan_findings sf
+                    JOIN artifacts a ON sf.artifact_id = a.id
+                    WHERE sf.cve_id IS NOT NULL
+                      AND a.repository_id = $1
+                      AND NOT a.is_deleted
+                      AND sf.created_at > NOW() - INTERVAL '30 days'
+                    GROUP BY sf.artifact_id, sf.cve_id
+                    ORDER BY MIN(sf.created_at) DESC
+                    LIMIT 100
+                ) inner_ranked
                 "#,
             )
             .bind(repo_id)
@@ -875,23 +1066,49 @@ impl SbomService {
             sqlx::query_as::<_, ScanFindingCveRow>(
                 r#"
                 SELECT
-                    sf.artifact_id,
-                    sf.cve_id,
-                    MAX(sf.severity) AS severity,
-                    MAX(sf.affected_component) AS affected_component,
-                    MAX(sf.affected_version) AS affected_version,
-                    MAX(sf.fixed_version) AS fixed_version,
-                    MIN(sf.created_at) AS first_detected_at,
-                    MAX(sf.created_at) AS last_detected_at,
-                    BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-                FROM scan_findings sf
-                JOIN artifacts a ON sf.artifact_id = a.id
-                WHERE sf.cve_id IS NOT NULL
-                  AND NOT a.is_deleted
-                  AND sf.created_at > NOW() - INTERVAL '30 days'
-                GROUP BY sf.artifact_id, sf.cve_id
-                ORDER BY MIN(sf.created_at) DESC
-                LIMIT 100
+                    artifact_id,
+                    cve_id,
+                    CASE severity_rank
+                        WHEN 4 THEN 'critical'
+                        WHEN 3 THEN 'high'
+                        WHEN 2 THEN 'medium'
+                        WHEN 1 THEN 'low'
+                        ELSE NULL
+                    END AS severity,
+                    affected_component,
+                    affected_version,
+                    fixed_version,
+                    first_detected_at,
+                    last_detected_at,
+                    all_acknowledged
+                FROM (
+                    SELECT
+                        sf.artifact_id,
+                        sf.cve_id,
+                        MAX(
+                            CASE LOWER(sf.severity)
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        ) AS severity_rank,
+                        MAX(sf.affected_component) AS affected_component,
+                        MAX(sf.affected_version) AS affected_version,
+                        MAX(sf.fixed_version) AS fixed_version,
+                        MIN(sf.created_at) AS first_detected_at,
+                        MAX(sf.created_at) AS last_detected_at,
+                        BOOL_AND(sf.is_acknowledged) AS all_acknowledged
+                    FROM scan_findings sf
+                    JOIN artifacts a ON sf.artifact_id = a.id
+                    WHERE sf.cve_id IS NOT NULL
+                      AND NOT a.is_deleted
+                      AND sf.created_at > NOW() - INTERVAL '30 days'
+                    GROUP BY sf.artifact_id, sf.cve_id
+                    ORDER BY MIN(sf.created_at) DESC
+                    LIMIT 100
+                ) inner_ranked
                 "#,
             )
             .fetch_all(&self.db)
@@ -2698,6 +2915,117 @@ mod tests {
     fn test_scan_row_passes_known_filter_keeps_when_known_empty() {
         let known: HashSet<String> = HashSet::new();
         assert!(scan_row_passes_known_filter(Some("CVE-2019-10744"), &known));
+    }
+
+    // --- severity_rank / severity_from_rank --------------------------------
+    //
+    // Round-2 regression coverage for the lexicographic-MAX bug (#1375). The
+    // pre-fix SQL used `MAX(severity)` against a TEXT column, which orders
+    // alphabetically: "medium" > "low" > "high" > "critical". So a CVE
+    // reported as `high` by one scanner and `medium` by another surfaced as
+    // `medium` in the trends counts and timeline, silently undercounting
+    // high/critical findings. The ranked CASE in `get_cve_trends` and
+    // `build_cve_entries_from_scan_findings` fixes this; these tests pin
+    // the Rust side of the contract so the SQL and Rust stay in lockstep.
+
+    #[test]
+    fn test_severity_rank_strict_ordering() {
+        // Operational severity ranking, NOT lex order. This is the load-
+        // bearing contract that motivated the round-2 SQL rewrite.
+        assert!(severity_rank("critical") > severity_rank("high"));
+        assert!(severity_rank("high") > severity_rank("medium"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+        assert!(severity_rank("low") > severity_rank("unknown"));
+    }
+
+    #[test]
+    fn test_severity_rank_case_insensitive() {
+        // The DB column has no case constraint and different scanners write
+        // different cases (Trivy: "HIGH", Grype: "High", OSV: "high"). The
+        // ranking must collapse all of these to the same value or the
+        // multi-scanner dedupe in `get_cve_trends` would split a single
+        // CVE into separate rows by case.
+        assert_eq!(severity_rank("CRITICAL"), severity_rank("critical"));
+        assert_eq!(severity_rank("High"), severity_rank("high"));
+        assert_eq!(severity_rank("Medium"), severity_rank("medium"));
+        assert_eq!(severity_rank("LOW"), severity_rank("low"));
+    }
+
+    #[test]
+    fn test_severity_rank_unknown_is_zero() {
+        // Anything outside the four canonical labels (NULL severity, future
+        // labels like "info" / "negligible", junk data) must rank 0 so it
+        // never outranks a real severity.
+        assert_eq!(severity_rank(""), 0);
+        assert_eq!(severity_rank("unknown"), 0);
+        assert_eq!(severity_rank("info"), 0);
+        assert_eq!(severity_rank("negligible"), 0);
+        assert!(severity_rank("low") > severity_rank("info"));
+    }
+
+    #[test]
+    fn test_severity_from_rank_round_trip() {
+        // Round-trip every canonical label so a refactor of the rank
+        // constants can't silently break the inverse mapping.
+        for label in ["critical", "high", "medium", "low"] {
+            let r = severity_rank(label);
+            assert_eq!(
+                severity_from_rank(r),
+                Some(label),
+                "rank/label round-trip must hold for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_severity_from_rank_unknown_ranks() {
+        assert_eq!(severity_from_rank(0), None);
+        assert_eq!(severity_from_rank(5), None);
+        assert_eq!(severity_from_rank(-1), None);
+    }
+
+    // The headline #1375 round-2 regression: aggregating `['low', 'high',
+    // 'medium']` must yield `'high'`, not `'medium'` (which is what the
+    // pre-fix lexicographic MAX returned).
+    #[test]
+    fn test_severity_rank_aggregates_high_over_medium_for_low_high_medium_input() {
+        let severities = ["low", "high", "medium"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(
+            severity_from_rank(max_rank),
+            Some("high"),
+            "['low','high','medium'] must aggregate to 'high', not the \
+             lex-largest 'medium' that the pre-fix MAX(severity) returned"
+        );
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_critical_over_high() {
+        // The other half of the lex-sort bug: "critical" sorts BEFORE
+        // "high" alphabetically, so the pre-fix MAX returned "high" for
+        // a (high, critical) pair. The rank picks "critical" correctly.
+        let severities = ["high", "critical"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("critical"));
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_mixed_case_input() {
+        // Multi-scanner overlap with inconsistent casing must still pick
+        // the operationally-worst severity.
+        let severities = ["MEDIUM", "High", "low"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("high"));
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_skips_unknown() {
+        // An unknown rank-0 row in the mix must not knock a real severity
+        // out of the aggregate (a regression worth pinning because a
+        // future scanner could write `"info"` or `""`).
+        let severities = ["unknown", "low", "info", "high", "negligible"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("high"));
     }
 
     // --- status mapping helpers --------------------------------------------

@@ -88,8 +88,19 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/components", get(get_sbom_components))
         .route("/:id/convert", post(convert_sbom))
         .route("/by-artifact/:artifact_id", get(get_sbom_by_artifact))
-        // CVE history
-        .route("/cve/history/:artifact_id", get(get_cve_history))
+        // CVE history. Three routes share the same backing handlers:
+        //   - `/cve/history/by-artifact/{uuid}`  -- typed UUID, REST-clean
+        //   - `/cve/history/by-cve/{cve_id}`     -- typed CVE-id, REST-clean
+        //   - `/cve/history/{id}`                -- legacy overload, kept for
+        //     compatibility with the in-flight v1.2.0 SDKs that already
+        //     consumed the overloaded shape. New clients should prefer the
+        //     two split routes. (#1375 round-2 decision: SPLIT + legacy.)
+        .route(
+            "/cve/history/by-artifact/:artifact_id",
+            get(get_cve_history_by_artifact),
+        )
+        .route("/cve/history/by-cve/:cve_id", get(get_cve_history_by_cve))
+        .route("/cve/history/:id", get(get_cve_history))
         .route("/cve/status/:id", post(update_cve_status))
         .route("/cve/trends", get(get_cve_trends))
         // License policies
@@ -706,12 +717,24 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
     true
 }
 
-/// Get CVE history by artifact UUID or CVE identifier.
+/// Get CVE history by artifact UUID or CVE identifier (legacy overload).
 ///
 /// The path param accepts either:
 ///   - A UUID `artifact_id` (legacy shape, returns all CVEs for one artifact)
 ///   - A CVE id like `CVE-2019-10744` (returns this CVE across every artifact
 ///     the caller can access)
+///
+/// # URL design decision (#1385 round-2)
+///
+/// Overloading a single `{id}` path parameter to mean two different lookups
+/// is a REST anti-pattern: the route's behavior changes based on a runtime
+/// content sniff. We considered splitting into two routes vs documenting the
+/// overload and chose **both**: the split routes
+/// `GET /cve/history/by-artifact/{uuid}` and `GET /cve/history/by-cve/{cve_id}`
+/// are the canonical shape for new clients (typed path params, no sniff),
+/// while this overload remains so the v1.2.0 SDKs that already shipped
+/// against the single-route shape keep working. New code should prefer the
+/// split routes; the overload may be deprecated in v1.3.
 ///
 /// Issue #1375: prior to this fix the route was typed `Path<Uuid>`, so any
 /// CVE-id call (e.g. the release-gate `GET /sbom/cve/history/CVE-2019-10744`)
@@ -723,7 +746,7 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
     context_path = "/api/v1/sbom",
     tag = "sbom",
     params(
-        ("id" = String, Path, description = "Artifact UUID or CVE identifier (e.g. CVE-2019-10744)")
+        ("id" = String, Path, description = "Artifact UUID or CVE identifier (e.g. CVE-2019-10744). Prefer the typed routes /cve/history/by-artifact/{uuid} or /cve/history/by-cve/{cve_id}.")
     ),
     responses(
         (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
@@ -756,6 +779,75 @@ async fn get_cve_history(
     Err(AppError::Validation(format!(
         "Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)"
     )))
+}
+
+/// Get CVE history for one artifact (typed UUID variant).
+///
+/// Canonical replacement for the UUID branch of the overloaded
+/// `/cve/history/{id}` route. Returns every CVE ever detected against the
+/// given artifact, deduped across curated `cve_history` rows and live
+/// `scan_findings` projections.
+#[utoipa::path(
+    get,
+    path = "/cve/history/by-artifact/{artifact_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact UUID")
+    ),
+    responses(
+        (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 403, description = "Caller does not have access to this artifact's repository"),
+        (status = 404, description = "Artifact not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cve_history_by_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    let service = SbomService::new(state.db.clone());
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    let entries = service.get_cve_history(artifact_id).await?;
+    Ok(Json(entries))
+}
+
+/// Get CVE history for one CVE identifier across artifacts (typed CVE-id
+/// variant).
+///
+/// Canonical replacement for the CVE-id branch of the overloaded
+/// `/cve/history/{id}` route. Returns every artifact the caller can access
+/// where the given CVE has been detected.
+#[utoipa::path(
+    get,
+    path = "/cve/history/by-cve/{cve_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("cve_id" = String, Path, description = "CVE identifier (e.g. CVE-2019-10744)")
+    ),
+    responses(
+        (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 400, description = "Path id is not a valid CVE identifier"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cve_history_by_cve(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(cve_id): Path<String>,
+) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    if !is_valid_cve_id(&cve_id) {
+        return Err(AppError::Validation(format!(
+            "Path id '{cve_id}' is not a valid CVE identifier (expected `CVE-YYYY-N`)"
+        )));
+    }
+    let service = SbomService::new(state.db.clone());
+    let entries = service
+        .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+        .await?;
+    Ok(Json(entries))
 }
 
 /// Update CVE status
@@ -1172,6 +1264,8 @@ async fn ensure_sbom_repo_access(
         get_sbom_components,
         convert_sbom,
         get_cve_history,
+        get_cve_history_by_artifact,
+        get_cve_history_by_cve,
         update_cve_status,
         get_cve_trends,
         list_license_policies,
