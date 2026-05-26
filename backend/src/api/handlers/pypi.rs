@@ -24,7 +24,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -227,10 +227,21 @@ async fn simple_root(
     build_simple_root_response(&headers, &repo_key, &packages)
 }
 
+/// Maximum size of an upstream PEP 503 root simple-index body we will parse.
+///
+/// PyPI's own root index is ~30 MB compressed but our typical Remote repos
+/// front a private/curated mirror with at most a few thousand packages
+/// (well under 1 MB). A 10 MB ceiling keeps us comfortably above any
+/// legitimate index while preventing a hostile or misconfigured upstream
+/// from feeding us a multi-hundred-megabyte HTML blob that would block the
+/// request handler synchronously inside the regex engine (#1377 review).
+const MAX_SIMPLE_ROOT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Fetch the PEP 503 root index from a Remote repo's upstream URL and parse
 /// out the project names. Returns `None` when the proxy service is not
-/// configured, the upstream URL is missing, the fetch fails, or the response
-/// is not HTML the parser recognises.
+/// configured, the upstream URL is missing, the fetch fails, the response
+/// exceeds [`MAX_SIMPLE_ROOT_BODY_BYTES`], or the response is not HTML the
+/// parser recognises.
 ///
 /// The fetched bytes are cached by the proxy_service under cache_path
 /// `simple/`. Subsequent calls within the cache TTL return the cached body
@@ -259,8 +270,43 @@ async fn fetch_remote_simple_root(
         Err(_) => return None,
     };
 
+    if content.len() > MAX_SIMPLE_ROOT_BODY_BYTES {
+        warn!(
+            repo_key = %repo_key,
+            upstream = %effective_upstream,
+            body_bytes = content.len(),
+            cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
+            "upstream PEP 503 root index exceeds size cap; skipping parse"
+        );
+        return None;
+    }
+
     let html = String::from_utf8_lossy(&content);
     Some(parse_simple_root_projects(&html))
+}
+
+/// Decode the minimal set of HTML entities that legally appear inside an
+/// `<a>` text or `href` value in a PEP 503 simple-index page: `&amp;`,
+/// `&lt;`, `&gt;`, `&quot;`, `&apos;`, and the numeric `&#39;` apostrophe.
+///
+/// PEP 503 project names are restricted to `[A-Za-z0-9._-]` after
+/// normalisation, so a real project name will not contain entities; but a
+/// raw upstream index served by Warehouse/Nexus/Artifactory may HTML-escape
+/// ampersands in non-conforming legacy names (e.g. `foo&amp;bar`) or in
+/// hrefs that include query strings. Decoding here ensures the value fed
+/// into [`normalize_pep503`] is the real character, not the literal
+/// entity reference.
+fn decode_html_entities_minimal(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
 }
 
 /// Extract project names from an upstream PEP 503 root simple index.
@@ -270,16 +316,40 @@ async fn fetch_remote_simple_root(
 /// to the last non-empty segment of the href when the text is empty. All
 /// names are PEP 503 normalised so duplicates collapse before merging into
 /// the response.
+///
+/// The regex accepts both double- and single-quoted href attributes (both
+/// are legal HTML) and the captured text/href is HTML-entity-decoded for a
+/// small set of common entities before normalisation, so a project like
+/// `foo&amp;bar` in upstream HTML normalises through the same path as
+/// `foo&bar` would.
+///
+/// Callers are expected to bound the input size before invoking this
+/// helper; see [`MAX_SIMPLE_ROOT_BODY_BYTES`]. This regex-based parser is
+/// intentionally narrow: a full HTML5 parser (e.g. the `scraper` crate)
+/// is tracked as a v1.2.1 follow-up.
 fn parse_simple_root_projects(html: &str) -> Vec<String> {
-    static A_TAG_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r#"(?is)<a\s+[^>]*?href="([^"]*)"[^>]*>([^<]*)</a>"#).unwrap());
+    // Match `<a ... href="..." ...>text</a>` or `<a ... href='...' ...>text</a>`.
+    // Two alternations so the two captured pairs always live in fixed group
+    // indices: 1+2 (double-quote) or 3+4 (single-quote). Whichever pair the
+    // alternation matched, the other is `None`.
+    static A_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?is)<a\s+[^>]*?(?:href="([^"]*)"[^>]*>([^<]*)|href='([^']*)'[^>]*>([^<]*))</a>"#,
+        )
+        .unwrap()
+    });
 
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for caps in A_TAG_RE.captures_iter(html) {
-        let href = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let text = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        let (href_raw, text_raw) = match (caps.get(1), caps.get(2), caps.get(3), caps.get(4)) {
+            (Some(h), Some(t), _, _) => (h.as_str(), t.as_str()),
+            (_, _, Some(h), Some(t)) => (h.as_str(), t.as_str()),
+            _ => continue,
+        };
+        let href = decode_html_entities_minimal(href_raw);
+        let text = decode_html_entities_minimal(text_raw.trim());
         let name = if !text.is_empty() {
-            text.to_string()
+            text
         } else {
             // Fallback: take the last non-empty path segment from the href.
             href.trim_end_matches('/')
@@ -3670,6 +3740,87 @@ mod tests {
         let projects = super::parse_simple_root_projects("<html><body>no links</body></html>");
         assert!(projects.is_empty());
     }
+
+    /// Regression: single-quoted href attributes are legal HTML and at
+    /// least one upstream (older Devpi releases) emits them. Before the
+    /// review hardening the regex only matched `href="..."`, silently
+    /// dropping single-quoted entries from the parsed project list.
+    #[test]
+    fn test_parse_simple_root_projects_accepts_single_quoted_hrefs() {
+        let html = "<html><body>\
+                    <a href='flask/'>Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Mixed single + double quote anchors in the same document must both
+    /// be picked up. Real-world index pages occasionally mix quoting styles
+    /// when concatenated from multiple templates.
+    #[test]
+    fn test_parse_simple_root_projects_mixed_quote_styles() {
+        let html = "<html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Regression: HTML entities inside the anchor text must be decoded
+    /// BEFORE PEP 503 normalisation, otherwise a name escaped as
+    /// `foo&amp;bar` would carry the literal entity reference (`&amp;`)
+    /// into the normalised output and never match a subsequent project
+    /// request. `normalize_pep503` only collapses `-`/`_`/`.` and
+    /// lowercases ASCII letters, so the assertion here is that the
+    /// LITERAL entity reference characters (`amp`, `lt`, `gt`, `quot`,
+    /// `apos`) do not appear in the output — the decoder must run first.
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_text() {
+        let html = "<html><body>\
+                    <a href=\"odd/\">foo&amp;bar</a>\
+                    <a href=\"q/\">a&lt;b</a>\
+                    <a href=\"r/\">a&gt;b</a>\
+                    <a href=\"s/\">a&quot;b</a>\
+                    <a href=\"t/\">a&apos;b</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // No entity reference TOKEN should survive into the output.
+        for p in &projects {
+            for token in ["amp;", "&lt", "&gt", "&quot", "&apos", "&#"] {
+                assert!(
+                    !p.contains(token),
+                    "entity reference token {token:?} leaked through into {p:?}"
+                );
+            }
+        }
+        // And the decoded characters themselves are present (proves the
+        // decoder ran, not that the regex simply rejected the input).
+        assert!(projects.iter().any(|p| p == "foo&bar"));
+    }
+
+    /// HTML entities in the href fallback path (when anchor text is empty)
+    /// must also be decoded before the trailing-segment extraction so the
+    /// resulting project name does not carry the literal entity reference.
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_href_fallback() {
+        let html = "<html><body><a href=\"my&#39;pkg/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // The `&#39;` must decode to `'` before normalisation; we assert
+        // the literal entity-reference characters do not survive.
+        assert_eq!(projects, vec!["my'pkg"]);
+    }
+
+    // The body-size cap constant must be high enough to comfortably
+    // accommodate any legitimate private-mirror index but low enough to
+    // stop a hostile upstream from forcing a multi-hundred-megabyte
+    // allocation + regex sweep on a single request. We assert this at
+    // compile time rather than runtime so the test is free.
+    const _MIN_CAP: usize = 1024 * 1024; // 1 MiB
+    const _MAX_CAP: usize = 64 * 1024 * 1024; // 64 MiB
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES >= _MIN_CAP);
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES <= _MAX_CAP);
 
     /// Regression: a Remote PyPI repo with NO local artifacts must proxy
     /// upstream `/simple/` and return the upstream's package list. Before
