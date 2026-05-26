@@ -78,23 +78,35 @@ pub(crate) fn classify_repo_access(auth: &Option<AuthExtension>) -> RepoAccessMo
     }
 }
 
-/// Clamp a user-supplied limit into `[min, max]`, falling back to `default`
-/// when the value is `None`.
+/// Clamp a user-supplied limit into `[max(min, 1), max]`, falling back to
+/// `default` when the value is `None`.
 ///
 /// This intentionally rejects `Some(0)` callers (the handlers handle that
 /// case explicitly *before* calling this helper), so the contract here is
 /// "non-zero positive limit, otherwise clamped to min". Negative values are
 /// also clamped up to `min`. This is split out as a pure function so the
 /// boundary behavior can be unit-tested without touching HTTP plumbing.
+///
+/// The effective floor is `min.max(1)` so that release builds cannot ever
+/// issue a `LIMIT 0` query even if a caller accidentally passes
+/// `min = 0` -- the previous implementation relied on a `debug_assert!`
+/// for that invariant, which is compiled out in release builds and would
+/// let `Some(0).clamp(0, max)` return `0`. Issue #1372 follow-up.
 pub(crate) fn clamp_positive_limit(limit: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
     debug_assert!(min >= 1, "clamp_positive_limit min must be >= 1");
     debug_assert!(max >= min, "clamp_positive_limit max must be >= min");
+    // Belt-and-braces for release builds: enforce the positive floor here
+    // instead of trusting the debug_assert above, which is stripped in
+    // release. This guarantees we never return 0 even if a caller passes
+    // min = 0 by mistake.
+    let floor = min.max(1);
+    let ceiling = max.max(floor);
     match limit {
-        None => default.clamp(min, max),
+        None => default.clamp(floor, ceiling),
         // Some(0) should be handled by the caller (return empty results);
-        // if it does reach here, clamp it up to `min` so we never issue a
+        // if it does reach here, clamp it up to `floor` so we never issue a
         // LIMIT 0 query the caller didn't actually ask for.
-        Some(v) => v.clamp(min, max),
+        Some(v) => v.clamp(floor, ceiling),
     }
 }
 
@@ -1628,6 +1640,45 @@ mod tests {
         assert_eq!(buggy_legacy, 1);
         // The new helper, called directly with Some(0), still clamps up to
         // 1 (matches legacy), but the handlers now never reach it.
+        assert_eq!(clamp_positive_limit(Some(0), 10, 1, 50), 1);
+    }
+
+    #[test]
+    fn test_clamp_positive_limit_release_build_floor_protects_against_min_zero() {
+        // Regression for the PR #1384 review: the previous implementation
+        // relied on `debug_assert!(min >= 1, ...)` to guarantee that
+        // `Some(0).clamp(min, max)` could not return 0. But `debug_assert!`
+        // is stripped in release builds, so a caller that mistakenly passed
+        // `min = 0` would issue a `LIMIT 0` SQL query in production. The
+        // helper now enforces `floor = min.max(1)` unconditionally, so this
+        // test holds regardless of build profile.
+        //
+        // Note: in debug builds the `debug_assert!` still fires before we
+        // get to assert anything; gate this on `not(debug_assertions)` so
+        // it actually runs only where the protection matters. The hardening
+        // is still present in debug -- this test just documents the release
+        // contract.
+        #[cfg(not(debug_assertions))]
+        {
+            // Simulate a programming error: min = 0.
+            assert_eq!(
+                clamp_positive_limit(Some(0), 10, 0, 50),
+                1,
+                "release builds must enforce LIMIT >= 1 even when min = 0"
+            );
+            assert_eq!(
+                clamp_positive_limit(Some(-3), 10, 0, 50),
+                1,
+                "release builds must enforce LIMIT >= 1 for negatives too"
+            );
+            assert_eq!(
+                clamp_positive_limit(None, 0, 0, 50),
+                1,
+                "release builds must enforce LIMIT >= 1 even with default = 0"
+            );
+        }
+        // Even in debug, prove the floor logic on a non-violating input:
+        // min = 1 and Some(0) must clamp to 1 (existing contract).
         assert_eq!(clamp_positive_limit(Some(0), 10, 1, 50), 1);
     }
 }

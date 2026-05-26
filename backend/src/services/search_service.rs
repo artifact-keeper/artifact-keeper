@@ -48,9 +48,10 @@ pub struct SearchQuery {
     /// the correct visibility.
     #[serde(skip)]
     pub accessible_repo_ids: Option<Vec<Uuid>>,
-    /// Sort field. Accepted values: `created_at` (default), `name`, `size`,
-    /// `downloads`. Unknown values fall back to `created_at` so a typo never
-    /// causes a 500.
+    /// Sort field. Accepted values: `created_at` (default), `name`, `size`
+    /// (alias: `size_bytes`), `downloads` (alias: `download_count`).
+    /// Unknown values are rejected with HTTP 400 VALIDATION_ERROR so typos
+    /// surface visibly instead of silently downgrading to `created_at`.
     pub sort_by: Option<String>,
     /// Sort direction: `asc` or `desc`. Default is `desc`. Honored for every
     /// supported sort field. The previous implementation hardcoded `desc`
@@ -124,30 +125,48 @@ pub(crate) fn build_suggest_pattern(prefix: &str) -> String {
 /// Translate the user-facing `sort_by` and `sort_order` parameters into a
 /// safe SQL ORDER BY clause.
 ///
-/// This is a whitelist: any value outside the supported set silently falls
-/// back to the default (`a.created_at DESC`) instead of erroring or being
-/// interpolated into SQL.  That keeps the endpoint forgiving for clients
-/// that forget the column name, and -- more importantly -- guarantees we
-/// never splice attacker-controlled text into the query.
+/// This is a whitelist: only the explicitly enumerated `sort_by` values are
+/// accepted. Anything else returns `AppError::Validation` so the API surfaces
+/// `400 VALIDATION_ERROR` rather than silently downgrading to `created_at`
+/// (the previous behavior made typos and not-yet-implemented fields look
+/// identical to "no sort", which was a UX trap caught in PR #1384 review).
+///
+/// `None` still falls back to the default (`created_at DESC`); the strict
+/// rejection only applies to non-empty, non-whitelisted values.
+///
+/// Because the return value is `&'static str`, no caller input is ever
+/// spliced into the query string -- the SQL injection guard is structural.
 ///
 /// Supported `sort_by` values:
-/// - `created_at` (default)
+/// - `created_at` (default when `None`)
 /// - `name` -> `a.name`
-/// - `size` -> `a.size_bytes` (sort_order is now honored here)
-/// - `downloads` -> falls through to `a.created_at` for now (would need
-///   a CTE; will land separately).
+/// - `size` / `size_bytes` -> `a.size_bytes`
+/// - `downloads` -> the same correlated subquery that populates the
+///   `download_count` column in `SELECT`. Ordering on a scalar subquery
+///   expression is portable Postgres and avoids needing a CTE.
 ///
-/// `sort_order` accepts `asc` / `desc` case-insensitively; anything else
-/// (including `None`) defaults to `desc`.
+/// `sort_order` accepts `asc` / `desc` case-insensitively; any other value
+/// (including `None`) defaults to `desc`. We are intentionally lenient on
+/// `sort_order` because picking the "wrong" direction is harmless -- it
+/// can't break SQL and it's obvious from the result ordering.
 pub(crate) fn build_order_by_clause(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
-) -> &'static str {
+) -> Result<&'static str> {
     let asc = matches!(
         sort_order.map(str::to_ascii_lowercase).as_deref(),
         Some("asc")
     );
-    match sort_by.map(str::to_ascii_lowercase).as_deref() {
+    let normalized = sort_by.map(str::to_ascii_lowercase);
+    let clause = match normalized.as_deref() {
+        // None or explicit "created_at" -> default sort.
+        None | Some("created_at") => {
+            if asc {
+                "a.created_at ASC, a.id ASC"
+            } else {
+                "a.created_at DESC, a.id DESC"
+            }
+        }
         Some("name") => {
             if asc {
                 "a.name ASC, a.id ASC"
@@ -162,15 +181,24 @@ pub(crate) fn build_order_by_clause(
                 "a.size_bytes DESC, a.id DESC"
             }
         }
-        // Default and any unknown value: created_at, honoring sort_order.
-        _ => {
+        Some("downloads") | Some("download_count") => {
+            // Mirror the COALESCE expression used in the SELECT list so the
+            // sort key matches the column we report to the client. The
+            // entire ORDER BY string is a compile-time `&'static str`, so
+            // there is no injection surface here.
             if asc {
-                "a.created_at ASC, a.id ASC"
+                "COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0) ASC, a.id ASC"
             } else {
-                "a.created_at DESC, a.id DESC"
+                "COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0) DESC, a.id DESC"
             }
         }
-    }
+        Some(other) => {
+            return Err(AppError::Validation(format!(
+                "Unsupported sort_by value: {other:?}. Supported values: created_at, name, size, downloads."
+            )));
+        }
+    };
+    Ok(clause)
 }
 
 /// Row type returned by all search SQL queries (12 fields).
@@ -248,8 +276,10 @@ impl SearchService {
 
         // The ORDER BY clause is built from a whitelisted helper, so it is
         // safe to splice into the SQL string. We never use the raw query
-        // params here.
-        let order_by = build_order_by_clause(query.sort_by.as_deref(), query.sort_order.as_deref());
+        // params here. Unknown `sort_by` returns AppError::Validation, which
+        // surfaces as HTTP 400 VALIDATION_ERROR to the caller (PR #1384).
+        let order_by =
+            build_order_by_clause(query.sort_by.as_deref(), query.sort_order.as_deref())?;
 
         // When accessible_repo_ids is provided, filter by that list instead of
         // the coarse public_only flag. An empty list means "no repos visible"
@@ -992,18 +1022,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_order_by_clause -- regression for issue #1372
+    // build_order_by_clause -- regression for issue #1372 and PR #1384 review
     //
     // The previous SQL hardcoded `ORDER BY a.created_at DESC`, so passing
     // `sort_by=size&sort_order=asc` had no effect: the smallest artifact
     // never bubbled to the head of the results. These tests pin the
-    // contract: every supported sort_by honors sort_order, and unknown
-    // fields fall back to created_at without surfacing as an error.
+    // contract: every supported sort_by (including `downloads`) honors
+    // sort_order, and unknown fields are now rejected with 400 instead of
+    // silently downgrading to `created_at` (PR #1384 review).
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_order_by_default_is_created_at_desc() {
-        let clause = build_order_by_clause(None, None);
+        let clause = build_order_by_clause(None, None).expect("default must be Ok");
         assert!(clause.contains("a.created_at"));
         assert!(clause.contains("DESC"));
         assert!(!clause.contains("ASC"));
@@ -1011,14 +1042,14 @@ mod tests {
 
     #[test]
     fn test_build_order_by_created_at_asc() {
-        let clause = build_order_by_clause(Some("created_at"), Some("asc"));
+        let clause = build_order_by_clause(Some("created_at"), Some("asc")).unwrap();
         assert!(clause.contains("a.created_at"));
         assert!(clause.contains("ASC"));
     }
 
     #[test]
     fn test_build_order_by_size_desc() {
-        let clause = build_order_by_clause(Some("size"), Some("desc"));
+        let clause = build_order_by_clause(Some("size"), Some("desc")).unwrap();
         assert!(
             clause.contains("a.size_bytes") && clause.contains("DESC"),
             "expected size_bytes DESC, got {}",
@@ -1030,7 +1061,7 @@ mod tests {
     fn test_build_order_by_size_asc_regression_1372() {
         // The core regression: this previously returned a clause that
         // still ordered by created_at DESC, ignoring asc/size entirely.
-        let clause = build_order_by_clause(Some("size"), Some("asc"));
+        let clause = build_order_by_clause(Some("size"), Some("asc")).unwrap();
         assert!(
             clause.contains("a.size_bytes") && clause.contains("ASC"),
             "expected size_bytes ASC (issue #1372), got {}",
@@ -1046,16 +1077,16 @@ mod tests {
     #[test]
     fn test_build_order_by_size_bytes_alias_accepted() {
         // Accept the canonical column name too, so an API caller using the
-        // raw column doesn't get silently downgraded to created_at.
-        let clause = build_order_by_clause(Some("size_bytes"), Some("asc"));
+        // raw column doesn't get rejected.
+        let clause = build_order_by_clause(Some("size_bytes"), Some("asc")).unwrap();
         assert!(clause.contains("a.size_bytes"));
         assert!(clause.contains("ASC"));
     }
 
     #[test]
     fn test_build_order_by_name_asc_and_desc() {
-        let asc = build_order_by_clause(Some("name"), Some("asc"));
-        let desc = build_order_by_clause(Some("name"), Some("desc"));
+        let asc = build_order_by_clause(Some("name"), Some("asc")).unwrap();
+        let desc = build_order_by_clause(Some("name"), Some("desc")).unwrap();
         assert!(asc.contains("a.name") && asc.contains("ASC"));
         assert!(desc.contains("a.name") && desc.contains("DESC"));
         assert_ne!(asc, desc, "asc and desc must produce different clauses");
@@ -1063,33 +1094,104 @@ mod tests {
 
     #[test]
     fn test_build_order_by_sort_order_is_case_insensitive() {
-        let upper = build_order_by_clause(Some("size"), Some("ASC"));
-        let lower = build_order_by_clause(Some("size"), Some("asc"));
-        let mixed = build_order_by_clause(Some("size"), Some("AsC"));
+        let upper = build_order_by_clause(Some("size"), Some("ASC")).unwrap();
+        let lower = build_order_by_clause(Some("size"), Some("asc")).unwrap();
+        let mixed = build_order_by_clause(Some("size"), Some("AsC")).unwrap();
         assert_eq!(upper, lower);
         assert_eq!(mixed, lower);
     }
 
     #[test]
-    fn test_build_order_by_unknown_sort_field_falls_back_to_created_at() {
-        // Unknown fields must not panic, error, or splice into SQL.
-        let clause = build_order_by_clause(Some("'; DROP TABLE artifacts; --"), Some("desc"));
-        assert!(clause.contains("a.created_at"));
-        assert!(!clause.contains("DROP"));
+    fn test_build_order_by_downloads_asc_and_desc_pr_1384() {
+        // PR #1384 review: `downloads` used to silently fall through to
+        // created_at. It now sorts on the same correlated subquery that
+        // populates the `download_count` column in SELECT.
+        let asc = build_order_by_clause(Some("downloads"), Some("asc")).unwrap();
+        let desc = build_order_by_clause(Some("downloads"), Some("desc")).unwrap();
+        assert!(
+            asc.contains("download_statistics") && asc.contains("ASC"),
+            "expected downloads ASC clause, got {}",
+            asc
+        );
+        assert!(
+            desc.contains("download_statistics") && desc.contains("DESC"),
+            "expected downloads DESC clause, got {}",
+            desc
+        );
+        assert_ne!(asc, desc);
+        // Belt-and-braces: must not collapse to a created_at clause.
+        assert!(
+            !asc.contains("a.created_at"),
+            "downloads asc must not fall back to created_at, got {}",
+            asc
+        );
+        assert!(
+            !desc.contains("a.created_at"),
+            "downloads desc must not fall back to created_at, got {}",
+            desc
+        );
+    }
+
+    #[test]
+    fn test_build_order_by_download_count_alias_accepted() {
+        // Accept the underlying column-style alias the same way `size_bytes`
+        // mirrors `size`.
+        let clause = build_order_by_clause(Some("download_count"), Some("desc")).unwrap();
+        assert!(clause.contains("download_statistics"));
+        assert!(clause.contains("DESC"));
+    }
+
+    #[test]
+    fn test_build_order_by_unknown_sort_field_returns_validation_error_pr_1384() {
+        // PR #1384 review: silent fallback to created_at made typos and
+        // not-yet-implemented sort fields look identical to "no sort". The
+        // contract is now strict -- unknown values return AppError::Validation
+        // (HTTP 400 VALIDATION_ERROR), so typos surface visibly.
+        let err = build_order_by_clause(Some("popularity"), Some("desc"))
+            .expect_err("unknown sort_by must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("popularity"),
+                    "error message must echo the bad sort_by, got {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("created_at")
+                        && msg.contains("name")
+                        && msg.contains("size")
+                        && msg.contains("downloads"),
+                    "error message must list supported values, got {}",
+                    msg
+                );
+            }
+            other => panic!("expected AppError::Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_order_by_unknown_sort_field_does_not_splice_into_sql() {
+        // The whitelist still guards against injection: an attacker-shaped
+        // value is rejected (not spliced) and never reaches the SQL string.
+        let err = build_order_by_clause(Some("'; DROP TABLE artifacts; --"), Some("desc"))
+            .expect_err("malicious sort_by must be rejected");
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[test]
     fn test_build_order_by_unknown_sort_order_defaults_to_desc() {
-        let clause = build_order_by_clause(Some("size"), Some("sideways"));
+        // sort_order is intentionally lenient -- a bad direction can't break
+        // SQL and is obvious from the result ordering.
+        let clause = build_order_by_clause(Some("size"), Some("sideways")).unwrap();
         assert!(clause.contains("a.size_bytes"));
         assert!(clause.contains("DESC"));
     }
 
     #[test]
     fn test_build_order_by_returns_static_str_so_no_attacker_text_is_spliced() {
-        // The function returns a `&'static str` -- proves at compile time
-        // that no caller input can leak into the SQL string.
-        let _: &'static str = build_order_by_clause(Some("hax"), Some("hax"));
+        // The Ok variant is a `&'static str` -- proves at compile time that
+        // no caller input can leak into the SQL string.
+        let _: Result<&'static str> = build_order_by_clause(Some("name"), Some("asc"));
     }
 
     #[test]
@@ -1097,8 +1199,8 @@ mod tests {
         // Mirrors the E2E expectation in #1372: with a dataset that has
         // distinct sizes, sort_order=asc and sort_order=desc must produce
         // different SQL, which is what guarantees a different head hit.
-        let asc = build_order_by_clause(Some("size"), Some("asc"));
-        let desc = build_order_by_clause(Some("size"), Some("desc"));
+        let asc = build_order_by_clause(Some("size"), Some("asc")).unwrap();
+        let desc = build_order_by_clause(Some("size"), Some("desc")).unwrap();
         assert_ne!(
             asc, desc,
             "sort_order=asc and sort_order=desc on sort_by=size must produce different ORDER BY clauses (issue #1372)"
