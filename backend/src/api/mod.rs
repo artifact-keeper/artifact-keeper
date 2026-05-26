@@ -113,6 +113,7 @@ pub struct AppState {
     pub proxy_service: Option<Arc<ProxyService>>,
     pub smtp_service: Option<Arc<SmtpService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
+    pub age_gate_service: Option<Arc<crate::services::age_gate_service::AgeGateService>>,
     /// When true, most API endpoints return 403 until the admin changes the default password.
     pub setup_required: Arc<AtomicBool>,
     pub event_bus: Arc<EventBus>,
@@ -186,6 +187,7 @@ impl AppState {
             dependency_track: None,
             permission_service,
             proxy_service: None,
+            age_gate_service: None,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
@@ -228,6 +230,7 @@ impl AppState {
             dependency_track: None,
             permission_service,
             proxy_service: None,
+            age_gate_service: None,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
@@ -292,6 +295,14 @@ impl AppState {
     /// Set the proxy service for remote repository proxying.
     pub fn set_proxy_service(&mut self, proxy_service: Arc<ProxyService>) {
         self.proxy_service = Some(proxy_service);
+    }
+
+    /// Set the age-gate service for proxy registry quality gates.
+    pub fn set_age_gate_service(
+        &mut self,
+        age_gate_service: Arc<crate::services::age_gate_service::AgeGateService>,
+    ) {
+        self.age_gate_service = Some(age_gate_service);
     }
 
     /// Set the SMTP service for email delivery.

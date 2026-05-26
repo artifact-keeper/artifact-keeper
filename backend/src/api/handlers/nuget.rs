@@ -1439,6 +1439,9 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
