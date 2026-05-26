@@ -2,6 +2,7 @@
 
 pub mod download_response;
 pub mod dto;
+pub mod extractors;
 pub mod handlers;
 pub mod middleware;
 pub mod openapi;
