@@ -29,12 +29,14 @@ use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers::{check_quarantine_row, internal_error, LocalArtifactRow};
 use crate::api::AppState;
+use crate::formats::maven::MavenHandler;
 use crate::storage::StorageLocation;
 
-/// Extensions for Maven GAV-grouped *secondary* files that share the
+/// Suffixes for Maven GAV-grouped companion files that share the
 /// primary's DB row. Returning bytes for any of these via the storage
 /// fallback is safe as long as the primary GAV is live and not under
-/// quarantine.
+/// quarantine. Classifier artifacts (`artifact-version-classifier.ext`)
+/// are handled separately by parsing the Maven coordinate below.
 ///
 /// Primary file extensions (`.jar`, `.aar`, `.war`, `.ear`, `.zip`) are
 /// **deliberately excluded** from this list. Primary files always have
@@ -59,9 +61,16 @@ const MAVEN_SECONDARY_FILE_EXTENSIONS: &[&str] = &[
 
 #[inline]
 fn is_maven_secondary_path(path: &str) -> bool {
-    MAVEN_SECONDARY_FILE_EXTENSIONS
+    if MAVEN_SECONDARY_FILE_EXTENSIONS
         .iter()
         .any(|ext| path.ends_with(ext))
+    {
+        return true;
+    }
+
+    MavenHandler::parse_coordinates(path)
+        .map(|coords| coords.classifier.is_some())
+        .unwrap_or(false)
 }
 
 /// Derive the GAV directory prefix for a maven artifact path.
@@ -95,8 +104,9 @@ fn maven_gav_directory(artifact_path: &str) -> Option<&str> {
 /// enforces on the SQL row. To preserve those policies for secondary
 /// files (which have no row of their own), this helper:
 ///
-/// 1. Refuses any path that doesn't match one of the documented
-///    secondary-file extensions ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]).
+/// 1. Refuses any path that is neither a known companion-file suffix
+///    ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]) nor a valid Maven coordinate
+///    with a classifier.
 ///    Primary `.jar`/`.aar`/`.war`/`.ear` paths fall back to
 ///    `NotFound` here so the caller can't accidentally route them
 ///    around their own SQL row.
@@ -123,8 +133,8 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    // Gate 1: Only known secondary-file extensions are eligible. A
-    // primary `.jar`/`.aar`/etc. always has its own row and must travel
+    // Gate 1: Only companion files and classifier artifacts are eligible.
+    // A primary `.jar`/`.aar`/etc. always has its own row and must travel
     // the SQL path so its quarantine/soft-delete state is honored.
     if !is_maven_secondary_path(artifact_path) {
         return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
@@ -217,6 +227,22 @@ mod tests {
                 is_maven_secondary_path(&path),
                 "{} should be recognized as secondary",
                 ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_maven_secondary_path_allows_classifier_artifacts() {
+        for path in [
+            "g/a/1.0/a-1.0-plain.jar",
+            "g/a/1.0/a-1.0-test-fixtures.jar",
+            "g/a/1.0/a-1.0-shadow.jar",
+            "g/a/1.0/a-1.0-linux-x86_64.zip",
+        ] {
+            assert!(
+                is_maven_secondary_path(path),
+                "{} should be recognized as a classifier artifact",
+                path
             );
         }
     }
@@ -355,6 +381,9 @@ mod tests {
             (".module", b"{\"name\":\"foo\"}".to_vec()),
             ("-sources.jar", b"sources-jar-bytes".to_vec()),
             ("-javadoc.jar", b"javadoc-jar-bytes".to_vec()),
+            ("-plain.jar", b"plain-jar-bytes".to_vec()),
+            ("-test-fixtures.jar", b"test-fixtures-jar-bytes".to_vec()),
+            ("-shadow.jar", b"shadow-jar-bytes".to_vec()),
             (".sha512", b"a".repeat(128)),
             (".sha256", b"b".repeat(64)),
             (".sha1", b"c".repeat(40)),
