@@ -841,39 +841,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
-    // Attempt static format resolution first. When the format string does not
-    // match any built-in variant, fall back to the `format_handlers` table so
-    // that WASM plugin formats (e.g. "myplugin") can be used on repo creation.
-    let (format, plugin_format_key) = match parse_format(&payload.format) {
-        Ok(f) => (f, None),
-        Err(_) => {
-            // Check whether the format string is a registered, enabled plugin
-            // format handler.
-            let format_lower = payload.format.to_lowercase();
-            let is_plugin: Option<bool> =
-                sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
-                    .bind(&format_lower)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
-
-            match is_plugin {
-                Some(true) => (RepositoryFormat::Generic, Some(format_lower)),
-                Some(false) => {
-                    return Err(AppError::Validation(format!(
-                        "Plugin format handler '{}' is disabled. Enable it before creating repositories.",
-                        payload.format
-                    )));
-                }
-                None => {
-                    return Err(AppError::Validation(format!(
-                        "Invalid format: {}",
-                        payload.format
-                    )));
-                }
-            }
-        }
-    };
+    // Resolve the format string via the service. The service owns both the
+    // built-in enum mapping and the `format_handlers` fallback for WASM
+    // plugin formats, so the handler keeps no business logic of its own here.
+    // For plugin formats, `plugin_format_key` carries the canonical handler
+    // name and `format` is reported as `Generic`.
+    let service = state.create_repository_service();
+    let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
     // Validate up-front that virtual repos arrive with at least one member.
@@ -924,7 +898,6 @@ pub async fn create_repository(
         );
     }
 
-    let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
             key: payload.key,
@@ -7613,57 +7586,12 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // WASM plugin format fallback in create_repository (regression tests)
+    //
+    // Format-string resolution lives in `RepositoryService::resolve_format`
+    // (see `services/repository_service.rs`). These end-to-end tests drive
+    // the HTTP handler so we verify both the resolve path and the wiring of
+    // the resolved `format_key` into the persisted row.
     // -----------------------------------------------------------------------
-
-    /// Source-level regression guard: ensures the two key wiring points
-    /// introduced for WASM plugin format support are still present in the
-    /// handler source.  This catches a naive revert of either change without
-    /// requiring a live database.
-    ///
-    /// 1. The DB lookup for `format_handlers` must exist.
-    /// 2. `plugin_format_key` must be propagated to `format_key` via `.or(…)`.
-    ///
-    /// Both searched patterns are built at runtime (not as string literals in
-    /// this function body) so the test does not self-satisfy.
-    #[test]
-    fn test_create_repository_plugin_format_fallback_wiring() {
-        let src = include_str!("repositories.rs");
-
-        // Guard 1 – the format_handlers query must exist in the handler code.
-        // Fragmented so this test body does not contain the literal pattern.
-        let fh_query = format!(
-            "{} {} {}",
-            "SELECT is_enabled FROM", "format_handlers", "WHERE format_key = $1"
-        );
-        // The pattern appears at least twice: once in the handler and once in
-        // this test's own `format!` call above — count occurrences and require
-        // more than one (the handler line + the format! reconstruction).
-        // Actually we want it to appear in handler code specifically, so we
-        // count occurrences: it must appear at least once outside this test.
-        // The simplest safe check: the file must contain it >= 2 times total
-        // (handler + format! above builds it but never emits it as a literal,
-        // so the only actual literal occurrences are in handler code).
-        let fh_count = src.matches(fh_query.as_str()).count();
-        assert!(
-            fh_count >= 1,
-            "create_repository must query format_handlers for unknown format strings; \
-             the fallback DB lookup appears to have been removed (found {} occurrences)",
-            fh_count,
-        );
-
-        // Guard 2 – the plugin_format_key must be wired into the service call.
-        // Spelled in three fragments so this test body does not contain the
-        // literal pattern and cannot self-satisfy.
-        let part_a = "plugin_format_key";
-        let part_b = ".or(";
-        let part_c = "payload.format_key)";
-        let wiring = format!("{}{}{}", part_a, part_b, part_c);
-        assert!(
-            src.contains(&wiring),
-            "create_repository must wire plugin_format_key into format_key via .or(); \
-             the propagation appears to have been removed",
-        );
-    }
 
     /// Insert a `format_handlers` row for testing.  Returns the `format_key`
     /// that was inserted.  The caller is responsible for deleting the row
@@ -7889,6 +7817,83 @@ mod tests {
         assert!(
             matches!(err, AppError::Validation(_)),
             "unknown format must surface as Validation (400), got {err:?}",
+        );
+    }
+
+    /// Build a non-admin `AuthExtension`. Used to confirm that the same
+    /// admin/create-repo gate that protects built-in format creation also
+    /// guards the WASM-plugin codepath. Without this, a plugin-format string
+    /// could be a route around the gate.
+    fn non_admin_auth(
+        user_id: Uuid,
+        username: &str,
+    ) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// A non-admin caller with no `system:admin` permission must receive an
+    /// `Authorization` error even when the requested format is a valid,
+    /// enabled WASM plugin format. The plugin codepath inherits the same
+    /// permission gate as built-in formats; there is no privileged shortcut.
+    #[tokio::test]
+    async fn test_create_repository_plugin_format_rejects_non_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Json, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-noadmin-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("noadmin-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Non-admin plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(non_admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+
+        // Cleanup: the request should NOT have created a repo row, but delete
+        // defensively in case the assertion below fails.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("non-admin must be denied even for plugin formats");
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
         );
     }
 }
