@@ -439,9 +439,19 @@ impl RepositoryService {
         //  * Built-in format (req.format_key = None): check the row keyed by
         //    the canonical enum name (e.g. "maven").
         //  * Plugin format (req.format_key = Some(plugin_key)): the caller
-        //    resolved this via `resolve_format`, which already verified the
-        //    plugin row was enabled. Re-check here under the same query so
-        //    a TOCTOU disable between resolve and insert is still caught.
+        //    resolved this via `resolve_format`, which already issued its own
+        //    SELECT against `format_handlers`. The re-check below is
+        //    intentional: we re-read `is_enabled` under our own SELECT to
+        //    narrow the TOCTOU window opened by resolve_format.
+        //
+        // Note: this re-check NARROWS but does not eliminate the TOCTOU window
+        // between resolve_format() and insert. A plugin disabled between the two
+        // SELECTs could still produce a repo bound to a now-disabled plugin, but
+        // (1) request-time format dispatch reads `format_handlers` per request, so
+        // the bound repo fails subsequent operations cleanly, and (2) plugin
+        // install/disable is admin-only, so the race is bounded by admin actions.
+        // A true single-tx fix with SELECT FOR SHARE is tracked as a v1.2.1
+        // hardening follow-up.
         let format_key = req
             .format_key
             .clone()
