@@ -7664,7 +7664,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_repository_with_enabled_plugin_format() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::extract::{Extension, Json, State};
+        use axum::extract::{Extension, State};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -7734,7 +7734,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_repository_with_disabled_plugin_format() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::extract::{Extension, Json, State};
+        use axum::extract::{Extension, State};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -7781,7 +7781,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_repository_with_unknown_format() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::extract::{Extension, Json, State};
+        use axum::extract::{Extension, State};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -7847,7 +7847,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_repository_plugin_format_rejects_non_admin() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::extract::{Extension, Json, State};
+        use axum::extract::{Extension, State};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
