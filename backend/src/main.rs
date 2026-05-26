@@ -1099,6 +1099,7 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
 /// Raw OIDC environment variable values for bootstrap.
 #[derive(Default)]
 struct OidcEnvVars {
+    name: Option<String>,
     issuer: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
@@ -1114,6 +1115,7 @@ struct OidcEnvVars {
 fn build_oidc_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
     build_oidc_request_from_values(OidcEnvVars {
+        name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
         client_id: std::env::var("OIDC_CLIENT_ID").ok(),
         client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
@@ -1135,6 +1137,10 @@ fn build_oidc_request_from_values(
     let issuer = env.issuer.filter(|v| !v.is_empty())?;
     let client_id = env.client_id.filter(|v| !v.is_empty())?;
     let client_secret = env.client_secret.filter(|v| !v.is_empty())?;
+    let name = env
+        .name
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
 
     let scopes = env
         .scopes
@@ -1158,7 +1164,7 @@ fn build_oidc_request_from_values(
     }
 
     Some(CreateOidcConfigRequest {
-        name: "default".to_string(),
+        name,
         issuer_url: issuer,
         client_id,
         client_secret,
@@ -1685,6 +1691,32 @@ mod tests {
     }
 
     #[test]
+    fn test_bootstrap_request_custom_name() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.name = Some("Corporate SSO".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.name, "Corporate SSO");
+    }
+
+    #[test]
+    fn test_bootstrap_request_empty_name_defaults_to_default() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.name = Some(String::new());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.name, "default");
+    }
+
+    #[test]
     fn test_bootstrap_request_missing_issuer() {
         let req = build_oidc_request_from_values(env(None, Some("client"), Some("secret")));
         assert!(req.is_none());
@@ -1849,6 +1881,7 @@ mod tests {
     #[test]
     fn test_bootstrap_request_all_optional_fields() {
         let req = build_oidc_request_from_values(OidcEnvVars {
+            name: Some("Corporate OIDC".into()),
             issuer: Some("https://auth.corp.com/realms/main".into()),
             client_id: Some("artifact-keeper".into()),
             client_secret: Some("super-secret-123".into()),
@@ -1860,6 +1893,7 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(req.name, "Corporate OIDC");
         assert_eq!(req.issuer_url, "https://auth.corp.com/realms/main");
         assert_eq!(req.client_id, "artifact-keeper");
         assert_eq!(req.client_secret, "super-secret-123");

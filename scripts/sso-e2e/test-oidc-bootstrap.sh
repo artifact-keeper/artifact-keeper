@@ -120,6 +120,12 @@ run_test "Bootstrapped config has correct issuer_url" '
     [[ "$issuer" == "http://keycloak:8080/realms/artifact-keeper" ]]
 '
 
+run_test "Bootstrapped config has custom name from OIDC_NAME" '
+    name=$(docker compose -f "$COMPOSE_FILE" exec -T postgres \
+        psql -U registry -d artifact_registry -t -c "SELECT name FROM oidc_configs LIMIT 1;" | sed "s/^ *//;s/ *$//")
+    [[ "$name" == "Test Keycloak OIDC" ]]
+'
+
 run_test "Bootstrapped config has groups_claim=roles in attribute_mapping" '
     mapping=$(docker compose -f "$COMPOSE_FILE" exec -T postgres \
         psql -U registry -d artifact_registry -t -c "SELECT attribute_mapping FROM oidc_configs LIMIT 1;")
