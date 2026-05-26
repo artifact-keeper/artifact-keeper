@@ -62,6 +62,16 @@ pub fn router() -> Router<SharedState> {
 
 /// Normalize a package name per PEP 503: lowercase, and replace any run of
 /// `[-_.]` characters with a single hyphen.
+///
+/// PEP 503 restricts canonical project names to the alphabet
+/// `[A-Za-z0-9._-]`. Any character outside that set is *malformed* and must
+/// be **dropped** rather than preserved. Preserving arbitrary characters
+/// (the previous behaviour) created a stored-XSS sink when this function
+/// was fed names parsed out of upstream HTML: an upstream serving an
+/// `<a>` element containing `<script>alert(1)</script>` would round-trip
+/// through `decode_html_entities_minimal` and land in our own simple-index
+/// HTML response (#1377 review, defense-in-depth layer 1). See also the
+/// HTML-escape applied at render time in `build_simple_root_response`.
 fn normalize_pep503(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut last_was_sep = true;
@@ -70,16 +80,14 @@ fn normalize_pep503(name: &str) -> String {
         if c.is_ascii_alphanumeric() {
             result.push(c.to_ascii_lowercase());
             last_was_sep = false;
-        } else if c == '-' || c == '_' || c == '.' {
-            if !last_was_sep {
-                result.push('-');
-                last_was_sep = true;
-            }
-        } else {
-            // Keep other characters as-is (digits, etc.)
-            result.push(c);
-            last_was_sep = false;
+        } else if (c == '-' || c == '_' || c == '.') && !last_was_sep {
+            result.push('-');
+            last_was_sep = true;
         }
+        // All other characters are NOT valid in a PEP 503 canonical name
+        // and are silently dropped. This is the security boundary that
+        // prevents `<`, `>`, `"`, `&`, control chars, etc. from ever
+        // appearing in a normalized package name.
     }
 
     if result.ends_with('-') {
@@ -276,13 +284,24 @@ async fn fetch_remote_simple_root(
             upstream = %effective_upstream,
             body_bytes = content.len(),
             cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
-            "upstream PEP 503 root index exceeds size cap; skipping parse"
+            "upstream PEP 503 root index exceeds size cap; skipping parse. \
+             A future release will allow operators to opt into a higher cap \
+             for full-mirror Remote repos that front pypi.org directly."
         );
         return None;
     }
 
-    let html = String::from_utf8_lossy(&content);
-    Some(parse_simple_root_projects(&html))
+    // The regex pass over up to ~10 MiB of HTML is CPU-bound and blocks
+    // the async runtime worker. Offload to a blocking thread so the
+    // request handler does not stall other tasks on a slow parse
+    // (#1377 review).
+    let parsed = tokio::task::spawn_blocking(move || {
+        let html = String::from_utf8_lossy(&content);
+        parse_simple_root_projects(&html)
+    })
+    .await
+    .ok()?;
+    Some(parsed)
 }
 
 /// Decode the minimal set of HTML entities that legally appear inside an
@@ -300,13 +319,60 @@ fn decode_html_entities_minimal(input: &str) -> String {
     if !input.contains('&') {
         return input.to_string();
     }
-    input
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
+    // Single-pass scan so chained `.replace()` cannot double-decode.
+    // Naive `.replace("&amp;", "&").replace("&lt;", "<")` would convert
+    // `&amp;lt;` into `<`, which can re-introduce script-like sequences
+    // from a malicious upstream. A single left-to-right scan only
+    // recognises an entity at its original position and copies the
+    // resulting character verbatim, so further entity sequences are not
+    // re-evaluated (#1377 review).
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Longest-match-first on the supported entities. The list is
+            // intentionally fixed and small; arbitrary `&xyz;` references
+            // are left untouched (and ultimately get dropped by
+            // `normalize_pep503`).
+            let rest = &input[i..];
+            if rest.starts_with("&amp;") {
+                out.push('&');
+                i += "&amp;".len();
+                continue;
+            }
+            if rest.starts_with("&lt;") {
+                out.push('<');
+                i += "&lt;".len();
+                continue;
+            }
+            if rest.starts_with("&gt;") {
+                out.push('>');
+                i += "&gt;".len();
+                continue;
+            }
+            if rest.starts_with("&quot;") {
+                out.push('"');
+                i += "&quot;".len();
+                continue;
+            }
+            if rest.starts_with("&apos;") {
+                out.push('\'');
+                i += "&apos;".len();
+                continue;
+            }
+            if rest.starts_with("&#39;") {
+                out.push('\'');
+                i += "&#39;".len();
+                continue;
+            }
+        }
+        // Push one UTF-8 codepoint and advance past it.
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Extract project names from an upstream PEP 503 root simple index.
@@ -395,16 +461,25 @@ fn build_simple_root_response(
             .unwrap());
     }
 
-    // HTML response (default)
+    // HTML response (default).
+    //
+    // Defense-in-depth against stored XSS (#1377 review): even though
+    // `normalize_pep503` drops every character outside `[a-z0-9.-]`, we
+    // still HTML-escape both the `repo_key` (URL-route input) and each
+    // `package` name (DB- or upstream-derived) before interpolation. The
+    // restrictive CSP header denies inline script execution even if a
+    // future regression somehow lets a `<` through both layers.
+    let escaped_repo_key = html_escape(repo_key);
     let mut html = String::from(
         "<!DOCTYPE html>\n<html>\n<head><meta name=\"pypi:repository-version\" content=\"1.0\"/>\
          <title>Simple Index</title></head>\n<body>\n<h1>Simple Index</h1>\n",
     );
 
     for package in packages {
+        let escaped = html_escape(package);
         html.push_str(&format!(
             "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
-            repo_key, package, package
+            escaped_repo_key, escaped, escaped
         ));
     }
     html.push_str("</body>\n</html>\n");
@@ -412,6 +487,13 @@ fn build_simple_root_response(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        // pip/uv only consume the link list; deny everything else so a
+        // hypothetical injection cannot exfiltrate cookies or load images.
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("X-Content-Type-Options", "nosniff")
         .body(Body::from(html))
         .unwrap())
 }
@@ -3573,6 +3655,205 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Stored-XSS regression tests (#1377 review)
+    //
+    // These tests pin the defense-in-depth contract for the proxied
+    // PEP 503 root index:
+    //   1. `normalize_pep503` MUST drop every char outside `[a-z0-9.-]`.
+    //   2. `build_simple_root_response` MUST HTML-escape everything it
+    //      interpolates.
+    //   3. The response MUST emit a restrictive Content-Security-Policy
+    //      so a hypothetical future regression cannot execute script.
+    //   4. `decode_html_entities_minimal` MUST NOT double-decode (so
+    //      `&amp;lt;` survives as the literal string `&lt;`, not `<`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pep503_drops_script_chars() {
+        // Layer 1: the security boundary at the name-normalisation step.
+        // A name parsed out of malicious upstream HTML must lose every
+        // character that could break out of an HTML attribute or text
+        // node before it ever reaches the response builder.
+        assert_eq!(
+            normalize_pep503("<script>alert(1)</script>"),
+            "scriptalert1script"
+        );
+        assert_eq!(
+            normalize_pep503("foo\"onerror=alert(1)"),
+            "fooonerroralert1"
+        );
+        assert_eq!(normalize_pep503("foo&bar"), "foobar");
+        assert_eq!(normalize_pep503("foo>bar"), "foobar");
+        assert_eq!(normalize_pep503("foo'bar"), "foobar");
+        // Backslash, tab, newline — all dropped.
+        assert_eq!(normalize_pep503("a\\b\tc\nd"), "abcd");
+        // Real-world: a valid name surrounded by junk loses only the junk.
+        assert_eq!(normalize_pep503("<a>flask</a>"), "aflaska");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_package_name() {
+        // Layer 2: even if a malformed name with HTML metacharacters did
+        // somehow reach the response builder (e.g. a future code path
+        // that bypasses `normalize_pep503`), the rendered HTML must
+        // never interpret it as markup.
+        let packages = vec![
+            "<script>alert('xss')</script>".to_string(),
+            "foo\"onerror=alert(1)\"".to_string(),
+            "ampersand&here".to_string(),
+        ];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Raw `<script>` must NEVER appear in the body. The literal
+        // string `alert` is fine to appear escaped, but the surrounding
+        // tag must be entity-encoded.
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        assert!(
+            !html.contains("</script>"),
+            "raw </script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        // The escaped form must be present, proving the escape ran.
+        assert!(html.contains("&lt;script&gt;"));
+        // Quote-injection inside the href attribute is neutralised.
+        assert!(!html.contains("\"onerror="));
+        assert!(html.contains("&quot;onerror"));
+        // Ampersand becomes &amp; (so the entity itself is safely encoded).
+        assert!(html.contains("ampersand&amp;here"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_repo_key() {
+        // The repo_key arrives from the URL router and should already
+        // be safe in practice, but the response builder treats it as
+        // untrusted on principle.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response =
+            build_simple_root_response(&headers, "repo\"><script>x</script>", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_sets_csp_header() {
+        // Layer 3: even if both upstream layers somehow regress, the
+        // browser refuses to execute inline script under this policy.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let csp = response
+            .headers()
+            .get("Content-Security-Policy")
+            .expect("CSP header MUST be present on simple-index responses")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        // X-Content-Type-Options nosniff also pins the content-type.
+        let xcto = response
+            .headers()
+            .get("X-Content-Type-Options")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(xcto, "nosniff");
+    }
+
+    #[test]
+    fn test_decode_html_entities_minimal_does_not_double_decode() {
+        // Naive chained `.replace()` would convert `&amp;lt;` -> `&lt;`
+        // -> `<`. A correct single-pass decoder yields `&lt;`.
+        assert_eq!(decode_html_entities_minimal("&amp;lt;"), "&lt;");
+        assert_eq!(decode_html_entities_minimal("&amp;gt;"), "&gt;");
+        assert_eq!(
+            decode_html_entities_minimal("&amp;amp;"),
+            "&amp;",
+            "double-encoded ampersand must decode once, not twice"
+        );
+        assert_eq!(decode_html_entities_minimal("&amp;quot;"), "&quot;");
+        // Single-encoded entities still decode normally.
+        assert_eq!(decode_html_entities_minimal("&lt;"), "<");
+        assert_eq!(decode_html_entities_minimal("&amp;"), "&");
+        assert_eq!(decode_html_entities_minimal("&quot;"), "\"");
+        // Mixed content.
+        assert_eq!(
+            decode_html_entities_minimal("foo &amp; &lt;bar&gt;"),
+            "foo & <bar>"
+        );
+        // Strings without `&` short-circuit and round-trip.
+        assert_eq!(decode_html_entities_minimal("hello world"), "hello world");
+        // Unknown entity references are passed through verbatim.
+        assert_eq!(decode_html_entities_minimal("&unknown;"), "&unknown;");
+    }
+
+    #[test]
+    fn test_malicious_upstream_simple_index_is_sanitized_end_to_end() {
+        // End-to-end pin: simulate a malicious upstream serving a
+        // `<script>`-bearing project name. After parsing + normalising,
+        // the rendered response must contain NO executable script
+        // markup (the package is effectively dropped because the only
+        // chars surviving normalisation are alphanumerics inside the
+        // `<script>` text, but the test focuses on the safety property
+        // rather than the exact surviving string).
+        let malicious_upstream = r#"
+            <!DOCTYPE html>
+            <html><body>
+              <a href="/simple/&lt;script&gt;alert(1)&lt;/script&gt;/">&lt;script&gt;alert(1)&lt;/script&gt;</a>
+              <a href="/simple/flask/">flask</a>
+              <a href="/simple/foo&amp;bar/">foo&amp;bar</a>
+            </body></html>
+        "#;
+
+        let names = parse_simple_root_projects(malicious_upstream);
+
+        // No surviving name may contain any HTML special character.
+        for name in &names {
+            assert!(!name.contains('<'), "parsed name leaked `<`: {:?}", name);
+            assert!(!name.contains('>'), "parsed name leaked `>`: {:?}", name);
+            assert!(!name.contains('&'), "parsed name leaked `&`: {:?}", name);
+            assert!(!name.contains('"'), "parsed name leaked `\"`: {:?}", name);
+            assert!(!name.contains('\''), "parsed name leaked `'`: {:?}", name);
+        }
+        // The benign names still come through.
+        assert!(names.iter().any(|n| n == "flask"));
+        assert!(names.iter().any(|n| n == "foobar"));
+
+        // Now render and verify the response body is XSS-safe.
+        let response =
+            build_simple_root_response(&HeaderMap::new(), "pypi-remote", &names).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("</script>"));
+        assert!(!html.contains("onerror="));
+    }
+
+    // -----------------------------------------------------------------------
     // merge_local_into_remote_simple_html — #1230 virtual union behavior
     // -----------------------------------------------------------------------
 
@@ -3771,11 +4052,14 @@ mod tests {
     /// Regression: HTML entities inside the anchor text must be decoded
     /// BEFORE PEP 503 normalisation, otherwise a name escaped as
     /// `foo&amp;bar` would carry the literal entity reference (`&amp;`)
-    /// into the normalised output and never match a subsequent project
-    /// request. `normalize_pep503` only collapses `-`/`_`/`.` and
-    /// lowercases ASCII letters, so the assertion here is that the
-    /// LITERAL entity reference characters (`amp`, `lt`, `gt`, `quot`,
-    /// `apos`) do not appear in the output — the decoder must run first.
+    /// into the normalised output. After the #1377 review hardening,
+    /// `normalize_pep503` also DROPS any character outside `[a-z0-9.-]`
+    /// — so the decoded `&`, `<`, `>`, `"`, `'` characters are stripped
+    /// at the normalisation step rather than carried through. The
+    /// assertion here is that (a) the literal entity reference tokens
+    /// do not leak through (decoder ran), AND (b) the dangerous
+    /// characters themselves do not leak through (normalisation
+    /// stripped them).
     #[test]
     fn test_parse_simple_root_projects_decodes_html_entities_in_text() {
         let html = "<html><body>\
@@ -3786,30 +4070,44 @@ mod tests {
                     <a href=\"t/\">a&apos;b</a>\
                     </body></html>";
         let projects = super::parse_simple_root_projects(html);
-        // No entity reference TOKEN should survive into the output.
         for p in &projects {
+            // No entity reference TOKEN should survive into the output.
             for token in ["amp;", "&lt", "&gt", "&quot", "&apos", "&#"] {
                 assert!(
                     !p.contains(token),
                     "entity reference token {token:?} leaked through into {p:?}"
                 );
             }
+            // Nor the dangerous decoded characters themselves.
+            for ch in ['&', '<', '>', '"', '\''] {
+                assert!(
+                    !p.contains(ch),
+                    "dangerous character {ch:?} leaked through into {p:?}"
+                );
+            }
         }
-        // And the decoded characters themselves are present (proves the
-        // decoder ran, not that the regex simply rejected the input).
-        assert!(projects.iter().any(|p| p == "foo&bar"));
+        // The benign letters survive normalisation: `foo&amp;bar`
+        // decodes to `foo&bar`, the `&` is stripped, and the result is
+        // `foobar`.
+        assert!(
+            projects.iter().any(|p| p == "foobar"),
+            "expected `foobar` (from `foo&amp;bar` after decode + strip) in {projects:?}"
+        );
     }
 
-    /// HTML entities in the href fallback path (when anchor text is empty)
-    /// must also be decoded before the trailing-segment extraction so the
-    /// resulting project name does not carry the literal entity reference.
+    /// HTML entities in the href fallback path (when anchor text is
+    /// empty) must also be decoded before the trailing-segment
+    /// extraction. After #1377 review hardening, the apostrophe
+    /// produced by the decode is then dropped by `normalize_pep503` so
+    /// the resulting project name contains only `[a-z0-9.-]`.
     #[test]
     fn test_parse_simple_root_projects_decodes_html_entities_in_href_fallback() {
         let html = "<html><body><a href=\"my&#39;pkg/\"></a></body></html>";
         let projects = super::parse_simple_root_projects(html);
-        // The `&#39;` must decode to `'` before normalisation; we assert
-        // the literal entity-reference characters do not survive.
-        assert_eq!(projects, vec!["my'pkg"]);
+        // The `&#39;` decodes to `'` (decoder ran), then the `'` is
+        // dropped at normalisation. The literal entity must not
+        // survive, and neither must the apostrophe.
+        assert_eq!(projects, vec!["mypkg"]);
     }
 
     // The body-size cap constant must be high enough to comfortably
