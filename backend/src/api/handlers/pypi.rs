@@ -24,7 +24,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -62,6 +62,16 @@ pub fn router() -> Router<SharedState> {
 
 /// Normalize a package name per PEP 503: lowercase, and replace any run of
 /// `[-_.]` characters with a single hyphen.
+///
+/// PEP 503 restricts canonical project names to the alphabet
+/// `[A-Za-z0-9._-]`. Any character outside that set is *malformed* and must
+/// be **dropped** rather than preserved. Preserving arbitrary characters
+/// (the previous behaviour) created a stored-XSS sink when this function
+/// was fed names parsed out of upstream HTML: an upstream serving an
+/// `<a>` element containing `<script>alert(1)</script>` would round-trip
+/// through `decode_html_entities_minimal` and land in our own simple-index
+/// HTML response (#1377 review, defense-in-depth layer 1). See also the
+/// HTML-escape applied at render time in `build_simple_root_response`.
 fn normalize_pep503(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut last_was_sep = true;
@@ -70,16 +80,14 @@ fn normalize_pep503(name: &str) -> String {
         if c.is_ascii_alphanumeric() {
             result.push(c.to_ascii_lowercase());
             last_was_sep = false;
-        } else if c == '-' || c == '_' || c == '.' {
-            if !last_was_sep {
-                result.push('-');
-                last_was_sep = true;
-            }
-        } else {
-            // Keep other characters as-is (digits, etc.)
-            result.push(c);
-            last_was_sep = false;
+        } else if (c == '-' || c == '_' || c == '.') && !last_was_sep {
+            result.push('-');
+            last_was_sep = true;
         }
+        // All other characters are NOT valid in a PEP 503 canonical name
+        // and are silently dropped. This is the security boundary that
+        // prevents `<`, `>`, `"`, `&`, control chars, etc. from ever
+        // appearing in a normalized package name.
     }
 
     if result.ends_with('-') {
@@ -172,19 +180,28 @@ async fn simple_root(
     .await
     .map_err(map_db_err)?;
 
-    let mut packages: Vec<String> = raw_names
-        .iter()
-        .map(|n| normalize_pep503(n))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut merged: std::collections::BTreeSet<String> =
+        raw_names.iter().map(|n| normalize_pep503(n)).collect();
+
+    // Remote repos: proxy the upstream /simple/ root and merge its package
+    // list into the response. Without this, a fresh Remote-only repo
+    // (proxy-cached artifacts no longer land in `artifacts`; see #1278/#1280)
+    // returns an empty root index even when the upstream advertises hundreds
+    // of packages. The fetched index is also cached via the proxy_service
+    // cache so subsequent requests hit the cache. (#1377)
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(names) =
+            fetch_remote_simple_root(&state, &repo.key, repo.id, &repo.upstream_url).await
+        {
+            merged.extend(names);
+        }
+    }
 
     // Virtual repos have no artifacts of their own. Aggregate package names
     // from all member repos so that the root index lists every package
     // available through the virtual endpoint.
-    if packages.is_empty() && repo.repo_type == RepositoryType::Virtual {
+    if merged.is_empty() && repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for member in &members {
             if member.repo_type == RepositoryType::Local
@@ -203,17 +220,216 @@ async fn simple_root(
                 .map_err(map_db_err)?;
 
                 merged.extend(member_raw.iter().map(|n| normalize_pep503(n)));
+            } else if member.repo_type == RepositoryType::Remote {
+                if let Some(names) =
+                    fetch_remote_simple_root(&state, &member.key, member.id, &member.upstream_url)
+                        .await
+                {
+                    merged.extend(names);
+                }
             }
-            // Remote member proxying for the root index is intentionally
-            // skipped: the upstream /simple/ can be very large and slow.
-            // Individual package lookups in simple_project() already proxy
-            // remote members on demand.
         }
-
-        packages = merged.into_iter().collect();
     }
 
+    let packages: Vec<String> = merged.into_iter().collect();
     build_simple_root_response(&headers, &repo_key, &packages)
+}
+
+/// Maximum size of an upstream PEP 503 root simple-index body we will parse.
+///
+/// PyPI's own root index is ~30 MB compressed but our typical Remote repos
+/// front a private/curated mirror with at most a few thousand packages
+/// (well under 1 MB). A 10 MB ceiling keeps us comfortably above any
+/// legitimate index while preventing a hostile or misconfigured upstream
+/// from feeding us a multi-hundred-megabyte HTML blob that would block the
+/// request handler synchronously inside the regex engine (#1377 review).
+const MAX_SIMPLE_ROOT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Fetch the PEP 503 root index from a Remote repo's upstream URL and parse
+/// out the project names. Returns `None` when the proxy service is not
+/// configured, the upstream URL is missing, the fetch fails, the response
+/// exceeds [`MAX_SIMPLE_ROOT_BODY_BYTES`], or the response is not HTML the
+/// parser recognises.
+///
+/// The fetched bytes are cached by the proxy_service under cache_path
+/// `simple/`. Subsequent calls within the cache TTL return the cached body
+/// without re-hitting upstream, which keeps the root index responsive even
+/// when the upstream registry is slow or transiently down (#1377).
+async fn fetch_remote_simple_root(
+    state: &SharedState,
+    repo_key: &str,
+    repo_id: uuid::Uuid,
+    upstream_url: &Option<String>,
+) -> Option<Vec<String>> {
+    let upstream = upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
+    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+        proxy,
+        repo_id,
+        repo_key,
+        &effective_upstream,
+        &upstream_path,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => return None,
+    };
+
+    if content.len() > MAX_SIMPLE_ROOT_BODY_BYTES {
+        warn!(
+            repo_key = %repo_key,
+            upstream = %effective_upstream,
+            body_bytes = content.len(),
+            cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
+            "upstream PEP 503 root index exceeds size cap; skipping parse. \
+             A future release will allow operators to opt into a higher cap \
+             for full-mirror Remote repos that front pypi.org directly."
+        );
+        return None;
+    }
+
+    // The regex pass over up to ~10 MiB of HTML is CPU-bound and blocks
+    // the async runtime worker. Offload to a blocking thread so the
+    // request handler does not stall other tasks on a slow parse
+    // (#1377 review).
+    let parsed = tokio::task::spawn_blocking(move || {
+        let html = String::from_utf8_lossy(&content);
+        parse_simple_root_projects(&html)
+    })
+    .await
+    .ok()?;
+    Some(parsed)
+}
+
+/// Decode the minimal set of HTML entities that legally appear inside an
+/// `<a>` text or `href` value in a PEP 503 simple-index page: `&amp;`,
+/// `&lt;`, `&gt;`, `&quot;`, `&apos;`, and the numeric `&#39;` apostrophe.
+///
+/// PEP 503 project names are restricted to `[A-Za-z0-9._-]` after
+/// normalisation, so a real project name will not contain entities; but a
+/// raw upstream index served by Warehouse/Nexus/Artifactory may HTML-escape
+/// ampersands in non-conforming legacy names (e.g. `foo&amp;bar`) or in
+/// hrefs that include query strings. Decoding here ensures the value fed
+/// into [`normalize_pep503`] is the real character, not the literal
+/// entity reference.
+fn decode_html_entities_minimal(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    // Single-pass scan so chained `.replace()` cannot double-decode.
+    // Naive `.replace("&amp;", "&").replace("&lt;", "<")` would convert
+    // `&amp;lt;` into `<`, which can re-introduce script-like sequences
+    // from a malicious upstream. A single left-to-right scan only
+    // recognises an entity at its original position and copies the
+    // resulting character verbatim, so further entity sequences are not
+    // re-evaluated (#1377 review).
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Longest-match-first on the supported entities. The list is
+            // intentionally fixed and small; arbitrary `&xyz;` references
+            // are left untouched (and ultimately get dropped by
+            // `normalize_pep503`).
+            let rest = &input[i..];
+            if rest.starts_with("&amp;") {
+                out.push('&');
+                i += "&amp;".len();
+                continue;
+            }
+            if rest.starts_with("&lt;") {
+                out.push('<');
+                i += "&lt;".len();
+                continue;
+            }
+            if rest.starts_with("&gt;") {
+                out.push('>');
+                i += "&gt;".len();
+                continue;
+            }
+            if rest.starts_with("&quot;") {
+                out.push('"');
+                i += "&quot;".len();
+                continue;
+            }
+            if rest.starts_with("&apos;") {
+                out.push('\'');
+                i += "&apos;".len();
+                continue;
+            }
+            if rest.starts_with("&#39;") {
+                out.push('\'');
+                i += "&#39;".len();
+                continue;
+            }
+        }
+        // Push one UTF-8 codepoint and advance past it.
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Extract project names from an upstream PEP 503 root simple index.
+///
+/// The root index is a flat HTML list of `<a href="...">project-name</a>`
+/// entries. We prefer the link text (canonical project name) but fall back
+/// to the last non-empty segment of the href when the text is empty. All
+/// names are PEP 503 normalised so duplicates collapse before merging into
+/// the response.
+///
+/// The regex accepts both double- and single-quoted href attributes (both
+/// are legal HTML) and the captured text/href is HTML-entity-decoded for a
+/// small set of common entities before normalisation, so a project like
+/// `foo&amp;bar` in upstream HTML normalises through the same path as
+/// `foo&bar` would.
+///
+/// Callers are expected to bound the input size before invoking this
+/// helper; see [`MAX_SIMPLE_ROOT_BODY_BYTES`]. This regex-based parser is
+/// intentionally narrow: a full HTML5 parser (e.g. the `scraper` crate)
+/// is tracked as a v1.2.1 follow-up.
+fn parse_simple_root_projects(html: &str) -> Vec<String> {
+    // Match `<a ... href="..." ...>text</a>` or `<a ... href='...' ...>text</a>`.
+    // Two alternations so the two captured pairs always live in fixed group
+    // indices: 1+2 (double-quote) or 3+4 (single-quote). Whichever pair the
+    // alternation matched, the other is `None`.
+    static A_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?is)<a\s+[^>]*?(?:href="([^"]*)"[^>]*>([^<]*)|href='([^']*)'[^>]*>([^<]*))</a>"#,
+        )
+        .unwrap()
+    });
+
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for caps in A_TAG_RE.captures_iter(html) {
+        let (href_raw, text_raw) = match (caps.get(1), caps.get(2), caps.get(3), caps.get(4)) {
+            (Some(h), Some(t), _, _) => (h.as_str(), t.as_str()),
+            (_, _, Some(h), Some(t)) => (h.as_str(), t.as_str()),
+            _ => continue,
+        };
+        let href = decode_html_entities_minimal(href_raw);
+        let text = decode_html_entities_minimal(text_raw.trim());
+        let name = if !text.is_empty() {
+            text
+        } else {
+            // Fallback: take the last non-empty path segment from the href.
+            href.trim_end_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string()
+        };
+        let normalized = normalize_pep503(&name);
+        if !normalized.is_empty() {
+            out.insert(normalized);
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Render the simple root index (list of all packages) as either HTML (PEP 503)
@@ -245,16 +461,25 @@ fn build_simple_root_response(
             .unwrap());
     }
 
-    // HTML response (default)
+    // HTML response (default).
+    //
+    // Defense-in-depth against stored XSS (#1377 review): even though
+    // `normalize_pep503` drops every character outside `[a-z0-9.-]`, we
+    // still HTML-escape both the `repo_key` (URL-route input) and each
+    // `package` name (DB- or upstream-derived) before interpolation. The
+    // restrictive CSP header denies inline script execution even if a
+    // future regression somehow lets a `<` through both layers.
+    let escaped_repo_key = html_escape(repo_key);
     let mut html = String::from(
         "<!DOCTYPE html>\n<html>\n<head><meta name=\"pypi:repository-version\" content=\"1.0\"/>\
          <title>Simple Index</title></head>\n<body>\n<h1>Simple Index</h1>\n",
     );
 
     for package in packages {
+        let escaped = html_escape(package);
         html.push_str(&format!(
             "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
-            repo_key, package, package
+            escaped_repo_key, escaped, escaped
         ));
     }
     html.push_str("</body>\n</html>\n");
@@ -262,6 +487,13 @@ fn build_simple_root_response(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        // pip/uv only consume the link list; deny everything else so a
+        // hypothetical injection cannot exfiltrate cookies or load images.
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("X-Content-Type-Options", "nosniff")
         .body(Body::from(html))
         .unwrap())
 }
@@ -3423,6 +3655,205 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Stored-XSS regression tests (#1377 review)
+    //
+    // These tests pin the defense-in-depth contract for the proxied
+    // PEP 503 root index:
+    //   1. `normalize_pep503` MUST drop every char outside `[a-z0-9.-]`.
+    //   2. `build_simple_root_response` MUST HTML-escape everything it
+    //      interpolates.
+    //   3. The response MUST emit a restrictive Content-Security-Policy
+    //      so a hypothetical future regression cannot execute script.
+    //   4. `decode_html_entities_minimal` MUST NOT double-decode (so
+    //      `&amp;lt;` survives as the literal string `&lt;`, not `<`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pep503_drops_script_chars() {
+        // Layer 1: the security boundary at the name-normalisation step.
+        // A name parsed out of malicious upstream HTML must lose every
+        // character that could break out of an HTML attribute or text
+        // node before it ever reaches the response builder.
+        assert_eq!(
+            normalize_pep503("<script>alert(1)</script>"),
+            "scriptalert1script"
+        );
+        assert_eq!(
+            normalize_pep503("foo\"onerror=alert(1)"),
+            "fooonerroralert1"
+        );
+        assert_eq!(normalize_pep503("foo&bar"), "foobar");
+        assert_eq!(normalize_pep503("foo>bar"), "foobar");
+        assert_eq!(normalize_pep503("foo'bar"), "foobar");
+        // Backslash, tab, newline — all dropped.
+        assert_eq!(normalize_pep503("a\\b\tc\nd"), "abcd");
+        // Real-world: a valid name surrounded by junk loses only the junk.
+        assert_eq!(normalize_pep503("<a>flask</a>"), "aflaska");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_package_name() {
+        // Layer 2: even if a malformed name with HTML metacharacters did
+        // somehow reach the response builder (e.g. a future code path
+        // that bypasses `normalize_pep503`), the rendered HTML must
+        // never interpret it as markup.
+        let packages = vec![
+            "<script>alert('xss')</script>".to_string(),
+            "foo\"onerror=alert(1)\"".to_string(),
+            "ampersand&here".to_string(),
+        ];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Raw `<script>` must NEVER appear in the body. The literal
+        // string `alert` is fine to appear escaped, but the surrounding
+        // tag must be entity-encoded.
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        assert!(
+            !html.contains("</script>"),
+            "raw </script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        // The escaped form must be present, proving the escape ran.
+        assert!(html.contains("&lt;script&gt;"));
+        // Quote-injection inside the href attribute is neutralised.
+        assert!(!html.contains("\"onerror="));
+        assert!(html.contains("&quot;onerror"));
+        // Ampersand becomes &amp; (so the entity itself is safely encoded).
+        assert!(html.contains("ampersand&amp;here"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_repo_key() {
+        // The repo_key arrives from the URL router and should already
+        // be safe in practice, but the response builder treats it as
+        // untrusted on principle.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response =
+            build_simple_root_response(&headers, "repo\"><script>x</script>", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_sets_csp_header() {
+        // Layer 3: even if both upstream layers somehow regress, the
+        // browser refuses to execute inline script under this policy.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let csp = response
+            .headers()
+            .get("Content-Security-Policy")
+            .expect("CSP header MUST be present on simple-index responses")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        // X-Content-Type-Options nosniff also pins the content-type.
+        let xcto = response
+            .headers()
+            .get("X-Content-Type-Options")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(xcto, "nosniff");
+    }
+
+    #[test]
+    fn test_decode_html_entities_minimal_does_not_double_decode() {
+        // Naive chained `.replace()` would convert `&amp;lt;` -> `&lt;`
+        // -> `<`. A correct single-pass decoder yields `&lt;`.
+        assert_eq!(decode_html_entities_minimal("&amp;lt;"), "&lt;");
+        assert_eq!(decode_html_entities_minimal("&amp;gt;"), "&gt;");
+        assert_eq!(
+            decode_html_entities_minimal("&amp;amp;"),
+            "&amp;",
+            "double-encoded ampersand must decode once, not twice"
+        );
+        assert_eq!(decode_html_entities_minimal("&amp;quot;"), "&quot;");
+        // Single-encoded entities still decode normally.
+        assert_eq!(decode_html_entities_minimal("&lt;"), "<");
+        assert_eq!(decode_html_entities_minimal("&amp;"), "&");
+        assert_eq!(decode_html_entities_minimal("&quot;"), "\"");
+        // Mixed content.
+        assert_eq!(
+            decode_html_entities_minimal("foo &amp; &lt;bar&gt;"),
+            "foo & <bar>"
+        );
+        // Strings without `&` short-circuit and round-trip.
+        assert_eq!(decode_html_entities_minimal("hello world"), "hello world");
+        // Unknown entity references are passed through verbatim.
+        assert_eq!(decode_html_entities_minimal("&unknown;"), "&unknown;");
+    }
+
+    #[test]
+    fn test_malicious_upstream_simple_index_is_sanitized_end_to_end() {
+        // End-to-end pin: simulate a malicious upstream serving a
+        // `<script>`-bearing project name. After parsing + normalising,
+        // the rendered response must contain NO executable script
+        // markup (the package is effectively dropped because the only
+        // chars surviving normalisation are alphanumerics inside the
+        // `<script>` text, but the test focuses on the safety property
+        // rather than the exact surviving string).
+        let malicious_upstream = r#"
+            <!DOCTYPE html>
+            <html><body>
+              <a href="/simple/&lt;script&gt;alert(1)&lt;/script&gt;/">&lt;script&gt;alert(1)&lt;/script&gt;</a>
+              <a href="/simple/flask/">flask</a>
+              <a href="/simple/foo&amp;bar/">foo&amp;bar</a>
+            </body></html>
+        "#;
+
+        let names = parse_simple_root_projects(malicious_upstream);
+
+        // No surviving name may contain any HTML special character.
+        for name in &names {
+            assert!(!name.contains('<'), "parsed name leaked `<`: {:?}", name);
+            assert!(!name.contains('>'), "parsed name leaked `>`: {:?}", name);
+            assert!(!name.contains('&'), "parsed name leaked `&`: {:?}", name);
+            assert!(!name.contains('"'), "parsed name leaked `\"`: {:?}", name);
+            assert!(!name.contains('\''), "parsed name leaked `'`: {:?}", name);
+        }
+        // The benign names still come through.
+        assert!(names.iter().any(|n| n == "flask"));
+        assert!(names.iter().any(|n| n == "foobar"));
+
+        // Now render and verify the response body is XSS-safe.
+        let response =
+            build_simple_root_response(&HeaderMap::new(), "pypi-remote", &names).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("</script>"));
+        assert!(!html.contains("onerror="));
+    }
+
+    // -----------------------------------------------------------------------
     // merge_local_into_remote_simple_html — #1230 virtual union behavior
     // -----------------------------------------------------------------------
 
@@ -3556,5 +3987,272 @@ mod tests {
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
         assert!(merged.contains("pkg-1.0.0.tar.gz"));
         assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1377 — Remote PyPI root simple-index proxy + cache.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_simple_root_projects_extracts_from_pep503_html() {
+        // Canonical PEP 503 root index shape: <a href="<project>/"><project></a>
+        let html = "<!DOCTYPE html><html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href=\"requests/\">requests</a>\
+                    <a href=\"my_pkg/\">My_Pkg</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // PEP 503 normalisation: lowercase + `_`/`.` collapsed to `-`.
+        assert_eq!(projects, vec!["flask", "my-pkg", "requests"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_falls_back_to_href_when_text_missing() {
+        // Some indexes emit the link without text content (Nexus). The
+        // parser must fall back to the trailing href segment so we do not
+        // silently drop entries.
+        let html = "<html><body><a href=\"numpy/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["numpy"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_empty_when_no_anchors() {
+        let projects = super::parse_simple_root_projects("<html><body>no links</body></html>");
+        assert!(projects.is_empty());
+    }
+
+    /// Regression: single-quoted href attributes are legal HTML and at
+    /// least one upstream (older Devpi releases) emits them. Before the
+    /// review hardening the regex only matched `href="..."`, silently
+    /// dropping single-quoted entries from the parsed project list.
+    #[test]
+    fn test_parse_simple_root_projects_accepts_single_quoted_hrefs() {
+        let html = "<html><body>\
+                    <a href='flask/'>Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Mixed single + double quote anchors in the same document must both
+    /// be picked up. Real-world index pages occasionally mix quoting styles
+    /// when concatenated from multiple templates.
+    #[test]
+    fn test_parse_simple_root_projects_mixed_quote_styles() {
+        let html = "<html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Regression: HTML entities inside the anchor text must be decoded
+    /// BEFORE PEP 503 normalisation, otherwise a name escaped as
+    /// `foo&amp;bar` would carry the literal entity reference (`&amp;`)
+    /// into the normalised output. After the #1377 review hardening,
+    /// `normalize_pep503` also DROPS any character outside `[a-z0-9.-]`
+    /// — so the decoded `&`, `<`, `>`, `"`, `'` characters are stripped
+    /// at the normalisation step rather than carried through. The
+    /// assertion here is that (a) the literal entity reference tokens
+    /// do not leak through (decoder ran), AND (b) the dangerous
+    /// characters themselves do not leak through (normalisation
+    /// stripped them).
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_text() {
+        let html = "<html><body>\
+                    <a href=\"odd/\">foo&amp;bar</a>\
+                    <a href=\"q/\">a&lt;b</a>\
+                    <a href=\"r/\">a&gt;b</a>\
+                    <a href=\"s/\">a&quot;b</a>\
+                    <a href=\"t/\">a&apos;b</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        for p in &projects {
+            // No entity reference TOKEN should survive into the output.
+            for token in ["amp;", "&lt", "&gt", "&quot", "&apos", "&#"] {
+                assert!(
+                    !p.contains(token),
+                    "entity reference token {token:?} leaked through into {p:?}"
+                );
+            }
+            // Nor the dangerous decoded characters themselves.
+            for ch in ['&', '<', '>', '"', '\''] {
+                assert!(
+                    !p.contains(ch),
+                    "dangerous character {ch:?} leaked through into {p:?}"
+                );
+            }
+        }
+        // The benign letters survive normalisation: `foo&amp;bar`
+        // decodes to `foo&bar`, the `&` is stripped, and the result is
+        // `foobar`.
+        assert!(
+            projects.iter().any(|p| p == "foobar"),
+            "expected `foobar` (from `foo&amp;bar` after decode + strip) in {projects:?}"
+        );
+    }
+
+    /// HTML entities in the href fallback path (when anchor text is
+    /// empty) must also be decoded before the trailing-segment
+    /// extraction. After #1377 review hardening, the apostrophe
+    /// produced by the decode is then dropped by `normalize_pep503` so
+    /// the resulting project name contains only `[a-z0-9.-]`.
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_href_fallback() {
+        let html = "<html><body><a href=\"my&#39;pkg/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // The `&#39;` decodes to `'` (decoder ran), then the `'` is
+        // dropped at normalisation. The literal entity must not
+        // survive, and neither must the apostrophe.
+        assert_eq!(projects, vec!["mypkg"]);
+    }
+
+    // The body-size cap constant must be high enough to comfortably
+    // accommodate any legitimate private-mirror index but low enough to
+    // stop a hostile upstream from forcing a multi-hundred-megabyte
+    // allocation + regex sweep on a single request. We assert this at
+    // compile time rather than runtime so the test is free.
+    const _MIN_CAP: usize = 1024 * 1024; // 1 MiB
+    const _MAX_CAP: usize = 64 * 1024 * 1024; // 64 MiB
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES >= _MIN_CAP);
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES <= _MAX_CAP);
+
+    /// Regression: a Remote PyPI repo with NO local artifacts must proxy
+    /// upstream `/simple/` and return the upstream's package list. Before
+    /// #1377 this returned an empty index because `simple_root` only ever
+    /// queried the local `artifacts` table, and proxy-cached items no
+    /// longer create rows there (#1278 / #1280).
+    ///
+    /// Also covers the cache-roundtrip path: a second invocation must
+    /// reuse the proxy_service cache and produce the same package list
+    /// without re-hitting upstream.
+    #[tokio::test]
+    async fn test_simple_root_remote_proxies_and_caches_upstream_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let upstream_index = "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"/></head><body>\
+                              <a href=\"reltest-pkg/\">reltest-pkg</a>\
+                              <a href=\"flask/\">Flask</a>\
+                              </body></html>";
+
+        // Both /simple/ and /simple (without trailing slash) should be
+        // covered: the proxy fetch always lands on /simple/.
+        let hits_for_mock = hits.clone();
+        Mock::given(method("GET"))
+            .and(path("/simple/"))
+            .respond_with(move |_req: &wiremock::Request| {
+                hits_for_mock.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(upstream_index)
+            })
+            .mount(&mock_server)
+            .await;
+
+        // Re-point repo at the mock upstream.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let do_cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        // 1st call: HTML body must contain BOTH upstream packages and route
+        // their hrefs to the local repo (not the upstream URL).
+        let result = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root must succeed for Remote repo, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_str = std::str::from_utf8(&body_bytes).expect("utf8");
+        assert!(
+            body_str.contains(">reltest-pkg<"),
+            "root simple index must list 'reltest-pkg' from upstream (#1377): {body_str}"
+        );
+        assert!(
+            body_str.contains(">flask<"),
+            "root simple index must list 'flask' (normalised) from upstream: {body_str}"
+        );
+        assert!(
+            body_str.contains(&format!("/pypi/{}/simple/", fx.repo_key)),
+            "root simple index must point hrefs at the local repo, not the upstream: {body_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream hit exactly once on first call"
+        );
+
+        // 2nd call: proxy cache must satisfy this request without a fresh
+        // upstream HEAD/GET. Package list must still be the same.
+        let result2 = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response2 = match result2 {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root cache roundtrip must succeed, got {status}");
+            }
+        };
+        let body_bytes2 = axum::body::to_bytes(response2.into_body(), 1024 * 1024)
+            .await
+            .expect("body2");
+        let body_str2 = std::str::from_utf8(&body_bytes2).expect("utf82");
+        assert!(
+            body_str2.contains(">reltest-pkg<"),
+            "cached root simple index must still list 'reltest-pkg' (#1377): {body_str2}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream must NOT be hit again on a cache-roundtrip read"
+        );
+
+        do_cleanup().await;
     }
 }
