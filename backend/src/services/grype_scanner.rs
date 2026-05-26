@@ -25,11 +25,11 @@ use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
+use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
-    is_oci_image_artifact, parse_oci_manifest_path, ScanOutput, ScanWorkspace, Scanner,
-    VersionCache,
+    is_oci_image_artifact, parse_oci_manifest_path, validate_trivy_purl, ScanOutput, ScanWorkspace,
+    Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,30 @@ pub struct GrypeArtifact {
     pub version: String,
     #[serde(rename = "type", default)]
     pub artifact_type: Option<String>,
+    /// Package URL emitted by Grype v0.50+ on the matched artifact, e.g.
+    /// `pkg:npm/lodash@4.17.20`. When present, this is preferred over a
+    /// synthesized PURL because Grype's normalization handles edge cases
+    /// (namespaced npm scopes, Maven group/artifact split, Go module
+    /// path encoding) that a from-scratch builder would miss.
+    #[serde(default)]
+    pub purl: Option<String>,
+    /// SPDX license expression emitted by some Grype-cataloged ecosystems
+    /// (deb, rpm, language packages with declared metadata). Optional;
+    /// many Grype matches lack a `licenses` block entirely.
+    #[serde(default)]
+    pub licenses: Option<Vec<GrypeLicense>>,
+}
+
+/// Per-license entry inside `artifact.licenses`. Grype emits objects of
+/// the shape `{"value": "MIT", "spdxExpression": "MIT", "type": "declared"}`.
+/// We only need the `value` (or `spdxExpression` when present) — the rest
+/// is informational.
+#[derive(Debug, Deserialize)]
+pub struct GrypeLicense {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default, rename = "spdxExpression")]
+    pub spdx_expression: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,23 +269,34 @@ impl GrypeScanner {
     }
 
     /// Convert Grype matches into `RawFinding` values.
+    ///
+    /// `affected_component` holds the bare package name. Earlier versions of
+    /// this method appended the artifact type in parentheses (e.g. `log4j-core
+    /// (java-archive)`), but #1311 aligned the image-scanner code path with
+    /// the filesystem-scanner contract from #903: cross-source join keys
+    /// (SBOM, CVE-mapping, UI) need the raw name, and any type information
+    /// belongs in a separate column rather than smuggled inside the name
+    /// string.
+    ///
+    /// Companion package inventory is emitted by [`convert_packages`] so that
+    /// SBOM generation reflects the components Grype matched on even when the
+    /// co-resident Trivy filesystem scanner missed them (a transitive
+    /// node_module nested deeper than Trivy's lockfile parser walked, an
+    /// ecosystem Trivy lacks a parser for, etc. — see #1273).
     fn convert_findings(report: &GrypeReport) -> Vec<RawFinding> {
         report
             .matches
             .iter()
             .map(|m| {
-                let affected_component = Some(match &m.artifact.artifact_type {
-                    Some(t) => format!("{} ({})", m.artifact.name, t),
-                    None => m.artifact.name.clone(),
-                });
-
                 RawFinding {
                     severity: Severity::from_str_loose(&m.vulnerability.severity)
                         .unwrap_or(Severity::Info),
                     title: format!("{} in {}", m.vulnerability.id, m.artifact.name),
                     description: m.vulnerability.description.clone(),
                     cve_id: Some(m.vulnerability.id.clone()),
-                    affected_component,
+                    // Bare package name; matches scanner_service::convert_trivy_findings
+                    // so SBOM / CVE-mapping consumers can join on the raw name.
+                    affected_component: Some(m.artifact.name.clone()),
                     affected_version: Some(m.artifact.version.clone()),
                     fixed_version: m
                         .vulnerability
@@ -277,6 +312,143 @@ impl GrypeScanner {
                 }
             })
             .collect()
+    }
+
+    /// Convert Grype matches into [`RawPackage`] inventory rows (#1273).
+    ///
+    /// Grype's JSON output names every package it finds a CVE for inside the
+    /// `matches[].artifact` block. Persisting those as `scan_packages` rows
+    /// makes the SBOM read path (`extract_dependencies_for_artifact`) surface
+    /// the vulnerable component in the CycloneDX/SPDX `components` list, even
+    /// when the co-resident Trivy filesystem scanner did not enumerate it —
+    /// the bug reported in #1273 where a Grype CVE lands on a transitive
+    /// node_module that Trivy's package-lock parser walked past.
+    ///
+    /// One package can carry multiple CVEs (Grype emits one match per CVE),
+    /// so we dedupe by `(name, version)` to keep the inventory list small
+    /// and to mirror the database's `scan_packages_unique_per_scan` index:
+    /// the DB would reject duplicates anyway, but pre-deduping cuts the
+    /// INSERT volume and avoids the per-row metric incrementing on rows
+    /// the index drops.
+    ///
+    /// PURL preference order, mirroring the spec recommendation:
+    /// 1. Grype's own `artifact.purl` when present (Grype v0.50+ emits this
+    ///    for the catalogued ecosystems; the field is normalized for
+    ///    namespaced npm scopes, Maven group/artifact, etc.).
+    /// 2. Synthesized from the Grype `artifact.type` token and the
+    ///    `(name, version)` pair when the PURL field is absent (legacy
+    ///    Grype builds, exotic ecosystems).
+    /// 3. `None` when neither path produces a syntactically valid PURL.
+    ///
+    /// Returns an empty Vec when the report has no matches, which is the
+    /// expected output for clean artifacts and preserves the pre-#1273
+    /// behaviour of [`ScanOutput::findings_only`] for that case.
+    fn convert_packages(report: &GrypeReport) -> Vec<RawPackage> {
+        let mut seen: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
+        let mut packages = Vec::new();
+        for m in &report.matches {
+            if m.artifact.name.is_empty() {
+                continue;
+            }
+            let version_opt = if m.artifact.version.is_empty() {
+                None
+            } else {
+                Some(m.artifact.version.clone())
+            };
+            let key = (m.artifact.name.clone(), version_opt.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let purl = grype_artifact_purl(&m.artifact);
+            let license = grype_artifact_license(&m.artifact);
+            packages.push(RawPackage {
+                name: m.artifact.name.clone(),
+                version: version_opt,
+                purl,
+                license,
+                // Grype does not name the lockfile/manifest the match came
+                // from in a stable field; leaving source_target None mirrors
+                // the convention used for image-mode Trivy rows that lack a
+                // per-result target string.
+                source_target: m.artifact.artifact_type.clone(),
+            });
+        }
+        packages
+    }
+}
+
+/// Resolve a PURL string for a Grype-matched artifact (#1273).
+///
+/// Prefers Grype's own `artifact.purl` when it passes the same syntactic
+/// validation Trivy PURLs go through ([`validate_trivy_purl`]). Falls back to
+/// synthesizing `pkg:<type>/<name>@<version>` from the Grype `artifact.type`
+/// token. Returns `None` when neither path produces a valid PURL.
+fn grype_artifact_purl(artifact: &GrypeArtifact) -> Option<String> {
+    if let Some(raw) = artifact.purl.as_deref() {
+        if let Some(valid) = validate_trivy_purl(raw) {
+            return Some(valid);
+        }
+    }
+    let purl_type = grype_type_to_purl_type(artifact.artifact_type.as_deref()?)?;
+    if artifact.name.is_empty() || artifact.version.is_empty() {
+        return None;
+    }
+    let synthesized = format!("pkg:{}/{}@{}", purl_type, artifact.name, artifact.version);
+    validate_trivy_purl(&synthesized)
+}
+
+/// Reduce a Grype `licenses` array to a SPDX-safe joined expression.
+/// Mirrors the Trivy-side [`crate::services::scanner_service::sanitize_trivy_licenses`]
+/// pipeline: each input term passes through the SPDX whitelist so a hostile
+/// metadata field cannot smuggle a non-standard identifier into the SBOM.
+fn grype_artifact_license(artifact: &GrypeArtifact) -> Option<String> {
+    let licenses = artifact.licenses.as_ref()?;
+    let terms: Vec<String> = licenses
+        .iter()
+        .filter_map(|l| {
+            l.spdx_expression
+                .as_deref()
+                .or(l.value.as_deref())
+                .map(str::to_string)
+        })
+        .collect();
+    crate::services::scanner_service::sanitize_trivy_licenses(&terms)
+}
+
+/// Map a Grype `artifact.type` token to its PURL `type` segment.
+///
+/// Grype's package types are documented at
+/// <https://github.com/anchore/syft/blob/main/syft/pkg/type.go> and follow a
+/// stable enumeration: `npm`, `python`, `gem`, `java-archive`, `go-module`,
+/// `rust-crate`, `apk`, `deb`, `rpm`, `dotnet`, `php-composer`, etc.
+///
+/// Returns `None` for unknown types so the caller drops the PURL field rather
+/// than minting `pkg:unknown/...` strings that downstream tooling will reject.
+/// This mirrors the conservative posture of
+/// [`crate::services::scanner_service::format_to_purl_type`] which falls back
+/// to `"generic"`, but for inventory rows that already have a name+version we
+/// prefer a missing PURL to a wrong-namespace one.
+fn grype_type_to_purl_type(grype_type: &str) -> Option<&'static str> {
+    match grype_type.to_lowercase().as_str() {
+        "npm" => Some("npm"),
+        "python" => Some("pypi"),
+        "gem" => Some("gem"),
+        "java-archive" | "jenkins-plugin" => Some("maven"),
+        "go-module" | "go-mod" => Some("golang"),
+        "rust-crate" => Some("cargo"),
+        "apk" => Some("apk"),
+        "deb" => Some("deb"),
+        "rpm" => Some("rpm"),
+        "dotnet" => Some("nuget"),
+        "php-composer" | "composer" => Some("composer"),
+        "conan" => Some("conan"),
+        "hex" => Some("hex"),
+        "dart-pub" => Some("pub"),
+        "swift" => Some("swift"),
+        "cocoapods" => Some("cocoapods"),
+        "hackage" => Some("hackage"),
+        _ => None,
     }
 }
 
@@ -360,12 +532,24 @@ impl Scanner for GrypeScanner {
             };
 
             let findings = Self::convert_findings(&report);
+            let packages = Self::convert_packages(&report);
             info!(
-                "Grype OCI scan complete for {}: {} vulnerabilities found",
+                "Grype OCI scan complete for {}: {} vulnerabilities, {} components",
                 artifact.name,
-                findings.len()
+                findings.len(),
+                packages.len()
             );
-            return Ok(ScanOutput::findings_only(findings));
+            // #1273: emit a `packages` list (not `findings_only`) so the
+            // vulnerable components Grype matched on appear in the SBOM
+            // even when Trivy did not enumerate them. ScanCompleteness
+            // stays Complete because Grype's catalog of matched packages
+            // is the universe it intends to report on; the partial-scan
+            // signal is reserved for Trivy's parser-skipped lockfiles.
+            return Ok(ScanOutput {
+                findings,
+                packages,
+                scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            });
         }
 
         let workspace =
@@ -381,20 +565,33 @@ impl Scanner for GrypeScanner {
         };
 
         let findings = Self::convert_findings(&report);
+        let packages = Self::convert_packages(&report);
 
         info!(
-            "Grype scan complete for {}: {} vulnerabilities found",
+            "Grype scan complete for {}: {} vulnerabilities, {} components",
             artifact.name,
-            findings.len()
+            findings.len(),
+            packages.len()
         );
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
-        // Grype's default JSON shape does not enumerate non-vulnerable
-        // packages; SBOM generation for Grype-scanned artifacts depends on
-        // Trivy's filesystem inventory running alongside. Returning an
-        // empty packages Vec is correct rather than misleading.
-        Ok(ScanOutput::findings_only(findings))
+        // #1273: Grype's default JSON does not enumerate *every* installed
+        // package the way Trivy's `--list-all-pkgs` does, but it does name
+        // every CVE-matched artifact in the `matches[].artifact` block.
+        // Persisting those as scan_packages rows means an artifact whose
+        // only inventory signal is Grype (Trivy missed a transitive
+        // node_module, or the ecosystem has no Trivy parser at all) still
+        // produces an SBOM whose `components` list includes the vulnerable
+        // package — the bug reported in #1273. The empty-packages Vec
+        // returned for clean artifacts (no matches) preserves the original
+        // findings-only semantic, with `extract_dependencies_for_artifact`
+        // falling through to Trivy's inventory.
+        Ok(ScanOutput {
+            findings,
+            packages,
+            scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+        })
     }
 }
 
@@ -634,6 +831,8 @@ mod tests {
                     name: "vulnerable-pkg".to_string(),
                     version: "1.0.0".to_string(),
                     artifact_type: Some("python".to_string()),
+                    purl: None,
+                    licenses: None,
                 },
             }],
         };
@@ -644,22 +843,69 @@ mod tests {
         assert_eq!(findings[0].cve_id, Some("CVE-2023-99999".to_string()));
         assert_eq!(findings[0].fixed_version, Some("2.0.0".to_string()));
         assert_eq!(findings[0].source, Some("grype".to_string()));
-        assert!(findings[0]
-            .affected_component
-            .as_ref()
-            .unwrap()
-            .contains("vulnerable-pkg"));
-        assert!(findings[0]
-            .affected_component
-            .as_ref()
-            .unwrap()
-            .contains("python"));
+        // #1311: affected_component is the bare package name, mirroring the
+        // filesystem-scanner contract from #903. The artifact type
+        // ("python") used to be appended in parentheses but is now dropped
+        // so SBOM / CVE-mapping consumers can join on the raw name.
+        assert_eq!(
+            findings[0].affected_component,
+            Some("vulnerable-pkg".to_string()),
+            "affected_component must be the bare package name, not '<name> (<type>)'"
+        );
         assert_eq!(findings[0].affected_version, Some("1.0.0".to_string()));
         assert!(findings[0]
             .source_url
             .as_ref()
             .unwrap()
             .contains("nvd.nist.gov"));
+    }
+
+    /// Regression test for #1311. Grype's image-scanner code path (via
+    /// registry mode #1160) historically wrapped `affected_component` as
+    /// `"<name> (<artifact_type>)"`, e.g. `"log4j-core (java-archive)"`.
+    /// PR #1150 standardized `scan_findings.affected_component` to the
+    /// bare package name across all scanners so SBOM CycloneDX/SPDX output
+    /// and the `scan_packages` join-table reconcile entries by raw name.
+    /// This test pins the bare-name format on a Grype finding that carries
+    /// a non-empty `artifact_type`, the exact shape that produced the bug.
+    #[test]
+    fn test_convert_findings_emits_bare_package_name_for_typed_artifact() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2021-44228".to_string(),
+                    severity: "Critical".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "log4j-core".to_string(),
+                    version: "2.14.1".to_string(),
+                    artifact_type: Some("java-archive".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+            }],
+        };
+
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 1);
+        let component = findings[0]
+            .affected_component
+            .as_ref()
+            .expect("affected_component must be populated");
+        assert_eq!(
+            component, "log4j-core",
+            "affected_component must be the bare package name; got {:?} \
+             (the legacy '<name> (<type>)' format breaks SBOM and CVE-mapping joins, see #1311)",
+            component
+        );
+        assert!(
+            !component.contains('('),
+            "affected_component must not contain the artifact-type parenthetical (#1311); got {:?}",
+            component
+        );
     }
 
     #[test]
@@ -677,6 +923,8 @@ mod tests {
                     name: "some-lib".to_string(),
                     version: "0.5.0".to_string(),
                     artifact_type: None,
+                    purl: None,
+                    licenses: None,
                 },
             }],
         };
@@ -952,5 +1200,287 @@ mod tests {
                 why
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1273: convert_packages produces a scan_packages inventory row for
+    // every artifact Grype matched a CVE on, so SBOM generation surfaces the
+    // vulnerable component even when Trivy's filesystem inventory missed it
+    // (transitive node_module deeper than Trivy walked, ecosystem with no
+    // Trivy parser, etc.). The original behaviour was `ScanOutput::findings_
+    // only` which left `packages` empty and made the SBOM read path return
+    // Trivy's incomplete list with no fallback for the Grype side.
+    // -----------------------------------------------------------------------
+
+    /// Regression test for #1273. A Grype match on a package not enumerated
+    /// by Trivy must surface as a `scan_packages` inventory row so the SBOM
+    /// `components` list includes the vulnerable component. Pre-fix, the
+    /// returned packages Vec was unconditionally empty.
+    #[test]
+    fn test_convert_packages_emits_inventory_for_each_match() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2021-44228".to_string(),
+                    severity: "Critical".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "log4j-core".to_string(),
+                    version: "2.14.1".to_string(),
+                    artifact_type: Some("java-archive".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+            }],
+        };
+
+        let packages = GrypeScanner::convert_packages(&report);
+        assert_eq!(
+            packages.len(),
+            1,
+            "one match must produce one inventory row"
+        );
+        assert_eq!(packages[0].name, "log4j-core");
+        assert_eq!(packages[0].version.as_deref(), Some("2.14.1"));
+        assert_eq!(
+            packages[0].purl.as_deref(),
+            Some("pkg:maven/log4j-core@2.14.1"),
+            "java-archive grype type must synthesize a pkg:maven/... PURL"
+        );
+        assert_eq!(
+            packages[0].source_target.as_deref(),
+            Some("java-archive"),
+            "Grype's artifact.type belongs in source_target so the SBOM \
+             writer can surface ecosystem context without smuggling it into \
+             the bare name (mirrors the #1311 contract)"
+        );
+    }
+
+    /// Multiple CVEs on the same (name, version) must collapse to a single
+    /// inventory row. Grype emits one match per CVE, so without dedup a
+    /// package with 5 CVEs would produce 5 identical scan_packages rows and
+    /// the DB's `scan_packages_unique_per_scan` index would reject 4 of them
+    /// (counting as inventory failures in the metrics layer).
+    #[test]
+    fn test_convert_packages_dedupes_by_name_and_version() {
+        let mk_match = |cve: &str| GrypeMatch {
+            vulnerability: GrypeVulnerability {
+                id: cve.to_string(),
+                severity: "High".to_string(),
+                description: None,
+                fix: None,
+                urls: None,
+            },
+            artifact: GrypeArtifact {
+                name: "lodash".to_string(),
+                version: "4.17.20".to_string(),
+                artifact_type: Some("npm".to_string()),
+                purl: None,
+                licenses: None,
+            },
+        };
+        let report = GrypeReport {
+            matches: vec![
+                mk_match("CVE-2021-23337"),
+                mk_match("CVE-2020-28500"),
+                mk_match("CVE-2021-23337"), // exact duplicate, also dedup'd
+            ],
+        };
+
+        let packages = GrypeScanner::convert_packages(&report);
+        assert_eq!(
+            packages.len(),
+            1,
+            "three matches on (lodash, 4.17.20) must collapse to one inventory row"
+        );
+        assert_eq!(packages[0].purl.as_deref(), Some("pkg:npm/lodash@4.17.20"));
+    }
+
+    /// Grype v0.50+ emits `artifact.purl` directly. Prefer it over the
+    /// synthesized form because Grype's normalization handles edge cases a
+    /// from-scratch builder would miss (namespaced npm scopes, Maven
+    /// group/artifact split, Go module path encoding).
+    #[test]
+    fn test_convert_packages_prefers_native_grype_purl() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2024-0001".to_string(),
+                    severity: "Medium".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "@types/node".to_string(),
+                    version: "20.0.0".to_string(),
+                    artifact_type: Some("npm".to_string()),
+                    purl: Some("pkg:npm/%40types/node@20.0.0".to_string()),
+                    licenses: None,
+                },
+            }],
+        };
+
+        let packages = GrypeScanner::convert_packages(&report);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].purl.as_deref(),
+            Some("pkg:npm/%40types/node@20.0.0"),
+            "Grype's emitted PURL must be preferred over the synthesized form \
+             so namespaced npm scopes survive the round-trip"
+        );
+    }
+
+    /// Empty name rows are dropped (data-quality filter mirroring the Trivy
+    /// path's `filter(|p| !p.name.is_empty())`).
+    #[test]
+    fn test_convert_packages_drops_empty_name() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2024-0002".to_string(),
+                    severity: "Low".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "".to_string(),
+                    version: "1.0.0".to_string(),
+                    artifact_type: Some("npm".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+            }],
+        };
+        assert!(GrypeScanner::convert_packages(&report).is_empty());
+    }
+
+    /// Unknown Grype types yield `None` for the PURL field rather than a
+    /// `pkg:generic/...` string. A bogus PURL is worse than a missing one
+    /// because downstream attestation tooling will reject the whole SBOM,
+    /// whereas a missing PURL just drops the field on that one row.
+    #[test]
+    fn test_convert_packages_unknown_type_drops_purl_keeps_row() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2024-0003".to_string(),
+                    severity: "Medium".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "esoteric-pkg".to_string(),
+                    version: "1.2.3".to_string(),
+                    artifact_type: Some("not-a-known-grype-type".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+            }],
+        };
+        let packages = GrypeScanner::convert_packages(&report);
+        assert_eq!(packages.len(), 1, "unknown type must keep the row");
+        assert!(
+            packages[0].purl.is_none(),
+            "unknown grype type must drop the PURL field rather than fabricate one"
+        );
+        assert_eq!(packages[0].name, "esoteric-pkg");
+        assert_eq!(packages[0].version.as_deref(), Some("1.2.3"));
+    }
+
+    /// Empty matches list yields an empty packages Vec — preserves the
+    /// pre-#1273 behaviour for clean artifacts, with the SBOM read path
+    /// falling through to Trivy's inventory exactly as before.
+    #[test]
+    fn test_convert_packages_empty_report() {
+        let report = GrypeReport { matches: vec![] };
+        assert!(GrypeScanner::convert_packages(&report).is_empty());
+    }
+
+    /// Coverage for `grype_type_to_purl_type` token-by-token. The set is
+    /// stable per Syft's `pkg.Type` enum and any change here will surface
+    /// in this test as a code-review checkpoint.
+    #[test]
+    fn test_grype_type_to_purl_type_known_mappings() {
+        for (grype_type, expected_purl_type) in [
+            ("npm", "npm"),
+            ("python", "pypi"),
+            ("gem", "gem"),
+            ("java-archive", "maven"),
+            ("go-module", "golang"),
+            ("rust-crate", "cargo"),
+            ("apk", "apk"),
+            ("deb", "deb"),
+            ("rpm", "rpm"),
+            ("dotnet", "nuget"),
+            ("php-composer", "composer"),
+        ] {
+            assert_eq!(
+                grype_type_to_purl_type(grype_type),
+                Some(expected_purl_type),
+                "grype type '{}' must map to purl type '{}'",
+                grype_type,
+                expected_purl_type
+            );
+        }
+        assert_eq!(
+            grype_type_to_purl_type("totally-fake-type"),
+            None,
+            "unknown grype types must return None so the caller drops the PURL"
+        );
+    }
+
+    /// Grype JSON containing both an `artifact.purl` and a `licenses` block
+    /// must round-trip through serde into the new fields. Pins the wire
+    /// format we care about so a Grype upgrade that renames either field is
+    /// caught by tests rather than at runtime when the SBOM inventory
+    /// silently loses license/PURL coverage.
+    #[test]
+    fn test_grype_report_deserializes_purl_and_licenses() {
+        let json = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "CVE-2024-9999",
+                    "severity": "High"
+                },
+                "artifact": {
+                    "name": "openssl",
+                    "version": "3.0.0",
+                    "type": "deb",
+                    "purl": "pkg:deb/debian/openssl@3.0.0",
+                    "licenses": [
+                        {"value": "Apache-2.0", "spdxExpression": "Apache-2.0", "type": "declared"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let report: GrypeReport = serde_json::from_str(json).expect("must parse");
+        let artifact = &report.matches[0].artifact;
+        assert_eq!(
+            artifact.purl.as_deref(),
+            Some("pkg:deb/debian/openssl@3.0.0")
+        );
+        let licenses = artifact.licenses.as_ref().expect("licenses must parse");
+        assert_eq!(licenses.len(), 1);
+        assert_eq!(licenses[0].value.as_deref(), Some("Apache-2.0"));
+        assert_eq!(licenses[0].spdx_expression.as_deref(), Some("Apache-2.0"));
+
+        let packages = GrypeScanner::convert_packages(&report);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].purl.as_deref(),
+            Some("pkg:deb/debian/openssl@3.0.0")
+        );
+        assert_eq!(
+            packages[0].license.as_deref(),
+            Some("Apache-2.0"),
+            "valid SPDX licenses must pass through the sanitizer unchanged"
+        );
     }
 }

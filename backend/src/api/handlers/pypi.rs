@@ -23,6 +23,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::future::Future;
 use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
@@ -342,12 +343,11 @@ async fn simple_project(
                     .unwrap());
             }
         }
-        // For virtual repos, iterate through members in priority order.
-        // Local/staging members are queried via DB; remote members use proxy.
+        // For virtual repos, iterate through ALL members and union their
+        // entries — both local DB rows and remote proxy responses — so a
+        // package that exists partially in a local member doesn't shadow
+        // the rest of upstream. See #1230.
         if repo.repo_type == RepositoryType::Virtual {
-            // Per-member upstream_url adjustment happens inside the loop below
-            // so each remote member can carry its own `…/simple` suffix without
-            // polluting siblings.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
             if members.is_empty() {
@@ -357,9 +357,10 @@ async fn simple_project(
                 );
             }
 
+            let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
+            let mut remote_response: Option<(Bytes, Option<String>)> = None;
+
             for member in &members {
-                // For local and staging repos, query the DB for matching
-                // artifacts, the same way we do for the top-level repo.
                 if member.repo_type == RepositoryType::Local
                     || member.repo_type == RepositoryType::Staging
                 {
@@ -381,29 +382,26 @@ async fn simple_project(
                     .await
                     .map_err(map_db_err)?;
 
-                    if !member_rows.is_empty() {
-                        let member_artifacts: Vec<SimpleProjectArtifact> = member_rows
-                            .into_iter()
-                            .map(|a| SimpleProjectArtifact {
-                                path: a.path,
-                                version: a.version,
-                                size_bytes: a.size_bytes,
-                                checksum_sha256: a.checksum_sha256,
-                                metadata: a.metadata,
-                            })
-                            .collect();
-                        return build_simple_project_response(
-                            &headers,
-                            &repo_key,
-                            &normalized,
-                            &member_artifacts,
-                        );
-                    }
+                    local_artifacts.extend(member_rows.into_iter().map(|a| {
+                        SimpleProjectArtifact {
+                            path: a.path,
+                            version: a.version,
+                            size_bytes: a.size_bytes,
+                            checksum_sha256: a.checksum_sha256,
+                            metadata: a.metadata,
+                        }
+                    }));
                     continue;
                 }
 
-                // For remote repos, proxy the simple index from upstream.
                 if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                // Only take the first remote response; multiple remote
+                // members in one virtual is rare, and merging two upstream
+                // /simple/<pkg>/ listings deterministically is out of scope
+                // for this fix.
+                if remote_response.is_some() {
                     continue;
                 }
                 let Some(ref upstream_url) = member.upstream_url else {
@@ -426,21 +424,7 @@ async fn simple_project(
 
                 match result {
                     Ok((content, content_type)) => {
-                        let ct =
-                            content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
-                        let body = if ct.contains("text/html") {
-                            let html = String::from_utf8_lossy(&content);
-                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
-                            Body::from(rewritten)
-                        } else {
-                            Body::from(content)
-                        };
-
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, ct)
-                            .body(body)
-                            .unwrap());
+                        remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
                         debug!(
@@ -451,10 +435,45 @@ async fn simple_project(
                 }
             }
 
-            return Err(AppError::NotFound(
-                "Package not found in any member repository".to_string(),
-            )
-            .into_response());
+            // Render the union.
+            match (local_artifacts.is_empty(), remote_response) {
+                (true, None) => {
+                    return Err(AppError::NotFound(
+                        "Package not found in any member repository".to_string(),
+                    )
+                    .into_response());
+                }
+                (false, None) => {
+                    return build_simple_project_response(
+                        &headers,
+                        &repo_key,
+                        &normalized,
+                        &local_artifacts,
+                    );
+                }
+                (_, Some((content, content_type))) => {
+                    let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                    let body = if ct.contains("text/html") {
+                        let html = String::from_utf8_lossy(&content);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let merged = merge_local_into_remote_simple_html(
+                            &rewritten,
+                            &repo_key,
+                            &normalized,
+                            &local_artifacts,
+                        );
+                        Body::from(merged)
+                    } else {
+                        Body::from(content)
+                    };
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .body(body)
+                        .unwrap());
+                }
+            }
         }
 
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -569,6 +588,68 @@ fn build_simple_project_response(
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap())
+}
+
+/// Splice local-member entries into a remote-member PEP 503 HTML response so
+/// the union is visible through the virtual repo. Entries already present in
+/// the remote response (matched by filename, the anchor's inner text per
+/// PEP 503) are skipped to preserve idempotence when the same file exists in
+/// both members.
+fn merge_local_into_remote_simple_html(
+    remote_html: &str,
+    repo_key: &str,
+    normalized: &str,
+    local: &[SimpleProjectArtifact],
+) -> String {
+    if local.is_empty() {
+        return remote_html.to_string();
+    }
+
+    static ANCHOR_FILENAME: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?s)<a\s[^>]*>([^<]+)</a>").unwrap());
+    let existing: std::collections::HashSet<&str> = ANCHOR_FILENAME
+        .captures_iter(remote_html)
+        .map(|c| c.get(1).unwrap().as_str().trim())
+        .collect();
+
+    let mut local_lines = String::new();
+    for a in local {
+        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(filename) {
+            continue;
+        }
+        let url = format!(
+            "/pypi/{}/simple/{}/{}#sha256={}",
+            repo_key, normalized, filename, a.checksum_sha256
+        );
+        let requires_python = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pkg_info"))
+            .and_then(|pi| pi.get("requires_python"))
+            .and_then(|v| v.as_str());
+        let rp_attr = requires_python
+            .map(|rp| format!(" data-requires-python=\"{}\"", html_escape(rp)))
+            .unwrap_or_default();
+        local_lines.push_str(&format!(
+            "<a href=\"{}\"{}>{}</a><br/>\n",
+            url, rp_attr, filename
+        ));
+    }
+
+    if local_lines.is_empty() {
+        return remote_html.to_string();
+    }
+
+    if let Some(idx) = remote_html.rfind("</body>") {
+        let mut out = String::with_capacity(remote_html.len() + local_lines.len());
+        out.push_str(&remote_html[..idx]);
+        out.push_str(&local_lines);
+        out.push_str(&remote_html[idx..]);
+        out
+    } else {
+        format!("{}{}", remote_html, local_lines)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,10 +873,27 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            get_remote_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || async move {
+                fetch_from_pypi_remote(proxy, repo.id, repo_key, upstream_url, project, filename)
+                    .await
+            })
+            .await?
+        } else {
+            storage
+                .get(&artifact.storage_key)
+                .await
+                .map_err(map_storage_err)?
+        }
+    } else {
+        storage
+            .get(&artifact.storage_key)
+            .await
+            .map_err(map_storage_err)?
+    };
 
     // Record download statistics for locally-stored artifacts only.
     // Proxied and virtual-repo fetches go through build_file_response()
@@ -818,6 +916,43 @@ async fn serve_file(
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
         .body(Body::from(content))
         .unwrap())
+}
+
+async fn get_remote_cached_or_refetch<F, Fut>(
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    match storage.get(storage_key).await {
+        Ok(content) => Ok(content),
+        Err(AppError::NotFound(_)) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
+            );
+            let bytes = refetch().await?;
+            // Best-effort write-back: persist the refetched payload so the
+            // next request hits the cache instead of re-traversing the
+            // simple index and re-downloading from upstream. Without this,
+            // N concurrent `uv` clients each issue a fresh upstream fetch
+            // for the same wheel (thundering herd; see PR #1283 review).
+            // We swallow write errors to keep serving the current request,
+            // but log them so operators can spot a broken backend.
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
+                );
+            }
+            Ok(bytes)
+        }
+        Err(e) => Err(map_storage_err(e)),
+    }
 }
 
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
@@ -2406,6 +2541,442 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // get_remote_cached_or_refetch
+    // -----------------------------------------------------------------------
+
+    /// Storage double that reports the entry as missing on every `get`, and
+    /// records every `put` so tests can assert the write-back path persists
+    /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
+    struct MissingStorage {
+        puts: std::sync::Mutex<Vec<(String, Bytes)>>,
+    }
+
+    impl MissingStorage {
+        fn new() -> Self {
+            Self {
+                puts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MissingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.puts
+                .lock()
+                .expect("puts mutex")
+                .push((key.to_string(), content));
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns the configured bytes for any `get` call, simulating a healthy
+    /// proxy-cache hit on disk.
+    struct PresentStorage {
+        bytes: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for PresentStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(self.bytes.clone())
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns a non-`NotFound` storage error for every `get`, simulating an
+    /// underlying backend failure (permissions, I/O, etc.) that should NOT be
+    /// silently swallowed as a stale-cache miss.
+    struct BrokenStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for BrokenStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::Storage("permission denied".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
+        let storage = MissingStorage::new();
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let storage_key =
+            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
+        let content = super::get_remote_cached_or_refetch(&storage, storage_key, move || {
+            let refetch_calls_clone = refetch_calls_clone.clone();
+            async move {
+                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::from_static(b"refetched-bytes"))
+            }
+        })
+        .await
+        .expect("refetch should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "missing proxy-cache entry should trigger exactly one upstream refetch"
+        );
+
+        // PR #1283 thundering-herd fix: the refetched payload MUST be written
+        // back to storage under the same key, so the next caller hits the
+        // cache instead of re-traversing the simple index and re-downloading
+        // from upstream.
+        let puts = storage.puts.lock().expect("puts mutex");
+        assert_eq!(
+            puts.len(),
+            1,
+            "refetched payload must be persisted exactly once for the next request"
+        );
+        assert_eq!(puts[0].0, storage_key);
+        assert_eq!(puts[0].1, Bytes::from_static(b"refetched-bytes"));
+    }
+
+    /// Storage double whose `put` always fails. The handler must still
+    /// successfully serve the refetched bytes to the current caller; a
+    /// broken write-back is observability noise, not a fatal error for
+    /// this request.
+    struct WriteFailingStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for WriteFailingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Err(AppError::Storage("disk full".to_string()))
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_serves_payload_even_if_writeback_fails() {
+        // A best-effort write-back must NOT fail the current request. If the
+        // disk is full or read-only the user still gets their wheel; the
+        // next request will simply re-fetch from upstream until the backend
+        // recovers.
+        let storage = WriteFailingStorage;
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
+            move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
+        )
+        .await
+        .expect("write-back failures must not fail the current request");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-when-disk-full"));
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
+        // Happy path: cache hits should return the stored bytes verbatim and
+        // must NEVER invoke the upstream refetch closure.
+        let storage = PresentStorage {
+            bytes: Bytes::from_static(b"cached-wheel-bytes"),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"should-not-be-used"))
+                }
+            },
+        )
+        .await
+        .expect("cached read should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"cached-wheel-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a healthy cache hit must not trigger an upstream refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_propagates_non_notfound_storage_error() {
+        // A storage backend error that is NOT `NotFound` (e.g. permission
+        // denied, I/O error) must be surfaced as a 500 instead of silently
+        // re-fetching, otherwise we mask infra issues from operators.
+        let storage = BrokenStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"never-reached"))
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("non-NotFound storage errors must propagate");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-NotFound storage errors must not trigger a refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_surfaces_refetch_failure() {
+        // When the cache is stale AND the upstream refetch also fails, the
+        // upstream error response must reach the caller untouched so the
+        // client sees the correct upstream status (e.g. 502).
+        let storage = MissingStorage::new();
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(AppError::BadGateway("upstream timed out".to_string()).into_response())
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("refetch failures must propagate to caller");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stale-cache miss must attempt exactly one refetch even if it fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
+        // Edge case: a legitimately empty cached payload (zero bytes) is
+        // still a cache hit and must be returned without triggering a
+        // refetch. This guards against accidentally treating empty bodies
+        // as "missing".
+        let storage = PresentStorage {
+            bytes: Bytes::new(),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"unexpected"))
+                }
+            },
+        )
+        .await
+        .expect("empty cached payload should still be a hit");
+
+        assert!(content.is_empty());
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "empty cached payload is a cache hit, not a stale miss"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // serve_file Remote-arm wiring (PR #1283: stale-cache refetch)
+    //
+    // The unit tests above exercise `get_remote_cached_or_refetch` in
+    // isolation. This DB-backed test pins the wiring at lines ~796-810 of
+    // serve_file: when the artifact row's `repo_type` is Remote and a
+    // proxy service is present, the handler must route the storage read
+    // through `get_remote_cached_or_refetch` (not a bare `storage.get`).
+    //
+    // We cover the cache-hit branch end-to-end: artifact row + on-disk
+    // payload both present. The refetch closure must not run; the bytes
+    // returned must come from storage; the response must be a well-formed
+    // PyPI download (correct content-type, content-disposition, length).
+    // The stale-cache branch is covered by the four `get_remote_cached_or_refetch`
+    // unit tests above (including writeback assertions); it cannot be
+    // driven end-to-end here because the SSRF guard at line 928 hard-blocks
+    // loopback as a resolved upstream file URL.
+    //
+    // Skips cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serve_file_remote_arm_routes_through_cached_or_refetch_helper() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let wheel_bytes: &[u8] = b"PK\x03\x04 cached-wheel-from-disk";
+        let filename = "wired-1.2.3-py3-none-any.whl";
+        let project = "wired";
+
+        // The wiring branch under test requires (a) a remote repo with an
+        // upstream_url AND (b) a proxy service on the state. We do NOT
+        // exercise upstream I/O in this test, so the upstream URL only
+        // needs to parse and pass SSRF (any public host works because
+        // nothing dials it).
+        let upstream = "https://upstream.example.test".to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Seed an artifact row + matching payload on disk. With the file
+        // present, `get_remote_cached_or_refetch` must short-circuit on
+        // the cache hit and return the bytes without invoking the refetch
+        // closure (the unit tests above pin that contract).
+        let storage_key = format!(
+            "proxy-cache/{}/simple/{}/{}",
+            fx.repo_key, project, filename
+        );
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        let repo_info = fx.repo_info("remote", Some(&upstream));
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &repo_info,
+            &storage_key,
+            Bytes::from_static(wheel_bytes),
+        )
+        .await
+        .expect("seed payload on disk");
+        let _artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind("1.2.3")
+        .bind(wheel_bytes.len() as i64)
+        .bind("test-wired")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed cached artifact row");
+
+        // Invoke serve_file directly. The Remote arm at lines ~796-810
+        // must construct a `get_remote_cached_or_refetch` call against
+        // the storage backend; the helper hits the cache and returns the
+        // wheel bytes; the handler wraps them in a PyPI download response.
+        let result = super::serve_file(&state, &repo_info, &fx.repo_key, project, filename).await;
+
+        // Clean up BEFORE asserting so a panic still leaves the DB clean.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!("serve_file Remote arm must serve cached payload, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("Content-Type")
+                .to_str()
+                .unwrap(),
+            "application/zip",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("Content-Length")
+                .to_str()
+                .unwrap(),
+            wheel_bytes.len().to_string(),
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(
+            &body_bytes[..],
+            wheel_bytes,
+            "wired Remote arm must serve the bytes returned by get_remote_cached_or_refetch"
+        );
+
+        cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
     // pypi_content_type
     // -----------------------------------------------------------------------
 
@@ -2849,5 +3420,141 @@ mod tests {
         // (simple_root uses BTreeSet). This test documents the contract.
         let count = html.matches("/pypi/pypi-virtual/simple/flask/").count();
         assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_local_into_remote_simple_html — #1230 virtual union behavior
+    // -----------------------------------------------------------------------
+
+    fn remote_html_with(entries: &[(&str, Option<&str>)]) -> String {
+        let mut s = String::from(
+            "<!DOCTYPE html>\n<html>\n<head>\n\
+             <meta name=\"pypi:repository-version\" content=\"1.0\"/>\n\
+             <title>Links for pkg</title>\n</head>\n<body>\n\
+             <h1>Links for pkg</h1>\n",
+        );
+        for (filename, rp) in entries {
+            let rp_attr = rp
+                .map(|v| format!(" data-requires-python=\"{}\"", v))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "<a href=\"/pypi/v/simple/pkg/{}\"{}>{}</a><br/>\n",
+                filename, rp_attr, filename
+            ));
+        }
+        s.push_str("</body>\n</html>\n");
+        s
+    }
+
+    #[test]
+    fn test_merge_local_appends_entries_absent_from_remote() {
+        // Reproducer for #1230: local member has versions upstream does not
+        // (or in our prod case, upstream has versions the local subset
+        // shadows — symmetric situation, same fix). The merged response
+        // must contain entries from both sides.
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", Some("&gt;=3.8"))]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "ffeeddccbbaa99887766554433221100".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+
+        assert!(
+            merged.contains("pkg-1.0.0.tar.gz"),
+            "remote entry preserved"
+        );
+        assert!(
+            merged.contains("pkg-2.0.0-py3-none-any.whl"),
+            "local entry spliced in"
+        );
+        assert!(
+            merged.contains("/pypi/virt/simple/pkg/pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100"),
+            "local URL uses the virtual repo key and carries the sha256 fragment"
+        );
+        // Spliced before </body> so the document is still well-formed.
+        let body_idx = merged.find("</body>").expect("</body> still present");
+        let local_idx = merged.find("pkg-2.0.0-py3-none-any.whl").unwrap();
+        assert!(local_idx < body_idx, "local entries must precede </body>");
+    }
+
+    #[test]
+    fn test_merge_local_skips_filenames_already_in_remote() {
+        // If a file with the same filename exists in both members, the
+        // remote entry wins (idempotence — no duplicate <a> emitted).
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let count = merged.matches("pkg-1.0.0.tar.gz</a>").count();
+        assert_eq!(count, 1, "filename present exactly once after dedupe");
+        // The local sha256 must NOT appear — the remote entry is canonical.
+        assert!(
+            !merged.contains(
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            "local sha256 not spliced in when filename dedupes against remote"
+        );
+    }
+
+    #[test]
+    fn test_merge_empty_local_returns_remote_unchanged() {
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[]);
+        assert_eq!(merged, remote);
+    }
+
+    #[test]
+    fn test_merge_emits_data_requires_python_attribute() {
+        let remote = remote_html_with(&[]);
+        let metadata = serde_json::json!({
+            "pkg_info": { "requires_python": ">=3.10,<3.14" }
+        });
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-3.0.0.tar.gz".to_string(),
+            version: Some("3.0.0".to_string()),
+            size_bytes: 256,
+            checksum_sha256: "deadbeef".to_string(),
+            metadata: Some(metadata),
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(
+            merged.contains("data-requires-python=\"&gt;=3.10,&lt;3.14\""),
+            "requires_python is HTML-escaped: {}",
+            merged
+        );
+    }
+
+    #[test]
+    fn test_merge_handles_remote_html_without_body_close() {
+        // Defensive: if upstream omits </body> (malformed but seen in the
+        // wild on some private indexes) the helper appends rather than
+        // dropping local entries.
+        let remote = String::from(
+            "<!DOCTYPE html>\n<html>\n<head></head>\n<body>\n\
+             <a href=\"/pypi/v/simple/pkg/pkg-1.0.0.tar.gz\">pkg-1.0.0.tar.gz</a><br/>\n",
+        );
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "cafebabe".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(merged.contains("pkg-1.0.0.tar.gz"));
+        assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
     }
 }

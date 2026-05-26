@@ -168,6 +168,27 @@ pub struct OidcCallbackQuery {
     state: String,
 }
 
+/// Validate the shape of an OIDC callback's `code` and `state` query
+/// parameters before any session lookup or IdP exchange.
+///
+/// Distinguishes "malformed callback" (the client sent us garbage) from
+/// "state mismatch / CSRF" (the client sent us well-formed but unrecognized
+/// state). Without this split, an empty state hits the SSO session lookup,
+/// misses, and returns 401, which leaks the ordering of our auth checks and
+/// confuses legitimate clients that crash mid-redirect.
+///
+/// Returns `AppError::Validation` (400) for missing/empty parameters. The
+/// CSRF replay defense (401) still fires for non-empty state values that
+/// don't match a cached session.
+fn validate_oidc_callback_params(params: &OidcCallbackQuery) -> Result<()> {
+    if params.state.is_empty() || params.code.is_empty() {
+        return Err(AppError::Validation(
+            "Invalid OIDC callback parameters: code and state are required".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Handle OIDC authorization callback
 #[utoipa::path(
     get,
@@ -181,6 +202,7 @@ pub struct OidcCallbackQuery {
     responses(
         (status = 307, description = "Redirect to frontend with exchange code"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Invalid or expired SSO state (CSRF)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_callback(
@@ -189,6 +211,11 @@ pub async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
+    // Validate parameter shape BEFORE hitting the session store. Empty state
+    // or code is a malformed callback (400), not a CSRF failure (401). See
+    // `validate_oidc_callback_params` doc comment.
+    validate_oidc_callback_params(&params)?;
+
     // Validate SSO session (CSRF check), then delegate to shared logic.
     //
     // Security: the path id MUST match the provider_id that was bound to the
@@ -225,6 +252,10 @@ pub async fn oidc_callback_generic(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Redirect> {
+    // Validate parameter shape BEFORE hitting the session store. See
+    // `validate_oidc_callback_params` doc comment.
+    validate_oidc_callback_params(&params)?;
+
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
     oidc_callback_inner(
@@ -1124,6 +1155,129 @@ mod tests {
         let q: OidcCallbackQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.code, "auth_code_123");
         assert_eq!(q.state, "csrf_state_456");
+    }
+
+    // -----------------------------------------------------------------------
+    // OIDC callback parameter validation (#1369)
+    //
+    // Empty state used to fall through to the SSO session lookup and return
+    // 401 ("Invalid or expired SSO state"). That leaked the ordering of our
+    // auth checks (info-leak via 401 vs 400) and confused legitimate clients
+    // that lost the state value mid-redirect. Malformed callbacks now get a
+    // 400; the 401 path is reserved for non-empty state values that miss the
+    // session cache (CSRF replay defense).
+    // -----------------------------------------------------------------------
+
+    /// Assert that an `AppError` maps to the expected HTTP status code.
+    /// Uses the same status mapping as the real `IntoResponse` impl.
+    fn assert_status(err: &AppError, expected: axum::http::StatusCode) {
+        let actual = match err {
+            AppError::Validation(_) => axum::http::StatusCode::BAD_REQUEST,
+            AppError::Authentication(_) => axum::http::StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
+            AppError::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert_eq!(
+            actual, expected,
+            "expected status {expected:?} for {err:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_empty_state_returns_400() {
+        let params = OidcCallbackQuery {
+            code: "valid_code".to_string(),
+            state: String::new(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("empty state must reject");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "empty state should map to Validation (400), got {err:?}"
+        );
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_empty_code_returns_400() {
+        let params = OidcCallbackQuery {
+            code: String::new(),
+            state: "valid_state".to_string(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("empty code must reject");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "empty code should map to Validation (400), got {err:?}"
+        );
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_both_empty_returns_400() {
+        let params = OidcCallbackQuery {
+            code: String::new(),
+            state: String::new(),
+        };
+        let err =
+            validate_oidc_callback_params(&params).expect_err("empty code and state must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_well_formed_passes() {
+        // Well-formed values (any non-empty string) pass the shape check and
+        // delegate the CSRF / cache-miss decision to validate_sso_session,
+        // which keeps returning 401 (Authentication) on miss. We don't
+        // exercise the DB path here; the contract is that this validator
+        // does NOT veto well-formed inputs.
+        let params = OidcCallbackQuery {
+            code: "ac_xyz".to_string(),
+            state: "st_xyz".to_string(),
+        };
+        validate_oidc_callback_params(&params).expect("well-formed params should pass");
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_error_message_no_leak() {
+        // The 400 message must not name internal subsystems (SSO sessions
+        // table, SQL, etc.). It only states what the caller did wrong.
+        let params = OidcCallbackQuery {
+            code: "ac".to_string(),
+            state: String::new(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("must reject");
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        let lower = msg.to_lowercase();
+        assert!(!lower.contains("sso_sessions"), "leaks table name: {msg}");
+        assert!(!lower.contains("select"), "leaks SQL: {msg}");
+        assert!(!lower.contains("delete"), "leaks SQL: {msg}");
+        assert!(lower.contains("state"), "should mention what is missing");
+    }
+
+    #[test]
+    fn test_oidc_callback_400_distinct_from_401() {
+        // Regression for #1369: an empty state must NOT collide with the
+        // "session not found" 401 path. The two cases route to different
+        // AppError variants with different status codes.
+        let empty = OidcCallbackQuery {
+            code: "ac".to_string(),
+            state: String::new(),
+        };
+        let empty_err = validate_oidc_callback_params(&empty).expect_err("must reject");
+        // Empty -> 400 Validation
+        assert!(matches!(empty_err, AppError::Validation(_)));
+
+        // Non-empty but unrecognized state would flow to
+        // validate_sso_session, which returns AppError::Authentication
+        // ("Invalid or expired SSO state") -> 401. Simulate that path's
+        // error here so the test pins the contract.
+        let csrf_miss = AppError::Authentication("Invalid or expired SSO state".to_string());
+        assert_status(&empty_err, axum::http::StatusCode::BAD_REQUEST);
+        assert_status(&csrf_miss, axum::http::StatusCode::UNAUTHORIZED);
     }
 
     #[test]

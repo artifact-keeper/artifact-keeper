@@ -311,7 +311,7 @@ impl MigrationService {
         // Check if repository with same key exists
         let existing: Option<(String, String)> = sqlx::query_as(
             r#"
-            SELECT repository_type, format
+            SELECT repo_type::text, format::text
             FROM repositories
             WHERE key = $1
             "#,
@@ -387,23 +387,24 @@ impl MigrationService {
 
         let repo_type = config.repo_type.to_artifact_keeper();
 
+        // The repositories table schema has no `metadata`, `display_name`, or
+        // `repository_type` columns. The corresponding columns are `name` and
+        // `repo_type`, and `storage_path` is NOT NULL — so the INSERT must
+        // supply it. We default storage_path to the repository key, matching
+        // how local repos are typically named by the storage backend.
         let repo_id: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO repositories (key, display_name, repository_type, format, description, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO repositories (key, name, description, format, repo_type, storage_path)
+            VALUES ($1, $2, $3, $4::repository_format, $5::repository_type, $6)
             RETURNING id
             "#,
         )
         .bind(&config.target_key)
-        .bind(&config.target_key) // display_name same as key
-        .bind(repo_type)
-        .bind(&format)
+        .bind(&config.target_key) // name same as key for auto-provisioned repos
         .bind(&config.description)
-        .bind(serde_json::json!({
-            "migrated_from": "artifactory",
-            "source_key": config.source_key,
-            "original_package_type": config.package_type,
-        }))
+        .bind(&format)
+        .bind(repo_type)
+        .bind(&config.target_key) // storage_path defaults to key
         .fetch_one(&self.db)
         .await?;
 

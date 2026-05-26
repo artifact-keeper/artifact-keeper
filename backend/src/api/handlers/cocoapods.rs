@@ -678,6 +678,77 @@ mod tests {
         assert_eq!(podspec.version, "5.8.0");
     }
 
+    /// End-to-end regression for #1286 at the handler layer: a publisher
+    /// uploads a tar.gz whose `*.podspec.json` carries linker fields that the
+    /// `PodSpec` struct historically did not name (`vendored_frameworks`,
+    /// `xcconfig`, `preserve_paths`, `requires_arc`, `documentation_url`,
+    /// `screenshots`). After extraction + serialization, every one of those
+    /// fields must still be present in the JSON that the
+    /// `Specs/<name>/<version>/<name>.podspec.json` endpoint will serve to the
+    /// CocoaPods client.
+    #[test]
+    fn test_extract_podspec_from_archive_preserves_linker_fields() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let podspec_json = serde_json::json!({
+            "name": "MyLibrary",
+            "version": "2.8.45",
+            "summary": "MyCompany MyLibrary",
+            "description": "Library of my company",
+            "homepage": "https://github.com/",
+            "documentation_url": "https://github.com/",
+            "screenshots": "https://github.com/",
+            "license": { "type": "Apache 2.0", "file": "LICENSE" },
+            "authors": { "My Company": "devteam@my.company" },
+            "platforms": { "osx": "10.13", "ios": "11.2" },
+            "source": { "http": "https://ak.int.local/cocoapods/repo/pods/MyLibrary-2.8.45.tar.gz" },
+            "preserve_paths": ["MyLibrary.xcframework"],
+            "vendored_frameworks": "MyLibrary.xcframework",
+            "xcconfig": { "LD_RUNPATH_SEARCH_PATHS": "@loader_path/../Frameworks" },
+            "requires_arc": true,
+        });
+        let podspec_bytes = serde_json::to_vec(&podspec_json).unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("MyLibrary.podspec.json").unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        let compressed = gz.finish().unwrap();
+
+        let podspec = extract_podspec_from_archive(&compressed).unwrap();
+        assert_eq!(podspec.name, "MyLibrary");
+        assert_eq!(podspec.version, "2.8.45");
+
+        // Re-serialize as the handler would when storing or serving the JSON.
+        let served = serde_json::to_value(&podspec).unwrap();
+        for field in [
+            "documentation_url",
+            "screenshots",
+            "preserve_paths",
+            "vendored_frameworks",
+            "xcconfig",
+            "requires_arc",
+            "description",
+        ] {
+            assert_eq!(
+                served.get(field),
+                podspec_json.get(field),
+                "podspec field {} was dropped between archive extraction and serving (regression for #1286)",
+                field,
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // build_cocoapods_filename
     // -----------------------------------------------------------------------
@@ -795,6 +866,7 @@ mod tests {
             source: None,
             platforms: None,
             dependencies: None,
+            extra: std::collections::HashMap::new(),
         };
         let meta = build_cocoapods_metadata(&podspec, "Alamofire-5.8.0.tar.gz");
         assert_eq!(meta["filename"], "Alamofire-5.8.0.tar.gz");
@@ -815,6 +887,7 @@ mod tests {
             source: None,
             platforms: None,
             dependencies: None,
+            extra: std::collections::HashMap::new(),
         };
         let meta = build_cocoapods_metadata(&podspec, "Moya-15.0.0.tar.gz");
         assert_eq!(meta.as_object().unwrap().len(), 2);
@@ -832,6 +905,7 @@ mod tests {
             source: None,
             platforms: None,
             dependencies: None,
+            extra: std::collections::HashMap::new(),
         };
         let meta = build_cocoapods_metadata(&podspec, "RxSwift-6.6.0.tar.gz");
         assert_eq!(meta["podspec"]["summary"], "Reactive Programming in Swift");

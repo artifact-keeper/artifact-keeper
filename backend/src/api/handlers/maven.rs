@@ -1148,24 +1148,30 @@ async fn serve_artifact(
                 let artifact_path = path.to_string();
 
                 // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // Maven `artifacts.name` stores `coords.artifact_id` (the
-                // artifactId component of GAV; see the publish-path
-                // around line 1634). To run the guard we have to parse
-                // the GAV out of the request path. The guard fires
-                // whenever a non-Remote member already owns the
-                // artifactId case-insensitively; this is strictly a
-                // safety net rather than an authority check, because
-                // different groupIds may legitimately share an
-                // artifactId. The trade-off is preferable to leaving
-                // the shadowing attack open. If the path fails to parse
-                // as a Maven coordinate (eg. dynamic metadata.xml
-                // requests reach this branch from earlier fall-through),
-                // skip the guard rather than block the request.
+                // Originally this used the generic `name`-only guard
+                // (`virtual_non_remote_owns_name`) keyed off
+                // `coords.artifact_id`. That over-matched across
+                // groupIds: a local `com.example.mylib:common:1.0` shadowed
+                // every remote `com/.../common/...` lookup, returning
+                // 404 instead of falling through to the remote member
+                // (#1287). The Maven-aware variant matches the full
+                // groupId+artifactId path prefix so only true GA
+                // collisions activate the suppression. The guard
+                // remains a safety net rather than an authority check:
+                // different versions under the same GA still
+                // legitimately share a directory, and we accept the
+                // false-positive within a single GA in exchange for
+                // closing the shadowing attack. If the path fails to
+                // parse as a Maven coordinate (eg. dynamic
+                // metadata.xml requests reach this branch from earlier
+                // fall-through), skip the guard rather than block the
+                // request.
                 let local_owns = match MavenHandler::parse_coordinates(path) {
                     Ok(coords) => {
-                        proxy_helpers::virtual_non_remote_owns_name(
+                        proxy_helpers::virtual_non_remote_owns_maven_ga(
                             &state.db,
                             repo.id,
+                            &coords.group_id,
                             &coords.artifact_id,
                         )
                         .await?

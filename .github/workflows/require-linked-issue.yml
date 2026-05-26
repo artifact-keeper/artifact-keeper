@@ -1,0 +1,182 @@
+name: Require Linked Issue
+
+# Use pull_request_target so the workflow has a writable GITHUB_TOKEN on fork PRs.
+# Safe: workflow does not check out PR code; reads pr.body via event payload only.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  issues: read
+  contents: read
+
+concurrency:
+  group: require-linked-issue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-linked-issue:
+    name: Require linked issue in PR body
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body for linked issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const BOT_MARKER = '<!-- require-linked-issue-bot -->';
+            const BYPASS_LABEL = 'no-issue-required';
+
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('This workflow must run on pull_request events.');
+              return;
+            }
+
+            const labels = (pr.labels || []).map(l => (l && l.name) ? l.name : '');
+            if (labels.includes(BYPASS_LABEL)) {
+              core.info(`Bypass label "${BYPASS_LABEL}" present on PR #${pr.number}; skipping check.`);
+              return;
+            }
+
+            // Strip HTML comments, fenced code blocks, and inline code spans from the PR body
+            // before scanning for link keywords. This prevents contributors from "passing" the
+            // check by leaving a Closes #N reference inside a comment or code block.
+            const sanitizedBody = (pr.body || '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/```[\s\S]*?```/g, '')
+              .replace(/`[^`\n]*`/g, '');
+
+            // Match Closes/Fixes/Resolves (all tense variants) followed by #N.
+            // Allows optional owner/repo prefix to be tolerant, but only same-repo refs satisfy the requirement.
+            const linkRegex = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+))?#(\d+)/gi;
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const candidates = [];
+            let m;
+            while ((m = linkRegex.exec(sanitizedBody)) !== null) {
+              const refOwner = m[2] || owner;
+              const refRepo = m[3] || repo;
+              const number = parseInt(m[4], 10);
+              candidates.push({ owner: refOwner, repo: refRepo, number, keyword: m[1] });
+            }
+
+            core.info(`Found ${candidates.length} candidate issue link(s) in PR body.`);
+
+            // Only same-repo references satisfy the policy.
+            const sameRepoCandidates = candidates.filter(
+              c => c.owner.toLowerCase() === owner.toLowerCase() && c.repo.toLowerCase() === repo.toLowerCase()
+            );
+
+            let validLink = null;
+            const notFoundRefs = [];
+            for (const c of sameRepoCandidates) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  owner: c.owner,
+                  repo: c.repo,
+                  issue_number: c.number,
+                });
+                // Skip if the "issue" is actually this same PR (self-reference).
+                if (issue.pull_request && issue.number === pr.number) {
+                  continue;
+                }
+                validLink = { number: c.number, title: issue.title };
+                break;
+              } catch (err) {
+                if (err.status === 404) {
+                  notFoundRefs.push({ owner: c.owner, repo: c.repo, number: c.number });
+                  core.warning(`Referenced issue #${c.number} not found in ${c.owner}/${c.repo}.`);
+                } else {
+                  core.warning(`Could not verify #${c.number}: ${err.message}`);
+                }
+              }
+            }
+
+            // Paginate so the bot's prior comment is found even on long-discussion PRs.
+            const allComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const priorBotComment = allComments.find(
+              c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(BOT_MARKER)
+            );
+
+            if (validLink) {
+              core.info(`Found valid linked issue #${validLink.number}: ${validLink.title}`);
+              if (priorBotComment) {
+                core.info(`Deleting stale bot comment ${priorBotComment.id}.`);
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: priorBotComment.id,
+                });
+              }
+              return;
+            }
+
+            const templatePath = '.github/PULL_REQUEST_TEMPLATE.md';
+            const templateUrl = `https://github.com/${owner}/${repo}/blob/main/${templatePath}`;
+
+            // If we got specific 404s, surface them so the contributor can correct the number directly.
+            let headline;
+            let detail;
+            if (notFoundRefs.length > 0) {
+              const ref = notFoundRefs[0];
+              headline = `Referenced issue #${ref.number} does not exist in ${ref.owner}/${ref.repo}`;
+              detail = `The PR body references issue #${ref.number} in \`${ref.owner}/${ref.repo}\`, but that issue could not be found. Check the number and edit the PR body to point at a real, open issue.`;
+            } else {
+              headline = 'Missing linked issue';
+              detail = 'This PR does not reference a tracking issue in its body. Every PR must link to an issue in this repository so we can trace work back to a planned change.';
+            }
+
+            const commentBody = [
+              BOT_MARKER,
+              `### ${headline}`,
+              '',
+              detail,
+              '',
+              '**How to fix**',
+              '',
+              `1. Edit the PR description and add a line like \`Closes #123\`, \`Fixes #123\`, or \`Resolves #123\` referring to an open issue in \`${owner}/${repo}\`.`,
+              '2. Save the description. This check will re-run automatically.',
+              '',
+              '**Accepted keywords** (case-insensitive, any tense): `close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`.',
+              '',
+              `**Policy reference**: see the [PR template](${templateUrl}).`,
+              '',
+              `**Maintainer bypass**: apply the \`${BYPASS_LABEL}\` label to this PR to skip the check (use sparingly, e.g. for trivial typo fixes or release-tag chores).`,
+            ].join('\n');
+
+            if (priorBotComment) {
+              if (priorBotComment.body !== commentBody) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: priorBotComment.id,
+                  body: commentBody,
+                });
+                core.info(`Updated existing bot comment ${priorBotComment.id}.`);
+              } else {
+                core.info('Existing bot comment is already up to date.');
+              }
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body: commentBody,
+              });
+              core.info('Posted missing-link bot comment.');
+            }
+
+            if (notFoundRefs.length > 0) {
+              const ref = notFoundRefs[0];
+              core.setFailed(`Referenced issue #${ref.number} does not exist in ${ref.owner}/${ref.repo}. Check the number and edit the PR body.`);
+            } else {
+              core.setFailed('PR body must reference a tracking issue (e.g. "Closes #123"). See the bot comment for details.');
+            }

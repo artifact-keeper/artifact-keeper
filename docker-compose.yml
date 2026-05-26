@@ -33,7 +33,7 @@ services:
   # In production, replace this with certs issued by your internal CA or use a
   # managed database service that handles TLS for you.
   pg-certs:
-    image: alpine:3.20
+    image: alpine:3.23
     container_name: artifact-keeper-pg-certs
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -118,6 +118,8 @@ services:
       - shared_config:/shared
     entrypoint: ["/bin/sh", "/init-dtrack.sh"]
     restart: "no"
+    healthcheck:
+      disable: true
 
   # ---------------------------------------------------------------------------
   # Backend API server
@@ -293,7 +295,7 @@ services:
   # the backend and remove these services if you do not need SBOM analysis.
   # https://dependencytrack.org/
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.11.4
+    image: dependencytrack/apiserver:4.14.2
     container_name: artifact-keeper-dtrack-api
     depends_on:
       postgres:
@@ -322,12 +324,6 @@ services:
       - dtrack_data:/data
     ports:
       - "8092:8080"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/version"]
-      interval: 30s
-      timeout: 10s
-      start_period: 60s
-      retries: 5
     restart: unless-stopped
 
   # Dependency-Track native frontend (optional, for debugging/admin).
@@ -335,7 +331,7 @@ services:
   # useful for direct Dependency-Track access. Gated behind a profile:
   #   docker compose --profile dtrack-ui up
   dependency-track-frontend:
-    image: dependencytrack/frontend:4.11.4
+    image: dependencytrack/frontend:4.14.2
     container_name: artifact-keeper-dtrack-frontend
     profiles:
       - dtrack-ui  # Only starts with: docker compose --profile dtrack-ui up

@@ -11,14 +11,14 @@
 #                                               team's apiKeys ONLY expose
 #                                               .maskedKey (NOT .key)  <-- the bug
 #   - DELETE /api/v1/team/<uuid>/key/<pubid> -> 204 (idempotent rotation)
-#   - POST /api/v1/team/<uuid>/key           -> {"key":"<unmasked>","publicId":"..."}
+#   - PUT  /api/v1/team/<uuid>/key           -> {"key":"<unmasked>","publicId":"..."}
 #   - POST /api/v1/configProperty            -> 200
 #
 # Mock state and behavior knobs (env vars passed to mock_dtrack.py):
 #   - SEED_FOREIGN_PUBLIC_ID  pre-attach a key with this publicId before
 #                             startup, simulating an operator-attached
 #                             integration key on the Automation team
-#   - FAIL_POST_KEY_ONCE      if "1", the first POST /key returns 500 to
+#   - FAIL_PUT_KEY_ONCE       if "1", the first PUT /key returns 500 to
 #                             exercise the script's negative path
 #
 # This test deliberately uses no test framework other than bash + python3 +
@@ -45,7 +45,7 @@ mkdir -p "$SHARED_DIR"
 MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 
-# The unmasked key the mock will return from POST /api/v1/team/<uuid>/key.
+# The unmasked key the mock will return from PUT /api/v1/team/<uuid>/key.
 # A passing test must end up with this exact value at the API key file path.
 EXPECTED_KEY="odt_TEST_FAKE_DO_NOT_USE_AUTOMATION"
 MASKED_KEY="odt_********ECRET"  # what GET /team would expose (the broken path)
@@ -63,15 +63,15 @@ TEAM_UUID    = "11111111-2222-3333-4444-555555555555"
 # leave it unset so the team starts empty (matches a fresh DT install).
 SEED_FOREIGN = os.environ.get("SEED_FOREIGN_PUBLIC_ID", "").strip()
 
-# Negative-path knob: if "1", the first POST /key returns HTTP 500 so the
+# Negative-path knob: if "1", the first PUT /key returns HTTP 500 so the
 # init script's error branch can be exercised without random fault injection.
-FAIL_POST_KEY_ONCE = os.environ.get("FAIL_POST_KEY_ONCE", "0") == "1"
+FAIL_PUT_KEY_ONCE = os.environ.get("FAIL_PUT_KEY_ONCE", "0") == "1"
 
 state = {
     "keys": ([{"publicId": SEED_FOREIGN, "maskedKey": MASKED_KEY}]
              if SEED_FOREIGN else []),
-    "post_key_count": 0,
-    "post_key_failed_once": False,
+    "put_key_count": 0,
+    "put_key_failed_once": False,
 }
 KEY_LOG = os.environ["KEY_LOG"]
 
@@ -112,18 +112,20 @@ class H(BaseHTTPRequestHandler):
             # DT login returns a bare JWT string, not JSON.
             return self._send(200, b"eyJhbGciOiJIUzI1NiJ9.mockjwt.signature",
                               ctype="text/plain")
+        if self.path == "/api/v1/configProperty":
+            return self._send(200)
+        return self._send(404)
+
+    def do_PUT(self):
         if self.path == f"/api/v1/team/{TEAM_UUID}/key":
             # Negative-path injection: fail the first call, then recover.
-            if FAIL_POST_KEY_ONCE and not state["post_key_failed_once"]:
-                state["post_key_failed_once"] = True
+            if FAIL_PUT_KEY_ONCE and not state["put_key_failed_once"]:
+                state["put_key_failed_once"] = True
                 return self._send(500, b'{"error":"injected failure"}')
-            # DT 4.x: POST returns the unmasked key once. Status pinned to
-            # 200 to match DT 4.11 swagger (this matches today's contract;
-            # the init script uses curl -sf which accepts any 2xx — drift
-            # detection is NOT provided by mock-fidelity alone, only by an
-            # explicit response-code assertion in the script itself).
-            state["post_key_count"] += 1
-            n = state["post_key_count"]
+            # DT 4.11.x: PUT returns the unmasked key once. Status pinned to
+            # 201 to match the implementation contract.
+            state["put_key_count"] += 1
+            n = state["put_key_count"]
             unmasked = f"{EXPECTED_KEY}_run{n}"
             new = {"publicId": f"newpub{n}",
                    "maskedKey": f"odt_********KEY{n}",
@@ -132,9 +134,7 @@ class H(BaseHTTPRequestHandler):
                                   "maskedKey": new["maskedKey"]})
             with open(KEY_LOG, "a") as f:
                 f.write(unmasked + "\n")
-            return self._send(200, json.dumps(new).encode())
-        if self.path == "/api/v1/configProperty":
-            return self._send(200)
+            return self._send(201, json.dumps(new).encode())
         return self._send(404)
 
     def do_DELETE(self):
@@ -228,21 +228,21 @@ OUR_PUBLIC_ID="$(cat "$PUBLIC_ID_MARKER")"
   fail "Phase 1: publicId marker '$OUR_PUBLIC_ID' != expected 'newpub1'"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: warm restart — must short-circuit, NOT re-hit POST /key, AND log it
+# Phase 2: warm restart — must short-circuit, NOT re-hit PUT /key, AND log it
 # ─────────────────────────────────────────────────────────────────────────────
 INIT_RC2=$(run_init init2)
 [ "$INIT_RC2" -eq 0 ] || fail "Phase 2 warm restart exited $INIT_RC2 (expected 0)"
 [ -s "$KEY_FILE" ]    || fail "Phase 2: $KEY_FILE missing after warm restart"
 
-# Behavioral assertion: mock saw exactly one POST /key total.
-POST_COUNT_AFTER_WARM=$(wc -l < "$KEY_LOG" | tr -d ' ')
-[ "$POST_COUNT_AFTER_WARM" -eq 1 ] || \
-  fail "Phase 2: warm restart hit POST /key (count=${POST_COUNT_AFTER_WARM}, expected 1)"
+# Behavioral assertion: mock saw exactly one PUT /key total.
+PUT_COUNT_AFTER_WARM=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT_AFTER_WARM" -eq 1 ] || \
+  fail "Phase 2: warm restart hit PUT /key (count=${PUT_COUNT_AFTER_WARM}, expected 1)"
 
 # Log-content assertion: warm restart must take the explicit short-circuit
 # branch (line ~54-57 of init-dtrack.sh: "API key already provisioned ...
 # skipping"). Without this, a future refactor that bypasses the early-exit
-# but happens to no-op the POST elsewhere would still pass POST_COUNT==1.
+# but happens to no-op the PUT elsewhere would still pass PUT_COUNT==1.
 grep -q 'already provisioned' "$WORK_DIR/init2.out" || \
   fail "Phase 2: warm restart did not emit 'already provisioned' short-circuit log"
 
@@ -257,10 +257,10 @@ INIT_RC3=$(run_init init3)
 SECOND_KEY="$(tr -d '\n' < "$KEY_FILE")"
 [ "$SECOND_KEY" != "$FIRST_KEY" ] || \
   fail "Phase 3: rotation did not fire (second key '$SECOND_KEY' equals first)"
-POST_COUNT=$(wc -l < "$KEY_LOG" | tr -d ' ')
-[ "$POST_COUNT" -ge 2 ] || \
-  fail "Phase 3: expected POST /key >=2 across runs, mock saw $POST_COUNT"
-echo "[test] rotation path fired: ${FIRST_KEY} -> ${SECOND_KEY} (POST /key count=${POST_COUNT})"
+PUT_COUNT=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT" -ge 2 ] || \
+  fail "Phase 3: expected PUT /key >=2 across runs, mock saw $PUT_COUNT"
+echo "[test] rotation path fired: ${FIRST_KEY} -> ${SECOND_KEY} (PUT /key count=${PUT_COUNT})"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 4: foreign-key safety rail — refuse to rotate by default
@@ -292,7 +292,7 @@ echo "$TEAM_AFTER" | jq -e '.[] | select(.name=="Automation") | .apiKeys[] | sel
 # Init must succeed, the foreign key must be deleted, and a WARNING must
 # name the revoked publicId so the rotation is auditable.
 # ─────────────────────────────────────────────────────────────────────────────
-POST_COUNT_BEFORE_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+PUT_COUNT_BEFORE_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
 INIT_RC5=$(run_init init5 env DTRACK_INIT_FORCE_ROTATE=true)
 [ "$INIT_RC5" -eq 0 ] || \
   fail "Phase 5: FORCE_ROTATE=true expected to succeed, got $INIT_RC5"
@@ -306,8 +306,8 @@ grep -q 'operator-integration-key-001' "$WORK_DIR/init5.err" || \
 # under FORCE_ROTATE (e.g. retry-on-error that doesn't check the prior
 # attempt) would leak an extra orphaned key. KEY_LOG is mock-side and
 # survives the restart in start_mock (append-mode).
-POST_COUNT_AFTER_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
-DELTA=$((POST_COUNT_AFTER_FORCE - POST_COUNT_BEFORE_FORCE))
+PUT_COUNT_AFTER_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+DELTA=$((PUT_COUNT_AFTER_FORCE - PUT_COUNT_BEFORE_FORCE))
 [ "$DELTA" -eq 1 ] || \
   fail "Phase 5: FORCE_ROTATE minted $DELTA keys (expected exactly 1)"
 
@@ -318,17 +318,17 @@ if echo "$TEAM_AFTER_FORCE" | jq -e '.[] | select(.name=="Automation") | .apiKey
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 6: negative path — POST /key returns 500
+# Phase 6: negative path — PUT /key returns 500
 # Wipe state, restart mock with fault injection, init must fail loudly and
 # leave no half-written API key file behind.
 # ─────────────────────────────────────────────────────────────────────────────
 rm -f "$KEY_FILE" "$PUBLIC_ID_MARKER" "$SHARED_DIR/.dtrack-bootstrapped"
 : > "$KEY_LOG"
-start_mock FAIL_POST_KEY_ONCE=1
+start_mock FAIL_PUT_KEY_ONCE=1
 
 INIT_RC6=$(run_init init6)
 [ "$INIT_RC6" -ne 0 ] || \
-  fail "Phase 6: POST /key 500 should fail init, got exit 0"
+  fail "Phase 6: PUT /key 500 should fail init, got exit 0"
 [ ! -f "$KEY_FILE" ] || \
   fail "Phase 6: failed init left a half-written $KEY_FILE on disk"
 [ ! -f "$KEY_FILE.tmp" ] || \

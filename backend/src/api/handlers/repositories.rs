@@ -6,7 +6,7 @@ use axum::{
     http::{header, HeaderMap},
     response::IntoResponse,
     routing::get,
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +16,12 @@ use uuid::Uuid;
 
 use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
 use crate::api::dto::Pagination;
+// Use the crate-local `Json` extractor so any deserialization failure on a
+// request body surfaces as HTTP 400 + `{code: "VALIDATION_ERROR"}` instead of
+// Axum's default 422 + plain-text body. See #1368 and the module docs in
+// `crate::api::extractors`. The wrapper also implements `IntoResponse` so it
+// is a drop-in replacement on response types too.
+use crate::api::extractors::Json;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -30,6 +36,7 @@ use crate::services::repository_service::{
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::upload_service;
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -1233,9 +1240,16 @@ pub struct ListArtifactsQuery {
     pub per_page: Option<u32>,
     pub q: Option<String>,
     pub path_prefix: Option<String>,
-    /// When set to `maven_component`, Maven/Gradle artifacts are grouped by
-    /// groupId, artifactId, and version.  Individual files (jar, pom, checksums)
-    /// appear in the `artifact_files` array of each component.
+    /// Server-side artifact grouping.
+    ///
+    /// Supported values:
+    /// - `maven_component`: Maven/Gradle artifacts are grouped by
+    ///   groupId, artifactId, and version.  Individual files (jar, pom,
+    ///   checksums) appear in the `artifact_files` array of each component.
+    /// - `docker_tag`: Docker/OCI artifacts are grouped by (image, tag),
+    ///   with `total_size_bytes` summed across the manifest config and
+    ///   referenced layer blobs.  The grouped rows are returned in the
+    ///   `docker_tags` array.
     pub group_by: Option<String>,
 }
 
@@ -1262,6 +1276,52 @@ pub struct ArtifactListResponse {
     /// Maven component grouping.  Only present when `group_by=maven_component`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<MavenComponentResponse>>,
+    /// Docker tag grouping.  Only present when `group_by=docker_tag`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_tags: Option<Vec<DockerTagResponse>>,
+}
+
+/// A Docker/OCI tag grouped by (image, tag).
+///
+/// `total_size_bytes` is the server-side aggregation of the manifest body
+/// plus every referenced layer blob.  This is what the UI should display
+/// as the on-disk image size; the previous client-side aggregation that
+/// only summed the manifest body itself reported a few kilobytes for
+/// images that are hundreds of megabytes on disk (artifact-keeper#1193).
+///
+/// For multi-arch image indexes the size is the sum across all per-arch
+/// child manifests recorded in `oci_manifest_refs`, so an `amd64+arm64`
+/// index reports the combined storage cost.
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct DockerTagResponse {
+    /// Representative manifest artifact ID.
+    pub id: Uuid,
+    /// Repository key this tag belongs to.
+    pub repository_key: String,
+    /// Image name (no registry host, no tag).  Maps to the OCI v2 `<name>`
+    /// path segment, which may include slashes (e.g. `library/postgres`).
+    pub image: String,
+    /// Tag string (e.g. `16-alpine`).  Never a `sha256:...` digest;
+    /// digest-only references are filtered out of the grouping.
+    pub tag: String,
+    /// Manifest content digest (e.g. `sha256:abcdef...`).
+    pub manifest_digest: String,
+    /// Total size in bytes of the manifest plus all referenced layer blobs.
+    /// For image indexes, this sums across child manifests.
+    pub total_size_bytes: i64,
+    /// Number of layer blobs referenced by the manifest.  For image indexes
+    /// this is the sum of layer counts across child manifests.  `0` when
+    /// the manifest could not be parsed.
+    pub layer_count: i32,
+    /// Whether this manifest is a multi-arch image index.
+    pub is_index: bool,
+    /// Last push (or update) timestamp from the underlying `oci_tags` row.
+    pub last_pushed_at: chrono::DateTime<chrono::Utc>,
+    /// Latest scan status (`pending`, `running`, `completed`, `failed`) from
+    /// `scan_results`, if the manifest has ever been scanned.  `None` when
+    /// the artifact has never been scanned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_status: Option<String>,
 }
 
 /// A Maven component grouped by GAV (groupId, artifactId, version).
@@ -1338,6 +1398,28 @@ pub async fn list_artifacts(
             &repo,
             &key,
             query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
+
+    let is_docker_format = matches!(
+        repo.format,
+        RepositoryFormat::Docker
+            | RepositoryFormat::Podman
+            | RepositoryFormat::Oras
+            | RepositoryFormat::WasmOci
+            | RepositoryFormat::HelmOci
+    );
+    let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
+
+    if want_docker_grouping {
+        return list_artifacts_grouped_by_docker_tag(
+            &state,
+            &repo,
+            &key,
             query.q.as_deref(),
             page,
             per_page,
@@ -1426,6 +1508,7 @@ pub async fn list_artifacts(
             total_pages,
         },
         components: None,
+        docker_tags: None,
     }))
 }
 
@@ -1645,6 +1728,7 @@ async fn list_artifacts_grouped_by_maven_component(
             total_pages,
         },
         components: Some(page_components),
+        docker_tags: None,
     }))
 }
 
@@ -1714,6 +1798,345 @@ fn group_maven_artifacts(
     }
 
     groups.into_values().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Docker tag grouping (artifact-keeper#1193)
+//
+// Mirrors the Maven `group_by=maven_component` pattern: the frontend can
+// request a paginated list of Docker tags where each row carries the
+// server-side aggregated image size (manifest + every referenced layer
+// blob).  Without this, the web UI had to fetch every artifact row and
+// guess at sizes from the manifest body alone, which under-reports the
+// real on-disk image cost by ~3 orders of magnitude.
+//
+// The aggregation walks `oci_tags` (human-readable tags only; digest
+// references are filtered) and looks up the precomputed `size_bytes` on
+// the corresponding `artifacts` row. The OCI v2 PUT-manifest handler
+// already computes `config_size + layers_size` when persisting the
+// artifact row, so the grouping is a join, not a re-parse of every
+// manifest body. For multi-arch image indexes, the child manifest
+// digests recorded in `oci_manifest_refs` are also summed in.
+// ---------------------------------------------------------------------------
+
+/// Database row used to assemble a `DockerTagResponse`.
+///
+/// `total_size_bytes` is the precomputed size on the `artifacts` row for
+/// the manifest. For image-index manifests, the child sizes are added by
+/// `expand_docker_index_sizes` after this query runs.
+#[derive(Debug, Clone)]
+struct DockerTagRow {
+    artifact_id: Uuid,
+    image: String,
+    tag: String,
+    manifest_digest: String,
+    manifest_content_type: String,
+    manifest_size_bytes: i64,
+    last_pushed_at: chrono::DateTime<chrono::Utc>,
+    scan_status: Option<String>,
+}
+
+/// Build a grouped-by-tag response for Docker/OCI repositories.
+///
+/// Fetches up to `MAX_FETCH` distinct (image, tag) rows from `oci_tags`,
+/// joined to the corresponding `artifacts` row to get the precomputed
+/// manifest+layers size. The grouped list is then paginated in memory.
+///
+/// Digest references (tags containing `:` such as `sha256:abc...`) are
+/// excluded, matching the OCI v2 `tags/list` filter.  An optional `q`
+/// substring is matched case-insensitively against the tag string so the
+/// web UI's tag-search input keeps working in grouped mode.
+async fn list_artifacts_grouped_by_docker_tag(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    repo_key: &str,
+    search_query: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    const MAX_FETCH: i64 = 10_000;
+
+    let rows = fetch_docker_tag_rows(&state.db, repo.id, search_query, MAX_FETCH).await?;
+
+    // For multi-arch image indexes, fold in each child manifest's size so
+    // the surfaced number matches what `docker pull` actually downloads
+    // for the platforms the index references.
+    let index_digests: Vec<String> = rows
+        .iter()
+        .filter(|r| is_docker_index_content_type(&r.manifest_content_type))
+        .map(|r| r.manifest_digest.clone())
+        .collect();
+
+    let child_sizes = if index_digests.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        fetch_index_child_sizes(&state.db, repo.id, &index_digests).await?
+    };
+
+    let mut docker_tags: Vec<DockerTagResponse> = rows
+        .into_iter()
+        .map(|row| build_docker_tag_response(row, repo_key, &child_sizes))
+        .collect();
+
+    // Stable lexical sort by (image, tag) for paging determinism.
+    docker_tags.sort_by(|a, b| (&a.image, &a.tag).cmp(&(&b.image, &b.tag)));
+
+    let total = docker_tags.len() as i64;
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let offset = ((page - 1) * per_page) as usize;
+    let page_tags: Vec<DockerTagResponse> = docker_tags
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items: Vec::new(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+        components: None,
+        docker_tags: Some(page_tags),
+    }))
+}
+
+/// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
+/// latest `scan_results` row. Returns at most `limit` rows.
+///
+/// The join keys are deterministic strings produced by the OCI v2 push
+/// handler: every `oci_tags` row has a matching `artifacts` row at
+/// `path = v2/{image}/manifests/{tag}` (see `handle_put_manifest`).  We
+/// use `repository_id + path` so the join survives image renames.
+async fn fetch_docker_tag_rows(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    search_query: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DockerTagRow>> {
+    use sqlx::Row;
+
+    // POSITION(':' IN tag) = 0 excludes digest references (sha256:...),
+    // matching the spec'd /v2/<name>/tags/list filter.
+    //
+    // The artifacts join is by composed path because OCI artifact rows do
+    // not carry a back-reference to the oci_tags row; the push handler
+    // composes `v2/{image}/manifests/{tag}` deterministically.
+    //
+    // LEFT JOIN scan_results on the latest row per artifact is filtered
+    // by NOT EXISTS so we don't carry historical scans; this matches the
+    // partial-index pattern from migration 101.
+    let sql = if search_query.is_some() {
+        r#"SELECT
+                a.id            AS artifact_id,
+                t.name          AS image,
+                t.tag           AS tag,
+                t.manifest_digest AS manifest_digest,
+                t.manifest_content_type AS manifest_content_type,
+                a.size_bytes    AS manifest_size_bytes,
+                t.updated_at    AS last_pushed_at,
+                s.status        AS scan_status
+            FROM oci_tags t
+            JOIN artifacts a
+              ON a.repository_id = t.repository_id
+             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+             AND a.is_deleted = false
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM scan_results
+                WHERE artifact_id = a.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) s ON true
+            WHERE t.repository_id = $1
+              AND POSITION(':' IN t.tag) = 0
+              AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'
+            ORDER BY t.name, t.tag
+            LIMIT $3"#
+    } else {
+        r#"SELECT
+                a.id            AS artifact_id,
+                t.name          AS image,
+                t.tag           AS tag,
+                t.manifest_digest AS manifest_digest,
+                t.manifest_content_type AS manifest_content_type,
+                a.size_bytes    AS manifest_size_bytes,
+                t.updated_at    AS last_pushed_at,
+                s.status        AS scan_status
+            FROM oci_tags t
+            JOIN artifacts a
+              ON a.repository_id = t.repository_id
+             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+             AND a.is_deleted = false
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM scan_results
+                WHERE artifact_id = a.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) s ON true
+            WHERE t.repository_id = $1
+              AND POSITION(':' IN t.tag) = 0
+            ORDER BY t.name, t.tag
+            LIMIT $2"#
+    };
+
+    let rows = if let Some(q) = search_query {
+        sqlx::query(sql)
+            .bind(repository_id)
+            .bind(q)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+    } else {
+        sqlx::query(sql)
+            .bind(repository_id)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(DockerTagRow {
+            artifact_id: r
+                .try_get("artifact_id")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            image: r
+                .try_get("image")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            tag: r
+                .try_get("tag")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            manifest_digest: r
+                .try_get("manifest_digest")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            manifest_content_type: r
+                .try_get::<Option<String>, _>("manifest_content_type")
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .unwrap_or_default(),
+            manifest_size_bytes: r
+                .try_get("manifest_size_bytes")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            last_pushed_at: r
+                .try_get("last_pushed_at")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            scan_status: r.try_get("scan_status").ok().flatten(),
+        });
+    }
+    Ok(out)
+}
+
+/// Sum the precomputed `artifacts.size_bytes` for each child manifest
+/// referenced by an image index. Returns a map keyed by the parent
+/// (index) digest with the total child size in bytes.
+///
+/// Children are stored as their own digest-keyed artifact rows
+/// (`v2/{image}/manifests/sha256:...`); we join `oci_manifest_refs` to
+/// pick up every (parent, child) edge in one round trip. Children
+/// without a matching artifact row contribute zero, which mirrors the
+/// `download_blob` fallback behavior for missing children.
+async fn fetch_index_child_sizes(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    index_digests: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        r#"SELECT
+                r.parent_digest AS parent_digest,
+                COALESCE(SUM(a.size_bytes), 0)::BIGINT AS child_total
+            FROM oci_manifest_refs r
+            LEFT JOIN artifacts a
+              ON a.repository_id = r.repository_id
+             AND a.checksum_sha256 = REPLACE(r.child_digest, 'sha256:', '')
+             AND a.is_deleted = false
+            WHERE r.repository_id = $1
+              AND r.parent_digest = ANY($2)
+            GROUP BY r.parent_digest"#,
+    )
+    .bind(repository_id)
+    .bind(index_digests)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        let parent: String = r
+            .try_get("parent_digest")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let total: i64 = r
+            .try_get("child_total")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        out.insert(parent, total);
+    }
+    Ok(out)
+}
+
+/// Convert a fetched `DockerTagRow` into the response shape.
+///
+/// Folds in the per-index child total (if any) so multi-arch tags
+/// report the full on-disk cost across architectures rather than just
+/// the index document size.
+fn build_docker_tag_response(
+    row: DockerTagRow,
+    repo_key: &str,
+    index_child_sizes: &std::collections::HashMap<String, i64>,
+) -> DockerTagResponse {
+    let is_index = is_docker_index_content_type(&row.manifest_content_type);
+    let child_size = if is_index {
+        index_child_sizes
+            .get(&row.manifest_digest)
+            .copied()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let total_size_bytes = row.manifest_size_bytes.saturating_add(child_size);
+
+    DockerTagResponse {
+        id: row.artifact_id,
+        repository_key: repo_key.to_string(),
+        image: row.image,
+        tag: row.tag,
+        manifest_digest: row.manifest_digest,
+        total_size_bytes,
+        // Layer count is not persisted; the push handler stores the sum
+        // but not the count. Leaving it as a derived field would require
+        // re-fetching every manifest body. Future enhancement: persist
+        // layer_count alongside size_bytes on the artifact row.
+        layer_count: 0,
+        is_index,
+        last_pushed_at: row.last_pushed_at,
+        scan_status: row.scan_status,
+    }
+}
+
+/// True for OCI image-index and Docker manifest-list content types.
+///
+/// Mirrors `oci_v2::is_index_content_type` but lives here to keep the
+/// repositories handler self-contained (its cousin in `oci_v2.rs` is
+/// `pub(crate)` and could be re-exported, but duplicating two lines is
+/// cheaper than the cross-module visibility churn). Charset hints
+/// (`; charset=utf-8`) are stripped before comparison.
+fn is_docker_index_content_type(content_type: &str) -> bool {
+    let bare = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        bare.as_str(),
+        "application/vnd.oci.image.index.v1+json"
+            | "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
 }
 
 /// Get artifact metadata
@@ -1809,6 +2232,16 @@ pub async fn upload_artifact(
 ) -> Result<Json<ArtifactResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    // Validate the composed artifact path against traversal, null bytes,
+    // backslashes, percent-encoded traversal, absolute paths, etc. This
+    // protects all upload entry points (URL-path variant, multipart with
+    // path in URL, and multipart with `path` form field added in #1237).
+    // Filesystem storage's `key_to_path` would strip `..` segments, but S3
+    // and other object backends would happily accept `../etc/passwd`.
+    upload_service::validate_artifact_path(&path)
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -1947,7 +2380,15 @@ async fn upload_artifact_multipart_with_path(
 
 /// Upload artifact via multipart/form-data POST (no path in URL).
 ///
-/// The artifact path comes from the `file` field's filename.
+/// The artifact path is built from the optional `path` form field combined
+/// with the uploaded file's filename:
+///   - missing/empty `path` -> path is just the filename
+///   - `path` ending in `/` -> path becomes `<path><filename>` (directory prefix)
+///   - otherwise the `path` value is used verbatim as the full artifact path
+///
+/// This is what makes the web UI's "Custom path (optional)" field actually
+/// land artifacts at the requested path (#1237). Previously the form field
+/// was silently dropped and only the filename was used.
 async fn upload_artifact_multipart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1955,15 +2396,41 @@ async fn upload_artifact_multipart(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
-    let (body, filename) = extract_multipart_file(multipart).await?;
+    let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
+    let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_artifact(
         State(state),
         Extension(auth),
-        Path((key, filename)),
+        Path((key, artifact_path)),
         headers,
         body,
     )
     .await
+}
+
+/// Combine an optional client-provided `path` field with the uploaded file's
+/// filename into a single artifact path.
+///
+/// Rules (see #1237):
+///   - `None` or empty `custom_path` -> `filename`
+///   - `custom_path` ending in `/`   -> `<custom_path><filename>` (directory)
+///   - otherwise                     -> `custom_path` verbatim (full path)
+///
+/// Leading slashes on `custom_path` are stripped so callers can pass either
+/// `unifi/docs/` or `/unifi/docs/`. Empty segments produced by `//` are
+/// rejected by `validate_artifact_path` later in the upload pipeline.
+fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
+    let raw = custom_path.unwrap_or("").trim();
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return filename.to_string();
+    }
+    if trimmed.ends_with('/') {
+        // Treat as a directory prefix: append the uploaded filename.
+        format!("{trimmed}{filename}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Extract the first file field from a multipart form.
@@ -1986,6 +2453,53 @@ async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, Stri
     Err(AppError::Validation(
         "No file field found in multipart form".to_string(),
     ))
+}
+
+/// Extract both a file field and an optional `path` text field from a
+/// multipart form.
+///
+/// Iterates the full form: a file field (one with a `filename`) yields the
+/// body and original filename; a `path` field (any non-file field named
+/// `path`) yields the requested artifact path. Either may appear in any
+/// order. Returns an error if no file is found.
+async fn extract_multipart_file_and_path(
+    mut multipart: Multipart,
+) -> Result<(Bytes, String, Option<String>)> {
+    let mut file: Option<(Bytes, String)> = None;
+    let mut custom_path: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+    {
+        let filename = field.file_name().map(|s| s.to_string());
+        let name = field.name().map(|s| s.to_string());
+        if let Some(filename) = filename {
+            // File upload field
+            if file.is_none() {
+                let data: Bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
+                file = Some((data, filename));
+            }
+        } else if name.as_deref() == Some("path") {
+            // Custom path text field
+            let value = field
+                .text()
+                .await
+                .map_err(|e| AppError::Validation(format!("Failed to read path field: {e}")))?;
+            custom_path = Some(value);
+        }
+    }
+
+    match file {
+        Some((body, filename)) => Ok((body, filename, custom_path)),
+        None => Err(AppError::Validation(
+            "No file field found in multipart form".to_string(),
+        )),
+    }
 }
 
 /// Download artifact
@@ -2149,41 +2663,24 @@ pub async fn download_artifact(
         )
             .into_response()),
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
-            // Try proxy for remote repositories
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                // Apply routing rules to rewrite the path before upstream fetch
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
                     .unwrap_or_else(|| path.clone());
 
-                let (content, content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &fetch_path)
-                        .await
-                        .map_err(|_| {
-                            AppError::NotFound("Artifact not found upstream".to_string())
-                        })?;
-
-                let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-                let filename = path.rsplit('/').next().unwrap_or(&path);
-
-                Ok((
-                    [
-                        (header::CONTENT_TYPE, ct),
-                        (
-                            header::CONTENT_DISPOSITION,
-                            format!("attachment; filename=\"{}\"", filename),
-                        ),
-                        (header::CONTENT_LENGTH, content.len().to_string()),
-                        (
-                            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                            "upstream".to_string(),
-                        ),
-                    ],
-                    content,
+                Ok(proxy_helpers::proxy_fetch_streaming(
+                    proxy,
+                    repo.id,
+                    &key,
+                    upstream_url,
+                    &fetch_path,
+                    "application/octet-stream",
                 )
-                    .into_response())
+                .await
+                .unwrap_or_else(|e| e)
+                .into_response())
             } else {
                 Err(AppError::NotFound("Artifact not found".to_string()))
             }
@@ -3068,6 +3565,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ArtifactResponse,
         ArtifactListResponse,
         MavenComponentResponse,
+        DockerTagResponse,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -3912,6 +4410,13 @@ mod tests {
         assert_eq!(query.group_by.as_deref(), Some("maven_component"));
     }
 
+    #[test]
+    fn test_list_artifacts_query_group_by_docker_tag() {
+        let json = r#"{"group_by": "docker_tag"}"#;
+        let query: ListArtifactsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.group_by.as_deref(), Some("docker_tag"));
+    }
+
     // -----------------------------------------------------------------------
     // group_maven_artifacts
     // -----------------------------------------------------------------------
@@ -4127,10 +4632,12 @@ mod tests {
                 total_pages: 0,
             },
             components: None,
+            docker_tags: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        // components field should be omitted when None
+        // components and docker_tags fields should be omitted when None
         assert!(!json.contains("\"components\""));
+        assert!(!json.contains("\"docker_tags\""));
     }
 
     #[test]
@@ -4156,10 +4663,179 @@ mod tests {
                 total_pages: 1,
             },
             components: Some(vec![comp]),
+            docker_tags: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"components\":["));
         assert!(json.contains("\"group_id\":\"org.example\""));
+    }
+
+    #[test]
+    fn test_artifact_list_response_with_docker_tags() {
+        let tag = DockerTagResponse {
+            id: Uuid::new_v4(),
+            repository_key: "docker-hub".to_string(),
+            image: "library/postgres".to_string(),
+            tag: "16-alpine".to_string(),
+            manifest_digest: "sha256:abcdef".to_string(),
+            total_size_bytes: 250_000_000,
+            layer_count: 8,
+            is_index: false,
+            last_pushed_at: chrono::Utc::now(),
+            scan_status: Some("completed".to_string()),
+        };
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 1,
+                total_pages: 1,
+            },
+            components: None,
+            docker_tags: Some(vec![tag]),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"docker_tags\":["));
+        assert!(json.contains("\"image\":\"library/postgres\""));
+        assert!(json.contains("\"tag\":\"16-alpine\""));
+        assert!(json.contains("\"total_size_bytes\":250000000"));
+        assert!(json.contains("\"layer_count\":8"));
+        assert!(json.contains("\"is_index\":false"));
+        assert!(json.contains("\"scan_status\":\"completed\""));
+        assert!(!json.contains("\"components\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_docker_index_content_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_docker_index_content_type_recognizes_oci_index() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_recognizes_docker_manifest_list() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_strips_charset() {
+        assert!(is_docker_index_content_type(
+            "application/vnd.oci.image.index.v1+json; charset=utf-8"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_rejects_single_manifest() {
+        assert!(!is_docker_index_content_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(!is_docker_index_content_type(
+            "application/vnd.docker.distribution.manifest.v2+json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_index_content_type_rejects_empty() {
+        assert!(!is_docker_index_content_type(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_docker_tag_response
+    // -----------------------------------------------------------------------
+
+    fn docker_tag_row(content_type: &str, manifest_size: i64) -> DockerTagRow {
+        DockerTagRow {
+            artifact_id: Uuid::new_v4(),
+            image: "library/postgres".to_string(),
+            tag: "16-alpine".to_string(),
+            manifest_digest: "sha256:parentdigest".to_string(),
+            manifest_content_type: content_type.to_string(),
+            manifest_size_bytes: manifest_size,
+            last_pushed_at: chrono::Utc::now(),
+            scan_status: None,
+        }
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_single_arch_uses_manifest_size() {
+        // For a regular (single-arch) manifest, size_bytes on the artifact
+        // row is already config_size + sum(layers.size). No child
+        // expansion should happen.
+        let row = docker_tag_row("application/vnd.oci.image.manifest.v1+json", 12_345_678);
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 12_345_678);
+        assert!(!resp.is_index);
+        assert_eq!(resp.image, "library/postgres");
+        assert_eq!(resp.tag, "16-alpine");
+        assert_eq!(resp.repository_key, "docker-hub");
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_index_sums_child_sizes() {
+        // For an image index, the manifest itself is tiny (the index
+        // document), but the children carry the real layer cost. The
+        // total should fold in the precomputed child total.
+        let row = docker_tag_row(
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            2_500, // tiny index document
+        );
+        let mut children = std::collections::HashMap::new();
+        children.insert("sha256:parentdigest".to_string(), 500_000_000); // 500 MB across arches
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 2_500 + 500_000_000);
+        assert!(resp.is_index);
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_index_without_children_falls_back_to_manifest_only() {
+        // Defensive: if the oci_manifest_refs backfill has not yet caught
+        // up for an older index, the children map is empty. The response
+        // should still surface the manifest body size rather than 0 so
+        // the UI does not show a meaningless number.
+        let row = docker_tag_row("application/vnd.oci.image.index.v1+json", 1_234);
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, 1_234);
+        assert!(resp.is_index);
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_preserves_scan_status() {
+        let mut row = docker_tag_row("application/vnd.oci.image.manifest.v1+json", 100);
+        row.scan_status = Some("completed".to_string());
+        let children = std::collections::HashMap::new();
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.scan_status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_build_docker_tag_response_saturating_add_handles_overflow() {
+        // Pathological case: both sizes near i64::MAX should saturate
+        // instead of wrapping to a negative number that the UI would
+        // render as a nonsense size.
+        let row = docker_tag_row("application/vnd.oci.image.index.v1+json", i64::MAX - 100);
+        let mut children = std::collections::HashMap::new();
+        children.insert("sha256:parentdigest".to_string(), 1_000);
+
+        let resp = build_docker_tag_response(row, "docker-hub", &children);
+
+        assert_eq!(resp.total_size_bytes, i64::MAX);
     }
 
     #[test]
@@ -6272,5 +6948,631 @@ mod tests {
              If this fails, deny_unknown_fields was likely added and the validator can \
              be simplified."
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // download_artifact: remote-repo streaming-fallback path (#1300 / PR #1294).
+    //
+    // The generic `/:key/download/*path` handler used to buffer the full
+    // upstream body into memory before responding, which OOM-killed pods
+    // serving multi-GB artifacts. PR #1294 migrated the remote-NotFound
+    // fallback arm to `proxy_helpers::proxy_fetch_streaming`. These tests
+    // pin that contract end-to-end:
+    //
+    //   1. wiremock stands in for the real upstream
+    //   2. an empty `artifacts` table forces `artifact_service.download`
+    //      to return NotFound, which routes execution into the new
+    //      `proxy_fetch_streaming(..)` block (lines 2159-2169)
+    //   3. assertions confirm the bytes round-trip and the streaming
+    //      Content-Type / Content-Length headers come from upstream
+    //
+    // Without these tests the new lines have no coverage in CI: every
+    // other download path the handler can take terminates before the
+    // remote-fallback arm. See PR #1294 review and the 70% new-code
+    // coverage gate in `.github/workflows/ci.yml` (`coverage` job).
+    // ---------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Update the `upstream_url` and `is_public` columns on a repository row.
+    /// Lets the test point a Remote repo at a wiremock server (which only
+    /// has a stable URL after `MockServer::start().await`) and skip auth
+    /// without needing a separate admin-user fixture.
+    async fn point_repo_at_upstream(pool: &sqlx::PgPool, repo_id: Uuid, upstream: &str) {
+        sqlx::query(
+            "UPDATE repositories \
+             SET upstream_url = $2, is_public = true \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .bind(upstream)
+        .execute(pool)
+        .await
+        .expect("update repo upstream_url");
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_remote_streams_upstream_body() {
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        // Stand up the upstream and pin a single path.
+        let server = wiremock::MockServer::start().await;
+        let upstream_body: &[u8] = b"the-streamed-bytes-from-upstream";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/foo/bar.tgz"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(upstream_body)
+                    .insert_header("content-type", "application/x-tar"),
+            )
+            .mount(&server)
+            .await;
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+
+        // Build state with a real proxy_service so the streaming-fallback
+        // arm in `download_artifact` has somewhere to dispatch to.
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        // Anonymous request: `is_public = true` makes require_visible pass
+        // without needing to thread an admin AuthExtension through.
+        let router = tdh::router_anon(download_router(), state);
+        let req = tdh::get(format!("/{}/download/foo/bar.tgz", fx.repo_key));
+        let (status, body) = tdh::send(router, req).await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "remote-NotFound branch must stream a 200 (not OOM on a buffered \
+             alloc, not 404 from the local-fetch arm)"
+        );
+        assert_eq!(
+            &body[..],
+            upstream_body,
+            "streamed body bytes must round-trip from wiremock through \
+             proxy_fetch_streaming and back to the caller"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_remote_propagates_upstream_content_type() {
+        // The handler passes "application/octet-stream" as the
+        // `default_content_type` to `proxy_fetch_streaming`, but the
+        // upstream-supplied `content-type` must win when present. This
+        // pins the precedence rule alongside the body round-trip above.
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/some/file.bin"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(b"ctype-pinned".as_ref())
+                    .insert_header("content-type", "application/java-archive"),
+            )
+            .mount(&server)
+            .await;
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let router = tdh::router_anon(download_router(), state);
+        let req = tdh::get(format!("/{}/download/some/file.bin", fx.repo_key));
+        // Reach into the router directly so we can also inspect headers
+        // before draining the body into bytes.
+        use tower::ServiceExt;
+        let resp = router.oneshot(req).await.expect("oneshot");
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(
+            ct, "application/java-archive",
+            "upstream content-type must override the handler's \
+             `application/octet-stream` default fallback"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(&body_bytes[..], b"ctype-pinned");
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_remote_returns_default_content_type_when_upstream_omits_it() {
+        // When upstream doesn't set Content-Type, the handler's
+        // `application/octet-stream` default must be applied. This covers
+        // the `default_content_type` argument plumbed through #1294.
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/no/ctype.bin"))
+            .respond_with(
+                // No content-type header. wiremock will still emit a
+                // default `Content-Type: application/octet-stream` for
+                // raw byte bodies in some versions, but in this codebase
+                // we rely on the upstream metadata `content_type` field
+                // being None to exercise the default fallback.
+                wiremock::ResponseTemplate::new(200).set_body_bytes(b"no-upstream-ctype".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let router = tdh::router_anon(download_router(), state);
+        let req = tdh::get(format!("/{}/download/no/ctype.bin", fx.repo_key));
+        let (status, body) = tdh::send(router, req).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            b"no-upstream-ctype",
+            "body bytes must still flow through even when upstream omits \
+             a Content-Type header"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_remote_upstream_404_returns_error_response() {
+        // When upstream responds 404, `proxy_fetch_streaming` returns
+        // `Err(response)` which the handler unwraps via
+        // `.unwrap_or_else(|e| e).into_response()`. This pins that the
+        // error path produces a non-200 response (i.e. the unwrap_or_else
+        // arm in lines 2167-2168 is exercised, not just the happy path).
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gone/never.bin"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let router = tdh::router_anon(download_router(), state);
+        let req = tdh::get(format!("/{}/download/gone/never.bin", fx.repo_key));
+        let (status, _body) = tdh::send(router, req).await;
+
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "an upstream 404 must NOT surface as a successful streamed body; \
+             the err-into-response shortcut on line 2168 must propagate the \
+             failure status"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_remote_without_proxy_service_returns_not_found() {
+        // Belt-and-braces: with `proxy_service = None` the
+        // remote-NotFound arm falls through to `Err(NotFound)`, exercising
+        // the `else` branch right after the `proxy_fetch_streaming` call.
+        // Guards against a refactor that accidentally calls the streaming
+        // helper with an unwrap on a missing proxy service.
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        // Mark public; do NOT install a proxy_service on the state.
+        point_repo_at_upstream(&fx.pool, fx.repo_id, "https://unused.example.test").await;
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+
+        let router = tdh::router_anon(download_router(), state);
+        let req = tdh::get(format!("/{}/download/whatever.bin", fx.repo_key));
+        let (status, _body) = tdh::send(router, req).await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "no proxy_service on the AppState must short-circuit to 404, \
+             not call into a streaming helper that does not exist"
+        );
+
+        fx.teardown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Source-level pin: the remote-NotFound arm in `download_artifact` must
+    // call `proxy_helpers::proxy_fetch_streaming(` (#1294). Mirrors the
+    // five pins added in #1183 for the maven / goproxy / gitlfs / alpine /
+    // debian handlers. A silent revert to the buffered `proxy_fetch` helper
+    // would re-introduce the OOM regression closed by #895 and #1294.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_repositories_download_artifact_uses_streaming_helper_1294() {
+        let src = include_str!("repositories.rs");
+        assert!(
+            src.contains("proxy_helpers::proxy_fetch_streaming("),
+            "`repositories::download_artifact` MUST call \
+             `proxy_helpers::proxy_fetch_streaming(` for the remote \
+             upstream-fallback download (#1294). A revert to the buffered \
+             `proxy_fetch` helper would re-introduce the OOM regression \
+             closed by #895/#1294."
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // compose_artifact_path (#1237)
+    //
+    // The web UI's "Custom path (optional)" field is sent as a `path` form
+    // field alongside the file in a multipart POST to
+    // `/api/v1/repositories/<repo>/artifacts`. Before #1237 this field was
+    // silently dropped and only the file's filename ever reached the
+    // storage layer. These tests pin the composition rules:
+    //   - empty / missing custom_path -> use the filename only
+    //   - trailing slash -> directory prefix (append filename)
+    //   - no trailing slash -> full path verbatim
+    //   - arbitrary depth allowed (1 or N segments)
+    // The downstream `validate_artifact_path` in the upload pipeline
+    // continues to reject `..`, `//`, null bytes, etc.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_no_custom_path_uses_filename() {
+        // Empty and absent both fall back to the filename
+        assert_eq!(compose_artifact_path(None, "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(compose_artifact_path(Some(""), "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(
+            compose_artifact_path(Some("   "), "foo.tar.gz"),
+            "foo.tar.gz",
+            "whitespace-only path should fall back to filename"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_one_segment_verbatim() {
+        // Bug repro case from #1237: custom_path `unifi/guide.pdf` should
+        // become the full artifact path, NOT `unifi-udmp-security-guide.pdf`.
+        assert_eq!(
+            compose_artifact_path(Some("unifi/guide.pdf"), "unifi-udmp-security-guide.pdf"),
+            "unifi/guide.pdf"
+        );
+        // Single-segment custom path
+        assert_eq!(
+            compose_artifact_path(Some("renamed.bin"), "original.bin"),
+            "renamed.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_trailing_slash_appends_filename() {
+        // Issue #1237 explicit example: `unifi/docs/` + filename ->
+        // `unifi/docs/unifi-udmp-security-guide.pdf`
+        assert_eq!(
+            compose_artifact_path(Some("unifi/docs/"), "unifi-udmp-security-guide.pdf"),
+            "unifi/docs/unifi-udmp-security-guide.pdf"
+        );
+        // Single-segment directory
+        assert_eq!(
+            compose_artifact_path(Some("releases/"), "v1.tar.gz"),
+            "releases/v1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_arbitrary_depth() {
+        // 3-segment path
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/file.bin"), "ignored.bin"),
+            "a/b/c/file.bin"
+        );
+        // 5-segment path (deep)
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/e/file.bin"), "ignored.bin"),
+            "a/b/c/d/e/file.bin"
+        );
+        // 4-segment directory prefix
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/"), "file.bin"),
+            "a/b/c/d/file.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_strips_leading_slash() {
+        // Leading slash on the form field should not produce an absolute
+        // path (validate_artifact_path rejects those). Strip it so a UI
+        // that sends `/unifi/docs/` still works.
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/docs/"), "x.pdf"),
+            "unifi/docs/x.pdf"
+        );
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/guide.pdf"), "x.pdf"),
+            "unifi/guide.pdf"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_with_special_chars() {
+        // Spaces, dots, dashes, underscores, plus signs - all valid in paths
+        // (the downstream validator only rejects traversal patterns).
+        assert_eq!(
+            compose_artifact_path(Some("my dir/file.tar.gz"), "x.bin"),
+            "my dir/file.tar.gz"
+        );
+        assert_eq!(
+            compose_artifact_path(
+                Some("releases/v1.2.3-rc.1/"),
+                "artifact_v1.2.3+linux.x86_64.bin"
+            ),
+            "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Security: composed paths must be rejected by validate_artifact_path
+    //
+    // Regression for the gap found in #1322's security review:
+    // `compose_artifact_path` happily produces `../etc/passwd` from a
+    // malicious `path` form field, and the original PR did NOT call
+    // `validate_artifact_path` on the composed value before handing it to
+    // the storage layer. Filesystem storage's `key_to_path` strips `..`
+    // segments, but S3/GCS backends do not, so a `path=../../etc/passwd`
+    // form field could escape the repository's storage key prefix.
+    //
+    // The fix is to call `validate_artifact_path` inside `upload_artifact`
+    // so every entry point (URL-path PUT, multipart-with-path POST, and
+    // the new multipart `path` form field added in #1237) is covered. The
+    // first test pins the composition+validation contract without needing
+    // a database; the second drives the actual handler end-to-end and
+    // asserts the HTTP response is 400.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_traversal_is_rejected_by_validator() {
+        // The composed path is exactly the attacker-controlled value
+        // (no trailing slash means the path is used verbatim).
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // And validate_artifact_path must reject it. If this ever starts
+        // returning Ok(_) the security guarantee is gone.
+        let err = upload_service::validate_artifact_path(&composed)
+            .expect_err("../etc/passwd must be rejected as traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("traversal"),
+            "expected traversal rejection, got: {msg}"
+        );
+
+        // Belt-and-braces: a few other shapes the composer can produce
+        // from hostile form fields, all of which must fail validation.
+        for hostile in [
+            "../../etc/passwd",
+            "a/../b",
+            "file\0.txt",
+            "a/%2e%2e/b",
+            "a\\b",
+        ] {
+            assert!(
+                upload_service::validate_artifact_path(hostile).is_err(),
+                "validate_artifact_path must reject {hostile:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_artifact_rejects_traversal_path_with_400() {
+        // End-to-end pin: drive `upload_artifact` with a path produced by
+        // `compose_artifact_path("../etc/passwd", _)` and assert the
+        // handler returns 400 Bad Request without touching storage. Skips
+        // gracefully when no DATABASE_URL is configured.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // `make_auth` builds a JWT-style AuthExtension (is_api_token =
+        // false), so `require_scope("write")` automatically passes - no
+        // need to populate `scopes`.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        let result = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), composed)),
+            HeaderMap::new(),
+            Bytes::from_static(b"payload-should-never-be-stored"),
+        )
+        .await;
+
+        let err = result.expect_err("traversal path must be rejected");
+        // AppError::Validation maps to 400 Bad Request via IntoResponse
+        // (see error.rs status_and_code). Pinning the variant here is
+        // equivalent and avoids reaching into a private method.
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "traversal path must surface as Validation (400), got {err:?}",
+        );
+
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual-repo /members + /cache-ttl sub-router registration (#1366)
+    // -----------------------------------------------------------------------
+    //
+    // Issue #1366 surfaced as 22 release-gate failures all reporting HTTP 404
+    // on `/api/v1/repositories/{key}/members` (and the sibling /cache-ttl
+    // route) for v1.2.0-rc.2. Investigation against the same commit
+    // (f81136eb) showed the routes are reachable end-to-end on a freshly
+    // built backend, so the source itself is not regressed -- the production
+    // failure was rooted elsewhere (likely a stale image / deploy artifact).
+    //
+    // These tests defend the router shape itself so a future refactor that
+    // accidentally drops one of the routes (the hypothesis the issue raised)
+    // would fail at `cargo test --workspace --lib` rather than slipping
+    // through to release-gate. The pattern matches the existing source-level
+    // regression for `/lxc` in `routes.rs::tests` (#1272): a runtime test
+    // would need a full DB + auth fixture which we already have elsewhere,
+    // but those tests cannot catch a route that was simply not registered
+    // (a missing route never reaches the handler under test). Source-level
+    // pins catch exactly that class of bug.
+    //
+    // Each assertion is built from `format!`d substrings so the test source
+    // itself does not satisfy the search if `include_str!` is replaced
+    // with a less specific lookup in a future refactor.
+    mod virtual_member_router_registration {
+        const SRC: &str = include_str!("repositories.rs");
+
+        fn router_fn_body() -> &'static str {
+            // Slice the `pub fn router()` body so route assertions do not
+            // accidentally match a route literal that appears inside a
+            // doc-comment or another function. The body starts at the
+            // signature and ends at the next top-level `pub` item.
+            let marker = "pub fn router() -> Router<SharedState> {";
+            let start = SRC
+                .find(marker)
+                .expect("repositories::router() definition must exist");
+            let after = &SRC[start..];
+            let end = after[1..]
+                .find("\npub ")
+                .map(|i| i + 1)
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+
+        #[test]
+        fn router_registers_members_get_post_put() {
+            // The combined route must include all three methods on a single
+            // `/:key/members` literal. Splitting them across multiple
+            // `.route()` calls is also valid axum, but the current shape is
+            // a single call -- if you change that, update this test in the
+            // same PR so the intent stays explicit.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            for method_handler in [
+                ("list_virtual_members", "get"),
+                ("add_virtual_member", "post"),
+                ("update_virtual_members", "put"),
+            ] {
+                let needle = format!("{}({})", method_handler.1, method_handler.0);
+                assert!(
+                    body.contains(&needle),
+                    "router() must bind {} via `{}` (regression of #1366)",
+                    method_handler.0,
+                    needle
+                );
+            }
+        }
+
+        #[test]
+        fn router_registers_members_delete_by_member_key() {
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}/:member_key\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the per-member delete route at {} (regression of #1366)",
+                path
+            );
+            let delete_handler = format!("delete({})", "remove_virtual_member");
+            assert!(
+                body.contains(&delete_handler),
+                "router() must bind remove_virtual_member via `{}` (regression of #1366)",
+                delete_handler
+            );
+        }
+
+        #[test]
+        fn router_registers_cache_ttl_put_and_get() {
+            // The release-gate failure for #1366 also flagged
+            // `PUT /repositories/{key}/cache-ttl` returning 404. cache-ttl is
+            // a sibling sub-resource of /members, so a regression that drops
+            // the virtual-member routes is likely to drop this one too. Pin
+            // both routes together so a single source-level read of
+            // `router()` covers the whole sub-router shape.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "cache-ttl");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            let put_handler = format!("put({})", "set_cache_ttl");
+            let get_handler = format!("get({})", "get_cache_ttl");
+            assert!(
+                body.contains(&put_handler),
+                "router() must bind set_cache_ttl via `{}` (regression of #1366)",
+                put_handler
+            );
+            assert!(
+                body.contains(&get_handler),
+                "router() must bind get_cache_ttl via `{}` (regression of #1366)",
+                get_handler
+            );
+        }
+
+        #[test]
+        fn router_fn_marker_resolves_so_the_above_tests_are_not_vacuous() {
+            // Belt-and-suspenders: if a future refactor renames `router()`
+            // or changes its signature, `router_fn_body()` would panic and
+            // the three tests above would fail noisily rather than passing
+            // a `false.contains(...)` against an empty slice.
+            let body = router_fn_body();
+            assert!(
+                body.starts_with("pub fn router() -> Router<SharedState> {"),
+                "router_fn_body() did not anchor on the expected signature; \
+                 the route assertions above may be vacuously true. Refactor \
+                 hint: update the `marker` literal in router_fn_body() to \
+                 match the new signature."
+            );
+            // Sanity check that the body is non-trivial. A bare stub
+            // implementation (e.g. `Router::new()` only) would silently
+            // make every contains() assertion above fail with a
+            // not-found-substring message, which is the right outcome, but
+            // we also assert here so the failure mode is obvious.
+            assert!(
+                body.len() > 200,
+                "router() body is suspiciously short ({} bytes); the route \
+                 assertions above may be testing an empty router",
+                body.len()
+            );
+        }
     }
 }

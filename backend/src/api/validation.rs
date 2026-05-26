@@ -172,18 +172,22 @@ pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
 ///   evaluated *first* so `::1` is correctly classified as IPv6 loopback
 ///   rather than IPv4 alias `0.0.0.1`.
 ///
-/// Private-IP allowlist (issue #976): operators on corporate networks
-/// with no public internet may need to point upstreams at internal
-/// mirrors. Two opt-in escape hatches:
+/// Private-IP allowlist (issues #976, #1224): operators on corporate
+/// networks with no public internet, or in-cluster test fixtures that
+/// need to reach a mock upstream on a pod CIDR, may need to point
+/// upstreams at internal mirrors. Two opt-in escape hatches:
 ///
 /// - `UPSTREAM_ALLOW_PRIVATE_IPS=true` — allow all RFC1918 + IPv6
 ///   unique-local. Cloud metadata IPs (169.254.169.254, 192.0.0.192,
 ///   100.100.100.200) and loopback / link-local / unspecified remain
 ///   blocked, since those are SSRF targets, not "internal mirrors".
-/// - `UPSTREAM_PRIVATE_IP_ALLOWLIST=10.0.0.0/8,192.168.7.0/24` — more
+/// - `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8,192.168.7.0/24` — more
 ///   precise: only the listed CIDRs are exempted. Same metadata /
 ///   loopback hard-blocks apply. Wins over the blanket toggle if both
 ///   are set (allowlist is strictly more restrictive).
+///   `UPSTREAM_PRIVATE_IP_ALLOWLIST` is accepted as a backward-compatible
+///   alias; if both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` takes
+///   precedence.
 pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -256,21 +260,42 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
 /// Whether the operator has opted the given private IP into the
 /// upstream allowlist. Returns false (i.e. block) by default. Order:
 ///
-/// 1. If `UPSTREAM_PRIVATE_IP_ALLOWLIST` is set, only IPs inside one
-///    of those CIDRs are exempted. The blanket toggle is ignored.
+/// 1. If `AK_SSRF_ALLOW_PRIVATE_CIDRS` (or its backward-compatible
+///    alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`) is set, only IPs inside
+///    one of those CIDRs are exempted. The blanket toggle is ignored.
+///    If both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` wins so the
+///    canonical name is the operator's source of truth.
 /// 2. Otherwise, `UPSTREAM_ALLOW_PRIVATE_IPS=true` exempts all
 ///    RFC1918 + IPv6 unique-local addresses.
 ///
 /// Metadata IPs and loopback are checked separately and are never
 /// reachable through this path (see `is_hard_blocked_ipv4`).
 fn private_ip_allowed(ip: std::net::IpAddr) -> bool {
-    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
-        let trimmed = list.trim();
-        if !trimmed.is_empty() {
-            return cidr_list_contains(trimmed, ip);
-        }
+    if let Some(list) = private_cidr_allowlist_value() {
+        return cidr_list_contains(&list, ip);
     }
     upstream_allow_private_ips_enabled()
+}
+
+/// Read the configured private-CIDR allowlist, preferring the canonical
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` (issue #1224) over the older
+/// `UPSTREAM_PRIVATE_IP_ALLOWLIST` (issue #976). Returns `None` when
+/// neither is set, or when both are blank, so the caller can fall
+/// through to the blanket toggle. Whitespace-only values are treated as
+/// unset.
+pub fn private_cidr_allowlist_value() -> Option<String> {
+    for name in [
+        "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+        "UPSTREAM_PRIVATE_IP_ALLOWLIST",
+    ] {
+        if let Ok(v) = std::env::var(name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// True when `UPSTREAM_ALLOW_PRIVATE_IPS` is set to a truthy value
@@ -305,7 +330,7 @@ fn cidr_list_contains(list: &str, ip: std::net::IpAddr) -> bool {
                     target: "security",
                     cidr = entry,
                     reason = %reason,
-                    "UPSTREAM_PRIVATE_IP_ALLOWLIST entry ignored (malformed)"
+                    "AK_SSRF_ALLOW_PRIVATE_CIDRS / UPSTREAM_PRIVATE_IP_ALLOWLIST entry ignored (malformed)"
                 );
             }
         }
@@ -332,7 +357,8 @@ fn cidr_contains(entry: &str, ip: std::net::IpAddr) -> std::result::Result<bool,
     // defeats the point of a narrower allowlist over the blanket toggle
     // and is almost always operator error (a copy-pasted 0.0.0.0/0 or
     // ::/0 from a different config). Operators who genuinely want every
-    // private IP should set UPSTREAM_ALLOW_PRIVATE_IPS=true explicitly.
+    // private IP should set `UPSTREAM_ALLOW_PRIVATE_IPS=true` explicitly
+    // instead of widening `AK_SSRF_ALLOW_PRIVATE_CIDRS`.
     if prefix == 0 {
         return Err("prefix 0 (all-IPs) is not permitted in the allowlist");
     }
@@ -491,16 +517,22 @@ mod tests {
 
     #[test]
     fn test_rejects_10_network() {
+        // Takes the allowlist guard so a parallel test that sets
+        // AK_SSRF_ALLOW_PRIVATE_CIDRS or UPSTREAM_PRIVATE_IP_ALLOWLIST
+        // for an allowlist scenario does not race this baseline.
+        let _g = AllowlistGuard::new();
         assert_blocked_ip("http://10.0.0.1/api");
     }
 
     #[test]
     fn test_rejects_172_16_network() {
+        let _g = AllowlistGuard::new();
         assert_blocked_ip("http://172.16.0.1/api");
     }
 
     #[test]
     fn test_rejects_192_168_network() {
+        let _g = AllowlistGuard::new();
         assert_blocked_ip("http://192.168.1.1/api");
     }
 
@@ -543,6 +575,8 @@ mod tests {
 
     #[test]
     fn test_rejects_ipv4_mapped_private_10() {
+        // Env-locked so allowlist-mutating tests don't race the baseline.
+        let _g = AllowlistGuard::new();
         assert_blocked_ip("http://[::ffff:10.0.0.1]/api");
     }
 
@@ -786,6 +820,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
         prev_list: Option<String>,
+        prev_ssrf: Option<String>,
     }
 
     impl AllowlistGuard {
@@ -795,9 +830,11 @@ mod tests {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
                 prev_list: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
+                prev_ssrf: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
             };
             std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
             std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+            std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
             g
         }
     }
@@ -811,6 +848,10 @@ mod tests {
             match &self.prev_list {
                 Some(v) => std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", v),
                 None => std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST"),
+            }
+            match &self.prev_ssrf {
+                Some(v) => std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", v),
+                None => std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
             }
         }
     }
@@ -1026,5 +1067,163 @@ mod tests {
     fn test_cidr_contains_invalid_prefix_returns_error() {
         assert!(cidr_contains("10.0.0.0/40", "10.0.0.1".parse().unwrap()).is_err());
         assert!(cidr_contains("fc00::/200", "fc00::1".parse().unwrap()).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1224: AK_SSRF_ALLOW_PRIVATE_CIDRS is the canonical name for
+    // the comma-separated private-CIDR allowlist. UPSTREAM_PRIVATE_IP_ALLOWLIST
+    // remains accepted as a backward-compatible alias.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_default_blocks_private() {
+        // Default behaviour with neither env var set: every RFC1918
+        // address is still blocked. This pins the production posture
+        // so a refactor cannot silently flip the default to "allow".
+        let _g = AllowlistGuard::new();
+        assert_blocked_ip("http://10.244.0.103:45293/upstream");
+        assert_blocked_ip("http://192.168.1.1/x");
+        assert_blocked_ip("http://172.16.0.1/x");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_unblocks_listed_pod_cidr() {
+        // Issue #1224's exact in-cluster mock-upstream scenario: pod
+        // CIDR is 10.244.0.0/16 and the test fixture lives on a pod IP
+        // inside that range. With AK_SSRF_ALLOW_PRIVATE_CIDRS set to
+        // that CIDR, the validator must let the upstream URL through.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        assert!(
+            validate_outbound_url("http://10.244.0.103:45293/upstream", "Upstream URL").is_ok(),
+            "10.244.0.103 must be allowed when AK_SSRF_ALLOW_PRIVATE_CIDRS=10.244.0.0/16"
+        );
+        // Outside the allowlist subnet but still RFC1918 — stays blocked.
+        assert_blocked_ip("http://192.168.1.1/x");
+        // Outside the listed pod CIDR but still in 10.0.0.0/8 — stays blocked.
+        assert_blocked_ip("http://10.0.0.1/x");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_still_blocks_metadata() {
+        // Hard-blocked metadata IPs must not become reachable even if
+        // an operator lists a containing CIDR. Defense-in-depth: the
+        // metadata IP check fires before the allowlist is consulted.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "169.254.0.0/16");
+        assert_blocked_ip("http://169.254.169.254/latest/meta-data");
+        // Oracle metadata IP, even if 192.0.0.0/24 is allowlisted.
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "192.0.0.0/24");
+        assert_blocked_ip("http://192.0.0.192/opc/v2/instance");
+        // Alibaba metadata IP, even if the containing CGNAT block is allowlisted.
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "100.100.100.0/24");
+        assert_blocked_ip("http://100.100.100.200/latest/meta-data");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_still_blocks_loopback() {
+        // Loopback is the AK process itself. Even with the allowlist
+        // covering 127.0.0.0/8, this must stay blocked because it would
+        // reintroduce SSRF to localhost admin endpoints.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "127.0.0.0/8");
+        assert_blocked_ip("http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_malformed_entries_skipped() {
+        // A typo in one entry must not silently widen the allowlist nor
+        // crash. The good entry still works; the bad one is logged + skipped.
+        let _g = AllowlistGuard::new();
+        std::env::set_var(
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+            "not-an-ip, 10.0.0.0/77, 10.244.0.0/16",
+        );
+        assert!(
+            validate_outbound_url("http://10.244.0.5/x", "Upstream URL").is_ok(),
+            "10.244.0.5 must be allowed (good entry survives malformed peers)"
+        );
+        assert_blocked_ip("http://10.0.0.1/x");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_empty_falls_through() {
+        // Empty / whitespace-only is treated as unset so it falls
+        // through to the blanket toggle rather than collapsing to
+        // "block all private".
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "   ");
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_url("http://10.0.0.5/x", "Upstream URL").is_ok(),
+            "blanket toggle must take over when AK_SSRF_ALLOW_PRIVATE_CIDRS is blank"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_ipv6_subnet() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "fd00::/8");
+        assert!(validate_outbound_url("http://[fd12::1]/x", "Upstream URL").is_ok());
+        assert_blocked_ip("http://[fc00::1]/x");
+    }
+
+    #[test]
+    fn test_ssrf_allow_private_cidrs_takes_precedence_over_alias() {
+        // Both AK_SSRF_ALLOW_PRIVATE_CIDRS (new canonical) and
+        // UPSTREAM_PRIVATE_IP_ALLOWLIST (legacy alias) are set. The new
+        // name MUST win so an operator who migrates to the canonical
+        // name without removing the old one gets the new behaviour.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "192.168.99.0/24");
+        // In the canonical (new) list, NOT in the legacy alias.
+        assert!(
+            validate_outbound_url("http://10.244.0.7/x", "Upstream URL").is_ok(),
+            "10.244.0.7 must be allowed via AK_SSRF_ALLOW_PRIVATE_CIDRS"
+        );
+        // In the legacy alias only. The new name wins so this stays blocked.
+        assert_blocked_ip("http://192.168.99.1/x");
+    }
+
+    #[test]
+    fn test_legacy_alias_still_honored_when_new_var_unset() {
+        // Backward compatibility: operators who already set the old
+        // UPSTREAM_PRIVATE_IP_ALLOWLIST must not have to migrate
+        // immediately. With only the alias set, it still takes effect.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "10.0.0.0/8");
+        assert!(validate_outbound_url("http://10.5.6.7/x", "Upstream URL").is_ok());
+        assert_blocked_ip("http://192.168.1.1/x");
+    }
+
+    #[test]
+    fn test_private_cidr_allowlist_value_helper() {
+        // Direct contract test for the helper main.rs uses to format
+        // the boot-time warning. The new name takes precedence; empty
+        // / whitespace values fall through; both unset -> None.
+        let _g = AllowlistGuard::new();
+        assert!(private_cidr_allowlist_value().is_none());
+
+        std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", "10.0.0.0/8");
+        assert_eq!(
+            private_cidr_allowlist_value().as_deref(),
+            Some("10.0.0.0/8"),
+            "legacy alias picked up when new name is unset"
+        );
+
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        assert_eq!(
+            private_cidr_allowlist_value().as_deref(),
+            Some("10.244.0.0/16"),
+            "new canonical name wins over legacy alias"
+        );
+
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "   ");
+        assert_eq!(
+            private_cidr_allowlist_value().as_deref(),
+            Some("10.0.0.0/8"),
+            "blank new value falls through to legacy alias"
+        );
     }
 }

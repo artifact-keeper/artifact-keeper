@@ -16,7 +16,7 @@ apt-get update -qq > /dev/null
 apt-get install -y -qq build-essential devscripts dpkg-dev curl gnupg python3 > /dev/null 2>&1
 
 # --- Setup repo + signing ---
-setup_signed_repo "$REPO_KEY" "debian"
+setup_signed_repo "$REPO_KEY" "debian" "gpg"
 
 # --- Build .deb package ---
 log "Building Debian package..."
@@ -98,25 +98,17 @@ log "Downloading public key..."
 curl -sf "$BACKEND_URL/debian/$REPO_KEY/dists/stable/gpg-key.asc" > /tmp/repo-key.asc
 [ -s /tmp/repo-key.asc ] || fail "Empty public key"
 
-log "Public key downloaded (RSA PEM format)"
-# Note: Our signing uses RSA PKCS#1v15, not OpenPGP format.
-# Real GPG verification would need pgp crate in backend.
-# We validate the signature endpoints exist and use [trusted=yes] for apt.
+grep -q "BEGIN PGP PUBLIC KEY BLOCK" /tmp/repo-key.asc || fail "Public key is not OpenPGP armored"
+install -d -m 0755 /etc/apt/keyrings
+gpg --dearmor -o /etc/apt/keyrings/e2e-registry.gpg /tmp/repo-key.asc
 
-log "Adding apt source (trusted mode)..."
-echo "deb [trusted=yes] $BACKEND_URL/debian/$REPO_KEY stable main" \
+log "Adding apt source (signed-by mode)..."
+echo "deb [signed-by=/etc/apt/keyrings/e2e-registry.gpg] $BACKEND_URL/debian/$REPO_KEY stable main" \
     > /etc/apt/sources.list.d/e2e-registry.list
-
-# Allow insecure repos since our signing uses RSA not OpenPGP
-cat > /etc/apt/apt.conf.d/99e2e-insecure << 'APTCONF'
-Acquire::AllowInsecureRepositories "true";
-Acquire::AllowDowngradeToInsecureRepositories "true";
-APT::Get::AllowUnauthenticated "true";
-APTCONF
 
 # --- apt-get update + install ---
 log "Running apt-get update..."
-apt-get update 2>&1 | tail -10 || log "apt update had warnings (expected with RSA-only signatures)"
+apt-get update 2>&1 | tail -10
 
 log "Installing $PKG_NAME..."
 apt-get install -y -qq "$PKG_NAME" 2>&1 || {

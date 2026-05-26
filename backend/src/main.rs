@@ -175,8 +175,26 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        repair_legacy_073_checksum(&db_pool).await?;
-        sqlx::migrate!("./migrations").run(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
+            .await?;
+        // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
+        // or backfill UPDATEs) take longer than the per-query
+        // `statement_timeout` that operators commonly set on their Postgres
+        // parameter group as an app-query safeguard (10 s on AWS RDS for many
+        // tunings). Acquire a dedicated connection and raise the timeouts
+        // session-locally so the migration runner doesn't share fate with
+        // production query limits. The SET is per-session and is wiped when
+        // the connection is dropped — global limits for normal app queries
+        // are unaffected.
+        let mut conn = db_pool.acquire().await?;
+        sqlx::query("SET statement_timeout = '30min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET lock_timeout = '5min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::migrate!("./migrations").run(&mut *conn).await?;
         tracing::info!("Database migrations complete");
     }
 
@@ -303,29 +321,48 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
 
-    // Issue #976: surface the upstream private-IP allowlist at boot so the
-    // posture is obvious in startup logs. Metadata IPs remain blocked
-    // unconditionally; the validator handles that. The warning is loud
-    // because relaxing the SSRF guard is a security tradeoff the operator
-    // owns.
-    if let Ok(list) = std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST") {
-        let trimmed = list.trim();
-        if !trimmed.is_empty() {
-            tracing::warn!(
-                target: "security",
-                allowlist = %trimmed,
-                "UPSTREAM_PRIVATE_IP_ALLOWLIST is set; upstream URLs may now \
-                 target listed private CIDRs. Cloud metadata IPs and loopback \
-                 remain blocked. SSRF risk surface widened (issue #976)."
-            );
-        }
+    // Issues #976, #1224: surface the upstream private-IP allowlist at
+    // boot so the posture is obvious in startup logs. Metadata IPs
+    // remain blocked unconditionally; the validator handles that. The
+    // warning is loud because relaxing the SSRF guard is a security
+    // tradeoff the operator owns.
+    if let Some(list) = artifact_keeper_backend::api::validation::private_cidr_allowlist_value() {
+        tracing::warn!(
+            target: "security",
+            allowlist = %list,
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
+             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             metadata IPs and loopback remain blocked. SSRF risk surface \
+             widened (issues #976, #1224)."
+        );
     } else if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
         tracing::warn!(
             target: "security",
             "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \
              RFC1918 / unique-local addresses. Cloud metadata IPs and loopback \
-             remain blocked. Prefer UPSTREAM_PRIVATE_IP_ALLOWLIST with explicit \
-             CIDRs for a narrower SSRF surface (issue #976)."
+             remain blocked. Prefer AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit \
+             CIDRs for a narrower SSRF surface (issues #976, #1224)."
+        );
+    }
+
+    // Catch a common ops footgun: a placeholder env name `WEBHOOK_ALLOW_PRIVATE_IPS`
+    // briefly appeared in chart values (artifact-keeper-test PR #187) and is
+    // still floating around in older docs and copies. The backend never read
+    // that name -- the actual flag is `UPSTREAM_ALLOW_PRIVATE_IPS`. Warn so
+    // operators who copy the old name see why their webhook private-IP
+    // allowance has no effect, instead of silently failing webhook tests.
+    // See artifact-keeper#1367 / artifact-keeper-test PR #188.
+    if std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").is_ok()
+        && std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").is_err()
+    {
+        tracing::warn!(
+            target: "security",
+            "WEBHOOK_ALLOW_PRIVATE_IPS is set but is NOT read by the backend. \
+             The correct env var to allow webhook targets on private IPs is \
+             UPSTREAM_ALLOW_PRIVATE_IPS=true (or the narrower \
+             AK_SSRF_ALLOW_PRIVATE_CIDRS). Webhook deliveries to RFC1918 / \
+             loopback hosts will continue to be rejected until the correct \
+             name is used."
         );
     }
 
@@ -552,13 +589,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
-    // Validate the webhook signing-secret encryption key at boot. If the
-    // operator has set AK_WEBHOOK_SECRET_KEY but it is malformed, fail loud
-    // and early instead of letting create/rotate-secret return HTTP 500
-    // hours later. A missing key is also fatal: webhooks v2 cannot create
-    // or rotate secrets without it. Operators who want to run the backend
-    // without webhook support entirely can omit the key by also disabling
-    // the producer (WEBHOOKS_V2_PRODUCER_ENABLED=false, the default).
+    // Validate the webhook signing-secret encryption key at boot. We accept
+    // any common base64 alphabet (standard or URL-safe, padded or not) so
+    // operator-supplied keys generated by tools like `openssl rand -base64`
+    // or Kubernetes secret generators work regardless of which characters
+    // happen to land in the output (see #1350: a `_` byte from base64url
+    // tripped the standard-only decoder).
+    //
+    // If the operator has set AK_WEBHOOK_SECRET_KEY but it is still malformed
+    // after trying every alphabet, fail loud and early instead of letting
+    // create/rotate-secret return HTTP 500 hours later. A missing key is
+    // also fatal: webhooks v2 cannot create or rotate secrets without it.
+    // Operators who want to run the backend without webhook support entirely
+    // can omit the key by also disabling the producer
+    // (WEBHOOKS_V2_PRODUCER_ENABLED=false, the default).
     match artifact_keeper_backend::services::webhook_secret_crypto::ensure_configured() {
         Ok(()) => tracing::info!("Webhook secret encryption key validated"),
         Err(artifact_keeper_backend::services::webhook_secret_crypto::WebhookSecretError::KeyMissing) => {
@@ -1129,86 +1173,6 @@ fn build_oidc_request_from_values(
     })
 }
 
-/// Repair a stale `_sqlx_migrations` row for version 73 that was left over by
-/// the duplicate-073 bug fixed in #1138.
-///
-/// Between PR #975 (forward-port of download-ticket cascade) and PR #1138
-/// (rename to 083), the migrations directory contained two files numbered 073:
-/// `073_account_lockout.sql` and `073_download_tickets_cascade.sql`. Postgres
-/// only kept whichever row `sqlx migrate run` inserted first, with that file's
-/// checksum. After #1138 renamed the colliding file to 083, the surviving 073
-/// file on disk (`073_account_lockout.sql`) may differ from what the DB stored,
-/// and `sqlx migrate run` then aborts with `Migration(VersionMismatch(73))`
-/// before applying any newer migration (issue #1129).
-///
-/// This pre-migration step looks at the DB and only acts when both halves of
-/// the broken state are present: the lockout schema (proof account_lockout was
-/// applied at some point) AND the `_sqlx_migrations` row for version 73 whose
-/// checksum no longer matches the current file. In that exact case we rewrite
-/// the stored checksum to the current file's checksum so the migrator can move
-/// on. The check is conservative; if either signal is missing we leave the row
-/// alone so unrelated checksum drift still surfaces as a startup error.
-async fn repair_legacy_073_checksum(db: &sqlx::PgPool) -> Result<()> {
-    // Skip when the table doesn't exist yet (fresh DB) or when no row for
-    // version 73 has been recorded.
-    let table_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_sqlx_migrations')",
-    )
-    .fetch_one(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    if !table_exists {
-        return Ok(());
-    }
-
-    let stored_checksum: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 73")
-            .fetch_optional(db)
-            .await
-            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    let Some(stored) = stored_checksum else {
-        return Ok(());
-    };
-
-    // Confirm the lockout migration was previously applied by checking for one
-    // of its columns. If the column is absent, this row predates the duplicate
-    // and is unrelated to the bug we're repairing.
-    let lockout_applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-         WHERE table_name = 'users' AND column_name = 'failed_login_attempts')",
-    )
-    .fetch_one(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    if !lockout_applied {
-        return Ok(());
-    }
-
-    let current_file = include_str!("../migrations/073_account_lockout.sql");
-    use sha2::{Digest, Sha384};
-    let mut hasher = Sha384::new();
-    hasher.update(current_file.as_bytes());
-    let current_checksum = hasher.finalize().to_vec();
-
-    if stored == current_checksum {
-        return Ok(());
-    }
-
-    tracing::warn!(
-        event = "migration_073_checksum_repair",
-        "Detected stale checksum for migration 073 (account_lockout). \
-         Rewriting _sqlx_migrations row so the migrator can proceed. \
-         This is a one-time recovery for installations affected by the \
-         duplicate-073 bug fixed in #1138."
-    );
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 73")
-        .bind(&current_checksum)
-        .execute(db)
-        .await
-        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-    Ok(())
-}
-
 /// Provision the initial admin user on first boot and determine setup mode.
 ///
 /// Returns `true` when the API should be locked until the admin changes
@@ -1512,7 +1476,9 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
         {}\
         \n\
           File:      {}\n\
-          Read it:   docker exec artifact-keeper-backend cat {}\n\
+          Read it by exec'ing into the artifact-keeper backend container:\n\
+            Docker:      docker exec artifact-keeper-backend cat {}\n\
+            Kubernetes:  kubectl exec deploy/artifact-keeper-backend -- cat {}\n\
         \n\
           The API is LOCKED until you change this password.\n\
           Open the web UI and log in -- you will be redirected to\n\
@@ -1524,6 +1490,7 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
         \n\
         ===========================================================",
         password_line,
+        password_file.display(),
         password_file.display(),
         password_file.display(),
     );

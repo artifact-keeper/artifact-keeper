@@ -8,11 +8,11 @@
 # Bug #978: Dependency-Track 4.x no longer exposes existing key material on
 # `GET /api/v1/team`. Only `maskedKey` is returned for previously-created
 # keys. The unmasked key is only ever returned in the response body of
-# `POST /api/v1/team/<uuid>/key`. We must therefore *create* a fresh key
+# `PUT /api/v1/team/<uuid>/key`. We must therefore *create* a fresh key
 # and capture the response, rather than try to read an existing one.
 #
 # Idempotence strategy: on each run we delete the publicId we previously
-# minted (recorded in PUBLIC_ID_MARKER) and then POST a new one. This keeps
+# minted (recorded in PUBLIC_ID_MARKER) and then PUT a new one. This keeps
 # the team to a single active key across reruns and prevents accumulation
 # across helm upgrades.
 #
@@ -112,7 +112,7 @@ fi
 echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
 
 # Rotate: delete the publicId we previously minted (tracked in
-# PUBLIC_ID_MARKER), then POST a new one below.
+# PUBLIC_ID_MARKER), then PUT a new one below.
 #
 # Safety rail: if the team has publicIds we did NOT mint, those may belong
 # to operator-attached integrations (CI scanners, dashboards, webhooks).
@@ -167,11 +167,12 @@ fi
 # Create a fresh API key. DT 4.x returns the unmasked secret in the
 # response body of this single call. There is no other way to retrieve it.
 echo "[dtrack-init] Generating new $DT_TEAM_NAME API key..."
-KEY_RESP=$(curl -sf -X POST "$DT_URL/api/v1/team/$TEAM_UUID/key" \
-  -H "Authorization: Bearer $TOKEN" || true)
+KEY_RESP=$(curl -sf -X PUT "$DT_URL/api/v1/team/$TEAM_UUID/key" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" || true)
 
 if [ -z "$KEY_RESP" ]; then
-  echo "[dtrack-init] ERROR: POST /api/v1/team/$TEAM_UUID/key returned empty body" >&2
+  echo "[dtrack-init] ERROR: PUT /api/v1/team/$TEAM_UUID/key returned empty body" >&2
   exit 1
 fi
 
@@ -237,17 +238,16 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
-# Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
-echo "[dtrack-init] Enabling NVD API 2.0 vulnerability source..."
+echo "[dtrack-init] Enabling NVD REST API 2.0 mirroring..."
 NVD_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
   -X POST "$DT_URL/api/v1/configProperty" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"groupName":"vuln-source","propertyName":"nvd.feeds.url","propertyValue":"https://services.nvd.nist.gov/rest/json/cves/2.0"}')
+  -d '{"groupName":"vuln-source","propertyName":"nvd.api.enabled","propertyValue":"true"}')
 if [ "$NVD_RESULT" = "200" ]; then
-  echo "[dtrack-init] NVD API 2.0 source configured"
+  echo "[dtrack-init] NVD REST API 2.0 mirroring enabled"
 else
-  echo "[dtrack-init] WARNING: NVD config returned HTTP $NVD_RESULT (may already be set or unsupported)"
+  echo "[dtrack-init] WARNING: NVD API config returned HTTP $NVD_RESULT (may already be set)"
 fi
 
 # Drop a marker so operators can tell at a glance that bootstrap completed.

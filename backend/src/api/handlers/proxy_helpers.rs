@@ -404,12 +404,47 @@ pub async fn proxy_fetch_streaming(
     path: &str,
     default_content_type: &str,
 ) -> Result<Response, Response> {
+    proxy_fetch_streaming_with_disposition(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        None,
+    )
+    .await
+}
+
+/// Streaming sibling of [`proxy_fetch`] that also forwards a
+/// `Content-Disposition: attachment; filename="…"` header on the
+/// outbound response.
+///
+/// Same body and cache semantics as [`proxy_fetch_streaming`]; only the
+/// outbound response headers differ. Used by [`try_remote_or_virtual_download`]
+/// so format handlers that previously buffered via `proxy_fetch` +
+/// `build_download_response` keep the attachment filename on the
+/// streaming code path (#1215).
+pub async fn proxy_fetch_streaming_with_disposition(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> Result<Response, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     let result = proxy_service
         .fetch_artifact_streaming(&repo, path)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
-    build_streaming_response(result, default_content_type).map_err(|e| {
+    build_streaming_response_with_disposition(
+        result,
+        default_content_type,
+        content_disposition_filename,
+    )
+    .map_err(|e| {
         map_proxy_error(
             repo_key,
             path,
@@ -430,9 +465,28 @@ pub async fn proxy_fetch_streaming(
 /// storage backend. Returns the underlying [`axum::http::Error`] on
 /// the rare malformed-header path so the caller can wrap into its
 /// own error type.
+#[cfg(test)]
 pub(crate) fn build_streaming_response(
     result: crate::services::proxy_service::StreamingFetchResult,
     default_content_type: &str,
+) -> std::result::Result<Response, axum::http::Error> {
+    build_streaming_response_with_disposition(result, default_content_type, None)
+}
+
+/// Variant of [`build_streaming_response`] that also sets a
+/// `Content-Disposition: attachment; filename="…"` header when
+/// `filename` is `Some`.
+///
+/// Extracted so the buffered [`build_download_response`] / streaming
+/// [`proxy_fetch_streaming_with_disposition`] code paths produce
+/// equivalent outbound headers — keeping clients that key off the
+/// suggested filename (browsers, curl `-OJ`) working when the
+/// remote-or-virtual download arm migrates from buffered to streaming
+/// (#1215).
+pub(crate) fn build_streaming_response_with_disposition(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+    filename: Option<&str>,
 ) -> std::result::Result<Response, axum::http::Error> {
     let mut builder = Response::builder().status(StatusCode::OK).header(
         "content-type",
@@ -443,6 +497,12 @@ pub(crate) fn build_streaming_response(
     );
     if let Some(len) = result.content_length {
         builder = builder.header("content-length", len);
+    }
+    if let Some(fname) = filename {
+        builder = builder.header(
+            "content-disposition",
+            format!("attachment; filename=\"{}\"", fname),
+        );
     }
     let body = axum::body::Body::from_stream(
         result
@@ -763,6 +823,100 @@ where
             VirtualMemberFetchStrategy::Local => {
                 if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
                     return Ok(result);
+                }
+            }
+            VirtualMemberFetchStrategy::Skip => {}
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        "Artifact not found in any member repository",
+    )
+        .into_response())
+}
+
+/// Streaming sibling of [`resolve_virtual_download`] that avoids
+/// buffering Remote member responses into memory (#1215). Returns a
+/// ready-to-serve [`Response`] whose body is either streamed from the
+/// proxy cache / upstream (Remote member) or built from the buffered
+/// bytes returned by `local_fetch` (Local / Staging member).
+///
+/// First-match semantics are preserved: iteration walks members in
+/// priority order, and the first member that successfully produces a
+/// response wins. Once a Remote member's [`proxy_fetch_streaming_with_disposition`]
+/// call returns `Ok`, the outbound response is committed — by then the
+/// upstream connection is established and we are already streaming
+/// bytes through to the client. A subsequent member can no longer be
+/// tried, but that matches the buffered helper's first-success-wins
+/// behaviour: it also returned on the first `Ok`.
+///
+/// Errors during a Remote member's streaming fetch (upstream 404,
+/// connection failure, etc.) move on to the next member, exactly as
+/// the buffered path did with `proxy_fetch`. Local-member failures
+/// (artifact missing on this member) also fall through.
+///
+/// Caller supplies the per-format `default_content_type` (used when
+/// upstream/storage metadata omits it) and an optional `filename` for
+/// the `Content-Disposition: attachment` header so the streaming path
+/// emits the same outbound headers as the buffered
+/// [`build_download_response`] used to.
+pub async fn resolve_virtual_download_streaming<F, Fut>(
+    db: &PgPool,
+    proxy_service: Option<&ProxyService>,
+    virtual_repo_id: Uuid,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    local_fetch: F,
+) -> Result<Response, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+{
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+
+    if members.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+    }
+
+    for member in &members {
+        let strategy = virtual_member_fetch_strategy(
+            &member.repo_type,
+            proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        );
+
+        match strategy {
+            VirtualMemberFetchStrategy::Proxy => {
+                if let (Some(proxy), Some(upstream_url)) =
+                    (proxy_service, member.upstream_url.as_deref())
+                {
+                    if let Ok(response) = proxy_fetch_streaming_with_disposition(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        path,
+                        default_content_type,
+                        content_disposition_filename,
+                    )
+                    .await
+                    {
+                        return Ok(response);
+                    }
+                }
+            }
+            VirtualMemberFetchStrategy::Local => {
+                if let Ok((content, content_type)) =
+                    local_fetch(member.id, member.storage_location()).await
+                {
+                    return Ok(build_download_response(
+                        content,
+                        content_type,
+                        default_content_type,
+                        content_disposition_filename,
+                    ));
                 }
             }
             VirtualMemberFetchStrategy::Skip => {}
@@ -1305,6 +1459,91 @@ pub async fn virtual_non_remote_owns_name(
     Ok(exists.is_some())
 }
 
+/// Build the SQL `LIKE` pattern that matches every artifact path under
+/// a given Maven `groupId/artifactId/` directory.
+///
+/// Pure helper extracted so the prefix construction has unit-test
+/// coverage without a database. Returns `<group-path>/<artifactId>/%`,
+/// where the dot-to-slash conversion runs before LIKE-escaping so
+/// directory separators in the groupId are preserved, and `%`/`_`/`\`
+/// inside either input become literal characters. Use with
+/// `LIKE ... ESCAPE '\'`.
+pub(crate) fn maven_ga_like_pattern(group_id: &str, artifact_id: &str) -> String {
+    let group_path = group_id.replace('.', "/");
+    let mut prefix = String::with_capacity(group_path.len() + artifact_id.len() + 3);
+    prefix.push_str(&super::escape_like_literal(&group_path));
+    prefix.push('/');
+    prefix.push_str(&super::escape_like_literal(artifact_id));
+    prefix.push('/');
+    prefix.push('%');
+    prefix
+}
+
+/// Maven-aware shadowing guard: returns true if any non-Remote member of
+/// `virtual_repo_id` owns an artifact under the same groupId + artifactId
+/// directory prefix.
+///
+/// The generic [`virtual_non_remote_owns_name`] matches by `artifacts.name`
+/// alone, which for Maven is the artifactId component of the GAV. Two
+/// distinct Maven coordinates that happen to share an artifactId (eg.
+/// `com.foo:bar:1.0` vs. `com.baz:bar:1.0`) collide under the generic
+/// guard, suppressing legitimate remote resolution for any sibling
+/// groupId (#1287). Matching on the full groupId/artifactId path prefix
+/// instead means a local `com/example/mylib/common/...` artifact no
+/// longer shadows a remote `com/android/tools/common/...` lookup.
+///
+/// `group_path` must be the dot-replaced groupId (`com.foo` ->
+/// `com/foo`); the function appends `/<artifact_id>/` and runs a
+/// `path LIKE` against `artifacts.path`. The prefix is escaped to
+/// neutralise `%` / `_` / `\` so a crafted artifactId cannot widen the
+/// match. Uses the `(repository_id, path)` btree (`idx_artifacts_repo_path`).
+///
+/// Fails closed on DB error (matches `virtual_non_remote_owns_name`).
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_maven_ga(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    group_id: &str,
+    artifact_id: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let prefix = maven_ga_like_pattern(group_id, artifact_id);
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+                              WHERE repository_id = ANY($1) \
+                                AND is_deleted = false \
+                                AND path LIKE $2 ESCAPE '\\' \
+                              LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(&prefix)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            event = "shadowing_guard_db_error",
+            virtual_repo_id = %virtual_repo_id,
+            format = "maven",
+            error = %e,
+            "Maven shadowing-guard DB query failed; failing closed to 500",
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+    })?;
+
+    Ok(exists.is_some())
+}
+
 /// Try the proxy and virtual fallbacks for a download miss.
 ///
 /// Returns `Ok(Some(response))` if the artifact was served from upstream
@@ -1313,10 +1552,18 @@ pub async fn virtual_non_remote_owns_name(
 /// upstream fetch failed.
 ///
 /// This consolidates the "miss path" of every format-handler download:
-/// Remote → `proxy_fetch` + serve, Virtual → `resolve_virtual_download` +
-/// serve. Each handler's only remaining variation is the upstream URL prefix,
-/// the content type defaults, and whether to include a filename in the
+/// Remote → `proxy_fetch_streaming_with_disposition` + serve, Virtual →
+/// `resolve_virtual_download_streaming` + serve. Each handler's only
+/// remaining variation is the upstream URL prefix, the content type
+/// defaults, and whether to include a filename in the
 /// `Content-Disposition` header.
+///
+/// Both arms stream the upstream response body through to the client
+/// without buffering it in memory (#1215). The previous implementation
+/// used the buffered `proxy_fetch` helper, which loaded the entire
+/// artifact body (up to gigabytes for some package formats) into
+/// memory before responding — see #895 / #737 for the OOM-kill history
+/// that prompted the streaming migration.
 pub async fn try_remote_or_virtual_download(
     state: &crate::api::SharedState,
     repo: &RepoInfo,
@@ -1330,14 +1577,22 @@ pub async fn try_remote_or_virtual_download(
             return Ok(None);
         };
 
-        let (content, content_type) =
-            proxy_fetch(proxy, repo.id, &repo.key, upstream_url, opts.upstream_path).await?;
-        return Ok(Some(build_download_response(
-            content,
-            content_type,
+        // #1215: stream the remote response body instead of buffering it.
+        // The buffered `proxy_fetch` helper used here previously was the
+        // last large-body caller for rpm / rubygems / puppet / hex /
+        // huggingface / cran / ansible downloads; routing through
+        // `proxy_helpers::proxy_fetch_streaming(` removes that buffering.
+        let response = proxy_fetch_streaming_with_disposition(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            opts.upstream_path,
             opts.default_content_type,
             opts.content_disposition_filename,
-        )));
+        )
+        .await?;
+        return Ok(Some(response));
     }
 
     if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Virtual {
@@ -1354,15 +1609,21 @@ pub async fn try_remote_or_virtual_download(
         } else {
             state.proxy_service.as_deref()
         };
-        let (content, content_type) = match opts.virtual_lookup {
+        // #1215: route Virtual-member Remote fetches through the
+        // streaming resolver so Virtual repos benefit from the same
+        // OOM-avoidance work landed for direct Remote downloads in
+        // #895 / #1181 / #1294.
+        let response = match opts.virtual_lookup {
             VirtualLookup::PathSuffix(suffix) => {
                 let suffix = suffix.to_string();
                 let state_arc = state.clone();
-                resolve_virtual_download(
+                resolve_virtual_download_streaming(
                     &state.db,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
+                    opts.default_content_type,
+                    opts.content_disposition_filename,
                     move |member_id, location| {
                         let db = db.clone();
                         let state = state_arc.clone();
@@ -1378,11 +1639,13 @@ pub async fn try_remote_or_virtual_download(
             VirtualLookup::ExactPath(path) => {
                 let path = path.to_string();
                 let state_arc = state.clone();
-                resolve_virtual_download(
+                resolve_virtual_download_streaming(
                     &state.db,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
+                    opts.default_content_type,
+                    opts.content_disposition_filename,
                     move |member_id, location| {
                         let db = db.clone();
                         let state = state_arc.clone();
@@ -1395,12 +1658,7 @@ pub async fn try_remote_or_virtual_download(
                 .await?
             }
         };
-        return Ok(Some(build_download_response(
-            content,
-            content_type,
-            opts.default_content_type,
-            opts.content_disposition_filename,
-        )));
+        return Ok(Some(response));
     }
 
     Ok(None)
@@ -1921,6 +2179,80 @@ mod tests {
     fn test_reverse_suffix_for_like_empty_input_just_slash() {
         // Empty suffix → reversed "/" → escaped "/"
         assert_eq!(reverse_suffix_for_like(""), "/");
+    }
+
+    // ── maven_ga_like_pattern tests (#1287) ─────────────────────────
+
+    #[test]
+    fn test_maven_ga_like_pattern_simple_groupid() {
+        // Regular groupId/artifactId pair: dots in groupId become
+        // path separators, then a `/<artifactId>/%` suffix is appended.
+        assert_eq!(
+            maven_ga_like_pattern("com.android.tools", "common"),
+            "com/android/tools/common/%"
+        );
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_distinguishes_groupids() {
+        // Two artifactIds that collide on `name` alone but live under
+        // different groupIds must produce distinct LIKE prefixes.
+        // This is the core property #1287 needs.
+        let foo = maven_ga_like_pattern("com.foo", "bar");
+        let baz = maven_ga_like_pattern("com.baz", "bar");
+        assert_ne!(foo, baz);
+        assert_eq!(foo, "com/foo/bar/%");
+        assert_eq!(baz, "com/baz/bar/%");
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_does_not_match_sibling_groupids() {
+        // `com.android.tools/common/...` must NOT be matched by a
+        // pattern derived from `com.example.mylib:common`. We assert
+        // the produced prefix is anchored at the full GA directory
+        // boundary.
+        let prefix = maven_ga_like_pattern("com.example.mylib", "common");
+        assert_eq!(prefix, "com/example/mylib/common/%");
+        // A path under a different groupId does not start with this
+        // prefix even though both share the `common` artifactId.
+        let unrelated_path = "com/android/tools/common/31.4.0/common-31.4.0.pom";
+        assert!(!unrelated_path.starts_with("com/example/mylib/common/"));
+        // Sanity: the matching local artifact path DOES start with it.
+        let local_path = "com/example/mylib/common/1.0.0/common-1.0.0.pom";
+        assert!(local_path.starts_with("com/example/mylib/common/"));
+        // And the LIKE suffix is open-ended.
+        assert!(prefix.ends_with('%'));
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_escapes_metachars() {
+        // A crafted artifactId containing `%` or `_` must not widen
+        // the LIKE match. Both inputs get escaped before being woven
+        // into the pattern.
+        assert_eq!(
+            maven_ga_like_pattern("a.b", "ev%il"),
+            "a/b/ev\\%il/%",
+            "% inside artifactId must be escaped"
+        );
+        assert_eq!(
+            maven_ga_like_pattern("a.b", "ev_il"),
+            "a/b/ev\\_il/%",
+            "_ inside artifactId must be escaped"
+        );
+        // `%` inside the groupId is also escaped (after the
+        // dot-to-slash conversion has already happened).
+        assert_eq!(
+            maven_ga_like_pattern("a%.b", "c"),
+            "a\\%/b/c/%",
+            "% inside groupId must be escaped"
+        );
+    }
+
+    #[test]
+    fn test_maven_ga_like_pattern_escapes_backslash() {
+        // Backslashes get escaped so the ESCAPE '\' clause stays
+        // honest.
+        assert_eq!(maven_ga_like_pattern("a.b", "c\\d"), "a/b/c\\\\d/%");
     }
 
     // ── request_base_url tests ──────────────────────────────────────
@@ -4154,4 +4486,92 @@ mod tests {
         "debian.rs",
         "the remote pool `.deb` download"
     );
+
+    // -------------------------------------------------------------------
+    // #1215: source-level pins for the remaining shared proxy paths.
+    //
+    // The buffered `proxy_fetch` helper previously satisfied two
+    // download-miss paths shared across many format handlers:
+    //
+    //   * `try_remote_or_virtual_download` — Remote arm (used by rpm,
+    //     rubygems, puppet, hex, huggingface, cran, ansible)
+    //   * `resolve_virtual_download` — Remote-member arm of Virtual
+    //     repository resolution
+    //
+    // Both arms now route through the streaming helper, eliminating the
+    // last large-body buffering on the shared download surface. As with
+    // the #1183 pins, these tests assert at compile-time-adjacent
+    // granularity that nobody silently swaps the streaming helper back
+    // for the buffered one. A failure here means a regression to the
+    // OOM behaviour tracked in #895 / #737.
+    //
+    // Implementation note: both arms live inside `proxy_helpers.rs`,
+    // so the pin reads its own source rather than another handler.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_try_remote_or_virtual_download_remote_uses_streaming_helper_1215() {
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn try_remote_or_virtual_download(")
+            .expect("try_remote_or_virtual_download must exist");
+        // Bound the window to just this function so the streaming token
+        // from elsewhere in the file does not satisfy the assertion
+        // vacuously. The closing brace of the function comes before the
+        // next `pub` item; a generous window of 8 KiB safely covers it.
+        let window_end = (fn_start + 8192).min(src.len());
+        let window = &src[fn_start..window_end];
+        assert!(
+            window.contains("proxy_fetch_streaming_with_disposition("),
+            "`try_remote_or_virtual_download`'s Remote arm MUST call \
+             `proxy_fetch_streaming_with_disposition(` (#1215). A revert \
+             to `proxy_fetch(` would re-introduce the OOM regression \
+             closed by #895/#1215 across rpm/rubygems/puppet/hex/\
+             huggingface/cran/ansible."
+        );
+        assert!(
+            !window.contains("let (content, content_type) =\n            proxy_fetch("),
+            "`try_remote_or_virtual_download`'s Remote arm MUST NOT call \
+             the buffered `proxy_fetch(` for the upstream download (#1215)."
+        );
+    }
+
+    #[test]
+    fn test_try_remote_or_virtual_download_virtual_uses_streaming_resolver_1215() {
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn try_remote_or_virtual_download(")
+            .expect("try_remote_or_virtual_download must exist");
+        let window_end = (fn_start + 8192).min(src.len());
+        let window = &src[fn_start..window_end];
+        assert!(
+            window.contains("resolve_virtual_download_streaming("),
+            "`try_remote_or_virtual_download`'s Virtual arm MUST call \
+             `resolve_virtual_download_streaming(` (#1215) so Remote \
+             members of a Virtual repo stream rather than buffer."
+        );
+        assert!(
+            !window.contains("resolve_virtual_download(\n"),
+            "`try_remote_or_virtual_download`'s Virtual arm MUST NOT \
+             call the buffered `resolve_virtual_download(` (#1215)."
+        );
+    }
+
+    #[test]
+    fn test_resolve_virtual_download_streaming_uses_streaming_helper_1215() {
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn resolve_virtual_download_streaming<")
+            .expect("resolve_virtual_download_streaming must exist");
+        let window_end = (fn_start + 4096).min(src.len());
+        let window = &src[fn_start..window_end];
+        assert!(
+            window.contains("proxy_fetch_streaming_with_disposition("),
+            "`resolve_virtual_download_streaming` MUST drive Remote \
+             members through `proxy_fetch_streaming_with_disposition(` \
+             (#1215). Buffering each Remote member's body before serving \
+             it would defeat the whole point of having a streaming \
+             resolver."
+        );
+    }
 }

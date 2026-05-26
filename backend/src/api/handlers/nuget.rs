@@ -58,8 +58,12 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v3/flatcontainer/:id/:version/:filename",
             get(flatcontainer_download),
         )
-        // Push package (dotnet nuget push)
+        // Push package (dotnet nuget push).
+        // Register both with and without trailing slash because `dotnet nuget
+        // push` appends a trailing slash to the PackagePublish/2.0.0 URL
+        // discovered from the v3 service index.
         .route("/:repo_key/api/v2/package", put(push_package))
+        .route("/:repo_key/api/v2/package/", put(push_package))
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +757,25 @@ async fn push_package(
     )
     .execute(&state.db)
     .await;
+
+    // Populate packages / package_versions tables (best-effort) so the
+    // package shows up in the UI Packages tab. Mirrors npm.rs / pypi.rs.
+    let description = if nuspec.description.is_empty() {
+        None
+    } else {
+        Some(nuspec.description.as_str())
+    };
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &nuspec.id,
+            &version,
+            size_bytes,
+            &checksum,
+            description,
+            Some(serde_json::json!({ "format": "nuget" })),
+        )
+        .await;
 
     // Update repository timestamp.
     let _ = sqlx::query!(
@@ -1661,5 +1684,243 @@ mod tests {
             build_nuget_search_pattern("Newtonsoft.Json"),
             "%newtonsoft.json%"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-backed router tests for the `push_package` paths added in
+// fix/nuget-push-trailing-slash-and-package-index:
+//
+//   1. The route is registered both with and without a trailing slash so
+//      `dotnet nuget push` (which appends a slash to the PackagePublish URL)
+//      hits the same handler. Each variant is exercised end-to-end.
+//   2. After a successful push, the handler calls
+//      `PackageService::try_create_or_update_from_artifact` so the package
+//      surfaces in the UI Packages tab. The description is folded from an
+//      empty `<description/>` in the nuspec to `Option::None` so the
+//      `packages.description` column is NULL rather than the empty string.
+//
+// These tests rely on `DATABASE_URL` being set (CI seeds + migrates a
+// Postgres before running `cargo llvm-cov --lib`). They no-op cleanly
+// in environments without Postgres.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod push_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use std::io::Write;
+
+    /// Build a minimal valid `.nupkg` (ZIP archive with a single `.nuspec`)
+    /// using the given package id, version, and description. Mirrors the
+    /// shape produced by `dotnet pack`. Authors is fixed since the new code
+    /// path does not branch on it.
+    fn build_nupkg(id: &str, version: &str, description: &str) -> Vec<u8> {
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(format!("{}.nuspec", id), options).unwrap();
+        let nuspec = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <package>\n  <metadata>\n\
+             <id>{}</id>\n\
+             <version>{}</version>\n\
+             <description>{}</description>\n\
+             <authors>Test Author</authors>\n\
+             </metadata>\n</package>",
+            id, version, description
+        );
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        let cursor = zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Send a PUT to `uri` carrying `nupkg_bytes` as a raw application/octet
+    /// stream body (the path `extract_nupkg_bytes` takes when no multipart
+    /// boundary is present).
+    async fn put_nupkg(uri: String, nupkg_bytes: Vec<u8>) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(nupkg_bytes))
+            .expect("build PUT request")
+    }
+
+    // -----------------------------------------------------------------------
+    // Route registration: trailing slash and no trailing slash both
+    // reach `push_package`. We confirm via end-to-end success (HTTP 201 or
+    // similar 2xx) for each URL shape.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn push_package_route_accepts_no_trailing_slash() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("RouteNoSlashPkg", "1.0.0", "no-slash route");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "expected 2xx for /api/v2/package, got {}: {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // Verify the artifact landed in the DB.
+        let exists: Option<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT id FROM artifacts \
+             WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("routenoslashpkg")
+        .bind("1.0.0")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query artifact");
+        assert!(exists.is_some(), "artifact row must exist after push");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn push_package_route_accepts_trailing_slash() {
+        // The bug this PR fixes: `dotnet nuget push` appends a trailing
+        // slash to the PackagePublish/2.0.0 URL from the v3 index. Before
+        // the fix, this returned 405/404. After the fix the route maps to
+        // `push_package` and the push succeeds end-to-end.
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("RouteWithSlashPkg", "2.0.0", "trailing-slash route");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package/", f.repo_key), pkg).await;
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "expected 2xx for /api/v2/package/ (with slash), got {}: {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let exists: Option<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT id FROM artifacts \
+             WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("routewithslashpkg")
+        .bind("2.0.0")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query artifact");
+        assert!(
+            exists.is_some(),
+            "trailing-slash push must create the artifact row"
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Packages-index population: `try_create_or_update_from_artifact` runs
+    // on every successful push and the description-folding branch must map
+    // a non-empty `<description>` to `Some(...)` (persisted) and an empty
+    // one to `None` (NULL column).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn push_package_populates_packages_index_with_description() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("IndexedPkg", "3.1.4", "an indexed package");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+        let (status, _) = tdh::send(app, req).await;
+        assert!(status.is_success(), "push failed: {}", status);
+
+        // The handler passes the original-case `nuspec.id` to
+        // `PackageService::try_create_or_update_from_artifact`, so the
+        // packages row is keyed by the original casing. (The artifacts row
+        // uses the lowercased name from the duplicate-check path; the two
+        // tables intentionally diverge for legacy reasons.)
+        let row: Option<(String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT name, description, metadata FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("IndexedPkg")
+        .bind("3.1.4")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+
+        let (name, desc, meta) = row.expect("packages row must exist after push");
+        assert_eq!(name, "IndexedPkg");
+        assert_eq!(
+            desc.as_deref(),
+            Some("an indexed package"),
+            "non-empty <description> must be persisted as Some(...)"
+        );
+        // The metadata JSON the handler passes is `{ "format": "nuget" }`.
+        let meta = meta.expect("metadata must be set");
+        assert_eq!(meta["format"], "nuget");
+
+        // package_versions should be populated too (UPSERT in the service).
+        let version_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("IndexedPkg")
+        .bind("3.1.4")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(
+            version_count.0, 1,
+            "exactly one package_versions row expected after a single push"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn push_package_packages_index_empty_description_maps_to_null() {
+        // Covers the `if nuspec.description.is_empty() { None } else
+        // { Some(...) }` branch added in this PR: an empty <description/>
+        // must land as NULL in the packages table rather than an empty
+        // string.
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("NoDescPkg", "0.1.0", "");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+        let (status, _) = tdh::send(app, req).await;
+        assert!(status.is_success(), "push failed: {}", status);
+
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT description FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("NoDescPkg")
+        .bind("0.1.0")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+
+        let (desc,) = row.expect("packages row must exist after push");
+        assert!(
+            desc.is_none(),
+            "empty <description> must fold to NULL, got {:?}",
+            desc
+        );
+
+        f.teardown().await;
     }
 }

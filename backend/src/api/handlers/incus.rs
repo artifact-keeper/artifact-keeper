@@ -7,7 +7,8 @@
 //! frame-by-frame, so memory stays flat regardless of image size.
 //! Both monolithic (single PUT) and chunked/resumable uploads are supported.
 //!
-//! Routes mounted at `/incus/{repo_key}/...`:
+//! Routes mounted at `/incus/{repo_key}/...` and (as an alias for repos
+//! created with `format: lxc`) `/lxc/{repo_key}/...`:
 //!   GET    /streams/v1/index.json              - SimpleStreams index
 //!   GET    /streams/v1/images.json             - SimpleStreams product catalog
 //!   GET    /images/{product}/{version}/{file}  - Download image file
@@ -632,9 +633,20 @@ async fn upload_image(
             .into_response()
     })?;
 
-    // Stream body to temp file (never buffers entire image in RAM)
+    // Stream body to temp file (never buffers entire image in RAM).
+    //
+    // Stage + final paths both live under `state.config.storage_path` (the
+    // server-wide STORAGE_PATH env), not `repo.storage_path`. When the
+    // repo's `storage_backend` isn't `filesystem`, `repo.storage_path` is
+    // just the repo key (a bare relative string — see repositories.rs's
+    // create handler), which would land `tokio::fs::create_dir_all` on
+    // the process CWD (`/` in a container) and abort with
+    // `Failed to create directory: Read-only file system`. The incus
+    // handler is currently always local-disk regardless of backend, so
+    // routing through the server-wide writable mount is correct here.
+    // Long-term, this should move onto `StorageBackend::put_streaming`.
     let temp_id = Uuid::new_v4();
-    let temp_path = temp_upload_path(&repo.storage_path, &temp_id);
+    let temp_path = temp_upload_path(&state.config.storage_path, &temp_id);
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
     // Extract metadata from the file on disk
@@ -643,7 +655,7 @@ async fn upload_image(
 
     // Move temp file to final storage location (atomic rename, same filesystem)
     let storage_key = build_storage_key(&repo.id, &artifact_path);
-    let final_path = storage_path_for_key(&repo.storage_path, &storage_key);
+    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
     finalize_temp_file(&temp_path, &final_path).await?;
 
     let artifact_id = upsert_artifact(UpsertArtifactParams {
@@ -785,7 +797,12 @@ async fn start_chunked_upload(
     })?;
 
     let session_id = Uuid::new_v4();
-    let temp_path = temp_upload_path(&repo.storage_path, &session_id);
+    // See upload_image for why staging goes under state.config.storage_path
+    // rather than repo.storage_path. The chosen path is also persisted to
+    // `incus_upload_sessions.storage_temp_path`, so subsequent
+    // chunk/complete/cancel calls naturally read it back from the session
+    // row and don't need to re-derive it.
+    let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
 
     // Stream initial body (may be empty) to temp file
     let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
@@ -896,7 +913,7 @@ async fn complete_chunked_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let session = get_session(&state.db, session_id).await?;
-    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append any final body data
@@ -931,9 +948,10 @@ async fn complete_chunked_upload(
     let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
         .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
 
-    // Move temp file to final storage location
+    // Move temp file to final storage location. See upload_image for why
+    // the base is state.config.storage_path, not repo.storage_path.
     let storage_key = build_storage_key(&session.repository_id, &session.artifact_path);
-    let final_path = storage_path_for_key(&repo.storage_path, &storage_key);
+    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
     finalize_temp_file(&temp_path, &final_path).await?;
 
     // Create artifact record

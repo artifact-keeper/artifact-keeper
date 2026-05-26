@@ -214,25 +214,40 @@ impl PolicyService {
         .ok_or_else(|| AppError::NotFound("Policy not found".to_string()))
     }
 
+    /// Apply a partial update to a scan policy. Any argument left as `None`
+    /// keeps the existing column value via `COALESCE`. See #1374 -- previously
+    /// the handler took every field as required, which (a) rejected legitimate
+    /// PATCH-style PUTs from the release-gate `scan-policy-crud` suite with a
+    /// 422 and (b) made it impossible to flip `is_enabled` without resubmitting
+    /// the entire policy. A single atomic UPDATE statement preserves multi-
+    /// field changes (so `max_severity` and `is_enabled` can both move in the
+    /// same request) instead of the prior shape where a partial body might
+    /// have only persisted whichever field deserialized first.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_policy(
         &self,
         id: Uuid,
-        name: &str,
-        max_severity: &str,
-        block_unscanned: bool,
-        block_on_fail: bool,
-        is_enabled: bool,
+        name: Option<&str>,
+        max_severity: Option<&str>,
+        block_unscanned: Option<bool>,
+        block_on_fail: Option<bool>,
+        is_enabled: Option<bool>,
         min_staging_hours: Option<i32>,
         max_artifact_age_days: Option<i32>,
-        require_signature: bool,
+        require_signature: Option<bool>,
     ) -> Result<ScanPolicy> {
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             UPDATE scan_policies
-            SET name = $2, max_severity = $3, block_unscanned = $4,
-                block_on_fail = $5, is_enabled = $6, min_staging_hours = $7,
-                max_artifact_age_days = $8, require_signature = $9, updated_at = NOW()
+            SET name = COALESCE($2, name),
+                max_severity = COALESCE($3, max_severity),
+                block_unscanned = COALESCE($4, block_unscanned),
+                block_on_fail = COALESCE($5, block_on_fail),
+                is_enabled = COALESCE($6, is_enabled),
+                min_staging_hours = COALESCE($7, min_staging_hours),
+                max_artifact_age_days = COALESCE($8, max_artifact_age_days),
+                require_signature = COALESCE($9, require_signature),
+                updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, repository_id, max_severity, block_unscanned,
                       block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
@@ -457,5 +472,140 @@ mod tests {
             violations,
         };
         assert!(!result.allowed);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1374 regression: PUT /security/policies/{id} must atomically persist
+    // every field the client provided in the same request. Previously the
+    // strict-shape DTO bounced partial bodies as 422, and even when callers
+    // resubmitted the whole policy a multi-field change was not guaranteed
+    // to round-trip through the update path. This DB-backed test asserts:
+    //
+    //  - `update_policy(max_severity, is_enabled)` flips BOTH columns,
+    //  - a follow-up `get_policy` confirms both values stuck,
+    //  - omitted fields (`name`, `block_unscanned`, ...) are NOT clobbered
+    //    by the COALESCE branch.
+    //
+    // Skips silently when `DATABASE_URL` is unset so `cargo test --lib`
+    // without a running Postgres still passes; the CI integration job
+    // covers this branch.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_update_policy_persists_multiple_fields_1374() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return, // No DB: skip locally; CI integration covers.
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return, // DB not reachable: skip.
+        };
+
+        let svc = PolicyService::new(pool.clone());
+
+        // Seed a global policy. Pre-conditions are deliberately the opposite
+        // of the values we PUT below so we can assert both columns actually
+        // moved (not just "happened to already match").
+        let original = svc
+            .create_policy(
+                &format!("1374-fixture-{}", &Uuid::new_v4().to_string()[..8]),
+                None,
+                "low", // will become "critical"
+                true,  // block_unscanned: untouched, must stay true
+                false,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("seed policy");
+        assert!(original.is_enabled, "policies default to is_enabled=true");
+        assert_eq!(original.max_severity, "low");
+        let policy_id = original.id;
+
+        // The exact partial-update the release-gate sends: flip max_severity
+        // AND is_enabled in one request. Every other field is `None`, so the
+        // COALESCE branches keep their existing values.
+        let updated = svc
+            .update_policy(
+                policy_id,
+                None,             // name -- untouched
+                Some("critical"), // max_severity: low -> critical
+                None,             // block_unscanned -- untouched
+                None,
+                Some(false), // is_enabled: true -> false (the bug)
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("partial update must succeed");
+
+        // BOTH fields must have moved in the same UPDATE statement.
+        assert_eq!(updated.max_severity, "critical");
+        assert!(!updated.is_enabled, "is_enabled must persist false (#1374)");
+        // Untouched fields must NOT have been silently reset by the COALESCE.
+        assert_eq!(updated.name, original.name);
+        assert!(updated.block_unscanned, "block_unscanned must stay true");
+        assert!(!updated.block_on_fail);
+        assert!(!updated.require_signature);
+
+        // GET-after-PUT: re-read from the DB to prove durability, not just
+        // that the RETURNING clause echoed our bind values.
+        let after = svc.get_policy(policy_id).await.expect("re-read policy");
+        assert_eq!(after.max_severity, "critical");
+        assert!(!after.is_enabled, "GET-after-PUT must see is_enabled=false");
+        assert!(after.block_unscanned, "GET-after-PUT untouched cols intact");
+
+        // Cleanup so reruns against a long-lived test DB don't accumulate.
+        let _ = svc.delete_policy(policy_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_policy_empty_patch_is_a_noop_1374() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let svc = PolicyService::new(pool.clone());
+
+        let original = svc
+            .create_policy(
+                &format!("1374-noop-{}", &Uuid::new_v4().to_string()[..8]),
+                None,
+                "medium",
+                true,
+                true,
+                Some(24),
+                Some(30),
+                true,
+            )
+            .await
+            .expect("seed policy");
+
+        // Empty PATCH: every argument is None, the SET clauses become
+        // `col = COALESCE(NULL, col)` which is a no-op for every column
+        // except `updated_at = NOW()`.
+        let after = svc
+            .update_policy(original.id, None, None, None, None, None, None, None, None)
+            .await
+            .expect("empty patch must succeed, not 422");
+
+        assert_eq!(after.name, original.name);
+        assert_eq!(after.max_severity, original.max_severity);
+        assert_eq!(after.block_unscanned, original.block_unscanned);
+        assert_eq!(after.block_on_fail, original.block_on_fail);
+        assert_eq!(after.is_enabled, original.is_enabled);
+        assert_eq!(after.min_staging_hours, original.min_staging_hours);
+        assert_eq!(after.max_artifact_age_days, original.max_artifact_age_days);
+        assert_eq!(after.require_signature, original.require_signature);
+
+        let _ = svc.delete_policy(original.id).await;
     }
 }

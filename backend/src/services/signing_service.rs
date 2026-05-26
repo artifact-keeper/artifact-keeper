@@ -6,7 +6,15 @@
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKey, SigningKeyPublic};
 use crate::services::encryption::CredentialEncryption;
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
+use pgp::composed::cleartext::CleartextSignedMessage;
+use pgp::composed::key::{KeyType, SecretKeyParamsBuilder};
+use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
+use pgp::crypto::hash::HashAlgorithm;
+use pgp::crypto::public_key::PublicKeyAlgorithm;
+use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::types::{KeyVersion, PublicKeyTrait};
+use pgp::ArmorOptions;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
@@ -32,6 +40,23 @@ pub(crate) fn algorithm_to_bits(algorithm: &str) -> std::result::Result<usize, S
     }
 }
 
+fn algorithm_to_bits_u32(algorithm: &str) -> std::result::Result<u32, String> {
+    algorithm_to_bits(algorithm).and_then(|bits| {
+        u32::try_from(bits).map_err(|_| format!("Unsupported RSA key size: {}", bits))
+    })
+}
+
+fn pgp_user_id(uid_name: Option<&str>, uid_email: Option<&str>, fallback_name: &str) -> String {
+    match (uid_name, uid_email) {
+        (Some(name), Some(email)) if !name.is_empty() && !email.is_empty() => {
+            format!("{} <{}>", name, email)
+        }
+        (Some(name), _) if !name.is_empty() => name.to_string(),
+        (_, Some(email)) if !email.is_empty() => format!("{} <{}>", fallback_name, email),
+        _ => fallback_name.to_string(),
+    }
+}
+
 /// Compute the SHA-256 fingerprint of a DER-encoded public key.
 /// Returns the full hex-encoded fingerprint.
 pub(crate) fn compute_fingerprint(public_key_der: &[u8]) -> String {
@@ -46,6 +71,124 @@ pub(crate) fn derive_key_id(fingerprint: &str) -> String {
 /// Build a rotated key name from an existing key name.
 pub(crate) fn build_rotated_key_name(original_name: &str) -> String {
     format!("{} (rotated)", original_name)
+}
+
+// ---------------------------------------------------------------------------
+// CPU-bound rPGP helpers
+//
+// These are pure functions with no I/O or DB access, intended to be invoked
+// from `tokio::task::spawn_blocking` (#1236 review). RSA key generation can
+// take hundreds of milliseconds to multiple seconds, and OpenPGP signing is
+// also non-trivial CPU work. Running them inline on a tokio runtime worker
+// stalls the rest of the HTTP server.
+// ---------------------------------------------------------------------------
+
+/// Parameters describing an OpenPGP key to generate. Owns its data so it can
+/// cross a `spawn_blocking` boundary.
+struct OpenPgpKeyParams {
+    bits: u32,
+    user_id: String,
+}
+
+/// Generate an OpenPGP RSA key pair and return
+/// (armored_public, armored_private, fingerprint_hex, key_id_hex).
+///
+/// CPU-bound. Call from within `spawn_blocking`.
+fn generate_openpgp_key_blocking(
+    params: OpenPgpKeyParams,
+) -> Result<(String, String, String, String)> {
+    let mut key_params = SecretKeyParamsBuilder::default();
+    key_params
+        .version(KeyVersion::V4)
+        .key_type(KeyType::Rsa(params.bits))
+        .can_certify(true)
+        .can_sign(true)
+        .primary_user_id(params.user_id)
+        .passphrase(None);
+
+    let mut rng = rand08::rngs::OsRng;
+    let secret_key = key_params
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build OpenPGP key params: {}", e)))?
+        .generate(rng)
+        .map_err(|e| AppError::Internal(format!("Failed to generate OpenPGP key: {}", e)))?;
+    let signed_secret_key = secret_key
+        .sign(&mut rng, String::new)
+        .map_err(|e| AppError::Internal(format!("Failed to certify OpenPGP key: {}", e)))?;
+    let public_key = SignedPublicKey::from(signed_secret_key.clone());
+
+    let public_armored = public_key
+        .to_armored_string(ArmorOptions::default())
+        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP public key: {}", e)))?;
+    let private_armored = signed_secret_key
+        .to_armored_string(ArmorOptions::default())
+        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP private key: {}", e)))?;
+
+    let fingerprint = hex::encode(public_key.fingerprint().as_bytes());
+    let key_id = hex::encode(public_key.key_id().as_ref());
+
+    Ok((public_armored, private_armored, fingerprint, key_id))
+}
+
+/// Create an ASCII-armored detached OpenPGP signature.
+///
+/// CPU-bound. Call from within `spawn_blocking`.
+fn sign_openpgp_detached_blocking(
+    secret_key: pgp::SignedSecretKey,
+    data: Vec<u8>,
+) -> Result<String> {
+    let mut config = SignatureConfig::v4(
+        SignatureType::Binary,
+        PublicKeyAlgorithm::RSA,
+        HashAlgorithm::SHA2_256,
+    );
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerFingerprint(secret_key.fingerprint())),
+        Subpacket::regular(SubpacketData::SignatureCreationTime(
+            chrono::Utc::now().trunc_subsecs(0),
+        )),
+    ];
+    config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
+        secret_key.key_id(),
+    ))];
+
+    let signature = config
+        .sign(&secret_key, String::new, &data[..])
+        .map_err(|e| AppError::Internal(format!("Failed to sign OpenPGP data: {}", e)))?;
+    StandaloneSignature::new(signature)
+        .to_armored_string(ArmorOptions::default())
+        .map_err(|e| AppError::Internal(format!("Failed to armor OpenPGP signature: {}", e)))
+}
+
+/// Create an OpenPGP cleartext signed message.
+///
+/// CPU-bound. Call from within `spawn_blocking`.
+fn sign_openpgp_cleartext_blocking(
+    secret_key: pgp::SignedSecretKey,
+    text: String,
+) -> Result<String> {
+    let rng = rand08::rngs::OsRng;
+    CleartextSignedMessage::sign(rng, &text, &secret_key, String::new)
+        .and_then(|msg| msg.to_armored_string(ArmorOptions::default()))
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to create OpenPGP cleartext signature: {}",
+                e
+            ))
+        })
+}
+
+/// Helper to dispatch a CPU-bound crypto closure to the blocking pool and
+/// convert a panic into an `AppError::Internal`. Centralizes the
+/// `spawn_blocking` join-error handling so callers stay readable.
+async fn run_blocking<F, T>(label: &'static str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::Internal(format!("{label} task panicked: {e}")))?
 }
 
 /// Service for managing signing keys and signing operations.
@@ -73,45 +216,15 @@ impl SigningService {
         }
     }
 
-    /// Generate a new RSA key pair and store it.
+    /// Generate a new signing key pair and store it.
     pub async fn create_key(&self, req: CreateKeyRequest) -> Result<SigningKeyPublic> {
-        let bits = algorithm_to_bits(&req.algorithm).map_err(AppError::Validation)?;
-
-        // Generate RSA key pair (use OsRng from rsa's rand_core to avoid version mismatch)
-        let mut rng = rsa::rand_core::OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, bits)
-            .map_err(|e| AppError::Internal(format!("Failed to generate RSA key: {}", e)))?;
-        let public_key = RsaPublicKey::from(&private_key);
-
-        // Serialize keys
-        let public_pem = public_key
-            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-            .map_err(|e| AppError::Internal(format!("Failed to encode public key: {}", e)))?;
-
-        let private_pem = private_key
-            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .map_err(|e| AppError::Internal(format!("Failed to encode private key: {}", e)))?;
-
-        // Encrypt private key
-        let private_bytes = private_pem.as_bytes();
-        let private_enc = self.encryption.encrypt(private_bytes);
-
-        // Compute fingerprint (SHA-256 of DER-encoded public key)
-        let public_der = public_key
-            .to_public_key_der()
-            .map_err(|e| AppError::Internal(format!("Failed to encode public key DER: {}", e)))?;
-        let fingerprint = compute_fingerprint(public_der.as_ref());
-        let key_id = derive_key_id(&fingerprint);
-
-        // Build GPG-style armored public key if key_type is gpg
-        let public_key_out = if req.key_type == "gpg" {
-            // For GPG consumers, wrap the RSA public key in a GPG-compatible format.
-            // We use raw PEM for now — real GPG armoring would need pgp crate.
-            // Consumers that need actual GPG packets should import via gpg --import.
-            public_pem.clone()
+        let (public_key_out, private_key_material, fingerprint, key_id) = if req.key_type == "gpg" {
+            self.generate_openpgp_key(&req).await?
         } else {
-            public_pem.clone()
+            self.generate_rsa_key(&req.algorithm).await?
         };
+
+        let private_enc = self.encryption.encrypt(private_key_material.as_bytes());
 
         let id = Uuid::new_v4();
         let now = Utc::now();
@@ -160,6 +273,53 @@ impl SigningService {
             created_at: now,
             last_used_at: None,
         })
+    }
+
+    async fn generate_rsa_key(&self, algorithm: &str) -> Result<(String, String, String, String)> {
+        let bits = algorithm_to_bits(algorithm).map_err(AppError::Validation)?;
+
+        // RSA-4096 key generation is CPU-bound and can take multiple seconds
+        // under load. Run on the blocking pool so the async runtime stays free
+        // to service other requests.
+        run_blocking("rsa_keygen", move || {
+            let mut rng = rsa::rand_core::OsRng;
+            let private_key = RsaPrivateKey::new(&mut rng, bits)
+                .map_err(|e| AppError::Internal(format!("Failed to generate RSA key: {}", e)))?;
+            let public_key = RsaPublicKey::from(&private_key);
+
+            let public_pem = public_key
+                .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+                .map_err(|e| AppError::Internal(format!("Failed to encode public key: {}", e)))?;
+            let private_pem = private_key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .map_err(|e| AppError::Internal(format!("Failed to encode private key: {}", e)))?
+                .to_string();
+
+            let public_der = public_key.to_public_key_der().map_err(|e| {
+                AppError::Internal(format!("Failed to encode public key DER: {}", e))
+            })?;
+            let fingerprint = compute_fingerprint(public_der.as_ref());
+            let key_id = derive_key_id(&fingerprint);
+
+            Ok((public_pem, private_pem, fingerprint, key_id))
+        })
+        .await
+    }
+
+    async fn generate_openpgp_key(
+        &self,
+        req: &CreateKeyRequest,
+    ) -> Result<(String, String, String, String)> {
+        let bits = algorithm_to_bits_u32(&req.algorithm).map_err(AppError::Validation)?;
+        let user_id = pgp_user_id(req.uid_name.as_deref(), req.uid_email.as_deref(), &req.name);
+
+        // Building and signing an RSA-4096 OpenPGP key is CPU-bound and can
+        // take multiple seconds. Run on the blocking pool (#1236 review).
+        let params = OpenPgpKeyParams { bits, user_id };
+        run_blocking("openpgp_keygen", move || {
+            generate_openpgp_key_blocking(params)
+        })
+        .await
     }
 
     /// Get a signing key by ID (public info only).
@@ -242,6 +402,10 @@ impl SigningService {
         Ok(())
     }
 
+    async fn active_key_or_none(&self, repo_id: Uuid) -> Result<Option<SigningKey>> {
+        self.get_active_key_for_repo(repo_id).await
+    }
+
     /// Sign data with the repository's active signing key (RSA PKCS#1 v1.5 SHA-256).
     pub async fn sign_data(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
         let key = match self.get_active_key_for_repo(repo_id).await? {
@@ -282,7 +446,109 @@ impl SigningService {
         Ok(signature.to_bytes().to_vec())
     }
 
-    /// Get the public key in PEM format for a repository.
+    /// Create an ASCII-armored detached OpenPGP signature for repository metadata.
+    pub async fn sign_openpgp_detached(
+        &self,
+        repo_id: Uuid,
+        data: &[u8],
+    ) -> Result<Option<String>> {
+        let key = match self.active_key_or_none(repo_id).await? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let armored = self.sign_openpgp_detached_with_key(&key, data).await?;
+        self.mark_key_used(key.id).await?;
+        Ok(Some(armored))
+    }
+
+    /// Create an OpenPGP cleartext signed message for repository metadata.
+    pub async fn sign_openpgp_cleartext(
+        &self,
+        repo_id: Uuid,
+        text: &str,
+    ) -> Result<Option<String>> {
+        let key = match self.active_key_or_none(repo_id).await? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let armored = self.sign_openpgp_cleartext_with_key(&key, text).await?;
+        self.mark_key_used(key.id).await?;
+        Ok(Some(armored))
+    }
+
+    fn load_openpgp_secret_key(&self, key: &SigningKey) -> Result<pgp::SignedSecretKey> {
+        if key.key_type != "gpg" {
+            return Err(AppError::Validation(
+                "OpenPGP signatures require a signing key with key_type='gpg'".to_string(),
+            ));
+        }
+
+        let private_key = self
+            .encryption
+            .decrypt(&key.private_key_enc)
+            .map_err(|e| AppError::Internal(format!("Failed to decrypt private key: {}", e)))?;
+        let private_key = std::str::from_utf8(&private_key)
+            .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in OpenPGP key: {}", e)))?;
+
+        let (secret_key, _) = pgp::SignedSecretKey::from_string(private_key).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to parse OpenPGP private key. Existing key may be a legacy PEM key; rotate or recreate it: {}",
+                e
+            ))
+        })?;
+        Ok(secret_key)
+    }
+
+    /// Sign `data` with `key` and return an ASCII-armored detached OpenPGP
+    /// signature. Exposed publicly (in addition to `sign_openpgp_detached`)
+    /// so callers that already hold the active `SigningKey` — e.g. handlers
+    /// checking a content-keyed signed-Release cache — can avoid a second
+    /// DB lookup per request (#1236).
+    pub async fn sign_openpgp_detached_with_key(
+        &self,
+        key: &SigningKey,
+        data: &[u8],
+    ) -> Result<String> {
+        // Decrypt + parse on the runtime: cheap relative to the signing work
+        // itself, and lets us avoid cloning the encryption state across the
+        // spawn_blocking boundary.
+        let secret_key = self.load_openpgp_secret_key(key)?;
+        let data_owned = data.to_vec();
+        run_blocking("openpgp_sign_detached", move || {
+            sign_openpgp_detached_blocking(secret_key, data_owned)
+        })
+        .await
+    }
+
+    /// Sign `text` with `key` and return an ASCII-armored cleartext
+    /// signed message. See [`Self::sign_openpgp_detached_with_key`] for
+    /// the rationale on the public surface.
+    pub async fn sign_openpgp_cleartext_with_key(
+        &self,
+        key: &SigningKey,
+        text: &str,
+    ) -> Result<String> {
+        let secret_key = self.load_openpgp_secret_key(key)?;
+        let text_owned = text.to_string();
+        run_blocking("openpgp_sign_cleartext", move || {
+            sign_openpgp_cleartext_blocking(secret_key, text_owned)
+        })
+        .await
+    }
+
+    /// Stamp the `last_used_at` column for `key_id`. Public so callers
+    /// that sign through the `_with_key` path can still record usage.
+    pub async fn mark_key_used(&self, key_id: Uuid) -> Result<()> {
+        sqlx::query!(
+            "UPDATE signing_keys SET last_used_at = NOW() WHERE id = $1",
+            key_id,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the public key in PEM or ASCII-armored OpenPGP format for a repository.
     pub async fn get_repo_public_key(&self, repo_id: Uuid) -> Result<Option<String>> {
         let key = self.get_active_key_for_repo(repo_id).await?;
         Ok(key.map(|k| k.public_key_pem))
@@ -475,6 +741,75 @@ mod tests {
             rotated_from: None,
             last_used_at: None,
         }
+    }
+
+    async fn generate_test_openpgp_signing_key(passphrase: &str) -> SigningKey {
+        let service = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(passphrase),
+        };
+        let req = CreateKeyRequest {
+            repository_id: None,
+            name: "test-openpgp-key".to_string(),
+            key_type: "gpg".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: Some("Test User".to_string()),
+            uid_email: Some("test@example.com".to_string()),
+            created_by: None,
+        };
+        let (public_key_pem, private_key_material, fingerprint, key_id) =
+            service.generate_openpgp_key(&req).await.unwrap();
+        let now = Utc::now();
+        SigningKey {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: req.name,
+            key_type: req.key_type,
+            fingerprint: Some(fingerprint),
+            key_id: Some(key_id),
+            public_key_pem,
+            private_key_enc: service.encryption.encrypt(private_key_material.as_bytes()),
+            algorithm: req.algorithm,
+            uid_name: req.uid_name,
+            uid_email: req.uid_email,
+            expires_at: None,
+            is_active: true,
+            created_at: now,
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_openpgp_key_and_signatures_are_parseable_and_verifiable() {
+        let passphrase = "openpgp-test-passphrase";
+        let key = generate_test_openpgp_signing_key(passphrase).await;
+        assert!(key
+            .public_key_pem
+            .starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+
+        let service = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(passphrase),
+        };
+        let (public_key, _) = pgp::SignedPublicKey::from_string(&key.public_key_pem).unwrap();
+        public_key.verify().unwrap();
+
+        let data = b"Origin: artifact-keeper\nSuite: stable\n";
+        let detached = service
+            .sign_openpgp_detached_with_key(&key, data)
+            .await
+            .unwrap();
+        let (signature, _) = StandaloneSignature::from_string(&detached).unwrap();
+        signature.verify(&public_key, data).unwrap();
+
+        let cleartext = service
+            .sign_openpgp_cleartext_with_key(&key, std::str::from_utf8(data).unwrap())
+            .await
+            .unwrap();
+        let (message, _) = CleartextSignedMessage::from_string(&cleartext).unwrap();
+        message.verify(&public_key).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -1040,6 +1375,125 @@ mod tests {
         assert!(
             !enc_str.contains("BEGIN PRIVATE KEY"),
             "Private key should not be stored as plaintext PEM"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure helpers (algorithm_to_bits_u32, pgp_user_id, derive_key_id,
+    // build_rotated_key_name). These are the small free functions that the
+    // OpenPGP signing path (#1236) pulls into the call chain; they each
+    // have a couple of branches that the round-trip / property tests above
+    // don't exercise directly. Locking them down keeps the new-code
+    // coverage gate above the 70% floor and pins the precise behavior
+    // each branch is responsible for so a future refactor can't silently
+    // change what gets put into a generated key's user-id or what shape
+    // the rotated-key name takes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_algorithm_to_bits_u32_rsa2048() {
+        assert_eq!(algorithm_to_bits_u32("rsa2048").unwrap(), 2048u32);
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_u32_rsa4096() {
+        assert_eq!(algorithm_to_bits_u32("rsa4096").unwrap(), 4096u32);
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_u32_unsupported() {
+        let err = algorithm_to_bits_u32("ed25519").unwrap_err();
+        assert!(
+            err.contains("Unsupported algorithm"),
+            "expected unsupported-algorithm error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pgp_user_id_name_and_email() {
+        let uid = pgp_user_id(Some("Alice"), Some("alice@example.com"), "fallback");
+        assert_eq!(uid, "Alice <alice@example.com>");
+    }
+
+    #[test]
+    fn test_pgp_user_id_name_only() {
+        let uid = pgp_user_id(Some("Alice"), None, "fallback");
+        assert_eq!(uid, "Alice");
+    }
+
+    #[test]
+    fn test_pgp_user_id_name_only_empty_email() {
+        // The non-empty name should win over an empty email argument.
+        let uid = pgp_user_id(Some("Alice"), Some(""), "fallback");
+        assert_eq!(uid, "Alice");
+    }
+
+    #[test]
+    fn test_pgp_user_id_email_only_uses_fallback_name() {
+        let uid = pgp_user_id(None, Some("alice@example.com"), "fallback");
+        assert_eq!(uid, "fallback <alice@example.com>");
+    }
+
+    #[test]
+    fn test_pgp_user_id_empty_name_with_email_uses_fallback_name() {
+        // Empty name still falls back even when email is set, since the
+        // (Some(name), _) branch requires !name.is_empty().
+        let uid = pgp_user_id(Some(""), Some("alice@example.com"), "fallback");
+        assert_eq!(uid, "fallback <alice@example.com>");
+    }
+
+    #[test]
+    fn test_pgp_user_id_neither_present() {
+        let uid = pgp_user_id(None, None, "fallback");
+        assert_eq!(uid, "fallback");
+    }
+
+    #[test]
+    fn test_pgp_user_id_both_empty_falls_back() {
+        // Pathological case: empty strings on both sides. Should still
+        // produce the fallback rather than "<>" or "name <>".
+        let uid = pgp_user_id(Some(""), Some(""), "fallback");
+        assert_eq!(uid, "fallback");
+    }
+
+    #[test]
+    fn test_derive_key_id_normal_fingerprint() {
+        // A 40-hex-char SHA-1-style fingerprint: last 16 hex chars become
+        // the short key id.
+        let fp = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(derive_key_id(fp), "89abcdef01234567");
+    }
+
+    #[test]
+    fn test_derive_key_id_short_fingerprint_returns_whole_string() {
+        // saturating_sub: fingerprints shorter than 16 chars should not
+        // panic; the whole string is the key id.
+        let fp = "abc123";
+        assert_eq!(derive_key_id(fp), "abc123");
+    }
+
+    #[test]
+    fn test_derive_key_id_empty_fingerprint() {
+        assert_eq!(derive_key_id(""), "");
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_appends_suffix() {
+        assert_eq!(
+            build_rotated_key_name("debian-stable"),
+            "debian-stable (rotated)"
+        );
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_already_rotated_still_appends() {
+        // We always append, even on an already-rotated name. Pin this so
+        // a future "smart rename" refactor that changes the shape (e.g.,
+        // appending "(rotated 2)") shows up as an explicit test break
+        // and forces an explicit decision.
+        assert_eq!(
+            build_rotated_key_name("debian-stable (rotated)"),
+            "debian-stable (rotated) (rotated)"
         );
     }
 }

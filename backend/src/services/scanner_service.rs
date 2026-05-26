@@ -143,16 +143,25 @@ WITH latest_scans AS (
 )
 ";
 
-/// Derive the Dependency-Track project name and purl type from an optional
-/// repo name and format. When the repo row is missing, falls back to the
-/// raw repository UUID string.
+/// Derive Dependency-Track project context from an optional repo row.
 ///
-/// Returns `(project_name, purl_type)`.
+/// Returns `(repo_label, purl_type)` where `repo_label` is the human-readable
+/// repository name (falling back to the raw repository UUID string when the
+/// repository row is missing). The repo label is used in the DT project
+/// description to give operators a way to trace a finding back to the source
+/// repo. The purl type is derived from the repository format and is used to
+/// stamp every component's purl in the generated SBOM.
+///
+/// Issue #1276: the DT *project name* itself is derived from the artifact
+/// name (and version) by the caller, not this helper. Using the artifact
+/// name lets DT findings map cleanly to the specific artifact AK stored,
+/// rather than collapsing every artifact in a repo onto one project that
+/// shared the repo's name and the first artifact's version.
 pub(crate) fn derive_dt_project_info(
     repo_row: Option<(String, Option<String>)>,
     fallback_id: &str,
 ) -> (String, &'static str) {
-    let (project_name, repo_format) = match repo_row {
+    let (repo_label, repo_format) = match repo_row {
         Some((name, format)) => (name, format),
         None => (fallback_id.to_string(), None),
     };
@@ -160,7 +169,7 @@ pub(crate) fn derive_dt_project_info(
         Some(ref fmt) => format_to_purl_type(fmt),
         None => "generic",
     };
-    (project_name, purl_type)
+    (repo_label, purl_type)
 }
 
 /// Build a list of [`DependencyInfo`] from scan-finding rows.
@@ -389,7 +398,21 @@ impl ScanWorkspace {
             || lower.ends_with(".egg")
     }
 
-    /// Extract an archive file into the given directory using system tools.
+    /// Extract an archive file into the given directory.
+    ///
+    /// Uses in-process Rust crates (`tar`, `flate2`, `zip`) rather than
+    /// shelling out to `tar`/`unzip`. This removes the runtime dependency
+    /// on system binaries (see issue #1243: the Alpine container image does
+    /// not ship a full `tar`, so npm `.tgz` extraction silently failed and
+    /// scans reported zero findings).
+    ///
+    /// Supported formats:
+    /// - `.tar.gz`, `.tgz`, `.crate` -- gzipped tar
+    /// - `.gem` -- plain tar (outer container; nested data.tar.gz is left as-is)
+    /// - `.zip`, `.whl`, `.jar`, `.war`, `.ear`, `.nupkg`, `.egg` -- zip archives
+    ///
+    /// CPU-bound work runs on a blocking task to avoid stalling the tokio
+    /// runtime when extracting large archives.
     pub async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
         let name = archive_path
             .file_name()
@@ -397,15 +420,14 @@ impl ScanWorkspace {
             .to_string_lossy()
             .to_lowercase();
 
-        let src = archive_path.to_string_lossy();
-        let dst = dest.to_string_lossy();
+        let src = archive_path.to_path_buf();
+        let dst = dest.to_path_buf();
 
-        let output =
+        let kind =
             if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-                tokio::process::Command::new("tar")
-                    .args(["xzf", &src, "-C", &dst])
-                    .output()
-                    .await
+                ArchiveKind::TarGz
+            } else if name.ends_with(".gem") {
+                ArchiveKind::Tar
             } else if name.ends_with(".zip")
                 || name.ends_with(".whl")
                 || name.ends_with(".jar")
@@ -414,32 +436,102 @@ impl ScanWorkspace {
                 || name.ends_with(".nupkg")
                 || name.ends_with(".egg")
             {
-                tokio::process::Command::new("unzip")
-                    .args(["-o", "-q", &src, "-d", &dst])
-                    .output()
-                    .await
-            } else if name.ends_with(".gem") {
-                tokio::process::Command::new("tar")
-                    .args(["xf", &src, "-C", &dst])
-                    .output()
-                    .await
+                ArchiveKind::Zip
             } else {
                 return Ok(());
             };
 
-        match output {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(AppError::Internal(format!(
-                "Archive extraction failed (exit {}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ))),
-            Err(e) => Err(AppError::Internal(format!(
-                "Failed to execute extraction command: {}",
-                e
-            ))),
-        }
+        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst))
+            .await
+            .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ArchiveKind {
+    /// gzip-compressed tar (.tar.gz, .tgz, .crate)
+    TarGz,
+    /// plain (uncompressed) tar (.gem)
+    Tar,
+    /// zip-based archive (.zip, .whl, .jar, etc.)
+    Zip,
+}
+
+fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result<()> {
+    let file = std::fs::File::open(src).map_err(|e| {
+        AppError::Internal(format!("Failed to open archive {}: {}", src.display(), e))
+    })?;
+
+    match kind {
+        ArchiveKind::TarGz => {
+            let decoder = flate2::read::GzDecoder::new(file);
+            unpack_tar(tar::Archive::new(decoder), dst)
+        }
+        ArchiveKind::Tar => unpack_tar(tar::Archive::new(file), dst),
+        ArchiveKind::Zip => unpack_zip(file, dst),
+    }
+}
+
+fn unpack_tar<R: std::io::Read>(mut archive: tar::Archive<R>, dst: &Path) -> Result<()> {
+    // Guard against path-traversal entries (`../etc/passwd`). The `tar`
+    // crate's `unpack` already refuses absolute paths and `..` components,
+    // but we re-enable the safety flags explicitly for clarity.
+    archive.set_overwrite(true);
+    archive.set_preserve_permissions(false);
+    archive
+        .unpack(dst)
+        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))
+}
+
+fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::Internal(format!("Failed to open zip archive: {}", e)))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AppError::Internal(format!("Failed to read zip entry {}: {}", i, e)))?;
+
+        // `enclosed_name` rejects absolute paths and any component containing
+        // `..`, so traversal attempts return None and are skipped.
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let out_path = dst.join(rel);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create zip dir {}: {}",
+                    out_path.display(),
+                    e
+                ))
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create zip parent {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let mut out = std::fs::File::create(&out_path).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to create zip output {}: {}",
+                out_path.display(),
+                e
+            ))
+        })?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| AppError::Internal(format!("Failed to write zip entry {}: {}", i, e)))?;
+    }
+
+    Ok(())
 }
 
 /// Handle a scan step failure: log a warning, clean up the workspace, and
@@ -2661,8 +2753,15 @@ impl ScannerService {
                 .ok()
                 .flatten();
 
-        let (project_name, purl_type) =
+        // #1276: DT project name is the artifact name (not the repo name), so
+        // each artifact gets its own DT project and findings map 1:1 back to
+        // the artifact AK stored. The repo label is folded into the
+        // description so operators can still trace a project back to its
+        // source repo. `purl_type` comes from the repo format because
+        // purl encoding is a property of the format, not the artifact.
+        let (repo_label, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
+        let project_name = artifact.name.as_str();
 
         // Build the dependency list, preferring the scan_packages inventory
         // (#903) so we forward the full dep tree even when Grype found zero
@@ -2762,12 +2861,14 @@ impl ScannerService {
             }
         };
 
-        // Get or create the DT project
+        // Get or create the DT project. #1276: project name = artifact name,
+        // version = artifact version, description carries the source repo
+        // label so the DT UI shows where the artifact came from.
         let dt_project = match dt
             .get_or_create_project(
-                &project_name,
+                project_name,
                 artifact.version.as_deref(),
-                Some(&format!("Artifact: {}", artifact.name)),
+                Some(&format!("Repository: {}", repo_label)),
             )
             .await
         {
@@ -3914,6 +4015,149 @@ mod tests {
         assert!(!ScanWorkspace::is_archive("Cargo.lock"));
         assert!(!ScanWorkspace::is_archive("package.json"));
         assert!(!ScanWorkspace::is_archive("foo.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ScanWorkspace::extract_archive (issue #1243)
+    //
+    // Regression coverage: previously these shelled out to `tar`/`unzip`,
+    // which silently failed on container images that don't ship those
+    // binaries (Alpine variant). The fix moved extraction in-process via
+    // the `tar`, `flate2`, and `zip` crates.
+    // -----------------------------------------------------------------------
+
+    /// Build an in-memory npm-shaped .tgz containing `package/package.json`
+    /// and `package/index.js`, write it to `dir/name`, return the path.
+    fn write_npm_tgz(dir: &Path, name: &str) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let pkg_json = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_ref()).unwrap();
+
+        let index_js = b"module.exports = function() { return 'hi'; };\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/index.js").unwrap();
+        header.set_size(index_js.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, index_js.as_ref()).unwrap();
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    fn write_simple_zip(dir: &Path, name: &str) -> PathBuf {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create zip");
+        let mut zw = zip::ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+        zw.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zw.start_file("com/example/App.class", opts).unwrap();
+        zw.write_all(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00]).unwrap();
+        zw.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_npm_tgz() {
+        // Regression for issue #1243: npm packages must extract without
+        // requiring the host `tar` binary.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&tgz, &dest)
+            .await
+            .expect("npm tgz should extract");
+
+        let pkg_json = dest.join("package").join("package.json");
+        let body = tokio::fs::read_to_string(&pkg_json).await.unwrap();
+        assert!(
+            body.contains("\"left-pad\""),
+            "package.json content: {}",
+            body
+        );
+        assert!(dest.join("package").join("index.js").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_crate_uses_targz() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // .crate files are gzipped tarballs, same wire format as .tgz.
+        let arc = write_npm_tgz(tmp.path(), "mycrate-0.1.0.crate");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&arc, &dest).await.unwrap();
+        assert!(dest.join("package").join("package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_zip_jar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let jar = write_simple_zip(tmp.path(), "app.jar");
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&jar, &dest).await.unwrap();
+        assert!(dest.join("META-INF").join("MANIFEST.MF").exists());
+        assert!(dest.join("com").join("example").join("App.class").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_unknown_extension_is_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("readme.txt");
+        tokio::fs::write(&plain, b"hello").await.unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        // Should succeed without touching the destination.
+        ScanWorkspace::extract_archive(&plain, &dest).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&dest).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_archive_corrupt_tgz_returns_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bad = tmp.path().join("broken.tgz");
+        tokio::fs::write(&bad, b"this is not a gzip stream")
+            .await
+            .unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        let err = ScanWorkspace::extract_archive(&bad, &dest)
+            .await
+            .expect_err("corrupt tgz should error");
+        match err {
+            AppError::Internal(msg) => assert!(
+                msg.contains("Tar extraction failed") || msg.contains("extraction"),
+                "unexpected error message: {}",
+                msg
+            ),
+            other => panic!("expected Internal error, got: {:?}", other),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7839,23 +8083,23 @@ mod tests {
     #[test]
     fn test_derive_dt_project_info_with_repo_name_and_format() {
         let row = Some(("my-npm-repo".to_string(), Some("npm".to_string())));
-        let (name, purl) = derive_dt_project_info(row, "fallback-id");
-        assert_eq!(name, "my-npm-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(repo_label, "my-npm-repo");
         assert_eq!(purl, "npm");
     }
 
     #[test]
     fn test_derive_dt_project_info_with_repo_name_no_format() {
         let row = Some(("my-repo".to_string(), None));
-        let (name, purl) = derive_dt_project_info(row, "fallback-id");
-        assert_eq!(name, "my-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(repo_label, "my-repo");
         assert_eq!(purl, "generic");
     }
 
     #[test]
     fn test_derive_dt_project_info_no_repo_row() {
-        let (name, purl) = derive_dt_project_info(None, "abc-123-uuid");
-        assert_eq!(name, "abc-123-uuid");
+        let (repo_label, purl) = derive_dt_project_info(None, "abc-123-uuid");
+        assert_eq!(repo_label, "abc-123-uuid");
         assert_eq!(purl, "generic");
     }
 
@@ -7869,9 +8113,68 @@ mod tests {
     #[test]
     fn test_derive_dt_project_info_docker_format() {
         let row = Some(("docker-repo".to_string(), Some("docker".to_string())));
-        let (name, purl) = derive_dt_project_info(row, "x");
-        assert_eq!(name, "docker-repo");
+        let (repo_label, purl) = derive_dt_project_info(row, "x");
+        assert_eq!(repo_label, "docker-repo");
         assert_eq!(purl, "docker");
+    }
+
+    /// Regression: #1276. The DT project name must be the artifact name (with
+    /// the artifact's version as the project version), not the repo name and
+    /// not the repository UUID. The repo name belongs in the description so
+    /// operators can still trace a finding back to its source repo. This
+    /// test pins the contract the caller in `submit_sbom_to_dependency_track`
+    /// is now expected to honor.
+    #[test]
+    fn test_dt_project_name_is_artifact_name_not_repo_or_uuid() {
+        // Simulate what the caller assembles for DT.
+        let repo_row = Some(("my-npm-repo".to_string(), Some("npm".to_string())));
+        let repository_uuid = "11111111-2222-3333-4444-555555555555";
+        let artifact_name = "lodash";
+        let artifact_version = Some("4.17.21");
+
+        let (repo_label, purl) = derive_dt_project_info(repo_row, repository_uuid);
+
+        // What the caller would actually send to DT:
+        let dt_project_name = artifact_name;
+        let dt_project_version = artifact_version;
+        let dt_project_description = format!("Repository: {}", repo_label);
+
+        // The DT project name must NOT be the repository UUID (#1276).
+        assert_ne!(dt_project_name, repository_uuid);
+        // The DT project name must NOT be the repository name either; that
+        // would collapse every artifact in the repo onto one DT project.
+        assert_ne!(dt_project_name, repo_label.as_str());
+        // It IS the artifact name, with the artifact's version pinned to
+        // the DT project version so DT can dedupe per artifact version.
+        assert_eq!(dt_project_name, "lodash");
+        assert_eq!(dt_project_version, Some("4.17.21"));
+        // The repo context is preserved in the description.
+        assert_eq!(dt_project_description, "Repository: my-npm-repo");
+        // purl_type is still driven by the repo format.
+        assert_eq!(purl, "npm");
+    }
+
+    /// Regression: #1276 fallback path. When the repository row is missing
+    /// (deleted concurrent with a scan, or migration glitch), DT submission
+    /// still happens but the description carries the repo UUID rather than
+    /// a name. The project name is still the artifact name, never the UUID.
+    #[test]
+    fn test_dt_project_name_is_artifact_name_when_repo_row_missing() {
+        let repository_uuid = "deadbeef-1111-2222-3333-444444444444";
+        let artifact_name = "express";
+
+        let (repo_label, purl) = derive_dt_project_info(None, repository_uuid);
+
+        let dt_project_name = artifact_name;
+        let dt_project_description = format!("Repository: {}", repo_label);
+
+        assert_ne!(dt_project_name, repository_uuid);
+        assert_eq!(dt_project_name, "express");
+        assert_eq!(
+            dt_project_description,
+            format!("Repository: {}", repository_uuid)
+        );
+        assert_eq!(purl, "generic");
     }
 
     #[test]

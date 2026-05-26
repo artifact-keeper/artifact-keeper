@@ -84,6 +84,14 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/vscode", handlers::vscode::router())
         .nest("/proto", handlers::protobuf::router())
         .nest("/incus", handlers::incus::router())
+        // `lxc` is the same wire protocol and same handler as `incus`; the
+        // `IncusHandler` accepts both `format='incus'` and `format='lxc'`
+        // repositories (see `resolve_incus_repo`). Without this alias,
+        // repositories created with `format: lxc` 404 on every request
+        // because no `/lxc/*` route existed (#1272). The SimpleStreams index
+        // served via this prefix currently references `/incus/...` download
+        // URLs; making those URLs prefix-aware is tracked as a follow-up.
+        .nest("/lxc", handlers::incus::router())
         .nest("/ext", handlers::wasm_proxy::router())
         .layer(middleware::from_fn_with_state(
             vis_state,
@@ -137,12 +145,22 @@ pub fn create_router(state: SharedState) -> Router {
     // login/setup/health/OCI challenge). The guard performs its own token
     // resolution so it can run as a global outer layer regardless of which
     // inner auth middleware (if any) the matched route uses.
+    //
+    // Register this long-lived AuthService's token cache with the global
+    // invalidation registry so a deactivation (issue #931 / #1371) flushes
+    // its cached API-token validations immediately. Without this the guard
+    // would keep accepting a deactivated user's API token from its own cache
+    // even though the inner auth_service rejects it, because the guard runs
+    // FIRST and its `pass/fail` decision is what produces the 401 here when
+    // `guest_access_enabled=false`.
+    let guest_auth_service = Arc::new(AuthService::new(
+        state.db.clone(),
+        Arc::new(state.config.clone()),
+    ));
+    guest_auth_service.register_for_global_flush();
     let guest_access_state = GuestAccessState {
         guest_access_enabled: state.config.guest_access_enabled,
-        auth_service: Arc::new(AuthService::new(
-            state.db.clone(),
-            Arc::new(state.config.clone()),
-        )),
+        auth_service: guest_auth_service,
     };
     router = router.layer(middleware::from_fn_with_state(
         guest_access_state,
@@ -322,18 +340,28 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User management routes require admin privileges. Password-mutating
-        // routes ride a stricter per-user rate-limit bucket (#1026) on top
-        // of auth; the bcrypt-verify in `change_password` is a CPU-DoS vector
-        // and a victim-JWT bearer would otherwise burn ~`api/min` password
-        // guesses through this endpoint.
+        // User-management routes are split across two `/users` nests by
+        // authorization model. The combined story spans #1250 (self-service
+        // password change must reach a non-admin's own user-id) and #1257
+        // (the same split is needed for the token CRUD + GET /:id paths,
+        // which the admin_middleware was 403'ing for non-admin self-action).
         //
-        // Self-service `POST /:id/password` is split out of the admin nest so
-        // a non-admin can change their OWN password (release-gate
-        // `tests/auth/test-jwt-after-password-change.sh` regression: "password
-        // change returned 403"). The handler itself enforces self-vs-admin
-        // authorization, so widening the middleware here does not let a
-        // non-admin alter someone else's password.
+        //   * auth_middleware nest (first nest below):
+        //     - `self_password_router`   : POST /:id/password
+        //                                  (rate-limited, #1026)
+        //     - `self_or_admin_router`   : GET /:id, GET/POST /:id/tokens,
+        //                                  DELETE /:id/tokens/:token_id
+        //     Each handler enforces `auth.user_id != id && !auth.is_admin`
+        //     (or `change_password`'s ownership check), so widening the
+        //     middleware here does NOT let one non-admin act on another.
+        //     Defense-in-depth `if !auth.is_admin` guards are present on
+        //     the admin handlers in the second nest below.
+        //
+        //   * admin_middleware nest (second nest):
+        //     - `router`                 : list / create / update / delete /
+        //                                  role-management
+        //     - `admin_password_router`  : reset / force-change
+        //                                  (rate-limited, #1026)
         .nest(
             "/users",
             handlers::users::self_password_router()
@@ -341,6 +369,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     password_change_rate_limit_state.clone(),
                     rate_limit_middleware,
                 ))
+                .merge(handlers::users::self_or_admin_router())
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
@@ -639,4 +668,49 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             api_rate_limit_state,
             rate_limit_middleware,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Source-level meta-tests pinning the `lxc` -> `incus` route alias
+    //! introduced for #1272. Repositories created with `format: lxc` 404'd
+    //! on every request because no `/lxc/*` route existed in the router,
+    //! even though the rest of the stack (enum variant, format dispatch,
+    //! repo resolver) accepted `lxc`. These assertions read the source of
+    //! `create_router` and fail loudly if a future refactor drops the
+    //! `/lxc` nest, since a runtime test would need full app state + a DB
+    //! fixture to reproduce the regression. The intent is to keep the two
+    //! prefixes wired to the same handler until the `lxc` format is either
+    //! folded into `incus` or given its own handler with prefix-aware URL
+    //! construction (tracked as a follow-up to #1272).
+    const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    #[test]
+    fn lxc_route_is_registered_alongside_incus() {
+        assert!(
+            ROUTES_RS_SRC.contains(".nest(\"/incus\", handlers::incus::router())"),
+            "incus route registration missing -- the lxc alias test below \
+             would otherwise be vacuously true; refactor needs to update \
+             this meta-test to match the new shape"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains(".nest(\"/lxc\", handlers::incus::router())"),
+            "/lxc route alias missing; lxc-format repositories will 404 \
+             on every request (regression of #1272)"
+        );
+    }
+
+    #[test]
+    fn lxc_and_incus_share_the_same_handler() {
+        // Pin the invariant that both prefixes mount the same router. If
+        // someone splits them into separate handlers in the future, this
+        // test should be updated alongside the routing decision so the
+        // intent stays explicit in source.
+        let incus_count = ROUTES_RS_SRC.matches("handlers::incus::router()").count();
+        assert!(
+            incus_count >= 2,
+            "expected handlers::incus::router() to be referenced at least \
+             twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
 }

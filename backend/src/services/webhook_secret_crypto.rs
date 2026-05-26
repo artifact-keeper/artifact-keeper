@@ -16,7 +16,13 @@
 //! This module is deliberately scoped to webhook secrets so that the key
 //! can be rotated independently from the SSO credential key.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64_URL,
+        URL_SAFE_NO_PAD as B64_URL_NO_PAD,
+    },
+    Engine as _,
+};
 use rand::RngCore;
 use thiserror::Error;
 
@@ -56,13 +62,50 @@ pub enum WebhookSecretError {
 /// Result type for webhook crypto operations.
 pub type Result<T> = std::result::Result<T, WebhookSecretError>;
 
-/// Load the 32-byte key from the environment, decoding base64.
+/// Decode an `AK_WEBHOOK_SECRET_KEY` value, accepting any of the common
+/// base64 alphabets: standard, standard-no-pad, URL-safe (base64url), and
+/// URL-safe-no-pad. Operators frequently generate these keys with tools that
+/// emit base64url (e.g. `openssl rand -base64 32 | tr '+/' '-_'`, `head -c
+/// 32 /dev/urandom | base64 -w0` on systems whose `base64` defaults to URL
+/// alphabet, or Kubernetes secret tooling). Refusing such values broke
+/// release-gate deploys when the generated key happened to contain `-` or
+/// `_` (see #1350, #1367), so we try every alphabet before giving up.
+fn decode_key_material(input: &str) -> std::result::Result<Vec<u8>, String> {
+    // The order matters only for the error message we propagate when every
+    // attempt fails: we want the most informative one. Standard base64 is
+    // tried first because it is the documented format.
+    let mut last_err: Option<String> = None;
+    for engine in [
+        &B64 as &dyn _Decoder,
+        &B64_NO_PAD,
+        &B64_URL,
+        &B64_URL_NO_PAD,
+    ] {
+        match engine.decode(input) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no base64 alphabet matched".to_string()))
+}
+
+/// Erased decoder trait so the four `general_purpose::*` constants (which
+/// have distinct concrete types) can live in the same array.
+trait _Decoder {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String>;
+}
+
+impl<E: base64::Engine> _Decoder for E {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String> {
+        base64::Engine::decode(self, input).map_err(|e| e.to_string())
+    }
+}
+
+/// Load the 32-byte key from the environment, decoding base64 or base64url.
 fn load_key() -> Result<[u8; 32]> {
     let raw = std::env::var(ENV_KEY).map_err(|_| WebhookSecretError::KeyMissing)?;
     let trimmed = raw.trim();
-    let bytes = B64
-        .decode(trimmed)
-        .map_err(|e| WebhookSecretError::KeyNotBase64(e.to_string()))?;
+    let bytes = decode_key_material(trimmed).map_err(WebhookSecretError::KeyNotBase64)?;
     if bytes.len() != 32 {
         return Err(WebhookSecretError::KeyWrongLength(bytes.len()));
     }
@@ -346,6 +389,63 @@ mod tests {
             ensure_configured(),
             Err(WebhookSecretError::KeyMissing)
         ));
+    }
+
+    #[test]
+    fn test_url_safe_base64_key_accepted() {
+        // Regression for #1367: backend refused to start when
+        // AK_WEBHOOK_SECRET_KEY was base64url-encoded (contains `-` or `_`).
+        // A 32-byte key whose URL-safe encoding contains `_`:
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        // Pick bytes whose standard-base64 form contains `/` and `+`, so
+        // the URL-safe form contains `_` and `-`. Byte values 0xFB and 0xFE
+        // map to alphabet chars `+` and `/`. Cycling 0xFB/0xFE produces an
+        // encoding rich in both `+/`, ensuring the URL-safe variant differs.
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe = base64::engine::general_purpose::URL_SAFE.encode(bytes);
+        assert!(
+            url_safe.contains('_') || url_safe.contains('-'),
+            "test fixture should exercise base64url alphabet, got {}",
+            url_safe
+        );
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe);
+        }
+        assert!(
+            ensure_configured().is_ok(),
+            "base64url-encoded key must be accepted; got error for input {}",
+            url_safe
+        );
+    }
+
+    #[test]
+    fn test_url_safe_no_pad_base64_key_accepted() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe_no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe_no_pad);
+        }
+        assert!(ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn test_garbage_key_still_rejected_as_invalid_base64() {
+        // A key with characters that are neither in the standard nor the
+        // URL-safe alphabet must still be rejected with KeyNotBase64 so
+        // the operator gets a clear diagnostic.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, "!!! definitely not base64 !!!");
+        }
+        let res = ensure_configured();
+        assert!(matches!(res, Err(WebhookSecretError::KeyNotBase64(_))));
     }
 
     #[test]

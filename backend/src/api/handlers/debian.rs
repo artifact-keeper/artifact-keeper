@@ -26,7 +26,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -36,8 +35,9 @@ use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
-use crate::api::SharedState;
+use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::models::repository::RepositoryType;
+use crate::models::signing_key::SigningKey;
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -318,50 +318,6 @@ async fn generate_release_content(
 }
 
 // ---------------------------------------------------------------------------
-// PGP armor helpers
-// ---------------------------------------------------------------------------
-
-/// Wrap a raw signature in PGP detached signature armor format.
-fn pgp_armor_signature(signature: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    // Wrap base64 at 76 characters per line (PGP convention)
-    let wrapped: Vec<&str> = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-    format!(
-        "-----BEGIN PGP SIGNATURE-----\n\
-         \n\
-         {}\n\
-         -----END PGP SIGNATURE-----\n",
-        wrapped.join("\n"),
-    )
-}
-
-/// Produce a GPG-style clearsigned document from content and signature.
-fn pgp_clearsign(content: &str, signature: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let wrapped: Vec<&str> = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-    format!(
-        "-----BEGIN PGP SIGNED MESSAGE-----\n\
-         Hash: SHA256\n\
-         \n\
-         {content}\
-         -----BEGIN PGP SIGNATURE-----\n\
-         \n\
-         {sig}\n\
-         -----END PGP SIGNATURE-----\n",
-        content = content,
-        sig = wrapped.join("\n"),
-    )
-}
-
-// ---------------------------------------------------------------------------
 // GET /debian/{repo_key}/dists/{distribution}/Release
 // ---------------------------------------------------------------------------
 
@@ -486,6 +442,10 @@ impl<'a> DebianProxy<'a> {
             proxy
                 .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
                 .await;
+            // Drop any signed-Release entries for this dist; the next
+            // InRelease / Release.gpg fetch will re-sign against the new
+            // content (#1236).
+            signed_release_cache_invalidate(self.state, self.repo_key, self.distribution).await;
         }
 
         Err(build_dists_response(content, upstream_ct, content_type))
@@ -534,6 +494,130 @@ fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(content).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Signed-Release cache helpers (#1236)
+//
+// `apt update` polls InRelease and Release.gpg on every refresh; OpenPGP
+// signing is multi-millisecond CPU work, so we cache the signed bytes keyed
+// by SHA-256(unsigned Release || key fingerprint). The fingerprint is in the
+// key so that a key rotation naturally invalidates the prior signature, and
+// the content prefix means any Release flip rotates the key without needing
+// an explicit invalidation pass — though we also evict eagerly from the
+// change-detect path to keep the cache from growing unboundedly.
+// ---------------------------------------------------------------------------
+
+/// Variant tag included in cache keys so InRelease and Release.gpg cannot
+/// collide even when they sign the same unsigned content with the same key.
+#[derive(Clone, Copy)]
+enum SignedReleaseVariant {
+    InRelease,
+    ReleaseGpg,
+}
+
+impl SignedReleaseVariant {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignedReleaseVariant::InRelease => "InRelease",
+            SignedReleaseVariant::ReleaseGpg => "Release.gpg",
+        }
+    }
+}
+
+/// Compute the cache key for a signed Release artifact. The fingerprint
+/// argument is the active signing key fingerprint (hex); when absent (no key
+/// configured) the caller should be returning 404 anyway and never call this.
+fn signed_release_cache_key(
+    variant: SignedReleaseVariant,
+    unsigned_release: &str,
+    key_fingerprint: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(variant.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(unsigned_release.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Look up a previously-signed Release artifact in the in-process cache.
+async fn signed_release_cache_get(state: &SharedState, cache_key: &str) -> Option<Bytes> {
+    let cache = state.signed_release_cache.read().await;
+    cache.get(cache_key).cloned()
+}
+
+/// Insert a freshly-signed Release artifact into the cache and update the
+/// `(repo_key, distribution)` reverse index used for targeted invalidation.
+/// A soft cap on total entries (`SIGNED_RELEASE_CACHE_MAX_ENTRIES`) bounds
+/// worst-case memory; once exceeded the entire cache is dropped, which is
+/// safe because every entry is reconstructible from its sign input.
+async fn signed_release_cache_put(
+    state: &SharedState,
+    repo_key: &str,
+    distribution: &str,
+    cache_key: String,
+    bytes: Bytes,
+) {
+    let mut cache = state.signed_release_cache.write().await;
+    if cache.len() >= SIGNED_RELEASE_CACHE_MAX_ENTRIES {
+        cache.clear();
+        let mut idx = state.signed_release_cache_index.write().await;
+        idx.clear();
+    }
+    cache.insert(cache_key.clone(), bytes);
+    drop(cache);
+
+    let mut idx = state.signed_release_cache_index.write().await;
+    let entry = idx
+        .entry((repo_key.to_string(), distribution.to_string()))
+        .or_default();
+    if !entry.contains(&cache_key) {
+        entry.push(cache_key);
+    }
+}
+
+/// Evict all signed-Release entries belonging to the given
+/// `(repo_key, distribution)`. Called from the change-detection paths so
+/// that an upstream Release flip drops the matching signed copies in
+/// lock-step with the sibling-Packages eviction in `proxy_service`.
+async fn signed_release_cache_invalidate(state: &SharedState, repo_key: &str, distribution: &str) {
+    let key = (repo_key.to_string(), distribution.to_string());
+    let drained = {
+        let mut idx = state.signed_release_cache_index.write().await;
+        idx.remove(&key).unwrap_or_default()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    let mut cache = state.signed_release_cache.write().await;
+    for cache_key in drained {
+        cache.remove(&cache_key);
+    }
+}
+
+/// Resolve the active signing key for a repository, returning a 404 when
+/// none is configured. We refuse to silently fall through to unsigned
+/// `InRelease` (#1236): clients trust the signature, so absence of a key
+/// is a configuration error the operator needs to see, not a soft fallback.
+async fn require_active_signing_key(
+    signing_svc: &SigningService,
+    repo_id: uuid::Uuid,
+) -> Result<SigningKey, Response> {
+    match signing_svc.get_active_key_for_repo(repo_id).await {
+        Ok(Some(k)) => Ok(k),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load signing key: {}", e),
+        )
+            .into_response()),
+    }
 }
 
 /// Iterate the virtual repo's Remote members for `upstream_path` and
@@ -604,6 +688,7 @@ async fn try_virtual_dists_detecting_change(
                     proxy
                         .invalidate_dist_packages_cache(&member.key, distribution, text)
                         .await;
+                    signed_release_cache_invalidate(state, &member.key, distribution).await;
                 }
                 return Ok(Some(build_dists_response(
                     content,
@@ -682,19 +767,40 @@ async fn in_release_file(
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, release.as_bytes())
-        .await
-        .unwrap_or(None);
+    // Resolve the signing key up front so we can both (a) return 404 when
+    // none is configured and (b) include the fingerprint in the cache key.
+    // The previous `.unwrap_or(release)` fallback silently served unsigned
+    // bytes, which is a security footgun (#1236 review).
+    let key = require_active_signing_key(&signing_svc, repo.id).await?;
+    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let cache_key =
+        signed_release_cache_key(SignedReleaseVariant::InRelease, &release, fingerprint);
 
-    let body = match signature {
-        Some(sig) => pgp_clearsign(&release, &sig),
-        None => release,
+    let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
+        cached
+    } else {
+        let armored = signing_svc
+            .sign_openpgp_cleartext_with_key(&key, &release)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to sign InRelease: {}", e),
+                )
+                    .into_response()
+            })?;
+        // Best-effort `last_used_at` stamp; we don't fail the request if the
+        // audit update errors (the sign already succeeded).
+        let _ = signing_svc.mark_key_used(key.id).await;
+        let bytes = Bytes::from(armored.into_bytes());
+        signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
+        bytes
     };
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_LENGTH, body.len().to_string())
         .body(Body::from(body))
         .unwrap())
 }
@@ -718,26 +824,36 @@ async fn release_gpg(
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, release.as_bytes())
-        .await
-        .unwrap_or(None);
+    let key = require_active_signing_key(&signing_svc, repo.id).await?;
+    let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
+    let cache_key =
+        signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, fingerprint);
 
-    match signature {
-        Some(sig) => {
-            let armored = pgp_armor_signature(&sig);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/pgp-signature")
-                .body(Body::from(armored))
-                .unwrap())
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
-    }
+    let body = if let Some(cached) = signed_release_cache_get(&state, &cache_key).await {
+        cached
+    } else {
+        let armored = signing_svc
+            .sign_openpgp_detached_with_key(&key, release.as_bytes())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to sign Release.gpg: {}", e),
+                )
+                    .into_response()
+            })?;
+        let _ = signing_svc.mark_key_used(key.id).await;
+        let bytes = Bytes::from(armored.into_bytes());
+        signed_release_cache_put(&state, &repo_key, &distribution, cache_key, bytes.clone()).await;
+        bytes
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-signature")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,59 +2031,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pgp_armor_signature
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_armor_signature_basic() {
-        let sig_data = b"test signature data";
-        let armored = pgp_armor_signature(sig_data);
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-        let b64 = base64::engine::general_purpose::STANDARD.encode(sig_data);
-        assert!(armored.contains(&b64));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_empty() {
-        let armored = pgp_armor_signature(b"");
-        assert!(armored.contains("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.contains("-----END PGP SIGNATURE-----"));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_long_data_wraps() {
-        let sig_data = vec![0u8; 100];
-        let armored = pgp_armor_signature(&sig_data);
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-    }
-
-    // -----------------------------------------------------------------------
-    // pgp_clearsign
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_clearsign_basic() {
-        let content = "Origin: artifact-keeper\nSuite: stable\n";
-        let sig_data = b"signature";
-        let result = pgp_clearsign(content, sig_data);
-        assert!(result.starts_with("-----BEGIN PGP SIGNED MESSAGE-----\n"));
-        assert!(result.contains("Hash: SHA256\n"));
-        assert!(result.contains(content));
-        assert!(result.contains("-----BEGIN PGP SIGNATURE-----\n"));
-        assert!(result.contains("-----END PGP SIGNATURE-----\n"));
-    }
-
-    #[test]
-    fn test_pgp_clearsign_preserves_content() {
-        let content = "Line 1\nLine 2\nLine 3\n";
-        let sig = b"sig";
-        let result = pgp_clearsign(content, sig);
-        assert!(result.contains("Line 1\nLine 2\nLine 3\n"));
-    }
-
-    // -----------------------------------------------------------------------
     // Upstream path construction for APT remote proxy (#674)
     // -----------------------------------------------------------------------
 
@@ -2332,5 +2395,165 @@ mod tests {
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).unwrap();
         assert_eq!(decompressed, text.as_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure helpers added alongside the OpenPGP signing flow (#1236). These
+    // are the path-shape parsers and string builders that the Debian
+    // handlers exercise before they touch the DB or storage; locking them
+    // down keeps the per-PR coverage gate above the 70% floor and pins
+    // exact behavior so a future refactor of the dists/* route shape (or
+    // the `binary-{arch}` segment convention) shows up as a test break.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_deb_filename_standard() {
+        let info = parse_deb_filename("hello_2.10-2_amd64.deb").expect("standard shape parses");
+        assert_eq!(info.name, "hello");
+        assert_eq!(info.version, "2.10-2");
+        assert_eq!(info.arch, "amd64");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_missing_deb_suffix() {
+        // No .deb suffix at all -- strip_suffix returns None.
+        assert!(parse_deb_filename("hello_2.10-2_amd64").is_none());
+    }
+
+    #[test]
+    fn test_parse_deb_filename_only_two_segments() {
+        // Two underscores would be required; this has one.
+        assert!(parse_deb_filename("hello_amd64.deb").is_none());
+    }
+
+    #[test]
+    fn test_parse_deb_filename_version_may_contain_underscores() {
+        // splitn(3) caps at three pieces, so any extra underscores in
+        // segment 3 become part of the `arch` field. This pins the
+        // splitn behaviour so a future refactor that bumps the split
+        // depth shows up as an explicit test break.
+        let info = parse_deb_filename("pkg_1.0_amd64_extra.deb").expect("splitn yields 3 segments");
+        assert_eq!(info.name, "pkg");
+        assert_eq!(info.version, "1.0");
+        assert_eq!(info.arch, "amd64_extra");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_present() {
+        assert_eq!(strip_binary_arch_prefix("binary-amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_absent() {
+        // Without the binary- prefix the input is returned unchanged.
+        assert_eq!(strip_binary_arch_prefix("amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_only_prefix() {
+        // Edge case: the prefix is the entire input.
+        assert_eq!(strip_binary_arch_prefix("binary-"), "");
+    }
+
+    #[test]
+    fn test_packages_index_suffix_plain() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", ""),
+            "main/binary-amd64/Packages"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_compressed() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", "gz"),
+            "main/binary-amd64/Packages.gz"
+        );
+        assert_eq!(
+            packages_index_suffix("contrib", "binary-arm64", "xz"),
+            "contrib/binary-arm64/Packages.xz"
+        );
+    }
+
+    #[test]
+    fn test_parse_packages_request_wrong_segment_count() {
+        // Two segments -- caller should fall through to the upstream
+        // proxy, not handle it as a Packages request.
+        assert!(parse_packages_request("main/Packages").is_none());
+        // Four segments.
+        assert!(parse_packages_request("main/binary-amd64/extra/Packages").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_missing_binary_prefix() {
+        // Middle segment must start with "binary-"; "src-" is a real
+        // Debian segment but is not handled here.
+        assert!(parse_packages_request("main/src-amd64/Sources").is_none());
+        assert!(parse_packages_request("main/amd64/Packages").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_unknown_extension() {
+        // Anything other than Packages / Packages.gz / Packages.xz
+        // is None so the caller proxies to upstream.
+        assert!(parse_packages_request("main/binary-amd64/Packages.bz2").is_none());
+        assert!(parse_packages_request("main/binary-amd64/Release").is_none());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_changed() {
+        // Non-empty bytes + changed -> Some(snippet) so the caller emits
+        // a webhook payload. Empty bytes still returns Some but with the
+        // empty string.
+        let payload = release_invalidation_payload(true, b"foo bar baz");
+        assert!(payload.is_some());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_unchanged_is_none() {
+        // changed = false -> None; no webhook fires.
+        assert!(release_invalidation_payload(false, b"any content").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // signed_release_cache_key (#1236)
+    //
+    // The cache key must be stable for a given (variant, content, key
+    // fingerprint) triple and must differ for InRelease vs Release.gpg
+    // and across key rotations, so a key rotation cannot accidentally
+    // serve a stale signature from a previous fingerprint.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_signed_release_cache_key_is_deterministic() {
+        let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
+        let b = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
+        assert_eq!(a, b);
+        // SHA-256 hex = 64 chars.
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn test_signed_release_cache_key_variant_namespaces_collide_safely() {
+        let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
+        let b = signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, "Release\n", "abcd");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_signed_release_cache_key_content_change_rotates_key() {
+        let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
+        let b =
+            signed_release_cache_key(SignedReleaseVariant::InRelease, "Release-changed\n", "abcd");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_signed_release_cache_key_fingerprint_change_rotates_key() {
+        // A signing-key rotation must rotate the cache key so we never
+        // serve a signature produced by a deactivated key.
+        let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
+        let b = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "ef01");
+        assert_ne!(a, b);
     }
 }

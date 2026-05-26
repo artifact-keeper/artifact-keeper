@@ -2,6 +2,7 @@
 
 pub mod download_response;
 pub mod dto;
+pub mod extractors;
 pub mod handlers;
 pub mod middleware;
 pub mod openapi;
@@ -68,6 +69,33 @@ pub type RepoCache = Arc<RwLock<HashMap<String, (CachedRepo, Instant)>>>;
 /// Key: `"{repo_key}:{crate_name_lowercase}"`. Value: raw response bytes + insertion time.
 pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
 
+/// Thread-safe in-process cache for signed APT Release artifacts
+/// (`InRelease` and `Release.gpg`). Key: hex-encoded SHA-256 of
+/// `(unsigned Release content || signing key fingerprint)`. Value: the
+/// armored signed bytes.
+///
+/// OpenPGP signing of the Release file is CPU-bound (multi-millisecond per
+/// hit on RSA-4096) and `apt update` requests both InRelease and Release.gpg
+/// on every refresh. Caching by content hash means the signature is reused
+/// across requests until the underlying Release content actually changes,
+/// at which point the cache key naturally rotates. The `(repo_key,
+/// distribution) -> set of cache keys` reverse index lets the change-detect
+/// path purge stale entries when an upstream Release flip is detected
+/// (mirroring how sibling Packages caches are invalidated for #1147).
+pub type SignedReleaseCache = Arc<RwLock<HashMap<String, Bytes>>>;
+
+/// Reverse index from (repo_key, distribution) to the set of cache keys
+/// installed under that scope. Lets the change-detect path drop just the
+/// signed-Release entries that belong to the changed distribution without
+/// scanning the entire cache.
+pub type SignedReleaseCacheIndex = Arc<RwLock<HashMap<(String, String), Vec<String>>>>;
+
+/// Soft cap on the signed-Release cache. Each distribution typically holds
+/// at most two entries (InRelease + Release.gpg) per active fingerprint, so
+/// 1024 is comfortably above the working-set size for a busy registry while
+/// still bounding worst-case memory if the cache ever grows pathologically.
+pub const SIGNED_RELEASE_CACHE_MAX_ENTRIES: usize = 1024;
+
 /// Application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -95,6 +123,14 @@ pub struct AppState {
     /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
     /// SHA-256 re-verification on every warm index request.
     pub index_cache: IndexCache,
+    /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
+    /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
+    /// re-signing on every `apt update` poll (#1236).
+    pub signed_release_cache: SignedReleaseCache,
+    /// Reverse index for `signed_release_cache` so the change-detect path
+    /// can evict just the entries belonging to a specific
+    /// `(repo_key, distribution)` when the underlying Release flips.
+    pub signed_release_cache_index: SignedReleaseCacheIndex,
     /// Concurrency cap for bcrypt-bound auth work (login, password verify,
     /// API token verify). `None` when `auth_max_concurrency == 0`, in which
     /// case auth runs without a process-wide cap (legacy behaviour).
@@ -156,6 +192,8 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
+            signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
         }
     }
@@ -196,6 +234,8 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
+            signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
         }
     }

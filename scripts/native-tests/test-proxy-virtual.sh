@@ -78,8 +78,18 @@ echo "  Authenticated successfully"
 echo ""
 
 # Helper: create a repository (deletes first if exists to ensure clean state)
+#
+# Args:
+#   $1  key
+#   $2  name
+#   $3  format
+#   $4  repo_type (local|remote|virtual|staging)
+#   $5  upstream_url (optional, only for remote)
+#   $6  member_repos JSON array (required for virtual; per #1281 the backend
+#       rejects virtual creates without members at 400). Example:
+#         '[{"repo_key":"npm-local","priority":1},{"repo_key":"npm-proxy","priority":2}]'
 create_repo() {
-    local key="$1" name="$2" format="$3" repo_type="$4" upstream_url="${5:-}"
+    local key="$1" name="$2" format="$3" repo_type="$4" upstream_url="${5:-}" member_repos="${6:-}"
 
     # Delete if exists (ignore errors)
     curl -s -o /dev/null -X DELETE "$API_URL/repositories/$key" -H "$AUTH" 2>/dev/null || true
@@ -88,6 +98,9 @@ create_repo() {
     if [ -n "$upstream_url" ]; then
         body="$body,\"upstream_url\":\"$upstream_url\""
     fi
+    if [ -n "$member_repos" ]; then
+        body="$body,\"member_repos\":$member_repos"
+    fi
     body="$body}"
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/repositories" \
@@ -95,8 +108,9 @@ create_repo() {
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
         return 0
     else
-        echo "  WARNING: create_repo $key returned HTTP $http_code"
-        return 1
+        echo "  ERROR: create_repo $key returned HTTP $http_code (body: $body)"
+        echo "  Aborting: subsequent tests depend on this repo existing."
+        exit 1
     fi
 }
 
@@ -144,28 +158,30 @@ echo "  - hex-local-e2e (local)"
 create_repo "hex-proxy" "Hex Proxy" "hex" "remote" "https://repo.hex.pm"
 echo "  - hex-proxy (remote -> repo.hex.pm)"
 
-# Virtual repos (aggregating local + remote)
-create_repo "npm-virtual" "NPM Virtual" "npm" "virtual"
-echo "  - npm-virtual (virtual)"
+# Virtual repos (aggregating local + remote).
+# Per #1281, virtual creates must supply member_repos at POST time; the standalone
+# POST /repositories/{key}/members endpoint still works for post-create edits and
+# is exercised below as an idempotent 409 to keep that path covered.
+create_repo "npm-virtual" "NPM Virtual" "npm" "virtual" "" \
+    '[{"repo_key":"npm-local-e2e","priority":1},{"repo_key":"npm-proxy","priority":2}]'
+echo "  - npm-virtual (virtual) members: npm-local-e2e (pri=1), npm-proxy (pri=2)"
 
-create_repo "pypi-virtual" "PyPI Virtual" "pypi" "virtual"
-echo "  - pypi-virtual (virtual)"
+create_repo "pypi-virtual" "PyPI Virtual" "pypi" "virtual" "" \
+    '[{"repo_key":"pypi-local-e2e","priority":1},{"repo_key":"pypi-proxy","priority":2}]'
+echo "  - pypi-virtual (virtual) members: pypi-local-e2e (pri=1), pypi-proxy (pri=2)"
 
-create_repo "hex-virtual" "Hex Virtual" "hex" "virtual"
-echo "  - hex-virtual (virtual)"
+create_repo "hex-virtual" "Hex Virtual" "hex" "virtual" "" \
+    '[{"repo_key":"hex-local-e2e","priority":1},{"repo_key":"hex-proxy","priority":2}]'
+echo "  - hex-virtual (virtual) members: hex-local-e2e (pri=1), hex-proxy (pri=2)"
 
-# Wire virtual members (local first = higher priority, then remote proxy)
+# Re-issue add_virtual_member as a 409 no-op so the dedicated endpoint stays
+# exercised in smoke. add_virtual_member() already accepts 409 as success.
 add_virtual_member "npm-virtual" "npm-local-e2e" 1
 add_virtual_member "npm-virtual" "npm-proxy" 2
-echo "  - npm-virtual members: npm-local-e2e (pri=1), npm-proxy (pri=2)"
-
 add_virtual_member "pypi-virtual" "pypi-local-e2e" 1
 add_virtual_member "pypi-virtual" "pypi-proxy" 2
-echo "  - pypi-virtual members: pypi-local-e2e (pri=1), pypi-proxy (pri=2)"
-
 add_virtual_member "hex-virtual" "hex-local-e2e" 1
 add_virtual_member "hex-virtual" "hex-proxy" 2
-echo "  - hex-virtual members: hex-local-e2e (pri=1), hex-proxy (pri=2)"
 
 echo ""
 
