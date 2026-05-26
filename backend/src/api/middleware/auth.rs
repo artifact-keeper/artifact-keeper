@@ -60,6 +60,19 @@ pub struct AuthExtension {
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTicketAuth;
 
+/// Calling token's `iat` (issued-at) Unix-timestamp in seconds.
+///
+/// Inserted alongside [`AuthExtension`] by [`auth_middleware`] only when the
+/// caller authenticated with a JWT (Bearer or cookie). Absent for API-key,
+/// Basic, ticket, and service-account auth (where there is no JWT iat).
+///
+/// Used by handlers that perform credential-change invalidation
+/// (TOTP enable/disable, password change) to exempt the calling session's
+/// own token from being killed by the same operation it just performed.
+/// Issue #1370.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenIat(pub i64);
+
 impl AuthExtension {
     /// Check whether this auth context has a required scope.
     /// JWT sessions (non-API-token auth) always pass since they have no scope
@@ -369,7 +382,10 @@ pub async fn auth_middleware(
     // 401 message stays informative when only a ?ticket= was supplied.
     let had_header_credentials = !matches!(extracted, ExtractedToken::None);
 
-    let header_result: Result<AuthExtension, &'static str> = match extracted {
+    // Carry the JWT `iat` alongside the resolved AuthExtension so handlers
+    // performing credential-change invalidation (TOTP, password) can exempt
+    // the calling session's own token. Only populated on the JWT path.
+    let header_result: Result<(AuthExtension, Option<TokenIat>), &'static str> = match extracted {
         // Replica-safe access-token validation. The async variant consults the
         // DB credential-change watermark (#1173) so a password reset, TOTP
         // change, or deactivation on a peer replica is honoured here on the
@@ -379,16 +395,19 @@ pub async fn auth_middleware(
         // PR #1190 was supposed to close.
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => Ok(AuthExtension::from(claims)),
+                Ok(claims) => {
+                    let iat = TokenIat(claims.iat);
+                    Ok((AuthExtension::from(claims), Some(iat)))
+                }
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok(ext),
+                    Ok(ext) => Ok((ext, None)),
                     Err(_) => Err("Invalid or expired token"),
                 },
             }
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => Ok(ext),
+                Ok(ext) => Ok((ext, None)),
                 Err(_) => Err("Invalid or expired API token"),
             }
         }
@@ -396,7 +415,7 @@ pub async fn auth_middleware(
             None => Err("Invalid Basic auth credentials"),
             Some((username, password)) => {
                 match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
+                    Ok((user, _token_pair)) => Ok((AuthExtension::from(user), None)),
                     Err(_) => Err("Invalid credentials"),
                 }
             }
@@ -406,8 +425,11 @@ pub async fn auth_middleware(
     };
 
     let header_error = match header_result {
-        Ok(ext) => {
+        Ok((ext, token_iat)) => {
             request.extensions_mut().insert(ext);
+            if let Some(iat) = token_iat {
+                request.extensions_mut().insert(iat);
+            }
             return next.run(request).await;
         }
         Err(msg) => msg,
@@ -471,47 +493,112 @@ async fn validate_api_token_with_scopes(
 /// token is present, and `None` otherwise (missing, invalid, or expired).
 /// This is the shared logic used by [`optional_auth_middleware`] and
 /// [`repo_visibility_middleware`].
+///
+/// Note: this helper conflates "no credential" with "invalid credential" —
+/// callers that need to distinguish those two outcomes (e.g. to honour an
+/// off-boarding deactivation immediately on optional-auth routes, see
+/// [`try_resolve_auth_outcome`] and issue #1371) should use the outcome
+/// variant instead.
 pub(crate) async fn try_resolve_auth(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
 ) -> Option<AuthExtension> {
+    match try_resolve_auth_outcome(auth_service, extracted).await {
+        AuthOutcome::Resolved(ext) => Some(ext),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+    }
+}
+
+/// Outcome of resolving an authentication credential.
+///
+/// Distinguishes three states an optional-auth path needs to handle
+/// differently after #1371:
+///
+///   * [`AuthOutcome::Resolved`] - a credential was presented and validated.
+///   * [`AuthOutcome::NoCredential`] - no credential was presented; the
+///     caller may continue as an anonymous request when policy allows.
+///   * [`AuthOutcome::InvalidCredential`] - a credential WAS presented but
+///     failed validation (expired JWT, revoked / deactivated API token,
+///     wrong basic-auth password, etc.). RFC 7235 calls for 401 here — and
+///     for off-boarding (issue #1371) it is load-bearing: silently
+///     downgrading a deactivated user's still-cached API token to "no auth"
+///     means the user's token continues to receive public-only responses
+///     instead of being unambiguously rejected, which masks the
+///     deactivation and weakens the security posture.
+///
+/// Use [`try_resolve_auth_outcome`] to obtain this tri-state result; the
+/// boolean [`try_resolve_auth`] helper continues to flatten Invalid into
+/// None for callers that don't need to distinguish.
+#[derive(Debug)]
+pub(crate) enum AuthOutcome {
+    Resolved(AuthExtension),
+    NoCredential,
+    InvalidCredential,
+}
+
+/// Resolve a possibly-missing credential into an [`AuthOutcome`].
+///
+/// This is the strict variant of [`try_resolve_auth`]: it preserves the
+/// distinction between "no credential presented" and "credential presented
+/// but invalid" so optional-auth middleware can return 401 on the latter
+/// rather than silently dropping to anonymous. The original
+/// [`try_resolve_auth`] delegates to this function and flattens the result.
+///
+/// Decision tree:
+///   * `ExtractedToken::None` -> `NoCredential` (anonymous request)
+///   * `ExtractedToken::Invalid` -> `InvalidCredential` (malformed Authorization
+///     header; the client explicitly attempted to authenticate)
+///   * `ExtractedToken::Bearer` / `ApiKey` / `Basic` ->
+///     - `Resolved(ext)` on any successful path
+///     - `InvalidCredential` if every validation attempt failed
+pub(crate) async fn try_resolve_auth_outcome(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
             // See `auth_middleware` for why this is the async variant. Same
             // rationale: optional-auth routes still need to reject pre-change
             // tokens across replicas (#1173).
             if let Ok(claims) = auth_service.validate_access_token_async(token).await {
-                return Some(AuthExtension::from(claims));
+                return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
             if let Ok(ext) = validate_api_token_with_scopes(auth_service, token).await {
-                return Some(ext);
+                return AuthOutcome::Resolved(ext);
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
             // API keys. Try decoding as credentials before giving up.
             if let Some((username, password)) = decode_basic_credentials(token) {
                 if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
-                    return Some(AuthExtension::from(user));
+                    return AuthOutcome::Resolved(AuthExtension::from(user));
                 }
             }
-            None
+            AuthOutcome::InvalidCredential
         }
-        ExtractedToken::ApiKey(token) => validate_api_token_with_scopes(auth_service, token)
-            .await
-            .ok(),
+        ExtractedToken::ApiKey(token) => {
+            match validate_api_token_with_scopes(auth_service, token).await {
+                Ok(ext) => AuthOutcome::Resolved(ext),
+                Err(()) => AuthOutcome::InvalidCredential,
+            }
+        }
         ExtractedToken::Basic(encoded) => {
-            let (username, password) = decode_basic_credentials(encoded)?;
+            let Some((username, password)) = decode_basic_credentials(encoded) else {
+                return AuthOutcome::InvalidCredential;
+            };
             // Try bcrypt username/password auth first
             if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
-                return Some(AuthExtension::from(user));
+                return AuthOutcome::Resolved(AuthExtension::from(user));
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format
-            validate_api_token_with_scopes(auth_service, &password)
-                .await
-                .ok()
+            match validate_api_token_with_scopes(auth_service, &password).await {
+                Ok(ext) => AuthOutcome::Resolved(ext),
+                Err(()) => AuthOutcome::InvalidCredential,
+            }
         }
-        ExtractedToken::None | ExtractedToken::Invalid => None,
+        ExtractedToken::None => AuthOutcome::NoCredential,
+        ExtractedToken::Invalid => AuthOutcome::InvalidCredential,
     }
 }
 
@@ -731,13 +818,30 @@ async fn try_resolve_ticket_for_parts(
 ///
 /// Supports the same authentication schemes as auth_middleware but
 /// allows requests without any authentication to proceed.
+///
+/// Off-boarding semantics (#1371): when the client explicitly presents a
+/// credential that fails to validate (expired JWT, revoked or deactivated
+/// API token, wrong basic-auth password, malformed Authorization header),
+/// the request is rejected with 401 rather than being silently downgraded
+/// to anonymous. Without this, a deactivated user whose API token is still
+/// in the upstream `validate_api_token` cache (post-#931) would continue to
+/// receive 200-with-public-list responses on optional-auth routes for up to
+/// `API_TOKEN_CACHE_TTL_SECS` — masking the deactivation and breaking the
+/// off-boarding contract. We only short-circuit when no `?ticket=` fallback
+/// is available, since download tickets are a legitimate alternative
+/// credential for read-only routes.
 pub async fn optional_auth_middleware(
     State(auth_service): State<Arc<AuthService>>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let extracted = extract_token(&request);
-    let mut auth_ext = try_resolve_auth(&auth_service, extracted).await;
+    let outcome = try_resolve_auth_outcome(&auth_service, extracted).await;
+    let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
+    let mut auth_ext: Option<AuthExtension> = match outcome {
+        AuthOutcome::Resolved(ext) => Some(ext),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+    };
 
     // If header-based auth produced no identity, fall back to a `?ticket=`
     // query param. Optional-auth routes are typically reads, so a ticket can
@@ -750,6 +854,14 @@ pub async fn optional_auth_middleware(
                 authed_via_ticket = true;
             }
         }
+    }
+
+    // Off-boarding: an explicitly-presented credential that failed validation
+    // must produce 401. We allow a ticket to rescue the request because a
+    // browser may include a stale Authorization cookie alongside a fresh
+    // download ticket — the ticket is what authorizes the read.
+    if credential_invalid && auth_ext.is_none() {
+        return unauthorized_response();
     }
 
     request.extensions_mut().insert(auth_ext);
@@ -1019,9 +1131,26 @@ pub async fn repo_visibility_middleware(
     // handlers that declare `Extension<Option<AuthExtension>>` don't fail
     // Axum extraction with HTTP 500 (MissingExtension). The handler itself
     // is responsible for returning the 404 once it tries to resolve the repo.
+    //
+    // Off-boarding (#1371): an explicitly-presented credential that failed
+    // validation must produce 401 even before we know whether the repo
+    // exists. Leaking the existence of a repo via 404-vs-401 is a separate
+    // info-disclosure question (#-TBD); for now we mirror
+    // `optional_auth_middleware` and prioritise honouring the deactivation.
     let Some(repo) = repo else {
         let extracted = extract_token(&request);
-        let auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+        let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
+        let auth_ext: Option<AuthExtension> = match outcome {
+            AuthOutcome::Resolved(ext) => Some(ext),
+            AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+        };
+        if credential_invalid && auth_ext.is_none() {
+            return unauthorized_response();
+        }
+        // Note: `credential_invalid` was captured before the match consumed
+        // `outcome`; this mirrors the pattern further down for the repo-hit
+        // branch.
         request.extensions_mut().insert(auth_ext);
         return next.run(request).await;
     };
@@ -1031,7 +1160,13 @@ pub async fn repo_visibility_middleware(
 
     // Perform optional auth (shared with optional_auth_middleware).
     let extracted = extract_token(&request);
-    let mut auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+    let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
+    let mut auth_ext: Option<AuthExtension> = match outcome {
+        AuthOutcome::Resolved(ext) => Some(ext),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+    };
+    // `credential_invalid` was captured before the match consumed `outcome`.
 
     // Fall back to a `?ticket=` query param when no header credentials were
     // supplied or accepted. Tickets are read-only and bound to a path; the
@@ -1045,6 +1180,12 @@ pub async fn repo_visibility_middleware(
                 authed_via_ticket = true;
             }
         }
+    }
+
+    // Off-boarding (#1371): explicit credential presented but invalid (and
+    // no rescuing ticket) means 401, not anonymous read.
+    if credential_invalid && auth_ext.is_none() {
+        return unauthorized_response();
     }
 
     // Insert auth extension for downstream handlers.
@@ -2940,8 +3081,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // optional_auth_middleware: must always pass through to the handler with
-    // Option<AuthExtension> in extensions, even when auth fails.
+    // optional_auth_middleware behaviour matrix (#1371):
+    //   * no credential       -> pass through anonymously (200)
+    //   * invalid credential  -> 401 (was 200 pre-#1371; the silent downgrade
+    //                            masked off-boarding deactivations on cached
+    //                            API tokens, see issue #1371)
+    //   * valid credential    -> pass through with AuthExtension (200)
+    // The "invalid credential -> 401" rule yields to a successful ticket
+    // fallback because download tickets are a legitimate alternative
+    // capability for read-only routes.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -2950,10 +3098,94 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // -----------------------------------------------------------------------
+    // try_resolve_auth_outcome: tri-state behaviour pinned for #1371.
+    // The outcome enum is what lets `optional_auth_middleware` distinguish
+    // "no credential" (continue anonymously) from "credential presented but
+    // invalid" (401). The legacy `try_resolve_auth` helper delegates to this
+    // function and collapses Invalid into None for back-compat.
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_optional_auth_middleware_passes_through_with_bad_bearer() {
-        // Bad Bearer + ?ticket= query: both fail (lazy pool). Middleware must
-        // still pass through to the handler with `None` auth extension.
+    async fn test_try_resolve_auth_outcome_no_credential_for_none() {
+        let auth_service = make_test_auth_service();
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None).await;
+        assert!(matches!(outcome, AuthOutcome::NoCredential));
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_invalid_for_garbage_scheme() {
+        let auth_service = make_test_auth_service();
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid).await;
+        assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_invalid_for_bad_bearer() {
+        // Bearer that decodes as neither a JWT nor any valid API token must
+        // be flagged as Invalid, NOT NoCredential. Pre-#1371 this distinction
+        // did not exist and optional-auth routes silently downgraded to
+        // anonymous.
+        let auth_service = make_test_auth_service();
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("not-a-real-jwt")).await;
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_invalid_for_bad_api_key() {
+        let auth_service = make_test_auth_service();
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("not-a-real-token"))
+                .await;
+        assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_invalid_for_unparseable_basic() {
+        // Base64 that decodes but does not contain `user:password` must be
+        // Invalid, not NoCredential. The client tried to authenticate; we
+        // owe them a 401.
+        let auth_service = make_test_auth_service();
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic("not-base64-at-all"))
+                .await;
+        assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+    }
+
+    #[test]
+    fn test_try_resolve_auth_collapses_invalid_to_none_for_back_compat() {
+        // Pin the legacy helper's contract: callers that opt into the
+        // tri-state outcome get distinct values, callers that stick with the
+        // Option-shaped helper still see Invalid flattened to None. This is
+        // what lets the guest_access guard and existing internal call sites
+        // keep working without touching every call site.
+        //
+        // (No async needed — we exercise the flatten by hand for the static
+        // mapping rules. The branching that calls the auth service is
+        // covered by the async tests above.)
+        let flatten = |outcome: AuthOutcome| -> Option<AuthExtension> {
+            match outcome {
+                AuthOutcome::Resolved(ext) => Some(ext),
+                AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+            }
+        };
+        assert!(flatten(AuthOutcome::NoCredential).is_none());
+        assert!(flatten(AuthOutcome::InvalidCredential).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_optional_auth_middleware_rejects_invalid_bearer_with_401() {
+        // Pre-#1371 behaviour: a Bearer header that failed every validation
+        // path was silently downgraded to anonymous and the handler returned
+        // 200 (with public-only data on real endpoints). That masked the
+        // post-deactivation cache rejection from /api/v1/repositories. The
+        // ticket fallback also fails here (lazy pool, invalid ticket), so the
+        // outcome must be 401, not 200.
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe?ticket=xyz")
@@ -2961,11 +3193,18 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "explicit invalid Bearer must produce 401 (issue #1371)"
+        );
     }
 
     #[tokio::test]
-    async fn test_optional_auth_middleware_passes_through_with_invalid_header() {
+    async fn test_optional_auth_middleware_rejects_invalid_authorization_header_with_401() {
+        // A garbage scheme is `ExtractedToken::Invalid`. The client explicitly
+        // attempted to authenticate, so pass-through to anonymous is the wrong
+        // policy after #1371 — return 401 instead.
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
@@ -2973,7 +3212,11 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "explicit invalid Authorization scheme must produce 401 (issue #1371)"
+        );
     }
 
     // -----------------------------------------------------------------------
