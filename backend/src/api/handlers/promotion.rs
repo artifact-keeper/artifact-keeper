@@ -15,9 +15,11 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::quality::{QualityGateEvaluation, QualityGateViolation};
 use crate::models::repository::RepositoryType;
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
+use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 
 pub fn router() -> Router<SharedState> {
@@ -185,6 +187,107 @@ pub fn validate_promotion_target_and_format(
     Ok(())
 }
 
+/// Outcome of a single quality-gate evaluation, used by `promote_artifact` to
+/// drive both the block (409) and warn (attach-to-response) branches from one
+/// underlying DB query.
+///
+/// `evaluate_quality_gate` is the most expensive call in the promotion path
+/// (it joins `quality_gates`, `artifact_health_scores`, and a handful of
+/// related rows). Calling it twice for the same request opens a TOCTOU window
+/// where a gate flips between calls and the second call observes a different
+/// state than the first. We collapse both branches onto a single evaluation by
+/// folding the raw `QualityGateEvaluation` into this three-state outcome up
+/// front, then matching on it.
+///
+/// `NotEvaluated` covers two non-fatal cases that the previous code already
+/// treated as "skip the gate, continue":
+///   * `skip_policy_check = true` in the request
+///   * `quality_check_service` is not wired into application state
+///   * the underlying evaluation returned `Err` (missing gate / missing health
+///     score), which has always been logged-and-continued rather than 5xx'd.
+#[derive(Debug, Clone)]
+pub enum GateOutcome {
+    /// Gate evaluation says this promotion must be rejected. The handler
+    /// surfaces this as `AppError::Conflict` -> HTTP 409 with the gate name,
+    /// health score and grade, and violation count.
+    Block(QualityGateEvaluation),
+    /// Gate evaluation produced violations but the gate is configured to
+    /// `warn` (or anything other than `block`). The promotion proceeds and
+    /// the violations are attached to the response payload.
+    Warn(Vec<QualityGateViolation>),
+    /// No actionable gate state: either the gate passed, the evaluation was
+    /// skipped (caller opt-out, service not wired, or recoverable error
+    /// inside `evaluate_quality_gate`).
+    NotEvaluated,
+}
+
+/// Evaluate the quality gate for `(artifact_id, repository_id)` exactly once
+/// per promotion request and reduce the result to a `GateOutcome`.
+///
+/// Skips evaluation when the caller passed `skip_policy_check = true` or when
+/// `quality_check_service` is not wired into application state. Errors from
+/// the underlying evaluation (e.g. missing gate, missing health score) are
+/// logged and downgraded to `NotEvaluated`; they are not fatal because the
+/// promotion path historically allowed promotions without a configured gate.
+///
+/// Returning a single owned outcome here is what lets the handler avoid the
+/// double-evaluation pattern that existed before (#1382 review): the same
+/// underlying DB read powers both the block path and the warn path.
+pub async fn evaluate_gate_once(
+    quality_check_service: Option<&QualityCheckService>,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    skip_policy_check: bool,
+) -> GateOutcome {
+    if skip_policy_check {
+        return GateOutcome::NotEvaluated;
+    }
+    let Some(qc) = quality_check_service else {
+        return GateOutcome::NotEvaluated;
+    };
+    match qc.evaluate_quality_gate(artifact_id, repository_id).await {
+        Ok(eval) => classify_gate_evaluation(eval),
+        Err(e) => {
+            tracing::warn!(
+                "Quality gate evaluation failed for artifact {}: {}",
+                artifact_id,
+                e
+            );
+            GateOutcome::NotEvaluated
+        }
+    }
+}
+
+/// Pure classifier from `QualityGateEvaluation` to `GateOutcome`.
+///
+/// Split out so that the block / warn / pass decision can be unit tested
+/// without spinning up a `QualityCheckService` or a database. The classifier
+/// pins the contract that "gate failed AND action == 'block'" maps to Block,
+/// "gate failed AND action != 'block'" maps to Warn, anything else passes.
+pub fn classify_gate_evaluation(eval: QualityGateEvaluation) -> GateOutcome {
+    if eval.passed {
+        return GateOutcome::NotEvaluated;
+    }
+    if eval.action == "block" {
+        return GateOutcome::Block(eval);
+    }
+    GateOutcome::Warn(eval.violations)
+}
+
+/// Render a `GateOutcome::Block` payload as `AppError::Conflict` (HTTP 409).
+///
+/// Centralised so the handler doesn't carry the format string and the message
+/// shape is asserted by a single unit test rather than duplicated.
+pub fn gate_block_error(eval: &QualityGateEvaluation) -> AppError {
+    AppError::Conflict(format!(
+        "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
+        eval.gate_name,
+        eval.health_score,
+        eval.health_grade,
+        eval.violations.len(),
+    ))
+}
+
 /// Look up the linked release repository key for a staging repository.
 ///
 /// Reads the `release_repository_id` value from the `repository_config` table,
@@ -345,41 +448,41 @@ pub async fn promote_artifact(
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
 
-    // Quality gate evaluation runs BEFORE the staging-source shape check so
-    // that gate violations take precedence in the error response. A
-    // gate-blocked promotion returns HTTP 409 Conflict, which is the
-    // documented rejection code for promotions blocked by gate policy.
-    if !req.skip_policy_check {
-        if let Some(ref qc) = state.quality_check_service {
-            match qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
-                Ok(gate_eval) => {
-                    if !gate_eval.passed && gate_eval.action == "block" {
-                        return Err(AppError::Conflict(format!(
-                            "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
-                            gate_eval.gate_name,
-                            gate_eval.health_score,
-                            gate_eval.health_grade,
-                            gate_eval.violations.len(),
-                        )));
-                    }
-                }
-                Err(e) => {
-                    // Missing gate or missing health score are not fatal; the
-                    // promotion can proceed to the remaining checks.
-                    tracing::warn!(
-                        "Quality gate evaluation failed for artifact {}: {}",
-                        artifact_id,
-                        e
-                    );
-                }
-            }
-        }
+    // Evaluate the quality gate exactly once per request. The block path and
+    // the warn path both branch off this single outcome so we never re-query
+    // the gate mid-flight; that closes the TOCTOU window where a gate could
+    // flip from "warn" to "block" between two evaluations (#1382 review).
+    //
+    // This call also runs BEFORE the staging-source shape check so gate
+    // violations take precedence in the error response. A gate-blocked
+    // promotion returns HTTP 409 Conflict, which is the documented rejection
+    // code for promotions blocked by gate policy (#1376).
+    let gate_outcome = evaluate_gate_once(
+        state.quality_check_service.as_deref(),
+        artifact_id,
+        source_repo.id,
+        req.skip_policy_check,
+    )
+    .await;
+
+    if let GateOutcome::Block(ref eval) = gate_outcome {
+        return Err(gate_block_error(eval));
     }
 
     // Now run shape validation. Gate evaluation has already finished above so
     // a violating artifact cannot be masked by a 400 staging-source error.
     validate_promotion_repos(&source_repo, &target_repo)?;
 
+    // Ordering note (#1382 review): quality-gate block precedes
+    // approval-required. A gate-violating artifact in an approval-required
+    // repository returns 409 (gate block) rather than the 200 "approval
+    // required" response. This is intentional: a gate-blocked artifact will
+    // never be promotable until the underlying violations are resolved, so
+    // routing it through the approval workflow would only produce an
+    // approval request that is guaranteed to fail re-evaluation. Security
+    // and policy enforcement therefore take precedence over the approval UX
+    // hint. See `test_gate_block_precedes_approval_required` for the
+    // regression pin.
     if super::approval::check_approval_required(&state.db, source_repo.id).await? {
         return Ok(Json(PromotionResponse {
             promoted: false,
@@ -432,22 +535,18 @@ pub async fn promote_artifact(
                 message: Some("Promotion blocked by policy violations".to_string()),
             }));
         }
+    }
 
-        // Warn-level gate evaluation (after shape validation). If the gate was
-        // configured to `warn` rather than `block`, we surface the violations
-        // in the response but still allow the promotion to proceed.
-        if let Some(ref qc) = state.quality_check_service {
-            if let Ok(gate_eval) = qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
-                if !gate_eval.passed && gate_eval.action != "block" {
-                    for v in &gate_eval.violations {
-                        policy_violations.push(PolicyViolation {
-                            rule: v.rule.clone(),
-                            severity: "medium".to_string(),
-                            message: v.message.clone(),
-                        });
-                    }
-                }
-            }
+    // Attach any warn-level gate violations to the response. This uses the
+    // SAME `gate_outcome` value produced by `evaluate_gate_once` above; the
+    // gate is not re-evaluated here.
+    if let GateOutcome::Warn(violations) = gate_outcome {
+        for v in violations {
+            policy_violations.push(PolicyViolation {
+                rule: v.rule,
+                severity: "medium".to_string(),
+                message: v.message,
+            });
         }
     }
 
@@ -1556,6 +1655,197 @@ mod tests {
             }
             other => panic!("expected Conflict error, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-evaluation gate outcome (regression for #1382 review)
+    //
+    // The promotion handler must evaluate the quality gate exactly once per
+    // request and drive both the block path (HTTP 409) and the warn path
+    // (violations attached to response) from that single outcome. The tests
+    // below pin:
+    //   * the classifier mapping QualityGateEvaluation -> GateOutcome
+    //   * the rendered Conflict message for a Block outcome
+    //   * the documented ordering: gate-block precedes approval-required
+    // -----------------------------------------------------------------------
+
+    use crate::models::quality::{ComponentScores, QualityGateEvaluation, QualityGateViolation};
+
+    fn make_gate_eval(
+        passed: bool,
+        action: &str,
+        violations: Vec<QualityGateViolation>,
+    ) -> QualityGateEvaluation {
+        QualityGateEvaluation {
+            passed,
+            action: action.to_string(),
+            gate_name: "test-gate".to_string(),
+            health_score: 42,
+            health_grade: "D".to_string(),
+            violations,
+            component_scores: ComponentScores {
+                security: Some(50),
+                license: Some(60),
+                quality: Some(40),
+                metadata: Some(70),
+            },
+        }
+    }
+
+    fn make_violation(rule: &str) -> QualityGateViolation {
+        QualityGateViolation {
+            rule: rule.to_string(),
+            expected: ">=70".to_string(),
+            actual: "42".to_string(),
+            message: format!("Rule {} failed", rule),
+        }
+    }
+
+    #[test]
+    fn test_classify_gate_passed_is_not_evaluated() {
+        let eval = make_gate_eval(true, "block", vec![]);
+        assert!(matches!(
+            classify_gate_evaluation(eval),
+            GateOutcome::NotEvaluated
+        ));
+    }
+
+    #[test]
+    fn test_classify_gate_failed_block_is_block() {
+        let eval = make_gate_eval(false, "block", vec![make_violation("min_health_score")]);
+        match classify_gate_evaluation(eval) {
+            GateOutcome::Block(inner) => {
+                assert_eq!(inner.gate_name, "test-gate");
+                assert_eq!(inner.violations.len(), 1);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_gate_failed_warn_is_warn() {
+        let eval = make_gate_eval(
+            false,
+            "warn",
+            vec![
+                make_violation("min_security_score"),
+                make_violation("min_metadata_score"),
+            ],
+        );
+        match classify_gate_evaluation(eval) {
+            GateOutcome::Warn(violations) => {
+                assert_eq!(violations.len(), 2);
+                assert_eq!(violations[0].rule, "min_security_score");
+                assert_eq!(violations[1].rule, "min_metadata_score");
+            }
+            other => panic!("expected Warn, got {:?}", other),
+        }
+    }
+
+    /// Non-standard actions (anything that is not "block") fall through to
+    /// the warn path. Pinning so a future "audit" or "log" action does not
+    /// accidentally become a block.
+    #[test]
+    fn test_classify_gate_failed_unknown_action_is_warn() {
+        let eval = make_gate_eval(false, "audit", vec![make_violation("min_quality_score")]);
+        assert!(matches!(
+            classify_gate_evaluation(eval),
+            GateOutcome::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn test_gate_block_error_renders_conflict_with_gate_metadata() {
+        let eval = make_gate_eval(false, "block", vec![make_violation("min_health_score")]);
+        let err = gate_block_error(&eval);
+        match err {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("Promotion blocked by quality gate"));
+                assert!(msg.contains("test-gate"));
+                assert!(msg.contains("health score: 42"));
+                assert!(msg.contains("grade: D"));
+                assert!(msg.contains("violations: 1"));
+            }
+            other => panic!("expected Conflict, got {:?}", other),
+        }
+    }
+
+    /// Regression for #1382 review concern (1): gate evaluation must happen
+    /// exactly once per request. We can't drive the full async handler from a
+    /// unit test (no DB), so we assert the invariant structurally: there is
+    /// exactly one call to `evaluate_quality_gate` reachable from
+    /// `promote_artifact`, routed through `evaluate_gate_once`.
+    #[test]
+    fn test_promote_artifact_uses_single_gate_evaluation() {
+        let src = include_str!("promotion.rs");
+
+        // Locate the promote_artifact handler body. Bounded by the next
+        // `pub async fn` declaration to avoid scanning the bulk handler.
+        let handler_start = src
+            .find("pub async fn promote_artifact(")
+            .expect("promote_artifact handler must exist");
+        let after_handler = &src[handler_start + 1..];
+        let next_pub_async = after_handler
+            .find("pub async fn ")
+            .expect("expected a following pub async fn to bound the handler scope");
+        let handler_body = &src[handler_start..handler_start + 1 + next_pub_async];
+
+        // Direct `.evaluate_quality_gate(` calls inside the handler must be
+        // zero: the handler must route through `evaluate_gate_once` instead.
+        let direct_calls = handler_body.matches(".evaluate_quality_gate(").count();
+        assert_eq!(
+            direct_calls, 0,
+            "promote_artifact must not call evaluate_quality_gate directly; \
+             use evaluate_gate_once to enforce single-evaluation. Found {} direct call(s).",
+            direct_calls
+        );
+
+        // And exactly one `evaluate_gate_once(` invocation in the handler.
+        let helper_calls = handler_body.matches("evaluate_gate_once(").count();
+        assert_eq!(
+            helper_calls, 1,
+            "promote_artifact must call evaluate_gate_once exactly once per request; \
+             found {} call(s).",
+            helper_calls
+        );
+    }
+
+    /// Regression for #1382 review concern (2): documented ordering between
+    /// quality-gate block and approval-required.
+    ///
+    /// Quality-gate block (HTTP 409) precedes the "approval required" hint
+    /// (HTTP 200 with `promoted: false`). A gate-violating artifact in an
+    /// approval-required repository must return 409, NOT the approval hint,
+    /// because the approval request would be guaranteed to re-fail the gate.
+    ///
+    /// We assert this structurally on the handler source: the `Block` early
+    /// return must appear before the `check_approval_required` call.
+    #[test]
+    fn test_gate_block_precedes_approval_required() {
+        let src = include_str!("promotion.rs");
+        let handler_start = src
+            .find("pub async fn promote_artifact(")
+            .expect("promote_artifact handler must exist");
+        let after_handler = &src[handler_start + 1..];
+        let next_pub_async = after_handler
+            .find("pub async fn ")
+            .expect("expected a following pub async fn to bound the handler scope");
+        let handler_body = &src[handler_start..handler_start + 1 + next_pub_async];
+
+        let gate_block_idx = handler_body
+            .find("GateOutcome::Block")
+            .expect("handler must early-return on GateOutcome::Block");
+        let approval_idx = handler_body
+            .find("check_approval_required(")
+            .expect("handler must call check_approval_required");
+
+        assert!(
+            gate_block_idx < approval_idx,
+            "Gate-block early return must come before approval-required check. \
+             Reordering this changes the documented precedence (#1382): a \
+             gate-blocked artifact in an approval-required repo returns 409, \
+             not the 200 approval-required hint."
+        );
     }
 
     // -----------------------------------------------------------------------
