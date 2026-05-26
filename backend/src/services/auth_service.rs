@@ -175,8 +175,35 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 /// the source of truth across replicas.
 pub fn invalidate_user_tokens(user_id: Uuid) {
     let now = Utc::now().timestamp();
+    invalidate_user_tokens_at(user_id, now);
+}
+
+/// Variant of [`invalidate_user_tokens`] that exempts the caller's own JWT.
+///
+/// `caller_iat` is the calling token's issued-at (seconds). The in-memory
+/// watermark is set to `caller_iat - 1` so the sync `<=` check still passes
+/// for the calling token (`caller_iat <= caller_iat - 1` is false), while
+/// every token issued at any second strictly before `caller_iat` is
+/// invalidated.
+///
+/// Used by TOTP enable/disable so the session that initiated the credential
+/// change is not logged out by the same operation. Other sessions (and any
+/// stolen pre-change tokens) are still killed. The refresh-grant bypass
+/// from #1146 is closed separately by the caller via
+/// [`AuthService::revoke_all_refresh_token_families`].
+pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat: i64) {
+    // -1 so the sync `<=` check at the line `issued_at <= changed_at` lets
+    // the calling token through. Older tokens (iat <= caller_iat - 1) are
+    // still caught.
+    invalidate_user_tokens_at(user_id, caller_iat.saturating_sub(1));
+}
+
+/// Set the in-memory watermark to a specific epoch second. Shared by the
+/// "invalidate everything" and "exempt caller" variants above.
+fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
     if let Ok(mut map) = invalidation_map().write() {
-        map.insert(user_id, (now, Instant::now()));
+        map.insert(user_id, (watermark, Instant::now()));
+        let now = Utc::now().timestamp();
         let cutoff = now - INVALIDATION_RETENTION_SECS;
         map.retain(|_, (ts, _)| *ts > cutoff);
     }
