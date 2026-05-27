@@ -602,24 +602,15 @@ impl ArtifactoryClient {
         // could otherwise return an attacker-controlled downloadUri that
         // exfiltrates our credentials. On mismatch, log a warning and surface
         // the original 404 to the caller instead of issuing the request.
-        let base_host = reqwest::Url::parse(&self.config.base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-        let fallback_host = reqwest::Url::parse(&download_uri)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-        match (base_host.as_deref(), fallback_host.as_deref()) {
-            (Some(base), Some(fb)) if base == fb => {}
-            _ => {
-                tracing::warn!(
-                    repo = %repo_key,
-                    path = %path,
-                    base_url = %self.config.base_url,
-                    download_uri = %download_uri,
-                    "Refusing to follow Artifactory downloadUri to a foreign host; returning original 404"
-                );
-                return Ok(response);
-            }
+        if !fallback_host_matches(&self.config.base_url, &download_uri) {
+            tracing::warn!(
+                repo = %repo_key,
+                path = %path,
+                base_url = %self.config.base_url,
+                download_uri = %download_uri,
+                "Refusing to follow Artifactory downloadUri to a foreign host; returning original 404"
+            );
+            return Ok(response);
         }
 
         tracing::debug!(
@@ -808,6 +799,26 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
     }
 }
 
+/// SSRF host-allowlist predicate for the Artifactory downloadUri fallback.
+///
+/// Returns `true` only when both URLs parse and resolve to the same host
+/// (case-insensitive, exact match — no suffix matching). Mismatched hosts,
+/// missing hosts, and unparseable URLs all return `false` so the caller
+/// surfaces the original 404 instead of leaking auth headers to an
+/// attacker-controlled or misconfigured endpoint.
+pub(crate) fn fallback_host_matches(base_url: &str, download_uri: &str) -> bool {
+    let base_host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let fallback_host = reqwest::Url::parse(download_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    matches!(
+        (base_host.as_deref(), fallback_host.as_deref()),
+        (Some(b), Some(f)) if b == f
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,25 +855,11 @@ mod tests {
     // -----------------------------------------------------------------------
     // SSRF host-allowlist for download_response_with_fallback
     //
-    // The helper that decides whether a downloadUri returned by Artifactory
-    // can be followed with our auth headers is implemented inline in the
-    // fallback method. We re-derive the same predicate here so the rule
-    // itself has explicit unit coverage and regressions are caught even
-    // without an HTTP fixture.
+    // The helper decides whether a downloadUri returned by Artifactory can be
+    // followed with our auth headers. It now lives at module scope and is
+    // called from `download_response_with_fallback`, so these tests exercise
+    // the production predicate directly.
     // -----------------------------------------------------------------------
-
-    fn fallback_host_matches(base_url: &str, download_uri: &str) -> bool {
-        let base_host = reqwest::Url::parse(base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-        let fallback_host = reqwest::Url::parse(download_uri)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-        matches!(
-            (base_host.as_deref(), fallback_host.as_deref()),
-            (Some(b), Some(f)) if b == f
-        )
-    }
 
     #[test]
     fn test_fallback_host_matches_same_host_same_scheme() {
@@ -902,6 +899,57 @@ mod tests {
         assert!(!fallback_host_matches(
             "https://artifactory.example.com",
             "https://evil.artifactory.example.com/exfil"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_same_host_different_scheme() {
+        // Host is what we gate on; scheme is irrelevant to the SSRF rule.
+        // A downgrade to http on the same host is still an in-allowlist host
+        // (TLS posture is a separate concern handled by the HTTP client).
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "http://artifactory.example.com/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_same_host_with_explicit_port() {
+        // An explicit port (e.g. 8081) on the same host name still matches:
+        // we compare host strings, not host:port authority.
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com:8081/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_empty_base_url() {
+        // Empty / unparseable base must not authorize any downloadUri.
+        assert!(!fallback_host_matches(
+            "",
+            "https://artifactory.example.com/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_relative_download_uri() {
+        // Some Artifactory deployments return a path-only downloadUri. We
+        // can't safely follow it from this helper (no host to compare), so
+        // it must be rejected.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "/artifactory/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_host_with_trailing_dot() {
+        // Strict equality: "example.com." (FQDN) is NOT equal to
+        // "example.com" as a host string. Treat as a foreign host.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com./api/storage/foo/bar.jar"
         ));
     }
 

@@ -915,25 +915,12 @@ impl MigrationWorker {
 
         match existing {
             None => Ok(false), // No duplicate
-            Some((existing_sha256, existing_sha1)) => match conflict_resolution {
-                ConflictResolution::Skip => {
-                    // Prefer strong digest match (sha256). If source only has sha1,
-                    // compare against stored sha1 when available; otherwise treat as
-                    // duplicate-by-path to avoid full remigration loops.
-                    if let Some(expected_sha256) = expected.sha256.as_deref() {
-                        Ok(expected_sha256 == existing_sha256)
-                    } else if let Some(expected_sha1) = expected.sha1.as_deref() {
-                        Ok(existing_sha1
-                            .as_deref()
-                            .map_or(true, |s| s == expected_sha1))
-                    } else {
-                        Ok(true)
-                    }
-                }
-                ConflictResolution::Overwrite => Ok(false), // Always process
-                // Rename is currently treated as overwrite in migration.
-                ConflictResolution::Rename => Ok(false),
-            },
+            Some((existing_sha256, existing_sha1)) => Ok(decide_duplicate_match(
+                expected,
+                &existing_sha256,
+                existing_sha1.as_deref(),
+                conflict_resolution,
+            )),
         }
     }
 
@@ -2059,6 +2046,67 @@ pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
     artifact_path.rsplit('/').next().unwrap_or(artifact_path)
 }
 
+/// Decide whether a duplicate artifact row should be treated as already
+/// present (return `true` -> skip the transfer) or processed (return
+/// `false` -> proceed with the upload).
+///
+/// Pure, DB-free predicate extracted from `check_artifact_duplicate` so the
+/// branch table is exercised by inline tests without standing up Postgres.
+///
+/// Rules, in order:
+/// - `Overwrite` and `Rename` always re-process the artifact.
+/// - For `Skip`, prefer the strongest declared digest:
+///   - sha256: exact match against the stored sha256.
+///   - sha1 (no sha256 declared): exact match against the stored sha1 if
+///     present; if the stored row has no sha1, treat the path collision as
+///     a duplicate (avoids endless remigration loops on legacy rows).
+///   - Neither digest declared: treat as duplicate by path.
+pub(crate) fn decide_duplicate_match(
+    expected: &ExpectedChecksums,
+    existing_sha256: &str,
+    existing_sha1: Option<&str>,
+    conflict_resolution: ConflictResolution,
+) -> bool {
+    match conflict_resolution {
+        ConflictResolution::Overwrite | ConflictResolution::Rename => false,
+        ConflictResolution::Skip => {
+            if let Some(expected_sha256) = expected.sha256.as_deref() {
+                expected_sha256 == existing_sha256
+            } else if let Some(expected_sha1) = expected.sha1.as_deref() {
+                existing_sha1.map_or(true, |s| s == expected_sha1)
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Compute the canonical artifact path written to the `artifacts.path`
+/// column for a migrated artifact.
+///
+/// Per-format publish handlers in Artifact Keeper store artifacts under
+/// `<name>/<version>/<filename>`. Migration must use the same shape so
+/// download lookups (npm `serve_tarball`, PyPI simple/, Helm index.yaml,
+/// etc.) find the migrated rows.
+///
+/// Falls back to the legacy `<repo_key>/<artifact_path>` shape when the
+/// format-aware parser produced no usable version. That happens for
+/// unknown formats and for parseable formats whose filename did not yield
+/// a version (e.g. raw blobs). The legacy shape keeps the row insertable
+/// without losing the source-side path context.
+pub(crate) fn canonical_artifact_path(
+    parsed_name: &str,
+    parsed_version: Option<&str>,
+    filename: &str,
+    repo_key: &str,
+    artifact_path: &str,
+) -> String {
+    match parsed_version {
+        Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
+        _ => format!("{}/{}", repo_key, artifact_path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2534,6 +2582,175 @@ mod tests {
             "Docker-Remote-Cache",
             "library/nginx/sha256__abc/manifest.json"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_duplicate_match - DB-free predicate extracted from
+    // check_artifact_duplicate. Each branch of the digest-fallback table is
+    // exercised so the helper has direct coverage instead of being reached
+    // only through the integration path.
+    // -----------------------------------------------------------------------
+
+    fn checksums(sha256: Option<&str>, sha1: Option<&str>) -> ExpectedChecksums {
+        ExpectedChecksums {
+            sha256: sha256.map(String::from),
+            sha1: sha1.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_overwrite_always_reprocesses() {
+        // Overwrite ignores any digest agreement and always returns false so
+        // the caller re-uploads the artifact.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), Some("def")),
+            "abc",
+            Some("def"),
+            ConflictResolution::Overwrite,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_rename_always_reprocesses() {
+        // Rename currently maps to overwrite semantics in migration.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), None),
+            "abc",
+            None,
+            ConflictResolution::Rename,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha256_exact_match() {
+        // Strongest digest available and stored: must agree exactly.
+        assert!(decide_duplicate_match(
+            &checksums(Some("abc"), None),
+            "abc",
+            None,
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha256_mismatch_reprocesses() {
+        // sha256 declared but the stored row differs: not a duplicate.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), Some("ignored")),
+            "xyz",
+            Some("ignored"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_match_when_no_sha256() {
+        // Source declares only sha1: must compare against stored sha1.
+        assert!(decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "irrelevant-stored-sha256",
+            Some("def"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_mismatch_reprocesses() {
+        // sha1 declared but stored sha1 differs: not a duplicate.
+        assert!(!decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "stored-sha256",
+            Some("other-sha1"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_legacy_row_without_stored_sha1() {
+        // Source declares sha1 but legacy row predates sha1 storage. To
+        // avoid endless remigration loops we treat the path collision as a
+        // duplicate.
+        assert!(decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "stored-sha256",
+            None,
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_no_digests_treats_as_duplicate() {
+        // Neither digest declared: by-path duplicate.
+        assert!(decide_duplicate_match(
+            &checksums(None, None),
+            "stored-sha256",
+            Some("stored-sha1"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // canonical_artifact_path - pure path-shape helper extracted from
+    // transfer_artifact so the per-format / fallback branches are testable
+    // without standing up storage + Postgres.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_canonical_artifact_path_uses_name_version_filename_when_parsed() {
+        // Happy path: a parseable filename (e.g. npm tarball) yields the
+        // canonical `<name>/<version>/<filename>` shape that AK's publish
+        // handlers already use.
+        let path = canonical_artifact_path(
+            "lodash",
+            Some("4.17.21"),
+            "lodash-4.17.21.tgz",
+            "npm-remote-cache",
+            "lodash/-/lodash-4.17.21.tgz",
+        );
+        assert_eq!(path, "lodash/4.17.21/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_canonical_artifact_path_falls_back_when_version_missing() {
+        // No version recovered (unknown format / unparseable filename):
+        // legacy `<repo>/<source-path>` shape.
+        let path = canonical_artifact_path(
+            "raw-blob",
+            None,
+            "blob.bin",
+            "generic-cache",
+            "some/deep/path/blob.bin",
+        );
+        assert_eq!(path, "generic-cache/some/deep/path/blob.bin");
+    }
+
+    #[test]
+    fn test_canonical_artifact_path_falls_back_when_version_is_empty() {
+        // Defensive: empty-string version must also trigger the fallback so
+        // we never write `<name>//<filename>` to the artifacts table.
+        let path = canonical_artifact_path(
+            "weird-pkg",
+            Some(""),
+            "weird-pkg.tar",
+            "raw-cache",
+            "weird-pkg.tar",
+        );
+        assert_eq!(path, "raw-cache/weird-pkg.tar");
+    }
+
+    #[test]
+    fn test_canonical_artifact_path_preserves_filename_independent_of_source_layout() {
+        // The canonical shape ignores the source-side layout entirely once a
+        // version was recovered. A PyPI wheel migrated from a deeply nested
+        // hash-prefixed cache path still lands under <name>/<version>/<file>.
+        let path = canonical_artifact_path(
+            "wheel",
+            Some("0.46.2"),
+            "wheel-0.46.2-py3-none-any.whl",
+            "pypi-remote-cache",
+            "13/2c/5e07/wheel-0.46.2-py3-none-any.whl",
+        );
+        assert_eq!(path, "wheel/0.46.2/wheel-0.46.2-py3-none-any.whl");
     }
 
     #[test]
