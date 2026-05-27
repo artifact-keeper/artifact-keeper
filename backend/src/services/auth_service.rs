@@ -170,12 +170,20 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 
 /// Record a local credential invalidation in the in-memory fast-path so
 /// subsequent token-validation checks on this replica reject tokens issued
-/// before `now` without first waiting for the DB cache to refresh. The DB
-/// columns (`password_changed_at`, `totp_verified_at`, `updated_at`) remain
-/// the source of truth across replicas.
+/// at or before `now` without first waiting for the DB cache to refresh.
+/// The DB columns (`password_changed_at`, `totp_verified_at`, `updated_at`)
+/// remain the source of truth across replicas.
+///
+/// Boundary (regression of #931, fixed by #1436): the replica-safe path in
+/// `is_token_invalidated_replica_safe` compares with strict `<` (#1265),
+/// not `<=`. A JWT minted in the same wall-clock second as the password
+/// change would otherwise survive: `iat == watermark` makes `iat < watermark`
+/// false. We write `now + 1` so any token with `iat <= now` is rejected.
+/// The sync map at `is_token_invalidated` uses `<=` so the `+1` does not
+/// double-count there.
 pub fn invalidate_user_tokens(user_id: Uuid) {
-    let now = Utc::now().timestamp();
-    invalidate_user_tokens_at(user_id, now);
+    let watermark = Utc::now().timestamp().saturating_add(1);
+    invalidate_user_tokens_at(user_id, watermark);
 }
 
 /// Variant of [`invalidate_user_tokens`] that exempts the caller's own JWT.
@@ -184,7 +192,9 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
 /// watermark is set to `caller_iat - 1` so the sync `<=` check still passes
 /// for the calling token (`caller_iat <= caller_iat - 1` is false), while
 /// every token issued at any second strictly before `caller_iat` is
-/// invalidated.
+/// invalidated. The sync path is the one consulted by the gRPC interceptor
+/// (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so the `-1`
+/// here is load-bearing on those code paths.
 ///
 /// Used by TOTP enable/disable so the session that initiated the credential
 /// change is not logged out by the same operation. Other sessions (and any
@@ -3166,7 +3176,11 @@ mod tests {
     fn test_token_issued_after_invalidation_is_accepted() {
         let user_id = Uuid::new_v4();
         invalidate_user_tokens(user_id);
-        let after = Utc::now().timestamp() + 1;
+        // Watermark is `now + 1` (#1436 fix) so the sync `<=` map rejects
+        // every iat <= now+1. We bump the test "after" to `now + 2` to
+        // represent a JWT minted at least one whole second after the
+        // invalidation completed.
+        let after = Utc::now().timestamp() + 2;
         assert!(!is_token_invalidated(user_id, after));
     }
 
@@ -3184,7 +3198,8 @@ mod tests {
         // Slight delay so second invalidation gets a newer timestamp
         std::thread::sleep(std::time::Duration::from_millis(10));
         invalidate_user_tokens(user_id);
-        let after = Utc::now().timestamp() + 1;
+        // Same `+2` rationale as test_token_issued_after_invalidation_is_accepted.
+        let after = Utc::now().timestamp() + 2;
         // Token issued before second invalidation is still rejected
         assert!(is_token_invalidated(user_id, mid - 1));
         // Token issued after second invalidation is accepted
