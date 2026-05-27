@@ -116,11 +116,19 @@ impl MavenHandler {
         };
 
         // Check for classifier: -classifier.ext
+        //
+        // Edge case: `artifact-version-.ext` has an empty classifier and is
+        // not a valid Maven coordinate. Reject it via the trailing
+        // `Err` branch below so callers (e.g. `is_maven_secondary_path` in
+        // the virtual-repo fallback) don't treat it as a classifier
+        // artifact and route it around its own SQL row. See #1399.
         if let Some(rest) = remainder.strip_prefix('-') {
             if let Some(dot_pos) = rest.rfind('.') {
                 let classifier = &rest[..dot_pos];
                 let extension = &rest[dot_pos + 1..];
-                return Ok((Some(classifier.to_string()), extension.to_string()));
+                if !classifier.is_empty() {
+                    return Ok((Some(classifier.to_string()), extension.to_string()));
+                }
             }
         }
 
@@ -538,6 +546,20 @@ mod tests {
         assert_eq!(coords.artifact_id, "test");
         assert_eq!(coords.version, "1.0.0-SNAPSHOT");
         assert_eq!(coords.extension, "pom");
+    }
+
+    #[test]
+    fn test_parse_coordinates_rejects_empty_classifier() {
+        // `artifact-version-.ext` has a dangling hyphen and an empty
+        // classifier. It is not a valid Maven coordinate; the parser
+        // must reject it rather than returning `Some("")`. The Maven
+        // virtual-repo fallback (#1399) relies on this to refuse routing
+        // empty-classifier paths around their SQL row.
+        let result = MavenHandler::parse_coordinates("g/a/1.0/a-1.0-.jar");
+        assert!(
+            result.is_err(),
+            "empty-classifier coordinate must not parse as a valid Maven path"
+        );
     }
 
     #[test]
