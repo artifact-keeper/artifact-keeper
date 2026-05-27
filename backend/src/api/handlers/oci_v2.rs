@@ -819,6 +819,25 @@ fn upstream_content_violates_digest(reference: &str, content: &[u8]) -> bool {
     is_digest_reference(reference) && compute_sha256(content) != reference
 }
 
+/// Positive-sense counterpart to [`upstream_content_violates_digest`].
+///
+/// Returns `true` when the served `content` is acceptable to forward to the
+/// client: either the reference is a human-readable tag (no digest to
+/// verify against) or the SHA-256 of the bytes matches the requested
+/// content-addressable digest. Returns `false` only on a true digest
+/// mismatch, in which case the caller must "fall through" to the next
+/// virtual-repo member (or surface a 404).
+///
+/// Reads at call sites as
+/// `if !verify_digest_or_fall_through(content, reference) { continue }`,
+/// matching the resolver's existing control flow without the double
+/// negative of the older `if upstream_content_violates_digest(..)` form.
+/// Kept as a thin wrapper instead of replacing the original so existing
+/// call sites + their tests stay stable.
+fn verify_digest_or_fall_through(content: &[u8], reference: &str) -> bool {
+    !upstream_content_violates_digest(reference, content)
+}
+
 /// Where (and how) a virtual-repo blob was found.
 ///
 /// `Local` carries the owning member's full `Repository`, boxed to keep
@@ -1033,9 +1052,10 @@ pub async fn resolve_virtual_blob(
                         // content matches before serving it; otherwise
                         // we would happily relay corrupt or tampered
                         // bytes to the client under the wrong digest.
-                        // The decision lives in `upstream_content_violates_digest`
-                        // so it can be unit-tested without a wiremock upstream.
-                        if upstream_content_violates_digest(digest, &content) {
+                        // The decision lives in `verify_digest_or_fall_through`
+                        // (positive-sense wrapper over the same predicate) so
+                        // it can be unit-tested without a wiremock upstream.
+                        if !verify_digest_or_fall_through(&content, digest) {
                             warn!(
                                 "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
                                 upstream_url, digest
@@ -1144,23 +1164,22 @@ pub async fn resolve_virtual_manifest(
                         // #1348 round 1, concern #3 (CRITICAL):
                         // When the manifest reference is itself a digest
                         // (e.g. `sha256:abc...`) the client is asserting
-                        // content-addressable semantics. The previous
-                        // code computed `compute_sha256(content)` and
-                        // returned it as `manifest_digest` *without*
-                        // checking against the requested reference, so a
-                        // compromised or misbehaving upstream could
-                        // serve arbitrary bytes under the requested
-                        // digest. Verify and reject mismatches.
-                        // `compute_sha256` returns the `sha256:`-prefixed
-                        // form, matching the OCI digest grammar.
-                        let computed = compute_sha256(&content);
-                        if is_digest_ref && computed != reference {
+                        // content-addressable semantics. A compromised or
+                        // misbehaving upstream could otherwise serve
+                        // arbitrary bytes under the requested digest.
+                        // The decision lives in `verify_digest_or_fall_through`
+                        // (positive-sense wrapper over the same predicate) so
+                        // it can be unit-tested without a wiremock upstream.
+                        if !verify_digest_or_fall_through(&content, reference) {
                             warn!(
-                                "Virtual manifest digest mismatch from upstream {} for {} (computed {}): refusing to serve",
-                                upstream_url, reference, computed
+                                "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
+                                upstream_url, reference
                             );
                             continue;
                         }
+                        // `compute_sha256` returns the `sha256:`-prefixed
+                        // form, matching the OCI digest grammar.
+                        let computed = compute_sha256(&content);
                         return Some((computed, content_type, content));
                     }
                 }
@@ -6175,6 +6194,134 @@ mod tests {
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             b""
         ));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_invalid_digest_format_rejects() {
+        // A reference that *looks* like a digest but fails `is_digest_reference`
+        // (uppercase algorithm, empty algorithm, empty encoded) must not be
+        // treated as a content-addressable assertion, even when the bytes
+        // would not match. Belt-and-braces: violates_digest returns false
+        // because `is_digest_reference` short-circuits to false first.
+        assert!(!super::upstream_content_violates_digest(
+            "SHA256:abc",
+            b"hi"
+        ));
+        assert!(!super::upstream_content_violates_digest(":abc", b"hi"));
+        assert!(!super::upstream_content_violates_digest("sha256:", b"hi"));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_case_sensitive_hex_mismatch() {
+        // sha256 hex digests are lowercase per the OCI grammar. An uppercase
+        // hex reference does not equal the lowercase computed digest, so the
+        // helper must reject it as a mismatch.
+        let bytes = b"hello world";
+        let upper = "sha256:B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        assert!(super::upstream_content_violates_digest(upper, bytes));
+    }
+
+    // verify_digest_or_fall_through: positive-sense counterpart used by
+    // resolver call sites to keep the control flow readable. The wrapper is
+    // a strict negation of upstream_content_violates_digest; the tests here
+    // pin both that contract and the call-site idiom ("continue when false").
+
+    #[test]
+    fn test_verify_digest_or_fall_through_tag_reference_always_accepts() {
+        // Tags have no content-addressable contract — the caller must
+        // forward whatever upstream served and compute the digest itself.
+        assert!(super::verify_digest_or_fall_through(b"anything", "latest"));
+        assert!(super::verify_digest_or_fall_through(b"", "v1.2.3"));
+        assert!(super::verify_digest_or_fall_through(
+            b"\x00\x01\x02",
+            "release-candidate"
+        ));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_matching_digest_accepts() {
+        let bytes = b"hello world";
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(super::verify_digest_or_fall_through(bytes, digest));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_mismatched_digest_falls_through() {
+        // The exact resolver idiom: "false" means the caller should `continue`
+        // to the next virtual-repo member instead of forwarding bytes.
+        let bytes = b"hello world";
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!super::verify_digest_or_fall_through(bytes, wrong));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_empty_content_with_canonical_digest() {
+        // The canonical empty-string sha256 verifies correctly.
+        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(super::verify_digest_or_fall_through(b"", canonical));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_empty_content_with_wrong_digest_falls_through() {
+        // Empty body + non-canonical empty-digest = mismatch, must fall through.
+        let wrong = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        assert!(!super::verify_digest_or_fall_through(b"", wrong));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_invalid_digest_format_accepts() {
+        // Malformed digest references (uppercase algorithm, empty parts) are
+        // *not* content-addressable. The wrapper treats them as tag-like and
+        // accepts the content; the caller still computes a digest from the
+        // bytes for response headers.
+        assert!(super::verify_digest_or_fall_through(b"hi", "SHA256:abc"));
+        assert!(super::verify_digest_or_fall_through(b"hi", ":abc"));
+        assert!(super::verify_digest_or_fall_through(b"hi", "sha256:"));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_is_inverse_of_violates_digest() {
+        // Property: the wrapper is the strict negation of the underlying
+        // helper across both branch outputs.
+        let cases: &[(&[u8], &str)] = &[
+            (b"hello world", "latest"),
+            (
+                b"hello world",
+                "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+            ),
+            (
+                b"hello world",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                b"",
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (b"hi", "SHA256:abc"),
+        ];
+        for (bytes, reference) in cases {
+            assert_eq!(
+                super::verify_digest_or_fall_through(bytes, reference),
+                !super::upstream_content_violates_digest(reference, bytes),
+                "wrapper must invert violates_digest for ({:?}, {:?})",
+                std::str::from_utf8(bytes).unwrap_or("<binary>"),
+                reference,
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_large_content_canonical_digest() {
+        // Realistic OCI blob size (~256KiB) of a deterministic byte pattern.
+        // Confirms the helper computes the digest over the *whole* slice,
+        // not just a prefix, by feeding a pattern whose sha256 we precompute.
+        let bytes: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let computed = super::compute_sha256(&bytes);
+        assert!(super::verify_digest_or_fall_through(&bytes, &computed));
+
+        // And a one-byte truncation must trip the mismatch path.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(!super::verify_digest_or_fall_through(truncated, &computed));
     }
 
     // VirtualResolveKey / VirtualResolveKind: constructor, equality,
