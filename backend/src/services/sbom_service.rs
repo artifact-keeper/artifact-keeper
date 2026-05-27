@@ -1418,6 +1418,55 @@ impl SbomService {
         }
     }
 
+    /// Conservative set of ubiquitous, long-stable SPDX identifiers that are
+    /// guaranteed to be present in any modern SPDX license list (and thus
+    /// accepted in a CycloneDX `license.id`). Kept intentionally small: a
+    /// miss here only downgrades a recognized license to the free-form
+    /// `name` field, whereas a *wrong* entry would re-introduce the
+    /// whole-BOM rejection this guards against.
+    const SPDX_COMMON_IDS: &'static [&'static str] = &[
+        "0BSD",
+        "Apache-2.0",
+        "Artistic-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "BSL-1.0",
+        "CC0-1.0",
+        "EPL-2.0",
+        "GPL-2.0-only",
+        "GPL-2.0-or-later",
+        "GPL-3.0-only",
+        "GPL-3.0-or-later",
+        "ISC",
+        "LGPL-2.1-only",
+        "LGPL-2.1-or-later",
+        "LGPL-3.0-only",
+        "LGPL-3.0-or-later",
+        "AGPL-3.0-only",
+        "AGPL-3.0-or-later",
+        "MIT",
+        "MPL-2.0",
+        "Unlicense",
+        "Zlib",
+    ];
+
+    /// Build a CycloneDX `licenses[]` entry for a single license string.
+    ///
+    /// CycloneDX requires `license.id` to be a member of the SPDX license
+    /// enumeration; Dependency-Track rejects the *entire* BOM with HTTP 400
+    /// ("Schema validation failed") if any component carries an `id` outside
+    /// that set. Package license metadata is frequently not a bare SPDX id
+    /// (free-form names, SPDX expressions, "UNKNOWN"), so emit `id` only for
+    /// recognized identifiers and fall back to the free-form `name` field —
+    /// which DT accepts unconditionally — for everything else.
+    fn cyclonedx_license_entry(license: &str) -> serde_json::Value {
+        if Self::SPDX_COMMON_IDS.contains(&license) {
+            serde_json::json!({"license": {"id": license}})
+        } else {
+            serde_json::json!({"license": {"name": license}})
+        }
+    }
+
     fn generate_cyclonedx_inner(
         &self,
         dependencies: &[DependencyInfo],
@@ -1450,7 +1499,7 @@ impl SbomService {
                 cdx_comp["purl"] = serde_json::json!(p);
             }
             if let Some(l) = &dep.license {
-                cdx_comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+                cdx_comp["licenses"] = serde_json::json!([Self::cyclonedx_license_entry(l)]);
             }
             if let Some(h) = &dep.sha256 {
                 cdx_comp["hashes"] = serde_json::json!([{"alg": "SHA-256", "content": h}]);
@@ -1638,7 +1687,7 @@ mod tests {
             comp["purl"] = serde_json::json!(p);
         }
         if let Some(l) = &dep.license {
-            comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+            comp["licenses"] = serde_json::json!([SbomService::cyclonedx_license_entry(l)]);
         }
         if let Some(h) = &dep.sha256 {
             comp["hashes"] = serde_json::json!([{"alg": "SHA-256", "content": h}]);
@@ -1760,6 +1809,50 @@ mod tests {
     #[test]
     fn test_format_version_spdx() {
         assert_eq!(format_version(SbomFormat::SPDX), "2.3");
+    }
+
+    // ===================================================================
+    // cyclonedx_license_entry — SPDX id vs free-form name
+    // ===================================================================
+
+    #[test]
+    fn test_cyclonedx_license_entry_known_spdx_uses_id() {
+        let entry = SbomService::cyclonedx_license_entry("Apache-2.0");
+        assert_eq!(entry["license"]["id"], "Apache-2.0");
+        assert!(entry["license"].get("name").is_none());
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_non_spdx_uses_name() {
+        // A free-form / non-SPDX license must NOT land in `id` — that makes
+        // Dependency-Track reject the entire BOM with HTTP 400. It belongs in
+        // the free-form `name` field.
+        let entry = SbomService::cyclonedx_license_entry("Public Domain");
+        assert_eq!(entry["license"]["name"], "Public Domain");
+        assert!(entry["license"].get("id").is_none());
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_spdx_expression_uses_name() {
+        // SPDX expressions are not bare ids and fail `license.id` enum
+        // validation; they must fall back to `name`.
+        let entry = SbomService::cyclonedx_license_entry("MIT OR Apache-2.0");
+        assert_eq!(entry["license"]["name"], "MIT OR Apache-2.0");
+        assert!(entry["license"].get("id").is_none());
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_non_spdx_license_not_in_id() {
+        let dep = DependencyInfo {
+            name: "weird-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            purl: None,
+            license: Some("UNKNOWN".to_string()),
+            sha256: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(comp["licenses"][0]["license"]["name"], "UNKNOWN");
+        assert!(comp["licenses"][0]["license"].get("id").is_none());
     }
 
     // ===================================================================
