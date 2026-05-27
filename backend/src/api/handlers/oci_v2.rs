@@ -419,6 +419,14 @@ fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
 
+fn upload_progress_range(bytes_received: i64) -> String {
+    if bytes_received <= 0 {
+        "0-0".to_string()
+    } else {
+        format!("0-{}", bytes_received - 1)
+    }
+}
+
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -1554,7 +1562,7 @@ async fn handle_start_upload(
             format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
         )
         .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", format!("0-{}", bytes_received.max(0)))
+        .header("Range", upload_progress_range(bytes_received))
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -1655,7 +1663,7 @@ async fn handle_patch_upload(
             format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
         )
         .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", format!("0-{}", new_bytes))
+        .header("Range", upload_progress_range(new_bytes))
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -4026,6 +4034,14 @@ mod tests {
             upload_storage_key(&uuid),
             "oci-uploads/550e8400-e29b-41d4-a716-446655440000"
         );
+    }
+
+    #[test]
+    fn test_upload_progress_range_is_inclusive() {
+        assert_eq!(upload_progress_range(0), "0-0");
+        assert_eq!(upload_progress_range(1), "0-0");
+        assert_eq!(upload_progress_range(2), "0-1");
+        assert_eq!(upload_progress_range(4435), "0-4434");
     }
 
     // -----------------------------------------------------------------------
