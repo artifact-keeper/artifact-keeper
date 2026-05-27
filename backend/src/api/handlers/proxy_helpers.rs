@@ -648,8 +648,11 @@ pub async fn proxy_check_cache(
 /// helper treats this as a stale/evicted cache entry and invokes the
 /// `refetch` closure to retrieve the bytes from upstream. The refetched bytes
 /// are written back to storage via a best-effort `put` so future requests hit
-/// the cache. Non-`NotFound` storage errors are propagated as 500 responses so
-/// operators see real backend failures.
+/// the cache. That write-back is intentional: `refetch` updates the shared
+/// proxy cache, while this helper repopulates the repo-scoped storage key that
+/// the format handler will read on the next request. Non-`NotFound` storage
+/// errors are propagated as 500 responses so operators see real backend
+/// failures.
 pub(crate) async fn get_cached_or_refetch<F, Fut>(
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
@@ -2748,20 +2751,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
 
+    enum RecordingGetBehavior {
+        Hit,
+        Miss,
+    }
+
     /// Recording mock storage backend that counts every method call so tests
     /// can assert which I/O paths fired (in particular: was the full object
-    /// `get(...)` called).
+    /// `get(...)` called and whether a write-back happened).
     struct RecordingStorage {
         get_calls: StdArc<AtomicUsize>,
+        put_calls: StdArc<AtomicUsize>,
         presigned_calls: StdArc<AtomicUsize>,
+        last_put: StdArc<std::sync::Mutex<Option<(String, Bytes)>>>,
+        get_behavior: RecordingGetBehavior,
         supports: bool,
     }
 
     impl RecordingStorage {
         fn new(supports: bool) -> Self {
+            Self::new_with_get_behavior(supports, RecordingGetBehavior::Hit)
+        }
+
+        fn new_with_get_behavior(supports: bool, get_behavior: RecordingGetBehavior) -> Self {
             Self {
                 get_calls: StdArc::new(AtomicUsize::new(0)),
+                put_calls: StdArc::new(AtomicUsize::new(0)),
                 presigned_calls: StdArc::new(AtomicUsize::new(0)),
+                last_put: StdArc::new(std::sync::Mutex::new(None)),
+                get_behavior,
                 supports,
             }
         }
@@ -2769,12 +2787,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for RecordingStorage {
-        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_put.lock().unwrap() = Some((key.to_string(), content));
             Ok(())
         }
-        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Bytes::from_static(b"full-body"))
+            match self.get_behavior {
+                RecordingGetBehavior::Hit => Ok(Bytes::from_static(b"full-body")),
+                RecordingGetBehavior::Miss => Err(crate::error::AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key
+                ))),
+            }
         }
         async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
             Ok(true)
@@ -2902,6 +2928,37 @@ mod tests {
             "backend without redirect support must yield None"
         );
         assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_refetches_and_writes_back_when_storage_missing() {
+        let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let refetch_calls = StdArc::new(AtomicUsize::new(0));
+        let refetched_bytes = Bytes::from_static(b"refetched-body");
+        let storage_key = "proxy-cache/repo/pkg/__content__";
+
+        let result = super::get_cached_or_refetch(&storage, storage_key, {
+            let refetch_calls = refetch_calls.clone();
+            let refetched_bytes = refetched_bytes.clone();
+            move || async move {
+                refetch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(refetched_bytes)
+            }
+        })
+        .await
+        .expect("miss path should recover via refetch");
+
+        assert_eq!(result, refetched_bytes);
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.put_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refetch_calls.load(Ordering::SeqCst), 1);
+
+        let recorded_put = storage.last_put.lock().unwrap().clone();
+        let Some((recorded_key, recorded_bytes)) = recorded_put else {
+            panic!("expected a write-back after refetch");
+        };
+        assert_eq!(recorded_key, storage_key);
+        assert_eq!(recorded_bytes, refetched_bytes);
     }
 
     // ── classify_remote_or_virtual tests ───────────────────────────────
