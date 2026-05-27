@@ -45,6 +45,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
 use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
@@ -54,7 +56,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::error::{AppError, Result};
-use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend, StoragePathFormat};
+use crate::storage::{
+    PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
+};
 
 /// GCP metadata server URL for fetching access tokens.
 const GCP_METADATA_TOKEN_URL: &str =
@@ -383,8 +387,11 @@ pub struct GcsBackend {
 impl GcsBackend {
     /// Create a new GCS backend.
     pub async fn new(config: GcsConfig) -> Result<Self> {
+        // Default 30 s is fine for single-MB OCI layers, but a multi-GiB
+        // resumable upload's total can run for many minutes; bound the cliff at
+        // 30 min. Per-chunk PUTs stay well under this on intra-GCP networking.
         let client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -820,6 +827,168 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
+    /// Streaming upload to GCS via the JSON API's resumable-upload protocol.
+    /// Splits the input stream into 32 MiB chunks; each chunk is a short PUT to
+    /// the session URL. The final chunk sends the known total size; intermediate
+    /// chunks use `*` ("more to come") per the GCS spec.
+    ///
+    /// Why not a single `reqwest::Body::wrap_stream` PUT? That dies on the
+    /// gateway timeout for multi-GiB artifacts — Envoy / GCP's HTTPS LB caps an
+    /// individual request at ~3 min, which a 3.4 GiB single-shot upload exceeds.
+    /// Resumable upload moves the work into many short requests (each chunk PUT
+    /// completes in ~1 s on intra-GCP networking), so the per-request budget is
+    /// never the bottleneck; total time tracks GCS throughput, not a timeout.
+    /// Chunks must be 256 KiB-aligned (except the last); 32 MiB satisfies that
+    /// and keeps heap bounded regardless of artifact size.
+    async fn put_stream(
+        &self,
+        key: &str,
+        mut stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use sha2::Sha256 as Sha256Inner;
+
+        const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+
+        // Initiate the resumable session; the Location header is the session URL.
+        let token = self.get_bearer_token().await?;
+        let initiate_url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=resumable&name={}",
+            self.base_url,
+            urlencoding::encode(&self.config.bucket),
+            urlencoding::encode(key),
+        );
+
+        let init_response = self
+            .client
+            .post(&initiate_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", "0")
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS resumable initiate failed: {}", e)))?;
+
+        if !init_response.status().is_success() {
+            let status = init_response.status();
+            let body = init_response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS resumable initiate failed: {} {}",
+                status, body
+            )));
+        }
+
+        let session_url = init_response
+            .headers()
+            .get("Location")
+            .ok_or_else(|| {
+                AppError::Storage("GCS resumable initiate returned no Location header".to_string())
+            })?
+            .to_str()
+            .map_err(|e| AppError::Storage(format!("GCS Location header not valid UTF-8: {}", e)))?
+            .to_string();
+
+        let mut hasher = Sha256Inner::new();
+        let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
+        let mut total_bytes: u64 = 0;
+        let mut stream_done = false;
+
+        while !stream_done {
+            while buffer.len() < CHUNK_SIZE && !stream_done {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        hasher.update(&bytes);
+                        buffer.extend_from_slice(&bytes);
+                    }
+                    Some(Err(e)) => {
+                        return Err(AppError::Storage(format!(
+                            "stream read error before GCS upload: {}",
+                            e
+                        )));
+                    }
+                    None => stream_done = true,
+                }
+            }
+
+            if buffer.is_empty() && total_bytes == 0 {
+                // Zero-byte upload — finalise with an empty PUT.
+                let zero_resp = self
+                    .client
+                    .put(&session_url)
+                    .header("Content-Length", "0")
+                    .header("Content-Range", "bytes */0")
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        AppError::Storage(format!("GCS resumable zero-byte PUT failed: {}", e))
+                    })?;
+                if !zero_resp.status().is_success() {
+                    let status = zero_resp.status();
+                    let body = zero_resp.text().await.unwrap_or_default();
+                    return Err(AppError::Storage(format!(
+                        "GCS resumable zero-byte PUT failed: {} {}",
+                        status, body
+                    )));
+                }
+                break;
+            }
+
+            if buffer.is_empty() {
+                break;
+            }
+
+            let chunk_len = buffer.len() as u64;
+            let chunk_start = total_bytes;
+            let chunk_end = chunk_start + chunk_len - 1;
+            let total_str = if stream_done {
+                (total_bytes + chunk_len).to_string()
+            } else {
+                "*".to_string()
+            };
+            let content_range = format!("bytes {}-{}/{}", chunk_start, chunk_end, total_str);
+
+            let chunk_body = std::mem::take(&mut buffer);
+            let put_resp = self
+                .client
+                .put(&session_url)
+                .header("Content-Length", chunk_len.to_string())
+                .header("Content-Range", &content_range)
+                .body(chunk_body)
+                .send()
+                .await
+                .map_err(|e| {
+                    AppError::Storage(format!(
+                        "GCS resumable PUT (range {}) failed: {}",
+                        content_range, e
+                    ))
+                })?;
+
+            let status = put_resp.status().as_u16();
+            // 308 Resume Incomplete = OK for intermediate chunks; 200/201 = OK
+            // for the final chunk.
+            let ok = if stream_done {
+                put_resp.status().is_success()
+            } else {
+                status == 308
+            };
+            if !ok {
+                let body = put_resp.text().await.unwrap_or_default();
+                return Err(AppError::Storage(format!(
+                    "GCS resumable PUT (range {}) returned {}: {}",
+                    content_range, status, body
+                )));
+            }
+
+            total_bytes += chunk_len;
+            buffer = Vec::with_capacity(CHUNK_SIZE);
+        }
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total_bytes,
+        })
+    }
+
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.object_download_url(key);
         let response = self.authorized_get(&url).await?;
@@ -839,6 +1008,38 @@ impl StorageBackend for GcsBackend {
         }
 
         // Propagate the error via require_success (always fails for non-2xx)
+        require_success(response, "GCS download failed").await?;
+        unreachable!()
+    }
+
+    /// Stream the object body without buffering it in a single `Bytes`. The
+    /// default trait impl wraps `get()` in a one-item stream, which forces the
+    /// entire object onto the heap before the consumer can write it to disk —
+    /// for a 3+ GiB scan input that alone can exceed node-allocatable on small
+    /// pools and OOM-kill the pod. `bytes_stream()` pulls chunks straight from
+    /// the HTTPS connection, keeping the in-flight footprint at reqwest's TCP
+    /// read buffer (~64 KiB) instead of object-size.
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let url = self.object_download_url(key);
+        let response = self.authorized_get(&url).await?;
+
+        if response.status().is_success() {
+            let stream = response.bytes_stream().map(|r| {
+                r.map_err(|e| AppError::Storage(format!("GCS stream chunk read failed: {}", e)))
+            });
+            return Ok(Box::pin(stream));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // The migration-mode Artifactory fallback still buffers
+            // (try_fallback_get returns Bytes); wrap it in a single-item stream
+            // so the caller's interface stays uniform.
+            if let Some(bytes) = self.try_fallback_get(key).await? {
+                return Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })));
+            }
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+
         require_success(response, "GCS download failed").await?;
         unreachable!()
     }
@@ -984,6 +1185,48 @@ mod tests {
 
     async fn create_test_backend() -> GcsBackend {
         GcsBackend::new(create_test_config()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_success() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"streamed body contents".to_vec();
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let mut stream = backend.get_stream("test/file.txt").await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, body);
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_not_found() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        match backend.get_stream("missing.txt").await {
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => panic!("Expected NotFound, got {:?}", e),
+            Ok(_) => panic!("Expected NotFound, got Ok stream"),
+        }
     }
 
     // ---- Backend creation ----
