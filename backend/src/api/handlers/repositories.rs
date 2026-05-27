@@ -841,7 +841,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
-    let format = parse_format(&payload.format)?;
+    // Resolve the format string via the service. The service owns both the
+    // built-in enum mapping and the `format_handlers` fallback for WASM
+    // plugin formats, so the handler keeps no business logic of its own here.
+    // For plugin formats, `plugin_format_key` carries the canonical handler
+    // name and `format` is reported as `Generic`.
+    let service = state.create_repository_service();
+    let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
     // Validate up-front that virtual repos arrive with at least one member.
@@ -892,7 +898,6 @@ pub async fn create_repository(
         );
     }
 
-    let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
             key: payload.key,
@@ -905,7 +910,10 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
-            format_key: payload.format_key,
+            // Plugin format key takes precedence over any explicit format_key
+            // in the payload: when a WASM plugin format was resolved above,
+            // `plugin_format_key` carries the canonical handler name.
+            format_key: plugin_format_key.or(payload.format_key),
         })
         .await?;
 
@@ -7574,5 +7582,318 @@ mod tests {
                 body.len()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WASM plugin format fallback in create_repository (regression tests)
+    //
+    // Format-string resolution lives in `RepositoryService::resolve_format`
+    // (see `services/repository_service.rs`). These end-to-end tests drive
+    // the HTTP handler so we verify both the resolve path and the wiring of
+    // the resolved `format_key` into the persisted row.
+    // -----------------------------------------------------------------------
+
+    /// Insert a `format_handlers` row for testing.  Returns the `format_key`
+    /// that was inserted.  The caller is responsible for deleting the row
+    /// after the test (use `cleanup_format_handler`).
+    async fn insert_format_handler(pool: &sqlx::PgPool, format_key: &str, is_enabled: bool) {
+        sqlx::query(
+            "INSERT INTO format_handlers \
+             (format_key, handler_type, display_name, is_enabled) \
+             VALUES ($1, 'wasm', $2, $3) \
+             ON CONFLICT (format_key) DO UPDATE \
+             SET is_enabled = EXCLUDED.is_enabled",
+        )
+        .bind(format_key)
+        .bind(format!("Test handler for {}", format_key))
+        .bind(is_enabled)
+        .execute(pool)
+        .await
+        .expect("insert format_handler");
+    }
+
+    async fn cleanup_format_handler(pool: &sqlx::PgPool, format_key: &str) {
+        sqlx::query("DELETE FROM format_handlers WHERE format_key = $1")
+            .bind(format_key)
+            .execute(pool)
+            .await
+            .expect("cleanup format_handler");
+    }
+
+    /// Helper: build an admin `AuthExtension` so the permission gate in
+    /// `create_repository` is bypassed without needing a database permission row.
+    fn admin_auth(user_id: Uuid, username: &str) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Deserialize a `CreateRepositoryRequest` from a minimal JSON object,
+    /// merging in `overrides` so individual tests only specify the fields they
+    /// care about.
+    fn make_create_request(
+        key: &str,
+        name: &str,
+        format: &str,
+        overrides: serde_json::Value,
+    ) -> CreateRepositoryRequest {
+        let mut base = serde_json::json!({
+            "key": key,
+            "name": name,
+            "format": format,
+            "repo_type": "local"
+        });
+        if let (serde_json::Value::Object(b), serde_json::Value::Object(o)) = (&mut base, overrides)
+        {
+            b.extend(o);
+        }
+        serde_json::from_value(base).expect("valid CreateRepositoryRequest")
+    }
+
+    /// When a format string is not a built-in variant but there IS an
+    /// **enabled** row in `format_handlers`, `create_repository` must succeed
+    /// and the resulting repository must have `format = Generic` and
+    /// `format_key = <the plugin key>`.
+    #[tokio::test]
+    async fn test_create_repository_with_enabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-wasm-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("wasm-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "WASM plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+
+        let Json(resp) = result.expect("create_repository with enabled plugin format must succeed");
+        assert_eq!(
+            resp.format, "generic",
+            "plugin-backed repo must be stored as Generic format"
+        );
+
+        // Verify the format_key was persisted to the DB (RepositoryResponse does
+        // not expose format_key directly).
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT format_key FROM repositories WHERE key = $1")
+                .bind(&repo_key)
+                .fetch_optional(&pool)
+                .await
+                .expect("query format_key");
+
+        // Cleanup after reading so we don't delete the row before asserting.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(format_key.as_str()),
+            "plugin format key must be persisted to the repositories.format_key column"
+        );
+    }
+
+    /// When the format string maps to a **disabled** `format_handlers` row,
+    /// `create_repository` must return a `Validation` error whose message
+    /// mentions "disabled".
+    #[tokio::test]
+    async fn test_create_repository_with_disabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-disabled-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, false).await;
+
+        let payload = make_create_request(
+            &format!("disabled-repo-{}", Uuid::new_v4().simple()),
+            "Disabled plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("disabled plugin format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
+            "disabled plugin format must produce a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
+    /// When the format string is unknown and has **no** `format_handlers` row
+    /// at all, `create_repository` must return a `Validation` error.
+    #[tokio::test]
+    async fn test_create_repository_with_unknown_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let payload = make_create_request(
+            &format!("unknown-repo-{}", Uuid::new_v4().simple()),
+            "Unknown format repo",
+            // A format string that will never match any built-in or plugin.
+            "totally-unknown-zzz",
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("unknown format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "unknown format must surface as Validation (400), got {err:?}",
+        );
+    }
+
+    /// Build a non-admin `AuthExtension`. Used to confirm that the same
+    /// admin/create-repo gate that protects built-in format creation also
+    /// guards the WASM-plugin codepath. Without this, a plugin-format string
+    /// could be a route around the gate.
+    fn non_admin_auth(
+        user_id: Uuid,
+        username: &str,
+    ) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// A non-admin caller with no `system:admin` permission must receive an
+    /// `Authorization` error even when the requested format is a valid,
+    /// enabled WASM plugin format. The plugin codepath inherits the same
+    /// permission gate as built-in formats; there is no privileged shortcut.
+    #[tokio::test]
+    async fn test_create_repository_plugin_format_rejects_non_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-noadmin-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("noadmin-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Non-admin plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(non_admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+
+        // Cleanup: the request should NOT have created a repo row, but delete
+        // defensively in case the assertion below fails.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("non-admin must be denied even for plugin formats");
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
+        );
     }
 }
