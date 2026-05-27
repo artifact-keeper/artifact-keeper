@@ -134,6 +134,20 @@ impl IncusScanner {
     /// Prepare the scan workspace by extracting rootfs from the image.
     async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
         let workspace = self.workspace_dir(artifact);
+
+        // Wipe any partial tree left by a previous failed scan (OOM, disk-full,
+        // janitor reap, ...) so extraction below starts from a clean slate.
+        // Best-effort: a missing path is fine; anything else surfaces.
+        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(AppError::Internal(format!(
+                    "Failed to clear stale scan workspace {}: {}",
+                    workspace.display(),
+                    e
+                )));
+            }
+        }
+
         let rootfs_dir = workspace.join("rootfs");
         tokio::fs::create_dir_all(&rootfs_dir)
             .await
@@ -144,7 +158,13 @@ impl IncusScanner {
 
         match info.file_type {
             IncusFileType::UnifiedTarball => {
-                self.extract_tarball(content, &rootfs_dir).await?;
+                // Extract into the workspace root: `incus image export` archives
+                // unpack to `rootfs/…`, while `incus export` container backups
+                // unpack to `backup/container/rootfs/…`. `find_rootfs` then locates
+                // whichever layout this archive used; fall back to `rootfs/` so a
+                // marker-less archive still scans (with a warning) rather than fails.
+                self.extract_tarball(content, &workspace).await?;
+                return Ok(Self::find_rootfs(&workspace).await.unwrap_or(rootfs_dir));
             }
             IncusFileType::RootfsSquashfs => {
                 self.extract_squashfs(content, &workspace, &rootfs_dir)
@@ -172,9 +192,19 @@ impl IncusScanner {
         Ok(rootfs_dir)
     }
 
-    /// Extract a unified tarball (tar.xz or tar.gz) into the rootfs directory.
+    /// Extract a unified tarball (tar.xz or tar.gz) into `dest`.
+    ///
+    /// Hardened against state left by a prior failed scan and against archive
+    /// modes the runtime UID can't later traverse or delete:
+    ///   * `--overwrite` so a stale partial tree doesn't cause `File exists`;
+    ///   * `--no-same-owner` so tar doesn't try (and silently fail) to chown to
+    ///     the archive's UIDs as a non-root pod;
+    ///   * `--mode=u=rwX,go=rX` so special bits never survive — e.g. a setgid
+    ///     `2755` kernel-module dir would otherwise land as `d--x--S---` and
+    ///     break the later recursive cleanup. `--no-same-permissions` alone is
+    ///     not enough: the umask doesn't mask the setuid/setgid/sticky bits.
     async fn extract_tarball(&self, content: &Bytes, dest: &Path) -> Result<()> {
-        let tarball_path = dest.parent().unwrap_or(dest).join("image.tar.xz");
+        let tarball_path = dest.join("image.tar.xz");
         write_temp_file(&tarball_path, content, "tarball").await?;
 
         // Detect compression: XZ magic bytes (0xFD 0x37 0x7A 0x58 0x5A)
@@ -184,6 +214,9 @@ impl IncusScanner {
         run_command(
             "tar",
             &[
+                "--overwrite",
+                "--no-same-owner",
+                "--mode=u=rwX,go=rX",
                 decompress_flag,
                 &tarball_path.to_string_lossy(),
                 "-C",
@@ -195,6 +228,40 @@ impl IncusScanner {
 
         let _ = tokio::fs::remove_file(&tarball_path).await;
         Ok(())
+    }
+
+    /// Locate the actual rootfs inside an extracted incus archive by probing
+    /// known package-DB markers. `incus image export` archives put it at
+    /// `rootfs/`; `incus export` container backups put it at
+    /// `backup/container/rootfs/`. Returns the first candidate that contains a
+    /// recognised marker, or `None` (the caller falls back to `rootfs/` + warns).
+    async fn find_rootfs(workspace: &Path) -> Option<PathBuf> {
+        const MARKERS: &[&str] = &[
+            "var/lib/dpkg/status",
+            "var/lib/rpm/Packages",
+            "var/lib/rpm/rpmdb.sqlite",
+            "etc/apk/installed",
+            "etc/os-release",
+        ];
+        const CANDIDATES: &[&str] = &["rootfs", "backup/container/rootfs", "backup/rootfs"];
+        for candidate in CANDIDATES {
+            let base = workspace.join(candidate);
+            for marker in MARKERS {
+                if tokio::fs::metadata(base.join(marker)).await.is_ok() {
+                    info!(
+                        "Located scannable rootfs at {} (matched {})",
+                        base.display(),
+                        marker
+                    );
+                    return Some(base);
+                }
+            }
+        }
+        warn!(
+            "No OS package-DB marker found under {} — trivy may report zero findings",
+            workspace.display()
+        );
+        None
     }
 
     /// Extract a squashfs image using unsquashfs.
@@ -456,6 +523,50 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::Medium);
         assert_eq!(findings[1].title, "CVE-2024-67890 in libc6");
         assert!(findings[1].fixed_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // find_rootfs tests
+
+    #[tokio::test]
+    async fn test_find_rootfs_backup_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // `incus export` container-backup layout: rootfs two levels deep.
+        let dpkg = ws.join("backup/container/rootfs/var/lib/dpkg");
+        tokio::fs::create_dir_all(&dpkg).await.unwrap();
+        tokio::fs::write(dpkg.join("status"), b"Package: bash\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            IncusScanner::find_rootfs(ws).await,
+            Some(ws.join("backup/container/rootfs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_rootfs_image_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // `incus image export` layout: rootfs at the top level.
+        let etc = ws.join("rootfs/etc");
+        tokio::fs::create_dir_all(&etc).await.unwrap();
+        tokio::fs::write(etc.join("os-release"), b"ID=ubuntu\n")
+            .await
+            .unwrap();
+
+        assert_eq!(IncusScanner::find_rootfs(ws).await, Some(ws.join("rootfs")));
+    }
+
+    #[tokio::test]
+    async fn test_find_rootfs_no_marker_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A tree with no recognised package DB → None (caller falls back + warns).
+        tokio::fs::create_dir_all(tmp.path().join("rootfs/usr/bin"))
+            .await
+            .unwrap();
+        assert_eq!(IncusScanner::find_rootfs(tmp.path()).await, None);
     }
 
     // -----------------------------------------------------------------------
