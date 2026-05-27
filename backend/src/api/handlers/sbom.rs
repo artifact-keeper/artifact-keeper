@@ -717,6 +717,46 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
     true
 }
 
+/// Outcome of dispatching the overloaded `/cve/history/{id}` path param.
+///
+/// Pure typing of the UUID-vs-CVE-id sniff so the dispatch decision is
+/// unit-testable without booting Axum or Postgres. The handler reads
+/// `classify_cve_history_path` and branches on the variant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CveHistoryPath {
+    /// Parsed UUID; treat as artifact_id lookup.
+    Artifact(Uuid),
+    /// Parsed CVE id (canonical upper-case form); treat as cross-artifact
+    /// CVE lookup.
+    Cve(String),
+    /// Neither parse succeeded; handler returns 400.
+    Invalid,
+}
+
+/// Classify an overloaded `/cve/history/{id}` path parameter. UUID first
+/// (legacy semantic), then CVE id, else invalid.
+///
+/// Extracted from `get_cve_history` so the routing decision is exercised
+/// by unit tests; the async wrapper only owns the DB calls. (#1375)
+pub(crate) fn classify_cve_history_path(id: &str) -> CveHistoryPath {
+    if let Ok(uuid) = Uuid::parse_str(id) {
+        return CveHistoryPath::Artifact(uuid);
+    }
+    if is_valid_cve_id(id) {
+        // Normalize to upper-case so the downstream lookup matches the
+        // schema's storage convention.
+        return CveHistoryPath::Cve(id.trim().to_ascii_uppercase());
+    }
+    CveHistoryPath::Invalid
+}
+
+/// Construct the 400 message returned when neither a UUID nor a CVE id
+/// matches. Pulled out so the message wording (which clients sometimes
+/// parse) is pinned by a test.
+pub(crate) fn invalid_cve_history_path_message(id: &str) -> String {
+    format!("Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)")
+}
+
 /// Get CVE history by artifact UUID or CVE identifier (legacy overload).
 ///
 /// The path param accepts either:
@@ -761,24 +801,20 @@ async fn get_cve_history(
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     let service = SbomService::new(state.db.clone());
 
-    // Try UUID first: this preserves the legacy artifact_id call path.
-    if let Ok(artifact_id) = Uuid::parse_str(&id) {
-        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
-        let entries = service.get_cve_history(artifact_id).await?;
-        return Ok(Json(entries));
+    match classify_cve_history_path(&id) {
+        CveHistoryPath::Artifact(artifact_id) => {
+            ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+            let entries = service.get_cve_history(artifact_id).await?;
+            Ok(Json(entries))
+        }
+        CveHistoryPath::Cve(cve_id) => {
+            let entries = service
+                .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+                .await?;
+            Ok(Json(entries))
+        }
+        CveHistoryPath::Invalid => Err(AppError::Validation(invalid_cve_history_path_message(&id))),
     }
-
-    // Fall back to CVE-id lookup across artifacts the caller can see.
-    if is_valid_cve_id(&id) {
-        let entries = service
-            .get_cve_history_by_cve_id(&id, auth.allowed_repo_ids.as_deref())
-            .await?;
-        return Ok(Json(entries));
-    }
-
-    Err(AppError::Validation(format!(
-        "Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)"
-    )))
 }
 
 /// Get CVE history for one artifact (typed UUID variant).
@@ -813,6 +849,14 @@ async fn get_cve_history_by_artifact(
     Ok(Json(entries))
 }
 
+/// Construct the 400 message for the typed `/cve/history/by-cve/{cve_id}`
+/// route. Separated from `invalid_cve_history_path_message` because the
+/// wording is slightly different (typed route knows the id is meant to
+/// be a CVE id, not "either a UUID or a CVE id").
+pub(crate) fn invalid_cve_id_route_message(cve_id: &str) -> String {
+    format!("Path id '{cve_id}' is not a valid CVE identifier (expected `CVE-YYYY-N`)")
+}
+
 /// Get CVE history for one CVE identifier across artifacts (typed CVE-id
 /// variant).
 ///
@@ -839,9 +883,7 @@ async fn get_cve_history_by_cve(
     Path(cve_id): Path<String>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     if !is_valid_cve_id(&cve_id) {
-        return Err(AppError::Validation(format!(
-            "Path id '{cve_id}' is not a valid CVE identifier (expected `CVE-YYYY-N`)"
-        )));
+        return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
     let service = SbomService::new(state.db.clone());
     let entries = service
@@ -2092,5 +2134,109 @@ mod tests {
         assert!(!is_valid_cve_id(&uuid.to_string()));
         assert!(Uuid::parse_str("CVE-2019-10744").is_err());
         assert!(is_valid_cve_id("CVE-2019-10744"));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_cve_history_path: pure dispatch over the overloaded path
+    // parameter. Pulled out of the async handler so the routing decision
+    // (UUID first, CVE second, else 400) is unit-testable. (#1375)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_cve_history_path_uuid_wins() {
+        let uuid = Uuid::new_v4();
+        let result = classify_cve_history_path(&uuid.to_string());
+        assert_eq!(result, CveHistoryPath::Artifact(uuid));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_release_gate_fixture() {
+        // CVE-2019-10744 is the release-gate fixture; the pre-fix
+        // Path<Uuid> extractor 400'd it. Now it must route to the CVE
+        // branch.
+        let result = classify_cve_history_path("CVE-2019-10744");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2019-10744".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_normalizes_to_upper() {
+        // Lower-case input must normalize to canonical upper-case before
+        // hitting the lookup, so the case-insensitive DB compare lives
+        // in one place.
+        let result = classify_cve_history_path("cve-2024-12345");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2024-12345".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_trims_whitespace() {
+        // Reverse-proxy / curl quirks sometimes leave leading whitespace;
+        // the classify step must strip it before forwarding.
+        let result = classify_cve_history_path("  CVE-2024-1234  ");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2024-1234".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_invalid_returns_invalid() {
+        assert_eq!(
+            classify_cve_history_path("not-a-uuid"),
+            CveHistoryPath::Invalid
+        );
+        assert_eq!(classify_cve_history_path(""), CveHistoryPath::Invalid);
+        // 7-byte malformed UUID-ish string.
+        assert_eq!(
+            classify_cve_history_path("abcdefg"),
+            CveHistoryPath::Invalid
+        );
+        // CVE-shape but invalid (suffix too short).
+        assert_eq!(
+            classify_cve_history_path("CVE-2024-1"),
+            CveHistoryPath::Invalid
+        );
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_uuid_preferred_over_cve_id() {
+        // A canonical UUID never matches the CVE shape (no leading
+        // "CVE-"), so this is mostly a smoke check that the UUID branch
+        // runs first. If someone ever changed `is_valid_cve_id` to match
+        // arbitrary strings, this test would catch the routing flip.
+        let uuid_str = "12345678-1234-1234-1234-123456789abc";
+        match classify_cve_history_path(uuid_str) {
+            CveHistoryPath::Artifact(_) => (),
+            other => panic!("expected Artifact, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 400 error wording: pin the strings so a refactor that renames them
+    // does not silently break clients that grep the body for keywords.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalid_cve_history_path_message_includes_offending_id() {
+        let msg = invalid_cve_history_path_message("zzz");
+        assert!(msg.contains("zzz"));
+        assert!(msg.contains("UUID"));
+        assert!(msg.contains("CVE-YYYY-N"));
+    }
+
+    #[test]
+    fn test_invalid_cve_id_route_message_includes_offending_id() {
+        let msg = invalid_cve_id_route_message("CVE-bad");
+        assert!(msg.contains("CVE-bad"));
+        assert!(msg.contains("CVE-YYYY-N"));
+        // The typed-route message must NOT mention "UUID" since the route
+        // does not accept UUIDs.
+        assert!(!msg.contains("UUID"));
+    }
+
+    #[test]
+    fn test_invalid_cve_history_path_message_distinct_from_typed_route_message() {
+        // The overloaded route and the typed CVE route emit different
+        // messages because they accept different shapes; pin that they
+        // do not collapse.
+        let overload = invalid_cve_history_path_message("xxx");
+        let typed = invalid_cve_id_route_message("xxx");
+        assert_ne!(overload, typed);
     }
 }
