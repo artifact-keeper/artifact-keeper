@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -3188,15 +3190,111 @@ impl ScannerService {
         Ok(count)
     }
 
-    /// Fetch artifact content from the configured storage backend.
+    /// Fetch artifact content from the configured storage backend, staged as
+    /// an mmap-backed `Bytes` rather than buffered whole in heap.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
         let storage = self.resolve_repo_storage(artifact.repository_id).await?;
-        storage.get(&artifact.storage_key).await.map_err(|e| {
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to open stream for artifact {} (key={}): {}",
+                    artifact.id, artifact.storage_key, e
+                ))
+            })?;
+        Self::stage_stream_to_mmap(stream, &self.scan_workspace_path).await
+    }
+
+    /// Stream `stream` to a tempfile under `workspace_path`, then return an
+    /// `mmap`-backed `Bytes`.
+    ///
+    /// The previous `storage.get(...)` returned the full (multi-GiB) artifact as
+    /// anon heap and the orchestrator held it alive across every applicable
+    /// scanner — past the cgroup ceiling on smaller nodes, where the OOM killer
+    /// was the only outcome. File-backed (mmap) pages are kernel-reclaimable
+    /// under cgroup pressure; anon pages are not. The tempfile is unlinked once
+    /// mapped; on Linux the inode stays pinned until the returned `Bytes` drops,
+    /// so disk frees the moment scanning finishes.
+    async fn stage_stream_to_mmap(
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+    ) -> Result<Bytes> {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::fs::create_dir_all(workspace_path)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to create scan workspace {}: {}",
+                    workspace_path, e
+                ))
+            })?;
+
+        let workspace = workspace_path.to_string();
+        let temp = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(&workspace))
+            .await
+            .map_err(|e| AppError::Storage(format!("Tempfile join failure: {}", e)))?
+            .map_err(|e| AppError::Storage(format!("Failed to create scan tempfile: {}", e)))?;
+        let temp_path = temp.path().to_path_buf();
+
+        let mut total: u64 = 0;
+        {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| {
+                    AppError::Storage(format!(
+                        "Failed to open scan tempfile {} for write: {}",
+                        temp_path.display(),
+                        e
+                    ))
+                })?;
+            let mut writer = tokio::io::BufWriter::new(file);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    AppError::Storage(format!("Stream error while staging scan input: {}", e))
+                })?;
+                total += chunk.len() as u64;
+                writer.write_all(&chunk).await.map_err(|e| {
+                    AppError::Storage(format!(
+                        "Write error to scan tempfile {}: {}",
+                        temp_path.display(),
+                        e
+                    ))
+                })?;
+            }
+            writer.flush().await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Flush error on scan tempfile {}: {}",
+                    temp_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        if total == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let file = std::fs::File::open(&temp_path).map_err(|e| {
             AppError::Storage(format!(
-                "Failed to read artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, e
+                "Failed to reopen scan tempfile {} for mmap: {}",
+                temp_path.display(),
+                e
             ))
-        })
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            AppError::Storage(format!(
+                "mmap failed on scan tempfile {}: {}",
+                temp_path.display(),
+                e
+            ))
+        })?;
+        drop(temp);
+
+        Ok(Bytes::from_owner(mmap))
     }
 
     /// Resolve the storage backend for a given repository by looking up
@@ -3480,6 +3578,36 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // stage_stream_to_mmap (scan-input staging)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_stage_stream_to_mmap_concatenates_chunks() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let out = ScannerService::stage_stream_to_mmap(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_stage_stream_to_mmap_empty_stream() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = futures::stream::iter(Vec::<Result<Bytes>>::new()).boxed();
+        let out = ScannerService::stage_stream_to_mmap(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
 
     // -----------------------------------------------------------------------
     // Scanner version parsing (issue #902)
