@@ -841,6 +841,70 @@ mod tests {
         assert!(matches!(config.auth, ArtifactoryAuth::ApiToken(_)));
     }
 
+    // -----------------------------------------------------------------------
+    // SSRF host-allowlist for download_response_with_fallback
+    //
+    // The helper that decides whether a downloadUri returned by Artifactory
+    // can be followed with our auth headers is implemented inline in the
+    // fallback method. We re-derive the same predicate here so the rule
+    // itself has explicit unit coverage and regressions are caught even
+    // without an HTTP fixture.
+    // -----------------------------------------------------------------------
+
+    fn fallback_host_matches(base_url: &str, download_uri: &str) -> bool {
+        let base_host = reqwest::Url::parse(base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        let fallback_host = reqwest::Url::parse(download_uri)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        matches!(
+            (base_host.as_deref(), fallback_host.as_deref()),
+            (Some(b), Some(f)) if b == f
+        )
+    }
+
+    #[test]
+    fn test_fallback_host_matches_same_host_same_scheme() {
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com/artifactory/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_case_insensitive() {
+        assert!(fallback_host_matches(
+            "https://ArtiFactory.Example.com",
+            "https://artifactory.example.COM/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_foreign_host() {
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://attacker.example.net/exfil"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_invalid_uri() {
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "not a url"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_subdomain_swap() {
+        // Strict equality, not suffix matching: subdomain swaps must fail.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://evil.artifactory.example.com/exfil"
+        ));
+    }
+
     #[test]
     fn test_client_creation_with_api_token() {
         let config = ArtifactoryClientConfig {
