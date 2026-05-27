@@ -183,6 +183,72 @@ pub(crate) fn should_reject_disabled_format(format_enabled: Option<bool>) -> boo
     format_enabled == Some(false)
 }
 
+/// Pure parse of a user-supplied format string into a built-in
+/// [`RepositoryFormat`] variant. Returns `None` for strings that do not match
+/// any built-in variant; callers are expected to fall back to the
+/// `format_handlers` table to resolve plugin-provided formats.
+///
+/// Case-insensitive. The accepted strings are the canonical snake_case keys
+/// produced by [`derive_format_key`], so this is the inverse of that function
+/// on the built-in domain.
+pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
+    match s.to_lowercase().as_str() {
+        "maven" => Some(RepositoryFormat::Maven),
+        "gradle" => Some(RepositoryFormat::Gradle),
+        "npm" => Some(RepositoryFormat::Npm),
+        "pypi" => Some(RepositoryFormat::Pypi),
+        "nuget" => Some(RepositoryFormat::Nuget),
+        "go" => Some(RepositoryFormat::Go),
+        "rubygems" => Some(RepositoryFormat::Rubygems),
+        "docker" => Some(RepositoryFormat::Docker),
+        "helm" => Some(RepositoryFormat::Helm),
+        "rpm" => Some(RepositoryFormat::Rpm),
+        "debian" => Some(RepositoryFormat::Debian),
+        "conan" => Some(RepositoryFormat::Conan),
+        "cargo" => Some(RepositoryFormat::Cargo),
+        "generic" => Some(RepositoryFormat::Generic),
+        "podman" => Some(RepositoryFormat::Podman),
+        "buildx" => Some(RepositoryFormat::Buildx),
+        "oras" => Some(RepositoryFormat::Oras),
+        "wasm_oci" => Some(RepositoryFormat::WasmOci),
+        "helm_oci" => Some(RepositoryFormat::HelmOci),
+        "poetry" => Some(RepositoryFormat::Poetry),
+        "conda" => Some(RepositoryFormat::Conda),
+        "yarn" => Some(RepositoryFormat::Yarn),
+        "bower" => Some(RepositoryFormat::Bower),
+        "pnpm" => Some(RepositoryFormat::Pnpm),
+        "chocolatey" => Some(RepositoryFormat::Chocolatey),
+        "powershell" => Some(RepositoryFormat::Powershell),
+        "terraform" => Some(RepositoryFormat::Terraform),
+        "opentofu" => Some(RepositoryFormat::Opentofu),
+        "alpine" => Some(RepositoryFormat::Alpine),
+        "conda_native" => Some(RepositoryFormat::CondaNative),
+        "composer" => Some(RepositoryFormat::Composer),
+        "hex" => Some(RepositoryFormat::Hex),
+        "cocoapods" => Some(RepositoryFormat::Cocoapods),
+        "swift" => Some(RepositoryFormat::Swift),
+        "pub" => Some(RepositoryFormat::Pub),
+        "sbt" => Some(RepositoryFormat::Sbt),
+        "chef" => Some(RepositoryFormat::Chef),
+        "puppet" => Some(RepositoryFormat::Puppet),
+        "ansible" => Some(RepositoryFormat::Ansible),
+        "gitlfs" => Some(RepositoryFormat::Gitlfs),
+        "vscode" => Some(RepositoryFormat::Vscode),
+        "jetbrains" => Some(RepositoryFormat::Jetbrains),
+        "huggingface" => Some(RepositoryFormat::Huggingface),
+        "mlmodel" => Some(RepositoryFormat::Mlmodel),
+        "cran" => Some(RepositoryFormat::Cran),
+        "vagrant" => Some(RepositoryFormat::Vagrant),
+        "opkg" => Some(RepositoryFormat::Opkg),
+        "p2" => Some(RepositoryFormat::P2),
+        "bazel" => Some(RepositoryFormat::Bazel),
+        "protobuf" => Some(RepositoryFormat::Protobuf),
+        "incus" => Some(RepositoryFormat::Incus),
+        "lxc" => Some(RepositoryFormat::Lxc),
+        _ => None,
+    }
+}
+
 /// Calculate quota usage as a fraction (0.0 to 1.0+).
 pub(crate) fn quota_usage_percentage(used_bytes: i64, quota_bytes: i64) -> f64 {
     if quota_bytes <= 0 {
@@ -321,13 +387,75 @@ impl RepositoryService {
         Ok(row.and_then(|r| r.0))
     }
 
+    /// Resolve a user-supplied format string to a [`RepositoryFormat`] plus
+    /// an optional canonical plugin key.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. If `s` matches a built-in variant (see [`parse_format_str`]), return
+    ///    `(variant, None)`.
+    /// 2. Otherwise look up `s` in `format_handlers` (lower-cased). If the row
+    ///    exists and `is_enabled = true`, return
+    ///    `(RepositoryFormat::Generic, Some(format_key))`: the repo is stored
+    ///    as Generic but the custom plugin key is preserved so the runtime
+    ///    plugin dispatcher can route requests to it.
+    /// 3. If the row exists but is disabled, or no row exists, return an
+    ///    `AppError::Validation`. The disabled error message mirrors the
+    ///    wording used by [`Self::create`] for built-in disabled formats so
+    ///    the HTTP surface is consistent.
+    ///
+    /// This is the single source of truth for "is this format string usable
+    /// for repository creation?" — the HTTP handler must not perform the
+    /// `format_handlers` query itself.
+    pub async fn resolve_format(&self, s: &str) -> Result<(RepositoryFormat, Option<String>)> {
+        if let Some(builtin) = parse_format_str(s) {
+            return Ok((builtin, None));
+        }
+        let format_lower = s.to_lowercase();
+        let is_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
+                .bind(&format_lower)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        match is_enabled {
+            Some(true) => Ok((RepositoryFormat::Generic, Some(format_lower))),
+            Some(false) => Err(AppError::Validation(format!(
+                "Format handler '{}' is disabled. Enable it before creating repositories.",
+                format_lower
+            ))),
+            None => Err(AppError::Validation(format!("Invalid format: {}", s))),
+        }
+    }
+
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
         // Validate remote repository has upstream URL and it is safe to contact
         validate_remote_upstream(&req.repo_type, &req.upstream_url)?;
 
-        // Check if format handler is enabled (T044)
-        let format_key = derive_format_key(&req.format);
+        // Check if format handler is enabled (T044).
+        //
+        // Two cases:
+        //  * Built-in format (req.format_key = None): check the row keyed by
+        //    the canonical enum name (e.g. "maven").
+        //  * Plugin format (req.format_key = Some(plugin_key)): the caller
+        //    resolved this via `resolve_format`, which already issued its own
+        //    SELECT against `format_handlers`. The re-check below is
+        //    intentional: we re-read `is_enabled` under our own SELECT to
+        //    narrow the TOCTOU window opened by resolve_format.
+        //
+        // Note: this re-check NARROWS but does not eliminate the TOCTOU window
+        // between resolve_format() and insert. A plugin disabled between the two
+        // SELECTs could still produce a repo bound to a now-disabled plugin, but
+        // (1) request-time format dispatch reads `format_handlers` per request, so
+        // the bound repo fails subsequent operations cleanly, and (2) plugin
+        // install/disable is admin-only, so the race is bounded by admin actions.
+        // A true single-tx fix with SELECT FOR SHARE is tracked as a v1.2.1
+        // hardening follow-up.
+        let format_key = req
+            .format_key
+            .clone()
+            .unwrap_or_else(|| derive_format_key(&req.format));
         let format_enabled: Option<bool> =
             sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
                 .bind(&format_key)
@@ -1361,6 +1489,89 @@ mod tests {
     #[test]
     fn test_should_reject_disabled_format_not_found() {
         assert!(!should_reject_disabled_format(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_format_str (extracted pure function)
+    //
+    // The inverse of `derive_format_key` on the built-in domain. Unknown
+    // strings (plugin formats, garbage) return `None` — the caller falls
+    // back to the `format_handlers` table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_format_str_known_builtins() {
+        assert_eq!(parse_format_str("maven"), Some(RepositoryFormat::Maven));
+        assert_eq!(parse_format_str("npm"), Some(RepositoryFormat::Npm));
+        assert_eq!(parse_format_str("docker"), Some(RepositoryFormat::Docker));
+        assert_eq!(parse_format_str("generic"), Some(RepositoryFormat::Generic));
+    }
+
+    #[test]
+    fn test_parse_format_str_case_insensitive() {
+        assert_eq!(parse_format_str("MAVEN"), Some(RepositoryFormat::Maven));
+        assert_eq!(parse_format_str("Docker"), Some(RepositoryFormat::Docker));
+    }
+
+    #[test]
+    fn test_parse_format_str_snake_case_multiword() {
+        // Multi-word variants must match the snake_case key produced by
+        // `derive_format_key`, NOT the lowercased Debug form.
+        assert_eq!(
+            parse_format_str("conda_native"),
+            Some(RepositoryFormat::CondaNative)
+        );
+        assert_eq!(
+            parse_format_str("wasm_oci"),
+            Some(RepositoryFormat::WasmOci)
+        );
+        assert_eq!(
+            parse_format_str("helm_oci"),
+            Some(RepositoryFormat::HelmOci)
+        );
+        // The lowercased-Debug form must NOT match — these are the cases the
+        // old `Debug + to_lowercase` approach silently mishandled.
+        assert_eq!(parse_format_str("condanative"), None);
+        assert_eq!(parse_format_str("wasmoci"), None);
+    }
+
+    #[test]
+    fn test_parse_format_str_unknown_returns_none() {
+        // Plugin-name-looking strings: the caller is expected to consult
+        // `format_handlers` after `None` is returned.
+        assert_eq!(parse_format_str("my-wasm-plugin"), None);
+        assert_eq!(parse_format_str("totally-unknown-zzz"), None);
+        assert_eq!(parse_format_str(""), None);
+    }
+
+    #[test]
+    fn test_parse_format_str_round_trip_with_derive_format_key() {
+        // Every built-in variant must round-trip through derive_format_key →
+        // parse_format_str. Guards against silent drift between the two
+        // mapping tables.
+        let variants = [
+            RepositoryFormat::Maven,
+            RepositoryFormat::Gradle,
+            RepositoryFormat::Npm,
+            RepositoryFormat::Pypi,
+            RepositoryFormat::Docker,
+            RepositoryFormat::CondaNative,
+            RepositoryFormat::WasmOci,
+            RepositoryFormat::HelmOci,
+            RepositoryFormat::Generic,
+            RepositoryFormat::Lxc,
+        ];
+        for v in variants {
+            let key = derive_format_key(&v);
+            let parsed = parse_format_str(&key);
+            assert_eq!(
+                parsed,
+                Some(v.clone()),
+                "round-trip failed for {:?} (key={})",
+                v,
+                key
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
