@@ -778,6 +778,39 @@ fn candidate_upstream_images(image: &str, upstream_url: &str) -> Vec<String> {
     vec![image.to_string()]
 }
 
+/// Format the upstream HTTP path used to fetch a blob from a remote OCI
+/// member. Kept as a tiny pure helper so the format is exercised by unit
+/// tests without spinning up a wiremock upstream.
+///
+/// Spec: <https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-blobs>
+fn upstream_blob_path(image: &str, digest: &str) -> String {
+    format!("v2/{}/blobs/{}", image, digest)
+}
+
+/// Format the upstream HTTP path used to fetch a manifest by tag or
+/// digest from a remote OCI member.
+///
+/// Spec: <https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-manifests>
+fn upstream_manifest_path(image: &str, reference: &str) -> String {
+    format!("v2/{}/manifests/{}", image, reference)
+}
+
+/// Pure decision: given a requested `digest` reference and the actual
+/// `content` bytes served by an upstream, decide whether to *reject* the
+/// response on a digest mismatch.
+///
+/// Returns `true` only when (a) the requested reference is itself a
+/// content-addressable digest, and (b) the SHA-256 of the served bytes
+/// does not match it. Tags and other non-digest references always return
+/// `false` (nothing to compare against).
+///
+/// Extracted out of `resolve_virtual_blob` / `resolve_virtual_manifest`
+/// for unit-test coverage of the #1348 round-1 security fix without
+/// having to stand up a wiremock upstream.
+fn upstream_content_violates_digest(reference: &str, content: &[u8]) -> bool {
+    is_digest_reference(reference) && compute_sha256(content) != reference
+}
+
 /// Where (and how) a virtual-repo blob was found.
 ///
 /// `Local` carries the owning member's full `Repository`, boxed to keep
@@ -819,7 +852,7 @@ pub enum VirtualBlobResolution {
 const VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
 const VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
 
-#[derive(Eq, Hash, PartialEq, Clone)]
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
 struct VirtualResolveKey {
     repo_id: Uuid,
     kind: VirtualResolveKind,
@@ -827,7 +860,21 @@ struct VirtualResolveKey {
     reference: String,
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+impl VirtualResolveKey {
+    /// Pure constructor. Centralised so call sites do not need to know
+    /// the field layout (and so unit tests can pin the construction
+    /// without touching the global cache).
+    fn new(repo_id: Uuid, kind: VirtualResolveKind, image: &str, reference: &str) -> Self {
+        Self {
+            repo_id,
+            kind,
+            image: image.to_string(),
+            reference: reference.to_string(),
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 enum VirtualResolveKind {
     Blob,
     Manifest,
@@ -841,6 +888,25 @@ fn virtual_negative_cache(
     CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
+/// Pure decision: given the wall-clock duration since an entry was
+/// inserted and the configured TTL, is the entry still a "hit"?
+///
+/// Extracted out of `virtual_negative_cache_hit` so the freshness window
+/// can be unit-tested without depending on `Instant::now()`.
+fn negative_cache_entry_is_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
+}
+
+/// Pure decision: given the current entry count and the configured
+/// maximum, should an insertion path attempt to evict expired entries
+/// before recording a new one?
+///
+/// Extracted out of `virtual_negative_cache_insert` so the cap policy
+/// is testable without poking at the global cache.
+fn negative_cache_should_evict_before_insert(current_len: usize, max_entries: usize) -> bool {
+    current_len >= max_entries
+}
+
 /// Returns true if a recent resolution attempt for this `(repo_id, kind,
 /// image, reference)` returned None, and the entry has not yet expired.
 fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
@@ -852,7 +918,7 @@ fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
         Err(_) => return false, // poisoned: behave as miss
     };
     match read.get(key) {
-        Some(at) => now.duration_since(*at) < ttl,
+        Some(at) => negative_cache_entry_is_fresh(now.duration_since(*at), ttl),
         None => false,
     }
 }
@@ -869,11 +935,14 @@ fn virtual_negative_cache_insert(key: VirtualResolveKey) {
     // first, and if that doesn't free space, refuse the insert. We never
     // want this cache to behave as a memory leak under pathological probe
     // loads.
-    if write.len() >= VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES {
+    if negative_cache_should_evict_before_insert(write.len(), VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES) {
         let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
         let now = std::time::Instant::now();
-        write.retain(|_, at| now.duration_since(*at) < ttl);
-        if write.len() >= VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES {
+        write.retain(|_, at| negative_cache_entry_is_fresh(now.duration_since(*at), ttl));
+        if negative_cache_should_evict_before_insert(
+            write.len(),
+            VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+        ) {
             return;
         }
     }
@@ -907,12 +976,7 @@ pub async fn resolve_virtual_blob(
     // none of the members serve this blob. Bounds the cost of probe
     // storms (e.g. Docker pull retry loops) against a virtual repo with
     // many remote members.
-    let cache_key = VirtualResolveKey {
-        repo_id,
-        kind: VirtualResolveKind::Blob,
-        image: image_name.to_string(),
-        reference: digest.to_string(),
-    };
+    let cache_key = VirtualResolveKey::new(repo_id, VirtualResolveKind::Blob, image_name, digest);
     if virtual_negative_cache_hit(&cache_key) {
         return None;
     }
@@ -945,7 +1009,7 @@ pub async fn resolve_virtual_blob(
                 (&state.proxy_service, member.upstream_url.as_deref())
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
-                    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+                    let upstream_path = upstream_blob_path(&image, digest);
                     if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
                         proxy,
                         member.id,
@@ -961,9 +1025,9 @@ pub async fn resolve_virtual_blob(
                         // content matches before serving it; otherwise
                         // we would happily relay corrupt or tampered
                         // bytes to the client under the wrong digest.
-                        // `compute_sha256` returns the `sha256:`-prefixed
-                        // form, matching the OCI digest grammar.
-                        if is_digest_reference(digest) && compute_sha256(&content) != digest {
+                        // The decision lives in `upstream_content_violates_digest`
+                        // so it can be unit-tested without a wiremock upstream.
+                        if upstream_content_violates_digest(digest, &content) {
                             warn!(
                                 "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
                                 upstream_url, digest
@@ -1008,12 +1072,8 @@ pub async fn resolve_virtual_manifest(
     // #1348 round 1, concern #2: same negative-cache short-circuit as
     // `resolve_virtual_blob`. Tags vs digest references share the cache
     // because tag probes are themselves a common N-member fan-out.
-    let cache_key = VirtualResolveKey {
-        repo_id,
-        kind: VirtualResolveKind::Manifest,
-        image: image_name.to_string(),
-        reference: reference.to_string(),
-    };
+    let cache_key =
+        VirtualResolveKey::new(repo_id, VirtualResolveKind::Manifest, image_name, reference);
     if virtual_negative_cache_hit(&cache_key) {
         return None;
     }
@@ -1062,7 +1122,7 @@ pub async fn resolve_virtual_manifest(
                 (&state.proxy_service, member.upstream_url.as_deref())
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
-                    let upstream_path = format!("v2/{}/manifests/{}", image, reference);
+                    let upstream_path = upstream_manifest_path(&image, reference);
                     if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_with_accept(
                         proxy,
                         member.id,
@@ -5936,6 +5996,416 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual-repo OCI delegation (PR #1419, refs #1348)
+    //
+    // The async resolvers `resolve_virtual_blob` / `resolve_virtual_manifest`
+    // are exercised end-to-end by wiremock-backed `#[ignore]`d integration
+    // tests under `backend/tests/oci_virtual_resolution_tests.rs`. Those
+    // require a live Postgres so they do not count toward unit-test
+    // coverage. The unit tests below pin each of the *pure* decision
+    // helpers extracted out of the resolver hot path so the logic that
+    // serves cache hits, rejects digest-mismatched upstream content, and
+    // bounds the negative cache is covered without spinning up real
+    // infrastructure.
+    // -----------------------------------------------------------------------
+
+    // candidate_upstream_images: edge-case coverage beyond the existing
+    // happy-path tests above.
+
+    #[test]
+    fn test_candidate_upstream_images_http_docker_hub_normalises() {
+        // Protocol stripping in `is_docker_hub` must also handle `http://`
+        // (we sometimes see this in local-dev configs with TLS-terminating
+        // sidecars). Bare `redis` must still be normalised to `library/redis`.
+        assert_eq!(
+            super::candidate_upstream_images("redis", "http://registry-1.docker.io"),
+            vec!["library/redis".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_subdomain_docker_io() {
+        // `is_docker_hub` matches `host.ends_with(".docker.io")`. This
+        // covers `index.docker.io`, `registry.docker.io`, etc.
+        assert_eq!(
+            super::candidate_upstream_images("nginx", "https://index.docker.io"),
+            vec!["library/nginx".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_quay_preserved_verbatim() {
+        // Quay does not have a `library/` convention. The image must be
+        // returned unmodified so `quay.io/prometheus/node-exporter` resolves
+        // correctly.
+        assert_eq!(
+            super::candidate_upstream_images("prometheus/node-exporter", "https://quay.io"),
+            vec!["prometheus/node-exporter".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_internal_mirror_preserves_image() {
+        // Internal mirror with arbitrary host. We must return a single
+        // candidate equal to the input.
+        let result =
+            super::candidate_upstream_images("myorg/svc", "https://mirror.internal.example.com");
+        assert_eq!(result, vec!["myorg/svc".to_string()]);
+        assert_eq!(result.len(), 1, "no fallback round-trip must be emitted");
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_double_library_prefix_passthrough() {
+        // Defensive: if a caller already passed `library/library/foo` (rare,
+        // but possible via dockerd mirror-mode + a misconfigured upstream),
+        // we don't strip it. The function only *adds* `library/`, never
+        // rewrites an existing one.
+        assert_eq!(
+            super::candidate_upstream_images("library/library/foo", "https://registry-1.docker.io"),
+            vec!["library/library/foo".to_string()]
+        );
+    }
+
+    // upstream_blob_path / upstream_manifest_path: pure path formatters.
+
+    #[test]
+    fn test_upstream_blob_path_uses_v2_prefix() {
+        assert_eq!(
+            super::upstream_blob_path("library/alpine", "sha256:abc"),
+            "v2/library/alpine/blobs/sha256:abc"
+        );
+    }
+
+    #[test]
+    fn test_upstream_blob_path_preserves_nested_image_name() {
+        assert_eq!(
+            super::upstream_blob_path(
+                "myorg/sub/team/app",
+                "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            ),
+            "v2/myorg/sub/team/app/blobs/sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+    }
+
+    #[test]
+    fn test_upstream_manifest_path_tag_reference() {
+        assert_eq!(
+            super::upstream_manifest_path("library/postgres", "16-alpine"),
+            "v2/library/postgres/manifests/16-alpine"
+        );
+    }
+
+    #[test]
+    fn test_upstream_manifest_path_digest_reference() {
+        assert_eq!(
+            super::upstream_manifest_path("nginx", "sha256:1234"),
+            "v2/nginx/manifests/sha256:1234"
+        );
+    }
+
+    // upstream_content_violates_digest: pure decision used by both
+    // resolve_virtual_blob and resolve_virtual_manifest before serving
+    // upstream content. This is the #1348 round-1 security fix.
+
+    #[test]
+    fn test_upstream_content_violates_digest_tag_reference_never_rejects() {
+        // Tags carry no content-addressable contract: the resolver must
+        // accept whatever upstream serves and let the caller compute the
+        // digest itself.
+        assert!(!super::upstream_content_violates_digest(
+            "latest",
+            b"any bytes here"
+        ));
+        assert!(!super::upstream_content_violates_digest("v1.2.3", b""));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_matching_digest_accepts() {
+        // sha256 of "hello world" is a well-known value. The resolver must
+        // accept content whose computed digest equals the requested digest.
+        let bytes = b"hello world";
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(!super::upstream_content_violates_digest(digest, bytes));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_mismatch_rejects() {
+        // Requesting a digest that does *not* match the upstream's bytes
+        // must trip the violation guard. This is the bytes-substitution
+        // attack vector PR #1348 round 1 concern #3 closes.
+        let bytes = b"hello world";
+        // Anything other than the real sha256 of "hello world".
+        let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::upstream_content_violates_digest(fake_digest, bytes));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_empty_content_with_wrong_digest() {
+        // Real sha256 of "" is e3b0c44...b855. Anything else with empty
+        // content must be rejected.
+        assert!(super::upstream_content_violates_digest(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            b""
+        ));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_empty_content_with_correct_digest() {
+        // The canonical empty-string sha256 must pass.
+        assert!(!super::upstream_content_violates_digest(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            b""
+        ));
+    }
+
+    // VirtualResolveKey / VirtualResolveKind: constructor, equality,
+    // hashing. The cache uses this as a hashmap key so each field must
+    // participate in equality.
+
+    #[test]
+    fn test_virtual_resolve_key_new_roundtrip() {
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc");
+        assert_eq!(key.repo_id, id);
+        assert_eq!(key.kind, VirtualResolveKind::Blob);
+        assert_eq!(key.image, "alpine");
+        assert_eq!(key.reference, "sha256:abc");
+    }
+
+    #[test]
+    fn test_virtual_resolve_key_equality_uses_all_fields() {
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let base = VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc");
+
+        // Same fields are equal.
+        assert_eq!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc")
+        );
+        // Different repo_id differentiates.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(other, VirtualResolveKind::Blob, "alpine", "sha256:abc")
+        );
+        // Different kind differentiates: blob and manifest caches must not collide.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:abc")
+        );
+        // Different image differentiates.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "nginx", "sha256:abc")
+        );
+        // Different reference differentiates: a tag and digest miss for
+        // the same image must be cached separately.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:def")
+        );
+    }
+
+    #[test]
+    fn test_virtual_resolve_key_hashes_consistently() {
+        // HashMap relies on `Eq` and `Hash` agreeing. Two keys built with
+        // the same inputs must hash identically.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let id = Uuid::new_v4();
+        let k1 = VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "img", "latest");
+        let k2 = VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "img", "latest");
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        k1.hash(&mut h1);
+        k2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_virtual_resolve_kind_distinct() {
+        assert_ne!(VirtualResolveKind::Blob, VirtualResolveKind::Manifest);
+    }
+
+    // negative_cache_entry_is_fresh: TTL decision boundary.
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_well_within_ttl() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_millis(100),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_just_before_ttl() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_millis(4_999),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_exactly_at_ttl_is_stale() {
+        // Strict `<` comparison: an entry whose age equals the TTL is no
+        // longer fresh. This matters because Tokio's coarse timer can land
+        // exactly on the boundary on overloaded CI runners.
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::negative_cache_entry_is_fresh(ttl, ttl));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_past_ttl_is_stale() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_secs(6),
+            ttl
+        ));
+    }
+
+    // negative_cache_should_evict_before_insert: capacity decision.
+
+    #[test]
+    fn test_negative_cache_should_not_evict_when_under_cap() {
+        assert!(!super::negative_cache_should_evict_before_insert(0, 4096));
+        assert!(!super::negative_cache_should_evict_before_insert(
+            4095, 4096
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_should_evict_at_cap() {
+        // `>=` boundary: when we hit the cap exactly, the insertion path
+        // must attempt eviction before recording a new entry, otherwise we
+        // would exceed the bound by one entry on every insert.
+        assert!(super::negative_cache_should_evict_before_insert(4096, 4096));
+    }
+
+    #[test]
+    fn test_negative_cache_should_evict_when_over_cap() {
+        assert!(super::negative_cache_should_evict_before_insert(
+            10_000, 4096
+        ));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_constants_are_sensible() {
+        // Pin the configured TTL and cap so an accidental edit (e.g.
+        // bumping TTL to 5 minutes) trips review attention.
+        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_TTL_MS, 5_000);
+        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES, 4096);
+    }
+
+    // virtual_negative_cache hit / insert: end-to-end roundtrip through the
+    // process-global cache. The cache is process-local and shared across
+    // tests, so we isolate per-test state by using a fresh random `repo_id`
+    // in every test rather than calling `virtual_negative_cache_clear()`
+    // (which would race against other tests' inserts under
+    // `cargo test`'s default parallel runner).
+
+    #[test]
+    fn test_virtual_negative_cache_hit_returns_false_on_unseen_key() {
+        // A freshly-generated repo_id has never been inserted, so the
+        // cache must report no hit. No `clear()` needed: the UUID is
+        // unique to this test.
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "never-inserted",
+            "sha256:zzz",
+        );
+        assert!(!super::virtual_negative_cache_hit(&key));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_insert_then_hit() {
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(
+            id,
+            VirtualResolveKind::Manifest,
+            "alpine",
+            "sha256:cachehit",
+        );
+        // Sanity: before insert, no hit for this unique key.
+        assert!(!super::virtual_negative_cache_hit(&key));
+        super::virtual_negative_cache_insert(key.clone());
+        assert!(super::virtual_negative_cache_hit(&key));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_blob_and_manifest_kinds_are_isolated() {
+        // The same image+reference cached as a Blob miss must not
+        // short-circuit a Manifest probe (and vice-versa). The `kind`
+        // field is part of the cache key for exactly this reason. We use
+        // a fresh repo_id so this test doesn't interact with any other
+        // running in parallel.
+        let id = Uuid::new_v4();
+        let blob_key =
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:shared");
+        let manifest_key =
+            VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:shared");
+        // Sanity: both kinds are uncached for this unique repo_id.
+        assert!(!super::virtual_negative_cache_hit(&blob_key));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+        super::virtual_negative_cache_insert(blob_key.clone());
+        assert!(super::virtual_negative_cache_hit(&blob_key));
+        // The manifest variant of the same image+reference must still
+        // miss: kinds are isolated.
+        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+    }
+
+    // Note: `virtual_negative_cache_clear()` is exercised by the
+    // wiremock-backed integration tests in
+    // `backend/tests/oci_virtual_resolution_tests.rs`, which run serially
+    // against a real DB. We deliberately do not invoke `clear()` from any
+    // unit test below because `cargo test`'s default parallel runner would
+    // let one test's `clear()` wipe another test's just-inserted entry.
+
+    // VirtualBlobResolution variant construction. The `Local` variant
+    // boxes the owning `Repository` to keep the enum small
+    // (clippy::large_enum_variant); the `Remote` variant carries a
+    // `Bytes` body. Pin the field layout so accidental reshuffles fail
+    // here rather than at a serialisation boundary.
+
+    #[test]
+    fn test_virtual_blob_resolution_remote_variant_fields() {
+        let resolution = VirtualBlobResolution::Remote {
+            content: Bytes::from_static(b"layer-bytes"),
+            content_type: Some("application/octet-stream".to_string()),
+        };
+        match resolution {
+            VirtualBlobResolution::Remote {
+                content,
+                content_type,
+            } => {
+                assert_eq!(content.as_ref(), b"layer-bytes");
+                assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+            }
+            VirtualBlobResolution::Local { .. } => {
+                panic!("Remote variant constructed but Local matched");
+            }
+        }
+    }
+
+    #[test]
+    fn test_virtual_blob_resolution_remote_variant_without_content_type() {
+        // Upstreams that omit Content-Type should still produce a usable
+        // resolution; the caller will fall back to a default media type.
+        let resolution = VirtualBlobResolution::Remote {
+            content: Bytes::new(),
+            content_type: None,
+        };
+        if let VirtualBlobResolution::Remote { content_type, .. } = resolution {
+            assert!(content_type.is_none());
+        } else {
+            panic!("expected Remote variant");
+        }
     }
 }
 
