@@ -353,7 +353,13 @@ impl IncusScanner {
 
         // Detect compression: XZ magic bytes (0xFD 0x37 0x7A 0x58 0x5A)
         let is_xz = content.len() >= 5 && content[..5] == [0xFD, 0x37, 0x7A, 0x58, 0x5A];
-        let decompress_flag = if is_xz { "xJf" } else { "xzf" };
+        // Leading `-` is required: GNU tar only treats a bare option bundle
+        // (`xzf`) as options when it is the FIRST argument. Here it follows
+        // `--no-same-owner`/`--mode=...`, so without the dash GNU tar parses
+        // `xzf` as a file operand and aborts with "You must specify one of
+        // the '-Acdtrux' options". (bsdtar on macOS is lenient, which is why
+        // local runs passed but Linux CI failed.)
+        let decompress_flag = if is_xz { "-xJf" } else { "-xzf" };
 
         run_command(
             "tar",
