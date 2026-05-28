@@ -275,6 +275,14 @@ pub(crate) fn cve_trends_from_aggregates(
         low_count: low,
         avg_days_to_fix: None,
         timeline,
+        // #1446: mirror the count fields under the bare aliases so the
+        // security-tests trends-shape probe (which checks for `total`,
+        // `critical`, `high`, ...) sees a recognized aggregate shape.
+        total,
+        critical,
+        high,
+        medium,
+        low,
     }
 }
 
@@ -3405,6 +3413,35 @@ mod tests {
         // avg_days_to_fix is always None on the scan-findings path.
         assert!(trends.avg_days_to_fix.is_none());
         assert!(trends.timeline.is_empty());
+        // #1446: alias fields must mirror their *_count / *_cves counterparts
+        // so the security-tests `cve-history` trends-shape probe sees a
+        // recognized aggregate (`.total`, `.critical`, `.high`, ...).
+        assert_eq!(trends.total, 100);
+        assert_eq!(trends.critical, 5);
+        assert_eq!(trends.high, 10);
+        assert_eq!(trends.medium, 20);
+        assert_eq!(trends.low, 30);
+    }
+
+    #[test]
+    fn test_cve_trends_serializes_alias_fields() {
+        // #1446: the JSON body must surface `total`, `critical`, `high`,
+        // `medium`, `low` alongside the original `total_cves`,
+        // `critical_count`, ... keys. The security-tests probe accepts ANY
+        // of `.total // .count // .critical // .high` as a recognized
+        // aggregate; we pin both shapes so future refactors can't break it.
+        let trends = cve_trends_from_aggregates(7, 3, 1, 2, 3, 1, 0, 4, vec![]);
+        let json = serde_json::to_value(&trends).expect("serialize CveTrends");
+        // Original keys retained.
+        assert_eq!(json["total_cves"], 7);
+        assert_eq!(json["critical_count"], 2);
+        assert_eq!(json["high_count"], 3);
+        // Alias keys added.
+        assert_eq!(json["total"], 7);
+        assert_eq!(json["critical"], 2);
+        assert_eq!(json["high"], 3);
+        assert_eq!(json["medium"], 1);
+        assert_eq!(json["low"], 0);
     }
 
     #[test]
