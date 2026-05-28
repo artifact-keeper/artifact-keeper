@@ -129,18 +129,17 @@ impl FilesystemBackend {
     }
 
     fn temp_write_path(&self, path: &std::path::Path) -> Result<PathBuf> {
-        let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-            AppError::Storage(format!(
-                "Cannot derive temporary storage path for {}",
-                path.display()
-            ))
-        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "Cannot derive temporary storage path for {}",
+                    path.display()
+                ))
+            })?;
 
-        Ok(path.with_file_name(format!(
-            ".{}.{}.tmp",
-            file_name,
-            Uuid::new_v4().simple()
-        )))
+        Ok(path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple())))
     }
 }
 

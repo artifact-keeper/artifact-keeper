@@ -79,7 +79,8 @@ where
                     return Err(timeout_error());
                 }
 
-                let _ = tokio::time::timeout(remaining.min(FOLLOWER_WAIT_SLICE), notify.notified()).await;
+                let _ = tokio::time::timeout(remaining.min(FOLLOWER_WAIT_SLICE), notify.notified())
+                    .await;
             }
             LocalHydrationRole::Leader(notify) => {
                 let result = async {
@@ -93,8 +94,9 @@ where
 
                     produce
                         .take()
-                        .expect("proxy hydration producer should only run once")()
-                        .await
+                        .expect("proxy hydration producer should only run once")(
+                    )
+                    .await
                 }
                 .await;
 

@@ -720,9 +720,7 @@ impl ProxyService {
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
         coordinate_proxy_hydration(
             &hydration_lease_key,
-            || async {
-                self.get_cached_artifact(&cache_key, &metadata_key).await
-            },
+            || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
             || async {
                 let full_url = Self::build_upstream_url(upstream_url, fetch_path);
                 let upstream_result = self
@@ -763,7 +761,12 @@ impl ProxyService {
                     }
                 }
             },
-            || AppError::Storage(format!("Timed out waiting for proxy cache hydration: {}", cache_key)),
+            || {
+                AppError::Storage(format!(
+                    "Timed out waiting for proxy cache hydration: {}",
+                    cache_key
+                ))
+            },
         )
         .await
     }
