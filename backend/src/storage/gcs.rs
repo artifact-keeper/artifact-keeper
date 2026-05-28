@@ -114,6 +114,30 @@ fn content_range(start: u64, len: u64, total: Option<u64>) -> String {
     }
 }
 
+/// Parse the `Range` header GCS returns on a 308 status-query response and
+/// return the next byte offset to send (the confirmed-last byte + 1).
+///
+/// GCS resumable uploads always start at byte 0, so a valid header is exactly
+/// `bytes=0-<n>` (case-insensitive `bytes=` prefix). Returns `None` for any
+/// other shape (missing `bytes=` prefix, a non-zero start, a non-numeric end,
+/// or trailing junk) so the caller can treat it as a hard error rather than
+/// silently resyncing to offset 0.
+fn parse_resumable_range_next(header: &str) -> Option<u64> {
+    let header = header.trim();
+    // Strip the "bytes=" prefix (case-insensitive on the literal "bytes").
+    let rest = header
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        .map(|_| &header[6..])?;
+    let (start, end) = rest.split_once('-')?;
+    // Resumable uploads always begin at byte 0.
+    if start.trim() != "0" {
+        return None;
+    }
+    let confirmed_last: u64 = end.trim().parse().ok()?;
+    confirmed_last.checked_add(1)
+}
+
 /// True if an upstream HTTP status is a transient failure worth retrying
 /// (429 Too Many Requests, or any 5xx).
 fn is_transient_status(status: u16) -> bool {
@@ -998,16 +1022,71 @@ impl GcsBackend {
             ));
         }
 
-        // Parse "Range: bytes=0-N" → next offset is N+1.
-        let next = resp
-            .headers()
-            .get("Range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.rsplit('-').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .map(|confirmed_last| confirmed_last + 1)
-            .unwrap_or(0);
-        Ok(Some(next))
+        // No Range header on a 308 means GCS has durably received zero bytes,
+        // so the next byte to send is offset 0.
+        let range_header = match resp.headers().get("Range") {
+            None => return Ok(Some(0)),
+            Some(v) => v,
+        };
+
+        // A present Range header must be exactly "bytes=0-N" (resumable uploads
+        // always start at byte 0). Anything else is malformed: rather than
+        // silently resyncing to offset 0 (which would re-PUT already-accepted
+        // bytes and can leave the session in a mismatched state), fail the chunk
+        // so the upload aborts cleanly.
+        let parsed = range_header
+            .to_str()
+            .ok()
+            .and_then(parse_resumable_range_next)
+            .ok_or_else(|| {
+                let raw = range_header.to_str().unwrap_or("<non-utf8>").to_string();
+                AppError::Storage(format!(
+                    "GCS resumable status query returned malformed Range header: {:?}",
+                    raw
+                ))
+            })?;
+        Ok(Some(parsed))
+    }
+
+    /// Issue an explicit terminal finalize PUT (`Content-Range: bytes */<total>`,
+    /// zero-length body) and require a 2xx response.
+    ///
+    /// A 308-confirmed offset from `query_resumable_offset` only means GCS has
+    /// durably *received* every byte; it does NOT mean the object is finalized.
+    /// GCS only finalizes when a PUT declares the total size and it answers
+    /// 200/201. On a resumed final chunk the total may only have been declared
+    /// on the PUT that failed, so the session can still be open even though all
+    /// bytes landed. This terminal PUT closes that gap: we treat the upload as
+    /// done only once GCS confirms finalization with a 2xx. A non-2xx (other
+    /// than a transient that the caller may retry) is surfaced as an error.
+    async fn finalize_resumable(&self, session_url: &str, total: u64) -> Result<()> {
+        let range = content_range(0, 0, Some(total));
+        let resp = self
+            .stream_client
+            .put(session_url)
+            .header("Content-Length", "0")
+            .header("Content-Range", &range)
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "GCS resumable finalize (range {}) network error: {}",
+                    range, e
+                ))
+            })?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(map_status_error(
+            status,
+            &format!("GCS resumable finalize (range {}) not confirmed", range),
+            &body,
+        ))
     }
 
     /// PUT one resumable chunk with bounded retry on transient failures.
@@ -1092,17 +1171,38 @@ impl GcsBackend {
             // Backoff, then resync against the confirmed offset so we don't
             // resend bytes GCS already durably accepted.
             tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-            if let Ok(Some(confirmed_next)) =
-                self.query_resumable_offset(session_url, final_total).await
-            {
-                if confirmed_next >= chunk_end_exclusive {
-                    // Whole chunk already landed during the failed attempt.
+            match self.query_resumable_offset(session_url, final_total).await {
+                Ok(None) => {
+                    // The status query saw a 2xx: the object is already
+                    // finalized. This is the only signal that confirms
+                    // finalization, so it is safe to report success.
                     return Ok(chunk_end_exclusive);
                 }
-                if confirmed_next > offset {
-                    let drop = (confirmed_next - offset) as usize;
-                    body.drain(0..drop.min(body.len()));
-                    offset = confirmed_next;
+                Ok(Some(confirmed_next)) => {
+                    if confirmed_next >= chunk_end_exclusive {
+                        // Every byte of this chunk landed during the failed
+                        // attempt, but a 308 only confirms bytes RECEIVED, not
+                        // a finalized object. For the terminal chunk we must
+                        // still send an explicit finalize PUT and require a 2xx
+                        // before reporting success, otherwise we would return Ok
+                        // on a session GCS never closed.
+                        if let Some(total) = final_total {
+                            self.finalize_resumable(session_url, total).await?;
+                        }
+                        return Ok(chunk_end_exclusive);
+                    }
+                    if confirmed_next > offset {
+                        let drop = (confirmed_next - offset) as usize;
+                        body.drain(0..drop.min(body.len()));
+                        offset = confirmed_next;
+                    }
+                }
+                Err(e) => {
+                    // A status query that itself fails (e.g. malformed Range,
+                    // see parse_resumable_range_next) is not recoverable: abort
+                    // the chunk rather than blindly resending from a guessed
+                    // offset.
+                    return Err(e);
                 }
             }
         }
@@ -1543,6 +1643,36 @@ mod tests {
     #[test]
     fn test_content_range_zero_byte_object() {
         assert_eq!(content_range(0, 0, Some(0)), "bytes */0");
+    }
+
+    // ---- parse_resumable_range_next pure helper ----
+
+    #[test]
+    fn test_parse_resumable_range_next_valid() {
+        // bytes=0-N → next offset is N+1.
+        assert_eq!(parse_resumable_range_next("bytes=0-0"), Some(1));
+        assert_eq!(
+            parse_resumable_range_next("bytes=0-16777215"),
+            Some(16777216)
+        );
+        // Case-insensitive on the "bytes=" literal, tolerant of surrounding ws.
+        assert_eq!(parse_resumable_range_next("  Bytes=0-9  "), Some(10));
+    }
+
+    #[test]
+    fn test_parse_resumable_range_next_rejects_malformed() {
+        // Non-zero start (resumable uploads always begin at 0).
+        assert_eq!(parse_resumable_range_next("bytes=5-10"), None);
+        // Missing the "bytes=" prefix.
+        assert_eq!(parse_resumable_range_next("0-10"), None);
+        assert_eq!(parse_resumable_range_next("0-10/100"), None);
+        // No dash separator.
+        assert_eq!(parse_resumable_range_next("bytes=0"), None);
+        // Non-numeric end.
+        assert_eq!(parse_resumable_range_next("bytes=0-abc"), None);
+        // Empty / garbage.
+        assert_eq!(parse_resumable_range_next(""), None);
+        assert_eq!(parse_resumable_range_next("nonsense"), None);
     }
 
     #[test]
@@ -2567,6 +2697,243 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.bytes_written, total as u64);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_resume_from_nonzero_offset() {
+        // An intermediate chunk PUT fails transiently, and the status query
+        // reports that GCS already durably accepted the first 16 MiB of the
+        // 32 MiB chunk (Range: bytes=0-16777215). The retry must resume from
+        // byte 16777216 with exactly the remaining 16 MiB body, not resend from
+        // 0. This exercises the body.drain / offset = confirmed_next slicing.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/resume-nonzero";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // First full-chunk PUT (bytes 0-33554431/*) fails once with 503.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query (bytes */*): 308 with Range showing 16 MiB confirmed, so
+        // confirmed_next == 16777216.
+        let half = 16 * 1024 * 1024u64;
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes */*"))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", half - 1).as_str()),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        // Retry must resume from byte 16777216 carrying exactly the remaining
+        // 16 MiB. Assert both the start offset (Content-Range) and the remaining
+        // body length (Content-Length).
+        let resume_range = format!("bytes {}-{}/*", half, RESUMABLE_CHUNK_SIZE - 1);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", resume_range.as_str()))
+            .and(header("Content-Length", half.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(308))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Final chunk carrying the total → 200.
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0x77u8; RESUMABLE_CHUNK_SIZE], vec![0x88u8; 8]];
+        let result = backend
+            .put_stream("repos/resume.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+        // The .expect(1) on the resume PUT is verified on server drop.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_finalize_after_resume() {
+        // The FINAL chunk PUT fails transiently, the status query then reports
+        // every byte received (308, Range covering the whole object). A 308 only
+        // confirms bytes received, NOT a finalized object, so the code must send
+        // an explicit terminal finalize PUT (bytes */<total>) and require a 2xx
+        // before reporting success.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/finalize-resume";
+        let location = format!("{}{}", server.uri(), session_path);
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let finalize_range = format!("bytes */{}", total);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // Intermediate chunk → 308.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .mount(&server)
+            .await;
+
+        // Final chunk PUT fails once with 503 (transient).
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query (bytes */<total>): first call returns 308 with a Range
+        // showing the whole object is durably received.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", total - 1).as_str()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Terminal finalize PUT (same bytes */<total> shape) must fire and is
+        // answered with 200. Assert it is called exactly once.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0x99u8; RESUMABLE_CHUNK_SIZE], vec![0xAAu8; 8]];
+        let result = backend
+            .put_stream("repos/finalize.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+        // The .expect(1) on the finalize PUT is verified on server drop.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_finalize_after_resume_non_2xx_errors() {
+        // Same resumed-final-chunk path as above, but the terminal finalize PUT
+        // comes back non-2xx (the session never closed). The upload must NOT be
+        // reported as successful: the error is surfaced to the caller.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/finalize-fail";
+        let location = format!("{}{}", server.uri(), session_path);
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let finalize_range = format!("bytes */{}", total);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // The abort DELETE that put_stream issues on failure.
+        Mock::given(method("DELETE"))
+            .and(path_regex(session_path))
+            .respond_with(ResponseTemplate::new(499))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .mount(&server)
+            .await;
+
+        // Final chunk PUT fails once with 503.
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query: 308, whole object received.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", total - 1).as_str()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Terminal finalize PUT returns 500: the object is not finalized.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("finalize failed"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0xBBu8; RESUMABLE_CHUNK_SIZE], vec![0xCCu8; 8]];
+        let err = backend
+            .put_stream("repos/finalize-fail.bin", stream_of(chunks))
+            .await;
+        assert!(
+            err.is_err(),
+            "a non-2xx finalize after resume must be surfaced as an error, got: {:?}",
+            err.map(|r| r.bytes_written)
+        );
     }
 
     #[tokio::test]
