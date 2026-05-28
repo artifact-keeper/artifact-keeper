@@ -411,6 +411,14 @@ fn blob_storage_key(digest: &str) -> String {
     format!("oci-blobs/{}", digest)
 }
 
+/// Storage key prefix for OCI manifest objects.
+///
+/// WARNING: the `oci-manifests/` prefix is also hard-coded in the
+/// lifecycle cascade SQL (`backend/src/services/lifecycle_service.rs`,
+/// `CASCADE_OCI_TAGS_SQL`) and in the storage GC orphan predicate
+/// (`backend/src/services/storage_gc_service.rs`). Changing this
+/// function alone will silently break both. Tracked in #1413 for
+/// extracting a shared constant.
 fn manifest_storage_key(digest: &str) -> String {
     format!("oci-manifests/{}", digest)
 }

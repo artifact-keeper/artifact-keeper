@@ -156,14 +156,20 @@ impl MigrationService {
 
         let (url, auth_type, credentials_enc) = connection;
 
-        // Decrypt credentials using the migration encryption key
-        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY").map_err(|_| {
-            MigrationError::ConfigError(
-                "MIGRATION_ENCRYPTION_KEY is not set. \
-                 Configure this environment variable before using migration features."
-                    .to_string(),
-            )
-        })?;
+        // Decrypt credentials using the migration encryption key. Falls
+        // back to the dev passphrase if the env var is unset so we can
+        // decrypt rows written by `migration::create_connection` under
+        // the same fallback (see issue #1439 / Bug A).
+        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "MIGRATION_ENCRYPTION_KEY is not set; using built-in fallback to \
+                     decrypt source-connection credentials."
+                );
+                "artifact-keeper-default-migration-key-dev-only".to_string()
+            });
         let credentials_json =
             crate::services::encryption::decrypt_credentials(&credentials_enc, &encryption_key)
                 .map_err(|e| MigrationError::ConfigError(format!("Decryption failed: {}", e)))?;
