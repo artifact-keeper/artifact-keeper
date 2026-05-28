@@ -87,12 +87,69 @@ impl BlockReason {
     }
 }
 
-/// Validate that a URL is safe for the server to contact (anti-SSRF).
+/// Which validator path is calling. Each path consults a distinct
+/// "allow private IPs" env var so a test cluster that needs to relax one
+/// surface does not accidentally relax the other. Issue #1435.
+///
+/// - [`OutboundUrlContext::Upstream`] reads `UPSTREAM_ALLOW_PRIVATE_IPS`.
+///   Use for remote-repository upstream URLs and any other "the backend
+///   fetches a package on behalf of a client" path.
+/// - [`OutboundUrlContext::Webhook`] reads `WEBHOOK_ALLOW_PRIVATE_IPS`.
+///   Use for webhook delivery target URLs.
+///
+/// The named-CIDR allowlist (`AK_SSRF_ALLOW_PRIVATE_CIDRS`) is shared
+/// across both contexts because it is a positive allowlist that operators
+/// curate explicitly; widening it is an opt-in action, not a per-surface
+/// relaxation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundUrlContext {
+    /// Remote-proxy / upstream fetch path.
+    Upstream,
+    /// Webhook delivery target path.
+    Webhook,
+}
+
+impl OutboundUrlContext {
+    /// Name of the env var that, when set to a truthy value, exempts
+    /// RFC1918 / IPv6 unique-local addresses for this context.
+    fn env_var(self) -> &'static str {
+        match self {
+            OutboundUrlContext::Upstream => "UPSTREAM_ALLOW_PRIVATE_IPS",
+            OutboundUrlContext::Webhook => "WEBHOOK_ALLOW_PRIVATE_IPS",
+        }
+    }
+}
+
+/// Validate that a URL is safe for the server to contact (anti-SSRF) in
+/// the upstream / remote-proxy context. Reads `UPSTREAM_ALLOW_PRIVATE_IPS`
+/// for the private-IP relaxation toggle.
 ///
 /// Rejects private/internal IPs, known cloud metadata endpoints, and
 /// Docker-internal service hostnames. `label` is used in error messages
-/// (e.g. "Webhook URL", "Remote instance URL").
+/// (e.g. "Remote instance URL", "PyPI upstream file URL").
+///
+/// For webhook URLs use [`validate_outbound_webhook_url`] which reads
+/// the separate `WEBHOOK_ALLOW_PRIVATE_IPS` env var so test clusters
+/// can relax one surface without defeating the SSRF guard on the other.
 pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
+    validate_outbound_url_with(url_str, label, OutboundUrlContext::Upstream)
+}
+
+/// Validate a webhook delivery target URL (anti-SSRF). Reads
+/// `WEBHOOK_ALLOW_PRIVATE_IPS` for the private-IP relaxation toggle.
+///
+/// Functionally identical to [`validate_outbound_url`] except for which
+/// env var gates the RFC1918 / IPv6 unique-local relaxation. Split out
+/// in issue #1435 so a test cluster that enables webhook tests against a
+/// local mock receiver does not also relax the SSRF guard for remote
+/// proxy upstream URLs (and vice versa).
+pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
+    validate_outbound_url_with(url_str, label, OutboundUrlContext::Webhook)
+}
+
+/// Common implementation shared by the per-context validators. The
+/// `ctx` selects which env var the private-IP relaxation toggle reads.
+fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContext) -> Result<()> {
     let parsed = reqwest::Url::parse(url_str)
         .map_err(|_| AppError::Validation(format!("Invalid {}", label)))?;
 
@@ -108,7 +165,7 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
         return Err(AppError::Validation(format!("{} must have a host", label)));
     }
 
-    if let Some(reason) = is_blocked_url(&parsed) {
+    if let Some(reason) = is_blocked_url_in(&parsed, ctx) {
         record_block(label, &reason);
         return Err(match reason {
             BlockReason::Hostname(host) => {
@@ -124,10 +181,21 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Decide whether a parsed URL targets a blocked address. Used by both
-/// [`validate_outbound_url`] and the redirect policy on the shared HTTP
-/// client. Returning `Some(_)` means the request must not be issued.
+/// Decide whether a parsed URL targets a blocked address. Used by the
+/// redirect policy on the shared HTTP client. Uses the `Upstream`
+/// context (i.e. honors `UPSTREAM_ALLOW_PRIVATE_IPS`) because the
+/// redirect policy fires on every outbound HTTP, including upstream
+/// proxy fetches. Webhook delivery code paths re-validate the final URL
+/// with [`validate_outbound_webhook_url`] before sending, so a webhook
+/// that depends on `WEBHOOK_ALLOW_PRIVATE_IPS` does not need the
+/// redirect policy to also relax under the webhook env var.
 pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
+    is_blocked_url_in(url, OutboundUrlContext::Upstream)
+}
+
+/// Context-aware variant of [`is_blocked_url`]. Returning `Some(_)`
+/// means the request must not be issued for the given context.
+fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<BlockReason> {
     let host = url.host_str()?;
     let host_lower = host.to_lowercase();
     // Strip a trailing dot so `localhost.` is treated like `localhost`.
@@ -146,7 +214,7 @@ pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
-        if is_blocked_ip(ip) {
+        if is_blocked_ip_in(ip, ctx) {
             return Some(BlockReason::Ip(ip));
         }
     }
@@ -172,26 +240,35 @@ pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
 ///   evaluated *first* so `::1` is correctly classified as IPv6 loopback
 ///   rather than IPv4 alias `0.0.0.1`.
 ///
-/// Private-IP allowlist (issues #976, #1224): operators on corporate
-/// networks with no public internet, or in-cluster test fixtures that
-/// need to reach a mock upstream on a pod CIDR, may need to point
-/// upstreams at internal mirrors. Two opt-in escape hatches:
+/// Private-IP allowlist (issues #976, #1224, #1435): operators on
+/// corporate networks with no public internet, or in-cluster test
+/// fixtures that need to reach a mock upstream on a pod CIDR, may need
+/// to point upstreams at internal mirrors. Three opt-in escape hatches:
 ///
 /// - `UPSTREAM_ALLOW_PRIVATE_IPS=true` — allow all RFC1918 + IPv6
-///   unique-local. Cloud metadata IPs (169.254.169.254, 192.0.0.192,
-///   100.100.100.200) and loopback / link-local / unspecified remain
-///   blocked, since those are SSRF targets, not "internal mirrors".
+///   unique-local for the **upstream / remote-proxy** path.
+/// - `WEBHOOK_ALLOW_PRIVATE_IPS=true` — same relaxation but for the
+///   **webhook delivery** path. Split from the upstream toggle in
+///   issue #1435 so a test cluster that enables one surface does not
+///   silently relax the other.
 /// - `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8,192.168.7.0/24` — more
-///   precise: only the listed CIDRs are exempted. Same metadata /
-///   loopback hard-blocks apply. Wins over the blanket toggle if both
-///   are set (allowlist is strictly more restrictive).
+///   precise: only the listed CIDRs are exempted, and this allowlist
+///   applies to **both** contexts. Same metadata / loopback hard-blocks
+///   apply. Wins over the blanket toggle if both are set (allowlist is
+///   strictly more restrictive).
 ///   `UPSTREAM_PRIVATE_IP_ALLOWLIST` is accepted as a backward-compatible
 ///   alias; if both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` takes
 ///   precedence.
-pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+///
+/// Cloud metadata IPs (169.254.169.254, 192.0.0.192, 100.100.100.200)
+/// and loopback / link-local / unspecified remain blocked under every
+/// relaxation, since those are SSRF targets, not "internal mirrors".
+///
+/// Context-aware: selects which env var gates the private-IP allowlist.
+fn is_blocked_ip_in(ip: std::net::IpAddr, ctx: OutboundUrlContext) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
-        std::net::IpAddr::V6(v6) => is_blocked_ipv6(v6),
+        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4, ctx),
+        std::net::IpAddr::V6(v6) => is_blocked_ipv6(v6, ctx),
     }
 }
 
@@ -211,7 +288,7 @@ fn is_hard_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
     false
 }
 
-fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
+fn is_blocked_ipv4(v4: std::net::Ipv4Addr, ctx: OutboundUrlContext) -> bool {
     // Hard blocks first: metadata IPs and loopback are never unblocked
     // by the private-IP allowlist toggle.
     if is_hard_blocked_ipv4(v4) {
@@ -219,7 +296,7 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
     }
     let octets = v4.octets();
     if v4.is_private() {
-        return !private_ip_allowed(std::net::IpAddr::V4(v4));
+        return !private_ip_allowed(std::net::IpAddr::V4(v4), ctx);
     }
     if cgnat_block_enabled()
         && octets[0] == 100
@@ -230,7 +307,7 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
     false
 }
 
-fn is_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
+fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
     // Evaluate IPv6 own properties first so `::1` is caught as IPv6
     // loopback before the IPv4-alias fallthrough re-interprets it.
     if v6.is_loopback() || v6.is_unspecified() {
@@ -243,38 +320,43 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
     if segs[0] & IPV6_UNIQUE_LOCAL_MASK == IPV6_UNIQUE_LOCAL_PREFIX {
         // Unique-local (fc00::/7) is the IPv6 equivalent of RFC1918.
         // Honor the same allowlist as IPv4 private addresses.
-        return !private_ip_allowed(std::net::IpAddr::V6(v6));
+        return !private_ip_allowed(std::net::IpAddr::V6(v6), ctx);
     }
     // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
     // forms must obey the IPv4 rules so attackers cannot bypass them
     // by writing the v4 address inside a v6 literal.
     if let Some(v4) = v6.to_ipv4_mapped() {
-        return is_blocked_ipv4(v4);
+        return is_blocked_ipv4(v4, ctx);
     }
     if let Some(v4) = v6.to_ipv4() {
-        return is_blocked_ipv4(v4);
+        return is_blocked_ipv4(v4, ctx);
     }
     false
 }
 
 /// Whether the operator has opted the given private IP into the
-/// upstream allowlist. Returns false (i.e. block) by default. Order:
+/// allowlist for the given context. Returns false (i.e. block) by
+/// default. Order:
 ///
 /// 1. If `AK_SSRF_ALLOW_PRIVATE_CIDRS` (or its backward-compatible
 ///    alias `UPSTREAM_PRIVATE_IP_ALLOWLIST`) is set, only IPs inside
 ///    one of those CIDRs are exempted. The blanket toggle is ignored.
 ///    If both are set, `AK_SSRF_ALLOW_PRIVATE_CIDRS` wins so the
-///    canonical name is the operator's source of truth.
-/// 2. Otherwise, `UPSTREAM_ALLOW_PRIVATE_IPS=true` exempts all
-///    RFC1918 + IPv6 unique-local addresses.
+///    canonical name is the operator's source of truth. The allowlist
+///    applies to both contexts.
+/// 2. Otherwise, the per-context blanket toggle is consulted:
+///    `UPSTREAM_ALLOW_PRIVATE_IPS=true` for the upstream/remote-proxy
+///    path, `WEBHOOK_ALLOW_PRIVATE_IPS=true` for the webhook path.
+///    Issue #1435 split these so relaxing one does not silently relax
+///    the other.
 ///
 /// Metadata IPs and loopback are checked separately and are never
 /// reachable through this path (see `is_hard_blocked_ipv4`).
-fn private_ip_allowed(ip: std::net::IpAddr) -> bool {
+fn private_ip_allowed(ip: std::net::IpAddr, ctx: OutboundUrlContext) -> bool {
     if let Some(list) = private_cidr_allowlist_value() {
         return cidr_list_contains(&list, ip);
     }
-    upstream_allow_private_ips_enabled()
+    allow_private_ips_enabled(ctx)
 }
 
 /// Read the configured private-CIDR allowlist, preferring the canonical
@@ -303,7 +385,21 @@ pub fn private_cidr_allowlist_value() -> Option<String> {
 /// can use the same parsing for the startup-log message and there is
 /// only one place to update if the accepted vocabulary changes.
 pub fn upstream_allow_private_ips_enabled() -> bool {
-    match std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS") {
+    allow_private_ips_enabled(OutboundUrlContext::Upstream)
+}
+
+/// True when `WEBHOOK_ALLOW_PRIVATE_IPS` is set to a truthy value.
+/// Mirror of [`upstream_allow_private_ips_enabled`] for the webhook
+/// surface (issue #1435).
+pub fn webhook_allow_private_ips_enabled() -> bool {
+    allow_private_ips_enabled(OutboundUrlContext::Webhook)
+}
+
+/// Context-aware truthy-env parse. Single source of truth for the
+/// "allow private IPs" vocabulary so `1` / `true` / `TRUE` are
+/// recognised identically by both surfaces.
+fn allow_private_ips_enabled(ctx: OutboundUrlContext) -> bool {
+    match std::env::var(ctx.env_var()) {
         Ok(v) => {
             let t = v.trim();
             t == "1" || t.eq_ignore_ascii_case("true")
@@ -819,6 +915,7 @@ mod tests {
     struct AllowlistGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
+        prev_webhook: Option<String>,
         prev_list: Option<String>,
         prev_ssrf: Option<String>,
     }
@@ -829,10 +926,12 @@ mod tests {
             let g = Self {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
+                prev_webhook: std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").ok(),
                 prev_list: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
                 prev_ssrf: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
             };
             std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
             std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
             std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
             g
@@ -844,6 +943,10 @@ mod tests {
             match &self.prev_allow {
                 Some(v) => std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", v),
                 None => std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS"),
+            }
+            match &self.prev_webhook {
+                Some(v) => std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", v),
+                None => std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS"),
             }
             match &self.prev_list {
                 Some(v) => std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", v),
@@ -1225,5 +1328,134 @@ mod tests {
             Some("10.0.0.0/8"),
             "blank new value falls through to legacy alias"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1435: env-var split between upstream and webhook private-IP
+    // relaxation. Relaxing one surface must not silently relax the other.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_validator_ignores_upstream_env_var() {
+        // The webhook validator must NOT honor UPSTREAM_ALLOW_PRIVATE_IPS.
+        // This is the security regression: the test cluster previously set
+        // UPSTREAM_ALLOW_PRIVATE_IPS=1 to allow webhook tests, which also
+        // defeated the SSRF guard for remote-proxy upstream URLs. After the
+        // split, only WEBHOOK_ALLOW_PRIVATE_IPS relaxes the webhook path.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        let result = validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL");
+        assert!(
+            result.is_err(),
+            "webhook validator must reject 10.0.0.1 when only UPSTREAM_ALLOW_PRIVATE_IPS is set"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("private/internal network"),
+            "expected IP-block rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_upstream_validator_ignores_webhook_env_var() {
+        // Inverse of the above: setting WEBHOOK_ALLOW_PRIVATE_IPS must
+        // NOT relax the upstream / remote-proxy validator.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        let result = validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL");
+        assert!(
+            result.is_err(),
+            "upstream validator must reject 10.0.0.1 when only WEBHOOK_ALLOW_PRIVATE_IPS is set"
+        );
+    }
+
+    #[test]
+    fn test_webhook_validator_accepts_rfc1918_when_webhook_env_set() {
+        // Positive case: the new webhook env var actually relaxes the
+        // webhook surface so the test cluster's mock receiver remains
+        // reachable after the rename.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL").is_ok(),
+            "10.0.0.1 must be allowed for webhook URLs when WEBHOOK_ALLOW_PRIVATE_IPS=true"
+        );
+        assert!(
+            validate_outbound_webhook_url("http://192.168.7.5/hook", "Webhook URL").is_ok(),
+            "192.168.7.5 must be allowed for webhook URLs when WEBHOOK_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_webhook_validator_still_blocks_loopback_with_webhook_env() {
+        // Loopback is the AK process itself. WEBHOOK_ALLOW_PRIVATE_IPS
+        // must NEVER unblock 127.0.0.1 or ::1, since that would let a
+        // webhook reach admin endpoints colocated on the same host.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_webhook_url("http://127.0.0.1:9090/hook", "Webhook URL").is_err(),
+            "127.0.0.1 must stay blocked even with WEBHOOK_ALLOW_PRIVATE_IPS=true"
+        );
+        assert!(
+            validate_outbound_webhook_url("http://[::1]:8080/hook", "Webhook URL").is_err(),
+            "::1 must stay blocked even with WEBHOOK_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_webhook_validator_still_blocks_metadata_with_webhook_env() {
+        // Cloud metadata IPs are the canonical SSRF target. They must
+        // NEVER be reachable through the webhook surface, regardless of
+        // env-var relaxation.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(validate_outbound_webhook_url(
+            "http://169.254.169.254/latest/meta-data",
+            "Webhook URL"
+        )
+        .is_err());
+        assert!(
+            validate_outbound_webhook_url("http://192.0.0.192/opc/v2/instance", "Webhook URL")
+                .is_err()
+        );
+        assert!(validate_outbound_webhook_url(
+            "http://100.100.100.200/latest/meta-data",
+            "Webhook URL"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_named_cidr_allowlist_applies_to_both_contexts() {
+        // AK_SSRF_ALLOW_PRIVATE_CIDRS is a positive allowlist that
+        // operators curate explicitly. It applies to BOTH contexts.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.244.0.0/16");
+        assert!(
+            validate_outbound_webhook_url("http://10.244.0.5/hook", "Webhook URL").is_ok(),
+            "named allowlist must apply to webhook context"
+        );
+        assert!(
+            validate_outbound_url("http://10.244.0.5/upstream", "Upstream URL").is_ok(),
+            "named allowlist must apply to upstream context"
+        );
+        // Outside the allowlist: both contexts still block.
+        assert!(validate_outbound_webhook_url("http://10.0.0.1/hook", "Webhook URL").is_err());
+        assert!(validate_outbound_url("http://10.0.0.1/upstream", "Upstream URL").is_err());
+    }
+
+    #[test]
+    fn test_webhook_allow_private_ips_enabled_helper() {
+        // Boot-time helper used by main.rs to log the security posture.
+        let _g = AllowlistGuard::new();
+        assert!(!webhook_allow_private_ips_enabled());
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(webhook_allow_private_ips_enabled());
+        // Truthy vocabulary mirrors UPSTREAM_ALLOW_PRIVATE_IPS.
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "1");
+        assert!(webhook_allow_private_ips_enabled());
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "maybe");
+        assert!(!webhook_allow_private_ips_enabled());
     }
 }

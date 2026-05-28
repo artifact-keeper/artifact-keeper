@@ -277,6 +277,16 @@ pub struct CveTimelineEntry {
 }
 
 /// CVE trends summary.
+///
+/// #1446: the security-tests `cve-history` suite probes the trends body for
+/// any of `total`, `count`, `critical`, or `high` to confirm the response
+/// carries aggregate counts (PR #1385 fixed `cve-history` but the trends
+/// shape was not aligned). The original field set (`total_cves`,
+/// `critical_count`, ...) is retained for openapi consumers; the bare
+/// `total`/`critical`/`high`/`medium`/`low` aliases are added alongside so
+/// both shape contracts are satisfied without breaking existing clients.
+/// `#[serde(default)]` keeps deserialization working when the alias fields
+/// are absent (older payloads, tests that build the struct via field init).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CveTrends {
     pub total_cves: i64,
@@ -289,6 +299,21 @@ pub struct CveTrends {
     pub low_count: i64,
     pub avg_days_to_fix: Option<f64>,
     pub timeline: Vec<CveTimelineEntry>,
+    /// Alias of `total_cves` (#1446).
+    #[serde(default)]
+    pub total: i64,
+    /// Alias of `critical_count` (#1446).
+    #[serde(default)]
+    pub critical: i64,
+    /// Alias of `high_count` (#1446).
+    #[serde(default)]
+    pub high: i64,
+    /// Alias of `medium_count` (#1446).
+    #[serde(default)]
+    pub medium: i64,
+    /// Alias of `low_count` (#1446).
+    #[serde(default)]
+    pub low: i64,
 }
 
 #[cfg(test)]

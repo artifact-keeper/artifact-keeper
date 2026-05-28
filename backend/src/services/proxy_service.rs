@@ -202,8 +202,16 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
 
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
-/// * Other non-2xx → `AppError::Storage` (transient/upstream-misconfig
-///   error; bubbles to the client as 500/5xx)
+/// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
+///   bubbles to the client as 503). Closes the 502-leak path in #1445:
+///   a flaky upstream returning 502/503/504 should NOT propagate the raw
+///   status to the client. Surfacing 503 lets clients (and our own retry
+///   guard / single-flight followers) treat the failure as "try again in
+///   a moment" instead of misclassifying it as a permanent gateway error.
+/// * Other 4xx (401, 403, etc.) → `AppError::BadGateway` (upstream-config /
+///   auth misconfig; bubbles to the client as 502). 4xx is genuinely a
+///   gateway-side problem (the upstream told us we are not allowed) so
+///   503 would be misleading.
 /// * 2xx → `Ok(())`
 fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     if status == StatusCode::NOT_FOUND {
@@ -212,8 +220,14 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
             url
         )));
     }
+    if status.is_server_error() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "Upstream returned error status {}: {}",
+            status, url
+        )));
+    }
     if !status.is_success() {
-        return Err(AppError::Storage(format!(
+        return Err(AppError::BadGateway(format!(
             "Upstream returned error status {}: {}",
             status, url
         )));
@@ -1387,19 +1401,12 @@ impl ProxyService {
         let status = response.status();
         let effective_url = response.url().to_string();
 
-        if status == StatusCode::NOT_FOUND {
-            return Err(AppError::NotFound(format!(
-                "Artifact not found at upstream: {}",
-                url
-            )));
-        }
-
-        if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
+        // Centralise the 404/4xx/5xx classification through
+        // `validate_upstream_status` (#1445) so the buffered fetch path
+        // gets the same 5xx -> ServiceUnavailable mapping the streaming
+        // path does. Previously this inlined a "non-2xx -> Storage" rule
+        // that surfaced raw upstream 502/503/504 to clients as 502.
+        validate_upstream_status(status, url)?;
 
         let content_type = response
             .headers()
@@ -2152,6 +2159,52 @@ mod tests {
         assert_eq!(
             ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz").unwrap(),
             "proxy-cache/npm-proxy/@types/node/-/node-18.0.0.tgz/__content__"
+        );
+    }
+
+    /// #1445 (C): scoped npm tarball remote-proxy round-trip.
+    ///
+    /// The npm handler builds the upstream path as
+    /// `@scope%2Fpkg/-/{filename}` (with the scope separator percent-
+    /// encoded) and passes the SAME string as both the upstream fetch
+    /// path AND the proxy-cache path. The cache key derived from that
+    /// path MUST be byte-identical between write and read, otherwise a
+    /// cached tarball is invisible to the next request and every fetch
+    /// re-hits upstream, exactly the "scoped tarball through remote
+    /// proxy fails" symptom in #1445(C).
+    ///
+    /// This test pins the key formula so a future "normalize the cache
+    /// path before storing" refactor cannot silently regress.
+    #[test]
+    fn test_cache_storage_key_scoped_npm_encoded_path_round_trip() {
+        // Path as the npm handler constructs it (encode_package_name_for_upstream).
+        let encoded_path = "@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz";
+
+        let write_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a cache key");
+        let read_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a cache key on read");
+
+        assert_eq!(
+            write_key, read_key,
+            "scoped npm cache key MUST be deterministic so cached \
+             tarballs survive the next request (#1445C)"
+        );
+        assert_eq!(
+            write_key, "proxy-cache/npm-proxy/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz/__content__",
+            "scoped npm cache key MUST preserve the %2F-encoded scope \
+             separator verbatim. The upstream fetch path uses the same \
+             string, and any normalisation here would desync the two."
+        );
+
+        // The matching metadata key must round-trip too, otherwise the
+        // freshness probe and the content lookup land in different
+        // storage namespaces.
+        let meta_key = ProxyService::cache_metadata_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a metadata key");
+        assert_eq!(
+            meta_key,
+            "proxy-cache/npm-proxy/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz/__cache_meta__.json"
         );
     }
 
@@ -4485,28 +4538,63 @@ SHA256:
     }
 
     #[test]
-    fn test_validate_upstream_status_5xx_is_storage_error() {
+    fn test_validate_upstream_status_5xx_is_service_unavailable() {
+        // #1445: upstream 5xx (502/503/504/etc.) MUST map to
+        // ServiceUnavailable so the client sees a 503 (a transient,
+        // "retry in a moment" signal) instead of a raw 502 leaking from
+        // upstream. The previous mapping (Storage -> 502) made every
+        // flaky-upstream incident look like a permanent gateway failure
+        // to clients and broke the contract that the proxy returns
+        // either 2xx or 503 under load.
         match validate_upstream_status(StatusCode::INTERNAL_SERVER_ERROR, "http://up/x") {
-            Err(AppError::Storage(msg)) => {
+            Err(AppError::ServiceUnavailable(msg)) => {
                 assert!(msg.contains("500"));
                 assert!(msg.contains("http://up/x"));
             }
-            other => panic!("500 must map to AppError::Storage; got {:?}", other),
+            other => panic!(
+                "500 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
         }
         match validate_upstream_status(StatusCode::BAD_GATEWAY, "http://up/x") {
-            Err(AppError::Storage(_)) => {}
-            other => panic!("502 must map to AppError::Storage; got {:?}", other),
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "502 must map to AppError::ServiceUnavailable so the proxy \
+                 returns 503 instead of leaking the raw upstream 502 \
+                 (closes #1445); got {:?}",
+                other
+            ),
+        }
+        match validate_upstream_status(StatusCode::SERVICE_UNAVAILABLE, "http://up/x") {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "503 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
+        }
+        match validate_upstream_status(StatusCode::GATEWAY_TIMEOUT, "http://up/x") {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "504 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
         }
     }
 
     #[test]
-    fn test_validate_upstream_status_4xx_other_is_storage_error() {
+    fn test_validate_upstream_status_4xx_other_is_bad_gateway() {
         // Non-404 4xx (e.g. 401 if it slipped past the retry path, or
-        // 403 from a misconfigured private mirror) must NOT be mistaken
-        // for a cache miss. Falls through to Storage class.
+        // 403 from a misconfigured private mirror) is genuinely a
+        // gateway-side / auth-misconfig problem and stays mapped to
+        // BadGateway (502). A 503 would mislead clients into retrying
+        // an auth failure that needs a config fix.
         match validate_upstream_status(StatusCode::FORBIDDEN, "http://up/x") {
-            Err(AppError::Storage(_)) => {}
-            other => panic!("403 must map to AppError::Storage; got {:?}", other),
+            Err(AppError::BadGateway(_)) => {}
+            other => panic!("403 must map to AppError::BadGateway; got {:?}", other),
+        }
+        match validate_upstream_status(StatusCode::UNAUTHORIZED, "http://up/x") {
+            Err(AppError::BadGateway(_)) => {}
+            other => panic!("401 must map to AppError::BadGateway; got {:?}", other),
         }
     }
 
@@ -5031,6 +5119,92 @@ SHA256:
 
         let (body, _) = result.expect("blob fetch with accept=None must succeed");
         assert_eq!(&body[..], b"blob-bytes");
+    }
+
+    /// #1445 (A): the buffered proxy fetch path MUST persist the
+    /// upstream bytes AND make them visible to the next request through
+    /// the same proxy_service. The reproducer "cached artifacts should
+    /// contain `abbrev` after npm upstream fetch -- not present" asserts
+    /// this round-trip end-to-end against the live `/artifacts` listing
+    /// endpoint, which depends on the on-disk cache being readable via
+    /// `get_cached_artifact_by_path` on the next call.
+    ///
+    /// This test does NOT need a real upstream: the buffered path calls
+    /// `cache_artifact` synchronously (`.await`s the storage put) before
+    /// returning, so we can drive `cache_artifact` directly and then
+    /// assert that `get_cached_artifact_by_path` returns the same bytes.
+    /// A regression in this contract (for example, dropping the
+    /// metadata-sidecar write or moving it onto a fire-and-forget task)
+    /// would break the listing reproducer in the same way #1445(A)
+    /// reports.
+    ///
+    /// The wider "/artifacts listing also shows proxy-cached items"
+    /// behaviour requires the storage-routing redesign described on
+    /// `test_cache_artifact_does_not_insert_into_artifacts_table` and
+    /// is intentionally out of scope for this fix. This test pins the
+    /// half of the contract that lives inside ProxyService and is the
+    /// foundation any future listing-merge work will rely on.
+    #[tokio::test]
+    async fn test_cache_artifact_persists_bytes_for_next_request() {
+        use crate::services::storage_service::{FilesystemBackend, StorageService};
+
+        // Use a real filesystem-backed storage so the same put/get
+        // round-trip the production code does is exercised, including
+        // the metadata sidecar write.
+        let tmp = std::env::temp_dir().join(format!("ak-1445a-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+
+        let backend = Arc::new(FilesystemBackend::new(tmp.clone()));
+        let storage = Arc::new(StorageService::new(backend));
+
+        // Build the service with a `lazy` PgPool: we never call any
+        // code path that touches the DB on this test.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let proxy = ProxyService::new(pool, storage);
+
+        let repo_key = "npm-proxy";
+        let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
+        let content = Bytes::from_static(b"mock-tarball-bytes-for-abbrev-1.1.1");
+
+        // Drive cache_artifact directly with the same keys
+        // `fetch_artifact_with_cache_path` derives.
+        let cache_key = ProxyService::cache_storage_key(repo_key, cache_path).unwrap();
+        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path).unwrap();
+        proxy
+            .cache_artifact(
+                &cache_key,
+                &metadata_key,
+                &content,
+                Some("application/gzip".to_string()),
+                None,
+                DEFAULT_CACHE_TTL_SECS,
+                Uuid::new_v4(),
+                cache_path,
+            )
+            .await
+            .expect("cache_artifact must succeed on a healthy filesystem backend");
+
+        // The next request MUST find the cached bytes via the public
+        // lookup helper used by handlers (`proxy_check_cache` is built
+        // on top of this). A regression that lost the metadata sidecar
+        // or wrote it under the wrong key would surface here as None.
+        let lookup = proxy
+            .get_cached_artifact_by_path(repo_key, cache_path)
+            .await
+            .expect("cache lookup must not error on a fresh entry");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (got, got_ct) = lookup.expect(
+            "cache_artifact MUST persist bytes that the very next call to \
+             get_cached_artifact_by_path can read back. The reproducer in \
+             #1445(A) (`cached artifacts should contain abbrev after npm \
+             upstream fetch -- not present`) trips when this round-trip \
+             fails: bytes are returned to the client but the cache is \
+             empty next time.",
+        );
+        assert_eq!(&got[..], content.as_ref());
+        assert_eq!(got_ct.as_deref(), Some("application/gzip"));
     }
 
     /// Source-level pin for #1278: `cache_artifact` must NOT insert into

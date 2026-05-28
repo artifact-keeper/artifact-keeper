@@ -58,6 +58,7 @@ pub struct PeerRepoSubscription {
     pub sync_enabled: bool,
     pub replication_mode: Option<String>,
     pub replication_schedule: Option<String>,
+    pub replication_filter: Option<serde_json::Value>,
     pub last_replicated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
