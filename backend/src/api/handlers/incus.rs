@@ -582,15 +582,29 @@ async fn download_image(
         .await
         .map_err(|e| e.into_response())?;
 
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    let content = storage.get(&storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
+    // Read from the same on-disk layout the upload path writes to. Both the
+    // monolithic and chunked upload finalize_temp_file calls compute the final
+    // path via `storage_path_for_key(state.config.storage_path, &storage_key)`,
+    // which adds a 2-char shard prefix (e.g. `in/` for `incus/...` keys) under
+    // the server-wide STORAGE_PATH. Going through `state.storage_for_repo`
+    // would either (a) look at `repo.storage_path` (e.g.
+    // `<STORAGE_PATH>/<repo_key>`) and skip the shard prefix because
+    // FilesystemStorage::key_to_path treats `/`-bearing keys as hierarchical,
+    // or (b) for S3/GCS-backed repos hit a cloud bucket the incus uploads
+    // never touched. The result was every GET returning 500 (#1441). Mirror
+    // the upload path explicitly until incus moves onto
+    // `StorageBackend::put_streaming` / `get_stream`.
+    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
+    let content = tokio::fs::read(&final_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (StatusCode::NOT_FOUND, "Image file not found").into_response()
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        }
     })?;
 
     let content_type = content_type_for_download(&filename);
@@ -1980,5 +1994,58 @@ mod tests {
             content_type_for_artifact(path),
             content_type_for_download(filename)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1441 regression: download must read from the same on-disk layout the
+    // upload path writes to.
+    //
+    // Both upload paths (monolithic + chunked finalize) compute the final
+    // location via `storage_path_for_key(state.config.storage_path, key)`,
+    // which prepends a 2-char shard derived from the key's first 2 chars
+    // (e.g. `in/` for `incus/<repo_id>/...`). The previous download
+    // implementation went through `FilesystemStorage::key_to_path`, which
+    // treats hierarchical keys (those containing `/`) as already-distributed
+    // and skips the shard prefix entirely — so the read landed under a
+    // different directory than the write, returning HTTP 500 every time.
+    // This test pins the contract that a file written via
+    // `storage_path_for_key` is readable via the same call.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_reads_from_upload_path() {
+        let tmp = std::env::temp_dir().join(format!("ak-incus-1441-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let repo_id = Uuid::new_v4();
+        let artifact_path = build_artifact_path("ubuntu-noble", "20240215", "incus.tar.gz");
+        let storage_key = build_storage_key(&repo_id, &artifact_path);
+        let final_path =
+            storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
+
+        // Simulate what upload_image / complete_chunked_upload do after
+        // finalize_temp_file: create parent dirs, write the payload.
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let payload = b"incus-image-bytes";
+        tokio::fs::write(&final_path, payload).await.unwrap();
+
+        // The download handler re-derives the path the same way and
+        // tokio::fs::read it directly. Match that here.
+        let read_path = storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
+        let content = tokio::fs::read(&read_path).await.unwrap();
+        assert_eq!(content, payload);
+
+        // And the shard prefix is `in` because the storage key starts with
+        // `incus/`, which proves the write path uses the shard layout.
+        let path_str = final_path.to_string_lossy();
+        assert!(
+            path_str.contains("/in/incus/"),
+            "expected shard prefix /in/ before incus/<repo_id>/, got {}",
+            path_str
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }
