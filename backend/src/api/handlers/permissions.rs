@@ -247,6 +247,12 @@ pub async fn create_permission(
     // a fine-grained admin permission on the system sentinel.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+    // #1438 (1a): only admins may grant fine-grained permissions. Previously
+    // a non-admin JWT caller passed the scope check (JWT sessions are not
+    // scope-restricted), hit the INSERT, and tripped an FK violation that
+    // surfaced as 500 DATABASE_ERROR. The contract is admin-only, so reject
+    // here with 403 before any DB write.
+    auth.require_admin()?;
     let _ = auth;
 
     let permission: CreatedPermissionRow = sqlx::query_as(
@@ -883,6 +889,34 @@ mod tests {
     fn test_update_permission_scope_check_rejects_read_only() {
         let ext = read_only_token();
         assert!(ext.require_scope("write").is_err());
+    }
+
+    #[test]
+    fn test_create_permission_non_admin_jwt_rejected_with_403() {
+        // #1438 (1a): a non-admin JWT caller (no `is_api_token` so scopes
+        // are not enforced) previously slipped past the scope check, hit
+        // the INSERT, and tripped an FK violation that surfaced as 500
+        // DATABASE_ERROR. The handler now calls `require_admin()` so the
+        // same caller gets a clean 403 Authorization error before any DB
+        // write happens. This unit test pins the gate at the predicate
+        // level (no DB needed).
+        let non_admin_jwt = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        // JWT sessions pass the scope check (they are not scope-restricted),
+        // so the next gate, require_admin, must catch them.
+        assert!(non_admin_jwt.require_scope("write").is_ok());
+        match non_admin_jwt.require_admin() {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization, got {:?}", other),
+        }
     }
 
     #[test]
