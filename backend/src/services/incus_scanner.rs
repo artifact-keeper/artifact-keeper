@@ -373,15 +373,26 @@ impl IncusScanner {
         // toward the extracted-size budget (and to free the disk early).
         let _ = tokio::fs::remove_file(&tarball_path).await;
 
-        // Post-extraction hardening, run on a blocking thread (sync walk):
-        //   1. reject any symlink that escapes the workspace root (traversal),
-        //   2. enforce the uncompressed-size / entry-count bomb caps.
-        let root = dest.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::enforce_extraction_limits(&root))
-            .await
-            .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))??;
+        // Post-extraction hardening: reject escaping symlinks + enforce the
+        // bomb caps over the extracted tree. The squashfs path runs the exact
+        // same guard (see `extract_squashfs`).
+        Self::run_extraction_guard(dest).await?;
 
         Ok(())
+    }
+
+    /// Run the post-extraction hardening guard over `root` on a blocking thread.
+    /// Shared by both the tarball and squashfs extraction paths so the defense
+    /// posture (symlink-traversal rejection + decompression-bomb caps) is
+    /// identical regardless of image format.
+    ///
+    ///   1. reject any symlink that escapes the workspace root (traversal),
+    ///   2. enforce the uncompressed-size / entry-count bomb caps.
+    async fn run_extraction_guard(root: &Path) -> Result<()> {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::enforce_extraction_limits(&root))
+            .await
+            .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
     }
 
     /// Walk the extracted tree (synchronously) and abort if it contains a
@@ -540,14 +551,34 @@ impl IncusScanner {
     }
 
     /// Extract a squashfs image using unsquashfs.
+    ///
+    /// Hardened with the same defenses as [`Self::extract_tarball`]: a squashfs
+    /// image is just as capable of being a decompression bomb or carrying
+    /// escaping symlinks as a tarball.
+    ///   * input size is capped at [`MAX_COMPRESSED_INPUT_BYTES`] *before*
+    ///     writing the image to disk;
+    ///   * after extraction, [`Self::run_extraction_guard`] walks the output
+    ///     tree and aborts on any symlink that escapes the workspace root or if
+    ///     the tree exceeds [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`];
+    ///   * `unsquashfs -f` (force-overwrite) is intentionally NOT passed. `-f`
+    ///     only matters when the destination already holds conflicting files;
+    ///     it makes unsquashfs unlink and overwrite them, which weakens the
+    ///     defense posture the same way tar's `--overwrite` does. The per-scan
+    ///     UUID workspace + the `remove_dir_all` wipe in `prepare_workspace`
+    ///     guarantee `dest` is freshly-created and empty, and unsquashfs
+    ///     extracts happily into an existing empty directory without `-f`, so
+    ///     the flag is redundant here.
     async fn extract_squashfs(&self, content: &Bytes, workspace: &Path, dest: &Path) -> Result<()> {
+        // Decompression-bomb guard #1: bound the compressed input before it ever
+        // touches disk (same cap the tarball path uses).
+        Self::check_compressed_input_size(content.len() as u64)?;
+
         let squashfs_path = workspace.join("rootfs.squashfs");
         write_temp_file(&squashfs_path, content, "squashfs").await?;
 
         run_command(
             "unsquashfs",
             &[
-                "-f",
                 "-d",
                 &dest.to_string_lossy(),
                 &squashfs_path.to_string_lossy(),
@@ -556,7 +587,13 @@ impl IncusScanner {
         )
         .await?;
 
+        // Drop the source image before walking the tree so it isn't counted
+        // toward the extracted-size budget (and to free the disk early).
         let _ = tokio::fs::remove_file(&squashfs_path).await;
+
+        // Post-extraction hardening: identical guard to the tarball path.
+        Self::run_extraction_guard(dest).await?;
+
         Ok(())
     }
 
@@ -1415,6 +1452,169 @@ mod tests {
 
         // Should fail (unsquashfs either not found or fails on bad data)
         assert!(result.is_err());
+    }
+
+    /// Returns true when both `mksquashfs` and `unsquashfs` are on PATH, so the
+    /// end-to-end squashfs extraction test can build and unpack a real image.
+    fn squashfs_tools_available() -> bool {
+        ["mksquashfs", "unsquashfs"].iter().all(|bin| {
+            std::process::Command::new(bin)
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Build a squashfs image from `(path, contents)` pairs by laying out a tree
+    /// in a temp dir and running `mksquashfs`. Optionally plant a symlink
+    /// (`link_path -> link_target`). Returns the image bytes. Caller must ensure
+    /// `mksquashfs` is available (see [`squashfs_tools_available`]).
+    fn build_squashfs(files: &[(&str, &[u8])], symlink: Option<(&str, &str)>) -> Bytes {
+        let staging = tempfile::tempdir().unwrap();
+        let src = staging.path().join("src");
+        for (path, data) in files {
+            let full = src.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, data).unwrap();
+        }
+        if let Some((link_path, link_target)) = symlink {
+            let full = src.join(link_path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(link_target, &full).unwrap();
+        }
+
+        let img = staging.path().join("img.squashfs");
+        let out = std::process::Command::new("mksquashfs")
+            .arg(&src)
+            .arg(&img)
+            .arg("-noappend")
+            .output()
+            .expect("mksquashfs must run");
+        assert!(
+            out.status.success(),
+            "mksquashfs failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Bytes::from(std::fs::read(&img).unwrap())
+    }
+
+    /// Platform-independent traversal-guard check for the SQUASHFS path: build an
+    /// extracted-tree shape (the kind `unsquashfs` would produce) containing a
+    /// symlink that escapes the workspace root, and assert the shared
+    /// `enforce_extraction_limits` guard rejects it. This is the same helper the
+    /// squashfs path now routes through, so it covers the guard logic on CI
+    /// without an `unsquashfs` dependency. Complements the GNU-tar-gated
+    /// `test_extract_tarball_rejects_escaping_symlink`.
+    #[tokio::test]
+    async fn test_squashfs_extracted_tree_rejects_escaping_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Mimic an `unsquashfs -d <dest>` output dir holding an escaping symlink.
+        let dest = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(dest.join("etc")).await.unwrap();
+        tokio::fs::write(dest.join("etc/os-release"), b"ID=alpine\n")
+            .await
+            .unwrap();
+        let outside = dir.path().join("host-secret");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        // Absolute escape: rootfs/etc/escape -> <tmp>/host-secret (outside dest).
+        std::os::unix::fs::symlink(&outside, dest.join("etc/escape")).unwrap();
+
+        let res = IncusScanner::run_extraction_guard(&dest).await;
+        assert!(
+            res.is_err(),
+            "squashfs-extracted tree with an escaping symlink must be rejected by the shared guard"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "guard error must name the traversal; got: {}",
+            msg
+        );
+    }
+
+    /// `extract_squashfs` enforces the compressed-input cap before writing the
+    /// image, just like the tarball path. We can't allocate >2 GiB in a unit
+    /// test, so we assert the shared `check_compressed_input_size` gate (which
+    /// `extract_squashfs` now calls) rejects oversized input. The size-cap
+    /// boundary itself is covered by `test_check_compressed_input_size_enforced`.
+    #[tokio::test]
+    async fn test_extract_squashfs_enforces_compressed_cap() {
+        // The squashfs path shares the same compressed-size gate as the tarball
+        // path; an over-limit input is refused before it touches disk.
+        let res = IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES + 1);
+        assert!(res.is_err());
+        assert!(format!("{}", res.unwrap_err()).contains("too large to scan"));
+    }
+
+    /// End-to-end squashfs extraction: build a real squashfs image, extract it
+    /// with the production `extract_squashfs` (no `-f`), and assert the shared
+    /// guard ran (clean image passes, contents land under the dest). Skip-gated
+    /// on the squashfs tools being installed, mirroring the GNU-tar tests; the
+    /// platform-independent guard test above carries CI coverage when the tools
+    /// are absent.
+    #[tokio::test]
+    async fn test_extract_squashfs_end_to_end_runs_guard() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // Clean image with an in-tree relative symlink (must be accepted).
+        let img = build_squashfs(
+            &[
+                ("etc/os-release", b"ID=alpine\nVERSION_ID=3.20\n"),
+                ("var/lib/dpkg/status", b"Package: musl\n"),
+            ],
+            Some(("etc/os-release-link", "os-release")),
+        );
+
+        let workspace = dir.path().join("ws");
+        let dest = workspace.join("rootfs");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        scanner
+            .extract_squashfs(&img, &workspace, &dest)
+            .await
+            .expect("a clean squashfs image must extract and pass the guard");
+
+        // Contents landed under dest, the source image was cleaned up, and the
+        // guard (which ran as part of extract_squashfs) accepted the tree.
+        assert!(dest.join("etc/os-release").exists());
+        assert!(dest.join("var/lib/dpkg/status").exists());
+        assert!(
+            !workspace.join("rootfs.squashfs").exists(),
+            "source squashfs image must be removed after extraction"
+        );
+
+        // Now build a malicious image whose symlink escapes the workspace and
+        // prove extract_squashfs rejects it via the post-extraction guard.
+        let escape_img = build_squashfs(
+            &[("etc/os-release", b"ID=alpine\n")],
+            Some(("etc/escape", "/etc/shadow")),
+        );
+        let ws2 = dir.path().join("ws2");
+        let dest2 = ws2.join("rootfs");
+        tokio::fs::create_dir_all(&dest2).await.unwrap();
+
+        let res = scanner.extract_squashfs(&escape_img, &ws2, &dest2).await;
+        assert!(
+            res.is_err(),
+            "a squashfs image with an escaping symlink must be rejected by extract_squashfs"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "rejection must name the traversal; got: {}",
+            msg
+        );
     }
 
     // -----------------------------------------------------------------------
