@@ -672,6 +672,34 @@ async fn upload_image(
     })
     .await?;
 
+    // scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
+    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            repo.id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
+
     tracing::info!(
         "Uploaded Incus image: {}/{}/{} ({}B, sha256:{})",
         product,
@@ -968,6 +996,32 @@ async fn complete_chunked_upload(
         metadata: &metadata,
     })
     .await?;
+
+    // scan_on_upload trigger — see `upload_image` above.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            session.repository_id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
 
     // Clean up session
     let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
