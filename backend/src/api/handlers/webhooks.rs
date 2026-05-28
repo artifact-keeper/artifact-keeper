@@ -1028,8 +1028,14 @@ pub async fn cleanup_expired_previous_secrets(
 ///
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
+///
+/// Reads `WEBHOOK_ALLOW_PRIVATE_IPS` (not `UPSTREAM_ALLOW_PRIVATE_IPS`)
+/// for the RFC1918 / IPv6 unique-local relaxation toggle. Split from the
+/// upstream env var in issue #1435 so a test cluster that needs to allow
+/// webhook deliveries to a local mock receiver does not also relax the
+/// SSRF guard on the remote-proxy upstream path.
 fn validate_webhook_url(url_str: &str) -> Result<()> {
-    crate::api::validation::validate_outbound_url(url_str, "Webhook URL")
+    crate::api::validation::validate_outbound_webhook_url(url_str, "Webhook URL")
 }
 
 /// Whether a webhook row carries any form of signing secret.
@@ -1746,21 +1752,28 @@ mod tests {
 
     #[test]
     fn test_validate_webhook_url_blocks_loopback_ip() {
+        // Hard-blocked regardless of env vars, no guard needed.
         assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
     }
 
     #[test]
     fn test_validate_webhook_url_blocks_private_ip_10() {
+        // Takes the env guard so a sibling test that sets
+        // WEBHOOK_ALLOW_PRIVATE_IPS for an allowlist scenario does not
+        // race this default-deny baseline. Issue #1435.
+        let _g = WebhookEnvGuard::new();
         assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
     }
 
     #[test]
     fn test_validate_webhook_url_blocks_private_ip_172() {
+        let _g = WebhookEnvGuard::new();
         assert!(validate_webhook_url("http://172.16.0.1/hook").is_err());
     }
 
     #[test]
     fn test_validate_webhook_url_blocks_private_ip_192() {
+        let _g = WebhookEnvGuard::new();
         assert!(validate_webhook_url("http://192.168.1.1/hook").is_err());
     }
 
@@ -1772,6 +1785,122 @@ mod tests {
     #[test]
     fn test_validate_webhook_url_allows_public_ip() {
         assert!(validate_webhook_url("http://8.8.8.8/hook").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1435: webhook validator reads WEBHOOK_ALLOW_PRIVATE_IPS, NOT
+    // UPSTREAM_ALLOW_PRIVATE_IPS. These tests pin the env-var split so a
+    // future refactor cannot silently re-couple the two surfaces.
+    //
+    // Tests serialize on a local lock because they mutate process env.
+    // -----------------------------------------------------------------------
+
+    /// Local env lock for the env-var-split tests below. Independent of
+    /// `validation.rs`'s lock; both can race in `cargo test --workspace`
+    /// but each module's mutations are serialized internally and the
+    /// validator helper functions read env on each call.
+    static WEBHOOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Snapshot + restore the two private-IP env vars so a test that
+    /// flips one cannot leak state into a sibling.
+    struct WebhookEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_webhook: Option<String>,
+        prev_upstream: Option<String>,
+        prev_cidrs: Option<String>,
+        prev_alias: Option<String>,
+    }
+
+    impl WebhookEnvGuard {
+        fn new() -> Self {
+            let lock = WEBHOOK_ENV_LOCK.lock().unwrap();
+            let g = Self {
+                _lock: lock,
+                prev_webhook: std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").ok(),
+                prev_upstream: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
+                prev_cidrs: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
+                prev_alias: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
+            };
+            std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
+            std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+            g
+        }
+    }
+
+    impl Drop for WebhookEnvGuard {
+        fn drop(&mut self) {
+            for (name, val) in [
+                ("WEBHOOK_ALLOW_PRIVATE_IPS", &self.prev_webhook),
+                ("UPSTREAM_ALLOW_PRIVATE_IPS", &self.prev_upstream),
+                ("AK_SSRF_ALLOW_PRIVATE_CIDRS", &self.prev_cidrs),
+                ("UPSTREAM_PRIVATE_IP_ALLOWLIST", &self.prev_alias),
+            ] {
+                match val {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_rfc1918_with_only_upstream_env() {
+        // Security regression #1435: the validator used by the webhook
+        // handler must NOT be relaxed by UPSTREAM_ALLOW_PRIVATE_IPS.
+        // Before the split, the test cluster setting this env var to
+        // enable webhook tests also defeated SSRF protection on the
+        // remote-proxy upstream path AND let webhooks reach private IPs.
+        let _g = WebhookEnvGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_webhook_url("http://10.0.0.1/hook").is_err(),
+            "webhook validator must reject RFC1918 when only the upstream env var is set"
+        );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_rfc1918_with_webhook_env() {
+        // After the split, operators relax the webhook surface (and only
+        // the webhook surface) by setting WEBHOOK_ALLOW_PRIVATE_IPS.
+        let _g = WebhookEnvGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_webhook_url("http://10.0.0.1/hook").is_ok(),
+            "webhook validator must accept RFC1918 when WEBHOOK_ALLOW_PRIVATE_IPS=true"
+        );
+        assert!(
+            validate_webhook_url("http://192.168.1.5/hook").is_ok(),
+            "192.168.1.5 must also be accepted"
+        );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_returns_validation_error_for_4xx_mapping() {
+        // Webhook handler returns 4xx (not 500) on RFC1918 because the
+        // validator returns AppError::Validation, which `error.rs` maps
+        // to HTTP 400. Pins the error variant so a future refactor that
+        // changes the variant (e.g. to AppError::Internal) gets caught
+        // here BEFORE producing a 500 in production. Issue #1435 Part B.
+        let _g = WebhookEnvGuard::new();
+        let err = validate_webhook_url("http://10.0.0.1/hook")
+            .expect_err("RFC1918 webhook URL must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "expected AppError::Validation (→ HTTP 400), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_loopback_still_blocked_under_webhook_env() {
+        // Loopback must NEVER be unblocked, even with the per-surface
+        // env var. The webhook validator delegating to the shared SSRF
+        // logic ensures loopback is hard-blocked at the IP layer.
+        let _g = WebhookEnvGuard::new();
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("http://[::1]:8080/hook").is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1946,6 +2075,9 @@ mod tests {
 
     #[test]
     fn test_validate_webhook_url_rejects_private_ip() {
+        // Env guard so the env-var-split tests below do not race this
+        // baseline default-deny check. Issue #1435.
+        let _g = WebhookEnvGuard::new();
         assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
     }
 
