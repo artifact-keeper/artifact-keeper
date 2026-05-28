@@ -485,13 +485,33 @@ fn validate_virtual_repo_member_count(
     if *repo_type != RepositoryType::Virtual {
         return Ok(());
     }
-    let count = member_repos.map_or(0, <[_]>::len);
-    if count == 0 {
+    // #1444 follow-up: distinguish "field omitted entirely" (None) from
+    // "explicit empty list" (Some(vec![])).
+    //
+    // * None  -> caller is following the deferred-population pattern: create
+    //            the virtual, then add members via `POST /repositories/{key}/members`.
+    //            This is the shape every E2E test helper uses. Rejecting it
+    //            at create time (the original PR #1279 / #1281 behaviour)
+    //            breaks the create-then-add flow and surfaces as the
+    //            "members router returns 404" symptom in #1444 because
+    //            the follow-up POSTs target a nonexistent repo. We
+    //            therefore accept None and leave the empty-virtual state
+    //            visible at fetch time (NOT_FOUND on download) -- it
+    //            self-resolves on the first add_member.
+    //
+    // * Some(vec![]) -> caller explicitly said "no members". This is the
+    //            silent-drop trap from #1279 (mis-typed field name
+    //            deserialised to None pre-fix; the explicit empty form is
+    //            also a clear operator mistake). Keep rejecting it so the
+    //            mistake surfaces at create-time with an actionable
+    //            message, as #1281 intended.
+    if let Some([]) = member_repos {
         return Err(AppError::Validation(format!(
-            "Virtual repository '{}' requires at least one member. Provide \
-             `member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]` \
-             in the request body. Use `PUT /api/v1/repositories/{}/members` \
-             after creation to update the member list. (#1279)",
+            "Virtual repository '{}' was created with an explicit empty \
+             `member_repos: []`. Provide one or more members \
+             (`member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]`) \
+             at create time, or omit the field entirely and add members \
+             via `POST /api/v1/repositories/{}/members` afterwards. (#1279, #1444)",
             repo_key, repo_key
         )));
     }
@@ -857,8 +877,10 @@ pub async fn create_repository(
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Validate up-front that virtual repos arrive with at least one member.
-    // See `validate_virtual_repo_member_count` for the rationale (#1279).
+    // Validate up-front that virtual repos do not arrive with an explicit
+    // empty `member_repos: []`. Omitted-field (deferred-population) is
+    // accepted so the create-then-add pattern works.
+    // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
     // Resolve storage backend: use the requested one or fall back to the default.
@@ -6962,19 +6984,37 @@ mod tests {
         }
     }
 
-    /// A virtual repo with no `member_repos` field at all (the shape that
-    /// happens when an operator types `members: [...]` because the struct
-    /// uses `member_repos` and doesn't `deny_unknown_fields`) must 400 with
-    /// an actionable message.
+    /// A virtual repo with no `member_repos` field at all (the deferred-
+    /// population pattern used by every E2E test helper: create, then
+    /// `POST /members`) must be accepted. Pre-#1444 this 400'd, which
+    /// broke the create-then-add flow and surfaced as the "members router
+    /// 404" symptom because the follow-up POSTs targeted a nonexistent
+    /// repo. Empty-virtual state is now surfaced at fetch time instead of
+    /// create time, and self-heals on the first add_member.
     #[test]
-    fn test_validate_virtual_repo_member_count_rejects_none() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None)
-            .expect_err("None members must reject");
+    fn test_validate_virtual_repo_member_count_accepts_none_for_deferred_add() {
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None).is_ok(),
+            "omitted member_repos must be accepted so the create-then-add \
+             flow works (regression of #1444)"
+        );
+    }
+
+    /// A virtual repo created with explicit `member_repos: []` is still a
+    /// clear operator mistake (caller has actively typed "zero members")
+    /// and must 400 with an actionable message. This preserves the #1279
+    /// discoverability win for the case where the operator's intent is
+    /// unambiguous, while the omitted-field case (above) flows through
+    /// to the deferred-add pattern.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_explicit_empty() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
+            .expect_err("explicit empty members must reject");
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("requires at least one member"),
-                    "message should explain the requirement; got: {}",
+                    msg.contains("explicit empty"),
+                    "message should call out the explicit-empty shape; got: {}",
                     msg
                 );
                 assert!(
@@ -6990,16 +7030,6 @@ mod tests {
             }
             other => panic!("expected AppError::Validation, got {:?}", other),
         }
-    }
-
-    /// A virtual repo created with `member_repos: []` is also unusable. The
-    /// validator must reject this with the same Validation error class as
-    /// the None case so the handler returns 400 (not 500) in both shapes.
-    #[test]
-    fn test_validate_virtual_repo_member_count_rejects_empty() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
-            .expect_err("empty members must reject");
-        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A virtual repo with one or more members passes validation. Pin both
@@ -8097,5 +8127,112 @@ mod tests {
         assert!(!is_npm_family_format(&RepositoryFormat::Docker));
         assert!(!is_npm_family_format(&RepositoryFormat::Generic));
         assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
+    }
+
+    /// HTTP-level regression test for #1444: GET /:key/members against a
+    /// freshly-created virtual repo (no members yet) must return 2xx, not 404.
+    ///
+    /// This is the load-bearing assertion behind the user-reported "the
+    /// reproducer still fails" comment on #1444. Pre-fix, the chain was:
+    ///   1. test infra POSTs `/api/v1/repositories` for a virtual repo WITHOUT
+    ///      `member_repos` (the standard deferred-population shape).
+    ///   2. #1281's validator 400'd that request, so the virtual was never
+    ///      created.
+    ///   3. The follow-up POST `/repositories/{key}/members` then 404'd because
+    ///      the repo did not exist -- which the release-gate report classified
+    ///      as "the members sub-router is unmounted".
+    ///
+    /// Post-fix, step 1 succeeds with an empty-virtual repo. The /members
+    /// router has always been mounted; this test exercises it via the actual
+    /// axum `Router` (built from `router()`) so a future refactor that DOES
+    /// unmount the route fails this test in addition to the source-text pin
+    /// in `virtual_member_router_registration`.
+    #[tokio::test]
+    async fn test_members_route_returns_2xx_on_freshly_created_empty_virtual_1444() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::extract::{Extension, State};
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir =
+            std::env::temp_dir().join(format!("members-1444-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Step 1: create the virtual repo via the actual `create_repository`
+        // handler with `member_repos` OMITTED -- the deferred-population shape
+        // every E2E test helper uses.
+        let repo_key = format!("v-1444-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Virtual 1444 regression",
+            "generic",
+            serde_json::json!({ "repo_type": "virtual" }),
+        );
+        let create_result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Json(payload),
+        )
+        .await;
+        // The whole point of #1444 is that this NO LONGER returns 400.
+        let _created = create_result
+            .expect("create_repository must accept virtual repo with member_repos omitted (#1444)");
+
+        // Step 2: drive the actual /members route via axum::Router::oneshot.
+        // We mount `router()` as-is, wrap it in the auth-injection layer the
+        // production router applies, and hit GET /{key}/members.
+        let router = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            admin_auth(user_id, &username),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/members", repo_key))
+            .body(Body::empty())
+            .expect("build GET /members request");
+        let (status, body) = tdh::send(router, req).await;
+
+        // Cleanup before asserting so a panic does not leak DB state.
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id IN \
+                     (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET /:key/members on a freshly-created empty virtual must NOT return \
+             404 (regression of #1444 -- the symptom that the release-gate Full \
+             Suite classified as \"members sub-router unmounted\"); got body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            status.is_success(),
+            "GET /:key/members on a freshly-created empty virtual must return 2xx; \
+             got {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
     }
 }
