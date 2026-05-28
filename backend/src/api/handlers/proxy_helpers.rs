@@ -15,6 +15,7 @@ use crate::error::AppError;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
+use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::proxy_service::ProxyService;
 use crate::storage::StorageLocation;
 use std::future::Future;
@@ -645,19 +646,19 @@ pub async fn proxy_check_cache(
 /// Generic helper for remote proxy-backed cache reads.
 ///
 /// Tries `storage.get(storage_key)`. If it returns `AppError::NotFound`, the
-/// helper acquires a transaction-scoped advisory lock for `artifact_id`,
-/// retries the cache read under that lock, and only then invokes `refetch`
-/// when the file is still absent.
+/// helper coordinates a single repair attempt per storage key across local
+/// waiters and backend instances, then invokes `refetch` only when the file is
+/// still absent.
 ///
 /// The refetched bytes are written back to storage via a best-effort `put` so
 /// future requests hit the cache. That write-back is intentional: `refetch`
 /// updates the shared proxy cache, while this helper repopulates the
 /// repo-scoped storage key that the format handler will read on the next
-/// request. The lock serialises stale-cache recovery so concurrent requests do
-/// not all re-download and write back the same object.
+/// request. The hydration coordinator serialises stale-cache recovery so
+/// concurrent requests do not all re-download and write back the same object.
 ///
-/// The lock wait is bounded; if the helper cannot enter the critical section
-/// within the timeout window it returns `507 Insufficient Storage` so the
+/// The wait is bounded; if the helper cannot enter the repair window within the
+/// timeout it returns `507 Insufficient Storage` so the
 /// client can retry later. Non-`NotFound` storage errors are propagated as 500
 /// responses so operators still see real backend failures.
 pub(crate) async fn get_cached_or_refetch<F, Fut>(
@@ -671,159 +672,101 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    match storage.get(storage_key).await {
-        Ok(content) => Ok(content),
-        Err(AppError::NotFound(_)) => {
+    let _ = db;
+    let hydration_lease_key = format!("artifact-repair:{}", storage_key);
+    coordinate_proxy_hydration(
+        &hydration_lease_key,
+        || async {
+            match storage.get(storage_key).await {
+                Ok(content) => Ok(Some(content)),
+                Err(AppError::NotFound(_)) => Ok(None),
+                Err(e) => Err(map_storage_err(e)),
+            }
+        },
+        || async {
             tracing::warn!(
                 artifact_id = %artifact_id,
                 storage_key = %storage_key,
-                "proxy cache entry is missing on disk; acquiring advisory lock before upstream refetch"
+                "proxy cache entry is missing on disk; refetching under hydration lease"
             );
-            with_artifact_lock(db, artifact_id, || async {
-                match storage.get(storage_key).await {
-                    Ok(content) => Ok(content),
-                    Err(AppError::NotFound(_)) => {
-                        let bytes = refetch().await?;
-                        // Best-effort write-back: failures are logged but do not fail the
-                        // current request.
-                        if let Err(e) = storage.put(storage_key, bytes.clone()).await {
-                            tracing::warn!(
-                                artifact_id = %artifact_id,
-                                storage_key = %storage_key,
-                                error = %e,
-                                "failed to write back refetched proxy payload; subsequent requests will re-fetch"
-                            );
-                        }
-                        Ok(bytes)
-                    }
-                    Err(e) => Err(map_storage_err(e)),
-                }
-            })
-            .await
-        }
-        Err(e) => Err(map_storage_err(e)),
-    }
-}
 
-#[cfg(test)]
-fn artifact_lock_wait_timeout() -> Duration {
-    Duration::from_millis(250)
-}
-
-#[cfg(not(test))]
-fn artifact_lock_wait_timeout() -> Duration {
-    Duration::from_secs(5)
-}
-
-fn artifact_lock_key(artifact_id: Uuid) -> i64 {
-    i64::from_be_bytes(
-        artifact_id.as_bytes()[..8]
-            .try_into()
-            .expect("UUID is always 16 bytes"),
-    )
-}
-
-async fn with_artifact_lock<F, Fut, T>(
-    db: &PgPool,
-    artifact_id: Uuid,
-    operation: F,
-) -> Result<T, Response>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T, Response>>,
-{
-    let mut tx = db
-        .begin()
-        .await
-        .map_err(|e| internal_error("Database", e))?;
-    let wait_timeout = artifact_lock_wait_timeout();
-    let lock_key = artifact_lock_key(artifact_id);
-
-    match tokio::time::timeout(
-        wait_timeout,
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            let _ = tx.rollback().await;
-            return Err(internal_error("Database", e));
-        }
-        Err(_) => {
-            let _ = tx.rollback().await;
-            tracing::warn!(
-                artifact_id = %artifact_id,
-                timeout_ms = wait_timeout.as_millis(),
-                "timed out waiting for artifact advisory lock"
-            );
-            return Err((
+            let bytes = refetch().await?;
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched proxy payload; subsequent requests will re-fetch"
+                );
+            }
+            Ok(bytes)
+        },
+        || {
+            (
                 StatusCode::INSUFFICIENT_STORAGE,
                 "artifact file unavailable; retry later",
             )
-                .into_response());
-        }
-    }
-
-    let result = operation().await;
-    match result {
-        Ok(value) => {
-            let _ = tx.commit().await;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = tx.rollback().await;
-            Err(err)
-        }
-    }
+                .into_response()
+        },
+    )
+    .await
 }
 
 /// Serialise concurrent reads for a locally-stored artifact whose physical
-/// file was not found in storage.  Acquires a PostgreSQL transaction-scoped
-/// advisory lock keyed on the artifact UUID, then retries `storage.get()`.
+/// file was not found in storage. Retries `storage.get()` under the same
+/// in-process hydration coordinator used by proxy cache repair.
 ///
-/// Returns `Ok(bytes)` on success after the lock is held; a `507 Insufficient
-/// Storage` response when the file is still absent after locking (another
+/// Returns `Ok(bytes)` on success after the retry window; a `507 Insufficient
+/// Storage` response when the file is still absent after coordination (another
 /// writer should have written it — a client retry is warranted); or propagates
 /// non-`NotFound` storage errors as 500.
 ///
-/// This is the Phase-2 race-condition fix: when multiple concurrent requests
-/// arrive for the same artifact and the file is transiently absent (e.g. being
-/// written by another process), they queue behind the pg advisory lock rather
-/// than all failing simultaneously.  The lock is automatically released on
-/// transaction commit/rollback, so a crashed process never leaves a dangling
-/// lock.
+/// This is the local missing-file repair path: when multiple concurrent
+/// requests arrive for the same artifact and the file is transiently absent,
+/// they queue behind the in-process coordinator rather than all failing
+/// simultaneously.
 pub(crate) async fn advisory_lock_retry_get(
     db: &PgPool,
     artifact_id: Uuid,
     storage_key: &str,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
+    let _ = db;
+    let hydration_lease_key = format!("artifact-read-retry:{}", storage_key);
     tracing::warn!(
         artifact_id = %artifact_id,
         storage_key = %storage_key,
-        "storage miss on local artifact; acquiring pg_advisory_xact_lock to serialise re-read"
+        "storage miss on local artifact; coordinating re-read"
     );
-    with_artifact_lock(db, artifact_id, || async {
-        match storage.get(storage_key).await {
-            Ok(bytes) => Ok(bytes),
-            Err(crate::error::AppError::NotFound(_)) => {
-                tracing::error!(
-                    artifact_id = %artifact_id,
-                    storage_key = %storage_key,
-                    "artifact file still absent after advisory lock acquired; returning 507"
-                );
-                Err((
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "artifact file unavailable; retry later",
-                )
-                    .into_response())
+    coordinate_proxy_hydration(
+        &hydration_lease_key,
+        || async {
+            match storage.get(storage_key).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(crate::error::AppError::NotFound(_)) => Ok(None),
+                Err(e) => Err(map_storage_err(e)),
             }
-            Err(e) => Err(map_storage_err(e)),
-        }
-    })
+        },
+        || async {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                storage_key = %storage_key,
+                "artifact file still absent after coordinated retry; returning 507"
+            );
+            Err((
+                StatusCode::INSUFFICIENT_STORAGE,
+                "artifact file unavailable; retry later",
+            )
+                .into_response())
+        },
+        || {
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "artifact file unavailable; retry later",
+            )
+                .into_response()
+        },
+    )
     .await
 }
 

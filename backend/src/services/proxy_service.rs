@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -716,45 +717,55 @@ impl ProxyService {
             return Ok((content, content_type));
         }
 
-        // Fetch from upstream using the real fetch_path
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
-        let upstream_result = self
-            .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
-            .await;
+        let hydration_lease_key = format!("proxy-cache:{}", cache_key);
+        coordinate_proxy_hydration(
+            &hydration_lease_key,
+            || async {
+                self.get_cached_artifact(&cache_key, &metadata_key).await
+            },
+            || async {
+                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+                let upstream_result = self
+                    .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
+                    .await;
 
-        match upstream_result {
-            Ok(resp) => {
-                let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-                self.cache_artifact(
-                    &cache_key,
-                    &metadata_key,
-                    &resp.content,
-                    resp.content_type.clone(),
-                    resp.etag,
-                    cache_ttl,
-                    repo.id,
-                    cache_path,
-                )
-                .await?;
+                match upstream_result {
+                    Ok(resp) => {
+                        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                        self.cache_artifact(
+                            &cache_key,
+                            &metadata_key,
+                            &resp.content,
+                            resp.content_type.clone(),
+                            resp.etag,
+                            cache_ttl,
+                            repo.id,
+                            cache_path,
+                        )
+                        .await?;
 
-                Ok((resp.content, resp.content_type))
-            }
-            Err(upstream_err) => {
-                if let Ok(Some((stale_content, stale_content_type))) = self
-                    .get_stale_cached_artifact(&cache_key, &metadata_key)
-                    .await
-                {
-                    tracing::warn!(
-                        "Upstream fetch failed for {}; serving stale cached copy: {}",
-                        full_url,
-                        upstream_err
-                    );
-                    Ok((stale_content, stale_content_type))
-                } else {
-                    Err(upstream_err)
+                        Ok((resp.content, resp.content_type))
+                    }
+                    Err(upstream_err) => {
+                        if let Ok(Some((stale_content, stale_content_type))) = self
+                            .get_stale_cached_artifact(&cache_key, &metadata_key)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Upstream fetch failed for {}; serving stale cached copy: {}",
+                                full_url,
+                                upstream_err
+                            );
+                            Ok((stale_content, stale_content_type))
+                        } else {
+                            Err(upstream_err)
+                        }
+                    }
                 }
-            }
-        }
+            },
+            || AppError::Storage(format!("Timed out waiting for proxy cache hydration: {}", cache_key)),
+        )
+        .await
     }
 
     /// Streaming sibling of [`Self::fetch_artifact`] that does NOT buffer
