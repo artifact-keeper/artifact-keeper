@@ -335,35 +335,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
              metadata IPs and loopback remain blocked. SSRF risk surface \
              widened (issues #976, #1224)."
         );
-    } else if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
-        tracing::warn!(
-            target: "security",
-            "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream URLs may now target ALL \
-             RFC1918 / unique-local addresses. Cloud metadata IPs and loopback \
-             remain blocked. Prefer AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit \
-             CIDRs for a narrower SSRF surface (issues #976, #1224)."
-        );
-    }
-
-    // Catch a common ops footgun: a placeholder env name `WEBHOOK_ALLOW_PRIVATE_IPS`
-    // briefly appeared in chart values (artifact-keeper-test PR #187) and is
-    // still floating around in older docs and copies. The backend never read
-    // that name -- the actual flag is `UPSTREAM_ALLOW_PRIVATE_IPS`. Warn so
-    // operators who copy the old name see why their webhook private-IP
-    // allowance has no effect, instead of silently failing webhook tests.
-    // See artifact-keeper#1367 / artifact-keeper-test PR #188.
-    if std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").is_ok()
-        && std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").is_err()
-    {
-        tracing::warn!(
-            target: "security",
-            "WEBHOOK_ALLOW_PRIVATE_IPS is set but is NOT read by the backend. \
-             The correct env var to allow webhook targets on private IPs is \
-             UPSTREAM_ALLOW_PRIVATE_IPS=true (or the narrower \
-             AK_SSRF_ALLOW_PRIVATE_CIDRS). Webhook deliveries to RFC1918 / \
-             loopback hosts will continue to be rejected until the correct \
-             name is used."
-        );
+    } else {
+        if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
+            tracing::warn!(
+                target: "security",
+                "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream / remote-proxy URLs \
+                 may now target ALL RFC1918 / unique-local addresses. Cloud \
+                 metadata IPs and loopback remain blocked. Prefer \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
+                 narrower SSRF surface (issues #976, #1224, #1435)."
+            );
+        }
+        if artifact_keeper_backend::api::validation::webhook_allow_private_ips_enabled() {
+            tracing::warn!(
+                target: "security",
+                "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
+                 now target ALL RFC1918 / unique-local addresses. Cloud \
+                 metadata IPs and loopback remain blocked. Prefer \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
+                 narrower SSRF surface (issue #1435)."
+            );
+        }
     }
 
     // Create primary storage backend based on STORAGE_BACKEND config

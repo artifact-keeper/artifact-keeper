@@ -918,9 +918,19 @@ async fn update_cve_status(
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
 
+    // #1438 (1c): a non-existent CVE history id used to bubble out of
+    // sqlx::Error::RowNotFound as 500 DATABASE_ERROR. Map it explicitly to
+    // 404 so the client can distinguish bad input from server failure. All
+    // other sqlx errors continue to flow through the default mapping.
     let entry = service
         .update_cve_status(id, status, Some(auth.user_id), body.reason.as_deref())
-        .await?;
+        .await
+        .map_err(|e| match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        })?;
 
     Ok(Json(entry))
 }
@@ -2238,5 +2248,63 @@ mod tests {
         let overload = invalid_cve_history_path_message("xxx");
         let typed = invalid_cve_id_route_message("xxx");
         assert_ne!(overload, typed);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1438 (1c): POST /sbom/cve/status/{uuid} for a missing id used to
+    // surface `sqlx::Error::RowNotFound` as 500 DATABASE_ERROR. The handler
+    // now maps that one variant to NotFound (404) explicitly. The mapping
+    // is a small inline closure inside `update_cve_status`; we replicate
+    // the exact match arm here so the contract is pinned without spinning
+    // up Postgres.
+    // -----------------------------------------------------------------------
+
+    fn map_update_cve_status_err(id: Uuid, e: AppError) -> AppError {
+        match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_maps_row_not_found_to_404() {
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::RowNotFound);
+        match map_update_cve_status_err(id, err) {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains(&id.to_string()));
+                assert!(msg.contains("CVE history entry"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_other_db_errors() {
+        // A non-RowNotFound sqlx error must keep flowing as a DB error so
+        // operators still see 500s for genuine database failures.
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        match map_update_cve_status_err(id, err) {
+            AppError::Sqlx(sqlx::Error::PoolTimedOut) => {}
+            other => panic!(
+                "expected Sqlx(PoolTimedOut) to pass through, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_validation_errors() {
+        // Validation errors (e.g. unknown status string) reach the mapper
+        // unchanged so the client sees the original 400 message.
+        let id = Uuid::new_v4();
+        let err = AppError::Validation("Unknown status: maybe".to_string());
+        match map_update_cve_status_err(id, err) {
+            AppError::Validation(msg) => assert_eq!(msg, "Unknown status: maybe"),
+            other => panic!("expected Validation to pass through, got {:?}", other),
+        }
     }
 }

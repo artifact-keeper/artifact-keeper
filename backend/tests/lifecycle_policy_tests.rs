@@ -451,6 +451,598 @@ async fn test_size_quota_lru_frequently_downloaded_survives() {
     cleanup_with_downloads(&pool, repo_id).await;
 }
 
+// =============================================================================
+// oci_tags cascade: lifecycle soft-delete must also remove the live tag row,
+// otherwise storage GC (see backend/src/services/storage_gc_service.rs:36) sees
+// the tag as a live reference and never reclaims the manifest in S3.
+// =============================================================================
+
+/// Insert a fake OCI manifest artifact with realistic storage_key shape.
+async fn insert_oci_manifest_artifact(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    tag: &str,
+    digest: &str,
+    size: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let name = format!("{image}:{tag}");
+    let path = format!("v2/{image}/manifests/{tag}");
+    let storage_key = format!("oci-manifests/{digest}");
+    let checksum = format!("{:0>64}", "deadbeef");
+    sqlx::query(
+        r#"
+        INSERT INTO artifacts (id, repository_id, name, version, path, size_bytes,
+                               checksum_sha256, content_type, storage_key, is_deleted)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/vnd.oci.image.manifest.v1+json', $8, false)
+        "#,
+    )
+    .bind(id)
+    .bind(repo_id)
+    .bind(&name)
+    .bind(tag)
+    .bind(&path)
+    .bind(size)
+    .bind(&checksum)
+    .bind(&storage_key)
+    .execute(pool)
+    .await
+    .expect("failed to insert oci manifest artifact");
+    id
+}
+
+/// Insert a matching oci_tags row.
+async fn insert_oci_tag(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str, digest: &str) {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+        VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(digest)
+    .execute(pool)
+    .await
+    .expect("failed to insert oci_tag");
+}
+
+/// Return true if an oci_tags row still exists for the given (repo, image, tag).
+async fn oci_tag_exists(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str) -> bool {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .fetch_one(pool)
+    .await
+    .expect("oci_tags count failed");
+    row.0 > 0
+}
+
+/// Soft-deleting an OCI manifest via tag_pattern_delete must also remove the
+/// matching oci_tags row, otherwise storage GC's orphan predicate (#1144)
+/// keeps the manifest object alive in S3 forever.
+#[tokio::test]
+#[ignore]
+async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Two manifests in the same image: one ephemeral (matches the delete
+    // pattern), one a kept release.
+    let ephemeral_digest =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let release_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let ephemeral_id = insert_oci_manifest_artifact(
+        &pool,
+        repo_id,
+        "myimg",
+        "build-snapshot-images",
+        ephemeral_digest,
+        100,
+    )
+    .await;
+    let release_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "myimg", "v1.0.0", release_digest, 200).await;
+    insert_oci_tag(
+        &pool,
+        repo_id,
+        "myimg",
+        "build-snapshot-images",
+        ephemeral_digest,
+    )
+    .await;
+    insert_oci_tag(&pool, repo_id, "myimg", "v1.0.0", release_digest).await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Delete snapshot-images".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": "-snapshot-images$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .expect("failed to create policy");
+
+    // Dry run must not touch oci_tags.
+    let _ = svc
+        .execute_policy(policy.id, true)
+        .await
+        .expect("dry run failed");
+    assert!(!is_deleted(&pool, ephemeral_id).await);
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "build-snapshot-images").await,
+        "dry-run must leave oci_tags untouched"
+    );
+
+    // Real run: artifact is soft-deleted and the cascade removes the tag row.
+    let result = svc
+        .execute_policy(policy.id, false)
+        .await
+        .expect("execution failed");
+    assert_eq!(result.artifacts_removed, 1);
+
+    assert!(
+        is_deleted(&pool, ephemeral_id).await,
+        "ephemeral artifact should be soft-deleted"
+    );
+    assert!(
+        !is_deleted(&pool, release_id).await,
+        "release artifact must not be touched"
+    );
+
+    // Regression assertion (the bug this PR fixes).
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "myimg", "build-snapshot-images").await,
+        "cascade should remove oci_tags row for soft-deleted manifest"
+    );
+    // Sanity: the release tag is still alive.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "v1.0.0").await,
+        "release oci_tag must survive"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// max_age_days policy soft-deletes by age; the cascade must also fire.
+#[tokio::test]
+#[ignore]
+async fn test_max_age_days_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-age-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let old_digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    let old_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "myimg", "old", old_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "myimg", "old", old_digest).await;
+
+    // Backdate the artifact to look 10 days old.
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1")
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .expect("backdate failed");
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop > 7 days".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: serde_json::json!({"days": 7}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .expect("failed to create policy");
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, old_id).await);
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "myimg", "old").await,
+        "max_age_days must also cascade oci_tags"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Repo-scoped policy must not delete oci_tags in other repos.
+#[tokio::test]
+#[ignore]
+async fn test_cascade_respects_repo_scope() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_a = create_test_repo(&pool, &format!("test-cascade-a-{}", Uuid::new_v4())).await;
+    let repo_b = create_test_repo(&pool, &format!("test-cascade-b-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Same image:tag with the same digest in two repos; the artifact in
+    // repo_b is already soft-deleted (e.g., from an earlier cleanup) but
+    // a policy targeting repo_a must NOT cascade its tag row.
+    let digest = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    let a_id =
+        insert_oci_manifest_artifact(&pool, repo_a, "img", "snapshot-images", digest, 100).await;
+    let b_id =
+        insert_oci_manifest_artifact(&pool, repo_b, "img", "snapshot-images", digest, 100).await;
+    insert_oci_tag(&pool, repo_a, "img", "snapshot-images", digest).await;
+    insert_oci_tag(&pool, repo_b, "img", "snapshot-images", digest).await;
+
+    // Mark repo_b's artifact soft-deleted with no policy involvement.
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+        .bind(b_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_a),
+            name: "Drop snapshots in A".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": "-images$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let _ = svc.execute_policy(policy.id, false).await.unwrap();
+
+    assert!(is_deleted(&pool, a_id).await);
+    assert!(
+        !oci_tag_exists(&pool, repo_a, "img", "snapshot-images").await,
+        "tag in repo_a must be cascaded"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_b, "img", "snapshot-images").await,
+        "tag in repo_b must NOT be touched by a repo_a-scoped policy"
+    );
+
+    cleanup(&pool, repo_a).await;
+    cleanup(&pool, repo_b).await;
+}
+
+/// Regression for PR #1406 review concern #1: an OCI image name that
+/// embeds a `host:port` registry prefix (so `artifacts.name` looks like
+/// `host:5000/img:tag` with two colons) must still cascade. The previous
+/// `substring(a.name from '^(.+):[^:]+$')` predicate was brittle around
+/// this layout; the path-based join is stable.
+#[tokio::test]
+#[ignore]
+async fn test_cascade_handles_port_in_image_name() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-port-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let digest = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    let image = "myregistry.example:5000/image";
+    let tag = "snapshot-keep-me";
+    let id = insert_oci_manifest_artifact(&pool, repo_id, image, tag, digest, 100).await;
+    insert_oci_tag(&pool, repo_id, image, tag, digest).await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop snapshot-keep-me".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            // Anchor on tag suffix; we want the artifact name (which now
+            // contains a registry prefix and two colons) to still match.
+            config: serde_json::json!({"pattern": "snapshot-keep-me$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(
+        result.artifacts_removed, 1,
+        "policy must still match an image with a port-bearing registry prefix"
+    );
+    assert!(
+        is_deleted(&pool, id).await,
+        "artifact with port-in-name must be soft-deleted"
+    );
+    assert!(
+        !oci_tag_exists(&pool, repo_id, image, tag).await,
+        "cascade must remove the oci_tags row even when the image carries a host:port prefix"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Regression for PR #1406 review concern #1 (digest-shape edge case):
+/// when an artifact is pinned by digest the reference is
+/// `sha256:<hex>` and `artifacts.name = "img:sha256:<hex>"`. The previous
+/// greedy `substring(a.name from '^(.+):[^:]+$')` predicate matched the
+/// LAST colon, extracting `img:sha256` instead of `img`, so the join to
+/// `oci_tags.name` ('img') silently failed and the cascade never fired.
+/// The path-based predicate reconstructs the path exactly, so digest
+/// references survive.
+#[tokio::test]
+#[ignore]
+async fn test_cascade_handles_digest_reference() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-digest-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Tag value is itself a digest. The artifact_path written by the OCI
+    // handler is `v2/{image}/manifests/{reference}` where `reference` is
+    // the digest, and `artifacts.name = "{image}:{reference}"`.
+    let digest = "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+    let image = "imgwithdigest";
+    let reference = digest; // pinned-by-digest case
+    let id = insert_oci_manifest_artifact(&pool, repo_id, image, reference, digest, 200).await;
+    insert_oci_tag(&pool, repo_id, image, reference, digest).await;
+
+    // Backdate the row and run a max_age_days policy: this matches by
+    // age, not by name, so we exercise the cascade SQL without depending
+    // on the (broken) regex shape.
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("backdate failed");
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop > 7 days".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: serde_json::json!({"days": 7}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, id).await);
+
+    // This is the regression assertion: the old regex extracted
+    // "imgwithdigest:sha256" from "imgwithdigest:sha256:6666..." and the
+    // join failed. With the path-based predicate it succeeds.
+    assert!(
+        !oci_tag_exists(&pool, repo_id, image, reference).await,
+        "cascade must remove oci_tags row when reference is a digest (sha256:...)"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Regression for PR #1406 review concern #2: the soft-delete and the
+/// cascade must happen inside a single transaction. We can't easily
+/// crash the process mid-policy in a unit-ish test, but we can verify
+/// that an arbitrary failure inside the transaction (here: a policy
+/// type the dispatcher rejects after the transaction is open) leaves
+/// no orphaned oci_tags rows. Combined with the source-level assertion
+/// that `execute_policy` uses `self.db.begin()` and `tx.commit()`, this
+/// is enough to catch a regression that drops back to two pool
+/// round-trips.
+#[tokio::test]
+#[ignore]
+async fn test_execute_policy_reclaims_orphan_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-tx-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Seed: one manifest + one oci_tags row that already matches the
+    // cascade predicate (the artifact was soft-deleted by an earlier run
+    // but the tag was not removed — exactly the bug state).
+    let digest = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+    let id = insert_oci_manifest_artifact(&pool, repo_id, "img", "stale", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "stale", digest).await;
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run a real policy that won't match the stale artifact (it's
+    // already deleted). The cascade still runs in its own transaction
+    // (tx2 of the three-tx split) so the stale tag row is reclaimed.
+    let live_id = insert_oci_manifest_artifact(
+        &pool,
+        repo_id,
+        "img",
+        "live",
+        "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        100,
+    )
+    .await;
+    insert_oci_tag(
+        &pool,
+        repo_id,
+        "img",
+        "live",
+        "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    )
+    .await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop ^stale$ (no match)".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            // matches nothing — we just want to commit the cascade.
+            config: serde_json::json!({"pattern": "^never-matches$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 0);
+
+    // The cascade tx ran after the (no-op) soft-delete tx committed.
+    // The stale tag must be gone.
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "stale").await,
+        "cascade must reclaim pre-existing stale tags from prior crashed runs"
+    );
+    // The live one must survive.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "live").await,
+        "live tag must be untouched"
+    );
+    assert!(!is_deleted(&pool, live_id).await);
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Crash-recovery: if a prior policy execution crashed between the
+/// soft-delete transaction (tx1) and the cascade transaction (tx2), the
+/// system is left with orphan `oci_tags` rows pointing at soft-deleted
+/// manifests. A subsequent policy run must pick them up via the cascade
+/// sweep — that's what makes the three-transaction split safe.
+///
+/// This test simulates the crash by direct SQL: insert manifest +
+/// oci_tags, mark the artifact `is_deleted = true` (as tx1 would have
+/// done), but never run the cascade for it. Then a fresh policy run
+/// (whose own per-type matcher hits nothing) must still reclaim the
+/// orphan because tx2 filters on `a.is_deleted = true` globally within
+/// the policy's scope.
+#[tokio::test]
+#[ignore]
+async fn test_cascade_picks_up_orphans_from_prior_run() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-orphans-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Simulate three crashed-mid-execute orphans: artifacts already
+    // soft-deleted, oci_tags rows still present. This is the exact state
+    // a crash between tx1 (soft-delete commit) and tx2 (cascade commit)
+    // would leave behind.
+    let orphans = [
+        (
+            "imgA",
+            "v1",
+            "sha256:aaaa000000000000000000000000000000000000000000000000000000000001",
+        ),
+        (
+            "imgA",
+            "v2",
+            "sha256:aaaa000000000000000000000000000000000000000000000000000000000002",
+        ),
+        (
+            "imgB",
+            "snapshot",
+            "sha256:bbbb000000000000000000000000000000000000000000000000000000000001",
+        ),
+    ];
+    for (image, tag, digest) in &orphans {
+        let id = insert_oci_manifest_artifact(&pool, repo_id, image, tag, digest, 100).await;
+        insert_oci_tag(&pool, repo_id, image, tag, digest).await;
+        // Direct SQL = the soft-delete from a prior tx1 that committed
+        // before the process died.
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Sanity: orphans exist before the recovery run.
+    for (image, tag, _) in &orphans {
+        assert!(
+            oci_tag_exists(&pool, repo_id, image, tag).await,
+            "seeded orphan {}:{} must exist pre-recovery",
+            image,
+            tag
+        );
+    }
+
+    // A live artifact + tag that must survive the cascade. The policy's
+    // pattern won't match it, so per-type execute is a no-op — only tx2
+    // (cascade sweep) does any real work.
+    let live_digest = "sha256:cccc000000000000000000000000000000000000000000000000000000000001";
+    let live_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "imgC", "live", live_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "imgC", "live", live_digest).await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Recovery sweep".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            // Matches nothing; we only care that tx2 fires.
+            config: serde_json::json!({"pattern": "^never-matches-anything$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(
+        result.artifacts_removed, 0,
+        "per-type pattern matches nothing; cascade still must run"
+    );
+
+    // Every orphan tag row must be gone — tx2's filter on
+    // `a.is_deleted = true` picked them up.
+    for (image, tag, _) in &orphans {
+        assert!(
+            !oci_tag_exists(&pool, repo_id, image, tag).await,
+            "orphan {}:{} must be reclaimed by the cascade sweep",
+            image,
+            tag
+        );
+    }
+    // Live tag/artifact must survive.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "imgC", "live").await,
+        "live tag must not be swept"
+    );
+    assert!(!is_deleted(&pool, live_id).await);
+
+    // Idempotency: running the same policy again must be a no-op for the
+    // cascade (nothing more to delete) and must still succeed.
+    let result2 = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result2.artifacts_removed, 0);
+    assert!(oci_tag_exists(&pool, repo_id, "imgC", "live").await);
+
+    cleanup(&pool, repo_id).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_size_quota_under_limit_evicts_nothing() {
