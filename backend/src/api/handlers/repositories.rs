@@ -816,10 +816,17 @@ pub async fn list_repositories(
 pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Json(payload): Json<CreateRepositoryRequest>,
+    body: Bytes,
 ) -> Result<Json<RepositoryResponse>> {
+    // #1438 (1b): authenticate BEFORE deserializing the body. The previous
+    // `Json<CreateRepositoryRequest>` extractor ran first and rejected
+    // unauth requests carrying a payload the schema didn't recognize with
+    // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    let payload: CreateRepositoryRequest =
+        serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Fine-grained permission check: non-admins need "admin" on the system sentinel.
     if !auth.is_admin {
@@ -7635,15 +7642,17 @@ mod tests {
         }
     }
 
-    /// Deserialize a `CreateRepositoryRequest` from a minimal JSON object,
-    /// merging in `overrides` so individual tests only specify the fields they
-    /// care about.
+    /// Build a `CreateRepositoryRequest` body as raw bytes from a minimal
+    /// JSON object, merging in `overrides` so individual tests only specify
+    /// the fields they care about. Returns bytes (matching the handler's
+    /// post-#1438 signature) so tests don't need to round-trip through the
+    /// `CreateRepositoryRequest` struct, which is `Deserialize`-only.
     fn make_create_request(
         key: &str,
         name: &str,
         format: &str,
         overrides: serde_json::Value,
-    ) -> CreateRepositoryRequest {
+    ) -> Bytes {
         let mut base = serde_json::json!({
             "key": key,
             "name": name,
@@ -7654,7 +7663,7 @@ mod tests {
         {
             b.extend(o);
         }
-        serde_json::from_value(base).expect("valid CreateRepositoryRequest")
+        Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
     }
 
     /// When a format string is not a built-in variant but there IS an
@@ -7688,7 +7697,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7757,7 +7766,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7802,7 +7811,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7871,7 +7880,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(non_admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
