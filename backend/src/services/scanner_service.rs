@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -46,6 +48,25 @@ use crate::storage::StorageBackend;
 /// no longer count as reusable, so we re-scan stale artifacts to pick
 /// up freshly-published advisories.
 pub(crate) const DEDUP_TTL_DAYS: i32 = 30;
+
+/// Upper bound on the size of a single artifact we are willing to stage for
+/// scanning. Beyond this we reject the input rather than consume unbounded
+/// disk and virtual address space. 10 GiB is generous for real packages while
+/// still capping a hostile or runaway upload.
+pub(crate) const MAX_SCAN_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Below this size we keep the scan input in heap (`Bytes`) and skip the
+/// tempfile + mmap machinery entirely. The mmap path exists to keep
+/// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
+/// process alone; for a few-KB package that overhead (create_dir_all,
+/// spawn_blocking, tempfile, mmap) is pure cost. 8 MiB keeps the common
+/// small-artifact case on the fast in-memory path.
+pub(crate) const SCAN_MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+// The mmap threshold must sit below the hard size cap. Otherwise the spill
+// path could only be reached after the cap had already rejected the input,
+// leaving the two knobs inconsistent. Enforced at compile time.
+const _: () = assert!(SCAN_MMAP_THRESHOLD_BYTES < MAX_SCAN_INPUT_BYTES);
 
 /// Sanitize a filename to its basename, stripping any directory components
 /// to prevent path traversal attacks. Returns `"artifact"` as a fallback
@@ -3230,15 +3251,233 @@ impl ScannerService {
         Ok(count)
     }
 
-    /// Fetch artifact content from the configured storage backend.
+    /// Fetch artifact content from the configured storage backend, staged for
+    /// scanning. Small artifacts stay in heap; large ones are spilled to an
+    /// mmap-backed `Bytes` so they do not pin anon heap across every scanner.
+    ///
+    /// NOTE: cloud backends without a streaming `get_stream` override (GCS,
+    /// Azure) still buffer the whole object in memory inside the default
+    /// `get_stream` fallback before it reaches us here. Adding native
+    /// streaming reads for those backends is tracked separately by #1430 and
+    /// #1431 (GCS `get_stream`); this fix deliberately does not expand into
+    /// that work.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
+        // Early reject using the recorded size before we open the stream. The
+        // streaming loop below re-checks against the same ceiling because
+        // `size_bytes` can be stale or wrong for proxied/upstream content.
+        if artifact.size_bytes > MAX_SCAN_INPUT_BYTES as i64 {
+            return Err(AppError::Validation(format!(
+                "Artifact {} is {} bytes, exceeding the {} byte scan-input limit; skipping scan",
+                artifact.id, artifact.size_bytes, MAX_SCAN_INPUT_BYTES
+            )));
+        }
+
         let storage = self.resolve_repo_storage(artifact.repository_id).await?;
-        storage.get(&artifact.storage_key).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to read artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, e
-            ))
+        Self::stage_from_storage(
+            storage.as_ref(),
+            &artifact.storage_key,
+            &self.scan_workspace_path,
+        )
+        .await
+        .map_err(|e| match e {
+            // Preserve the validation/size-cap variant; only wrap raw
+            // storage/stream-open failures with artifact context.
+            AppError::Storage(msg) => AppError::Storage(format!(
+                "Failed to stage artifact {} (key={}): {}",
+                artifact.id, artifact.storage_key, msg
+            )),
+            other => other,
         })
+    }
+
+    /// Open a streaming read from `storage` for `key` and stage it for scanning.
+    /// Split out from [`fetch_artifact_content`] so it can be tested directly
+    /// against a real storage backend without a database round-trip.
+    async fn stage_from_storage(
+        storage: &dyn StorageBackend,
+        key: &str,
+        workspace_path: &str,
+    ) -> Result<Bytes> {
+        let stream = storage.get_stream(key).await.map_err(|e| {
+            AppError::Storage(format!("Failed to open stream for key {}: {}", key, e))
+        })?;
+        Self::stage_scan_input(stream, workspace_path).await
+    }
+
+    /// Stage `stream` for scanning, returning the bytes either in heap (small
+    /// inputs) or as an `mmap`-backed `Bytes` spilled to a tempfile (large
+    /// inputs).
+    ///
+    /// Why this exists: `storage.get(...)` used to return the full (multi-GiB)
+    /// artifact as anon heap and the orchestrator held it alive across every
+    /// applicable scanner — past the cgroup ceiling on smaller nodes, where
+    /// the OOM killer was the only outcome. File-backed (mmap) pages are
+    /// kernel-reclaimable under cgroup pressure; anon pages are not.
+    ///
+    /// Staging strategy:
+    /// - We buffer in heap while the running total stays below
+    ///   [`SCAN_MMAP_THRESHOLD_BYTES`]. Most artifacts never exceed it, so they
+    ///   never touch the disk/mmap path at all.
+    /// - The first chunk that pushes us over the threshold triggers a spill:
+    ///   the in-heap prefix and all remaining chunks are written to a tempfile
+    ///   which is then memory-mapped.
+    /// - The running total is checked against [`MAX_SCAN_INPUT_BYTES`] so a
+    ///   stream whose declared `size_bytes` was wrong (or absent) still cannot
+    ///   consume unbounded disk + virtual address space.
+    ///
+    /// Lifetime of the tempfile: the `NamedTempFile` is held until this function
+    /// returns, at which point its `Drop` unlinks the path. On Linux the inode
+    /// stays alive (and the `Mmap` valid) as long as the returned `Bytes` keeps
+    /// the mapping referenced, but the directory entry is gone immediately. The
+    /// on-disk blocks are reclaimed when the returned `Bytes` drops, i.e. when
+    /// scanning finishes.
+    async fn stage_scan_input(
+        stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+    ) -> Result<Bytes> {
+        Self::stage_scan_input_with_limits(
+            stream,
+            workspace_path,
+            SCAN_MMAP_THRESHOLD_BYTES,
+            MAX_SCAN_INPUT_BYTES,
+        )
+        .await
+    }
+
+    /// Inner staging routine with the threshold and cap as parameters so both
+    /// branches are testable with small inputs. Production calls go through
+    /// [`stage_scan_input`], which supplies the configured constants.
+    async fn stage_scan_input_with_limits(
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+        mmap_threshold: u64,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+
+        // Phase 1: buffer in heap until we either drain the stream (small
+        // input -> stay in memory) or cross the mmap threshold (large input
+        // -> fall through to the spill path below).
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                AppError::Storage(format!("Stream error while staging scan input: {}", e))
+            })?;
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(AppError::Validation(format!(
+                    "Scan input exceeded the {} byte limit while streaming; aborting scan",
+                    max_bytes
+                )));
+            }
+            buffered.extend_from_slice(&chunk);
+            if total > mmap_threshold {
+                return Self::spill_to_mmap(buffered, stream, total, workspace_path, max_bytes)
+                    .await;
+            }
+        }
+
+        // Small input: served straight from heap, no tempfile, no mmap.
+        Ok(Bytes::from(buffered))
+    }
+
+    /// Spill an already-buffered prefix plus the remaining stream to a tempfile
+    /// under `workspace_path`, then return an `mmap`-backed `Bytes`. Only
+    /// reached once the input is known to exceed the mmap threshold.
+    async fn spill_to_mmap(
+        prefix: Vec<u8>,
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        mut total: u64,
+        workspace_path: &str,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::fs::create_dir_all(workspace_path)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to create scan workspace {}: {}",
+                    workspace_path, e
+                ))
+            })?;
+
+        let workspace = workspace_path.to_string();
+        // Hold the NamedTempFile for the duration of staging. Its path is
+        // unlinked on Drop at function return; the Mmap keeps the inode alive.
+        let temp = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(&workspace))
+            .await
+            .map_err(|e| AppError::Storage(format!("Tempfile join failure: {}", e)))?
+            .map_err(|e| AppError::Storage(format!("Failed to create scan tempfile: {}", e)))?;
+
+        // Write through the NamedTempFile's own handle (an independent fd to the
+        // same inode via `reopen()`), never by reopening the path. Reopening by
+        // path would be a TOCTOU: between create and reopen another process
+        // could swap the file the path points at. `reopen()` shares the inode.
+        let owned_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen scan tempfile handle for write: {}",
+                e
+            ))
+        })?;
+        {
+            let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(owned_file));
+            writer.write_all(&prefix).await.map_err(|e| {
+                AppError::Storage(format!("Write error staging scan input prefix: {}", e))
+            })?;
+            drop(prefix);
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    AppError::Storage(format!("Stream error while staging scan input: {}", e))
+                })?;
+                total += chunk.len() as u64;
+                if total > max_bytes {
+                    return Err(AppError::Validation(format!(
+                        "Scan input exceeded the {} byte limit while streaming; aborting scan",
+                        max_bytes
+                    )));
+                }
+                writer.write_all(&chunk).await.map_err(|e| {
+                    AppError::Storage(format!("Write error to scan tempfile: {}", e))
+                })?;
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|e| AppError::Storage(format!("Flush error on scan tempfile: {}", e)))?;
+        }
+
+        // Map through a fresh independent fd to the same inode.
+        let map_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen scan tempfile handle for mmap: {}",
+                e
+            ))
+        })?;
+        // SAFETY: `memmap2::Mmap::map` is unsafe because the kernel mapping
+        // becomes undefined behavior if the underlying file is mutated or
+        // truncated by another writer while the mapping is live. We uphold the
+        // contract:
+        //   - The file is a freshly created `NamedTempFile` in a workspace the
+        //     backend owns (`SCAN_WORKSPACE_PATH` must be a local filesystem
+        //     the backend has exclusive control of, not a shared/network mount
+        //     that other processes write to).
+        //   - We are the only owner of this inode: `reopen()` hands back an
+        //     independent fd to the same inode, and `temp` is kept alive in
+        //     scope so nothing else holds the path to truncate or replace it.
+        //   - After this function returns, the path is unlinked (NamedTempFile
+        //     Drop), so no later process can open and truncate it; the inode
+        //     persists only because the `Mmap` (owned by the returned `Bytes`)
+        //     references it. We never write to the file again past this point.
+        let mmap = unsafe { memmap2::Mmap::map(&map_file) }
+            .map_err(|e| AppError::Storage(format!("mmap failed on scan tempfile: {}", e)))?;
+
+        // Drop `temp` -> unlinks the path. The inode stays alive behind the
+        // Mmap until the returned `Bytes` is dropped (scan finished).
+        drop(temp);
+
+        Ok(Bytes::from_owner(mmap))
     }
 
     /// Resolve the storage backend for a given repository by looking up
@@ -3522,6 +3761,220 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // stage_scan_input / stage_from_storage (scan-input staging)
+    // -----------------------------------------------------------------------
+
+    /// Count regular files directly under `dir` (non-recursive). Used to assert
+    /// the staging path never leaks a tempfile in the scan workspace.
+    fn count_entries(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_stage_scan_input_concatenates_chunks_in_memory() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"hello world");
+        // Small input takes the in-memory path: the workspace dir is never even
+        // touched (no create_dir_all, no tempfile).
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "small input must not create any file in the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_scan_input_empty_stream() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = futures::stream::iter(Vec::<Result<Bytes>>::new()).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(count_entries(tmp.path()), 0);
+    }
+
+    /// Below the threshold: in-memory path, correct bytes, no tempfile.
+    #[tokio::test]
+    async fn test_stage_scan_input_below_threshold_stays_in_memory() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A few KB, well under SCAN_MMAP_THRESHOLD_BYTES.
+        let payload = vec![0xABu8; 4 * 1024];
+        let expected = payload.clone();
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(payload))]).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), expected.len());
+        assert_eq!(&out[..], &expected[..]);
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "below-threshold input must not spill to disk"
+        );
+    }
+
+    /// Above the threshold: spills to a tempfile + mmap, returns correct bytes,
+    /// and unlinks the tempfile so nothing leaks in the workspace.
+    #[tokio::test]
+    async fn test_stage_scan_input_above_threshold_spills_to_mmap() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // Just over the threshold, streamed in 1 MiB chunks so the spill
+        // happens mid-stream (prefix already buffered when we cross over).
+        let chunk = vec![0x5Au8; 1024 * 1024];
+        let chunk_count = (SCAN_MMAP_THRESHOLD_BYTES / (1024 * 1024)) as usize + 2;
+        let chunks: Vec<Result<Bytes>> = (0..chunk_count)
+            .map(|_| Ok(Bytes::from(chunk.clone())))
+            .collect();
+        let total = chunk.len() * chunk_count;
+        let stream = futures::stream::iter(chunks).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), total);
+        assert!(out.iter().all(|&b| b == 0x5A), "bytes must round-trip");
+        // The NamedTempFile is unlinked on return; the workspace dir is created
+        // but must contain no leftover staging file.
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "mmap spill path must not leak a tempfile after return"
+        );
+    }
+
+    /// Mid-stream error must propagate AND leave no tempfile behind. We force
+    /// the error after crossing the threshold so the spill path (which created
+    /// a tempfile) is the one exercised.
+    #[tokio::test]
+    async fn test_stage_scan_input_midstream_error_cleans_up() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let big = vec![0x11u8; (SCAN_MMAP_THRESHOLD_BYTES + 1) as usize];
+        let chunks: Vec<Result<Bytes>> =
+            vec![Ok(Bytes::from(big)), Err(AppError::Storage("boom".into()))];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap()).await;
+        let err = result.expect_err("mid-stream error must propagate");
+        assert!(
+            err.to_string().contains("boom"),
+            "underlying error must surface, got: {}",
+            err
+        );
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "tempfile must be unlinked on error path (NamedTempFile Drop)"
+        );
+    }
+
+    /// A small-input mid-stream error: never spills, so nothing to clean up,
+    /// but the error must still propagate.
+    #[tokio::test]
+    async fn test_stage_scan_input_small_midstream_error_propagates() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"x")),
+            Err(AppError::Storage("boom".into())),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap()).await;
+        let err = result.expect_err("mid-stream error must propagate");
+        assert!(err.to_string().contains("boom"), "got: {}", err);
+        assert_eq!(count_entries(tmp.path()), 0);
+    }
+
+    /// `stage_from_storage` (the storage-backed half of `fetch_artifact_content`)
+    /// round-trips real stored bytes through a filesystem backend, with no DB.
+    #[tokio::test]
+    async fn test_stage_from_storage_roundtrips_filesystem_backend() {
+        use crate::storage::filesystem::FilesystemStorage;
+        use crate::storage::StorageBackend;
+        let store_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path());
+
+        let key = "deadbeefcafef00d";
+        let content = b"artifact bytes that fetch_artifact_content should return verbatim";
+        storage.put(key, Bytes::from_static(content)).await.unwrap();
+
+        let out =
+            ScannerService::stage_from_storage(&storage, key, work_dir.path().to_str().unwrap())
+                .await
+                .unwrap();
+        assert_eq!(&out[..], &content[..], "returned bytes must equal stored");
+    }
+
+    /// The size cap rejects an input that exceeds `max_bytes` while still in
+    /// the in-heap phase (before any spill). Driven with small data via the
+    /// limit-parameterized inner routine.
+    #[tokio::test]
+    async fn test_stage_scan_input_cap_rejects_in_memory_phase() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // 4 KiB input, cap of 1 KiB, threshold above the cap so we never spill.
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(vec![0u8; 4 * 1024]))]).boxed();
+        let result = ScannerService::stage_scan_input_with_limits(
+            stream,
+            tmp.path().to_str().unwrap(),
+            /* mmap_threshold */ 8 * 1024,
+            /* max_bytes */ 1024,
+        )
+        .await;
+        let err = result.expect_err("oversized input must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "got: {:?}", err);
+        assert!(err.to_string().contains("exceeded"));
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "rejected-in-memory input must not have created a tempfile"
+        );
+    }
+
+    /// The size cap also fires on the spill path (after the threshold is
+    /// crossed) and cleans up the tempfile it had started writing.
+    #[tokio::test]
+    async fn test_stage_scan_input_cap_rejects_on_spill_path_and_cleans_up() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // First chunk (2 KiB) crosses the 1 KiB threshold -> spill begins.
+        // Second chunk pushes total past the 3 KiB cap -> reject mid-spill.
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from(vec![0u8; 2 * 1024])),
+            Ok(Bytes::from(vec![0u8; 2 * 1024])),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input_with_limits(
+            stream,
+            tmp.path().to_str().unwrap(),
+            /* mmap_threshold */ 1024,
+            /* max_bytes */ 3 * 1024,
+        )
+        .await;
+        let err = result.expect_err("oversized input must be rejected on spill path");
+        assert!(matches!(err, AppError::Validation(_)), "got: {:?}", err);
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "tempfile must be unlinked when the cap aborts the spill"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Scanner version parsing (issue #902)
