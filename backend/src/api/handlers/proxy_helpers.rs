@@ -265,7 +265,11 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 
 /// Map a proxy service error to an HTTP error response.
 ///
-/// `NotFound` errors become 404; everything else becomes 502 Bad Gateway.
+/// * `NotFound` → 404 (upstream definitively does not have the artifact)
+/// * `Validation` → 400 (path-traversal / boundary check rejected)
+/// * `ServiceUnavailable` → 503 (upstream returned 5xx, see #1445 below)
+/// * Everything else → 502 (upstream timeouts, TLS errors, auth failures,
+///   body read errors, etc.)
 ///
 /// Log-level discipline (#1139): an upstream 404 (`AppError::NotFound`) is
 /// **normal proxy traffic**, not a failure of artifact-keeper. Docker / OCI
@@ -275,13 +279,25 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// floods operators with false-positive alerts and reads as "the proxy is
 /// broken" when the proxy is in fact doing its job correctly.
 ///
+/// 502 vs 503 split (#1445): upstream 5xx is a transient condition the
+/// client should retry against, not a permanent gateway-side error. Mapping
+/// raw upstream 502/503/504 to a client-side 502 broke the proxy's
+/// "returns 2xx or 503" contract under concurrent load: a single upstream
+/// hiccup would surface as 502 to every concurrent caller until the cache
+/// filled. Routing the entire 5xx family through 503 lets clients fan-out
+/// retries with backoff and keeps a flaky upstream from polluting the
+/// proxy's gateway-error metrics.
+///
 /// * **`NotFound`** is logged at `info` with wording that names the cause
 ///   (upstream returned 404). Operators triaging "why is my mirror not
 ///   working" see immediately that the upstream does not have the requested
 ///   artifact, not that artifact-keeper malfunctioned.
 /// * **`Validation`** stays at `warn` because it indicates a malformed path
 ///   (often a probe / attack attempt the path-traversal guard rejected).
-/// * **Everything else** (timeouts, TLS errors, 5xx, auth challenge parse
+/// * **`ServiceUnavailable`** is logged at `warn` (transient upstream
+///   failure that operators may still want to investigate if it persists,
+///   but the client gets a retry-friendly status).
+/// * **Everything else** (timeouts, TLS errors, auth challenge parse
 ///   failures, body read errors) stays at `warn` because those genuinely
 ///   warrant operator attention.
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
@@ -310,6 +326,23 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
                 e
             );
             (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response()
+        }
+        // #1445: upstream 5xx folds into 503 here. The handler-side
+        // contract is "raw upstream 5xx never leaks to clients"; the
+        // mapping at `validate_upstream_status` is the upstream-side
+        // half of the contract.
+        crate::error::AppError::ServiceUnavailable(_) => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %path,
+                "Upstream transient failure (5xx); returning 503: {}",
+                e
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Upstream temporarily unavailable; retry shortly",
+            )
+                .into_response()
         }
         _ => {
             tracing::warn!(
@@ -2642,6 +2675,27 @@ mod tests {
         let err = crate::error::AppError::Authentication("bad token".to_string());
         let resp = super::map_proxy_error("repo", "path", err);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #1445: when the upstream returns 5xx the proxy MUST return 503
+    /// (Service Unavailable) to the client, never the raw 502 from the
+    /// remote. The proxy_service maps upstream 5xx to
+    /// `AppError::ServiceUnavailable`; `map_proxy_error` must surface
+    /// that as `503` to preserve the "2xx or 503" client contract under
+    /// concurrent load (status set `502 200 502 502 502 200 401 401 ...`
+    /// in the reproducer was caused by the previous mapping that let
+    /// raw upstream 502 reach the client).
+    #[test]
+    fn test_map_proxy_error_service_unavailable_returns_503_for_upstream_5xx() {
+        let err = crate::error::AppError::ServiceUnavailable(
+            "Upstream returned error status 502: https://up/x".to_string(),
+        );
+        let resp = super::map_proxy_error("my-repo", "pkg/v1/file.bin", err);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream 5xx must surface as 503 to clients, not 502 (#1445)"
+        );
     }
 
     // --- build_remote_repo ---

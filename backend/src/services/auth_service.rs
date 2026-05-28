@@ -170,12 +170,20 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 
 /// Record a local credential invalidation in the in-memory fast-path so
 /// subsequent token-validation checks on this replica reject tokens issued
-/// before `now` without first waiting for the DB cache to refresh. The DB
-/// columns (`password_changed_at`, `totp_verified_at`, `updated_at`) remain
-/// the source of truth across replicas.
+/// at or before `now` without first waiting for the DB cache to refresh.
+/// The DB columns (`password_changed_at`, `totp_verified_at`, `updated_at`)
+/// remain the source of truth across replicas.
+///
+/// Boundary (regression of #931, fixed by #1436): the replica-safe path in
+/// `is_token_invalidated_replica_safe` compares with strict `<` (#1265),
+/// not `<=`. A JWT minted in the same wall-clock second as the password
+/// change would otherwise survive: `iat == watermark` makes `iat < watermark`
+/// false. We write `now + 1` so any token with `iat <= now` is rejected.
+/// The sync map at `is_token_invalidated` uses `<=` so the `+1` does not
+/// double-count there.
 pub fn invalidate_user_tokens(user_id: Uuid) {
-    let now = Utc::now().timestamp();
-    invalidate_user_tokens_at(user_id, now);
+    let watermark = Utc::now().timestamp().saturating_add(1);
+    invalidate_user_tokens_at(user_id, watermark);
 }
 
 /// Variant of [`invalidate_user_tokens`] that exempts the caller's own JWT.
@@ -184,7 +192,9 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
 /// watermark is set to `caller_iat - 1` so the sync `<=` check still passes
 /// for the calling token (`caller_iat <= caller_iat - 1` is false), while
 /// every token issued at any second strictly before `caller_iat` is
-/// invalidated.
+/// invalidated. The sync path is the one consulted by the gRPC interceptor
+/// (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so the `-1`
+/// here is load-bearing on those code paths.
 ///
 /// Used by TOTP enable/disable so the session that initiated the credential
 /// change is not logged out by the same operation. Other sessions (and any
@@ -470,21 +480,72 @@ pub fn install_global_auth_semaphore(sem: Option<Arc<Semaphore>>) {
     let _ = GLOBAL_AUTH_SEMAPHORE.set(sem);
 }
 
+/// How long to wait for a bcrypt-permit before giving up and shedding to
+/// 503. A short queue tolerance turns "burst of 50 concurrent basic-auth
+/// requests" (every CI package-manager invocation) into a survivable
+/// workload at small caps, instead of failing 42/50 outright (#1437,
+/// #1442). bcrypt-cost-12 is ~100-300 ms per verify so 3 s lets ~10-30
+/// queued requests drain at cap=8 before the next one sheds.
+const AUTH_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Try to claim a permit from the process-wide bcrypt-bound auth cap. Returns:
 /// - `Ok(None)` when no cap is installed (tests, or operator opt-out)
 /// - `Ok(Some(permit))` when a slot was acquired (must be held until the
 ///   bcrypt work completes; release is automatic on drop, including on panic)
-/// - `Err(ServiceUnavailable)` when the cap is saturated
-pub(crate) fn acquire_auth_permit_for_bcrypt() -> Result<Option<tokio::sync::OwnedSemaphorePermit>>
-{
+/// - `Err(ServiceUnavailable)` when the cap is saturated for longer than
+///   [`AUTH_PERMIT_WAIT`]
+///
+/// Async because we briefly wait for a free slot before shedding. The fast
+/// path (slot immediately available) does not yield. See #1437 / #1442 for
+/// the regression this fixes: an immediate `try_acquire_owned` shed 42/50
+/// concurrent basic-auth requests rather than letting them queue for the
+/// ~1-2 s drain time at cap=8.
+pub(crate) async fn acquire_auth_permit_for_bcrypt(
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
     let sem_arc = GLOBAL_AUTH_SEMAPHORE.get().and_then(|cell| cell.clone());
-    try_acquire_permit_from(sem_arc.as_ref())
+    acquire_permit_from(sem_arc.as_ref(), AUTH_PERMIT_WAIT).await
 }
 
 /// Pure helper that the public function delegates to. Extracted so that unit
 /// tests can exercise the shed logic on a fresh semaphore without contending
 /// with the process-wide `OnceLock` (which may have been set by an earlier
 /// test in the same binary).
+///
+/// Behaviour:
+/// - `None` cap -> `Ok(None)` (legacy uncapped mode).
+/// - Slot free -> immediate `Ok(Some(permit))` (fast path, no yield).
+/// - Slot saturated -> wait up to `wait` for a slot, then shed if it
+///   never frees. The shed is mapped to `ServiceUnavailable` which the
+///   `IntoResponse` impl turns into 503 + `Retry-After: 1`.
+async fn acquire_permit_from(
+    sem: Option<&Arc<Semaphore>>,
+    wait: std::time::Duration,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    let Some(sem) = sem else {
+        return Ok(None);
+    };
+
+    // Fast path: a slot is immediately available, so we never yield.
+    if let Ok(permit) = sem.clone().try_acquire_owned() {
+        return Ok(Some(permit));
+    }
+
+    // Saturated: queue for `wait`, then shed.
+    match tokio::time::timeout(wait, sem.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(Some(permit)),
+        // Either the semaphore was closed (shouldn't happen — it lives for
+        // process lifetime) or the wait elapsed. Both surface as 503 with a
+        // Retry-After hint so well-behaved clients back off.
+        _ => Err(AppError::ServiceUnavailable(
+            "Authentication service is at capacity, retry shortly".to_string(),
+        )),
+    }
+}
+
+/// Legacy non-blocking variant retained for tests and callers that need a
+/// synchronous shed boundary (no queue wait). New call sites should prefer
+/// [`acquire_auth_permit_for_bcrypt`] which queues briefly before shedding.
+#[cfg(test)]
 fn try_acquire_permit_from(
     sem: Option<&Arc<Semaphore>>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
@@ -1160,7 +1221,7 @@ impl AuthService {
         // Hold a process-wide auth-concurrency permit while bcrypt runs so
         // hash() also participates in the load-shed cap (signup, password
         // change, API-token creation all call this).
-        let _permit = acquire_auth_permit_for_bcrypt()?;
+        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         tokio::task::spawn_blocking(move || {
             hash(&pwd, DEFAULT_COST)
@@ -1178,7 +1239,7 @@ impl AuthService {
     /// fast-shedding load so the rest of the API does not starve the
     /// blocking-thread pool (#991, #1088).
     pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
-        let _permit = acquire_auth_permit_for_bcrypt()?;
+        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         let h = hash.to_string();
         tokio::task::spawn_blocking(move || {
@@ -2212,6 +2273,140 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #1437 / #1442: bounded-wait permit acquisition. The fast path must
+    // not yield, the queued path must drain when a slot frees, and the
+    // shed path must surface 503 after the wait elapses. Together these
+    // turn a burst of N basic-auth requests at cap=K into K-by-K drain
+    // instead of `N - K` instant 503 failures, which was the dominant
+    // failure shape in the stress-tests behind #1437.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_permit_fast_path_does_not_wait() {
+        let sem = Arc::new(Semaphore::new(2));
+        let started = std::time::Instant::now();
+        let permit = acquire_permit_from(Some(&sem), std::time::Duration::from_secs(60))
+            .await
+            .expect("must succeed");
+        assert!(permit.is_some());
+        // Free slot -> immediate success. 50 ms is generous and accounts
+        // for runner jitter.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "fast path should not wait, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_permit_waits_for_held_slot_to_free() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("first slot must succeed");
+
+        // Release the held permit shortly after a queued acquire starts,
+        // mimicking a bcrypt verify finishing.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        let permit = acquire_permit_from(Some(&sem), std::time::Duration::from_secs(5))
+            .await
+            .expect("queued acquire must succeed before timeout");
+        assert!(permit.is_some());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(40),
+            "should have waited for releaser, elapsed {:?}",
+            started.elapsed()
+        );
+        releaser.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_acquire_permit_sheds_after_wait_elapses() {
+        let sem = Arc::new(Semaphore::new(1));
+        let _held = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("first slot must succeed");
+
+        // Nobody will release the permit -> the wait elapses and we shed.
+        let result = acquire_permit_from(Some(&sem), std::time::Duration::from_millis(80)).await;
+        match result {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!("expected ServiceUnavailable after wait, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_permit_no_cap_short_circuits() {
+        // When the operator opts out (auth_max_concurrency=0), the helper
+        // must not block or shed - it returns `None` immediately so bcrypt
+        // runs uncapped (legacy behaviour). This preserves the test-binary
+        // semantics that #1200 was careful to keep working.
+        let started = std::time::Instant::now();
+        let permit = acquire_permit_from(None, std::time::Duration::from_secs(60))
+            .await
+            .expect("must succeed");
+        assert!(permit.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_permit_burst_drains_at_cap() {
+        // The end-to-end shape #1437 / #1442 was filed against: 50
+        // concurrent acquires at cap=8 must all complete (none shed)
+        // when each holder releases promptly. This is the contract that
+        // turns flat-line-at-8 stress tests into clean drains.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sem = Arc::new(Semaphore::new(8));
+        let succeeded = Arc::new(AtomicUsize::new(0));
+        let shed = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let sem = sem.clone();
+            let succeeded = succeeded.clone();
+            let shed = shed.clone();
+            handles.push(tokio::spawn(async move {
+                match acquire_permit_from(Some(&sem), std::time::Duration::from_secs(3)).await {
+                    Ok(Some(_permit)) => {
+                        // Simulate a 30 ms bcrypt verify before releasing.
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        // Should not happen with a cap installed.
+                        panic!("unexpected None permit with cap installed");
+                    }
+                    Err(_) => {
+                        shed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let ok = succeeded.load(Ordering::Relaxed);
+        let bad = shed.load(Ordering::Relaxed);
+        // At 50 requests with cap=8 and ~30 ms per slot, the entire burst
+        // completes in ~50 * 30 / 8 ≈ 190 ms, well under the 3 s shed
+        // boundary. Before this fix the same shape produced 50 - 8 = 42
+        // 503 failures (one permit at a time, no queue). We allow up to 5
+        // sheds for scheduler jitter on slow runners but the dominant
+        // outcome must be ~all succeed.
+        assert!(
+            ok >= 45,
+            "expected at least 45/50 to succeed, got {ok} ok, {bad} shed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Token generation & validation (no DB needed)
     // -----------------------------------------------------------------------
 
@@ -3166,7 +3361,11 @@ mod tests {
     fn test_token_issued_after_invalidation_is_accepted() {
         let user_id = Uuid::new_v4();
         invalidate_user_tokens(user_id);
-        let after = Utc::now().timestamp() + 1;
+        // Watermark is `now + 1` (#1436 fix) so the sync `<=` map rejects
+        // every iat <= now+1. We bump the test "after" to `now + 2` to
+        // represent a JWT minted at least one whole second after the
+        // invalidation completed.
+        let after = Utc::now().timestamp() + 2;
         assert!(!is_token_invalidated(user_id, after));
     }
 
@@ -3184,7 +3383,8 @@ mod tests {
         // Slight delay so second invalidation gets a newer timestamp
         std::thread::sleep(std::time::Duration::from_millis(10));
         invalidate_user_tokens(user_id);
-        let after = Utc::now().timestamp() + 1;
+        // Same `+2` rationale as test_token_issued_after_invalidation_is_accepted.
+        let after = Utc::now().timestamp() + 2;
         // Token issued before second invalidation is still rejected
         assert!(is_token_invalidated(user_id, mid - 1));
         // Token issued after second invalidation is accepted

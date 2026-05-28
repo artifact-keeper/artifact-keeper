@@ -158,14 +158,26 @@ impl PolicyType {
 /// no-op rather than a hard error. Pulled out so the failure path
 /// (missing key, wrong type) is covered by unit tests instead of only
 /// indirectly through the per-type SQL executors.
+///
+/// Backward-compat shape: callers historically posted policy configs as
+/// either the canonical nested form `{ "<key>": N }` (e.g. `{"keep": 5}`)
+/// or the flat form `{ "<policy_type>": N }` (e.g. `{"max_versions": 5}`).
+/// The flat form was the original wire shape used by early CLIs/e2e
+/// scripts and several integration tests still send it. We accept either
+/// transparently: prefer the canonical `key`, fall back to
+/// `policy_type_label`, only error if neither is a valid integer.
 pub(crate) fn parse_i64_field(
     config: &serde_json::Value,
     policy_type_label: &str,
     key: &str,
 ) -> Result<i64> {
-    config.get(key).and_then(|v| v.as_i64()).ok_or_else(|| {
-        AppError::Validation(format!("{policy_type_label} requires '{key}' in config"))
-    })
+    config
+        .get(key)
+        .and_then(|v| v.as_i64())
+        .or_else(|| config.get(policy_type_label).and_then(|v| v.as_i64()))
+        .ok_or_else(|| {
+            AppError::Validation(format!("{policy_type_label} requires '{key}' in config"))
+        })
 }
 
 /// Pull a non-empty regex pattern string from `policy.config["pattern"]`.
@@ -1176,41 +1188,45 @@ impl LifecycleService {
     }
 
     /// Validate policy config based on type.
+    ///
+    /// Each numeric policy type historically accepted **two** wire shapes:
+    /// the canonical nested key (e.g. `{"keep": 5}` for `max_versions`)
+    /// and the flat policy-type alias (e.g. `{"max_versions": 5}`). Older
+    /// CLIs and several integration tests still post the flat form, so we
+    /// accept either here and in `parse_i64_field`. The error message
+    /// still names the canonical key for forward guidance.
     fn validate_policy_config(&self, policy_type: &str, config: &serde_json::Value) -> Result<()> {
+        // Lookup helper: prefer canonical key, fall back to flat policy_type alias.
+        let read_positive_i64 = |canonical: &str| -> Option<i64> {
+            config
+                .get(canonical)
+                .and_then(|v| v.as_i64())
+                .or_else(|| config.get(policy_type).and_then(|v| v.as_i64()))
+                .filter(|&n| n > 0)
+        };
+
         match policy_type {
             "max_age_days" => {
-                config
-                    .get("days")
-                    .and_then(|v| v.as_i64())
-                    .filter(|&d| d > 0)
-                    .ok_or_else(|| {
-                        AppError::Validation(
-                            "max_age_days requires 'days' (positive integer) in config".to_string(),
-                        )
-                    })?;
+                read_positive_i64("days").ok_or_else(|| {
+                    AppError::Validation(
+                        "max_age_days requires 'days' (positive integer) in config".to_string(),
+                    )
+                })?;
             }
             "max_versions" => {
-                config
-                    .get("keep")
-                    .and_then(|v| v.as_i64())
-                    .filter(|&k| k > 0)
-                    .ok_or_else(|| {
-                        AppError::Validation(
-                            "max_versions requires 'keep' (positive integer) in config".to_string(),
-                        )
-                    })?;
+                read_positive_i64("keep").ok_or_else(|| {
+                    AppError::Validation(
+                        "max_versions requires 'keep' (positive integer) in config".to_string(),
+                    )
+                })?;
             }
             "no_downloads_days" => {
-                config
-                    .get("days")
-                    .and_then(|v| v.as_i64())
-                    .filter(|&d| d > 0)
-                    .ok_or_else(|| {
-                        AppError::Validation(
-                            "no_downloads_days requires 'days' (positive integer) in config"
-                                .to_string(),
-                        )
-                    })?;
+                read_positive_i64("days").ok_or_else(|| {
+                    AppError::Validation(
+                        "no_downloads_days requires 'days' (positive integer) in config"
+                            .to_string(),
+                    )
+                })?;
             }
             "tag_pattern_keep" | "tag_pattern_delete" => {
                 let pattern = config
@@ -1227,16 +1243,12 @@ impl LifecycleService {
                     .map_err(|e| AppError::Validation(format!("Invalid regex pattern: {}", e)))?;
             }
             "size_quota_bytes" => {
-                config
-                    .get("quota_bytes")
-                    .and_then(|v| v.as_i64())
-                    .filter(|&q| q > 0)
-                    .ok_or_else(|| {
-                        AppError::Validation(
-                            "size_quota_bytes requires 'quota_bytes' (positive integer) in config"
-                                .to_string(),
-                        )
-                    })?;
+                read_positive_i64("quota_bytes").ok_or_else(|| {
+                    AppError::Validation(
+                        "size_quota_bytes requires 'quota_bytes' (positive integer) in config"
+                            .to_string(),
+                    )
+                })?;
             }
             _ => {}
         }
@@ -1334,6 +1346,47 @@ mod tests {
         let config = json!({"keep": -1});
         let result = svc.validate_policy_config("max_versions", &config);
         assert!(result.is_err());
+    }
+
+    // Backward-compat: tests/CLIs that POSTed `{ "max_versions": N }`
+    // (flat shape) before the canonical `{ "keep": N }` was introduced.
+    #[tokio::test]
+    async fn test_validate_max_versions_flat_shape_valid() {
+        let svc = make_service_for_validation();
+        let config = json!({"max_versions": 5});
+        assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_flat_shape_zero_rejected() {
+        let svc = make_service_for_validation();
+        let config = json!({"max_versions": 0});
+        let result = svc.validate_policy_config("max_versions", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_canonical_wins_over_flat() {
+        // If both shapes are present, the canonical key takes precedence.
+        let svc = make_service_for_validation();
+        let config = json!({"keep": 7, "max_versions": -1});
+        assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_age_days_flat_shape_valid() {
+        let svc = make_service_for_validation();
+        let config = json!({"max_age_days": 30});
+        assert!(svc.validate_policy_config("max_age_days", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_size_quota_bytes_flat_shape_valid() {
+        let svc = make_service_for_validation();
+        let config = json!({"size_quota_bytes": 1024});
+        assert!(svc
+            .validate_policy_config("size_quota_bytes", &config)
+            .is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2809,6 +2862,43 @@ mod tests {
             parse_i64_field(&cfg, "size_quota_bytes", "quota_bytes").unwrap(),
             1_073_741_824
         );
+    }
+
+    #[test]
+    fn test_parse_i64_field_accepts_flat_policy_type_alias() {
+        // Pre-keep wire shape: tests/CLIs used to post `{ "max_versions": N }`
+        // (flat) instead of `{ "keep": N }`. Both shapes must work.
+        let cfg = json!({"max_versions": 5});
+        assert_eq!(parse_i64_field(&cfg, "max_versions", "keep").unwrap(), 5);
+
+        let cfg = json!({"max_age_days": 30});
+        assert_eq!(parse_i64_field(&cfg, "max_age_days", "days").unwrap(), 30);
+
+        let cfg = json!({"size_quota_bytes": 1024});
+        assert_eq!(
+            parse_i64_field(&cfg, "size_quota_bytes", "quota_bytes").unwrap(),
+            1024
+        );
+    }
+
+    #[test]
+    fn test_parse_i64_field_canonical_key_wins_over_flat_alias() {
+        // When both shapes are present the canonical key takes precedence
+        // so an operator can override the flat value during a migration.
+        let cfg = json!({"keep": 7, "max_versions": 99});
+        assert_eq!(parse_i64_field(&cfg, "max_versions", "keep").unwrap(), 7);
+    }
+
+    #[test]
+    fn test_parse_i64_field_flat_alias_non_integer_falls_through_to_error() {
+        // Neither key is a valid integer, so we still get the canonical
+        // "requires '<key>' in config" error — flat aliasing must not mask
+        // typos.
+        let cfg = json!({"max_versions": "five"});
+        let err = parse_i64_field(&cfg, "max_versions", "keep").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_versions"));
+        assert!(msg.contains("keep"));
     }
 
     #[test]
