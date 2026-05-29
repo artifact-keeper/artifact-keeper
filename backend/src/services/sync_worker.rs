@@ -72,6 +72,30 @@ pub(crate) fn failover_detection_deadline_secs(
 /// Duration of each worker tick in seconds.
 const TICK_INTERVAL_SECS: u64 = 10;
 
+/// Default per-peer TCP connect timeout (seconds) for sync transfers.
+///
+/// Bounds how long a single transfer waits to establish a connection to a
+/// peer. Without this, a peer whose endpoint black-holes connections (firewall
+/// DROP, dead host) would hold a transfer slot for the full request timeout
+/// (300s). In a fan-out to multiple peers, that unreachable peer would then
+/// occupy one of its own concurrency slots for minutes. Capping the connect
+/// phase lets the worker fail the broken leg quickly and retry under backoff,
+/// while healthy peers (separate tasks) are unaffected.
+///
+/// Override with `SYNC_PEER_CONNECT_TIMEOUT_SECS` (positive integer).
+const DEFAULT_PEER_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Read the configured per-peer connect timeout from
+/// `SYNC_PEER_CONNECT_TIMEOUT_SECS`, falling back to
+/// `DEFAULT_PEER_CONNECT_TIMEOUT_SECS`. Non-positive values are rejected.
+pub(crate) fn peer_connect_timeout_secs() -> u64 {
+    std::env::var("SYNC_PEER_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_PEER_CONNECT_TIMEOUT_SECS)
+}
+
 /// Default threshold (in bytes) above which chunked transfer is used instead
 /// of a single-request upload.  100 MB.
 /// Override with the `SYNC_CHUNKED_THRESHOLD_BYTES` env var.
@@ -125,8 +149,13 @@ pub async fn spawn_sync_worker(db: PgPool) {
         // Small startup delay so the server can finish initializing.
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut tick = interval(Duration::from_secs(TICK_INTERVAL_SECS));
+        let connect_timeout = peer_connect_timeout_secs();
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(300))
+            // Bound the connect phase so an unreachable peer in a fan-out
+            // fails fast instead of holding a transfer slot for the full
+            // request timeout.
+            .connect_timeout(Duration::from_secs(connect_timeout))
             .build()
             .expect("Failed to build HTTP client for sync worker");
 
@@ -2564,5 +2593,35 @@ mod tests {
     fn test_sync_chunk_size_bytes_default() {
         let val = DEFAULT_SYNC_CHUNK_SIZE_BYTES;
         assert_eq!(val, 52_428_800);
+    }
+
+    // ── peer_connect_timeout_secs ───────────────────────────────────────
+
+    #[test]
+    fn test_peer_connect_timeout_default_is_bounded() {
+        // The default must be small relative to the 300s request timeout so a
+        // black-holed peer in a fan-out cannot hold a transfer slot for long.
+        assert_eq!(DEFAULT_PEER_CONNECT_TIMEOUT_SECS, 10);
+        assert!(DEFAULT_PEER_CONNECT_TIMEOUT_SECS < 300);
+    }
+
+    #[test]
+    fn test_peer_connect_timeout_env_override() {
+        // Guarded against parallel env mutation by using a unique read path:
+        // set, read, clear. Other tests don't touch this var.
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "3");
+        assert_eq!(peer_connect_timeout_secs(), 3);
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "0");
+        // Non-positive is rejected, falls back to default.
+        assert_eq!(
+            peer_connect_timeout_secs(),
+            DEFAULT_PEER_CONNECT_TIMEOUT_SECS
+        );
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "notanumber");
+        assert_eq!(
+            peer_connect_timeout_secs(),
+            DEFAULT_PEER_CONNECT_TIMEOUT_SECS
+        );
+        std::env::remove_var("SYNC_PEER_CONNECT_TIMEOUT_SECS");
     }
 }
