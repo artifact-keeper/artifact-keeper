@@ -2831,12 +2831,32 @@ pub async fn download_artifact(
             }
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Virtual => {
-            // Virtual repo: try each member in priority order
+            // Virtual repo: try each member in priority order.
+            //
+            // Shadowing guard (B9): the generic-format download keys on the
+            // exact stored path. If a non-Remote member of this virtual repo
+            // owns the path, suppress the proxy service so Remote members are
+            // Skip'd and cannot shadow the local artifact. Without this a
+            // Remote member earlier in priority order that returns a 200 for
+            // the same path (catch-all upstream, or a different object at
+            // that path) would win the first-`Ok` race and serve the wrong
+            // or empty bytes, while a guarded format handler would 404-refuse.
+            let owns_locally =
+                proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+                    .await
+                    .map_err(|_| {
+                        AppError::Internal("virtual shadowing-guard query failed".to_string())
+                    })?;
+            let proxy_for_virtual = if owns_locally {
+                None
+            } else {
+                state.proxy_service.as_deref()
+            };
             let db = state.db.clone();
             let path_clone = path.clone();
             let (content, content_type) = proxy_helpers::resolve_virtual_download(
                 &state.db,
-                state.proxy_service.as_deref(),
+                proxy_for_virtual,
                 repo.id,
                 &path,
                 |member_id, location| {

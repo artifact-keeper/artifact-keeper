@@ -1038,6 +1038,70 @@ impl ProxyService {
         Ok((content, content_type, changed))
     }
 
+    /// List the PyPI project names that already have a cached `simple/<name>/`
+    /// index in this repository's proxy cache.
+    ///
+    /// PyPI clients fetch a per-project simple index (`simple/<name>/`) before
+    /// downloading any distribution. That index is proxy-cached at
+    /// `proxy-cache/<repo_key>/simple/<name>/__content__`. For a Remote repo,
+    /// proxy-cached artifacts are intentionally NOT recorded in the `artifacts`
+    /// table (#1278), so the root simple index (`simple/`) has no DB rows to
+    /// list and can come back empty even after clients have pulled packages
+    /// through the proxy. Walking the proxy-cache prefix recovers the set of
+    /// projects the proxy has actually served, so the root index lists them
+    /// (B8). Falls back to an empty list when the storage backend cannot list
+    /// the prefix.
+    pub async fn list_cached_pypi_packages(&self, repo_key: &str) -> Vec<String> {
+        let prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let keys = match self.storage.list(Some(&prefix)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    error = %e,
+                    "listing proxy cache for pypi simple-root packages failed; \
+                     returning no cached packages"
+                );
+                return Vec::new();
+            }
+        };
+        Self::pypi_package_names_from_cache_keys(repo_key, keys.iter().map(String::as_str))
+    }
+
+    /// Extract the distinct PyPI project names from a set of proxy-cache
+    /// storage keys.
+    ///
+    /// Keys look like
+    /// `proxy-cache/<repo_key>/simple/<name>/__content__` (and a sibling
+    /// `__cache_meta__.json`). We keep only entries that carry a package
+    /// segment (`simple/<name>/...`), pull the `<name>` segment out, and
+    /// dedupe. Pure so the parsing can be unit-tested without a storage
+    /// backend.
+    fn pypi_package_names_from_cache_keys<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let simple_prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(&simple_prefix) else {
+                continue;
+            };
+            // `rest` is `<name>/<more>...`; the first segment is the project.
+            // The bare `simple/` root index caches under `simple//__content__`
+            // (empty first segment) which we skip, and a `__content__` sitting
+            // directly under `simple/` has no project segment either.
+            let Some((name, tail)) = rest.split_once('/') else {
+                continue;
+            };
+            if name.is_empty() || tail.is_empty() {
+                continue;
+            }
+            names.insert(name.to_string());
+        }
+        names.into_iter().collect()
+    }
+
     /// Invalidate every cached file referenced from an APT Release file
     /// for a given distribution (#1147).
     ///
@@ -1238,10 +1302,22 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Check if metadata exists
-        let metadata = match self.load_cache_metadata(metadata_key).await? {
-            Some(m) => m,
-            None => return Ok(None),
+        // Check if metadata exists. A read/parse error on the sidecar (e.g. a
+        // waiter racing the single-flight leader's metadata write, or a
+        // half-written JSON) is treated as a cache miss rather than bubbling
+        // out as a 502 (B6): the caller re-fetches upstream and gets a clean
+        // 2xx or a 503, never a raw storage 502.
+        let metadata = match self.load_cache_metadata(metadata_key).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    metadata_key = %metadata_key,
+                    error = %e,
+                    "proxy cache metadata read failed; treating as miss and refetching upstream"
+                );
+                return Ok(None);
+            }
         };
 
         // Check if cache has expired
@@ -1269,7 +1345,24 @@ impl ProxyService {
                 Ok(Some((content, metadata.content_type)))
             }
             Err(AppError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            // B6 (coalescing 502 leak): a transient storage read error here
+            // (e.g. a waiter reading the cache body while the single-flight
+            // leader is mid-write, or a partially-written / poisoned entry)
+            // must NOT bubble out as a raw 502 to every concurrent waiter.
+            // Treat it as a cache miss so the caller re-fetches upstream; the
+            // upstream path then surfaces a clean 2xx (cache repopulated) or a
+            // 503 via `validate_upstream_status` when upstream itself is the
+            // one failing. Surfacing the read error as `Err(e)` made it
+            // `map_proxy_error` -> 502, which is exactly the raw status the
+            // stampede gate rejects.
+            Err(e) => {
+                tracing::warn!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "proxy cache read failed; treating as miss and refetching upstream"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -4596,6 +4689,174 @@ SHA256:
             Err(AppError::BadGateway(_)) => {}
             other => panic!("401 must map to AppError::BadGateway; got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // B6: coalescing-waiter 502 leak. Under a cache stampede, every
+    // concurrent waiter consults the proxy cache before re-fetching. If the
+    // single-flight leader's upstream fetch failed and left a transiently
+    // unreadable cache entry (mid-write, half-written sidecar, or a poisoned
+    // partial), reading that entry must NOT surface as a raw 502 to the
+    // waiter. `get_cached_artifact` must treat a non-NotFound storage error
+    // as a cache MISS (`Ok(None)`) so the waiter re-fetches upstream and
+    // gets a clean 2xx or a 503 (via `validate_upstream_status`) — never the
+    // raw upstream 502 the stampede gate rejects.
+    // -----------------------------------------------------------------------
+
+    /// Mock backend that serves valid, fresh metadata but fails the body
+    /// read with a transient `Storage` error (models a waiter racing the
+    /// leader's cache write, or a poisoned partial body).
+    struct PoisonedCacheBodyMock {
+        metadata: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PoisonedCacheBodyMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            if key.ends_with("__cache_meta__.json") {
+                Ok(self.metadata.clone())
+            } else {
+                // The body read fails transiently (NOT NotFound).
+                Err(AppError::Storage(
+                    "transient backend read error".to_string(),
+                ))
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_waiter_treats_unreadable_cache_body_as_miss_not_502() {
+        let mock = Arc::new(PoisonedCacheBodyMock {
+            metadata: fresh_metadata_bytes(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let result = service
+            .get_cached_artifact(
+                "proxy-cache/npm-proxy/lodash/__content__",
+                "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+            )
+            .await;
+
+        // Must be Ok(None) (treated as miss -> caller refetches upstream),
+        // NOT Err(_) which would map to a raw 502 for every concurrent waiter.
+        match result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!(
+                "a body read error must not be promoted to a cache hit; \
+                 got Ok(Some(_))"
+            ),
+            Err(e) => panic!(
+                "coalescing waiter saw a raw cache read error (would surface \
+                 as 502); it must be treated as a miss instead. got Err({:?})",
+                e
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_waiter_treats_unreadable_metadata_as_miss_not_502() {
+        /// Backend whose metadata sidecar read fails transiently.
+        struct PoisonedMetadataMock;
+        #[async_trait::async_trait]
+        impl crate::services::storage_service::StorageBackend for PoisonedMetadataMock {
+            async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> Result<Bytes> {
+                Err(AppError::Storage(
+                    "transient metadata read error".to_string(),
+                ))
+            }
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn size(&self, _key: &str) -> Result<u64> {
+                Ok(0)
+            }
+        }
+
+        let service = build_proxy_service_with_storage(Arc::new(PoisonedMetadataMock));
+
+        let result = service
+            .get_cached_artifact(
+                "proxy-cache/npm-proxy/lodash/__content__",
+                "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+            )
+            .await;
+
+        match result {
+            Ok(None) => {}
+            other => panic!(
+                "a metadata read error must be treated as a cache miss (Ok(None)), \
+                 not a raw 502; got {:?}",
+                other.map(|o| o.is_some())
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B8: pypi simple-root recovers cached project names from the proxy
+    // cache so a Remote repo's root index lists packages even though
+    // proxy-cached artifacts no longer land in the `artifacts` table (#1278).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_extracts_projects() {
+        let keys = vec![
+            "proxy-cache/pypi-remote/simple/flask/__content__",
+            "proxy-cache/pypi-remote/simple/flask/__cache_meta__.json",
+            "proxy-cache/pypi-remote/simple/requests/__content__",
+            "proxy-cache/pypi-remote/simple/numpy/__content__",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        // Deduped (flask appears twice across content + metadata) and sorted.
+        assert_eq!(names, vec!["flask", "numpy", "requests"]);
+    }
+
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_skips_root_and_other_repos() {
+        let keys = vec![
+            // bare simple root index (empty project segment) — must be skipped
+            "proxy-cache/pypi-remote/simple//__content__",
+            // a __content__ directly under simple/ with no project — skipped
+            "proxy-cache/pypi-remote/simple/__content__",
+            // a different repo's cache — must not leak in
+            "proxy-cache/other-repo/simple/django/__content__",
+            // an unrelated (non-simple) cache entry — skipped
+            "proxy-cache/pypi-remote/packages/foo.whl/__content__",
+            // a real project — kept
+            "proxy-cache/pypi-remote/simple/flask/__content__",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        assert_eq!(names, vec!["flask"]);
     }
 
     // -----------------------------------------------------------------------

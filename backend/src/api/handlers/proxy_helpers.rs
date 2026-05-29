@@ -1492,6 +1492,70 @@ pub async fn virtual_non_remote_owns_name(
     Ok(exists.is_some())
 }
 
+/// Returns true if any non-Remote member of `virtual_repo_id` owns an
+/// artifact stored at exactly `path`.
+///
+/// This is the exact-path analogue of [`virtual_non_remote_owns_name`],
+/// used by the generic-format virtual download path (`download_artifact`)
+/// where there is no format-specific package-name parser to feed the
+/// name-based guard. The generic format keys purely on the stored
+/// `artifacts.path` (e.g. `shadowpkg/1.0.0/shadowpkg-1.0.0.bin`), so the
+/// shadowing guard must match the same way.
+///
+/// When this returns true the caller must Skip every Remote member of the
+/// virtual repo for this download (by passing `proxy_service: None` to
+/// [`resolve_virtual_download`]). Otherwise a Remote member that returns a
+/// 200 for the same path (a catch-all upstream, or one that genuinely hosts
+/// a different object at that path) would shadow the local member that
+/// actually owns the artifact: the iteration returns the first `Ok`, and a
+/// Remote member earlier in priority order would win with the wrong (or
+/// empty) bytes (B9).
+///
+/// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
+/// Returns false on the benign "no non-Remote members" case so virtual repos
+/// that contain only upstream proxies behave exactly as before.
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_path(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    path: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+                              WHERE repository_id = ANY($1) \
+                                AND is_deleted = false \
+                                AND path = $2 \
+                              LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            event = "shadowing_guard_db_error",
+            virtual_repo_id = %virtual_repo_id,
+            format = "generic",
+            error = %e,
+            "generic exact-path shadowing-guard DB query failed; failing closed to 500",
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+    })?;
+
+    Ok(exists.is_some())
+}
+
 /// Build the SQL `LIKE` pattern that matches every artifact path under
 /// a given Maven `groupId/artifactId/` directory.
 ///
