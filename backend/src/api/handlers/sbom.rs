@@ -629,6 +629,17 @@ async fn get_sbom_components(
 }
 
 /// Convert an SBOM to a different format
+///
+/// Returns the converted SBOM as a [`SbomContentResponse`]: the metadata
+/// row plus the full converted document under `content`. The `content` is
+/// load-bearing here. A consumer that asked for `target_format=spdx` needs
+/// the SPDX document (`content.spdxVersion`, `content.SPDXID`, ...) to feed
+/// downstream attestation tooling, and a `target_format=cyclonedx` request
+/// needs `content.bomFormat == "CycloneDX"`. Returning metadata-only
+/// (`SbomResponse`) dropped the converted document entirely, so callers
+/// could not tell an SPDX result from a CycloneDX one and round-trip
+/// conversion appeared to lose the document shape. (release-gate
+/// `test-sbom-convert.sh` 2.5.a / 2.5.b.)
 #[utoipa::path(
     post,
     path = "/{id}/convert",
@@ -639,7 +650,7 @@ async fn get_sbom_components(
     ),
     request_body = ConvertSbomRequest,
     responses(
-        (status = 200, description = "Converted SBOM", body = SbomResponse),
+        (status = 200, description = "Converted SBOM with content", body = SbomContentResponse),
         (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
@@ -650,13 +661,13 @@ async fn convert_sbom(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<ConvertSbomRequest>,
-) -> Result<Json<SbomResponse>> {
+) -> Result<Json<SbomContentResponse>> {
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
 
     let doc = service.convert_sbom(id, target_format).await?;
-    Ok(Json(SbomResponse::from(doc)))
+    Ok(Json(SbomContentResponse::from(doc)))
 }
 
 // === CVE History ===
@@ -1558,6 +1569,91 @@ mod tests {
         let resp = SbomContentResponse::from(doc);
         assert_eq!(resp.content, content);
         assert_eq!(resp.content["components"][0]["name"], "serde");
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.a: the
+    /// `/sbom/{id}/convert` response is a [`SbomContentResponse`], and when
+    /// the target format is SPDX the serialized body must expose the SPDX
+    /// document under `content` so the test's `.content.spdxVersion` /
+    /// `.content.SPDXID` reads resolve. The handler previously returned a
+    /// metadata-only `SbomResponse`, which carried neither field and made
+    /// every convert-to-SPDX call look like it dropped `spdxVersion`.
+    #[test]
+    fn test_convert_response_surfaces_spdx_content_keys() {
+        let now = Utc::now();
+        let spdx_content = serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "dataLicense": "CC0-1.0",
+            "name": "artifact-sbom",
+            "packages": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "spdx".to_string(),
+            format_version: "2.3".to_string(),
+            spec_version: Some("SPDX-2.3".to_string()),
+            content: spdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        // The handler builds exactly this from `convert_sbom`'s SbomDocument.
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["spdxVersion"], "SPDX-2.3");
+        assert_eq!(json["content"]["SPDXID"], "SPDXRef-DOCUMENT");
+        // Metadata is flattened alongside content (id is load-bearing for the
+        // round-trip step, which converts the returned id back).
+        assert_eq!(json["format"], "spdx");
+        assert!(json["id"].is_string());
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.b
+    /// (round-trip): converting back to CycloneDX must expose
+    /// `content.bomFormat == "CycloneDX"`. The metadata-only response had no
+    /// `content`, so the reverse conversion read an empty `bomFormat`.
+    #[test]
+    fn test_convert_response_surfaces_cyclonedx_bom_format() {
+        let now = Utc::now();
+        let cdx_content = serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "components": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("CycloneDX 1.5".to_string()),
+            content: cdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["bomFormat"], "CycloneDX");
+        assert_eq!(json["format"], "cyclonedx");
     }
 
     // -----------------------------------------------------------------------
