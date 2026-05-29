@@ -25,6 +25,8 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use artifact_keeper_backend::services::repository_service::RepositoryService;
+
 /// Insert a hosted repository row directly. Returns the new repo id.
 async fn insert_repo(pool: &PgPool, key: &str, repo_type: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -81,34 +83,23 @@ async fn cleanup(pool: &PgPool, ids: &[Uuid]) {
     }
 }
 
-/// Replicates the handler's single-statement bulk update. Returns the set of
-/// member ids that were actually updated (the RETURNING set). The handler
-/// compares this set against its input to detect TOCTOU and surface a 404.
+/// Drives the real service path the handler uses: a single
+/// `UPDATE ... FROM UNNEST(...) ... RETURNING member_repo_id` run inside a
+/// transaction guarded by the process-wide member-graph advisory lock. The
+/// handler compares the returned set against its input to detect TOCTOU and
+/// surface a 404. Exercising the service (not a copy of the SQL) means a
+/// regression that drops the advisory lock -- which reopens the concurrent-PUT
+/// deadlock (B2) -- would also break the concurrency test below.
 async fn run_bulk_update(
     pool: &PgPool,
     virtual_id: Uuid,
     member_ids: &[Uuid],
     priorities: &[i32],
 ) -> Result<Vec<Uuid>, String> {
-    sqlx::query_scalar::<_, Uuid>(
-        r#"
-        UPDATE virtual_repo_members
-           SET priority = c.priority
-          FROM (
-            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
-                     AS t(member_repo_id, priority)
-          ) AS c
-         WHERE virtual_repo_members.virtual_repo_id = $1
-           AND virtual_repo_members.member_repo_id = c.member_repo_id
-        RETURNING virtual_repo_members.member_repo_id
-        "#,
-    )
-    .bind(virtual_id)
-    .bind(member_ids)
-    .bind(priorities)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())
+    let svc = RepositoryService::new(pool.clone());
+    svc.update_virtual_member_priorities(virtual_id, member_ids, priorities)
+        .await
+        .map_err(|e| format!("{e:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -297,4 +288,168 @@ async fn concurrent_puts_produce_deterministic_state() {
     }
 
     cleanup(&setup_pool, &[virt, m1, m2, m3]).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 (B2): concurrent PUTs over OVERLAPPING member sets must not
+// deadlock. This mirrors `test-virtual-members-concurrent-put.sh`: writer 1
+// touches {A, B} and writer 2 touches {B, C}, so B is the contested row.
+//
+// Without a serialising lock, the two UNNEST UPDATEs acquire row locks in
+// planner-scan order and can each grab one shared tuple then block on the
+// other's, which Postgres only breaks after `deadlock_timeout`. Under a tight
+// loop that surfaces as repeated multi-second stalls / aborts that blow the
+// client timeout (the suite's 124 exit). The advisory lock the service takes
+// serialises every member-graph mutation, so each round must complete
+// promptly with both writers succeeding and B ending at one writer's value.
+//
+// The whole loop is wrapped in `tokio::time::timeout`: a reintroduced
+// deadlock that the lock would have prevented turns this test from green to
+// a hard timeout failure rather than a flaky hang.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_overlapping_puts_do_not_deadlock() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let setup_pool = PgPool::connect(&db_url).await.expect("connect");
+
+    let suffix = Uuid::new_v4();
+    let virt = insert_repo(&setup_pool, &format!("vm-virt-ovl-{}", suffix), "virtual").await;
+    let m_a = insert_repo(&setup_pool, &format!("vm-a-ovl-{}", suffix), "local").await;
+    let m_b = insert_repo(&setup_pool, &format!("vm-b-ovl-{}", suffix), "local").await;
+    let m_c = insert_repo(&setup_pool, &format!("vm-c-ovl-{}", suffix), "local").await;
+    insert_member(&setup_pool, virt, m_a, 1).await;
+    insert_member(&setup_pool, virt, m_b, 1).await;
+    insert_member(&setup_pool, virt, m_c, 1).await;
+
+    let pool_a = PgPool::connect(&db_url).await.expect("connect a");
+    let pool_b = PgPool::connect(&db_url).await.expect("connect b");
+
+    let work = async {
+        for round in 0..50 {
+            // Reset B to a sentinel so each round is a true race.
+            sqlx::query(
+                "UPDATE virtual_repo_members SET priority = 1 \
+                 WHERE virtual_repo_id = $1 AND member_repo_id = $2",
+            )
+            .bind(virt)
+            .bind(m_b)
+            .execute(&setup_pool)
+            .await
+            .expect("reset B");
+
+            // Writer 1: {A=10, B=20}. Writer 2: {B=200, C=300}. B is contested.
+            let ids_1 = vec![m_a, m_b];
+            let prio_1 = vec![10, 20];
+            let ids_2 = vec![m_b, m_c];
+            let prio_2 = vec![200, 300];
+            let pa = pool_a.clone();
+            let pb = pool_b.clone();
+
+            let (r1, r2) = tokio::join!(
+                tokio::spawn(async move { run_bulk_update(&pa, virt, &ids_1, &prio_1).await }),
+                tokio::spawn(async move { run_bulk_update(&pb, virt, &ids_2, &prio_2).await }),
+            );
+            r1.expect("task 1 panic")
+                .unwrap_or_else(|e| panic!("round {round}: writer 1 failed: {e}"));
+            r2.expect("task 2 panic")
+                .unwrap_or_else(|e| panic!("round {round}: writer 2 failed: {e}"));
+
+            // Uncontested rows reflect their sole writer; contested B is one
+            // of the two bound values (never torn, never the sentinel).
+            assert_eq!(read_priority(&setup_pool, virt, m_a).await, Some(10));
+            assert_eq!(read_priority(&setup_pool, virt, m_c).await, Some(300));
+            let b = read_priority(&setup_pool, virt, m_b).await.unwrap();
+            assert!(
+                b == 20 || b == 200,
+                "round {round}: B must be 20 or 200, got {b}"
+            );
+        }
+    };
+
+    // 60s is far longer than the lock-serialised work needs (~50 fast
+    // UPDATEs) but well under what a deadlock storm would consume.
+    tokio::time::timeout(std::time::Duration::from_secs(60), work)
+        .await
+        .expect(
+            "concurrent overlapping PUTs deadlocked (B2 regression): work did not finish in 60s",
+        );
+
+    cleanup(&setup_pool, &[virt, m_a, m_b, m_c]).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 (B2, deadlock-shape): two writers update the SAME multi-row member
+// set in OPPOSITE order. This is the canonical shape that makes two
+// `UPDATE ... FROM UNNEST` statements deadlock: each acquires tuple locks in
+// its own scan order, so writer 1 can hold row 1 and wait on row 6 while
+// writer 2 holds row 6 and waits on row 1. Postgres only breaks that after
+// `deadlock_timeout` (~1s) by aborting one side; under the release-gate's
+// repeated concurrent PUTs the cumulative stalls + aborts blow the 120s
+// script budget (the observed exit 124).
+//
+// Empirically (probe during development) the raw no-lock statement deadlocked
+// in ~32/40 rounds of this shape; routing through the service's advisory-lock
+// transaction produced 0/40. This test pins that: with the lock, every round
+// completes promptly and no writer returns a deadlock error. A regression that
+// drops the lock fails here via the `tokio::time::timeout` wrapper (hard
+// timeout) or a `deadlock detected` error surfaced from a writer.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_reverse_order_puts_do_not_deadlock() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let setup_pool = PgPool::connect(&db_url).await.expect("connect");
+
+    let suffix = Uuid::new_v4();
+    let virt = insert_repo(&setup_pool, &format!("vm-virt-rev-{}", suffix), "virtual").await;
+    let mut members = Vec::new();
+    for i in 0..6 {
+        let m = insert_repo(&setup_pool, &format!("vm-rev-m{}-{}", i, suffix), "local").await;
+        insert_member(&setup_pool, virt, m, 1).await;
+        members.push(m);
+    }
+    let forward: Vec<Uuid> = members.clone();
+    let reverse: Vec<Uuid> = members.iter().rev().copied().collect();
+
+    let pool_a = PgPool::connect(&db_url).await.expect("connect a");
+    let pool_b = PgPool::connect(&db_url).await.expect("connect b");
+
+    let work = async {
+        for round in 0..40 {
+            let ids_a = forward.clone();
+            let ids_b = reverse.clone();
+            let prio_a = vec![10i32; forward.len()];
+            let prio_b = vec![20i32; reverse.len()];
+            let pa = pool_a.clone();
+            let pb = pool_b.clone();
+
+            let (ra, rb) = tokio::join!(
+                tokio::spawn(async move { run_bulk_update(&pa, virt, &ids_a, &prio_a).await }),
+                tokio::spawn(async move { run_bulk_update(&pb, virt, &ids_b, &prio_b).await }),
+            );
+            let res_a = ra.expect("task a panic");
+            let res_b = rb.expect("task b panic");
+            for res in [&res_a, &res_b] {
+                if let Err(e) = res {
+                    assert!(
+                        !e.to_lowercase().contains("deadlock"),
+                        "round {round}: writer hit a deadlock (B2 regression): {e}"
+                    );
+                    panic!("round {round}: writer failed unexpectedly: {e}");
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(60), work)
+        .await
+        .expect("reverse-order concurrent PUTs deadlocked (B2 regression): not finished in 60s");
+
+    cleanup(&setup_pool, &[virt]).await;
+    for m in members {
+        cleanup(&setup_pool, &[m]).await;
+    }
 }
