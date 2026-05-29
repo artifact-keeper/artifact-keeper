@@ -739,17 +739,40 @@ impl ProxyService {
         match upstream_result {
             Ok(resp) => {
                 let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-                self.cache_artifact(
-                    &cache_key,
-                    &metadata_key,
-                    &resp.content,
-                    resp.content_type.clone(),
-                    resp.etag,
-                    cache_ttl,
-                    repo.id,
-                    cache_path,
-                )
-                .await?;
+                // B6 (coalescing 502 leak, remaining path): the upstream fetch
+                // already SUCCEEDED -- `resp.content` is in hand. A failure to
+                // persist the cache entry must NOT fail the client request.
+                // Under a cold-cache stampede, N concurrent waiters all miss
+                // the cache and all race to write the SAME cache file; one of
+                // those writes can transiently fail (e.g. ENOENT from a
+                // create_dir_all/File::create race against a sibling writer, a
+                // half-renamed temp file, or a poisoned entry). Propagating
+                // that write error via `?` surfaced as `AppError::Io` ->
+                // `map_proxy_error` -> raw 502, which is exactly the leak the
+                // stampede gate rejects (`200 502 200 ...`). Treat the cache
+                // write as best-effort: log at warn and still serve the bytes
+                // we fetched. The cache self-heals on the next request (the
+                // streaming path already documents this self-healing).
+                if let Err(cache_err) = self
+                    .cache_artifact(
+                        &cache_key,
+                        &metadata_key,
+                        &resp.content,
+                        resp.content_type.clone(),
+                        resp.etag,
+                        cache_ttl,
+                        repo.id,
+                        cache_path,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %cache_err,
+                        "proxy cache write failed after successful upstream fetch; \
+                         serving fetched bytes and leaving cache to self-heal on next request"
+                    );
+                }
 
                 Ok((resp.content, resp.content_type))
             }

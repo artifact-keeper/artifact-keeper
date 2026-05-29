@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     extract::{Extension, Multipart, Path, Query, State},
     http::{header, HeaderMap},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -2308,7 +2308,7 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
@@ -2328,26 +2328,93 @@ pub async fn get_artifact_metadata(
     // normalised stored shape for npm-family repos when the caller
     // handed us the URL shape.
     let candidates = lookup_path_candidates(&path, &repo.format);
-    let artifact = lookup_artifact_by_paths(&state.db, repo.id, &candidates)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    let direct = lookup_artifact_by_paths(&state.db, repo.id, &candidates).await?;
 
-    let downloads = artifact_service.get_download_stats(artifact.id).await?;
-    let metadata = artifact_service.get_metadata(artifact.id).await?;
+    if let Some(artifact) = direct {
+        let downloads = artifact_service.get_download_stats(artifact.id).await?;
+        let metadata = artifact_service.get_metadata(artifact.id).await?;
 
-    Ok(Json(ArtifactResponse {
-        id: artifact.id,
-        repository_key: key,
-        path: artifact.path,
-        name: artifact.name,
-        version: artifact.version,
-        size_bytes: artifact.size_bytes,
-        checksum_sha256: artifact.checksum_sha256,
-        content_type: artifact.content_type,
-        download_count: downloads,
-        created_at: artifact.created_at,
-        metadata: metadata.map(|m| m.metadata),
-    }))
+        return Ok(Json(ArtifactResponse {
+            id: artifact.id,
+            repository_key: key,
+            path: artifact.path,
+            name: artifact.name,
+            version: artifact.version,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256,
+            content_type: artifact.content_type,
+            download_count: downloads,
+            created_at: artifact.created_at,
+            metadata: metadata.map(|m| m.metadata),
+        })
+        .into_response());
+    }
+
+    // B9 / #1221 / #1217: a virtual repository owns no `artifacts` rows of
+    // its own -- its content lives in its member repositories. The generic
+    // GET /:key/artifacts/*path route is the format-agnostic artifact-fetch
+    // surface clients use to pull bytes through a virtual repo (the
+    // virtual-shadowing-guard E2E fetches L's trusted artifact this way).
+    // A virtual repo therefore has no direct row to describe, and returning
+    // 404 here would make the local member's artifact unreachable through
+    // the virtual. Resolve members in priority order and serve the winning
+    // member's BYTES, applying the same local-over-remote shadowing guard
+    // as `download_artifact`: if a non-Remote member owns the exact path,
+    // suppress the proxy so a Remote member cannot shadow the trusted
+    // local artifact.
+    if repo.repo_type == RepositoryType::Virtual {
+        let owns_locally = proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+            .await
+            .map_err(|_| AppError::Internal("virtual shadowing-guard query failed".to_string()))?;
+        let proxy_for_virtual = if owns_locally {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
+        let db = state.db.clone();
+        let path_clone = path.clone();
+        let state_clone = state.clone();
+        let (content, content_type) = proxy_helpers::resolve_virtual_download(
+            &state.db,
+            proxy_for_virtual,
+            repo.id,
+            &path,
+            move |member_id, location| {
+                let db = db.clone();
+                let state = state_clone.clone();
+                let p = path_clone.clone();
+                async move {
+                    proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &p).await
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            AppError::NotFound("Artifact not found in any member repository".to_string())
+        })?;
+
+        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        let filename = path.rsplit('/').next().unwrap_or(&path);
+
+        return Ok((
+            [
+                (header::CONTENT_TYPE, ct),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                ),
+                (header::CONTENT_LENGTH, content.len().to_string()),
+                (
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "virtual".to_string(),
+                ),
+            ],
+            content,
+        )
+            .into_response());
+    }
+
+    Err(AppError::NotFound("Artifact not found".to_string()))
 }
 
 /// Upload artifact
