@@ -459,4 +459,112 @@ mod tests {
             Err(WebhookSecretError::KeyWrongLength(16))
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // decode_key_material: pure decoder used by load_key. Direct tests so
+    // we can pin every alphabet without paying the env-mutation cost the
+    // ensure_configured tests serialize on.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_key_material_standard_base64_padded() {
+        // Standard alphabet, padded — the documented format.
+        let raw = [0xAAu8; 32];
+        let encoded = B64.encode(raw);
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_standard_base64_unpadded() {
+        // The padding-tolerant engine must accept a payload whose length
+        // is a multiple of 4 but with the `=` characters stripped.
+        let raw = [0xCCu8; 32];
+        let encoded = B64.encode(raw).trim_end_matches('=').to_string();
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_padded() {
+        // URL-safe alphabet (`-`/`_`) must round-trip even when the input
+        // could not have come out of the standard engine.
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(raw);
+        assert!(encoded.contains('_') || encoded.contains('-'));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_unpadded() {
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        assert!(!encoded.ends_with('='));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_rejects_garbage() {
+        // Characters outside both alphabets must surface as an error.
+        let result = decode_key_material("!!! not base64 at all !!!");
+        assert!(result.is_err());
+        // And the error string is non-empty so operators see why.
+        assert!(!result.unwrap_err().is_empty());
+    }
+
+    #[test]
+    fn test_decode_key_material_empty_input_decodes_to_empty() {
+        // Empty input is a degenerate-but-valid base64 string. The decoder
+        // must succeed (returning empty bytes) so the caller's length check
+        // is what surfaces the diagnostic, not a generic base64 error.
+        assert_eq!(decode_key_material("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decode_key_material_passes_shortest_informative_error() {
+        // When every alphabet fails, the last attempt's error message is
+        // propagated. We can't pin a specific message (engine-internal),
+        // but the result must be Err with a non-empty string so callers
+        // can render it.
+        let err = decode_key_material("@@@@@@").unwrap_err();
+        assert!(!err.is_empty(), "error message must not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // digest_for_display: pure helper. Extra edge cases on top of the
+    // existing prefix/short-secret tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_for_display_no_prefix_uses_first4_dots_last4() {
+        // A secret without the standard `whsec_` prefix falls back to the
+        // generic `<first4>...<last4>` formatting.
+        let secret = "ABCD12345678WXYZ";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("ABCD"));
+        assert!(digest.ends_with("WXYZ"));
+        assert!(digest.contains("..."));
+        assert!(!digest.starts_with(SECRET_PREFIX));
+    }
+
+    #[test]
+    fn test_digest_for_display_prefix_with_short_body_returns_full_secret() {
+        // `whsec_` + a body shorter than 4 chars must surface verbatim so
+        // operators don't get a misleading `whsec_...xxx` rendering for a
+        // secret whose last4 *is* the entire body.
+        // 8+ chars total so the early "short secret" branch doesn't trip.
+        let secret = "whsec_xy"; // 8 chars total, 2-char body
+        let digest = digest_for_display(secret);
+        assert_eq!(digest, secret);
+    }
+
+    #[test]
+    fn test_digest_for_display_redaction_excludes_middle_bytes() {
+        // Anti-leak property: a `whsec_<body>` digest exposes only the
+        // first 6 characters (the prefix) and the last 4 of the body. The
+        // middle bytes must not appear in the rendered string.
+        let secret = "whsec_MIDDLE_SHOULD_NEVER_LEAKtail";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("whsec_"));
+        assert!(digest.ends_with("tail"));
+        assert!(!digest.contains("MIDDLE_SHOULD_NEVER_LEAK"));
+    }
 }

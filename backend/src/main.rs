@@ -220,6 +220,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // SSO config that the handlers actually use (fixes #238).
     bootstrap_oidc_from_env(&db_pool).await?;
 
+    // Bootstrap LDAP config from environment variables when no DB configs exist yet.
+    // Same bridge as OIDC above: the SSO handlers and provider list read from the
+    // database, so LDAP_* env vars must be seeded into ldap_configs on first boot
+    // for env-only deployments to work (fixes #1434).
+    bootstrap_ldap_from_env(&db_pool).await?;
+
     // Initialize peer identity for mesh networking
     let peer_id = init_peer_identity(&db_pool, &config).await?;
     tracing::info!("Peer identity: {} ({})", config.peer_instance_name, peer_id);
@@ -1165,6 +1171,113 @@ fn build_oidc_request_from_values(
     })
 }
 
+/// Bootstrap an LDAP provider from environment variables when the database
+/// has no LDAP configs yet.  This lets operators configure LDAP entirely via
+/// env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN, etc.) without needing admin
+/// API access first.  Mirrors `bootstrap_oidc_from_env` (fixes #1434).
+async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+
+    let req = match build_ldap_bootstrap_request() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Only bootstrap when no LDAP configs exist in the database
+    let existing = AuthConfigService::list_ldap(db).await?;
+    if !existing.is_empty() {
+        tracing::debug!(
+            "LDAP env vars present but {} config(s) already exist in DB, skipping bootstrap",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    let config = AuthConfigService::create_ldap(db, req).await?;
+    tracing::info!(
+        "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+        config.name,
+        config.id
+    );
+
+    Ok(())
+}
+
+/// Raw LDAP environment variable values for bootstrap.
+#[derive(Default)]
+struct LdapEnvVars {
+    url: Option<String>,
+    base_dn: Option<String>,
+    bind_dn: Option<String>,
+    bind_password: Option<String>,
+    user_filter: Option<String>,
+    username_attr: Option<String>,
+    email_attr: Option<String>,
+    display_name_attr: Option<String>,
+    groups_attr: Option<String>,
+    group_base_dn: Option<String>,
+    group_filter: Option<String>,
+    admin_group_dn: Option<String>,
+    use_starttls: Option<String>,
+}
+
+/// Build a CreateLdapConfigRequest from LDAP_* environment variables.
+/// Returns None if any of the required env vars are missing or empty.
+fn build_ldap_bootstrap_request(
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    build_ldap_request_from_values(LdapEnvVars {
+        url: std::env::var("LDAP_URL").ok(),
+        base_dn: std::env::var("LDAP_BASE_DN").ok(),
+        bind_dn: std::env::var("LDAP_BIND_DN").ok(),
+        bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+        user_filter: std::env::var("LDAP_USER_FILTER").ok(),
+        username_attr: std::env::var("LDAP_USERNAME_ATTR").ok(),
+        email_attr: std::env::var("LDAP_EMAIL_ATTR").ok(),
+        display_name_attr: std::env::var("LDAP_DISPLAY_NAME_ATTR").ok(),
+        groups_attr: std::env::var("LDAP_GROUPS_ATTR").ok(),
+        group_base_dn: std::env::var("LDAP_GROUP_BASE_DN").ok(),
+        group_filter: std::env::var("LDAP_GROUP_FILTER").ok(),
+        admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
+        use_starttls: std::env::var("LDAP_USE_STARTTLS").ok(),
+    })
+}
+
+/// Pure function that assembles a CreateLdapConfigRequest from optional values.
+/// Returns None if the LDAP server URL or base DN are missing or empty: both
+/// are required to bind and search the directory.
+fn build_ldap_request_from_values(
+    env: LdapEnvVars,
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    use artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest;
+
+    let server_url = env.url.filter(|v| !v.is_empty())?;
+    let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
+
+    let use_starttls = env
+        .use_starttls
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    Some(CreateLdapConfigRequest {
+        name: "default".to_string(),
+        server_url,
+        bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
+        bind_password: env.bind_password.filter(|v| !v.is_empty()),
+        user_base_dn,
+        user_filter: env.user_filter.filter(|v| !v.is_empty()),
+        group_base_dn: env.group_base_dn.filter(|v| !v.is_empty()),
+        group_filter: env.group_filter.filter(|v| !v.is_empty()),
+        email_attribute: env.email_attr.filter(|v| !v.is_empty()),
+        display_name_attribute: env.display_name_attr.filter(|v| !v.is_empty()),
+        username_attribute: env.username_attr.filter(|v| !v.is_empty()),
+        groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
+        admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
+        use_starttls: Some(use_starttls),
+        is_enabled: Some(true),
+        priority: Some(0),
+    })
+}
+
 /// Provision the initial admin user on first boot and determine setup mode.
 ///
 /// Returns `true` when the API should be locked until the admin changes
@@ -1990,6 +2103,133 @@ mod tests {
         } else {
             std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ldap_request_from_values (issue #1434)
+    // -----------------------------------------------------------------------
+
+    fn ldap_env(url: Option<&str>, base_dn: Option<&str>) -> LdapEnvVars {
+        LdapEnvVars {
+            url: url.map(String::from),
+            base_dn: base_dn.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_required_fields() {
+        let req = build_ldap_request_from_values(ldap_env(
+            Some("ldap://dc.local:389"),
+            Some("DC=domain,DC=local"),
+        ))
+        .unwrap();
+
+        assert_eq!(req.name, "default");
+        assert_eq!(req.server_url, "ldap://dc.local:389");
+        assert_eq!(req.user_base_dn, "DC=domain,DC=local");
+        // Bootstrapped providers are enabled so they show up in the SSO list.
+        assert_eq!(req.is_enabled, Some(true));
+        assert_eq!(req.priority, Some(0));
+        assert_eq!(req.use_starttls, Some(false));
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_missing_url() {
+        let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_missing_base_dn() {
+        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), None));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_url() {
+        let req = build_ldap_request_from_values(ldap_env(Some(""), Some("DC=domain,DC=local")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_base_dn() {
+        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), Some("")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_full_active_directory_config() {
+        // Mirrors the Active Directory example from issue #1434.
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            bind_dn: Some("user@domain".to_string()),
+            bind_password: Some("superPassword".to_string()),
+            user_filter: Some("(sAMAccountName={0})".to_string()),
+            username_attr: Some("sAMAccountName".to_string()),
+            email_attr: None,
+            display_name_attr: None,
+            groups_attr: None,
+            group_base_dn: Some("OU=Groups,DC=domain,DC=local".to_string()),
+            group_filter: Some("(memberUid={0})".to_string()),
+            admin_group_dn: Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local".to_string()),
+            use_starttls: Some("false".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(req.bind_dn.as_deref(), Some("user@domain"));
+        assert_eq!(req.bind_password.as_deref(), Some("superPassword"));
+        assert_eq!(req.user_filter.as_deref(), Some("(sAMAccountName={0})"));
+        assert_eq!(req.username_attribute.as_deref(), Some("sAMAccountName"));
+        assert_eq!(
+            req.group_base_dn.as_deref(),
+            Some("OU=Groups,DC=domain,DC=local")
+        );
+        assert_eq!(req.group_filter.as_deref(), Some("(memberUid={0})"));
+        assert_eq!(
+            req.admin_group_dn.as_deref(),
+            Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local")
+        );
+        assert_eq!(req.use_starttls, Some(false));
+        assert_eq!(req.is_enabled, Some(true));
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_starttls_truthy_values() {
+        for v in ["true", "1"] {
+            let req = build_ldap_request_from_values(LdapEnvVars {
+                url: Some("ldap://dc.local:389".to_string()),
+                base_dn: Some("DC=domain,DC=local".to_string()),
+                use_starttls: Some(v.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                req.use_starttls,
+                Some(true),
+                "value {v} should enable STARTTLS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_optional_fields_become_none() {
+        // Empty strings (e.g. unset compose interpolations) must not produce
+        // empty bind DNs or filters that would break directory binds.
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            bind_dn: Some("".to_string()),
+            bind_password: Some("".to_string()),
+            user_filter: Some("".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(req.bind_dn.is_none());
+        assert!(req.bind_password.is_none());
+        assert!(req.user_filter.is_none());
     }
 }
 // warm cache benchmark
