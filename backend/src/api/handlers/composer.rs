@@ -864,6 +864,30 @@ async fn upload(
     .execute(&state.db)
     .await;
 
+    // Populate packages / package_versions tables (best-effort).
+    //
+    // #1341: the WebUI Packages tab reads the `packages` table, not
+    // `artifacts`. Every other artifact-publishing handler (npm, pypi,
+    // nuget) calls PackageService after the artifact insert; the Composer
+    // handler did not, so a successfully uploaded Composer package was
+    // stored and served over the Composer wire protocol but never appeared
+    // in the WebUI. Mirror the npm/pypi pattern here. The call is
+    // fire-and-forget so a packages-table failure never blocks the upload.
+    {
+        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repo.id,
+                full_name,
+                &version,
+                size_bytes,
+                &sha256,
+                composer_json.description.as_deref(),
+                Some(serde_json::json!({ "format": "composer" })),
+            )
+            .await;
+    }
+
     info!(
         "Composer upload: {} {} to repo {}",
         full_name, version, repo_key
