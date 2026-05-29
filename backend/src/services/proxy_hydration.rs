@@ -143,13 +143,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn map_len() -> usize {
-        local_hydration_map()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len()
-    }
-
     fn map_contains(key: &str) -> bool {
         local_hydration_map()
             .lock()
@@ -209,7 +202,6 @@ mod tests {
     #[tokio::test]
     async fn cancelled_leader_does_not_poison_key() {
         let key = format!("test-cancel-{}", uuid::Uuid::new_v4());
-        let before = map_len();
 
         // Leader future parks forever inside the producer; we cancel it by
         // dropping the timeout-wrapped future. The Drop guard must reclaim the
@@ -226,9 +218,9 @@ mod tests {
             );
             let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
         }
-        // After the cancelled leader is dropped, the slot must be gone.
+        // After the cancelled leader is dropped, the per-key slot must be gone
+        // (the global map is shared across tests, so only assert per-key).
         assert!(!map_contains(&key));
-        assert_eq!(map_len(), before);
 
         // A fresh caller must be able to win the election and produce.
         let result: Result<u32, ()> =
