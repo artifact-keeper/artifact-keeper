@@ -314,6 +314,33 @@ fn tee_upstream_to_cache(
             .await;
 
         match put_result {
+            Ok(result) if result.bytes_written == 0 => {
+                // #1365: never cache a zero-byte body. A Maven client
+                // resolving dependencies can drive an upstream response
+                // with no body (a 204, a 200 with `Content-Length: 0`, or
+                // a HEAD-style probe that reaches the streaming download
+                // path), and the upstream POM/JAR is non-empty. Writing the
+                // metadata sidecar here would mark the empty object as a
+                // fresh, non-expired cache hit; the next GET would then
+                // serve `Content-Length: 0`, and Gradle fails parsing the
+                // POM with "Content is not allowed in prolog." Skip the
+                // sidecar so the entry is treated as a miss, and delete the
+                // empty object we just wrote so a later GET re-fetches the
+                // real body from upstream (self-heal).
+                tracing::warn!(
+                    cache_key = %cache_key_for_writer,
+                    "proxy upstream returned an empty body; not caching the zero-byte \
+                     object (no metadata sidecar) so the next request refetches upstream"
+                );
+                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                    tracing::debug!(
+                        cache_key = %cache_key_for_writer,
+                        error = %e,
+                        "best-effort delete of empty proxy-cache object failed; \
+                         the missing metadata sidecar still forces a refetch"
+                    );
+                }
+            }
             Ok(result) => {
                 let now = Utc::now();
                 // Pin the storage backend's ETag at write time so the
@@ -1813,6 +1840,22 @@ impl ProxyService {
         repository_id: Uuid,
         artifact_path: &str,
     ) -> Result<()> {
+        // #1365: never cache a zero-byte body on the buffered path either.
+        // An empty upstream response (204 / empty 200) must not become a
+        // fresh cache entry that a later request serves as
+        // `Content-Length: 0`. Skip the write entirely so the next request
+        // refetches from upstream; the caller treats a cache miss as the
+        // normal path. The streaming sibling `tee_upstream_to_cache` applies
+        // the same guard after `put_stream`.
+        if content.is_empty() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "proxy upstream returned an empty body; not caching the zero-byte \
+                 object so the next request refetches upstream"
+            );
+            return Ok(());
+        }
+
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
 
@@ -4187,6 +4230,7 @@ SHA256:
     struct TeeRecordingBackend {
         put_stream_chunks: tokio::sync::Mutex<Vec<Bytes>>,
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
     }
 
@@ -4195,6 +4239,7 @@ SHA256:
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
             })
         }
@@ -4202,6 +4247,7 @@ SHA256:
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
             })
         }
@@ -4224,7 +4270,8 @@ SHA256:
         async fn exists(&self, _key: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn delete(&self, _key: &str) -> Result<()> {
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
             Ok(())
         }
         async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
@@ -4360,10 +4407,17 @@ SHA256:
         );
     }
 
-    /// Empty upstream (e.g. a 0-byte upstream object) round-trips
-    /// cleanly. Edge case for the channel-drop-on-EOF sequence.
+    /// #1365 regression: an empty upstream body (a 204, an empty 200, or a
+    /// HEAD-style probe that reaches the streaming download path) must NOT
+    /// be cached. The client still receives the empty body for this
+    /// request, but the writer must (a) skip the metadata sidecar so a
+    /// later GET is a cache miss, and (b) delete the zero-byte object it
+    /// wrote so the next request refetches the real body from upstream.
+    /// Before the fix the writer persisted a `size_bytes: 0` sidecar,
+    /// which a subsequent GET served as `Content-Length: 0`, breaking
+    /// Gradle POM parsing ("Content is not allowed in prolog.").
     #[tokio::test]
-    async fn test_tee_empty_upstream_yields_empty_body_and_writes_metadata() {
+    async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
@@ -4380,17 +4434,18 @@ SHA256:
         while let Some(chunk) = client.next().await {
             total += chunk.unwrap().len();
         }
-        assert_eq!(total, 0);
+        assert_eq!(total, 0, "client receives the empty body for this request");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let writes = backend.metadata_writes.lock().await;
-        assert_eq!(writes.len(), 1, "empty-body cache still gets metadata");
-        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
-        assert_eq!(metadata.size_bytes, 0);
-        // SHA-256 of empty input:
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "zero-byte upstream body MUST NOT write a metadata sidecar; \
+             otherwise the next GET serves a Content-Length: 0 cache hit (#1365)"
+        );
         assert_eq!(
-            metadata.checksum_sha256,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "the empty cache object must be deleted so the next request refetches"
         );
     }
 
@@ -5489,6 +5544,214 @@ SHA256:
         );
         assert_eq!(&got[..], content.as_ref());
         assert_eq!(got_ct.as_deref(), Some("application/gzip"));
+    }
+
+    /// Build a minimal Remote `Repository` pointing at `upstream_url` for
+    /// the streaming proxy tests below. The storage path is unused by the
+    /// streaming cache (which writes through `self.storage`), but the field
+    /// is required by the struct.
+    fn remote_repo_for(key: &str, upstream_url: &str, storage_path: &str) -> Repository {
+        Repository {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: storage_path.to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// #1365 end-to-end regression: a non-empty upstream Maven POM proxied
+    /// through `fetch_artifact_streaming` must be cached at the full
+    /// upstream byte length, and the second request must serve that same
+    /// non-zero body from the cache (never `Content-Length: 0`).
+    ///
+    /// Drives the real streaming path (tee + filesystem `put_stream` +
+    /// metadata sidecar) against a wiremock upstream, so it exercises the
+    /// exact code that produced the zero-byte cache hit in the incident.
+    #[tokio::test]
+    async fn test_streaming_proxy_caches_full_length_pom() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The streaming fetch loads per-repo upstream auth from the DB, so
+        // this end-to-end test needs a real database. Skip gracefully when
+        // DATABASE_URL is unset/unreachable (matches the other wiremock
+        // proxy tests). The deterministic unit-level guard for #1365 lives
+        // in `test_tee_empty_upstream_is_not_cached`, which needs no DB.
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let pom = br#"<?xml version="1.0" encoding="UTF-8"?>
+<project><modelVersion>4.0.0</modelVersion>
+<groupId>io.sentry</groupId><artifactId>sentry</artifactId><version>8.42.0</version></project>"#;
+        let pom_path = "io/sentry/sentry/8.42.0/sentry-8.42.0.pom";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(pom.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-1365-ok-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+
+        // First request: cache miss, streamed from upstream and tee'd to cache.
+        let first = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("streaming fetch must succeed on a 200 upstream");
+        let body = drain_stream(first.body).await;
+        assert_eq!(
+            body.len(),
+            pom.len(),
+            "first (miss) response must carry the full upstream POM length"
+        );
+        assert_eq!(&body[..], pom.as_ref());
+
+        // Give the background cache writer time to flush the sidecar.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The cache must now be fresh with the correct length.
+        assert!(
+            proxy.is_cache_fresh("maven-central", pom_path).await,
+            "a non-empty POM must produce a fresh cache entry"
+        );
+
+        // Second request: served from cache. Must be non-zero and full length.
+        let second = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("cached streaming fetch must succeed");
+        assert_eq!(
+            second.content_length,
+            Some(pom.len() as u64),
+            "cache hit must report the full POM length, never 0 (#1365)"
+        );
+        let cached_body = drain_stream(second.body).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            &cached_body[..],
+            pom.as_ref(),
+            "cache hit must serve the full POM body, never an empty body (#1365)"
+        );
+    }
+
+    /// #1365 end-to-end regression: an empty upstream body (a 204, an empty
+    /// 200, or a HEAD-style probe reaching the streaming download path)
+    /// must NOT poison the cache. After draining the empty first response,
+    /// the entry must not be fresh, and once the upstream serves the real
+    /// POM the next request must return the full non-empty body.
+    #[tokio::test]
+    async fn test_streaming_proxy_does_not_cache_empty_upstream_then_self_heals() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let pom = br#"<?xml version="1.0"?><project><artifactId>sentry</artifactId></project>"#;
+        let pom_path = "io/sentry/sentry/8.42.0/sentry-8.42.0.pom";
+
+        let server = MockServer::start().await;
+        // First response: a valid 200 status but an empty body (the bug
+        // trigger). `up_to_n_times(1)` so the second request gets the
+        // real POM, proving the bad entry self-heals rather than sticking.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(b"".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(pom.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-1365-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+
+        // First request: empty upstream body. Client gets the empty body
+        // for THIS request, but nothing must be cached.
+        let first = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("streaming fetch must succeed even on an empty 200");
+        let body = drain_stream(first.body).await;
+        assert_eq!(
+            body.len(),
+            0,
+            "first response mirrors the empty upstream body"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !proxy.is_cache_fresh("maven-central", pom_path).await,
+            "an empty upstream body MUST NOT create a fresh cache entry (#1365)"
+        );
+
+        // Second request: upstream now serves the real POM. The proxy must
+        // refetch (the empty entry was not cached) and return the full body.
+        let second = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("refetch after empty upstream must succeed");
+        let healed = drain_stream(second.body).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            &healed[..],
+            pom.as_ref(),
+            "after the empty body was rejected, the next request must serve \
+             the full upstream POM (self-heal), never a zero-byte cache hit (#1365)"
+        );
+    }
+
+    /// Drain a streaming proxy body into a single `Vec<u8>`.
+    async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
+        let mut body = body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        out
     }
 
     /// Source-level pin for #1278: `cache_artifact` must NOT insert into
