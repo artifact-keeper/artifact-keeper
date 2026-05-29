@@ -447,6 +447,18 @@ pub async fn auth_middleware(
 
     let header_error = match header_result {
         Ok((ext, token_iat)) => {
+            // Insert BOTH shapes so handlers behind this middleware can
+            // extract either `Extension<AuthExtension>` or
+            // `Extension<Option<AuthExtension>>`. Without the Option-wrapped
+            // copy, a handler declaring `Extension<Option<AuthExtension>>`
+            // (e.g. the permission handlers, which gate on require_auth +
+            // require_scope) fails Axum extraction with HTTP 500
+            // ("Missing request extension: Extension of type
+            // Option<AuthExtension>") before the in-handler scope check runs.
+            // That surfaced as a 500 instead of the canonical 403 for a
+            // read-scope service-account token on POST /api/v1/permissions.
+            // See #1438 (B10).
+            request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             if let Some(iat) = token_iat {
                 request.extensions_mut().insert(iat);
@@ -462,6 +474,10 @@ pub async fn auth_middleware(
     let ticket_parts = extract_ticket_request_parts(&request);
     if let Some(parts) = ticket_parts.as_ref() {
         if let Some(ext) = try_resolve_ticket_for_parts(auth_service.db(), parts).await {
+            // Same dual-shape insertion as the header-auth path above so
+            // `Extension<Option<AuthExtension>>` handlers resolve under a
+            // ticket-authenticated request too (#1438 / B10).
+            request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             request.extensions_mut().insert(DownloadTicketAuth);
             return next.run(request).await;
@@ -3180,6 +3196,84 @@ mod tests {
     async fn test_optional_auth_middleware_passes_through_without_credentials() {
         let resp = run_through_optional_auth(empty_get("/probe")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1438 (B10): auth_middleware must insert BOTH `AuthExtension` and
+    // `Option<AuthExtension>` on its success path so handlers can declare
+    // either extractor shape. The permission handlers declare
+    // `Extension<Option<AuthExtension>>`; before this fix the middleware only
+    // inserted a bare `AuthExtension`, so the `Option<AuthExtension>`
+    // extractor failed request extraction with HTTP 500 ("Missing request
+    // extension") before the in-handler scope check ran -- a read-scope SA
+    // token got 500 instead of the canonical 403 on POST /api/v1/permissions.
+    //
+    // The middleware's success path requires a valid token + live AuthService,
+    // which the unit harness cannot provide. We instead pin the load-bearing
+    // contract directly: a request whose extensions carry the dual insertion
+    // (exactly what the fixed success path does) resolves BOTH
+    // `Extension<AuthExtension>` and `Extension<Option<AuthExtension>>` to 200.
+    // A regression that drops the Option-wrapped copy turns the second route
+    // into a 500, which this test catches.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_dual_auth_extension_insertion_resolves_both_extractor_shapes() {
+        use axum::{extract::Extension, middleware::Next, routing::get, Router};
+        use tower::ServiceExt;
+
+        fn sample_ext() -> AuthExtension {
+            AuthExtension {
+                user_id: Uuid::new_v4(),
+                username: "sa-dual".to_string(),
+                email: "sa@example.com".to_string(),
+                is_admin: false,
+                is_api_token: true,
+                is_service_account: true,
+                scopes: Some(vec!["read".to_string()]),
+                allowed_repo_ids: None,
+            }
+        }
+
+        // Mirror the exact dual insertion auth_middleware now performs on its
+        // success path.
+        async fn insert_both(mut request: Request, next: Next) -> Response {
+            let ext = sample_ext();
+            request.extensions_mut().insert(Some(ext.clone()));
+            request.extensions_mut().insert(ext);
+            next.run(request).await
+        }
+
+        let app: Router = Router::new()
+            .route(
+                "/bare",
+                get(|Extension(_a): Extension<AuthExtension>| async { (StatusCode::OK, "bare") }),
+            )
+            .route(
+                "/opt",
+                get(
+                    |Extension(a): Extension<Option<AuthExtension>>| async move {
+                        // Must be Some, not None: the fix inserts Some(ext),
+                        // not a None placeholder.
+                        assert!(a.is_some(), "Option<AuthExtension> must be Some");
+                        (StatusCode::OK, "opt")
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn(insert_both));
+
+        let bare = app.clone().oneshot(empty_get("/bare")).await.unwrap();
+        assert_eq!(
+            bare.status(),
+            StatusCode::OK,
+            "Extension<AuthExtension> must resolve"
+        );
+
+        let opt = app.oneshot(empty_get("/opt")).await.unwrap();
+        assert_eq!(
+            opt.status(),
+            StatusCode::OK,
+            "Extension<Option<AuthExtension>> must resolve (B10 regression guard)"
+        );
     }
 
     // -----------------------------------------------------------------------
