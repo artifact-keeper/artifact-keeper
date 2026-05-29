@@ -989,6 +989,134 @@ mod tests {
         );
     }
 
+    /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
+    enum RefKind {
+        /// Insert an `oci_tags` row pointing at the digest.
+        Tag {
+            image: &'static str,
+            tag: &'static str,
+        },
+        /// Insert an `oci_blobs` row pointing at the digest.
+        Blob,
+    }
+
+    /// Set up the canonical "soft-deleted artifact still referenced by an
+    /// OCI table" scenario for storage-GC isolation tests.
+    ///
+    /// Inserts an `oci_tags` or `oci_blobs` row for `digest` and a
+    /// soft-deleted `artifacts` row pointing at the same `storage_key`.
+    /// Returns the byte size that was written to the `artifacts` row so
+    /// callers can correlate with on-disk data when needed.
+    ///
+    /// Centralizing this layout removes the boilerplate duplication that
+    /// previously lived inline in the three GC isolation tests and makes
+    /// it easy for new regression tests to follow the same pattern.
+    async fn insert_referenced_soft_deleted_artifact(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        digest: &str,
+        storage_key: &str,
+        size_bytes: i64,
+        kind: RefKind,
+    ) {
+        let (path, name, version, content_type, checksum) = match &kind {
+            RefKind::Tag { image, tag } => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO oci_tags (
+                        repository_id, name, tag, manifest_digest, manifest_content_type
+                    )
+                    VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(*image)
+                .bind(*tag)
+                .bind(digest)
+                .execute(pool)
+                .await
+                .expect("insert oci tag");
+                (
+                    format!("v2/{}/manifests/{}", image, tag),
+                    format!("{}:{}", image, tag),
+                    (*tag).to_string(),
+                    "application/vnd.oci.image.manifest.v1+json",
+                    digest.trim_start_matches("sha256:").to_string(),
+                )
+            }
+            RefKind::Blob => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key)
+                    VALUES ($1, $2, $3, $4)
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(digest)
+                .bind(size_bytes)
+                .bind(storage_key)
+                .execute(pool)
+                .await
+                .expect("insert oci blob");
+                (
+                    format!("v2/gc-image/blobs/{}", digest),
+                    format!("gc-image:{}", digest),
+                    digest.to_string(),
+                    "application/octet-stream",
+                    digest.trim_start_matches("sha256:").to_string(),
+                )
+            }
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(name)
+        .bind(version)
+        .bind(size_bytes)
+        .bind(checksum)
+        .bind(content_type)
+        .bind(storage_key)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert soft-deleted artifact");
+    }
+
+    /// Assert that `(storage_key, "filesystem", storage_path)` does NOT
+    /// appear in the dry-run orphan-candidate set returned by
+    /// [`StorageGcService::select_orphans`]. The per-key form is the
+    /// isolation-safe alternative to asserting on the global
+    /// `storage_keys_deleted` counter (see #1493).
+    fn assert_key_not_orphaned(
+        orphans: &[sqlx::postgres::PgRow],
+        storage_key: &str,
+        storage_path: &str,
+        ref_kind: &str,
+    ) {
+        let our_key_collected = orphans.iter().any(|row| {
+            let key: String = row.try_get("storage_key").unwrap_or_default();
+            let backend: String = row.try_get("storage_backend").unwrap_or_default();
+            let path: String = row.try_get("storage_path").unwrap_or_default();
+            key == storage_key && backend == "filesystem" && path == storage_path
+        });
+        assert!(
+            !our_key_collected,
+            "GC must not flag {} as orphan while it is still referenced by {}",
+            storage_key, ref_kind
+        );
+    }
+
     #[tokio::test]
     async fn test_run_gc_dry_run_keeps_oci_manifest_referenced_by_tag() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -997,71 +1125,32 @@ mod tests {
             return;
         };
 
-        let image = "gc-image";
-        let tag = "latest";
         let digest = format!("sha256:{}", "a".repeat(64));
         let storage_key = format!("oci-manifests/{}", digest);
 
-        sqlx::query(
-            r#"
-            INSERT INTO oci_tags (
-                repository_id, name, tag, manifest_digest, manifest_content_type
-            )
-            VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
-            "#,
+        insert_referenced_soft_deleted_artifact(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &digest,
+            &storage_key,
+            123,
+            RefKind::Tag {
+                image: "gc-image",
+                tag: "latest",
+            },
         )
-        .bind(fixture.repo_id)
-        .bind(image)
-        .bind(tag)
-        .bind(&digest)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert oci tag");
-
-        sqlx::query(
-            r#"
-            INSERT INTO artifacts (
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, 123,
-                $6, 'application/vnd.oci.image.manifest.v1+json', $7, $8, true
-            )
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.repo_id)
-        .bind(format!("v2/{}/manifests/{}", image, tag))
-        .bind(format!("{}:{}", image, tag))
-        .bind(tag)
-        .bind("a".repeat(64))
-        .bind(&storage_key)
-        .bind(fixture.user_id)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert soft-deleted oci manifest artifact");
+        .await;
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         let orphans = service.select_orphans().await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
-        let our_repo_id = fixture.repo_id;
         fixture.teardown().await;
 
         let orphans = orphans.expect("dry-run candidate scan succeeds");
-        let our_key_collected = orphans.iter().any(|row| {
-            let key: String = row.try_get("storage_key").unwrap_or_default();
-            let backend: String = row.try_get("storage_backend").unwrap_or_default();
-            let path: String = row.try_get("storage_path").unwrap_or_default();
-            key == storage_key && backend == "filesystem" && path == storage_path_str
-        });
-        assert!(
-            !our_key_collected,
-            "GC must not flag {} (repo {}) as orphan while it is still referenced by oci_tags",
-            storage_key, our_repo_id
-        );
+        assert_key_not_orphaned(&orphans, &storage_key, &storage_path_str, "oci_tags");
     }
 
     #[tokio::test]
@@ -1075,63 +1164,26 @@ mod tests {
         let digest = format!("sha256:{}", "b".repeat(64));
         let storage_key = format!("oci-blobs/{}", digest);
 
-        sqlx::query(
-            r#"
-            INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key)
-            VALUES ($1, $2, 456, $3)
-            "#,
+        insert_referenced_soft_deleted_artifact(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &digest,
+            &storage_key,
+            456,
+            RefKind::Blob,
         )
-        .bind(fixture.repo_id)
-        .bind(&digest)
-        .bind(&storage_key)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert oci blob");
-
-        sqlx::query(
-            r#"
-            INSERT INTO artifacts (
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, 456,
-                $6, 'application/octet-stream', $7, $8, true
-            )
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.repo_id)
-        .bind(format!("v2/gc-image/blobs/{}", digest))
-        .bind(format!("gc-image:{}", digest))
-        .bind(&digest)
-        .bind("b".repeat(64))
-        .bind(&storage_key)
-        .bind(fixture.user_id)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert soft-deleted oci blob artifact");
+        .await;
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         let orphans = service.select_orphans().await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
-        let our_repo_id = fixture.repo_id;
         fixture.teardown().await;
 
         let orphans = orphans.expect("dry-run candidate scan succeeds");
-        let our_key_collected = orphans.iter().any(|row| {
-            let key: String = row.try_get("storage_key").unwrap_or_default();
-            let backend: String = row.try_get("storage_backend").unwrap_or_default();
-            let path: String = row.try_get("storage_path").unwrap_or_default();
-            key == storage_key && backend == "filesystem" && path == storage_path_str
-        });
-        assert!(
-            !our_key_collected,
-            "GC must not flag {} (repo {}) as orphan while it is still referenced by oci_blobs",
-            storage_key, our_repo_id
-        );
+        assert_key_not_orphaned(&orphans, &storage_key, &storage_path_str, "oci_blobs");
     }
 
     /// End-to-end variant of the manifest-survival test: run GC with
@@ -1151,8 +1203,6 @@ mod tests {
             return;
         };
 
-        let image = "gc-image-live";
-        let tag = "latest";
         let digest = format!("sha256:{}", "c".repeat(64));
         let storage_key = format!("oci-manifests/{}", digest);
         let manifest_body = Bytes::from_static(
@@ -1180,46 +1230,19 @@ mod tests {
             "manifest must exist before GC runs"
         );
 
-        sqlx::query(
-            r#"
-            INSERT INTO oci_tags (
-                repository_id, name, tag, manifest_digest, manifest_content_type
-            )
-            VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
-            "#,
+        insert_referenced_soft_deleted_artifact(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &digest,
+            &storage_key,
+            manifest_body.len() as i64,
+            RefKind::Tag {
+                image: "gc-image-live",
+                tag: "latest",
+            },
         )
-        .bind(fixture.repo_id)
-        .bind(image)
-        .bind(tag)
-        .bind(&digest)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert oci tag");
-
-        sqlx::query(
-            r#"
-            INSERT INTO artifacts (
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $9,
-                $6, 'application/vnd.oci.image.manifest.v1+json', $7, $8, true
-            )
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.repo_id)
-        .bind(format!("v2/{}/manifests/{}", image, tag))
-        .bind(format!("{}:{}", image, tag))
-        .bind(tag)
-        .bind("c".repeat(64))
-        .bind(&storage_key)
-        .bind(fixture.user_id)
-        .bind(manifest_body.len() as i64)
-        .execute(&fixture.pool)
-        .await
-        .expect("insert soft-deleted oci manifest artifact");
+        .await;
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
