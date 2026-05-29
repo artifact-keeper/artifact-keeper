@@ -195,6 +195,22 @@ async fn simple_root(
         {
             merged.extend(names);
         }
+        // Some upstreams don't serve a browsable root index (or it is too
+        // large to parse), so `fetch_remote_simple_root` returns nothing.
+        // Recover the projects the proxy has already served from the proxy
+        // cache so the root index lists them instead of coming back with
+        // zero anchors (B8 / #1377). Proxy-cached artifacts are not recorded
+        // in `artifacts` (#1278), making the cache the only local record of
+        // which projects exist for a Remote repo.
+        if let Some(proxy) = state.proxy_service.as_ref() {
+            merged.extend(
+                proxy
+                    .list_cached_pypi_packages(&repo.key)
+                    .await
+                    .into_iter()
+                    .map(|n| normalize_pep503(&n)),
+            );
+        }
     }
 
     // Virtual repos have no artifacts of their own. Aggregate package names
@@ -226,6 +242,15 @@ async fn simple_root(
                         .await
                 {
                     merged.extend(names);
+                }
+                if let Some(proxy) = state.proxy_service.as_ref() {
+                    merged.extend(
+                        proxy
+                            .list_cached_pypi_packages(&member.key)
+                            .await
+                            .into_iter()
+                            .map(|n| normalize_pep503(&n)),
+                    );
                 }
             }
         }
@@ -464,25 +489,14 @@ fn build_simple_root_response(
     // HTML response (default).
     //
     // Defense-in-depth against stored XSS (#1377 review): even though
-    // `normalize_pep503` drops every character outside `[a-z0-9.-]`, we
-    // still HTML-escape both the `repo_key` (URL-route input) and each
-    // `package` name (DB- or upstream-derived) before interpolation. The
-    // restrictive CSP header denies inline script execution even if a
-    // future regression somehow lets a `<` through both layers.
-    let escaped_repo_key = html_escape(repo_key);
-    let mut html = String::from(
-        "<!DOCTYPE html>\n<html>\n<head><meta name=\"pypi:repository-version\" content=\"1.0\"/>\
-         <title>Simple Index</title></head>\n<body>\n<h1>Simple Index</h1>\n",
-    );
-
-    for package in packages {
-        let escaped = html_escape(package);
-        html.push_str(&format!(
-            "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
-            escaped_repo_key, escaped, escaped
-        ));
-    }
-    html.push_str("</body>\n</html>\n");
+    // `normalize_pep503` drops every character outside `[a-z0-9.-]`, the
+    // shared renderer HTML-escapes both the `repo_key` (URL-route input) and
+    // each `package` name (DB- or upstream-derived) before interpolation. The
+    // restrictive CSP header below denies inline script execution even if a
+    // future regression somehow lets a `<` through both layers. The body
+    // construction lives in `PypiHandler::render_simple_root_html` so the
+    // anchor-rendering rules have pure unit coverage (B8).
+    let html = PypiHandler::render_simple_root_html(repo_key, packages);
 
     Ok(Response::builder()
         .status(StatusCode::OK)

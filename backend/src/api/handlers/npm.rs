@@ -157,6 +157,21 @@ fn encode_package_name_for_upstream(name: &str) -> String {
     name.to_string()
 }
 
+/// Build the upstream tarball path for a (possibly scoped) package.
+///
+/// Unlike the metadata endpoint, the npm tarball URL keeps the scope
+/// separator as a literal `/`: `@scope/pkg/-/pkg-1.0.0.tgz`. The public
+/// registry and AK's own scoped-tarball route
+/// (`/:repo_key/@:scope/:package/-/:filename`) both expect `@scope` and
+/// `pkg` as separate path segments. Percent-encoding the slash here (as
+/// `encode_package_name_for_upstream` does for metadata) collapses them into
+/// a single `@scope%2Fpkg` segment, which no upstream tarball route matches,
+/// so the proxy fetch 404s (B7). The scope separator must therefore stay
+/// un-encoded for tarballs even though metadata requires `%2F`.
+fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
+    format!("{}/-/{}", package_name, filename)
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -731,7 +746,9 @@ async fn npm_local_fetch(
     filename: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
     // Try exact path match first (proxy-cached artifacts use the upstream
-    // path verbatim, e.g. "@types%2Fmdurl/-/mdurl-2.0.0.tgz").
+    // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
+    // separator stays un-encoded for tarballs; see
+    // `build_tarball_upstream_path`).
     if let Ok(result) =
         proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
     {
@@ -792,8 +809,11 @@ async fn serve_tarball(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
-    let encoded_name = encode_package_name_for_upstream(package_name);
-    let upstream_path = format!("{}/-/{}", encoded_name, filename);
+    // Tarball URLs keep the scope separator as a literal `/`
+    // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
+    // collapsed the scope and package into one path segment that no upstream
+    // tarball route matched, so the remote-proxy fetch 404'd (B7).
+    let upstream_path = build_tarball_upstream_path(package_name, filename);
 
     // For remote repos, always proxy tarballs from upstream (hits cache if
     // already fetched). The proxy cache stores content under its own storage
@@ -2150,6 +2170,46 @@ mod tests {
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
         assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tarball_upstream_path (B7)
+    //
+    // Tarball URLs keep the scope separator as a literal `/`; only metadata
+    // uses `%2F`. These pin that the tarball path is NOT percent-encoded so a
+    // future refactor that routes it through `encode_package_name_for_upstream`
+    // (which would 404 the remote-proxy tarball fetch) fails here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tarball_upstream_path_scoped_keeps_literal_slash() {
+        let path = build_tarball_upstream_path("@e2escope/testpkg", "testpkg-1.0.0.tgz");
+        assert_eq!(path, "@e2escope/testpkg/-/testpkg-1.0.0.tgz");
+        assert!(
+            !path.contains("%2F") && !path.contains("%2f"),
+            "scoped tarball path must NOT encode the scope separator (B7); got {path}"
+        );
+    }
+
+    #[test]
+    fn test_tarball_upstream_path_unscoped() {
+        assert_eq!(
+            build_tarball_upstream_path("express", "express-4.18.2.tgz"),
+            "express/-/express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_tarball_upstream_path_diverges_from_metadata_encoding() {
+        // Metadata encodes the slash; tarballs must not. Pin that the two
+        // helpers produce different shapes for the same scoped package so a
+        // refactor cannot accidentally collapse them into one.
+        let name = "@types/mdurl";
+        let meta = encode_package_name_for_upstream(name);
+        let tarball = build_tarball_upstream_path(name, "mdurl-2.0.0.tgz");
+        assert_eq!(meta, "@types%2Fmdurl");
+        assert_eq!(tarball, "@types/mdurl/-/mdurl-2.0.0.tgz");
+        assert!(tarball.starts_with(&format!("{name}/-/")));
     }
 
     // -----------------------------------------------------------------------
