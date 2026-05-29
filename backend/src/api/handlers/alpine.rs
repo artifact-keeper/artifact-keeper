@@ -630,9 +630,9 @@ async fn download_package(
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
-            // readers with a pg advisory lock and retry once. Returns 507 if
-            // the file is still missing after acquiring the lock.
-            let content = proxy_helpers::advisory_lock_retry_get(
+            // readers with local hydration coordination and retry once.
+            // Returns 507 if the file is still missing after the retry window.
+            let content = proxy_helpers::coordinated_retry_get(
                 &state.db,
                 artifact.id,
                 &artifact.storage_key,

@@ -758,7 +758,7 @@ where
 /// requests arrive for the same artifact and the file is transiently absent,
 /// they queue behind the in-process coordinator rather than all failing
 /// simultaneously.
-pub(crate) async fn advisory_lock_retry_get(
+pub(crate) async fn coordinated_retry_get(
     db: &PgPool,
     artifact_id: Uuid,
     storage_key: &str,
@@ -1305,7 +1305,7 @@ pub async fn local_fetch_by_path(
     let content = match storage.get(&artifact.storage_key).await {
         Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            advisory_lock_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
         }
         Err(e) => return Err(map_storage_err(e)),
     };
@@ -1343,7 +1343,7 @@ pub async fn local_fetch_by_name_version(
     let content = match storage.get(&artifact.storage_key).await {
         Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            advisory_lock_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
         }
         Err(e) => return Err(map_storage_err(e)),
     };
@@ -1457,7 +1457,7 @@ pub async fn local_fetch_or_redirect(
     let content = match storage.get(&artifact.storage_key).await {
         Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            advisory_lock_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
         }
         Err(e) => return Err(map_storage_err(e)),
     };

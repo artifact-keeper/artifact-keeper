@@ -775,13 +775,8 @@ async fn npm_local_fetch(
     let content = match storage.get(&artifact.storage_key).await {
         Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            proxy_helpers::advisory_lock_retry_get(
-                db,
-                artifact.id,
-                &artifact.storage_key,
-                &*storage,
-            )
-            .await?
+            proxy_helpers::coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage)
+                .await?
         }
         Err(e) => return Err(map_storage_err(e)),
     };
