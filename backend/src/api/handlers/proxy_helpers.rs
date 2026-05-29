@@ -3118,12 +3118,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_cached_or_refetch_refetches_and_writes_back_when_storage_missing() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
         let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let artifact_id = Uuid::new_v4();
         let refetch_calls = StdArc::new(AtomicUsize::new(0));
         let refetched_bytes = Bytes::from_static(b"refetched-body");
         let storage_key = "proxy-cache/repo/pkg/__content__";
 
-        let result = super::get_cached_or_refetch(&storage, storage_key, {
+        let result = super::get_cached_or_refetch(&pool, artifact_id, &storage, storage_key, {
             let refetch_calls = refetch_calls.clone();
             let refetched_bytes = refetched_bytes.clone();
             move || async move {
