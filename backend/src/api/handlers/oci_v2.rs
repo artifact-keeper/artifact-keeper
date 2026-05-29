@@ -864,6 +864,88 @@ pub enum VirtualBlobResolution {
     },
 }
 
+/// Pure constructor for the `Local` arm of [`VirtualBlobResolution`].
+///
+/// Extracted out of [`resolve_virtual_blob`] so the DB-row → enum
+/// mapping is exercised by unit tests without spinning up the DB. The
+/// resolver's hot path passes `None` when the per-member SELECT misses,
+/// and the helper short-circuits that branch the same way the inline
+/// code did.
+fn local_blob_resolution(
+    size_bytes_and_storage_key: Option<(i64, String)>,
+    member: &crate::models::repository::Repository,
+) -> Option<VirtualBlobResolution> {
+    let (size_bytes, storage_key) = size_bytes_and_storage_key?;
+    Some(VirtualBlobResolution::Local {
+        size_bytes,
+        storage_key,
+        member: Box::new(member.clone()),
+    })
+}
+
+/// Pure decision: is a virtual-repo member eligible for upstream
+/// delegation on this request?
+///
+/// Returns `true` only when (a) the member is a remote repo and (b) the
+/// proxy service is wired up. Encapsulates the predicate the resolver
+/// uses before issuing any upstream HTTP traffic, so the gate is testable
+/// without a real `ProxyService`.
+fn should_attempt_remote_member(
+    member: &crate::models::repository::Repository,
+    has_proxy_service: bool,
+    has_upstream_url: bool,
+) -> bool {
+    member.repo_type == RepositoryType::Remote && has_proxy_service && has_upstream_url
+}
+
+/// Pure post-processing of a successful upstream blob fetch.
+///
+/// Returns `Some(VirtualBlobResolution::Remote { .. })` when the
+/// upstream bytes match the requested content-addressable digest, and
+/// `None` when they do not (the caller must "fall through" to the next
+/// virtual-repo member). For blobs the requested reference is always a
+/// digest, so the verification is unconditional.
+///
+/// Extracted out of [`resolve_virtual_blob`] so the security-critical
+/// verify-then-wrap step can be unit-tested without a wiremock upstream.
+fn finalize_upstream_blob(
+    digest: &str,
+    content: Bytes,
+    content_type: Option<String>,
+) -> Option<VirtualBlobResolution> {
+    if !verify_digest_or_fall_through(&content, digest) {
+        return None;
+    }
+    Some(VirtualBlobResolution::Remote {
+        content,
+        content_type,
+    })
+}
+
+/// Pure post-processing of a successful upstream manifest fetch.
+///
+/// Returns `Some((computed_digest, content_type, content))` when the
+/// upstream bytes are acceptable to forward (tag reference, or the
+/// reference is a digest and the SHA-256 matches). Returns `None`
+/// when a digest-reference request was answered with bytes whose
+/// SHA-256 does not match, signalling the caller to "fall through" to
+/// the next virtual-repo member.
+///
+/// Extracted out of [`resolve_virtual_manifest`] so the verification
+/// step and the `compute_sha256`-as-returned-digest behaviour can be
+/// unit-tested without a wiremock upstream.
+fn finalize_upstream_manifest(
+    reference: &str,
+    content: Bytes,
+    content_type: Option<String>,
+) -> Option<(String, Option<String>, Bytes)> {
+    if !verify_digest_or_fall_through(&content, reference) {
+        return None;
+    }
+    let computed = compute_sha256(&content);
+    Some((computed, content_type, content))
+}
+
 // ---------------------------------------------------------------------------
 // Virtual-resolution negative cache (#1348 round 1, concern #2)
 // ---------------------------------------------------------------------------
@@ -958,6 +1040,27 @@ fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
     }
 }
 
+/// Pure cap-and-evict step on a negative-cache map. Returns `true` iff
+/// there is room to record a new entry after evicting expired ones; the
+/// caller refuses the insert when this returns `false`.
+///
+/// Extracted out of [`virtual_negative_cache_insert`] so the cap policy
+/// (and the precise "evict expired first, refuse insert only if still
+/// at cap" semantics) can be unit-tested against an inline `HashMap`
+/// without touching the process-global cache.
+fn negative_cache_evict_and_has_room<K: Eq + std::hash::Hash>(
+    map: &mut std::collections::HashMap<K, std::time::Instant>,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    max_entries: usize,
+) -> bool {
+    if !negative_cache_should_evict_before_insert(map.len(), max_entries) {
+        return true;
+    }
+    map.retain(|_, at| negative_cache_entry_is_fresh(now.duration_since(*at), ttl));
+    !negative_cache_should_evict_before_insert(map.len(), max_entries)
+}
+
 /// Record a None resolution. Best-effort: lock poisoning silently degrades
 /// to "no caching", which is still correct, just slower.
 fn virtual_negative_cache_insert(key: VirtualResolveKey) {
@@ -966,22 +1069,13 @@ fn virtual_negative_cache_insert(key: VirtualResolveKey) {
         Ok(g) => g,
         Err(_) => return,
     };
-    // Cheap bound: if the map has grown past the cap, drop expired entries
-    // first, and if that doesn't free space, refuse the insert. We never
-    // want this cache to behave as a memory leak under pathological probe
-    // loads.
-    if negative_cache_should_evict_before_insert(write.len(), VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES) {
-        let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
-        let now = std::time::Instant::now();
-        write.retain(|_, at| negative_cache_entry_is_fresh(now.duration_since(*at), ttl));
-        if negative_cache_should_evict_before_insert(
-            write.len(),
-            VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
-        ) {
-            return;
-        }
+    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+    let now = std::time::Instant::now();
+    if !negative_cache_evict_and_has_room(&mut write, ttl, now, VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES)
+    {
+        return;
     }
-    write.insert(key, std::time::Instant::now());
+    write.insert(key, now);
 }
 
 /// Test-only: drop all negative-cache entries. Exposed to the
@@ -1029,17 +1123,18 @@ pub async fn resolve_virtual_blob(
         .fetch_optional(&state.db)
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .map(|row| (row.size_bytes, row.storage_key));
 
-        if let Some(blob) = local {
-            return Some(VirtualBlobResolution::Local {
-                size_bytes: blob.size_bytes,
-                storage_key: blob.storage_key,
-                member: Box::new(member.clone()),
-            });
+        if let Some(resolution) = local_blob_resolution(local, member) {
+            return Some(resolution);
         }
 
-        if member.repo_type == RepositoryType::Remote {
+        if should_attempt_remote_member(
+            member,
+            state.proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        ) {
             if let (Some(proxy), Some(upstream_url)) =
                 (&state.proxy_service, member.upstream_url.as_deref())
             {
@@ -1056,24 +1151,19 @@ pub async fn resolve_virtual_blob(
                     {
                         // #1348 round 1, concern #3 (digest verification):
                         // for blobs the requested `digest` is always a
-                        // content-addressable digest. Verify upstream
-                        // content matches before serving it; otherwise
-                        // we would happily relay corrupt or tampered
-                        // bytes to the client under the wrong digest.
-                        // The decision lives in `verify_digest_or_fall_through`
-                        // (positive-sense wrapper over the same predicate) so
-                        // it can be unit-tested without a wiremock upstream.
-                        if !verify_digest_or_fall_through(&content, digest) {
-                            warn!(
-                                "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
-                                upstream_url, digest
-                            );
-                            continue;
+                        // content-addressable digest. The verify-and-wrap
+                        // step lives in `finalize_upstream_blob` so it
+                        // can be unit-tested without a wiremock upstream.
+                        match finalize_upstream_blob(digest, content, content_type) {
+                            Some(resolution) => return Some(resolution),
+                            None => {
+                                warn!(
+                                    "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
+                                    upstream_url, digest
+                                );
+                                continue;
+                            }
                         }
-                        return Some(VirtualBlobResolution::Remote {
-                            content,
-                            content_type,
-                        });
                     }
                 }
             }
@@ -1153,7 +1243,11 @@ pub async fn resolve_virtual_manifest(
             }
         }
 
-        if member.repo_type == RepositoryType::Remote {
+        if should_attempt_remote_member(
+            member,
+            state.proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        ) {
             if let (Some(proxy), Some(upstream_url)) =
                 (&state.proxy_service, member.upstream_url.as_deref())
             {
@@ -1175,20 +1269,19 @@ pub async fn resolve_virtual_manifest(
                         // content-addressable semantics. A compromised or
                         // misbehaving upstream could otherwise serve
                         // arbitrary bytes under the requested digest.
-                        // The decision lives in `verify_digest_or_fall_through`
-                        // (positive-sense wrapper over the same predicate) so
-                        // it can be unit-tested without a wiremock upstream.
-                        if !verify_digest_or_fall_through(&content, reference) {
-                            warn!(
-                                "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
-                                upstream_url, reference
-                            );
-                            continue;
+                        // The verify+compute step lives in
+                        // `finalize_upstream_manifest` so it can be unit-
+                        // tested without a wiremock upstream.
+                        match finalize_upstream_manifest(reference, content, content_type) {
+                            Some(triple) => return Some(triple),
+                            None => {
+                                warn!(
+                                    "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
+                                    upstream_url, reference
+                                );
+                                continue;
+                            }
                         }
-                        // `compute_sha256` returns the `sha256:`-prefixed
-                        // form, matching the OCI digest grammar.
-                        let computed = compute_sha256(&content);
-                        return Some((computed, content_type, content));
                     }
                 }
             }
@@ -6577,6 +6670,330 @@ mod tests {
         } else {
             panic!("expected Remote variant");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Extracted pure helpers for #1419 virtual-resolver coverage.
+    // -----------------------------------------------------------------------
+    //
+    // `negative_cache_evict_and_has_room`, `local_blob_resolution`,
+    // `should_attempt_remote_member`, `finalize_upstream_blob`, and
+    // `finalize_upstream_manifest` were carved out of the async resolver
+    // hot path so the decision logic that previously lived inline could
+    // be covered by unit tests without standing up a Postgres + wiremock
+    // pair. These tests exercise the small purified pieces; the
+    // wiremock-backed integration tests in
+    // `backend/tests/oci_virtual_resolution_tests.rs` still cover the
+    // end-to-end resolver behaviour with a real DB.
+
+    fn build_test_repository(
+        repo_type: RepositoryType,
+        upstream_url: Option<&str>,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: Uuid::new_v4(),
+            key: "test-repo".to_string(),
+            name: "test-repo".to_string(),
+            description: None,
+            format: RepositoryFormat::Docker,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/test-repo".to_string(),
+            upstream_url: upstream_url.map(|s| s.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // negative_cache_evict_and_has_room: pure cap-and-evict step on a
+    // fresh `HashMap`. Exercised here rather than against the process-
+    // global cache so capacity-edge behaviour can be pinned without
+    // affecting other tests' inserts.
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_under_cap_short_circuits() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        map.insert(1, std::time::Instant::now());
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        // Under the cap (1 < 4): no eviction required, returns true and
+        // leaves the map untouched.
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 4
+        ));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_evicts_all_expired_and_grants_room() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        // Two entries inserted "long ago" — both will be evicted as expired.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        map.insert(1, long_ago);
+        map.insert(2, long_ago);
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        // At the cap (2 >= 2): eviction kicks in, both expired entries
+        // are dropped, room is granted.
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert!(
+            map.is_empty(),
+            "expired entries must be evicted to make room"
+        );
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_refuses_when_all_fresh() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        // Two fresh entries at the cap — neither is expired, so the
+        // helper must refuse the insert by returning false.
+        let now = std::time::Instant::now();
+        map.insert(1, now);
+        map.insert(2, now);
+        let ttl = std::time::Duration::from_secs(60);
+        assert!(!super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert_eq!(
+            map.len(),
+            2,
+            "no entries should be evicted when none are expired"
+        );
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_evicts_only_expired_subset() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        let long_ago = now - std::time::Duration::from_secs(60);
+        // One stale, one fresh, cap = 2. After eviction the fresh entry
+        // remains and there's room for one more.
+        map.insert(1, long_ago);
+        map.insert(2, now);
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&2));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_clear_drops_existing_entries() {
+        // The integration tests rely on `virtual_negative_cache_clear()`
+        // to isolate themselves from sibling tests' inserts. Cover the
+        // wipe semantics here so the pure clear path is exercised
+        // without depending on the test harness ordering.
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(
+            id,
+            VirtualResolveKind::Blob,
+            "clear-target",
+            "sha256:cleared",
+        );
+        super::virtual_negative_cache_insert(key.clone());
+        assert!(super::virtual_negative_cache_hit(&key));
+        super::virtual_negative_cache_clear();
+        assert!(
+            !super::virtual_negative_cache_hit(&key),
+            "clear() must drop the just-inserted entry"
+        );
+    }
+
+    // local_blob_resolution: pure DB-row → Local-variant constructor.
+
+    #[test]
+    fn test_local_blob_resolution_none_input_yields_none() {
+        let member = build_test_repository(RepositoryType::Local, None);
+        assert!(super::local_blob_resolution(None, &member).is_none());
+    }
+
+    #[test]
+    fn test_local_blob_resolution_some_input_constructs_local_variant() {
+        let member = build_test_repository(RepositoryType::Local, None);
+        let member_id = member.id;
+        let resolution =
+            super::local_blob_resolution(Some((1024, "oci-blobs/sha256:abc".into())), &member)
+                .expect("Some input must produce a Local resolution");
+        match resolution {
+            VirtualBlobResolution::Local {
+                size_bytes,
+                storage_key,
+                member,
+            } => {
+                assert_eq!(size_bytes, 1024);
+                assert_eq!(storage_key, "oci-blobs/sha256:abc");
+                assert_eq!(member.id, member_id);
+            }
+            VirtualBlobResolution::Remote { .. } => {
+                panic!("expected Local variant from local_blob_resolution");
+            }
+        }
+    }
+
+    // should_attempt_remote_member: 2x2x2 truth-table of the
+    // (repo_type == Remote, has_proxy_service, has_upstream_url)
+    // predicate. The function only returns true on `(true, true, true)`.
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_with_proxy_and_url() {
+        let m = build_test_repository(RepositoryType::Remote, Some("https://ghcr.io"));
+        assert!(super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_missing_proxy() {
+        let m = build_test_repository(RepositoryType::Remote, Some("https://ghcr.io"));
+        // ProxyService not wired up: must not attempt upstream.
+        assert!(!super::should_attempt_remote_member(&m, false, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_missing_url() {
+        let m = build_test_repository(RepositoryType::Remote, None);
+        // Member has no upstream_url configured: nothing to fetch.
+        assert!(!super::should_attempt_remote_member(&m, true, false));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_local_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Local, Some("https://ghcr.io"));
+        // Local-typed member must never trigger an upstream fetch even
+        // if a stale `upstream_url` is present.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_virtual_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Virtual, Some("https://ghcr.io"));
+        // Virtual members would recurse — the resolver only delegates to
+        // genuinely remote members.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_staging_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Staging, Some("https://ghcr.io"));
+        // Staging repos host promotion targets, not upstream proxies.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    // finalize_upstream_blob: verify-then-wrap step for the resolver.
+
+    #[test]
+    fn test_finalize_upstream_blob_matching_digest_returns_remote() {
+        let bytes = Bytes::from_static(b"hello world");
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let result =
+            super::finalize_upstream_blob(digest, bytes.clone(), Some("application/json".into()))
+                .expect("matching digest must produce a Remote resolution");
+        match result {
+            VirtualBlobResolution::Remote {
+                content,
+                content_type,
+            } => {
+                assert_eq!(content, bytes);
+                assert_eq!(content_type.as_deref(), Some("application/json"));
+            }
+            VirtualBlobResolution::Local { .. } => {
+                panic!("finalize_upstream_blob must never construct a Local variant");
+            }
+        }
+    }
+
+    #[test]
+    fn test_finalize_upstream_blob_mismatched_digest_falls_through() {
+        // The exact bytes-substitution attack vector PR #1348 closes:
+        // upstream serves "hello world" under a non-matching digest.
+        // finalize_upstream_blob must refuse the response so the resolver
+        // can `continue` to the next virtual-repo member.
+        let bytes = Bytes::from_static(b"hello world");
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::finalize_upstream_blob(wrong, bytes, None).is_none());
+    }
+
+    #[test]
+    fn test_finalize_upstream_blob_empty_body_with_canonical_digest_accepts() {
+        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let result = super::finalize_upstream_blob(canonical, Bytes::new(), None)
+            .expect("canonical empty-string digest must verify against empty content");
+        if let VirtualBlobResolution::Remote { content, .. } = result {
+            assert!(content.is_empty());
+        } else {
+            panic!("expected Remote variant");
+        }
+    }
+
+    // finalize_upstream_manifest: verify-then-compute step for manifest
+    // resolution.
+
+    #[test]
+    fn test_finalize_upstream_manifest_tag_reference_always_accepts_and_computes_digest() {
+        let body = Bytes::from_static(b"{\"schemaVersion\":2}");
+        let (returned_digest, ct, content) =
+            super::finalize_upstream_manifest("latest", body.clone(), Some("ct".into()))
+                .expect("tag reference must always accept and return a computed digest");
+        assert_eq!(content, body);
+        assert_eq!(ct.as_deref(), Some("ct"));
+        assert_eq!(returned_digest, super::compute_sha256(&body));
+        // Sanity: the returned digest is `sha256:`-prefixed per the OCI
+        // grammar.
+        assert!(returned_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_matching_digest_returns_computed_digest() {
+        let body = Bytes::from_static(b"hello world");
+        let requested = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let (returned_digest, _ct, content) =
+            super::finalize_upstream_manifest(requested, body.clone(), None)
+                .expect("matching digest must accept");
+        // The resolver returns the COMPUTED digest (not the requested
+        // one), guaranteeing the response header is always honest about
+        // what was served. For a match, the two are byte-for-byte equal.
+        assert_eq!(returned_digest, requested);
+        assert_eq!(content, body);
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_mismatched_digest_ref_falls_through() {
+        // The #1348 concern-3 attack: upstream tampers with a manifest
+        // when the client asked for a specific digest. The resolver
+        // must refuse so the caller advances to the next member.
+        let body = Bytes::from_static(b"{\"evil\":true}");
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::finalize_upstream_manifest(wrong, body, None).is_none());
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_invalid_digest_format_treated_as_tag() {
+        // A reference that is not a valid OCI digest is treated as a tag:
+        // the helper accepts the bytes and returns the computed sha256 as
+        // the response digest. (`is_digest_reference` rejects uppercase
+        // algorithm strings; everything else flows through the tag path.)
+        let body = Bytes::from_static(b"hi");
+        let (returned_digest, _ct, _content) =
+            super::finalize_upstream_manifest("SHA256:nope", body.clone(), None)
+                .expect("malformed digest reference must be treated as a tag");
+        assert_eq!(returned_digest, super::compute_sha256(&body));
     }
 }
 
