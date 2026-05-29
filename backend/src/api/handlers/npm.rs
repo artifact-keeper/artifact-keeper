@@ -766,7 +766,7 @@ async fn npm_local_fetch(
     let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
     let filename_escaped = super::escape_like_literal(filename);
     let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
@@ -789,10 +789,14 @@ async fn npm_local_fetch(
     let storage = state
         .storage_for_repo(location)
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        Err(crate::error::AppError::NotFound(_)) => {
+            proxy_helpers::coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage)
+                .await?
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
 
     Ok((content, Some(artifact.content_type.clone())))
 }

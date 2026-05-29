@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -757,68 +758,81 @@ impl ProxyService {
             return Ok((content, content_type));
         }
 
-        // Fetch from upstream using the real fetch_path
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
-        let upstream_result = self
-            .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
-            .await;
+        let hydration_lease_key = format!("proxy-cache:{}", cache_key);
+        coordinate_proxy_hydration(
+            &hydration_lease_key,
+            || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
+            || async {
+                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+                let upstream_result = self
+                    .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
+                    .await;
 
-        match upstream_result {
-            Ok(resp) => {
-                let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-                // B6 (coalescing 502 leak, remaining path): the upstream fetch
-                // already SUCCEEDED -- `resp.content` is in hand. A failure to
-                // persist the cache entry must NOT fail the client request.
-                // Under a cold-cache stampede, N concurrent waiters all miss
-                // the cache and all race to write the SAME cache file; one of
-                // those writes can transiently fail (e.g. ENOENT from a
-                // create_dir_all/File::create race against a sibling writer, a
-                // half-renamed temp file, or a poisoned entry). Propagating
-                // that write error via `?` surfaced as `AppError::Io` ->
-                // `map_proxy_error` -> raw 502, which is exactly the leak the
-                // stampede gate rejects (`200 502 200 ...`). Treat the cache
-                // write as best-effort: log at warn and still serve the bytes
-                // we fetched. The cache self-heals on the next request (the
-                // streaming path already documents this self-healing).
-                if let Err(cache_err) = self
-                    .cache_artifact(
-                        &cache_key,
-                        &metadata_key,
-                        &resp.content,
-                        resp.content_type.clone(),
-                        resp.etag,
-                        cache_ttl,
-                        repo.id,
-                        cache_path,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        error = %cache_err,
-                        "proxy cache write failed after successful upstream fetch; \
-                         serving fetched bytes and leaving cache to self-heal on next request"
-                    );
-                }
+                match upstream_result {
+                    Ok(resp) => {
+                        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                        // B6 (coalescing 502 leak, remaining path): the upstream fetch
+                        // already SUCCEEDED -- `resp.content` is in hand. A failure to
+                        // persist the cache entry must NOT fail the client request.
+                        // Under a cold-cache stampede, N concurrent waiters all miss
+                        // the cache and all race to write the SAME cache file; one of
+                        // those writes can transiently fail (e.g. ENOENT from a
+                        // create_dir_all/File::create race against a sibling writer, a
+                        // half-renamed temp file, or a poisoned entry). Propagating
+                        // that write error via `?` surfaced as `AppError::Io` ->
+                        // `map_proxy_error` -> raw 502, which is exactly the leak the
+                        // stampede gate rejects (`200 502 200 ...`). Treat the cache
+                        // write as best-effort: log at warn and still serve the bytes
+                        // we fetched. The cache self-heals on the next request (the
+                        // streaming path already documents this self-healing).
+                        if let Err(cache_err) = self
+                            .cache_artifact(
+                                &cache_key,
+                                &metadata_key,
+                                &resp.content,
+                                resp.content_type.clone(),
+                                resp.etag,
+                                cache_ttl,
+                                repo.id,
+                                cache_path,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                cache_key = %cache_key,
+                                error = %cache_err,
+                                "proxy cache write failed after successful upstream fetch; \
+                                 serving fetched bytes and leaving cache to self-heal on next request"
+                            );
+                        }
 
-                Ok((resp.content, resp.content_type))
-            }
-            Err(upstream_err) => {
-                if let Ok(Some((stale_content, stale_content_type))) = self
-                    .get_stale_cached_artifact(&cache_key, &metadata_key)
-                    .await
-                {
-                    tracing::warn!(
-                        "Upstream fetch failed for {}; serving stale cached copy: {}",
-                        full_url,
-                        upstream_err
-                    );
-                    Ok((stale_content, stale_content_type))
-                } else {
-                    Err(upstream_err)
+                        Ok((resp.content, resp.content_type))
+                    }
+                    Err(upstream_err) => {
+                        if let Ok(Some((stale_content, stale_content_type))) = self
+                            .get_stale_cached_artifact(&cache_key, &metadata_key)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Upstream fetch failed for {}; serving stale cached copy: {}",
+                                full_url,
+                                upstream_err
+                            );
+                            Ok((stale_content, stale_content_type))
+                        } else {
+                            Err(upstream_err)
+                        }
+                    }
                 }
-            }
-        }
+            },
+            || {
+                AppError::Storage(format!(
+                    "Timed out waiting for proxy cache hydration: {}",
+                    cache_key
+                ))
+            },
+        )
+        .await
     }
 
     /// Streaming sibling of [`Self::fetch_artifact`] that does NOT buffer

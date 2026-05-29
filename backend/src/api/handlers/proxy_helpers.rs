@@ -9,12 +9,16 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::download_response::try_presigned_redirect;
+use crate::api::handlers::error_helpers::map_storage_err;
 use crate::api::AppState;
+use crate::error::AppError;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
+use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::proxy_service::ProxyService;
 use crate::storage::StorageLocation;
+use std::future::Future;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -672,6 +676,133 @@ pub async fn proxy_check_cache(
     }
 }
 
+/// Generic helper for remote proxy-backed cache reads.
+///
+/// Tries `storage.get(storage_key)`. If it returns `AppError::NotFound`, the
+/// helper coordinates a single repair attempt per storage key across local
+/// waiters and backend instances, then invokes `refetch` only when the file is
+/// still absent.
+///
+/// The refetched bytes are written back to storage via a best-effort `put` so
+/// future requests hit the cache. That write-back is intentional: `refetch`
+/// updates the shared proxy cache, while this helper repopulates the
+/// repo-scoped storage key that the format handler will read on the next
+/// request. The hydration coordinator serialises stale-cache recovery so
+/// concurrent requests do not all re-download and write back the same object.
+///
+/// The wait is bounded; if the helper cannot enter the repair window within the
+/// timeout it returns `507 Insufficient Storage` so the
+/// client can retry later. Non-`NotFound` storage errors are propagated as 500
+/// responses so operators still see real backend failures.
+pub(crate) async fn get_cached_or_refetch<F, Fut>(
+    db: &PgPool,
+    artifact_id: Uuid,
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    let _ = db;
+    let hydration_lease_key = format!("artifact-repair:{}", storage_key);
+    coordinate_proxy_hydration(
+        &hydration_lease_key,
+        || async {
+            match storage.get(storage_key).await {
+                Ok(content) => Ok(Some(content)),
+                Err(AppError::NotFound(_)) => Ok(None),
+                Err(e) => Err(map_storage_err(e)),
+            }
+        },
+        || async {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                storage_key = %storage_key,
+                "proxy cache entry is missing on disk; refetching under hydration lease"
+            );
+
+            let bytes = refetch().await?;
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched proxy payload; subsequent requests will re-fetch"
+                );
+            }
+            Ok(bytes)
+        },
+        || {
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "artifact file unavailable; retry later",
+            )
+                .into_response()
+        },
+    )
+    .await
+}
+
+/// Serialise concurrent reads for a locally-stored artifact whose physical
+/// file was not found in storage. Retries `storage.get()` under the same
+/// in-process hydration coordinator used by proxy cache repair.
+///
+/// Returns `Ok(bytes)` on success after the retry window; a `507 Insufficient
+/// Storage` response when the file is still absent after coordination (another
+/// writer should have written it — a client retry is warranted); or propagates
+/// non-`NotFound` storage errors as 500.
+///
+/// This is the local missing-file repair path: when multiple concurrent
+/// requests arrive for the same artifact and the file is transiently absent,
+/// they queue behind the in-process coordinator rather than all failing
+/// simultaneously.
+pub(crate) async fn coordinated_retry_get(
+    db: &PgPool,
+    artifact_id: Uuid,
+    storage_key: &str,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<Bytes, Response> {
+    let _ = db;
+    let hydration_lease_key = format!("artifact-read-retry:{}", storage_key);
+    tracing::warn!(
+        artifact_id = %artifact_id,
+        storage_key = %storage_key,
+        "storage miss on local artifact; coordinating re-read"
+    );
+    coordinate_proxy_hydration(
+        &hydration_lease_key,
+        || async {
+            match storage.get(storage_key).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(crate::error::AppError::NotFound(_)) => Ok(None),
+                Err(e) => Err(map_storage_err(e)),
+            }
+        },
+        || async {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                storage_key = %storage_key,
+                "artifact file still absent after coordinated retry; returning 507"
+            );
+            Err((
+                StatusCode::INSUFFICIENT_STORAGE,
+                "artifact file unavailable; retry later",
+            )
+                .into_response())
+        },
+        || {
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "artifact file unavailable; retry later",
+            )
+                .into_response()
+        },
+    )
+    .await
+}
+
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
 /// the proxy cache key. This lets callers store content under a predictable
 /// local path even when the upstream download URL varies between requests.
@@ -1128,6 +1259,7 @@ pub async fn fetch_virtual_members(
 /// Row type for local artifact fetch queries, including quarantine fields.
 #[derive(sqlx::FromRow)]
 pub(crate) struct LocalArtifactRow {
+    pub id: Uuid,
     pub storage_key: String,
     pub content_type: String,
     pub quarantine_status: Option<String>,
@@ -1155,7 +1287,7 @@ pub async fn local_fetch_by_path(
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
     let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
          LIMIT 1",
@@ -1170,10 +1302,13 @@ pub async fn local_fetch_by_path(
     check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        Err(crate::error::AppError::NotFound(_)) => {
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
 
     Ok((content, Some(artifact.content_type)))
 }
@@ -1189,7 +1324,7 @@ pub async fn local_fetch_by_name_version(
     version: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
     let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
          LIMIT 1",
@@ -1205,10 +1340,13 @@ pub async fn local_fetch_by_name_version(
     check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        Err(crate::error::AppError::NotFound(_)) => {
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
 
     Ok((content, Some(artifact.content_type)))
 }
@@ -1290,7 +1428,7 @@ pub async fn local_fetch_or_redirect(
     artifact_path: &str,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
          LIMIT 1",
@@ -1316,10 +1454,13 @@ pub async fn local_fetch_or_redirect(
         }
     }
 
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        Err(crate::error::AppError::NotFound(_)) => {
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2823,20 +2964,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
 
+    enum RecordingGetBehavior {
+        Hit,
+        Miss,
+    }
+
     /// Recording mock storage backend that counts every method call so tests
     /// can assert which I/O paths fired (in particular: was the full object
-    /// `get(...)` called).
+    /// `get(...)` called and whether a write-back happened).
     struct RecordingStorage {
         get_calls: StdArc<AtomicUsize>,
+        put_calls: StdArc<AtomicUsize>,
         presigned_calls: StdArc<AtomicUsize>,
+        last_put: StdArc<std::sync::Mutex<Option<(String, Bytes)>>>,
+        get_behavior: RecordingGetBehavior,
         supports: bool,
     }
 
     impl RecordingStorage {
         fn new(supports: bool) -> Self {
+            Self::new_with_get_behavior(supports, RecordingGetBehavior::Hit)
+        }
+
+        fn new_with_get_behavior(supports: bool, get_behavior: RecordingGetBehavior) -> Self {
             Self {
                 get_calls: StdArc::new(AtomicUsize::new(0)),
+                put_calls: StdArc::new(AtomicUsize::new(0)),
                 presigned_calls: StdArc::new(AtomicUsize::new(0)),
+                last_put: StdArc::new(std::sync::Mutex::new(None)),
+                get_behavior,
                 supports,
             }
         }
@@ -2844,12 +3000,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for RecordingStorage {
-        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_put.lock().unwrap() = Some((key.to_string(), content));
             Ok(())
         }
-        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Bytes::from_static(b"full-body"))
+            match self.get_behavior {
+                RecordingGetBehavior::Hit => Ok(Bytes::from_static(b"full-body")),
+                RecordingGetBehavior::Miss => Err(crate::error::AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key
+                ))),
+            }
         }
         async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
             Ok(true)
@@ -2919,6 +3083,97 @@ mod tests {
         );
     }
 
+    struct MissingThenPresentStorage {
+        content: StdArc<tokio::sync::Mutex<Option<Bytes>>>,
+        put_calls: StdArc<AtomicUsize>,
+    }
+
+    impl MissingThenPresentStorage {
+        fn new() -> Self {
+            Self {
+                content: StdArc::new(tokio::sync::Mutex::new(None)),
+                put_calls: StdArc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MissingThenPresentStorage {
+        async fn put(&self, _key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            *self.content.lock().await = Some(content);
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            self.content.lock().await.clone().ok_or_else(|| {
+                crate::error::AppError::NotFound("missing test cache entry".to_string())
+            })
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(self.content.lock().await.is_some())
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            *self.content.lock().await = None;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_serializes_remote_refetches() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let storage = StdArc::new(MissingThenPresentStorage::new());
+        let artifact_id = Uuid::new_v4();
+        let refetch_calls = StdArc::new(AtomicUsize::new(0));
+        let start = StdArc::new(tokio::sync::Barrier::new(3));
+
+        let spawn_call = |pool: PgPool,
+                          storage: StdArc<MissingThenPresentStorage>,
+                          refetch_calls: StdArc<AtomicUsize>,
+                          start: StdArc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                start.wait().await;
+                get_cached_or_refetch(&pool, artifact_id, storage.as_ref(), "proxy/test", || {
+                    let refetch_calls = refetch_calls.clone();
+                    async move {
+                        refetch_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(Bytes::from_static(b"remote-bytes"))
+                    }
+                })
+                .await
+            })
+        };
+
+        let first = spawn_call(
+            pool.clone(),
+            storage.clone(),
+            refetch_calls.clone(),
+            start.clone(),
+        );
+        let second = spawn_call(
+            pool.clone(),
+            storage.clone(),
+            refetch_calls.clone(),
+            start.clone(),
+        );
+
+        start.wait().await;
+
+        let first = first.await.expect("first join").expect("first fetch");
+        let second = second.await.expect("second join").expect("second fetch");
+
+        assert_eq!(first, Bytes::from_static(b"remote-bytes"));
+        assert_eq!(second, Bytes::from_static(b"remote-bytes"));
+        assert_eq!(refetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.put_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn test_try_proxy_cache_redirect_returns_none_when_presigned_disabled() {
         let storage = RecordingStorage::new(true);
@@ -2977,6 +3232,50 @@ mod tests {
             "backend without redirect support must yield None"
         );
         assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_refetches_and_writes_back_when_storage_missing() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let artifact_id = Uuid::new_v4();
+        let refetch_calls = StdArc::new(AtomicUsize::new(0));
+        let refetched_bytes = Bytes::from_static(b"refetched-body");
+        let storage_key = "proxy-cache/repo/pkg/__content__";
+
+        let result = super::get_cached_or_refetch(&pool, artifact_id, &storage, storage_key, {
+            let refetch_calls = refetch_calls.clone();
+            let refetched_bytes = refetched_bytes.clone();
+            move || async move {
+                refetch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(refetched_bytes)
+            }
+        })
+        .await
+        .expect("miss path should recover via refetch");
+
+        assert_eq!(result, refetched_bytes);
+        // The hydration coordinator uses a double-checked-locking pattern: the
+        // first `check()` happens at the top of the loop, and a second `check()`
+        // runs after the caller wins the leader election (to avoid duplicating
+        // work if another leader populated the cache between the first check
+        // and the lease acquisition). In a single-threaded test the cache is
+        // never populated by anyone else, so we observe both checks and the
+        // count is exactly 2. The invariant we care about is "refetch ran once
+        // and wrote back once", asserted below.
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.put_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refetch_calls.load(Ordering::SeqCst), 1);
+
+        let recorded_put = storage.last_put.lock().unwrap().clone();
+        let Some((recorded_key, recorded_bytes)) = recorded_put else {
+            panic!("expected a write-back after refetch");
+        };
+        assert_eq!(recorded_key, storage_key);
+        assert_eq!(recorded_bytes, refetched_bytes);
     }
 
     // ── classify_remote_or_virtual tests ───────────────────────────────
