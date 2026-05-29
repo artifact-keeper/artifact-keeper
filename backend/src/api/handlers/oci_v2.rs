@@ -1358,12 +1358,87 @@ async fn cache_manifest_reference_locally(
     )
     .bind(repo.id)
     .bind(&repo.image)
-    .bind(cached_reference)
+    .bind(&cached_reference)
     .bind(&digest)
     .bind(&manifest_content_type)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
+
+    // #1357: mirror the push-path artifact row so proxied manifests surface
+    // in the repository artifact listing and the WebUI's Docker tag grouping.
+    //
+    // `list_artifacts_grouped_by_docker_tag` (repositories.rs) JOINs
+    // `oci_tags` to `artifacts` on
+    //     a.path = 'v2/' || t.name || '/manifests/' || t.tag
+    // For pushed manifests, `handle_put_manifest` writes both the oci_tags
+    // row AND the matching artifacts row, so the JOIN succeeds. For proxied
+    // manifests, only the oci_tags row was written -- the JOIN drops the
+    // tag and the UI shows "No image tags found" even after a successful
+    // `docker pull` through the proxy (#1357).
+    //
+    // This mirrors the push-path insert at line ~2832: same path shape,
+    // same storage_key (`oci-manifests/<digest>` under the per-repo
+    // backend), same ON CONFLICT semantics. Critically the storage_key
+    // resolves under `storage_for_repo(&repo.location)` -- the same
+    // per-repo backend used to write the manifest body above -- so this
+    // does NOT reintroduce the #1278 doubled-prefix bug. That bug was
+    // specific to `proxy_service::cache_artifact`, which writes to the
+    // global `proxy-cache/...` backend; manifests are stored to the
+    // per-repo location, so reads through `storage_for_repo` resolve
+    // correctly.
+    //
+    // `total_size` for proxied manifests is the manifest body length.
+    // The push path computes config+layers from the parsed manifest, but
+    // that requires already-cached blobs; for proxied manifests the body
+    // is what we have. The artifact row exists primarily to satisfy the
+    // JOIN; downstream byte-accounting uses the oci_tags-driven sizing in
+    // `list_artifacts_grouped_by_docker_tag`.
+    let artifact_path = format!("v2/{}/manifests/{}", repo.image, cached_reference);
+    let artifact_name = format!("{}:{}", repo.image, cached_reference);
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let size_bytes = content.len() as i64;
+
+    if let Err(e) = sqlx::query(
+        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (repository_id, path) DO UPDATE SET
+             version = EXCLUDED.version,
+             size_bytes = EXCLUDED.size_bytes,
+             checksum_sha256 = EXCLUDED.checksum_sha256,
+             content_type = EXCLUDED.content_type,
+             storage_key = EXCLUDED.storage_key,
+             is_deleted = false,
+             updated_at = NOW()"#,
+    )
+    .bind(repo.id)
+    .bind(&artifact_path)
+    .bind(&artifact_name)
+    .bind(Some(&cached_reference))
+    .bind(size_bytes)
+    .bind(checksum)
+    .bind(&manifest_content_type)
+    .bind(&manifest_key)
+    .execute(&state.db)
+    .await
+    {
+        // Best-effort: the oci_tags row + manifest body are already
+        // persisted, so we never fail the user's pull just because the
+        // listing-index row could not be written. The tag still resolves
+        // through `oci_tags`; only the UI listing is degraded until the
+        // next proxy refresh.
+        tracing::warn!(
+            repo = %repo.key,
+            image = %repo.image,
+            reference = %reference,
+            artifact_path = %artifact_path,
+            error = %e,
+            "Failed to upsert artifacts row for proxied manifest; manifest \
+             body and oci_tags row are still persisted, but the repository \
+             artifact listing will not include this tag until the next \
+             proxy refresh succeeds"
+        );
+    }
 
     Ok(digest)
 }
@@ -7544,6 +7619,255 @@ mod token_service_query_validation_tests {
             status,
             StatusCode::OK,
             "missing service param stays accepted (backward compat)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1357: proxied manifests must be indexed in the `artifacts` table so the
+// Docker tag UI listing (`list_artifacts_grouped_by_docker_tag` in
+// repositories.rs) finds the JOIN row. Pre-fix, `cache_manifest_reference_locally`
+// inserted only the `oci_tags` row, so a successful `docker pull` through a
+// remote proxy populated `oci_tags` but left `artifacts` empty, and the UI
+// reported "No image tags found". This is the gap referenced in the #1278
+// fix's "Tradeoff" note for the OCI manifest path -- safe to close here
+// because the manifest write uses the per-repo backend, not the global
+// `proxy-cache/...` backend that drove the #1278 doubled-prefix bug.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proxy_manifest_artifact_indexing_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// After `cache_manifest_reference_locally` writes a proxied manifest,
+    /// the JOIN used by the docker-tag listing must succeed: there must be
+    /// an `artifacts` row at the deterministic path
+    /// `v2/{image}/manifests/{tag}` whose storage_key matches the
+    /// per-repo manifest_storage_key(digest).
+    #[tokio::test]
+    async fn cache_manifest_inserts_artifacts_row_for_listing_join() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Build an OciRepoInfo pointing at the per-repo storage. The path
+        // matches what `repo.storage_location()` would return for this
+        // repository row, so the per-repo backend reads/writes resolve
+        // under <storage_dir>/oci-manifests/<digest>.
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key.clone(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#;
+        let body = Bytes::from_static(manifest);
+        let digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // For remote repos with a tag reference, the cached tag is the digest.
+        let expected_tag = digest.clone();
+        let expected_path = format!("v2/{}/manifests/{}", image, expected_tag);
+        let expected_storage_key = format!("oci-manifests/{}", digest);
+
+        // oci_tags row exists (regression-safe: this was the only insert pre-fix).
+        let tag_row: Option<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_content_type \
+             FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(&expected_tag)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_tags");
+        assert!(
+            tag_row.is_some(),
+            "expected oci_tags row for repo={}, image={}, tag={}",
+            repo_key,
+            image,
+            expected_tag
+        );
+
+        // #1357 fix: artifacts row must exist at the JOIN-compatible path,
+        // pointing at the per-repo manifest_storage_key. Without this row
+        // `list_artifacts_grouped_by_docker_tag` drops the tag and the UI
+        // shows "No image tags found" for proxied images.
+        let art_row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT storage_key, content_type, size_bytes \
+             FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&expected_path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query artifacts");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let (storage_key, content_type, size_bytes) = art_row.expect(
+            "expected artifacts row at v2/<image>/manifests/<tag> after \
+             cache_manifest_reference_locally; without it the docker-tag UI \
+             listing JOIN drops proxied tags (#1357)",
+        );
+        assert_eq!(
+            storage_key, expected_storage_key,
+            "artifacts.storage_key must point at the per-repo manifest object \
+             so storage_for_repo(repo.location).get(storage_key) resolves \
+             under the same backend the manifest was written to"
+        );
+        assert_eq!(
+            content_type, "application/vnd.oci.image.manifest.v1+json",
+            "content_type should carry the manifest media type"
+        );
+        assert_eq!(
+            size_bytes,
+            body.len() as i64,
+            "size_bytes must equal manifest body length"
+        );
+    }
+
+    /// Repeated proxy hits for the same tag must upsert (not duplicate) the
+    /// artifacts row, mirroring the push-path ON CONFLICT DO UPDATE.
+    #[tokio::test]
+    async fn cache_manifest_repeated_calls_upsert_artifact_row() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/nginx";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+
+        // First and second proxy fetches both call cache_manifest_reference_locally.
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "stable",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("first cache call");
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "stable",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("second cache call");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            count, 1,
+            "repeated cache calls for the same (repo, image, tag) must \
+             upsert via ON CONFLICT (repository_id, path), not insert a \
+             second row"
+        );
+    }
+
+    /// The fix must NOT route any write back through
+    /// `proxy_service::cache_artifact`, which is forbidden from inserting
+    /// into `artifacts` (#1278). Pin the source-level invariant so a future
+    /// refactor that consolidates the manifest-cache and blob-proxy-cache
+    /// paths cannot silently reintroduce the doubled-prefix 500s.
+    #[test]
+    fn cache_manifest_reference_locally_does_not_call_proxy_cache_artifact() {
+        let source = include_str!("oci_v2.rs");
+        let fn_marker = "async fn cache_manifest_reference_locally(";
+        let fn_start = source
+            .find(fn_marker)
+            .expect("cache_manifest_reference_locally must exist");
+        let after_start = &source[fn_start..];
+        let fn_end_rel = after_start
+            .find("\n}\n")
+            .or_else(|| after_start.find("\n    }\n"))
+            .expect("function must terminate with a column-0 or column-4 closer");
+        let fn_body = &after_start[..fn_end_rel];
+
+        assert!(
+            !fn_body.contains("proxy_service.cache_artifact")
+                && !fn_body.contains("self.cache_artifact")
+                && !fn_body.contains("ProxyService"),
+            "cache_manifest_reference_locally MUST NOT delegate to \
+             ProxyService::cache_artifact (#1278). The manifest body is \
+             written through the per-repo backend at `oci-manifests/<digest>` \
+             and the artifacts row points at that key; routing through the \
+             proxy cache would put bytes under `proxy-cache/<repo>/...` on \
+             the global backend and break the `storage_for_repo` read path."
         );
     }
 }
