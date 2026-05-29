@@ -485,13 +485,33 @@ fn validate_virtual_repo_member_count(
     if *repo_type != RepositoryType::Virtual {
         return Ok(());
     }
-    let count = member_repos.map_or(0, <[_]>::len);
-    if count == 0 {
+    // #1444 follow-up: distinguish "field omitted entirely" (None) from
+    // "explicit empty list" (Some(vec![])).
+    //
+    // * None  -> caller is following the deferred-population pattern: create
+    //            the virtual, then add members via `POST /repositories/{key}/members`.
+    //            This is the shape every E2E test helper uses. Rejecting it
+    //            at create time (the original PR #1279 / #1281 behaviour)
+    //            breaks the create-then-add flow and surfaces as the
+    //            "members router returns 404" symptom in #1444 because
+    //            the follow-up POSTs target a nonexistent repo. We
+    //            therefore accept None and leave the empty-virtual state
+    //            visible at fetch time (NOT_FOUND on download) -- it
+    //            self-resolves on the first add_member.
+    //
+    // * Some(vec![]) -> caller explicitly said "no members". This is the
+    //            silent-drop trap from #1279 (mis-typed field name
+    //            deserialised to None pre-fix; the explicit empty form is
+    //            also a clear operator mistake). Keep rejecting it so the
+    //            mistake surfaces at create-time with an actionable
+    //            message, as #1281 intended.
+    if let Some([]) = member_repos {
         return Err(AppError::Validation(format!(
-            "Virtual repository '{}' requires at least one member. Provide \
-             `member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]` \
-             in the request body. Use `PUT /api/v1/repositories/{}/members` \
-             after creation to update the member list. (#1279)",
+            "Virtual repository '{}' was created with an explicit empty \
+             `member_repos: []`. Provide one or more members \
+             (`member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]`) \
+             at create time, or omit the field entirely and add members \
+             via `POST /api/v1/repositories/{}/members` afterwards. (#1279, #1444)",
             repo_key, repo_key
         )));
     }
@@ -816,10 +836,17 @@ pub async fn list_repositories(
 pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Json(payload): Json<CreateRepositoryRequest>,
+    body: Bytes,
 ) -> Result<Json<RepositoryResponse>> {
+    // #1438 (1b): authenticate BEFORE deserializing the body. The previous
+    // `Json<CreateRepositoryRequest>` extractor ran first and rejected
+    // unauth requests carrying a payload the schema didn't recognize with
+    // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    let payload: CreateRepositoryRequest =
+        serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Fine-grained permission check: non-admins need "admin" on the system sentinel.
     if !auth.is_admin {
@@ -841,11 +868,19 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
-    let format = parse_format(&payload.format)?;
+    // Resolve the format string via the service. The service owns both the
+    // built-in enum mapping and the `format_handlers` fallback for WASM
+    // plugin formats, so the handler keeps no business logic of its own here.
+    // For plugin formats, `plugin_format_key` carries the canonical handler
+    // name and `format` is reported as `Generic`.
+    let service = state.create_repository_service();
+    let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Validate up-front that virtual repos arrive with at least one member.
-    // See `validate_virtual_repo_member_count` for the rationale (#1279).
+    // Validate up-front that virtual repos do not arrive with an explicit
+    // empty `member_repos: []`. Omitted-field (deferred-population) is
+    // accepted so the create-then-add pattern works.
+    // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
     // Resolve storage backend: use the requested one or fall back to the default.
@@ -892,7 +927,6 @@ pub async fn create_repository(
         );
     }
 
-    let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
             key: payload.key,
@@ -905,7 +939,10 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
-            format_key: payload.format_key,
+            // Plugin format key takes precedence over any explicit format_key
+            // in the payload: when a WASM plugin format was resolved above,
+            // `plugin_format_key` carries the canonical handler name.
+            format_key: plugin_format_key.or(payload.format_key),
         })
         .await?;
 
@@ -913,31 +950,36 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
-    // Add virtual repository members. The up-front validation above
-    // guarantees `member_repos` is `Some(non-empty)` whenever
-    // `repo_type == Virtual`, so the empty / None arms are unreachable.
+    // Add virtual repository members. Post-#1444, the validator accepts
+    // `member_repos == None` (deferred-population pattern: caller will
+    // POST /members later) and only rejects `Some(empty_vec)`. Treat the
+    // None arm as a clean no-op here; the Some(non-empty) arm is the
+    // create-with-members path and runs the original loop.
     if repo_type == RepositoryType::Virtual {
-        let member_inputs = payload
-            .member_repos
-            .as_deref()
-            .expect("member_repos non-empty validated above");
-        tracing::info!(
-            repo_key = %repo.key,
-            member_count = member_inputs.len(),
-            "Adding virtual repository members during creation"
-        );
-        for (idx, input) in member_inputs.iter().enumerate() {
-            let member_repo = service.get_by_key(&input.repo_key).await?;
-            let priority = resolve_member_priority(input.priority, idx);
-            tracing::debug!(
-                virtual_repo = %repo.key,
-                member_key = %input.repo_key,
-                priority = priority,
-                "Adding virtual member"
+        if let Some(member_inputs) = payload.member_repos.as_deref() {
+            tracing::info!(
+                repo_key = %repo.key,
+                member_count = member_inputs.len(),
+                "Adding virtual repository members during creation"
             );
-            service
-                .add_virtual_member(repo.id, member_repo.id, Some(priority))
-                .await?;
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = resolve_member_priority(input.priority, idx);
+                tracing::debug!(
+                    virtual_repo = %repo.key,
+                    member_key = %input.repo_key,
+                    priority = priority,
+                    "Adding virtual member"
+                );
+                service
+                    .add_virtual_member(repo.id, member_repo.id, Some(priority))
+                    .await?;
+            }
+        } else {
+            tracing::info!(
+                repo_key = %repo.key,
+                "Virtual repo created with no members; deferring to POST /members (#1444)"
+            );
         }
     }
 
@@ -1517,6 +1559,82 @@ pub async fn list_artifacts(
 /// Extracted from the inline listing loop so it can be unit-tested
 /// without a database. Pure transformation of `Artifact` fields plus
 /// the precomputed download count.
+/// Return the ordered list of paths to try when looking up an artifact
+/// by path under a repo of the given format.
+///
+/// The literal request path is always tried first so non-npm formats
+/// and already-stored paths keep working unchanged. For npm-family
+/// repos a second candidate is appended whenever the request path
+/// matches the canonical npm tarball URL shape
+/// (`<name>/-/<name>-<version>.tgz`); that second candidate is the
+/// version-segmented stored shape produced by `store_npm_version`. See
+/// #1443.
+///
+/// Returned without duplicates: if the literal path is already the
+/// stored shape (or `normalize_lookup_path` returns the same string),
+/// only one DB query runs.
+fn lookup_path_candidates(path: &str, format: &RepositoryFormat) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    if is_npm_family_format(format) {
+        if let Some(normalized) = crate::formats::npm::normalize_lookup_path(path) {
+            if normalized != path {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
+/// npm-family formats share the publish/download path conventions of
+/// the npm registry (`yarn`, `pnpm`, and `bower` all wrap the same
+/// upstream wire format). Keep this in sync with the `format` mapping
+/// in `parse_format` and with the publish handler in
+/// `api::handlers::npm`.
+fn is_npm_family_format(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Npm
+            | RepositoryFormat::Yarn
+            | RepositoryFormat::Bower
+            | RepositoryFormat::Pnpm
+    )
+}
+
+/// Try each candidate path in order, returning the first match. Skips
+/// soft-deleted rows. Used by `get_artifact_metadata` so the npm
+/// lookup-by-URL fallback only costs an extra DB roundtrip on a true
+/// cache miss.
+async fn lookup_artifact_by_paths(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    candidates: &[String],
+) -> Result<Option<crate::models::artifact::Artifact>> {
+    for candidate in candidates {
+        let found = sqlx::query_as!(
+            crate::models::artifact::Artifact,
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM artifacts
+            WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+            "#,
+            repository_id,
+            candidate
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -2167,25 +2285,21 @@ pub async fn get_artifact_metadata(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
-    let artifact = sqlx::query_as!(
-        crate::models::artifact::Artifact,
-        r#"
-        SELECT
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, is_deleted, uploaded_by,
-            quarantine_status, quarantine_until,
-            created_at, updated_at
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        "#,
-        repo.id,
-        path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    // #1443: npm publish stores tarballs under
+    // `<name>/<version>/<name>-<version>.tgz` (see
+    // `api::handlers::npm::store_npm_version`), but external callers
+    // (release-gate smoke test, JFrog/Artifactory-style consumers,
+    // webhook payloads) carry the canonical npm download-URL shape
+    // `<name>/-/<name>-<version>.tgz`. Without translating the request
+    // path, an exact-match lookup against `artifacts.path` never finds
+    // the row. Try the literal path first (so non-npm formats and
+    // already-stored npm paths still work), then fall back to the
+    // normalised stored shape for npm-family repos when the caller
+    // handed us the URL shape.
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    let artifact = lookup_artifact_by_paths(&state.db, repo.id, &candidates)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata = artifact_service.get_metadata(artifact.id).await?;
@@ -6870,19 +6984,37 @@ mod tests {
         }
     }
 
-    /// A virtual repo with no `member_repos` field at all (the shape that
-    /// happens when an operator types `members: [...]` because the struct
-    /// uses `member_repos` and doesn't `deny_unknown_fields`) must 400 with
-    /// an actionable message.
+    /// A virtual repo with no `member_repos` field at all (the deferred-
+    /// population pattern used by every E2E test helper: create, then
+    /// `POST /members`) must be accepted. Pre-#1444 this 400'd, which
+    /// broke the create-then-add flow and surfaced as the "members router
+    /// 404" symptom because the follow-up POSTs targeted a nonexistent
+    /// repo. Empty-virtual state is now surfaced at fetch time instead of
+    /// create time, and self-heals on the first add_member.
     #[test]
-    fn test_validate_virtual_repo_member_count_rejects_none() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None)
-            .expect_err("None members must reject");
+    fn test_validate_virtual_repo_member_count_accepts_none_for_deferred_add() {
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None).is_ok(),
+            "omitted member_repos must be accepted so the create-then-add \
+             flow works (regression of #1444)"
+        );
+    }
+
+    /// A virtual repo created with explicit `member_repos: []` is still a
+    /// clear operator mistake (caller has actively typed "zero members")
+    /// and must 400 with an actionable message. This preserves the #1279
+    /// discoverability win for the case where the operator's intent is
+    /// unambiguous, while the omitted-field case (above) flows through
+    /// to the deferred-add pattern.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_explicit_empty() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
+            .expect_err("explicit empty members must reject");
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("requires at least one member"),
-                    "message should explain the requirement; got: {}",
+                    msg.contains("explicit empty"),
+                    "message should call out the explicit-empty shape; got: {}",
                     msg
                 );
                 assert!(
@@ -6898,16 +7030,6 @@ mod tests {
             }
             other => panic!("expected AppError::Validation, got {:?}", other),
         }
-    }
-
-    /// A virtual repo created with `member_repos: []` is also unusable. The
-    /// validator must reject this with the same Validation error class as
-    /// the None case so the handler returns 400 (not 500) in both shapes.
-    #[test]
-    fn test_validate_virtual_repo_member_count_rejects_empty() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
-            .expect_err("empty members must reject");
-        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A virtual repo with one or more members passes validation. Pin both
@@ -7574,5 +7696,546 @@ mod tests {
                 body.len()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WASM plugin format fallback in create_repository (regression tests)
+    //
+    // Format-string resolution lives in `RepositoryService::resolve_format`
+    // (see `services/repository_service.rs`). These end-to-end tests drive
+    // the HTTP handler so we verify both the resolve path and the wiring of
+    // the resolved `format_key` into the persisted row.
+    // -----------------------------------------------------------------------
+
+    /// Insert a `format_handlers` row for testing.  Returns the `format_key`
+    /// that was inserted.  The caller is responsible for deleting the row
+    /// after the test (use `cleanup_format_handler`).
+    async fn insert_format_handler(pool: &sqlx::PgPool, format_key: &str, is_enabled: bool) {
+        sqlx::query(
+            "INSERT INTO format_handlers \
+             (format_key, handler_type, display_name, is_enabled) \
+             VALUES ($1, 'wasm', $2, $3) \
+             ON CONFLICT (format_key) DO UPDATE \
+             SET is_enabled = EXCLUDED.is_enabled",
+        )
+        .bind(format_key)
+        .bind(format!("Test handler for {}", format_key))
+        .bind(is_enabled)
+        .execute(pool)
+        .await
+        .expect("insert format_handler");
+    }
+
+    async fn cleanup_format_handler(pool: &sqlx::PgPool, format_key: &str) {
+        sqlx::query("DELETE FROM format_handlers WHERE format_key = $1")
+            .bind(format_key)
+            .execute(pool)
+            .await
+            .expect("cleanup format_handler");
+    }
+
+    /// Helper: build an admin `AuthExtension` so the permission gate in
+    /// `create_repository` is bypassed without needing a database permission row.
+    fn admin_auth(user_id: Uuid, username: &str) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Build a `CreateRepositoryRequest` body as raw bytes from a minimal
+    /// JSON object, merging in `overrides` so individual tests only specify
+    /// the fields they care about. Returns bytes (matching the handler's
+    /// post-#1438 signature) so tests don't need to round-trip through the
+    /// `CreateRepositoryRequest` struct, which is `Deserialize`-only.
+    fn make_create_request(
+        key: &str,
+        name: &str,
+        format: &str,
+        overrides: serde_json::Value,
+    ) -> Bytes {
+        let mut base = serde_json::json!({
+            "key": key,
+            "name": name,
+            "format": format,
+            "repo_type": "local"
+        });
+        if let (serde_json::Value::Object(b), serde_json::Value::Object(o)) = (&mut base, overrides)
+        {
+            b.extend(o);
+        }
+        Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
+    }
+
+    /// When a format string is not a built-in variant but there IS an
+    /// **enabled** row in `format_handlers`, `create_repository` must succeed
+    /// and the resulting repository must have `format = Generic` and
+    /// `format_key = <the plugin key>`.
+    #[tokio::test]
+    async fn test_create_repository_with_enabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-wasm-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("wasm-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "WASM plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        let Json(resp) = result.expect("create_repository with enabled plugin format must succeed");
+        assert_eq!(
+            resp.format, "generic",
+            "plugin-backed repo must be stored as Generic format"
+        );
+
+        // Verify the format_key was persisted to the DB (RepositoryResponse does
+        // not expose format_key directly).
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT format_key FROM repositories WHERE key = $1")
+                .bind(&repo_key)
+                .fetch_optional(&pool)
+                .await
+                .expect("query format_key");
+
+        // Cleanup after reading so we don't delete the row before asserting.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(format_key.as_str()),
+            "plugin format key must be persisted to the repositories.format_key column"
+        );
+    }
+
+    /// When the format string maps to a **disabled** `format_handlers` row,
+    /// `create_repository` must return a `Validation` error whose message
+    /// mentions "disabled".
+    #[tokio::test]
+    async fn test_create_repository_with_disabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-disabled-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, false).await;
+
+        let payload = make_create_request(
+            &format!("disabled-repo-{}", Uuid::new_v4().simple()),
+            "Disabled plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("disabled plugin format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
+            "disabled plugin format must produce a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
+    /// When the format string is unknown and has **no** `format_handlers` row
+    /// at all, `create_repository` must return a `Validation` error.
+    #[tokio::test]
+    async fn test_create_repository_with_unknown_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let payload = make_create_request(
+            &format!("unknown-repo-{}", Uuid::new_v4().simple()),
+            "Unknown format repo",
+            // A format string that will never match any built-in or plugin.
+            "totally-unknown-zzz",
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("unknown format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "unknown format must surface as Validation (400), got {err:?}",
+        );
+    }
+
+    /// Build a non-admin `AuthExtension`. Used to confirm that the same
+    /// admin/create-repo gate that protects built-in format creation also
+    /// guards the WASM-plugin codepath. Without this, a plugin-format string
+    /// could be a route around the gate.
+    fn non_admin_auth(
+        user_id: Uuid,
+        username: &str,
+    ) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// A non-admin caller with no `system:admin` permission must receive an
+    /// `Authorization` error even when the requested format is a valid,
+    /// enabled WASM plugin format. The plugin codepath inherits the same
+    /// permission gate as built-in formats; there is no privileged shortcut.
+    #[tokio::test]
+    async fn test_create_repository_plugin_format_rejects_non_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-noadmin-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("noadmin-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Non-admin plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(non_admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        // Cleanup: the request should NOT have created a repo row, but delete
+        // defensively in case the assertion below fails.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("non-admin must be denied even for plugin formats");
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1443 regression: lookup_path_candidates + is_npm_family_format
+    //
+    // npm publish stores tarballs under the version-segmented shape, but
+    // external callers (release-gate smoke test, JFrog-compatible
+    // tooling) supply the canonical npm download-URL shape
+    // (`<name>/-/<name>-<version>.tgz`). `get_artifact_metadata` walks
+    // this list of candidates so the literal request always wins for
+    // formats that don't normalise, and npm-family repos quietly fall
+    // back to the stored path on the second probe.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_path_candidates_npm_url_shape_adds_stored_fallback() {
+        let candidates =
+            lookup_path_candidates("rfs-pkg/-/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "rfs-pkg/-/rfs-pkg-1.0.0.tgz".to_string(),
+                "rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_scoped_url_shape() {
+        let candidates =
+            lookup_path_candidates("@angular/core/-/core-17.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "@angular/core/-/core-17.0.0.tgz".to_string(),
+                "@angular/core/17.0.0/core-17.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_stored_shape_passthrough() {
+        // When the caller already supplies the stored shape,
+        // normalize_lookup_path returns None and we issue exactly one
+        // query against the literal path.
+        let candidates =
+            lookup_path_candidates("rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec!["rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_metadata_path_not_rewritten() {
+        // package.json / packument paths don't end in .tgz so
+        // normalize_lookup_path returns None and only the literal path
+        // is tried.
+        let candidates = lookup_path_candidates("lodash/package.json", &RepositoryFormat::Npm);
+        assert_eq!(candidates, vec!["lodash/package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_non_npm_format_unchanged() {
+        // Maven repos must never have their paths rewritten by the npm
+        // normaliser, even if a path coincidentally matches `/-/` (it
+        // doesn't here, but the guard fires before normalisation
+        // anyway).
+        let candidates =
+            lookup_path_candidates("com/example/lib/1.0/lib-1.0.jar", &RepositoryFormat::Maven);
+        assert_eq!(
+            candidates,
+            vec!["com/example/lib/1.0/lib-1.0.jar".to_string()]
+        );
+
+        // And even a path that looks npm-shaped is left alone outside
+        // npm-family repos.
+        let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &RepositoryFormat::Generic);
+        assert_eq!(candidates, vec!["foo/-/foo-1.0.0.tgz".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_yarn_pnpm_bower_apply_normalisation() {
+        // Yarn, pnpm, and bower all wrap the npm wire format. They
+        // share the publish/download layout so the same normalisation
+        // must fire for them.
+        for fmt in [
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+            RepositoryFormat::Bower,
+        ] {
+            let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &fmt);
+            assert_eq!(
+                candidates,
+                vec![
+                    "foo/-/foo-1.0.0.tgz".to_string(),
+                    "foo/1.0.0/foo-1.0.0.tgz".to_string(),
+                ],
+                "format {fmt:?} must inherit npm path normalisation",
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_npm_family_format_membership() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        // Negative cases: every format outside the npm wire-protocol
+        // family must NOT inherit npm path normalisation.
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Pypi));
+        assert!(!is_npm_family_format(&RepositoryFormat::Docker));
+        assert!(!is_npm_family_format(&RepositoryFormat::Generic));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
+    }
+
+    /// HTTP-level regression test for #1444: GET /:key/members against a
+    /// freshly-created virtual repo (no members yet) must return 2xx, not 404.
+    ///
+    /// This is the load-bearing assertion behind the user-reported "the
+    /// reproducer still fails" comment on #1444. Pre-fix, the chain was:
+    ///   1. test infra POSTs `/api/v1/repositories` for a virtual repo WITHOUT
+    ///      `member_repos` (the standard deferred-population shape).
+    ///   2. #1281's validator 400'd that request, so the virtual was never
+    ///      created.
+    ///   3. The follow-up POST `/repositories/{key}/members` then 404'd because
+    ///      the repo did not exist -- which the release-gate report classified
+    ///      as "the members sub-router is unmounted".
+    ///
+    /// Post-fix, step 1 succeeds with an empty-virtual repo. The /members
+    /// router has always been mounted; this test exercises it via the actual
+    /// axum `Router` (built from `router()`) so a future refactor that DOES
+    /// unmount the route fails this test in addition to the source-text pin
+    /// in `virtual_member_router_registration`.
+    #[tokio::test]
+    async fn test_members_route_returns_2xx_on_freshly_created_empty_virtual_1444() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::extract::{Extension, State};
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir =
+            std::env::temp_dir().join(format!("members-1444-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Step 1: create the virtual repo via the actual `create_repository`
+        // handler with `member_repos` OMITTED -- the deferred-population shape
+        // every E2E test helper uses.
+        let repo_key = format!("v-1444-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Virtual 1444 regression",
+            "generic",
+            serde_json::json!({ "repo_type": "virtual" }),
+        );
+        // Post-#1438 `create_repository` takes `body: Bytes` so auth runs
+        // before body deserialisation. `make_create_request` already returns
+        // `Bytes`; pass it through directly (no `Json(...)` wrapper).
+        let create_result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        // The whole point of #1444 is that this NO LONGER returns 400.
+        let _created = create_result
+            .expect("create_repository must accept virtual repo with member_repos omitted (#1444)");
+
+        // Step 2: drive the actual /members route via axum::Router::oneshot.
+        // We mount `router()` as-is, wrap it in the auth-injection layer the
+        // production router applies, and hit GET /{key}/members.
+        let router = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            admin_auth(user_id, &username),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/members", repo_key))
+            .body(Body::empty())
+            .expect("build GET /members request");
+        let (status, body) = tdh::send(router, req).await;
+
+        // Cleanup before asserting so a panic does not leak DB state.
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id IN \
+                     (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET /:key/members on a freshly-created empty virtual must NOT return \
+             404 (regression of #1444 -- the symptom that the release-gate Full \
+             Suite classified as \"members sub-router unmounted\"); got body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            status.is_success(),
+            "GET /:key/members on a freshly-created empty virtual must return 2xx; \
+             got {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
     }
 }

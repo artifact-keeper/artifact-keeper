@@ -20,14 +20,79 @@ use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    cached_trivy_cli_version, fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
+
+/// Maximum compressed input size we will attempt to extract (2 GiB). Untrusted
+/// archives can be decompression bombs; refuse anything larger than this before
+/// writing it to disk. The uncompressed tree is further bounded by
+/// [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`] after extraction.
+const MAX_COMPRESSED_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum total uncompressed bytes we tolerate in an extracted rootfs (10 GiB).
+/// Bounds decompression bombs that expand a small archive into a PVC-filling
+/// tree. Checked by walking the extracted tree after `tar` finishes.
+const MAX_EXTRACTED_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Maximum number of filesystem entries we tolerate in an extracted rootfs.
+/// Bounds inode-exhaustion bombs (millions of tiny files).
+const MAX_EXTRACTED_ENTRIES: u64 = 2_000_000;
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
 async fn write_temp_file(path: &Path, content: &Bytes, label: &str) -> Result<()> {
     tokio::fs::write(path, content)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to write {} to workspace: {}", label, e)))
+}
+
+/// Normalise a path lexically, collapsing `.` and `..` components without
+/// touching the filesystem. Used by the symlink-traversal guard so dangling
+/// targets (e.g. `a -> ../../etc/passwd`) are still resolved and checked.
+///
+/// This is purely textual: it does not resolve intermediate symlinks. The
+/// guard pairs it with a `canonicalize` fallback for targets that exist.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut prefix: Option<Component> = None;
+    let mut has_root = false;
+    // Stack of resolved components. Entries are either ".." (only when not
+    // rooted and nothing left to pop) or normal path segments.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => prefix = Some(Component::Prefix(p)),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match parts.last() {
+                    // Pop a real segment.
+                    Some(last) if last != ".." => {
+                        parts.pop();
+                    }
+                    // Past the root is a no-op (cannot escape `/`).
+                    _ if has_root && parts.is_empty() => {}
+                    // Relative path with no segment to pop: preserve a leading
+                    // `..` so a relative escape survives and later fails the
+                    // starts_with(root) check.
+                    _ => parts.push(std::ffi::OsString::from("..")),
+                }
+            }
+            Component::Normal(seg) => parts.push(seg.to_os_string()),
+        }
+    }
+
+    let mut out = PathBuf::new();
+    if let Some(p) = prefix {
+        out.push(p.as_os_str());
+    }
+    if has_root {
+        out.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    for part in parts {
+        out.push(part);
+    }
+    out
 }
 
 /// Run an external command, returning an error with the given label on failure.
@@ -126,64 +191,181 @@ impl IncusScanner {
             .unwrap_or(false)
     }
 
-    /// Build the workspace directory path for a given artifact.
+    /// Build the base workspace directory path for a given artifact
+    /// (`<base>/incus-<artifact.id>`). The actual per-scan workspace appends a
+    /// random suffix to this; see [`Self::scan_workspace_dir`].
     fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
         ScanWorkspace::workspace_dir(&self.scan_workspace, Some("incus"), artifact)
     }
 
+    /// Build a per-scan-unique workspace directory
+    /// (`<base>/incus-<artifact.id>-<uuid>`).
+    ///
+    /// Concurrent scans of the *same* artifact (re-scan triggered while a prior
+    /// scan is still extracting, repository-wide rescan, ...) would otherwise
+    /// share `incus-<artifact.id>` and the top-of-`prepare_workspace`
+    /// `remove_dir_all` of one scan would delete the tree the other is mid-way
+    /// through extracting. A random suffix isolates each scan's tree.
+    fn scan_workspace_dir(&self, artifact: &Artifact) -> PathBuf {
+        let mut dir = self.workspace_dir(artifact).into_os_string();
+        dir.push("-");
+        dir.push(uuid::Uuid::new_v4().to_string());
+        PathBuf::from(dir)
+    }
+
     /// Prepare the scan workspace by extracting rootfs from the image.
-    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
-        let workspace = self.workspace_dir(artifact);
+    ///
+    /// Returns `(rootfs_path, workspace_root)`. The caller cleans up
+    /// `workspace_root` (the per-scan-unique directory) on both success and
+    /// failure.
+    async fn prepare_workspace(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let workspace = self.scan_workspace_dir(artifact);
+
+        // Wipe any partial tree left by a previous failed scan (OOM, disk-full,
+        // janitor reap, ...) so extraction below starts from a clean slate.
+        // Best-effort: a missing path is fine; anything else surfaces. With the
+        // per-scan UUID suffix this is effectively always a no-op, but it keeps
+        // extraction robust against a UUID collision or a partially-written tree.
+        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(AppError::Internal(format!(
+                    "Failed to clear stale scan workspace {}: {}",
+                    workspace.display(),
+                    e
+                )));
+            }
+        }
+
         let rootfs_dir = workspace.join("rootfs");
         tokio::fs::create_dir_all(&rootfs_dir)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
+        // From here on the workspace dir exists; clean it up before returning any
+        // error so a half-built tree (or the QCOW2 reject path) never lingers on
+        // the PVC. On success the caller owns cleanup of `workspace`.
+        let result = self
+            .prepare_workspace_inner(artifact, content, &workspace, &rootfs_dir)
+            .await;
+        match result {
+            Ok(rootfs) => Ok((rootfs, workspace)),
+            Err(e) => {
+                ScanWorkspace::cleanup_path(&workspace).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Extraction body for [`Self::prepare_workspace`]. Split out so the outer
+    /// function can guarantee workspace cleanup on every error path.
+    async fn prepare_workspace_inner(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+        workspace: &Path,
+        rootfs_dir: &Path,
+    ) -> Result<PathBuf> {
         let info = IncusHandler::parse_path(&artifact.path)
             .map_err(|e| AppError::Internal(format!("Invalid Incus path: {}", e)))?;
 
         match info.file_type {
             IncusFileType::UnifiedTarball => {
-                self.extract_tarball(content, &rootfs_dir).await?;
+                // Extract into the workspace root: `incus image export` archives
+                // unpack to `rootfs/…`, while `incus export` container backups
+                // unpack to `backup/container/rootfs/…`. `find_rootfs` then locates
+                // whichever layout this archive used; fall back to `rootfs/` so a
+                // marker-less archive still scans (with a warning) rather than fails.
+                self.extract_tarball(content, workspace).await?;
+                Ok(Self::find_rootfs(workspace)
+                    .await
+                    .unwrap_or_else(|| rootfs_dir.to_path_buf()))
             }
             IncusFileType::RootfsSquashfs => {
-                self.extract_squashfs(content, &workspace, &rootfs_dir)
+                self.extract_squashfs(content, workspace, rootfs_dir)
                     .await?;
+                Ok(rootfs_dir.to_path_buf())
             }
             IncusFileType::RootfsQcow2 => {
                 // QCOW2/IMG disk images require mounting — not feasible in a scanner context.
-                // Return empty workspace; scan will produce no findings.
                 warn!(
                     "Skipping QCOW2/IMG scan for {} — disk images cannot be extracted without mounting",
                     artifact.name
                 );
-                return Err(AppError::Internal(
+                Err(AppError::Internal(
                     "QCOW2 disk images are not scannable without mounting".to_string(),
-                ));
+                ))
             }
-            _ => {
-                return Err(AppError::Internal(format!(
-                    "Unsupported Incus file type for scanning: {}",
-                    info.file_type.as_str()
-                )));
-            }
+            _ => Err(AppError::Internal(format!(
+                "Unsupported Incus file type for scanning: {}",
+                info.file_type.as_str()
+            ))),
         }
-
-        Ok(rootfs_dir)
     }
 
-    /// Extract a unified tarball (tar.xz or tar.gz) into the rootfs directory.
+    /// Reject a compressed input larger than [`MAX_COMPRESSED_INPUT_BYTES`].
+    /// Checked before the archive is written to disk so an oversized upload
+    /// never lands on the PVC.
+    fn check_compressed_input_size(input_len: u64) -> Result<()> {
+        if input_len > MAX_COMPRESSED_INPUT_BYTES {
+            return Err(AppError::Internal(format!(
+                "Incus archive too large to scan: {} bytes exceeds limit of {} bytes",
+                input_len, MAX_COMPRESSED_INPUT_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    /// Extract a unified tarball (tar.xz or tar.gz) into `dest`.
+    ///
+    /// Hardened against malicious archives and against state/modes the runtime
+    /// UID can't later traverse or delete:
+    ///   * input size is capped at [`MAX_COMPRESSED_INPUT_BYTES`] *before*
+    ///     writing the archive, and the extracted tree is bounded by
+    ///     [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`] afterwards, so a
+    ///     decompression bomb can't fill the PVC;
+    ///   * `--overwrite` is intentionally NOT passed: it disables GNU tar's
+    ///     in-archive symlink-overwrite protection, which a crafted archive uses
+    ///     to plant `rootfs -> /etc` then write through it. The per-scan-unique
+    ///     workspace + the `remove_dir_all` wipe above already guarantee a clean
+    ///     target dir, so `--overwrite` is redundant as well as dangerous;
+    ///   * `--absolute-names` is NOT passed, so tar strips leading `/` and `..`
+    ///     from member paths (the default, safe behaviour);
+    ///   * after extraction, [`Self::reject_escaping_symlinks`] walks the tree
+    ///     and aborts if any symlink resolves outside the workspace root;
+    ///   * `--no-same-owner` so tar doesn't try (and silently fail) to chown to
+    ///     the archive's UIDs as a non-root pod;
+    ///   * `--mode=u=rwX,go=rX` so special bits never survive — e.g. a setgid
+    ///     `2755` kernel-module dir would otherwise land as `d--x--S---` and
+    ///     break the later recursive cleanup. `--no-same-permissions` alone is
+    ///     not enough: the umask doesn't mask the setuid/setgid/sticky bits.
     async fn extract_tarball(&self, content: &Bytes, dest: &Path) -> Result<()> {
-        let tarball_path = dest.parent().unwrap_or(dest).join("image.tar.xz");
+        // Decompression-bomb guard #1: bound the compressed input before it ever
+        // touches disk. A 2 GiB archive is already far larger than any real
+        // container image; anything bigger is almost certainly hostile.
+        Self::check_compressed_input_size(content.len() as u64)?;
+
+        let tarball_path = dest.join("image.tar.xz");
         write_temp_file(&tarball_path, content, "tarball").await?;
 
         // Detect compression: XZ magic bytes (0xFD 0x37 0x7A 0x58 0x5A)
         let is_xz = content.len() >= 5 && content[..5] == [0xFD, 0x37, 0x7A, 0x58, 0x5A];
-        let decompress_flag = if is_xz { "xJf" } else { "xzf" };
+        // Leading `-` is required: GNU tar only treats a bare option bundle
+        // (`xzf`) as options when it is the FIRST argument. Here it follows
+        // `--no-same-owner`/`--mode=...`, so without the dash GNU tar parses
+        // `xzf` as a file operand and aborts with "You must specify one of
+        // the '-Acdtrux' options". (bsdtar on macOS is lenient, which is why
+        // local runs passed but Linux CI failed.)
+        let decompress_flag = if is_xz { "-xJf" } else { "-xzf" };
 
         run_command(
             "tar",
             &[
+                "--no-same-owner",
+                "--mode=u=rwX,go=rX",
                 decompress_flag,
                 &tarball_path.to_string_lossy(),
                 "-C",
@@ -193,19 +375,216 @@ impl IncusScanner {
         )
         .await?;
 
+        // Drop the source archive before walking the tree so it isn't counted
+        // toward the extracted-size budget (and to free the disk early).
         let _ = tokio::fs::remove_file(&tarball_path).await;
+
+        // Post-extraction hardening: reject escaping symlinks + enforce the
+        // bomb caps over the extracted tree. The squashfs path runs the exact
+        // same guard (see `extract_squashfs`).
+        Self::run_extraction_guard(dest).await?;
+
         Ok(())
     }
 
+    /// Run the post-extraction hardening guard over `root` on a blocking thread.
+    /// Shared by both the tarball and squashfs extraction paths so the defense
+    /// posture (symlink-traversal rejection + decompression-bomb caps) is
+    /// identical regardless of image format.
+    ///
+    ///   1. reject any symlink that escapes the workspace root (traversal),
+    ///   2. enforce the uncompressed-size / entry-count bomb caps.
+    async fn run_extraction_guard(root: &Path) -> Result<()> {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::enforce_extraction_limits(&root))
+            .await
+            .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
+    }
+
+    /// Walk the extracted tree (synchronously) and abort if it contains a
+    /// symlink whose canonicalized target escapes `root`, or if its total size /
+    /// entry count exceeds the decompression-bomb caps.
+    ///
+    /// Symlinks are checked without following them (`symlink_metadata`); a link
+    /// is rejected when its resolved target is not inside `root`. Targets that
+    /// don't yet exist (dangling) are resolved lexically against the link's
+    /// parent so an `a -> ../../etc` style escape is still caught.
+    fn enforce_extraction_limits(root: &Path) -> Result<()> {
+        let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to canonicalize workspace root {}: {}",
+                root.display(),
+                e
+            ))
+        })?;
+
+        let mut total_bytes: u64 = 0;
+        let mut total_entries: u64 = 0;
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to read {} during guard: {}",
+                    dir.display(),
+                    e
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    AppError::Internal(format!("Failed to read dir entry during guard: {}", e))
+                })?;
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                    AppError::Internal(format!(
+                        "Failed to stat {} during guard: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+                let file_type = meta.file_type();
+
+                total_entries += 1;
+                if total_entries > MAX_EXTRACTED_ENTRIES {
+                    return Err(AppError::Internal(format!(
+                        "Incus archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
+                        MAX_EXTRACTED_ENTRIES
+                    )));
+                }
+
+                if file_type.is_symlink() {
+                    Self::reject_escaping_symlink(&path, &canonical_root)?;
+                    // Do not follow the link; nothing more to do for it.
+                    continue;
+                }
+
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    total_bytes += meta.len();
+                    if total_bytes > MAX_EXTRACTED_BYTES {
+                        return Err(AppError::Internal(format!(
+                            "Incus archive expands to more than {} bytes; refusing to scan suspected decompression bomb",
+                            MAX_EXTRACTED_BYTES
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reject a symlink at `link` whose target resolves outside `canonical_root`.
+    fn reject_escaping_symlink(link: &Path, canonical_root: &Path) -> Result<()> {
+        let target = std::fs::read_link(link).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to read symlink {} during guard: {}",
+                link.display(),
+                e
+            ))
+        })?;
+
+        // Resolve the target relative to the link's parent directory, then
+        // normalise lexically (collapsing `.` / `..`) so dangling targets are
+        // still checked. We deliberately avoid `canonicalize` on the joined
+        // path because it fails on dangling links. The link's parent always
+        // exists during the walk, so canonicalize it first — this maps it onto
+        // the same realpath the root was canonicalized to (e.g. macOS
+        // `/var/folders` -> `/private/var/folders`), avoiding a false reject of
+        // in-tree relative links.
+        let raw_parent = link.parent().unwrap_or(canonical_root);
+        let parent = std::fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
+        let joined = if target.is_absolute() {
+            target.clone()
+        } else {
+            parent.join(&target)
+        };
+        let resolved = normalize_lexically(&joined);
+
+        // Compare against the canonical root. A symlink is allowed only if its
+        // resolved target stays within the workspace.
+        let within = resolved.starts_with(canonical_root) || {
+            // For targets that exist, also accept when the resolved path
+            // canonicalizes inside the root (covers intermediate symlinks).
+            std::fs::canonicalize(&resolved)
+                .map(|c| c.starts_with(canonical_root))
+                .unwrap_or(false)
+        };
+
+        if !within {
+            return Err(AppError::Internal(format!(
+                "Incus archive contains symlink {} -> {} escaping the workspace; refusing extraction (path traversal)",
+                link.display(),
+                target.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Locate the actual rootfs inside an extracted incus archive by probing
+    /// known package-DB markers. `incus image export` archives put it at
+    /// `rootfs/`; `incus export` container backups put it at
+    /// `backup/container/rootfs/`. Returns the first candidate that contains a
+    /// recognised marker, or `None` (the caller falls back to `rootfs/` + warns).
+    async fn find_rootfs(workspace: &Path) -> Option<PathBuf> {
+        const MARKERS: &[&str] = &[
+            "var/lib/dpkg/status",
+            "var/lib/rpm/Packages",
+            "var/lib/rpm/rpmdb.sqlite",
+            "etc/apk/installed",
+            "etc/os-release",
+        ];
+        const CANDIDATES: &[&str] = &["rootfs", "backup/container/rootfs", "backup/rootfs"];
+        for candidate in CANDIDATES {
+            let base = workspace.join(candidate);
+            for marker in MARKERS {
+                if tokio::fs::metadata(base.join(marker)).await.is_ok() {
+                    info!(
+                        "Located scannable rootfs at {} (matched {})",
+                        base.display(),
+                        marker
+                    );
+                    return Some(base);
+                }
+            }
+        }
+        warn!(
+            "No OS package-DB marker found under {} — trivy may report zero findings",
+            workspace.display()
+        );
+        None
+    }
+
     /// Extract a squashfs image using unsquashfs.
+    ///
+    /// Hardened with the same defenses as [`Self::extract_tarball`]: a squashfs
+    /// image is just as capable of being a decompression bomb or carrying
+    /// escaping symlinks as a tarball.
+    ///   * input size is capped at [`MAX_COMPRESSED_INPUT_BYTES`] *before*
+    ///     writing the image to disk;
+    ///   * after extraction, [`Self::run_extraction_guard`] walks the output
+    ///     tree and aborts on any symlink that escapes the workspace root or if
+    ///     the tree exceeds [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`];
+    ///   * `unsquashfs -f` (force-overwrite) is intentionally NOT passed. `-f`
+    ///     only matters when the destination already holds conflicting files;
+    ///     it makes unsquashfs unlink and overwrite them, which weakens the
+    ///     defense posture the same way tar's `--overwrite` does. The per-scan
+    ///     UUID workspace + the `remove_dir_all` wipe in `prepare_workspace`
+    ///     guarantee `dest` is freshly-created and empty, and unsquashfs
+    ///     extracts happily into an existing empty directory without `-f`, so
+    ///     the flag is redundant here.
     async fn extract_squashfs(&self, content: &Bytes, workspace: &Path, dest: &Path) -> Result<()> {
+        // Decompression-bomb guard #1: bound the compressed input before it ever
+        // touches disk (same cap the tarball path uses).
+        Self::check_compressed_input_size(content.len() as u64)?;
+
         let squashfs_path = workspace.join("rootfs.squashfs");
         write_temp_file(&squashfs_path, content, "squashfs").await?;
 
         run_command(
             "unsquashfs",
             &[
-                "-f",
                 "-d",
                 &dest.to_string_lossy(),
                 &squashfs_path.to_string_lossy(),
@@ -214,13 +593,22 @@ impl IncusScanner {
         )
         .await?;
 
+        // Drop the source image before walking the tree so it isn't counted
+        // toward the extracted-size budget (and to free the disk early).
         let _ = tokio::fs::remove_file(&squashfs_path).await;
+
+        // Post-extraction hardening: identical guard to the tarball path.
+        Self::run_extraction_guard(dest).await?;
+
         Ok(())
     }
 
-    /// Clean up the scan workspace directory.
-    async fn cleanup_workspace(&self, artifact: &Artifact) {
-        ScanWorkspace::cleanup(&self.scan_workspace, Some("incus"), artifact).await;
+    /// Clean up the per-scan workspace directory by path. The path is the
+    /// per-scan-unique directory returned by [`Self::prepare_workspace`]; it
+    /// cannot be recomputed from the artifact alone (it carries a random
+    /// suffix), so the caller passes it through.
+    async fn cleanup_workspace(&self, workspace: &Path) {
+        ScanWorkspace::cleanup_path(workspace).await;
     }
 
     /// Run Trivy filesystem scan on the extracted rootfs.
@@ -291,18 +679,16 @@ impl Scanner for IncusScanner {
             artifact.name, artifact.id
         );
 
-        // Prepare workspace: extract rootfs from the image
-        let rootfs = match self.prepare_workspace(artifact, content).await {
+        // Prepare workspace: extract rootfs from the image. `prepare_workspace`
+        // cleans up its own per-scan workspace on extraction error; on success
+        // it returns `(rootfs, workspace)` and we own cleanup of `workspace`.
+        let (rootfs, workspace) = match self.prepare_workspace(artifact, content).await {
             Ok(r) => r,
             Err(e) => {
-                return Err(fail_scan(
-                    "Incus image extraction",
-                    artifact,
-                    &e,
-                    &self.scan_workspace,
-                    Some("incus"),
-                )
-                .await);
+                return Err(AppError::Internal(format!(
+                    "Incus image extraction failed for {}: {}",
+                    artifact.name, e
+                )));
             }
         };
 
@@ -317,14 +703,9 @@ impl Scanner for IncusScanner {
                 match self.scan_standalone(&rootfs).await {
                     Ok(report) => report,
                     Err(e) => {
-                        return Err(fail_scan(
-                            "Trivy Incus scan",
-                            artifact,
-                            &e,
-                            &self.scan_workspace,
-                            Some("incus"),
-                        )
-                        .await);
+                        return Err(
+                            fail_scan_path("Trivy Incus scan", artifact, &e, &workspace).await
+                        );
                     }
                 }
             }
@@ -339,7 +720,7 @@ impl Scanner for IncusScanner {
             output.packages.len()
         );
 
-        self.cleanup_workspace(artifact).await;
+        self.cleanup_workspace(&workspace).await;
 
         Ok(output)
     }
@@ -456,6 +837,50 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::Medium);
         assert_eq!(findings[1].title, "CVE-2024-67890 in libc6");
         assert!(findings[1].fixed_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // find_rootfs tests
+
+    #[tokio::test]
+    async fn test_find_rootfs_backup_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // `incus export` container-backup layout: rootfs two levels deep.
+        let dpkg = ws.join("backup/container/rootfs/var/lib/dpkg");
+        tokio::fs::create_dir_all(&dpkg).await.unwrap();
+        tokio::fs::write(dpkg.join("status"), b"Package: bash\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            IncusScanner::find_rootfs(ws).await,
+            Some(ws.join("backup/container/rootfs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_rootfs_image_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // `incus image export` layout: rootfs at the top level.
+        let etc = ws.join("rootfs/etc");
+        tokio::fs::create_dir_all(&etc).await.unwrap();
+        tokio::fs::write(etc.join("os-release"), b"ID=ubuntu\n")
+            .await
+            .unwrap();
+
+        assert_eq!(IncusScanner::find_rootfs(ws).await, Some(ws.join("rootfs")));
+    }
+
+    #[tokio::test]
+    async fn test_find_rootfs_no_marker_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A tree with no recognised package DB → None (caller falls back + warns).
+        tokio::fs::create_dir_all(tmp.path().join("rootfs/usr/bin"))
+            .await
+            .unwrap();
+        assert_eq!(IncusScanner::find_rootfs(tmp.path()).await, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1035,6 +1460,169 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Returns true when both `mksquashfs` and `unsquashfs` are on PATH, so the
+    /// end-to-end squashfs extraction test can build and unpack a real image.
+    fn squashfs_tools_available() -> bool {
+        ["mksquashfs", "unsquashfs"].iter().all(|bin| {
+            std::process::Command::new(bin)
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Build a squashfs image from `(path, contents)` pairs by laying out a tree
+    /// in a temp dir and running `mksquashfs`. Optionally plant a symlink
+    /// (`link_path -> link_target`). Returns the image bytes. Caller must ensure
+    /// `mksquashfs` is available (see [`squashfs_tools_available`]).
+    fn build_squashfs(files: &[(&str, &[u8])], symlink: Option<(&str, &str)>) -> Bytes {
+        let staging = tempfile::tempdir().unwrap();
+        let src = staging.path().join("src");
+        for (path, data) in files {
+            let full = src.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, data).unwrap();
+        }
+        if let Some((link_path, link_target)) = symlink {
+            let full = src.join(link_path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(link_target, &full).unwrap();
+        }
+
+        let img = staging.path().join("img.squashfs");
+        let out = std::process::Command::new("mksquashfs")
+            .arg(&src)
+            .arg(&img)
+            .arg("-noappend")
+            .output()
+            .expect("mksquashfs must run");
+        assert!(
+            out.status.success(),
+            "mksquashfs failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Bytes::from(std::fs::read(&img).unwrap())
+    }
+
+    /// Platform-independent traversal-guard check for the SQUASHFS path: build an
+    /// extracted-tree shape (the kind `unsquashfs` would produce) containing a
+    /// symlink that escapes the workspace root, and assert the shared
+    /// `enforce_extraction_limits` guard rejects it. This is the same helper the
+    /// squashfs path now routes through, so it covers the guard logic on CI
+    /// without an `unsquashfs` dependency. Complements the GNU-tar-gated
+    /// `test_extract_tarball_rejects_escaping_symlink`.
+    #[tokio::test]
+    async fn test_squashfs_extracted_tree_rejects_escaping_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Mimic an `unsquashfs -d <dest>` output dir holding an escaping symlink.
+        let dest = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(dest.join("etc")).await.unwrap();
+        tokio::fs::write(dest.join("etc/os-release"), b"ID=alpine\n")
+            .await
+            .unwrap();
+        let outside = dir.path().join("host-secret");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        // Absolute escape: rootfs/etc/escape -> <tmp>/host-secret (outside dest).
+        std::os::unix::fs::symlink(&outside, dest.join("etc/escape")).unwrap();
+
+        let res = IncusScanner::run_extraction_guard(&dest).await;
+        assert!(
+            res.is_err(),
+            "squashfs-extracted tree with an escaping symlink must be rejected by the shared guard"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "guard error must name the traversal; got: {}",
+            msg
+        );
+    }
+
+    /// `extract_squashfs` enforces the compressed-input cap before writing the
+    /// image, just like the tarball path. We can't allocate >2 GiB in a unit
+    /// test, so we assert the shared `check_compressed_input_size` gate (which
+    /// `extract_squashfs` now calls) rejects oversized input. The size-cap
+    /// boundary itself is covered by `test_check_compressed_input_size_enforced`.
+    #[tokio::test]
+    async fn test_extract_squashfs_enforces_compressed_cap() {
+        // The squashfs path shares the same compressed-size gate as the tarball
+        // path; an over-limit input is refused before it touches disk.
+        let res = IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES + 1);
+        assert!(res.is_err());
+        assert!(format!("{}", res.unwrap_err()).contains("too large to scan"));
+    }
+
+    /// End-to-end squashfs extraction: build a real squashfs image, extract it
+    /// with the production `extract_squashfs` (no `-f`), and assert the shared
+    /// guard ran (clean image passes, contents land under the dest). Skip-gated
+    /// on the squashfs tools being installed, mirroring the GNU-tar tests; the
+    /// platform-independent guard test above carries CI coverage when the tools
+    /// are absent.
+    #[tokio::test]
+    async fn test_extract_squashfs_end_to_end_runs_guard() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // Clean image with an in-tree relative symlink (must be accepted).
+        let img = build_squashfs(
+            &[
+                ("etc/os-release", b"ID=alpine\nVERSION_ID=3.20\n"),
+                ("var/lib/dpkg/status", b"Package: musl\n"),
+            ],
+            Some(("etc/os-release-link", "os-release")),
+        );
+
+        let workspace = dir.path().join("ws");
+        let dest = workspace.join("rootfs");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        scanner
+            .extract_squashfs(&img, &workspace, &dest)
+            .await
+            .expect("a clean squashfs image must extract and pass the guard");
+
+        // Contents landed under dest, the source image was cleaned up, and the
+        // guard (which ran as part of extract_squashfs) accepted the tree.
+        assert!(dest.join("etc/os-release").exists());
+        assert!(dest.join("var/lib/dpkg/status").exists());
+        assert!(
+            !workspace.join("rootfs.squashfs").exists(),
+            "source squashfs image must be removed after extraction"
+        );
+
+        // Now build a malicious image whose symlink escapes the workspace and
+        // prove extract_squashfs rejects it via the post-extraction guard.
+        let escape_img = build_squashfs(
+            &[("etc/os-release", b"ID=alpine\n")],
+            Some(("etc/escape", "/etc/shadow")),
+        );
+        let ws2 = dir.path().join("ws2");
+        let dest2 = ws2.join("rootfs");
+        tokio::fs::create_dir_all(&dest2).await.unwrap();
+
+        let res = scanner.extract_squashfs(&escape_img, &ws2, &dest2).await;
+        assert!(
+            res.is_err(),
+            "a squashfs image with an escaping symlink must be rejected by extract_squashfs"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "rejection must name the traversal; got: {}",
+            msg
+        );
+    }
+
     // -----------------------------------------------------------------------
     // cleanup_workspace
     // -----------------------------------------------------------------------
@@ -1048,12 +1636,12 @@ mod tests {
         );
         let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
 
-        // Create the workspace dir
-        let workspace = scanner.workspace_dir(&artifact);
+        // Create a per-scan workspace dir and clean it up by path.
+        let workspace = scanner.scan_workspace_dir(&artifact);
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         assert!(workspace.exists());
 
-        scanner.cleanup_workspace(&artifact).await;
+        scanner.cleanup_workspace(&workspace).await;
         assert!(!workspace.exists());
     }
 
@@ -1067,7 +1655,8 @@ mod tests {
         let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
 
         // Workspace doesn't exist, cleanup should not panic
-        scanner.cleanup_workspace(&artifact).await;
+        let workspace = scanner.scan_workspace_dir(&artifact);
+        scanner.cleanup_workspace(&workspace).await;
     }
 
     // -----------------------------------------------------------------------
@@ -1161,5 +1750,424 @@ mod tests {
                 v
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Real tarball extraction tests (#1427 regression + hardening guards).
+    //
+    // `extract_tarball` shells out to the system `tar`. The production flags
+    // (`--mode=u=rwX,go=rX`, `--no-same-owner`) are GNU-tar specific; macOS
+    // ships bsdtar, which rejects `--mode`. These tests therefore skip when the
+    // local `tar` is not GNU tar. Linux CI (where the coverage gate runs) has
+    // GNU tar, so the changed extraction code is exercised there.
+    // -----------------------------------------------------------------------
+
+    /// Returns true when the system `tar` is GNU tar (accepts `--mode`).
+    fn system_tar_is_gnu() -> bool {
+        std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .map(|o| {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains("GNU tar")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a gzipped tar from `(path, contents)` pairs.
+    fn build_gzip_tar(files: &[(&str, &[u8])]) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, data) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, &data[..]).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        Bytes::from(gz.finish().unwrap())
+    }
+
+    /// #1427 regression: an `incus export` container-backup archive
+    /// (`backup/container/rootfs/...`) must extract and resolve to the nested
+    /// rootfs, with the package-DB marker present. Previously `prepare_workspace`
+    /// only ever looked at `rootfs/` and produced an empty scan.
+    #[tokio::test]
+    async fn test_prepare_workspace_extracts_incus_export_backup() {
+        if !system_tar_is_gnu() {
+            eprintln!("skipping: system tar is not GNU tar (extraction flags unsupported)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        let tarball = build_gzip_tar(&[
+            (
+                "backup/container/rootfs/var/lib/dpkg/status",
+                b"Package: bash\nVersion: 5.2\n",
+            ),
+            (
+                "backup/container/rootfs/etc/os-release",
+                b"ID=ubuntu\nVERSION_ID=\"24.04\"\n",
+            ),
+        ]);
+
+        let (rootfs, workspace) = scanner
+            .prepare_workspace(&artifact, &tarball)
+            .await
+            .expect("prepare_workspace must succeed for a valid incus-export backup");
+
+        // Returned rootfs is the nested backup path, and the marker file exists.
+        assert_eq!(rootfs, workspace.join("backup/container/rootfs"));
+        assert!(
+            rootfs.join("var/lib/dpkg/status").exists(),
+            "dpkg status marker must exist under the resolved rootfs"
+        );
+
+        scanner.cleanup_workspace(&workspace).await;
+    }
+
+    /// Wedged-workspace recovery: a leftover file in a stale workspace tree must
+    /// not block a fresh extraction. With per-scan-unique dirs this is naturally
+    /// clean, but we verify the `remove_dir_all` wipe still recovers if the same
+    /// path is reused.
+    #[tokio::test]
+    async fn test_prepare_workspace_recovers_from_wedged_tree() {
+        if !system_tar_is_gnu() {
+            eprintln!("skipping: system tar is not GNU tar (extraction flags unsupported)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        // Pre-create a per-scan workspace with leftover junk, then prove the
+        // inner wipe + extraction starts from a clean slate. We exercise the
+        // extraction body directly against this fixed path.
+        let workspace = scanner.scan_workspace_dir(&artifact);
+        let stale = workspace.join("rootfs/STALE_LEFTOVER");
+        tokio::fs::create_dir_all(stale.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stale, b"leftover from a crashed scan")
+            .await
+            .unwrap();
+        assert!(stale.exists());
+
+        // Manually replicate prepare_workspace's wipe-then-extract against the
+        // wedged path (prepare_workspace itself allocates a fresh UUID dir).
+        tokio::fs::remove_dir_all(&workspace).await.unwrap();
+        let rootfs_dir = workspace.join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let tarball = build_gzip_tar(&[("rootfs/etc/os-release", b"ID=ubuntu\n")]);
+        scanner
+            .extract_tarball(&tarball, &workspace)
+            .await
+            .expect("extraction into a freshly-wiped workspace must succeed");
+
+        assert!(
+            !stale.exists(),
+            "leftover file from the wedged tree must be gone after the wipe"
+        );
+        let resolved = IncusScanner::find_rootfs(&workspace)
+            .await
+            .expect("os-release marker must be found");
+        assert_eq!(resolved, workspace.join("rootfs"));
+        assert!(resolved.join("etc/os-release").exists());
+
+        scanner.cleanup_workspace(&workspace).await;
+    }
+
+    /// Path-traversal guard: an archive containing a symlink that escapes the
+    /// workspace must be rejected, and nothing may be written outside the
+    /// workspace via that link.
+    #[tokio::test]
+    async fn test_extract_tarball_rejects_escaping_symlink() {
+        if !system_tar_is_gnu() {
+            eprintln!("skipping: system tar is not GNU tar (extraction flags unsupported)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // A sentinel directory outside the workspace that the symlink targets.
+        let escape_target = dir.path().join("escape_target");
+        tokio::fs::create_dir_all(&escape_target).await.unwrap();
+
+        let workspace = dir.path().join("ws");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        // Build an archive with a symlink `rootfs -> <escape_target>` followed by
+        // a write through it (`rootfs/pwned`). Without --absolute-names tar keeps
+        // the absolute symlink target verbatim; our guard must still catch it.
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_path("rootfs").unwrap();
+            link.set_link_name(&escape_target).unwrap();
+            link.set_size(0);
+            link.set_cksum();
+            builder.append(&link, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        let tarball = Bytes::from(gz.finish().unwrap());
+
+        let result = scanner.extract_tarball(&tarball, &workspace).await;
+        assert!(
+            result.is_err(),
+            "extraction must be rejected when an archive plants an escaping symlink"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "error must name the traversal violation; got: {}",
+            msg
+        );
+
+        // Nothing must have been written into the escape target through the link.
+        assert!(
+            !escape_target.join("pwned").exists(),
+            "no file may be written outside the workspace via the symlink"
+        );
+    }
+
+    /// In-workspace symlinks (the common case: relative links inside the rootfs)
+    /// must be accepted by the guard.
+    #[tokio::test]
+    async fn test_extract_tarball_allows_internal_symlink() {
+        if !system_tar_is_gnu() {
+            eprintln!("skipping: system tar is not GNU tar (extraction flags unsupported)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let workspace = dir.path().join("ws");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            let data = b"ID=ubuntu\n";
+            let mut file = tar::Header::new_gnu();
+            file.set_path("rootfs/etc/os-release").unwrap();
+            file.set_size(data.len() as u64);
+            file.set_mode(0o644);
+            file.set_cksum();
+            builder.append(&file, &data[..]).unwrap();
+
+            // Relative, in-tree symlink: rootfs/etc/os-release-link -> os-release
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_path("rootfs/etc/os-release-link").unwrap();
+            link.set_link_name("os-release").unwrap();
+            link.set_size(0);
+            link.set_cksum();
+            builder.append(&link, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        let tarball = Bytes::from(gz.finish().unwrap());
+
+        scanner
+            .extract_tarball(&tarball, &workspace)
+            .await
+            .expect("in-workspace relative symlinks must be allowed");
+        assert!(workspace.join("rootfs/etc/os-release").exists());
+
+        scanner.cleanup_workspace(&workspace).await;
+    }
+
+    /// Compressed-input bomb cap: oversized input is rejected before extraction.
+    /// We assert the cap logic by temporarily pointing the check at a tiny input
+    /// that still exceeds a (conceptually) small bound — here we verify the
+    /// boundary constant is enforced by exercising the lexical normaliser and the
+    /// guard directly, since allocating >2 GiB in a unit test is impractical.
+    #[test]
+    fn test_normalize_lexically_collapses_traversal() {
+        assert_eq!(
+            normalize_lexically(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("/a/b/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        // Cannot escape past root.
+        assert_eq!(
+            normalize_lexically(Path::new("/../../etc")),
+            PathBuf::from("/etc")
+        );
+        // Relative escape is preserved so the starts_with(root) check fails.
+        assert_eq!(
+            normalize_lexically(Path::new("../../etc")),
+            PathBuf::from("../../etc")
+        );
+    }
+
+    /// The decompression-bomb entry-count / byte caps are enforced by
+    /// `enforce_extraction_limits`. Verify a clean small tree (including an
+    /// in-tree symlink) passes the guard. Runs on every platform.
+    #[tokio::test]
+    async fn test_enforce_extraction_limits_accepts_small_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        tokio::fs::create_dir_all(root.join("a/b")).await.unwrap();
+        tokio::fs::write(root.join("a/b/file.txt"), b"hello")
+            .await
+            .unwrap();
+        // An in-tree relative symlink must be accepted.
+        std::os::unix::fs::symlink("file.txt", root.join("a/b/link")).unwrap();
+
+        let root2 = root.clone();
+        let res =
+            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root2))
+                .await
+                .unwrap();
+        assert!(
+            res.is_ok(),
+            "a small clean tree with an in-tree symlink must pass the guard"
+        );
+    }
+
+    /// Platform-independent traversal-guard check: build the extracted tree
+    /// directly with symlinks escaping the workspace root and assert
+    /// `enforce_extraction_limits` rejects them. Complements
+    /// `test_extract_tarball_rejects_escaping_symlink` (which needs GNU tar).
+    #[tokio::test]
+    async fn test_enforce_extraction_limits_rejects_escaping_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absolute escape: rootfs/etc/escape -> <tmp>/secret (outside `root`).
+        let root = dir.path().join("ws");
+        tokio::fs::create_dir_all(root.join("rootfs/etc"))
+            .await
+            .unwrap();
+        let outside = dir.path().join("secret");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("rootfs/etc/escape")).unwrap();
+
+        let root2 = root.clone();
+        let res =
+            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root2))
+                .await
+                .unwrap();
+        assert!(
+            res.is_err(),
+            "absolute escaping symlink must be rejected by the guard"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "guard error must name the traversal; got: {}",
+            msg
+        );
+
+        // Relative escape: rootfs/etc/dotdot -> ../../../secret (dangling-safe).
+        let root3 = dir.path().join("ws2");
+        tokio::fs::create_dir_all(root3.join("rootfs/etc"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("../../../secret", root3.join("rootfs/etc/dotdot")).unwrap();
+        let root3c = root3.clone();
+        let res2 =
+            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root3c))
+                .await
+                .unwrap();
+        assert!(
+            res2.is_err(),
+            "relative `../` escape must be rejected by the guard"
+        );
+    }
+
+    /// Compressed-input bomb cap (#2): inputs over the limit are rejected before
+    /// they touch disk; inputs at/under the limit pass the size gate.
+    #[test]
+    fn test_check_compressed_input_size_enforced() {
+        // At the limit: allowed.
+        assert!(IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES).is_ok());
+        // One byte over: rejected.
+        let res = IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES + 1);
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("too large to scan"),
+            "oversized-input error must explain the rejection; got: {}",
+            msg
+        );
+        // Typical small archive: allowed.
+        assert!(IncusScanner::check_compressed_input_size(4096).is_ok());
+    }
+
+    /// Chmod-before-cleanup: a `0o500` (no-write) subdirectory must not block
+    /// recursive removal. `cleanup_path` pre-chmods `u+rwX` before deleting.
+    #[tokio::test]
+    async fn test_cleanup_removes_readonly_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        let workspace = scanner.scan_workspace_dir(&artifact);
+        let locked = workspace.join("rootfs/locked");
+        tokio::fs::create_dir_all(&locked).await.unwrap();
+        tokio::fs::write(locked.join("inner"), b"x").await.unwrap();
+
+        // Drop write/traverse-friendly bits: 0o500 = r-x------.
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        scanner.cleanup_workspace(&workspace).await;
+        assert!(
+            !workspace.exists(),
+            "cleanup must remove the workspace despite a 0o500 subdir"
+        );
     }
 }

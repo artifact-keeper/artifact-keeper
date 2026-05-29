@@ -271,6 +271,75 @@ pub(crate) fn package_name_from_tarball_path(path: &str) -> Option<String> {
     None
 }
 
+/// Translate the canonical npm tarball URL path that clients ask for
+/// (`<name>/-/<name>-<version>.tgz` or `@<scope>/<name>/-/<name>-<version>.tgz`)
+/// into the stored DB path used by `store_npm_version` in the publish
+/// handler (`<name>/<version>/<name>-<version>.tgz` or
+/// `@<scope>/<name>/<version>/<name>-<version>.tgz`).
+///
+/// Returns `None` if the input does not match the npm tarball URL shape
+/// (so a lookup against a path that is already stored verbatim, eg. a
+/// `package.json` metadata path or a raw artifact upload, is left
+/// untouched).
+///
+/// This is the inverse of the path written by
+/// `api::handlers::npm::store_npm_version`, where the on-disk layout
+/// embeds the version segment for de-duplication. The npm download
+/// router converts `<name>/<version>/<filename>` back to
+/// `<name>/-/<filename>` for tarball URLs, so any external caller that
+/// has only the URL form (the management API's lookup-by-path endpoint,
+/// the artifact-metadata GET, the release-gate smoke test) needs the
+/// same normalisation to round-trip. See #1443.
+#[must_use]
+pub fn normalize_lookup_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    let last = parts.last().copied().unwrap_or("");
+
+    // The trailing segment must look like a tarball. Anything else (eg.
+    // `<name>/package.json`, a bare metadata path, an arbitrary raw
+    // upload) is stored under its literal path and must not be
+    // rewritten.
+    if last.is_empty() || !last.to_ascii_lowercase().ends_with(".tgz") {
+        return None;
+    }
+
+    // Scoped: ["@scope", "name", "-", "<file>.tgz"]
+    if parts.len() == 4 && parts[0].starts_with('@') && parts[2] == "-" {
+        let scope = parts[0];
+        let name = parts[1];
+        let filename = parts[3];
+        let version = version_from_tarball_filename(filename, name)?;
+        return Some(format!("{}/{}/{}/{}", scope, name, version, filename));
+    }
+
+    // Unscoped: ["name", "-", "<file>.tgz"]
+    if parts.len() == 3 && parts[1] == "-" {
+        let name = parts[0];
+        let filename = parts[2];
+        let version = version_from_tarball_filename(filename, name)?;
+        return Some(format!("{}/{}/{}", name, version, filename));
+    }
+
+    None
+}
+
+/// Extract `<version>` from `<name>-<version>.tgz`. Returns `None` when
+/// the prefix or suffix don't match so the caller can fall back to the
+/// raw path instead of guessing.
+fn version_from_tarball_filename(filename: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}-", name);
+    let suffix = ".tgz";
+    if !filename.starts_with(&prefix) || !filename.ends_with(suffix) {
+        return None;
+    }
+    let version = &filename[prefix.len()..filename.len() - suffix.len()];
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
+}
+
 #[async_trait]
 impl FormatHandler for NpmHandler {
     fn format(&self) -> RepositoryFormat {
@@ -994,5 +1063,90 @@ mod tests {
             package_name_from_tarball_path("l\u{043e}dash/-/lodash-4.17.21.tgz"),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1443: normalize_lookup_path round-trips the npm tarball URL shape
+    // (<name>/-/<name>-<ver>.tgz) into the stored DB path shape that the
+    // publish handler writes (<name>/<ver>/<name>-<ver>.tgz).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_lookup_path_unscoped_tarball() {
+        assert_eq!(
+            normalize_lookup_path("lodash/-/lodash-4.17.21.tgz"),
+            Some("lodash/4.17.21/lodash-4.17.21.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_scoped_tarball() {
+        assert_eq!(
+            normalize_lookup_path("@angular/core/-/core-17.0.0.tgz"),
+            Some("@angular/core/17.0.0/core-17.0.0.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_strips_leading_slash() {
+        assert_eq!(
+            normalize_lookup_path("/lodash/-/lodash-4.17.21.tgz"),
+            Some("lodash/4.17.21/lodash-4.17.21.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_prerelease_version() {
+        assert_eq!(
+            normalize_lookup_path("foo/-/foo-1.0.0-rc.1.tgz"),
+            Some("foo/1.0.0-rc.1/foo-1.0.0-rc.1.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_release_gate_pkg_shape() {
+        // Mirrors what test-real-flow-smoke.sh observes: the path npm
+        // publishes through is the URL shape; the path that gets stored
+        // is the version-segmented shape.
+        let url_shape = "rfs-pkg-e2e1779850088106/-/rfs-pkg-e2e1779850088106-1.0.1779850372.tgz";
+        let stored =
+            "rfs-pkg-e2e1779850088106/1.0.1779850372/rfs-pkg-e2e1779850088106-1.0.1779850372.tgz";
+        assert_eq!(normalize_lookup_path(url_shape), Some(stored.to_string()));
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_returns_none_for_metadata_path() {
+        // Non-tarball lookups must not be rewritten; they're already
+        // stored verbatim (or simply don't exist as artifact rows).
+        assert_eq!(normalize_lookup_path("lodash"), None);
+        assert_eq!(normalize_lookup_path("lodash/package.json"), None);
+        assert_eq!(normalize_lookup_path("@types/node"), None);
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_returns_none_for_already_stored_shape() {
+        // A path that is already in the stored shape (4 segments
+        // unscoped, 5 segments scoped, no `-/` marker) is left alone so
+        // the caller can issue an exact-match lookup with it directly.
+        assert_eq!(
+            normalize_lookup_path("lodash/4.17.21/lodash-4.17.21.tgz"),
+            None
+        );
+        assert_eq!(
+            normalize_lookup_path("@angular/core/17.0.0/core-17.0.0.tgz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_returns_none_when_filename_mismatches_name() {
+        // If `<name>-` does not prefix the filename we can't infer the
+        // version, so refuse rather than emit a broken path.
+        assert_eq!(normalize_lookup_path("foo/-/bar-1.0.0.tgz"), None);
+    }
+
+    #[test]
+    fn test_normalize_lookup_path_returns_none_for_non_tgz_extension() {
+        assert_eq!(normalize_lookup_path("foo/-/foo-1.0.0.zip"), None);
     }
 }

@@ -709,6 +709,62 @@ async fn download(
                     .unwrap());
             }
 
+            // Virtual repo: walk members and try the same two probes
+            // (stored checksum file, then stored metadata file) against
+            // each member's storage before falling through to dynamic
+            // generation. Without this, a `maven-metadata.xml.sha256`
+            // request against a virtual repo whose member holds the
+            // metadata file returned 404, because `repo.storage_location()`
+            // above is the virtual's own (empty) storage and the dynamic
+            // generation below only queries `repo.id` (which has no
+            // artifact rows for a virtual). #1444.
+            if repo.repo_type == RepositoryType::Virtual {
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                for member in &members {
+                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
+                        if let Ok(content) = member_storage.get(&checksum_storage_key).await {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/plain")
+                                .body(Body::from(content))
+                                .unwrap());
+                        }
+                        if let Ok(content) = member_storage.get(&meta_storage_key).await {
+                            let checksum = compute_checksum(&content, checksum_type);
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/plain")
+                                .body(Body::from(checksum))
+                                .unwrap());
+                        }
+                    }
+                }
+
+                // Also generate metadata from members' artifact rows.
+                // Artifact-level (group/artifact) metadata can be
+                // synthesised from `artifact_metadata` rows even when no
+                // member uploaded a precomputed `maven-metadata.xml`.
+                if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
+                    for member in &members {
+                        if let Ok(xml) = generate_metadata_for_artifact(
+                            &state.db,
+                            member.id,
+                            &group_id,
+                            &artifact_id,
+                        )
+                        .await
+                        {
+                            let checksum = compute_checksum(xml.as_bytes(), checksum_type);
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/plain")
+                                .body(Body::from(checksum))
+                                .unwrap());
+                        }
+                    }
+                }
+            }
+
             // Fall back to dynamic generation for artifact-level metadata
             if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
                 let xml =
@@ -3180,5 +3236,179 @@ mod tests {
         let xml = r#"<metadata><groupId>g</groupId><artifactId>a</artifactId></metadata>"#;
         let parsed = parse_snapshot_versions_xml(xml);
         assert!(parsed.is_empty());
+    }
+
+    // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──
+    //
+    // These exercise the maven `download` handler end-to-end through the
+    // actual axum Router so a future refactor that breaks virtual-repo
+    // routing surfaces the failure here, not at release-gate time.
+
+    /// HTTP-level regression test for #1444 / #839 (re-test): GET a Maven
+    /// SNAPSHOT jar by its `-SNAPSHOT` alias through a virtual repo returns
+    /// 200 and the original bytes.
+    ///
+    /// Setup: hosted Maven repo holds the SNAPSHOT jar at its timestamped
+    /// filename (the shape Maven actually deploys). A second virtual Maven
+    /// repo has the hosted as its sole member. We hit
+    /// `GET /maven/<virtual>/.../<artifact>-<base>-SNAPSHOT.jar`, which
+    /// goes through the `serve_artifact` virtual branch and the
+    /// `maven_local_fetch_snapshot` alias-resolution fallback.
+    #[tokio::test]
+    async fn test_virtual_repo_serves_snapshot_jar_by_alias_1444() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use uuid::Uuid;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // -- Build the hosted (local) member: insert repo + JAR row + bytes.
+        let (hosted_id, _hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, _username) = tdh::create_user(&pool).await;
+
+        let group_id = "com.example.snapj1444";
+        let group_path = "com/example/snapj1444";
+        let artifact_id = "snap";
+        let version = "1.0.0-SNAPSHOT";
+        let snap_ts_value = "1.0.0-20261231.235959-1";
+
+        // Timestamped path is what Maven deploy actually writes.
+        let timestamped_path = format!(
+            "{}/{}/{}/{}-{}.jar",
+            group_path, artifact_id, version, artifact_id, snap_ts_value
+        );
+        let jar_bytes = bytes::Bytes::from_static(b"snapshot-jar-bytes-for-1444");
+        let storage_key = format!("maven/{}", timestamped_path);
+
+        // Put the jar onto the hosted repo's storage.
+        let hosted_state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted_storage = hosted_state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: hosted_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage_for_repo");
+        hosted_storage
+            .put(&storage_key, jar_bytes.clone())
+            .await
+            .expect("put jar bytes on hosted storage");
+
+        // Insert the artifact row at the timestamped path; this is what
+        // `resolve_snapshot_artifact` looks up to map the -SNAPSHOT alias.
+        let artifact_id_db = Uuid::new_v4();
+        let sha256 = "deadbeef".repeat(8); // 64 hex chars
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, repository_id, path, name, version, size_bytes,
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)
+            "#,
+        )
+        .bind(artifact_id_db)
+        .bind(hosted_id)
+        .bind(&timestamped_path)
+        .bind(artifact_id)
+        .bind(version)
+        .bind(jar_bytes.len() as i64)
+        .bind(&sha256)
+        .bind("application/java-archive")
+        .bind(&storage_key)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert artifact row");
+
+        // Insert artifact_metadata so `resolve_snapshot_artifact`'s join finds
+        // groupId+artifactId. The resolver SELECTs from artifact_metadata.
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', jsonb_build_object(
+                'groupId', $2::text, 'artifactId', $3::text, 'version', $4::text,
+                'extension', 'jar'
+            ))
+            "#,
+        )
+        .bind(artifact_id_db)
+        .bind(group_id)
+        .bind(artifact_id)
+        .bind(version)
+        .execute(&pool)
+        .await
+        .expect("insert artifact_metadata");
+
+        // -- Build the virtual repo with the hosted as its sole member.
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("v-snapj-1444-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("snapj-1444-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(virtual_dir.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert virtual member");
+
+        // -- Build a state rooted at the hosted storage dir so the
+        //    virtual-resolution callback can read the jar bytes back.
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, "snapj-1444-user");
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let alias_uri = format!(
+            "/{}/{}/{}/{}/{}-{}.jar",
+            virtual_key, group_path, artifact_id, version, artifact_id, version
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(&alias_uri)
+            .body(Body::empty())
+            .expect("build GET alias jar");
+        let (status, body) = tdh::send(router, req).await;
+
+        // -- Cleanup first so a failed assert does not leak DB state.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, hosted_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&hosted_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET SNAPSHOT jar via -SNAPSHOT alias through virtual must return 200 \
+             (regression of #1444 / #839). uri={} body={}",
+            alias_uri,
+            String::from_utf8_lossy(&body[..body.len().min(300)])
+        );
+        assert_eq!(
+            &body[..],
+            &jar_bytes[..],
+            "virtual-served bytes must match the original jar content"
+        );
     }
 }
