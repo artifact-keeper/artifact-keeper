@@ -84,6 +84,19 @@ pub trait StorageBackend: Send + Sync {
     /// Delete content by key
     async fn delete(&self, key: &str) -> Result<()>;
 
+    /// Copy content between keys within the same backend.
+    ///
+    /// Backends with server-side copy support should override this. The
+    /// default routes through `get_stream()` + `put_stream()` so backends that
+    /// implement streaming but not native copy do not need to buffer the source
+    /// object in memory. Large-object backends must override `put_stream()`;
+    /// the default `put_stream()` remains a compatibility fallback for simple
+    /// in-memory implementations.
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let stream = self.get_stream(source).await?;
+        self.put_stream(dest, stream).await.map(|_| ())
+    }
+
     /// Check if this backend supports redirect downloads via presigned URLs
     fn supports_redirect(&self) -> bool {
         false
@@ -344,6 +357,48 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(collected, b"test");
+    }
+
+    #[tokio::test]
+    async fn test_default_copy_reads_source_and_writes_dest() {
+        use std::sync::{Arc, Mutex};
+
+        struct CopyBackend {
+            writes: Arc<Mutex<Vec<(String, Bytes)>>>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for CopyBackend {
+            async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+                self.writes.lock().unwrap().push((key.to_string(), content));
+                Ok(())
+            }
+
+            async fn get(&self, key: &str) -> Result<Bytes> {
+                assert_eq!(key, "source-key");
+                Ok(Bytes::from_static(b"copied bytes"))
+            }
+
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let backend = CopyBackend {
+            writes: writes.clone(),
+        };
+
+        backend.copy("source-key", "dest-key").await.unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "dest-key");
+        assert_eq!(writes[0].1, Bytes::from_static(b"copied bytes"));
     }
 
     #[tokio::test]

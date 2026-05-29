@@ -8,9 +8,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use utoipa::ToSchema;
+use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
+
+const ABANDONED_OCI_UPLOAD_TTL_SQL: &str = "INTERVAL '24 hours'";
+const ABANDONED_OCI_UPLOAD_SCAN_LIMIT: i64 = 1000;
+const OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT: i64 = 1000;
 
 /// SQL fragment expressing the orphan-storage-key predicate.
 ///
@@ -107,6 +112,21 @@ pub struct StorageGcService {
     storage_registry: Arc<StorageRegistry>,
 }
 
+#[derive(Debug)]
+struct AbandonedOciUploadSession {
+    id: Uuid,
+    location: StorageLocation,
+    storage_keys: Vec<String>,
+    bytes_received: i64,
+}
+
+#[derive(Debug)]
+struct OciUploadCleanupKey {
+    id: i64,
+    location: StorageLocation,
+    storage_key: String,
+}
+
 impl StorageGcService {
     pub fn new(db: PgPool, storage_registry: Arc<StorageRegistry>) -> Self {
         Self {
@@ -150,127 +170,171 @@ impl StorageGcService {
                 let count: i64 = row.try_get("artifact_count").unwrap_or(0);
                 accumulate_dry_run(&mut result, bytes, count);
             }
-            return Ok(result);
+        } else {
+            for row in &orphans {
+                let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+                let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
+                let storage_path: String = row.try_get("storage_path").unwrap_or_default();
+                let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
+                let count: i64 = row.try_get("artifact_count").unwrap_or(0);
+
+                // Resolve the correct storage backend for this repo
+                let location = StorageLocation {
+                    backend: storage_backend.clone(),
+                    path: storage_path.clone(),
+                };
+                let storage = match self.storage_for_location(&location) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        continue;
+                    }
+                };
+
+                // Begin a per-key transaction. The transaction holds row locks
+                // on the matching `artifacts` rows from `is_still_orphan`'s
+                // FOR UPDATE clause through the storage delete and the DB row
+                // deletes. Any writer trying to flip `is_deleted = false` or
+                // insert a new reference is blocked behind the lock.
+                let mut tx = match self.db.begin().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let msg = format_gc_error("begin gc tx", &storage_key, &e.to_string());
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        continue;
+                    }
+                };
+
+                // Re-verify the orphan predicate inside the tx, taking a row
+                // lock on the matching artifact rows. If a concurrent push has
+                // landed a live reference (`oci_tags`, `oci_blobs`,
+                // `oci_manifest_refs` parent re-tag, or a new live artifact
+                // sharing the key), this returns `false` and the GC pass
+                // skips the key to revisit on the next run.
+                match is_still_orphan(&mut tx, &storage_key, &storage_backend, &storage_path).await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = tx.rollback().await;
+                        tracing::debug!(
+                            storage_key = storage_key.as_str(),
+                            "GC skipped key: no longer orphan after row-lock re-check"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        let msg = format_gc_error("re-check orphan", &storage_key, &e.to_string());
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        continue;
+                    }
+                }
+
+                // Storage delete is not transactional, but it happens while
+                // the row lock is still held by `tx`. A racing pusher cannot
+                // begin re-using this storage key until we commit/rollback.
+                if let Err(e) = storage.delete(&storage_key).await {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error("delete storage key", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    // Skip DB cleanup if storage delete fails
+                    continue;
+                }
+
+                // Delete promotion_approvals (no CASCADE on this FK)
+                if let Err(e) = sqlx::query(
+                    r#"
+                    DELETE FROM promotion_approvals
+                    WHERE artifact_id IN (
+                        SELECT id FROM artifacts
+                        WHERE storage_key = $1 AND is_deleted = true
+                    )
+                    "#,
+                )
+                .bind(&storage_key)
+                .execute(&mut *tx)
+                .await
+                {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+
+                // Hard-delete artifact records (cascades to child tables)
+                if let Err(e) = sqlx::query(
+                    "DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true",
+                )
+                .bind(&storage_key)
+                .execute(&mut *tx)
+                .await
+                {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+
+                if let Err(e) = tx.commit().await {
+                    let msg = format_gc_error("commit gc tx", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+
+                record_gc_success(&mut result, bytes, count);
+            }
         }
 
-        for row in &orphans {
-            let storage_key: String = row.try_get("storage_key").unwrap_or_default();
-            let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
-            let storage_path: String = row.try_get("storage_path").unwrap_or_default();
-            let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
-            let count: i64 = row.try_get("artifact_count").unwrap_or(0);
-
-            // Resolve the correct storage backend for this repo
-            let location = StorageLocation {
-                backend: storage_backend.clone(),
-                path: storage_path.clone(),
-            };
-            let storage = match self.storage_for_location(&location) {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            // Begin a per-key transaction. The transaction holds row locks
-            // on the matching `artifacts` rows from `is_still_orphan`'s
-            // FOR UPDATE clause through the storage delete and the DB row
-            // deletes. Any writer trying to flip `is_deleted = false` or
-            // insert a new reference is blocked behind the lock.
-            let mut tx = match self.db.begin().await {
-                Ok(t) => t,
-                Err(e) => {
-                    let msg = format_gc_error("begin gc tx", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            };
-
-            // Re-verify the orphan predicate inside the tx, taking a row
-            // lock on the matching artifact rows. If a concurrent push has
-            // landed a live reference (`oci_tags`, `oci_blobs`,
-            // `oci_manifest_refs` parent re-tag, or a new live artifact
-            // sharing the key), this returns `false` and the GC pass
-            // skips the key to revisit on the next run.
-            match is_still_orphan(&mut tx, &storage_key, &storage_backend, &storage_path).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = tx.rollback().await;
-                    tracing::debug!(
-                        storage_key = storage_key.as_str(),
-                        "GC skipped key: no longer orphan after row-lock re-check"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    let msg = format_gc_error("re-check orphan", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
-                }
-            }
-
-            // Storage delete is not transactional, but it happens while
-            // the row lock is still held by `tx`. A racing pusher cannot
-            // begin re-using this storage key until we commit/rollback.
-            if let Err(e) = storage.delete(&storage_key).await {
-                let _ = tx.rollback().await;
-                let msg = format_gc_error("delete storage key", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                // Skip DB cleanup if storage delete fails
-                continue;
-            }
-
-            // Delete promotion_approvals (no CASCADE on this FK)
-            if let Err(e) = sqlx::query(
-                r#"
-                DELETE FROM promotion_approvals
-                WHERE artifact_id IN (
-                    SELECT id FROM artifacts
-                    WHERE storage_key = $1 AND is_deleted = true
-                )
-                "#,
-            )
-            .bind(&storage_key)
-            .execute(&mut *tx)
+        // Run each OCI cleanup sweep independently so a failure in one does
+        // not skip the others. Each sweep already isolates per-key errors
+        // into `result.errors`; here we capture a failure of the sweep's
+        // own setup query (e.g. the candidate SELECT) the same way instead
+        // of `?`-propagating out of run_gc and aborting later sweeps.
+        if let Err(e) = self
+            .cleanup_abandoned_oci_uploads(dry_run, &mut result)
             .await
-            {
-                let _ = tx.rollback().await;
-                let msg =
-                    format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
-
-            // Hard-delete artifact records (cascades to child tables)
-            if let Err(e) =
-                sqlx::query("DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true")
-                    .bind(&storage_key)
-                    .execute(&mut *tx)
-                    .await
-            {
-                let _ = tx.rollback().await;
-                let msg = format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
-
-            if let Err(e) = tx.commit().await {
-                let msg = format_gc_error("commit gc tx", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
-            }
-
-            record_gc_success(&mut result, bytes, count);
+        {
+            let msg = format_gc_error(
+                "run abandoned OCI upload cleanup",
+                "<sweep>",
+                &e.to_string(),
+            );
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+        }
+        if let Err(e) = self
+            .cleanup_unreferenced_oci_upload_keys(dry_run, &mut result)
+            .await
+        {
+            let msg = format_gc_error(
+                "run unreferenced OCI upload cleanup-key sweep",
+                "<sweep>",
+                &e.to_string(),
+            );
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+        }
+        if let Err(e) = self
+            .reap_pending_oci_upload_cleanup_keys(dry_run, &mut result)
+            .await
+        {
+            let msg = format_gc_error(
+                "run pending OCI upload cleanup-key reaper",
+                "<sweep>",
+                &e.to_string(),
+            );
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
         }
 
         if result.storage_keys_deleted > 0 {
@@ -318,6 +382,528 @@ impl StorageGcService {
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
     }
+
+    async fn cleanup_abandoned_oci_uploads(
+        &self,
+        dry_run: bool,
+        result: &mut StorageGcResult,
+    ) -> Result<()> {
+        let session_ids = self.select_abandoned_oci_upload_session_ids().await?;
+        let mut sessions_removed = 0_i64;
+        let mut upload_keys_deleted = 0_i64;
+
+        for session_id in session_ids {
+            let mut tx = match self.db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "begin abandoned OCI upload cleanup tx",
+                        &session_id.to_string(),
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            let session = match lock_abandoned_oci_upload_session(&mut tx, session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    let _ = tx.rollback().await;
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error(
+                        "lock abandoned OCI upload session",
+                        &session_id.to_string(),
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            if dry_run {
+                let _ = tx.rollback().await;
+                result.storage_keys_deleted += session.storage_keys.len() as i64;
+                result.bytes_freed += session.bytes_received.max(0);
+                continue;
+            }
+
+            let storage = match self.storage_for_location(&session.location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error(
+                        "resolve abandoned OCI upload storage",
+                        &session.id.to_string(),
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            let mut delete_failed = false;
+            for key in &session.storage_keys {
+                match storage.delete(key).await {
+                    Ok(()) | Err(AppError::NotFound(_)) => {}
+                    Err(e) => {
+                        let msg = format_gc_error(
+                            "delete abandoned OCI upload storage key",
+                            key,
+                            &e.to_string(),
+                        );
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        delete_failed = true;
+                    }
+                }
+            }
+            if delete_failed {
+                let _ = tx.rollback().await;
+                continue;
+            }
+
+            if let Err(e) = sqlx::query("DELETE FROM oci_upload_sessions WHERE id = $1")
+                .bind(session.id)
+                .execute(&mut *tx)
+                .await
+            {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error(
+                    "delete abandoned OCI upload session",
+                    &session.id.to_string(),
+                    &e.to_string(),
+                );
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            // NOTE: we intentionally do NOT delete this session's
+            // oci_upload_cleanup_keys rows here. This sweep only deletes the
+            // session's temp + part objects (session.storage_keys); the
+            // final-part / completion-temp objects left by a failed completion
+            // attempt are journaled under this session but are NOT in
+            // session.storage_keys (they were never inserted into
+            // oci_upload_parts), so they are reaped by the unreferenced-key
+            // sweep instead. Deleting the journal rows here would remove their
+            // only owner and strand those objects forever. The cost is that the
+            // unreferenced sweep re-issues a now-NotFound delete for the
+            // already-removed temp/part keys (a benign metrics double-count).
+            if let Err(e) = tx.commit().await {
+                let msg = format_gc_error(
+                    "commit abandoned OCI upload cleanup tx",
+                    &session.id.to_string(),
+                    &e.to_string(),
+                );
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            sessions_removed += 1;
+            upload_keys_deleted += session.storage_keys.len() as i64;
+            result.storage_keys_deleted += session.storage_keys.len() as i64;
+            result.bytes_freed += session.bytes_received.max(0);
+        }
+
+        if sessions_removed > 0 {
+            tracing::info!(
+                "Storage GC: removed {} abandoned OCI upload sessions and deleted {} upload keys",
+                sessions_removed,
+                upload_keys_deleted
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn select_abandoned_oci_upload_session_ids(&self) -> Result<Vec<Uuid>> {
+        let sql = format!(
+            r#"
+            SELECT id
+            FROM oci_upload_sessions
+            WHERE updated_at < NOW() - {ttl}
+            ORDER BY updated_at ASC
+            LIMIT $1
+            "#,
+            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<Uuid, _>("id")
+                    .map_err(|e| AppError::Database(e.to_string()))
+            })
+            .collect()
+    }
+
+    async fn cleanup_unreferenced_oci_upload_keys(
+        &self,
+        dry_run: bool,
+        result: &mut StorageGcResult,
+    ) -> Result<()> {
+        let cleanup_keys = self.select_unreferenced_oci_upload_cleanup_keys().await?;
+        let mut cleanup_rows_removed = 0_i64;
+
+        for cleanup_key in cleanup_keys {
+            if dry_run {
+                result.storage_keys_deleted += 1;
+                continue;
+            }
+
+            let storage = match self.storage_for_location(&cleanup_key.location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "resolve OCI upload cleanup-key storage",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            match storage.delete(&cleanup_key.storage_key).await {
+                Ok(()) | Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "delete OCI upload cleanup-key storage",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            if let Err(e) = sqlx::query(
+                r#"
+                DELETE FROM oci_upload_cleanup_keys
+                WHERE id = $1
+                  AND storage_write_completed_at IS NOT NULL
+                  -- Intentionally NOT guarded by `s.id = upload_session_id`
+                  -- (unlike the pending reaper): a committed cleanup key is a
+                  -- part / final-part / completion-temp key, never a session's
+                  -- storage_temp_key. The part check below protects live PATCH
+                  -- parts; the final-part / completion-temp objects left behind
+                  -- by a FAILED completion attempt are genuine orphans even
+                  -- while their session survives (it was reset to `open` for
+                  -- retry), so they MUST be reapable without waiting for the
+                  -- session to be abandoned. Adding the session-id branch here
+                  -- would strand them until the 24h sweep.
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_sessions s
+                    WHERE s.storage_temp_key = oci_upload_cleanup_keys.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_parts p
+                    WHERE p.storage_key = oci_upload_cleanup_keys.storage_key
+                  )
+                "#,
+            )
+            .bind(cleanup_key.id)
+            .execute(&self.db)
+            .await
+            {
+                let msg = format_gc_error(
+                    "delete OCI upload cleanup-key row",
+                    &cleanup_key.storage_key,
+                    &e.to_string(),
+                );
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            cleanup_rows_removed += 1;
+            result.storage_keys_deleted += 1;
+        }
+
+        if cleanup_rows_removed > 0 {
+            tracing::info!(
+                "Storage GC: removed {} stale OCI upload cleanup-key rows",
+                cleanup_rows_removed
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn select_unreferenced_oci_upload_cleanup_keys(
+        &self,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
+        let sql = format!(
+            r#"
+            SELECT c.id, c.storage_key, r.storage_backend, r.storage_path
+            FROM oci_upload_cleanup_keys c
+            JOIN repositories r ON r.id = c.repository_id
+            WHERE c.storage_write_completed_at IS NOT NULL
+              AND c.storage_write_completed_at < NOW() - {ttl}
+              -- See the matching DELETE: a committed key (part/final/completion
+              -- temp) is intentionally reapable even while its session lives,
+              -- so this is NOT guarded by `s.id = c.upload_session_id`.
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_upload_sessions s
+                WHERE s.storage_temp_key = c.storage_key
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_upload_parts p
+                WHERE p.storage_key = c.storage_key
+              )
+            ORDER BY c.created_at ASC
+            LIMIT $1
+            "#,
+            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| decode_oci_cleanup_key_row(&row))
+            .collect()
+    }
+
+    /// Reconcile aged `oci_upload_cleanup_keys` rows whose storage write was
+    /// never marked complete (`storage_write_completed_at IS NULL`).
+    ///
+    /// The normal sweep ([`cleanup_unreferenced_oci_upload_keys`]) only
+    /// reaps rows whose write has been marked complete. A crash or failed
+    /// storage write between the register-row INSERT and the mark leaves the
+    /// row stuck at NULL forever, so the table grows without bound. This
+    /// reaper closes that leak: it picks up rows that are
+    ///
+    /// 1. still NULL (never marked complete), and
+    /// 2. older than [`ABANDONED_OCI_UPLOAD_TTL_SQL`] (so no in-flight write
+    ///    can still be racing to create the object), and
+    /// 3. not referenced by any live upload session or part.
+    ///
+    /// For each, it best-effort deletes the storage object (treating
+    /// `NotFound` as success, since a crashed write may never have created
+    /// it) and then deletes the row, re-asserting the NULL + unreferenced
+    /// predicate in the DELETE's WHERE clause so it cannot race the writer
+    /// that may be marking the row complete concurrently.
+    async fn reap_pending_oci_upload_cleanup_keys(
+        &self,
+        dry_run: bool,
+        result: &mut StorageGcResult,
+    ) -> Result<()> {
+        let cleanup_keys = self.select_pending_oci_upload_cleanup_keys().await?;
+        let mut cleanup_rows_removed = 0_i64;
+
+        for cleanup_key in cleanup_keys {
+            if dry_run {
+                result.storage_keys_deleted += 1;
+                continue;
+            }
+
+            let storage = match self.storage_for_location(&cleanup_key.location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "resolve pending OCI upload cleanup-key storage",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            match storage.delete(&cleanup_key.storage_key).await {
+                Ok(()) | Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "delete pending OCI upload cleanup-key storage",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            // Re-assert NULL + unreferenced in the DELETE so a concurrent
+            // mark (writer flipping storage_write_completed_at to a value
+            // and inserting a session/part) cannot have the row reaped out
+            // from under it after we observed it as pending. The owning
+            // session (upload_session_id) is also re-checked so a row whose
+            // upload is still live is never reaped, even when the row's
+            // storage_key is a part key that does not textually match the
+            // session's storage_temp_key.
+            if let Err(e) = sqlx::query(
+                r#"
+                DELETE FROM oci_upload_cleanup_keys
+                WHERE id = $1
+                  AND storage_write_completed_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_sessions s
+                    WHERE s.id = oci_upload_cleanup_keys.upload_session_id
+                       OR s.storage_temp_key = oci_upload_cleanup_keys.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_parts p
+                    WHERE p.storage_key = oci_upload_cleanup_keys.storage_key
+                  )
+                "#,
+            )
+            .bind(cleanup_key.id)
+            .execute(&self.db)
+            .await
+            {
+                let msg = format_gc_error(
+                    "delete pending OCI upload cleanup-key row",
+                    &cleanup_key.storage_key,
+                    &e.to_string(),
+                );
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            cleanup_rows_removed += 1;
+            result.storage_keys_deleted += 1;
+        }
+
+        if cleanup_rows_removed > 0 {
+            tracing::info!(
+                "Storage GC: reaped {} aged pending OCI upload cleanup-key rows",
+                cleanup_rows_removed
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn select_pending_oci_upload_cleanup_keys(&self) -> Result<Vec<OciUploadCleanupKey>> {
+        let sql = format!(
+            r#"
+            SELECT c.id, c.storage_key, r.storage_backend, r.storage_path
+            FROM oci_upload_cleanup_keys c
+            JOIN repositories r ON r.id = c.repository_id
+            WHERE c.storage_write_completed_at IS NULL
+              AND c.created_at < NOW() - {ttl}
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_upload_sessions s
+                WHERE s.id = c.upload_session_id
+                   OR s.storage_temp_key = c.storage_key
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_upload_parts p
+                WHERE p.storage_key = c.storage_key
+              )
+            ORDER BY c.created_at ASC
+            LIMIT $1
+            "#,
+            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| decode_oci_cleanup_key_row(&row))
+            .collect()
+    }
+}
+
+/// Decode an `oci_upload_cleanup_keys` JOIN `repositories` row into an
+/// [`OciUploadCleanupKey`]. Shared by the unreferenced and pending cleanup-key
+/// selects, which project the identical column set.
+fn decode_oci_cleanup_key_row(row: &sqlx::postgres::PgRow) -> Result<OciUploadCleanupKey> {
+    Ok(OciUploadCleanupKey {
+        id: row
+            .try_get::<i64, _>("id")
+            .map_err(|e| AppError::Database(e.to_string()))?,
+        storage_key: row
+            .try_get::<String, _>("storage_key")
+            .map_err(|e| AppError::Database(e.to_string()))?,
+        location: StorageLocation {
+            backend: row
+                .try_get::<String, _>("storage_backend")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            path: row
+                .try_get::<String, _>("storage_path")
+                .map_err(|e| AppError::Database(e.to_string()))?,
+        },
+    })
+}
+
+async fn lock_abandoned_oci_upload_session(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+) -> sqlx::Result<Option<AbandonedOciUploadSession>> {
+    let sql = format!(
+        r#"
+        SELECT s.id, r.storage_backend, r.storage_path,
+               s.storage_temp_key, s.bytes_received
+        FROM oci_upload_sessions s
+        JOIN repositories r ON r.id = s.repository_id
+        WHERE s.id = $1
+          AND s.updated_at < NOW() - {ttl}
+        FOR UPDATE OF s
+        "#,
+        ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let storage_temp_key: String = row.try_get("storage_temp_key")?;
+    let part_rows = sqlx::query(
+        r#"
+        SELECT storage_key
+        FROM oci_upload_parts
+        WHERE upload_session_id = $1
+        ORDER BY part_index ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut storage_keys: Vec<String> = part_rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("storage_key"))
+        .collect::<sqlx::Result<Vec<_>>>()?;
+    storage_keys.push(storage_temp_key);
+    storage_keys.sort();
+    storage_keys.dedup();
+
+    Ok(Some(AbandonedOciUploadSession {
+        id: row.try_get("id")?,
+        location: StorageLocation {
+            backend: row.try_get("storage_backend")?,
+            path: row.try_get("storage_path")?,
+        },
+        storage_keys,
+        bytes_received: row.try_get("bytes_received")?,
+    }))
 }
 
 /// Re-verify the orphan predicate for a single (storage_key, repo
@@ -451,6 +1037,18 @@ pub(crate) fn empty_gc_result(dry_run: bool) -> StorageGcResult {
         bytes_freed: 0,
         errors: Vec::new(),
     }
+}
+
+#[cfg(test)]
+static STORAGE_GC_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    STORAGE_GC_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 #[cfg(test)]
@@ -1121,6 +1719,7 @@ mod tests {
     async fn test_run_gc_dry_run_keeps_oci_manifest_referenced_by_tag() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1157,6 +1756,7 @@ mod tests {
     async fn test_run_gc_dry_run_keeps_oci_blob_referenced_by_blob_index() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1199,6 +1799,7 @@ mod tests {
     async fn test_run_gc_live_keeps_oci_manifest_referenced_by_tag() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1267,6 +1868,725 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_run_gc_removes_abandoned_oci_upload_session_storage() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (storage, upload_id, temp_key, part_key) =
+            seed_abandoned_oci_upload_session(&fixture).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let temp_exists = storage.exists(&temp_key).await.expect("temp exists check");
+        let part_exists = storage.exists(&part_key).await.expect("part exists check");
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count upload sessions");
+        let part_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_parts WHERE upload_session_id = $1",
+        )
+        .bind(upload_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count upload parts");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&temp_key) || err.contains(&part_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for abandoned upload keys: {:?}",
+            key_errors
+        );
+        assert!(!temp_exists, "GC must delete stale upload temp objects");
+        assert!(!part_exists, "GC must delete stale upload part objects");
+        assert_eq!(session_count, 0, "GC must remove the stale upload session");
+        assert_eq!(part_count, 0, "GC must cascade stale upload parts");
+        assert!(
+            result.storage_keys_deleted >= 2,
+            "GC result should include the upload temp and part keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_dry_run_reports_abandoned_oci_upload_session_storage() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (storage, upload_id, temp_key, part_key) =
+            seed_abandoned_oci_upload_session(&fixture).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(true).await.expect("dry-run gc succeeds");
+
+        let temp_exists = storage.exists(&temp_key).await.expect("temp exists check");
+        let part_exists = storage.exists(&part_key).await.expect("part exists check");
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count upload sessions");
+        let part_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_parts WHERE upload_session_id = $1",
+        )
+        .bind(upload_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count upload parts");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&temp_key) || err.contains(&part_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "dry-run GC produced errors for abandoned upload keys: {:?}",
+            key_errors
+        );
+        assert!(temp_exists, "dry-run must not delete upload temp objects");
+        assert!(part_exists, "dry-run must not delete upload part objects");
+        assert_eq!(session_count, 1, "dry-run must keep the upload session");
+        assert_eq!(part_count, 1, "dry-run must keep upload parts");
+        assert!(
+            result.storage_keys_deleted >= 2,
+            "dry-run result should count the upload temp and part keys"
+        );
+        assert!(
+            result.bytes_freed >= 8,
+            "dry-run result should count abandoned upload bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_removes_unreferenced_oci_upload_cleanup_key_storage() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let storage_key = format!(
+            "oci-uploads/{}.part.00000000.{}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, Bytes::from_static(b"unreferenced"))
+            .await
+            .expect("write unreferenced cleanup key");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, storage_key, created_at, storage_write_completed_at
+            )
+            VALUES ($1, $2, NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&storage_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&storage_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            !key_exists,
+            "GC must delete unreferenced cleanup-key storage"
+        );
+        assert_eq!(cleanup_key_count, 0, "GC must delete cleanup-key row");
+        assert!(
+            result.storage_keys_deleted >= 1,
+            "GC result should include the cleanup-key storage object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_keeps_cleanup_key_referenced_by_active_upload_part() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let upload_id = Uuid::new_v4();
+        let temp_key = format!("oci-uploads/{}", upload_id);
+        let part_key = format!("{}.part.00000000.{}", temp_key, Uuid::new_v4());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&part_key, Bytes::from_static(b"active"))
+            .await
+            .expect("write active part");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_sessions (
+                id, repository_id, user_id, bytes_received, storage_temp_key, updated_at
+            )
+            VALUES ($1, $2, $3, 6, $4, NOW())
+            "#,
+        )
+        .bind(upload_id)
+        .bind(fixture.repo_id)
+        .bind(fixture.user_id)
+        .bind(&temp_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert active upload session");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_parts (
+                upload_session_id, part_index, storage_key, size_bytes, digest_sha256
+            )
+            VALUES ($1, 0, $2, 6, 'unused-test-digest')
+            "#,
+        )
+        .bind(upload_id)
+        .bind(&part_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert active upload part");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, upload_session_id, storage_key, created_at,
+                storage_write_completed_at
+            )
+            VALUES ($1, $2, $3, NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(upload_id)
+        .bind(&part_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&part_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&part_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&part_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for active cleanup key: {:?}",
+            key_errors
+        );
+        assert!(key_exists, "GC must not delete active upload part storage");
+        assert_eq!(
+            cleanup_key_count, 1,
+            "GC must keep cleanup row while a live part references it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_keeps_cleanup_key_referenced_by_active_upload_session() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let upload_id = Uuid::new_v4();
+        let temp_key = format!("oci-uploads/{}", upload_id);
+        let pending_part_key = format!("{}.part.00000001.{}", temp_key, Uuid::new_v4());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&pending_part_key, Bytes::from_static(b"pending"))
+            .await
+            .expect("write pending part");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_sessions (
+                id, repository_id, user_id, bytes_received, storage_temp_key, updated_at
+            )
+            VALUES ($1, $2, $3, 7, $4, NOW())
+            "#,
+        )
+        .bind(upload_id)
+        .bind(fixture.repo_id)
+        .bind(fixture.user_id)
+        .bind(&temp_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert active upload session");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, upload_session_id, storage_key, created_at
+            )
+            VALUES ($1, $2, $3, NOW() - INTERVAL '8 days')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(upload_id)
+        .bind(&pending_part_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage
+            .exists(&pending_part_key)
+            .await
+            .expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&pending_part_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&pending_part_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for active-session cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            key_exists,
+            "GC must not delete pending upload storage while its session is live"
+        );
+        assert_eq!(
+            cleanup_key_count, 1,
+            "GC must keep cleanup row while a live upload session references it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_keeps_pending_cleanup_key_until_storage_write_is_marked() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let storage_key = format!(
+            "oci-uploads/{}.part.00000000.{}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+
+        // A recent (within-TTL) pending row: the writer may still be racing
+        // to create the object and mark the write complete, so GC must leave
+        // it alone. Only once the row ages past the TTL without being marked
+        // does the pending reaper treat it as a crashed-writer leak
+        // (covered by test_run_gc_reaps_aged_pending_oci_upload_cleanup_key).
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, created_at)
+            VALUES ($1, $2, NOW())
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert pending cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&storage_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&storage_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for missing pending cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            !key_exists,
+            "test fixture should not create the pending key"
+        );
+        assert_eq!(
+            cleanup_key_count, 1,
+            "GC must keep a within-TTL pending cleanup row until the writer marks the storage write complete"
+        );
+    }
+
+    /// An AGED, unreferenced NULL row (the writer crashed between the
+    /// register INSERT and the storage-write-completed mark) must be
+    /// reaped: the storage object is best-effort deleted and the row is
+    /// removed. Without the reaper this row would leak forever because
+    /// the committed-row sweep requires `storage_write_completed_at IS NOT
+    /// NULL`.
+    #[tokio::test]
+    async fn test_run_gc_reaps_aged_pending_oci_upload_cleanup_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let storage_key = format!(
+            "oci-uploads/{}.part.00000000.{}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        // The crashed write may or may not have materialized the object;
+        // here we materialize it to assert the reaper deletes it.
+        storage
+            .put(&storage_key, Bytes::from_static(b"orphaned-pending"))
+            .await
+            .expect("write aged pending cleanup key");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, created_at)
+            VALUES ($1, $2, NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert aged pending cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&storage_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&storage_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for aged pending cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            !key_exists,
+            "reaper must delete the storage object for an aged pending cleanup key"
+        );
+        assert_eq!(
+            cleanup_key_count, 0,
+            "reaper must delete the aged pending cleanup-key row"
+        );
+    }
+
+    /// A RECENT NULL row (created within the TTL) must NOT be reaped: a
+    /// write may still be in flight and racing to create the object, so
+    /// reaping now could delete an object the writer is about to record.
+    #[tokio::test]
+    async fn test_run_gc_keeps_recent_pending_oci_upload_cleanup_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let storage_key = format!(
+            "oci-uploads/{}.part.00000000.{}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, Bytes::from_static(b"recent-pending"))
+            .await
+            .expect("write recent pending cleanup key");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, created_at)
+            VALUES ($1, $2, NOW())
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert recent pending cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&storage_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&storage_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for recent pending cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            key_exists,
+            "reaper must not delete the storage object for a recent pending cleanup key"
+        );
+        assert_eq!(
+            cleanup_key_count, 1,
+            "reaper must keep a recent pending cleanup-key row inside the TTL"
+        );
+    }
+
+    /// An aged NULL row that is still referenced by a live upload session
+    /// must NOT be reaped: the session still owns the storage object and
+    /// will eventually finalize or be swept by the abandoned-session path.
+    #[tokio::test]
+    async fn test_run_gc_keeps_aged_pending_cleanup_key_referenced_by_live_session() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let upload_id = Uuid::new_v4();
+        let temp_key = format!("oci-uploads/{}", upload_id);
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&temp_key, Bytes::from_static(b"live-session-temp"))
+            .await
+            .expect("write live session temp object");
+
+        // A live (recently updated) session whose storage_temp_key matches
+        // the cleanup row's storage_key, so the reaper's NOT EXISTS guard
+        // must protect it despite the cleanup row being aged + NULL.
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_sessions (
+                id, repository_id, user_id, bytes_received, storage_temp_key, updated_at
+            )
+            VALUES ($1, $2, $3, 0, $4, NOW())
+            "#,
+        )
+        .bind(upload_id)
+        .bind(fixture.repo_id)
+        .bind(fixture.user_id)
+        .bind(&temp_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert live upload session");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, upload_session_id, storage_key, created_at
+            )
+            VALUES ($1, $2, $3, NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(upload_id)
+        .bind(&temp_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert aged pending cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&temp_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&temp_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&temp_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for referenced aged pending cleanup key: {:?}",
+            key_errors
+        );
+        assert!(
+            key_exists,
+            "reaper must not delete storage referenced by a live upload session"
+        );
+        assert_eq!(
+            cleanup_key_count, 1,
+            "reaper must keep an aged pending cleanup row while a live session references it"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Regression for #1179: multi-arch index child-manifest protection
     // -----------------------------------------------------------------------
@@ -1285,6 +2605,64 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("count soft-deleted artifacts")
+    }
+
+    async fn seed_abandoned_oci_upload_session(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+    ) -> (Arc<dyn StorageBackend>, Uuid, String, String) {
+        let upload_id = Uuid::new_v4();
+        let temp_key = format!("oci-uploads/{}", upload_id);
+        let part_key = format!("{}.part.00000000.{}", temp_key, Uuid::new_v4());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+
+        storage
+            .put(&temp_key, Bytes::new())
+            .await
+            .expect("write upload temp object");
+        storage
+            .put(&part_key, Bytes::from_static(b"orphaned"))
+            .await
+            .expect("write upload part object");
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_sessions (
+                id, repository_id, user_id, bytes_received, storage_temp_key, updated_at
+            )
+            VALUES ($1, $2, $3, 8, $4, NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(upload_id)
+        .bind(fixture.repo_id)
+        .bind(fixture.user_id)
+        .bind(&temp_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert abandoned upload session");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_parts (
+                upload_session_id, part_index, storage_key, size_bytes, digest_sha256
+            )
+            VALUES ($1, 0, $2, 8, $3)
+            "#,
+        )
+        .bind(upload_id)
+        .bind(&part_key)
+        .bind("unused-test-digest")
+        .execute(&fixture.pool)
+        .await
+        .expect("insert abandoned upload part");
+
+        (storage, upload_id, temp_key, part_key)
     }
 
     /// Push a multi-arch image scenario: the index manifest is tagged
@@ -1308,6 +2686,7 @@ mod tests {
     async fn test_run_gc_keeps_oci_index_child_manifests() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1442,6 +2821,7 @@ mod tests {
     async fn test_run_gc_collects_orphaned_index_children() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1554,6 +2934,7 @@ mod tests {
     async fn test_run_gc_toctou_skips_key_when_tag_inserted_during_pass() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };

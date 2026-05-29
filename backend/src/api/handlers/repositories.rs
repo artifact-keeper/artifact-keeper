@@ -1217,6 +1217,64 @@ pub async fn update_repository(
     Ok(Json(repo_to_response(repo, storage_used)))
 }
 
+/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
+/// objects from storage before the repository row is deleted.
+///
+/// `oci_upload_cleanup_keys`, `oci_upload_sessions`, and `oci_upload_parts` all
+/// `ON DELETE CASCADE` with `repositories`, so once the repo row is gone their
+/// storage objects lose their only discoverable owner and become permanent
+/// orphans that storage-GC can never reclaim. We delete them up front. Failures
+/// are logged but never block repository deletion.
+async fn purge_repo_oci_upload_temp_objects(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+) {
+    let storage = match state.storage_for_repo(location) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Could not resolve storage to purge OCI upload temp objects before repository delete"
+            );
+            return;
+        }
+    };
+    // The cleanup-key journal records every temp/part/completion storage key
+    // written for this repo's uploads; union in the session/part keys as
+    // belt-and-suspenders in case a write predated its journal row.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
+         UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
+         UNION SELECT p.storage_key FROM oci_upload_parts p \
+           JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
+          WHERE s.repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to list OCI upload temp keys to purge before repository delete"
+        );
+        Vec::new()
+    });
+    for key in keys {
+        match storage.delete(&key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => tracing::warn!(
+                repo_id = %repo_id,
+                storage_key = %key,
+                error = %e,
+                "Failed to purge OCI upload temp object before repository delete"
+            ),
+        }
+    }
+}
+
 /// Delete repository
 #[utoipa::path(
     delete,
@@ -1257,6 +1315,11 @@ pub async fn delete_repository(
             ));
         }
     }
+
+    // Purge this repo's in-flight / abandoned OCI upload temp objects from
+    // storage BEFORE the repository row is deleted (see the helper). Best-effort:
+    // never blocks the delete.
+    purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
 
     service.delete(repo.id).await?;
 
@@ -7488,6 +7551,127 @@ mod tests {
             upstream_body,
             "streamed body bytes must round-trip from wiremock through \
              proxy_fetch_streaming and back to the caller"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_repository_purges_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // An in-flight upload temp object, tracked only by the cleanup-key journal.
+        let temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &temp_key,
+                bytes::Bytes::from_static(b"in-flight upload bytes"),
+            )
+            .await
+            .expect("write temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+             VALUES ($1, $2, NOW())",
+        )
+        .bind(fx.repo_id)
+        .bind(&temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("register cleanup key");
+        // A session storage_temp_key object (second UNION branch).
+        let session_id = Uuid::new_v4();
+        let session_temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &session_temp_key,
+                bytes::Bytes::from_static(b"session temp"),
+            )
+            .await
+            .expect("write session temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, storage_temp_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .bind(&session_temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload session");
+
+        // A part storage_key object (third UNION branch).
+        let part_key = format!("{}.part.00000000.{}", session_temp_key, Uuid::new_v4());
+        storage
+            .put(&part_key, bytes::Bytes::from_static(b"part bytes"))
+            .await
+            .expect("write part object");
+        sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) \
+             VALUES ($1, 0, $2, $3, NULL)",
+        )
+        .bind(session_id)
+        .bind(&part_key)
+        .bind(10_i64)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload part");
+
+        // A COMMITTED blob — content-addressed, owned by oci_blobs, NOT an upload
+        // temp object. The purge must never touch it.
+        let blob_digest = format!("sha256:{}", "a".repeat(64));
+        let blob_key = format!("oci-blobs/{blob_digest}");
+        storage
+            .put(
+                &blob_key,
+                bytes::Bytes::from_static(b"committed blob bytes"),
+            )
+            .await
+            .expect("write committed blob");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(&blob_digest)
+        .bind(20_i64)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        for k in [&temp_key, &session_temp_key, &part_key, &blob_key] {
+            assert!(
+                storage.exists(k).await.expect("exists"),
+                "precondition: {k} exists"
+            );
+        }
+
+        // The repo-delete purge must remove the journaled temp/session/part
+        // objects up front (once the repo row is deleted their owner rows CASCADE
+        // away), but must leave the committed blob untouched.
+        purge_repo_oci_upload_temp_objects(&state, fx.repo_id, &location).await;
+
+        for k in [&temp_key, &session_temp_key, &part_key] {
+            assert!(
+                !storage.exists(k).await.expect("exists after purge"),
+                "purge must remove OCI upload temp object {k}"
+            );
+        }
+        assert!(
+            storage
+                .exists(&blob_key)
+                .await
+                .expect("blob exists after purge"),
+            "purge must NOT delete the committed content-addressed blob {blob_key}"
         );
 
         fx.teardown().await;

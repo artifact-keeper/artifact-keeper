@@ -9,19 +9,13 @@
 use reqwest::redirect::Policy;
 use reqwest::tls::Certificate;
 use reqwest::ClientBuilder;
+use std::time::Duration;
 
 /// Maximum number of redirects we will follow even if every hop passes
 /// the SSRF check. Matches reqwest's historical default and prevents
 /// loops or pathological chains from tying up workers.
 const MAX_REDIRECTS: usize = 10;
 
-/// Return a [`ClientBuilder`] pre-loaded with custom CA certificates when
-/// the `CUSTOM_CA_CERT_PATH` environment variable is set.
-///
-/// The variable should point to a PEM file containing one or more CA
-/// certificates. This is required for HTTPS connections to internal services
-/// (Artifactory, Nexus, remote repositories) that use certificates signed by
-/// a private CA.
 /// Log detected proxy environment variables once at startup so operators can
 /// confirm that `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are (or are not)
 /// reaching the backend process.
@@ -55,6 +49,13 @@ fn log_proxy_env() {
     });
 }
 
+/// Return a [`ClientBuilder`] pre-loaded with custom CA certificates when
+/// the `CUSTOM_CA_CERT_PATH` environment variable is set.
+///
+/// The variable should point to a PEM file containing one or more CA
+/// certificates. This is required for HTTPS connections to internal services
+/// (Artifactory, Nexus, remote repositories) that use certificates signed by
+/// a private CA.
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
@@ -95,6 +96,22 @@ pub fn base_client_builder() -> ClientBuilder {
     builder
 }
 
+/// Return a client builder suitable for large storage data-plane transfers.
+///
+/// This intentionally avoids [`ClientBuilder::timeout`], which is a total
+/// request deadline and can abort healthy multi-GB uploads or downloads.
+/// Instead it sets a `connect_timeout` plus a `read_timeout` that bounds
+/// inactivity while *reading the response*. Note that `read_timeout` does not
+/// bound time spent streaming a large request *body*, so a stalled upstream
+/// that stops reading an upload is governed only by `connect_timeout` and
+/// connection-level (TCP) behavior, not by this timeout.
+pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
+    base_client_builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .https_only(!allow_http)
+}
+
 /// Build and return a ready-to-use [`reqwest::Client`] with custom CA
 /// certificates and proxy support.
 ///
@@ -133,8 +150,10 @@ fn ssrf_redirect_policy() -> Policy {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_client_builder, default_client};
+    use super::{base_client_builder, default_client, large_object_client_builder};
     use std::io::Write;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_default_client_builds_successfully() {
@@ -249,5 +268,55 @@ mod tests {
             err.to_string().contains("SSRF") || err.is_redirect(),
             "expected redirect-rejection error, got: {err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_large_object_client_builder_does_not_apply_total_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut received = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read request");
+                assert_ne!(n, 0, "client closed before request headers");
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nO")
+                .await
+                .expect("write first byte");
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            socket.write_all(b"K").await.expect("write second byte");
+        });
+
+        let client = large_object_client_builder(true)
+            .build()
+            .expect("build large-object client");
+        let request = tokio::spawn(async move {
+            client
+                .post(&url)
+                .body("request body")
+                .send()
+                .await
+                .expect("send request")
+                .bytes()
+                .await
+                .expect("read response")
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+
+        assert_eq!(request.await.expect("request task").as_ref(), b"OK");
+        server.await.expect("server task");
     }
 }

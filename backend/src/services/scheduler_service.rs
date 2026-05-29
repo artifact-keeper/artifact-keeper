@@ -316,6 +316,11 @@ pub fn spawn_all(
                                 "Storage GC completed with {} errors",
                                 result.errors.len()
                             );
+                            // Surface the actual messages, not just the count,
+                            // so the orchestration-layer log is actionable.
+                            for err in &result.errors {
+                                tracing::warn!(gc_error = %err, "Storage GC error");
+                            }
                         }
                     }
                     Err(e) => {
