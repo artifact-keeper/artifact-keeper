@@ -41,6 +41,7 @@ pub mod plugin_service;
 pub mod policy_service;
 pub mod promotion_policy_service;
 pub mod promotion_rule_service;
+pub mod proxy_hydration;
 pub mod proxy_service;
 pub mod quality_check_service;
 pub mod quarantine_service;
