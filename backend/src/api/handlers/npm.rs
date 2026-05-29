@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use base64::Engine;
@@ -39,6 +39,18 @@ use crate::models::repository::RepositoryType;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
+        // Security advisories bulk lookup (npm audit): POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk
+        // Quick audit (older npm versions / yarn): POST /npm/{repo_key}/-/npm/v1/security/audits/quick
+        // These literal-segment routes must precede the `:package` catch-alls
+        // below so axum matches them first. See issue #1400.
+        .route(
+            "/:repo_key/-/npm/v1/security/advisories/bulk",
+            post(security_advisories_bulk),
+        )
+        .route(
+            "/:repo_key/-/npm/v1/security/audits/quick",
+            post(security_audits_quick),
+        )
         // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
         .route(
             "/:repo_key/@:scope/:package/-/:filename",
@@ -179,6 +191,170 @@ fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
 async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
         .await
+}
+
+// ---------------------------------------------------------------------------
+// npm security advisories (npm audit) -- issue #1400
+// ---------------------------------------------------------------------------
+
+/// Build the empty `advisories/bulk` response shape that npm clients expect
+/// when no advisories are known for any of the requested packages. An empty
+/// JSON object signals "no advisories" without producing a parse error.
+fn empty_advisories_bulk_response() -> Response {
+    build_json_metadata_response(serde_json::Value::Object(serde_json::Map::new()).to_string())
+}
+
+/// Build the empty `audits/quick` response shape for the legacy npm audit
+/// endpoint. Returns a well-formed report with zero vulnerabilities so older
+/// npm and yarn clients treat the audit as a success rather than failing the
+/// command.
+fn empty_audits_quick_response() -> Response {
+    let body = serde_json::json!({
+        "actions": [],
+        "advisories": {},
+        "muted": [],
+        "metadata": {
+            "vulnerabilities": {
+                "info": 0,
+                "low": 0,
+                "moderate": 0,
+                "high": 0,
+                "critical": 0,
+            },
+            "dependencies": 0,
+            "devDependencies": 0,
+            "optionalDependencies": 0,
+            "totalDependencies": 0,
+        }
+    });
+    build_json_metadata_response(body.to_string())
+}
+
+/// Forward an npm audit POST request to the configured upstream registry.
+///
+/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
+/// whichever upstream is configured) so `npm audit` works for cached/mirrored
+/// dependencies. The full client body is forwarded verbatim. On any upstream
+/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
+/// well-formed response so the audit degrades gracefully instead of failing
+/// the client command. See issue #1400.
+async fn proxy_npm_audit_post(
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    empty_fallback: fn() -> Response,
+) -> Response {
+    let base = upstream_url.trim_end_matches('/');
+    let url = format!("{}{}", base, path);
+    let client = crate::services::http_client::default_client();
+    let req = client
+        .post(&url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    if !status.is_success() {
+                        debug!(
+                            target: "npm_audit",
+                            upstream = %url,
+                            status = %status,
+                            "npm audit upstream returned non-success; serving empty advisories"
+                        );
+                        return empty_fallback();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| empty_fallback())
+                }
+                Err(err) => {
+                    debug!(
+                        target: "npm_audit",
+                        upstream = %url,
+                        error = %err,
+                        "failed to read npm audit upstream body; serving empty advisories"
+                    );
+                    empty_fallback()
+                }
+            }
+        }
+        Err(err) => {
+            debug!(
+                target: "npm_audit",
+                upstream = %url,
+                error = %err,
+                "failed to reach npm audit upstream; serving empty advisories"
+            );
+            empty_fallback()
+        }
+    }
+}
+
+/// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
+///
+/// This endpoint is used by `npm audit` (npm >= 7) to look up known security
+/// advisories for the dependency graph. Remote repositories forward the
+/// request to the configured upstream registry. Local, Staging, and Virtual
+/// repositories return an empty advisory map so `npm audit` reports zero
+/// vulnerabilities instead of failing with a 404. See issue #1400.
+async fn security_advisories_bulk(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            return Ok(proxy_npm_audit_post(
+                upstream_url,
+                "/-/npm/v1/security/advisories/bulk",
+                body,
+                empty_advisories_bulk_response,
+            )
+            .await);
+        }
+    }
+
+    Ok(empty_advisories_bulk_response())
+}
+
+/// Handler for `POST /npm/{repo_key}/-/npm/v1/security/audits/quick`.
+///
+/// Legacy npm audit endpoint (npm v6) and the path some yarn versions use.
+/// Same Remote-proxy / empty-fallback behaviour as the bulk endpoint above.
+/// See issue #1400.
+async fn security_audits_quick(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            return Ok(proxy_npm_audit_post(
+                upstream_url,
+                "/-/npm/v1/security/audits/quick",
+                body,
+                empty_audits_quick_response,
+            )
+            .await);
+        }
+    }
+
+    Ok(empty_audits_quick_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,6 +2950,260 @@ mod tests {
             .await
             .expect("read body");
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
+
+        cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // npm audit advisories endpoint (issue #1400)
+    // -----------------------------------------------------------------------
+
+    /// The empty `advisories/bulk` response must be a JSON object so npm
+    /// parses it as "zero advisories" instead of bailing out. An array or
+    /// non-JSON body causes the npm client to print a parse error.
+    #[test]
+    fn test_empty_advisories_bulk_response_shape() {
+        let resp = super::empty_advisories_bulk_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.contains("application/json"),
+            "advisories/bulk must be JSON, got {ct}"
+        );
+
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 64 * 1024))
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert!(
+            parsed.is_object(),
+            "advisories/bulk response must be a JSON object, got {parsed:?}"
+        );
+        assert_eq!(
+            parsed.as_object().map(|m| m.len()).unwrap_or(0),
+            0,
+            "empty response must have no keys"
+        );
+    }
+
+    /// The empty `audits/quick` response must include `actions`, `advisories`,
+    /// `muted`, and `metadata.vulnerabilities` keys so the legacy npm v6 audit
+    /// command does not error out on missing fields.
+    #[test]
+    fn test_empty_audits_quick_response_shape() {
+        let resp = super::empty_audits_quick_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 64 * 1024))
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert!(parsed.get("actions").map(|v| v.is_array()).unwrap_or(false));
+        assert!(parsed
+            .get("advisories")
+            .map(|v| v.is_object())
+            .unwrap_or(false));
+        assert!(parsed.get("muted").map(|v| v.is_array()).unwrap_or(false));
+        let vulns = parsed
+            .pointer("/metadata/vulnerabilities")
+            .expect("metadata.vulnerabilities required");
+        for level in ["info", "low", "moderate", "high", "critical"] {
+            assert_eq!(
+                vulns.get(level).and_then(|v| v.as_u64()),
+                Some(0),
+                "level {level} must be present and zero"
+            );
+        }
+    }
+
+    /// Integration: a Hosted (Local) npm repo must serve `npm audit` with an
+    /// empty advisories object instead of returning 404. Without this, npm
+    /// audit fails the entire CI build. Tests the full router path so the
+    /// route table actually includes the new endpoint.
+    #[tokio::test]
+    async fn test_local_repo_advisories_bulk_returns_empty_object() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let body = serde_json::json!({
+            "express": ["4.17.0"],
+        })
+        .to_string();
+        let req = tdh::post(uri, "application/json", Bytes::from(body));
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!("Local npm repo must answer audit with 200, got {status}");
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "Local repo audit must return empty object, got {parsed:?}"
+        );
+
+        cleanup().await;
+    }
+
+    /// Integration: a Remote npm repo must forward the audit POST body
+    /// verbatim to the configured upstream registry and return the upstream
+    /// response body to the client. Mirrors the `npm audit` flow in
+    /// production where artifact-keeper is configured as the proxy and the
+    /// upstream is npmjs.org.
+    #[tokio::test]
+    async fn test_remote_repo_advisories_bulk_proxies_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let upstream_response = serde_json::json!({
+            "express": [
+                {
+                    "id": 1234,
+                    "url": "https://github.com/advisories/GHSA-xxxx",
+                    "title": "Test advisory",
+                    "severity": "high",
+                    "vulnerable_versions": "<4.17.3",
+                }
+            ]
+        });
+        let client_request = serde_json::json!({"express": ["4.17.0"]});
+
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .and(body_json(client_request.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(upstream_response.clone()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let req = tdh::post(
+            uri,
+            "application/json",
+            Bytes::from(client_request.to_string()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!("Remote npm repo must proxy audit to upstream with 200, got {status}");
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert_eq!(
+            parsed, upstream_response,
+            "Remote audit response must be the upstream payload verbatim"
+        );
+
+        cleanup().await;
+    }
+
+    /// Integration: a Remote npm repo whose upstream is unreachable must
+    /// degrade gracefully and return an empty advisories object so the
+    /// developer's `npm audit` command still exits cleanly. This is the
+    /// fallback contract callers depend on when the upstream is offline.
+    #[tokio::test]
+    async fn test_remote_repo_advisories_bulk_falls_back_when_upstream_down() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        // Point at a localhost port that nothing is listening on. This is
+        // SSRF-safe through default_client because the request itself never
+        // completes; we just need a guaranteed connection failure.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind("http://127.0.0.1:1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let req = tdh::post(
+            uri,
+            "application/json",
+            Bytes::from(r#"{"express":["4.17.0"]}"#.as_bytes().to_vec()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!(
+                "Remote npm repo must degrade to empty advisories on upstream \
+                 failure, got {status}"
+            );
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "fallback response must be an empty object, got {parsed:?}"
+        );
 
         cleanup().await;
     }
