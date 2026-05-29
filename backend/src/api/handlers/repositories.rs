@@ -1530,11 +1530,27 @@ pub async fn list_artifacts(
             std::collections::HashMap::new()
         };
 
+    // For npm-family repos the artifact is stored under the
+    // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
+    // (see `api::handlers::npm::store_npm_version`), but npm clients and
+    // every external consumer reference tarballs by the download-URL
+    // shape `<name>/-/<name>-<version>.tgz`. Surface the URL shape in the
+    // listing's `path` so callers that resolve an artifact by the path
+    // npm published (the management UI, SDKs, the release-gate real-flow
+    // smoke test) match against the same string they downloaded from.
+    // Lookup-by-path already accepts both shapes via
+    // `normalize_lookup_path` (#1443); this keeps the listing consistent.
+    let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
+
     let mut items = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
-        items.push(build_artifact_response(&artifact, &key, download_count));
+        let mut item = build_artifact_response(&artifact, &key, download_count);
+        if rewrite_npm_tarball_paths {
+            apply_npm_tarball_url_path(&mut item);
+        }
+        items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
             items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
@@ -1633,6 +1649,21 @@ async fn lookup_artifact_by_paths(
         }
     }
     Ok(None)
+}
+
+/// Rewrite an npm-family artifact listing row's `path` from the
+/// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
+/// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
+///
+/// No-op for any row whose path is not a stored npm tarball (metadata
+/// rows, raw uploads, paths already in URL form), so the listing keeps
+/// reporting those verbatim. See the real-flow-smoke follow-up to #1443:
+/// callers resolve a tarball by the URL path they downloaded from, which
+/// must match what the listing reports.
+fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
+    if let Some(url_path) = crate::formats::npm::tarball_url_path_from_stored(&item.path) {
+        item.path = url_path;
+    }
 }
 
 fn build_artifact_response(
@@ -3806,6 +3837,57 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_npm_tarball_url_path: the listing rewrite that lets npm clients
+    // (and the release-gate real-flow smoke test) resolve a tarball by the
+    // `<name>/-/<file>.tgz` URL path they downloaded from, even though it is
+    // stored under `<name>/<version>/<file>.tgz`. Follow-up to #1443.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_stored_tarball() {
+        let a = make_artifact_for_test("rfs-pkg/1.0.5/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_scoped_stored_tarball() {
+        let a = make_artifact_for_test("@angular/core/17.0.0/core-17.0.0.tgz");
+        let mut resp = build_artifact_response(&a, "npm-hosted", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "@angular/core/-/core-17.0.0.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_noop_for_metadata_row() {
+        // Non-tarball rows (a bare package metadata path) are left verbatim.
+        let a = make_artifact_for_test("rfs-pkg/package.json");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/package.json");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_idempotent_on_url_shape() {
+        // A path already in the `/-/` URL shape must not be rewritten again.
+        let a = make_artifact_for_test("rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_is_npm_family_format_covers_npm_aliases() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
     }
 
     #[test]
