@@ -1012,6 +1012,75 @@ impl RepositoryService {
         Ok(())
     }
 
+    /// Bulk-update the priorities of existing members of a virtual repository.
+    ///
+    /// `members` is a list of `(member_repo_id, priority)` pairs. Only rows
+    /// that already exist as members of `virtual_repo_id` are updated; rows are
+    /// neither inserted nor deleted. Returns the set of `member_repo_id`s that
+    /// actually matched so the caller can detect a TOCTOU miss (a member that
+    /// was removed between resolution and this UPDATE) and surface a 404.
+    ///
+    /// # Concurrency (B2)
+    ///
+    /// The UNNEST UPDATE acquires row locks on the matched rows in whatever
+    /// order the planner scans them. Two concurrent PUTs whose member sets
+    /// overlap (e.g. `{A,B}` vs `{B,C}`) can therefore each grab one shared
+    /// row and then block on the row the other holds, which Postgres only
+    /// resolves after `deadlock_timeout` by aborting one side. Under a tight
+    /// race loop that surfaces as repeated multi-second stalls / 500s that
+    /// blow the client timeout budget.
+    ///
+    /// Taking the same process-wide transaction-scoped advisory lock that
+    /// `add_virtual_member` uses serialises every member-graph mutation, so
+    /// no two of these UPDATEs ever contend for the same rows. The lock is
+    /// released automatically on commit/rollback. The critical section is a
+    /// single small UPDATE, so throughput impact on this rare administrative
+    /// action is negligible.
+    pub async fn update_virtual_member_priorities(
+        &self,
+        virtual_repo_id: Uuid,
+        member_repo_ids: &[Uuid],
+        priorities: &[i32],
+    ) -> Result<Vec<Uuid>> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(VIRTUAL_MEMBER_GRAPH_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let updated: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE virtual_repo_members
+               SET priority = c.priority
+              FROM (
+                SELECT * FROM UNNEST($2::uuid[], $3::int4[])
+                         AS t(member_repo_id, priority)
+              ) AS c
+             WHERE virtual_repo_members.virtual_repo_id = $1
+               AND virtual_repo_members.member_repo_id = c.member_repo_id
+            RETURNING virtual_repo_members.member_repo_id
+            "#,
+        )
+        .bind(virtual_repo_id)
+        .bind(member_repo_ids)
+        .bind(priorities)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(updated)
+    }
+
     /// Get virtual repository members
     pub async fn get_virtual_members(&self, virtual_repo_id: Uuid) -> Result<Vec<Repository>> {
         let repos = sqlx::query_as!(
