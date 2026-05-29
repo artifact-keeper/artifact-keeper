@@ -238,6 +238,35 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
+# Grant the DT team the permissions the backend integration depends on
+# (#1472). Without these, SBOM uploads from the scan pipeline silently
+# 401/403 and DT stays empty even when AK scans look green. The DT default
+# Automation team has NONE of these permissions, so without the loop below
+# the AK integration is broken-on-bootstrap.
+#
+# Source of truth for the permission list lives in
+# backend/src/services/dependency_track_service.rs (module docs + the
+# DT_PERMISSIONS_HINT constant). Keep these in sync.
+echo "[dtrack-init] Granting required permissions to $DT_TEAM_NAME team..."
+for PERM in BOM_UPLOAD PROJECT_CREATION_UPLOAD VIEW_PORTFOLIO VIEW_VULNERABILITY; do
+  PERM_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$DT_URL/api/v1/permission/$PERM/team/$TEAM_UUID" \
+    -H "Authorization: Bearer $TOKEN")
+  case "$PERM_CODE" in
+    200|304)
+      echo "[dtrack-init]   - $PERM: granted (HTTP $PERM_CODE)"
+      ;;
+    *)
+      # Don't exit non-zero on a single grant failure: an already-granted
+      # permission may return non-2xx on some DT versions, and a transient
+      # error should not block bootstrap. The backend logs a clear
+      # permissions hint on every 401/403 (see dependency_track_service.rs)
+      # so a genuinely-missing grant is still operator-visible.
+      echo "[dtrack-init]   WARNING: granting $PERM returned HTTP $PERM_CODE" >&2
+      ;;
+  esac
+done
+
 echo "[dtrack-init] Enabling NVD REST API 2.0 mirroring..."
 NVD_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
   -X POST "$DT_URL/api/v1/configProperty" \
