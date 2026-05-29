@@ -2678,12 +2678,15 @@ mod tests {
 
     /// Regression: a Remote npm repo must be able to fetch a scoped-package
     /// tarball through the proxy. The upstream URL the proxy hits must be
-    /// `@scope%2Fpkg/-/{filename}` — the npm registry protocol requires the
-    /// scope separator to be percent-encoded, because some private
-    /// registries (Nexus, Verdaccio, GitHub Packages) reject the unencoded
-    /// form. The handler must also unwrap axum's path extractor correctly
-    /// so the test request `/repo/@scope/pkg/-/file.tgz` reaches
-    /// `download_scoped_tarball` (not the unscoped fallback).
+    /// `@scope/pkg/-/{filename}` with the scope separator kept as a literal
+    /// `/`. Unlike npm metadata (which encodes the separator as `%2F`),
+    /// tarball routes expect `@scope` and `pkg` as separate path segments;
+    /// percent-encoding the slash collapses them into one `@scope%2Fpkg`
+    /// segment that no upstream tarball route matches, so the proxy fetch
+    /// 404s. See `build_tarball_upstream_path` (B7 / #1377). The handler must
+    /// also unwrap axum's path extractor correctly so the test request
+    /// `/repo/@scope/pkg/-/file.tgz` reaches `download_scoped_tarball` (not
+    /// the unscoped fallback).
     #[tokio::test]
     async fn test_remote_proxy_download_scoped_tarball_hits_encoded_upstream_path() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2697,11 +2700,13 @@ mod tests {
         let mock_server = MockServer::start().await;
         let tarball_bytes = b"\x1f\x8b\x08mock-scoped-tarball-bytes";
 
-        // Upstream must see the scope encoded as %2F. wiremock's `path`
-        // matcher receives the raw request path (after axum's transport
-        // decoded it), so we match the canonical npm-registry shape.
+        // Upstream must see the scope separator as a literal `/`
+        // (`@scope/pkg/-/file.tgz`), matching the canonical npm tarball
+        // route. wiremock's `path` matcher receives the request path with
+        // scope and package as separate segments; this is the shape
+        // `build_tarball_upstream_path` produces (B7 / #1377).
         Mock::given(method("GET"))
-            .and(path("/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz"))
+            .and(path("/@e2escope/testpkg/-/testpkg-1.0.0.tgz"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/octet-stream")
