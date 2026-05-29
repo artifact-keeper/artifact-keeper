@@ -292,7 +292,15 @@ impl StorageGcService {
     /// [`is_still_orphan`] before deletion so that pushes landing between
     /// this scan and the per-key delete cannot get their references
     /// silently dropped (#1180).
-    async fn select_orphans(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
+    ///
+    /// Visibility is `pub(crate)` so that unit tests in the same crate can
+    /// inspect the candidate set per-storage-key. The dry-run regression
+    /// tests (#1490 / #1493) cannot assert on the global
+    /// `storage_keys_deleted` counter because concurrent integration tests
+    /// share the same Postgres database, and a peer test's in-flight
+    /// orphan row would inflate that counter. Asserting per-key against
+    /// this candidate list keeps each test isolated from its neighbors.
+    pub(crate) async fn select_orphans(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql = format!(
             r#"
             SELECT a.storage_key, r.storage_backend, r.storage_path,
@@ -1036,17 +1044,24 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let result = service.run_gc(true).await;
+        let orphans = service.select_orphans().await;
 
+        let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
+        let our_repo_id = fixture.repo_id;
         fixture.teardown().await;
 
-        let result = result.expect("dry-run gc succeeds");
-        assert_eq!(
-            result.storage_keys_deleted, 0,
-            "GC must not delete manifest storage that is still referenced by oci_tags"
+        let orphans = orphans.expect("dry-run candidate scan succeeds");
+        let our_key_collected = orphans.iter().any(|row| {
+            let key: String = row.try_get("storage_key").unwrap_or_default();
+            let backend: String = row.try_get("storage_backend").unwrap_or_default();
+            let path: String = row.try_get("storage_path").unwrap_or_default();
+            key == storage_key && backend == "filesystem" && path == storage_path_str
+        });
+        assert!(
+            !our_key_collected,
+            "GC must not flag {} (repo {}) as orphan while it is still referenced by oci_tags",
+            storage_key, our_repo_id
         );
-        assert_eq!(result.artifacts_removed, 0);
-        assert_eq!(result.bytes_freed, 0);
     }
 
     #[tokio::test]
@@ -1099,17 +1114,24 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let result = service.run_gc(true).await;
+        let orphans = service.select_orphans().await;
 
+        let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
+        let our_repo_id = fixture.repo_id;
         fixture.teardown().await;
 
-        let result = result.expect("dry-run gc succeeds");
-        assert_eq!(
-            result.storage_keys_deleted, 0,
-            "GC must not delete blob storage that is still referenced by oci_blobs"
+        let orphans = orphans.expect("dry-run candidate scan succeeds");
+        let our_key_collected = orphans.iter().any(|row| {
+            let key: String = row.try_get("storage_key").unwrap_or_default();
+            let backend: String = row.try_get("storage_backend").unwrap_or_default();
+            let path: String = row.try_get("storage_path").unwrap_or_default();
+            key == storage_key && backend == "filesystem" && path == storage_path_str
+        });
+        assert!(
+            !our_key_collected,
+            "GC must not flag {} (repo {}) as orphan while it is still referenced by oci_blobs",
+            storage_key, our_repo_id
         );
-        assert_eq!(result.artifacts_removed, 0);
-        assert_eq!(result.bytes_freed, 0);
     }
 
     /// End-to-end variant of the manifest-survival test: run GC with
@@ -1201,17 +1223,21 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let result = service.run_gc(false).await.expect("live gc succeeds");
+        let _ = service.run_gc(false).await.expect("live gc succeeds");
 
         let file_still_exists = storage.exists(&storage_key).await.expect("exists check");
+        let row_still_exists = count_soft_deleted_with_key(&fixture.pool, &storage_key).await == 1;
 
         fixture.teardown().await;
 
-        assert_eq!(
-            result.storage_keys_deleted, 0,
-            "live GC must not delete a manifest referenced by oci_tags"
+        // Per-key assertions: concurrent integration tests share this DB,
+        // so the global `storage_keys_deleted` counter is not isolation-safe
+        // here. Verifying our specific row + file survived is.
+        assert!(
+            row_still_exists,
+            "soft-deleted artifact row for {} must survive a live GC pass while oci_tags references it",
+            storage_key
         );
-        assert_eq!(result.artifacts_removed, 0);
         assert!(
             file_still_exists,
             "manifest file must remain on disk after a live GC pass when oci_tags references it"
