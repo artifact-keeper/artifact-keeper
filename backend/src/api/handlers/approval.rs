@@ -1223,18 +1223,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_promotion_repos_source_not_staging() {
+    fn test_validate_promotion_repos_source_not_hosted() {
+        // B12 / #1376: the source-shape check now rejects only non-hosted
+        // repositories (Remote/Virtual). A Remote source owns no bytes and
+        // cannot be promoted from. (A Local source is now allowed, see
+        // promotion.rs `test_validate_promotion_repos_source_local_is_allowed`.)
         use crate::models::repository::*;
         let source = Repository {
             id: Uuid::nil(),
-            key: "local-maven".to_string(),
-            name: "Local Maven".to_string(),
+            key: "remote-maven".to_string(),
+            name: "Remote Maven".to_string(),
             description: None,
             format: RepositoryFormat::Maven,
             storage_backend: "filesystem".to_string(),
-            repo_type: RepositoryType::Local,
-            storage_path: "/tmp/local".to_string(),
-            upstream_url: None,
+            repo_type: RepositoryType::Remote,
+            storage_path: "/tmp/remote".to_string(),
+            upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
             is_public: false,
             quota_bytes: None,
             replication_priority: ReplicationPriority::LocalOnly,
@@ -1276,7 +1280,7 @@ mod tests {
         let result = validate_promotion_repos(&source, &target);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("staging"), "Error: {}", err_msg);
+        assert!(err_msg.contains("hosted"), "Error: {}", err_msg);
     }
 
     #[test]
