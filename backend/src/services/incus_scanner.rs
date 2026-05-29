@@ -23,20 +23,63 @@ use crate::services::scanner_service::{
     cached_trivy_cli_version, fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
-/// Maximum compressed input size we will attempt to extract (2 GiB). Untrusted
-/// archives can be decompression bombs; refuse anything larger than this before
-/// writing it to disk. The uncompressed tree is further bounded by
-/// [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`] after extraction.
-const MAX_COMPRESSED_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default ceiling on compressed input size we will attempt to extract
+/// (16 GiB). Untrusted archives can be decompression bombs; refuse anything
+/// larger than this before writing it to disk. The uncompressed tree is
+/// further bounded by [`max_extracted_bytes`] / [`MAX_EXTRACTED_ENTRIES`]
+/// after extraction.
+///
+/// #1492: a real `incus export` OS image is several GiB compressed, so the
+/// prior 2 GiB cap rejected legitimate images before extraction even started.
+/// The default is now sized for real OS images and is overridable via
+/// [`MAX_INCUS_SCAN_COMPRESSED_BYTES_ENV`] for sites with larger images, while
+/// the bomb guard stays in force at whatever ceiling is configured.
+const DEFAULT_MAX_COMPRESSED_INPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Maximum total uncompressed bytes we tolerate in an extracted rootfs (10 GiB).
-/// Bounds decompression bombs that expand a small archive into a PVC-filling
-/// tree. Checked by walking the extracted tree after `tar` finishes.
-const MAX_EXTRACTED_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Default ceiling on total uncompressed bytes we tolerate in an extracted
+/// rootfs (64 GiB). Bounds decompression bombs that expand a small archive
+/// into a PVC-filling tree. Checked by walking the extracted tree after `tar`
+/// finishes. Overridable via [`MAX_INCUS_SCAN_EXTRACTED_BYTES_ENV`].
+const DEFAULT_MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Maximum number of filesystem entries we tolerate in an extracted rootfs.
 /// Bounds inode-exhaustion bombs (millions of tiny files).
 const MAX_EXTRACTED_ENTRIES: u64 = 2_000_000;
+
+/// Env var overriding the compressed-input ceiling (plain byte count).
+const MAX_INCUS_SCAN_COMPRESSED_BYTES_ENV: &str = "MAX_INCUS_SCAN_COMPRESSED_BYTES";
+
+/// Env var overriding the extracted-tree byte ceiling (plain byte count).
+const MAX_INCUS_SCAN_EXTRACTED_BYTES_ENV: &str = "MAX_INCUS_SCAN_EXTRACTED_BYTES";
+
+/// Resolve a byte-size cap from an optional override string, falling back to
+/// `default` when the value is absent, blank, non-numeric, or zero. A zero cap
+/// would reject every image, so it is treated as "unset" rather than honoured.
+/// The override is a plain decimal byte count (e.g. `17179869184` for 16 GiB).
+fn resolve_byte_cap(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+/// Effective compressed-input ceiling, honouring
+/// [`MAX_INCUS_SCAN_COMPRESSED_BYTES_ENV`] over
+/// [`DEFAULT_MAX_COMPRESSED_INPUT_BYTES`].
+fn max_compressed_input_bytes() -> u64 {
+    resolve_byte_cap(
+        std::env::var(MAX_INCUS_SCAN_COMPRESSED_BYTES_ENV).ok(),
+        DEFAULT_MAX_COMPRESSED_INPUT_BYTES,
+    )
+}
+
+/// Effective extracted-tree byte ceiling, honouring
+/// [`MAX_INCUS_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_EXTRACTED_BYTES`].
+fn max_extracted_bytes() -> u64 {
+    resolve_byte_cap(
+        std::env::var(MAX_INCUS_SCAN_EXTRACTED_BYTES_ENV).ok(),
+        DEFAULT_MAX_EXTRACTED_BYTES,
+    )
+}
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
 async fn write_temp_file(path: &Path, content: &Bytes, label: &str) -> Result<()> {
@@ -306,14 +349,15 @@ impl IncusScanner {
         }
     }
 
-    /// Reject a compressed input larger than [`MAX_COMPRESSED_INPUT_BYTES`].
-    /// Checked before the archive is written to disk so an oversized upload
-    /// never lands on the PVC.
+    /// Reject a compressed input larger than the effective compressed cap
+    /// ([`max_compressed_input_bytes`]). Checked before the archive is written
+    /// to disk so an oversized upload never lands on the PVC.
     fn check_compressed_input_size(input_len: u64) -> Result<()> {
-        if input_len > MAX_COMPRESSED_INPUT_BYTES {
+        let cap = max_compressed_input_bytes();
+        if input_len > cap {
             return Err(AppError::Internal(format!(
                 "Incus archive too large to scan: {} bytes exceeds limit of {} bytes",
-                input_len, MAX_COMPRESSED_INPUT_BYTES
+                input_len, cap
             )));
         }
         Ok(())
@@ -323,9 +367,9 @@ impl IncusScanner {
     ///
     /// Hardened against malicious archives and against state/modes the runtime
     /// UID can't later traverse or delete:
-    ///   * input size is capped at [`MAX_COMPRESSED_INPUT_BYTES`] *before*
+    ///   * input size is capped at [`max_compressed_input_bytes`] *before*
     ///     writing the archive, and the extracted tree is bounded by
-    ///     [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`] afterwards, so a
+    ///     [`max_extracted_bytes`] / [`MAX_EXTRACTED_ENTRIES`] afterwards, so a
     ///     decompression bomb can't fill the PVC;
     ///   * `--overwrite` is intentionally NOT passed: it disables GNU tar's
     ///     in-archive symlink-overwrite protection, which a crafted archive uses
@@ -392,13 +436,91 @@ impl IncusScanner {
     /// posture (symlink-traversal rejection + decompression-bomb caps) is
     /// identical regardless of image format.
     ///
-    ///   1. reject any symlink that escapes the workspace root (traversal),
-    ///   2. enforce the uncompressed-size / entry-count bomb caps.
+    ///   1. make the tree owner-traversable so the non-root scanner UID can
+    ///      walk it and trivy can read the package DBs (#1492),
+    ///   2. reject any symlink that escapes the workspace root (traversal),
+    ///   3. enforce the uncompressed-size / entry-count bomb caps.
     async fn run_extraction_guard(root: &Path) -> Result<()> {
         let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::enforce_extraction_limits(&root))
-            .await
-            .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
+        tokio::task::spawn_blocking(move || {
+            // Open the tree up to the owner first: a real OS rootfs ships
+            // restrictive modes (0700 dirs, 0600 files), and `--no-same-owner`
+            // extraction plus tar's implicitly-created parent dirs leave parts
+            // of the tree untraversable by the non-root scanner UID. Without
+            // this the symlink/bomb walk below (and later trivy) EACCES on the
+            // first locked dir. Done in-process (not `chmod -R`) so we never
+            // chase a symlink target out of the workspace (#1492).
+            Self::make_tree_owner_traversable(&root)?;
+            Self::enforce_extraction_limits(&root)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Extraction guard task failed: {}", e)))?
+    }
+
+    /// Recursively add owner read/write/traverse bits (`u+rwX`) to every real
+    /// directory and file under `root` so the non-root scanner UID can walk the
+    /// tree and trivy can read its package databases. Walks top-down so a
+    /// `0o000` directory is opened before we descend into it.
+    ///
+    /// Symlinks are skipped via `symlink_metadata` and never followed, so an
+    /// in-tree `var/run -> /run` (or any absolute link) cannot cause us to
+    /// chmod a path outside the workspace — the property `chmod -R` cannot
+    /// guarantee. Only owner bits are added; group/other are never widened.
+    fn make_tree_owner_traversable(root: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            // Ensure this directory is traversable/readable before we list it.
+            // Owners may always chmod their own inode regardless of its current
+            // mode, so a 0o000 dir is recoverable here.
+            if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+                if meta.file_type().is_dir() {
+                    let mode = meta.permissions().mode();
+                    let mut perms = meta.permissions();
+                    perms.set_mode(mode | 0o700);
+                    let _ = std::fs::set_permissions(&dir, perms);
+                }
+            }
+
+            let entries = std::fs::read_dir(&dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to read {} while opening tree: {}",
+                    dir.display(),
+                    e
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    AppError::Internal(format!(
+                        "Failed to read dir entry while opening tree: {}",
+                        e
+                    ))
+                })?;
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                    AppError::Internal(format!(
+                        "Failed to stat {} while opening tree: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+                let file_type = meta.file_type();
+                if file_type.is_symlink() {
+                    // Never chmod through a link; the traversal guard checks it.
+                    continue;
+                }
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    let mode = meta.permissions().mode();
+                    let mut perms = meta.permissions();
+                    perms.set_mode(mode | 0o600);
+                    let _ = std::fs::set_permissions(&path, perms);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Walk the extracted tree (synchronously) and abort if it contains a
@@ -418,6 +540,7 @@ impl IncusScanner {
             ))
         })?;
 
+        let max_bytes = max_extracted_bytes();
         let mut total_bytes: u64 = 0;
         let mut total_entries: u64 = 0;
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -462,10 +585,10 @@ impl IncusScanner {
                     stack.push(path);
                 } else if file_type.is_file() {
                     total_bytes += meta.len();
-                    if total_bytes > MAX_EXTRACTED_BYTES {
+                    if total_bytes > max_bytes {
                         return Err(AppError::Internal(format!(
                             "Incus archive expands to more than {} bytes; refusing to scan suspected decompression bomb",
-                            MAX_EXTRACTED_BYTES
+                            max_bytes
                         )));
                     }
                 }
@@ -485,18 +608,31 @@ impl IncusScanner {
             ))
         })?;
 
-        // Resolve the target relative to the link's parent directory, then
-        // normalise lexically (collapsing `.` / `..`) so dangling targets are
-        // still checked. We deliberately avoid `canonicalize` on the joined
-        // path because it fails on dangling links. The link's parent always
-        // exists during the walk, so canonicalize it first — this maps it onto
-        // the same realpath the root was canonicalized to (e.g. macOS
-        // `/var/folders` -> `/private/var/folders`), avoiding a false reject of
-        // in-tree relative links.
+        // Resolve the target, then normalise lexically (collapsing `.` / `..`)
+        // so dangling targets are still checked. We deliberately avoid
+        // `canonicalize` on the joined path because it fails on dangling links.
+        //
+        // #1492: an absolute target inside a container rootfs points at the
+        // *image* root, not the host root. Every real OS rootfs ships absolute
+        // intra-image links like `/var/run -> /run`; resolving them against the
+        // host (the prior behaviour) flagged them as escaping and made it
+        // impossible to scan any real image. Re-root absolute targets under the
+        // workspace (chroot semantics) by stripping the leading `/` and joining
+        // onto `canonical_root`. Any `..` components survive the strip and are
+        // collapsed by `normalize_lexically`, so an absolute link that climbs
+        // out of the re-rooted workspace still fails the `starts_with` check
+        // below. Relative targets resolve against the link's parent as before.
         let raw_parent = link.parent().unwrap_or(canonical_root);
         let parent = std::fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
         let joined = if target.is_absolute() {
-            target.clone()
+            // Strip the root/prefix so the target is re-anchored under the
+            // workspace; `..` components are preserved and checked.
+            use std::path::Component;
+            let rerooted: PathBuf = target
+                .components()
+                .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
+                .collect();
+            canonical_root.join(rerooted)
         } else {
             parent.join(&target)
         };
@@ -561,11 +697,11 @@ impl IncusScanner {
     /// Hardened with the same defenses as [`Self::extract_tarball`]: a squashfs
     /// image is just as capable of being a decompression bomb or carrying
     /// escaping symlinks as a tarball.
-    ///   * input size is capped at [`MAX_COMPRESSED_INPUT_BYTES`] *before*
+    ///   * input size is capped at [`max_compressed_input_bytes`] *before*
     ///     writing the image to disk;
     ///   * after extraction, [`Self::run_extraction_guard`] walks the output
     ///     tree and aborts on any symlink that escapes the workspace root or if
-    ///     the tree exceeds [`MAX_EXTRACTED_BYTES`] / [`MAX_EXTRACTED_ENTRIES`];
+    ///     the tree exceeds [`max_extracted_bytes`] / [`MAX_EXTRACTED_ENTRIES`];
     ///   * `unsquashfs -f` (force-overwrite) is intentionally NOT passed. `-f`
     ///     only matters when the destination already holds conflicting files;
     ///     it makes unsquashfs unlink and overwrite them, which weakens the
@@ -1507,11 +1643,15 @@ mod tests {
 
     /// Platform-independent traversal-guard check for the SQUASHFS path: build an
     /// extracted-tree shape (the kind `unsquashfs` would produce) containing a
-    /// symlink that escapes the workspace root, and assert the shared
-    /// `enforce_extraction_limits` guard rejects it. This is the same helper the
-    /// squashfs path now routes through, so it covers the guard logic on CI
-    /// without an `unsquashfs` dependency. Complements the GNU-tar-gated
+    /// `../`-relative symlink that escapes the workspace root, and assert the
+    /// shared `enforce_extraction_limits` guard rejects it. This is the same
+    /// helper the squashfs path now routes through, so it covers the guard logic
+    /// on CI without an `unsquashfs` dependency. Complements the GNU-tar-gated
     /// `test_extract_tarball_rejects_escaping_symlink`.
+    ///
+    /// #1492: an absolute target is re-rooted under the workspace (chroot
+    /// semantics) and is no longer an escape, so this exercises the relative
+    /// `../` form that still escapes.
     #[tokio::test]
     async fn test_squashfs_extracted_tree_rejects_escaping_symlink() {
         let dir = tempfile::tempdir().unwrap();
@@ -1522,10 +1662,8 @@ mod tests {
         tokio::fs::write(dest.join("etc/os-release"), b"ID=alpine\n")
             .await
             .unwrap();
-        let outside = dir.path().join("host-secret");
-        tokio::fs::create_dir_all(&outside).await.unwrap();
-        // Absolute escape: rootfs/etc/escape -> <tmp>/host-secret (outside dest).
-        std::os::unix::fs::symlink(&outside, dest.join("etc/escape")).unwrap();
+        // Relative escape: rootfs/etc/escape -> ../../../host-secret (climbs out).
+        std::os::unix::fs::symlink("../../../host-secret", dest.join("etc/escape")).unwrap();
 
         let res = IncusScanner::run_extraction_guard(&dest).await;
         assert!(
@@ -1549,7 +1687,7 @@ mod tests {
     async fn test_extract_squashfs_enforces_compressed_cap() {
         // The squashfs path shares the same compressed-size gate as the tarball
         // path; an over-limit input is refused before it touches disk.
-        let res = IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES + 1);
+        let res = IncusScanner::check_compressed_input_size(max_compressed_input_bytes() + 1);
         assert!(res.is_err());
         assert!(format!("{}", res.unwrap_err()).contains("too large to scan"));
     }
@@ -1899,9 +2037,11 @@ mod tests {
         scanner.cleanup_workspace(&workspace).await;
     }
 
-    /// Path-traversal guard: an archive containing a symlink that escapes the
-    /// workspace must be rejected, and nothing may be written outside the
-    /// workspace via that link.
+    /// Path-traversal guard: an archive containing a `../`-relative symlink that
+    /// escapes the workspace must be rejected, and nothing may be written
+    /// outside the workspace via that link. (#1492: absolute targets are now
+    /// re-rooted under the workspace per chroot semantics and are no longer
+    /// treated as escapes; the relative `../` escape below still is.)
     #[tokio::test]
     async fn test_extract_tarball_rejects_escaping_symlink() {
         if !system_tar_is_gnu() {
@@ -1922,17 +2062,17 @@ mod tests {
         let workspace = dir.path().join("ws");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        // Build an archive with a symlink `rootfs -> <escape_target>` followed by
-        // a write through it (`rootfs/pwned`). Without --absolute-names tar keeps
-        // the absolute symlink target verbatim; our guard must still catch it.
+        // Build an archive with a relative symlink `rootfs/escape -> ../../escape_target`
+        // that climbs out of the workspace. Lexical normalisation resolves it
+        // outside the root, so the guard must reject it.
         let mut tar_data = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_data);
 
             let mut link = tar::Header::new_gnu();
             link.set_entry_type(tar::EntryType::Symlink);
-            link.set_path("rootfs").unwrap();
-            link.set_link_name(&escape_target).unwrap();
+            link.set_path("rootfs/escape").unwrap();
+            link.set_link_name("../../escape_target").unwrap();
             link.set_size(0);
             link.set_cksum();
             builder.append(&link, std::io::empty()).unwrap();
@@ -1949,7 +2089,7 @@ mod tests {
         let result = scanner.extract_tarball(&tarball, &workspace).await;
         assert!(
             result.is_err(),
-            "extraction must be rejected when an archive plants an escaping symlink"
+            "extraction must be rejected when an archive plants a ../-escaping symlink"
         );
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -2074,22 +2214,25 @@ mod tests {
     }
 
     /// Platform-independent traversal-guard check: build the extracted tree
-    /// directly with symlinks escaping the workspace root and assert
-    /// `enforce_extraction_limits` rejects them. Complements
+    /// directly with a `../`-relative symlink escaping the workspace root and
+    /// assert `enforce_extraction_limits` rejects it. Complements
     /// `test_extract_tarball_rejects_escaping_symlink` (which needs GNU tar).
+    ///
+    /// #1492: a plain absolute symlink (`-> /run`, `-> <tmp>/secret`) is no
+    /// longer treated as an escape — absolute targets are re-rooted under the
+    /// workspace (chroot semantics), so this test exercises the relative `../`
+    /// escape that survives the change. Absolute acceptance and absolute
+    /// climbing-out are covered by their own dedicated tests above.
     #[tokio::test]
     async fn test_enforce_extraction_limits_rejects_escaping_symlink() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Absolute escape: rootfs/etc/escape -> <tmp>/secret (outside `root`).
+        // Relative escape: rootfs/etc/dotdot -> ../../../secret (dangling-safe).
         let root = dir.path().join("ws");
         tokio::fs::create_dir_all(root.join("rootfs/etc"))
             .await
             .unwrap();
-        let outside = dir.path().join("secret");
-        tokio::fs::create_dir_all(&outside).await.unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("rootfs/etc/escape")).unwrap();
-
+        std::os::unix::fs::symlink("../../../secret", root.join("rootfs/etc/dotdot")).unwrap();
         let root2 = root.clone();
         let res =
             tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root2))
@@ -2097,7 +2240,7 @@ mod tests {
                 .unwrap();
         assert!(
             res.is_err(),
-            "absolute escaping symlink must be rejected by the guard"
+            "relative `../` escape must be rejected by the guard"
         );
         let msg = format!("{}", res.unwrap_err());
         assert!(
@@ -2105,32 +2248,17 @@ mod tests {
             "guard error must name the traversal; got: {}",
             msg
         );
-
-        // Relative escape: rootfs/etc/dotdot -> ../../../secret (dangling-safe).
-        let root3 = dir.path().join("ws2");
-        tokio::fs::create_dir_all(root3.join("rootfs/etc"))
-            .await
-            .unwrap();
-        std::os::unix::fs::symlink("../../../secret", root3.join("rootfs/etc/dotdot")).unwrap();
-        let root3c = root3.clone();
-        let res2 =
-            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root3c))
-                .await
-                .unwrap();
-        assert!(
-            res2.is_err(),
-            "relative `../` escape must be rejected by the guard"
-        );
     }
 
     /// Compressed-input bomb cap (#2): inputs over the limit are rejected before
     /// they touch disk; inputs at/under the limit pass the size gate.
     #[test]
     fn test_check_compressed_input_size_enforced() {
+        let cap = max_compressed_input_bytes();
         // At the limit: allowed.
-        assert!(IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES).is_ok());
+        assert!(IncusScanner::check_compressed_input_size(cap).is_ok());
         // One byte over: rejected.
-        let res = IncusScanner::check_compressed_input_size(MAX_COMPRESSED_INPUT_BYTES + 1);
+        let res = IncusScanner::check_compressed_input_size(cap + 1);
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
         assert!(
@@ -2168,6 +2296,172 @@ mod tests {
         assert!(
             !workspace.exists(),
             "cleanup must remove the workspace despite a 0o500 subdir"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1492: env-tunable caps so a real multi-GiB OS image can be scanned.
+    // -----------------------------------------------------------------------
+
+    /// The byte-cap resolver falls back to the default when the override is
+    /// unset, blank, non-numeric, or zero, and otherwise honours the parsed
+    /// value. Pure over an `Option<String>` so the test never touches process
+    /// env (which would race other tests).
+    #[test]
+    fn test_resolve_byte_cap_fallback_and_override() {
+        let default = 16 * 1024 * 1024 * 1024;
+        // Unset -> default.
+        assert_eq!(resolve_byte_cap(None, default), default);
+        // Blank / whitespace -> default.
+        assert_eq!(resolve_byte_cap(Some("".to_string()), default), default);
+        assert_eq!(resolve_byte_cap(Some("   ".to_string()), default), default);
+        // Non-numeric -> default.
+        assert_eq!(
+            resolve_byte_cap(Some("16GiB".to_string()), default),
+            default
+        );
+        // Zero -> default (a 0 cap would reject everything; treat as unset).
+        assert_eq!(resolve_byte_cap(Some("0".to_string()), default), default);
+        // Valid integer (with surrounding whitespace) -> parsed.
+        assert_eq!(
+            resolve_byte_cap(Some(" 5368709120 ".to_string()), default),
+            5_368_709_120
+        );
+    }
+
+    /// The default compressed cap must comfortably admit a real multi-GiB
+    /// `incus export` OS image (the 2 GiB pre-#1492 cap rejected them).
+    #[test]
+    fn test_default_compressed_cap_admits_multi_gib_image() {
+        let three_and_a_half_gib = 7 * 1024 * 1024 * 1024 / 2; // 3.5 GiB
+        assert!(
+            DEFAULT_MAX_COMPRESSED_INPUT_BYTES >= three_and_a_half_gib,
+            "default compressed cap {} must admit a 3.5 GiB OS image",
+            DEFAULT_MAX_COMPRESSED_INPUT_BYTES
+        );
+        // And the size gate agrees at the default.
+        assert!(IncusScanner::check_compressed_input_size(three_and_a_half_gib).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1492: make the extracted tree owner-traversable so a non-root scanner
+    // UID can walk it (and trivy can read the package DBs). A real rootfs ships
+    // restrictive modes that, with `--no-same-owner` extraction, EACCES both.
+    // -----------------------------------------------------------------------
+
+    /// A `0o000` directory holding a `0o000` file must become owner-traversable
+    /// and owner-readable after `make_tree_owner_traversable`, without the call
+    /// chasing or modifying any symlink target.
+    #[tokio::test]
+    async fn test_make_tree_owner_traversable_opens_locked_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let locked = root.join("var/lib/private");
+        tokio::fs::create_dir_all(&locked).await.unwrap();
+        let file = locked.join("status");
+        tokio::fs::write(&file, b"Package: bash\n").await.unwrap();
+
+        // Lock the file and its parent dir to 0o000 (what a real rootfs may ship).
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let root2 = root.clone();
+        let res =
+            tokio::task::spawn_blocking(move || IncusScanner::make_tree_owner_traversable(&root2))
+                .await
+                .unwrap();
+        assert!(res.is_ok(), "making the tree traversable must succeed");
+
+        // The previously-locked dir is now traversable, and the file readable.
+        let dir_mode = std::fs::metadata(&locked).unwrap().permissions().mode() & 0o700;
+        assert_eq!(dir_mode, 0o700, "owner rwx must be set on the locked dir");
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o600;
+        assert_eq!(file_mode, 0o600, "owner rw must be set on the locked file");
+        assert!(std::fs::read_dir(&locked).is_ok(), "dir must be listable");
+        assert_eq!(std::fs::read(&file).unwrap(), b"Package: bash\n");
+    }
+
+    /// The post-extraction guard must succeed on a restrictively-permissioned
+    /// tree: it opens the tree first, then walks it. Pre-#1492 the guard's
+    /// `read_dir` hit EACCES on a `0o000` dir and the whole scan failed.
+    #[tokio::test]
+    async fn test_run_extraction_guard_handles_restrictive_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let locked = root.join("rootfs/root");
+        tokio::fs::create_dir_all(&locked).await.unwrap();
+        tokio::fs::write(locked.join(".bashrc"), b"export PS1=#\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        IncusScanner::run_extraction_guard(&root)
+            .await
+            .expect("guard must open and pass a restrictively-permissioned tree");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1492: chroot symlink semantics. Absolute targets resolve against the
+    // workspace root (an in-tree, benign reference), not the host root, so the
+    // ubiquitous `/var/run -> /run` present in every OS rootfs is accepted.
+    // `../`-style escapes are still rejected.
+    // -----------------------------------------------------------------------
+
+    /// An absolute symlink whose target is in-tree under chroot semantics
+    /// (`/var/run -> /run`, `/etc/x -> /usr/share/x`) must be accepted.
+    #[tokio::test]
+    async fn test_guard_accepts_absolute_intra_rootfs_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let var = root.join("backup/container/rootfs/var");
+        tokio::fs::create_dir_all(&var).await.unwrap();
+        // The exact link from the bug report: var/run -> /run (absolute).
+        std::os::unix::fs::symlink("/run", var.join("run")).unwrap();
+        // A second, deeper absolute link for good measure.
+        let etc = root.join("backup/container/rootfs/etc");
+        tokio::fs::create_dir_all(&etc).await.unwrap();
+        std::os::unix::fs::symlink("/usr/share/zoneinfo/UTC", etc.join("localtime")).unwrap();
+
+        let root2 = root.clone();
+        let res =
+            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root2))
+                .await
+                .unwrap();
+        assert!(
+            res.is_ok(),
+            "absolute intra-rootfs symlinks (e.g. /var/run -> /run) must be accepted under chroot semantics; got: {:?}",
+            res.err().map(|e| e.to_string())
+        );
+    }
+
+    /// An absolute symlink with enough `..` to climb out of the re-rooted
+    /// workspace must still be rejected as traversal.
+    #[tokio::test]
+    async fn test_guard_rejects_absolute_symlink_climbing_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let etc = root.join("rootfs/etc");
+        tokio::fs::create_dir_all(&etc).await.unwrap();
+        // Re-rooted under the workspace this still normalises above the root.
+        std::os::unix::fs::symlink("/../../../../../../../../etc/shadow", etc.join("evil"))
+            .unwrap();
+
+        let root2 = root.clone();
+        let res =
+            tokio::task::spawn_blocking(move || IncusScanner::enforce_extraction_limits(&root2))
+                .await
+                .unwrap();
+        assert!(
+            res.is_err(),
+            "an absolute symlink climbing out of the re-rooted workspace must be rejected"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("escaping the workspace") || msg.contains("path traversal"),
+            "error must name the traversal; got: {}",
+            msg
         );
     }
 }
