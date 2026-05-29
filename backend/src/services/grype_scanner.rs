@@ -153,6 +153,37 @@ fn truncate_stream(s: &str, max: usize) -> String {
     format!("…[truncated]{}", &s[boundary..])
 }
 
+/// Classify a `std::io::Error` from spawning `grype` into an `AppError`.
+///
+/// Issue #1465: the prior implementation used a substring search on the
+/// child process's stderr (`"not found" || "No such file"`) to detect "grype
+/// is not installed". That heuristic mis-fired whenever grype itself printed
+/// "not found" in a normal runtime error, most commonly an HTTP 404 from
+/// registry-mode against an image ref the registry didn't recognize. The
+/// operator saw "Grype binary not available" when grype was perfectly
+/// installed; they patched their Dockerfile and the issue remained.
+///
+/// The correct signal is `io::ErrorKind::NotFound` returned by the spawn
+/// itself, which the kernel sets when `execve()` cannot resolve the program
+/// name on PATH. Any other spawn failure (permission denied, fork failure,
+/// etc.) is surfaced as a generic "failed to execute Grype" so the operator
+/// gets the underlying OS error.
+///
+/// Returned as a pure helper so the classification has a unit test that does
+/// not depend on whether `grype` happens to be installed on the test host.
+fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::Internal(
+            "Grype binary not available (the `grype` executable was not \
+             found on PATH; install it or use the prebuilt artifact-keeper \
+             backend image which bundles grype at /usr/local/bin/grype)"
+                .to_string(),
+        )
+    } else {
+        AppError::Internal(format!("Failed to execute Grype: {}", err))
+    }
+}
+
 /// Resolve the registry host string Grype's `registry:` mode targets. The
 /// first non-empty source wins, in priority order:
 ///   1. `AK_GRYPE_REGISTRY_HOST` — explicit override (full URL accepted).
@@ -262,6 +293,18 @@ impl GrypeScanner {
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
     async fn run_grype_target(&self, target: &str) -> Result<GrypeReport> {
+        // Issue #1465: detect "grype binary missing from PATH" via the
+        // io::ErrorKind of the spawn failure, NOT a substring search on
+        // stderr. The previous implementation classified any non-zero exit
+        // whose stderr contained "not found" or "No such file" as a missing
+        // binary, but those phrases also appear in normal grype runtime
+        // errors (registry-mode HTTP 404 "manifest not found", DB cache
+        // "no such file" when the seeded DB volume is missing, etc.). The
+        // user-visible result was a misleading "Grype binary not available"
+        // log on a perfectly-installed grype with an unreachable registry
+        // ref, sending operators down a wild-goose chase patching their
+        // Docker image. The kernel already gives us a precise NotFound
+        // signal when execve() cannot resolve "grype"; use that.
         let output = tokio::process::Command::new("grype")
             .args([target, "-o", "json"])
             .env("GRYPE_DB_AUTO_UPDATE", "false")
@@ -269,13 +312,10 @@ impl GrypeScanner {
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false")
             .output()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Grype: {}", e)))?;
+            .map_err(|e| classify_grype_spawn_error(&e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not found") || stderr.contains("No such file") {
-                return Err(AppError::Internal("Grype binary not available".to_string()));
-            }
             // Include a stdout tail too: Grype writes its progress/ETUI to
             // stderr, but a hard failure during JSON encoding can leave a
             // partial payload on stdout that is the only clue to the cause.
@@ -1270,6 +1310,93 @@ mod tests {
         assert_scan_failed(
             &no_grype.scan(&artifact, None, &content).await,
             "Grype scan",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1465: classify_grype_spawn_error pins the contract that
+    // "Grype binary not available" is reserved for the *spawn* NotFound
+    // signal. Prior code substring-matched stderr for "not found" / "No
+    // such file", which mis-classified any grype runtime error whose log
+    // included those phrases (the common case: a registry-mode HTTP 404
+    // "manifest not found" against an unreachable image ref) as a missing
+    // binary. Operators saw the misleading "binary not available" log on
+    // a perfectly-installed grype and patched their Dockerfile in vain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_grype_spawn_error_notfound_maps_to_binary_missing() {
+        // The exact std::io::Error::Kind tokio surfaces when execve() fails
+        // to resolve the program name on PATH.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let app = classify_grype_spawn_error(&io_err);
+        let msg = format!("{}", app);
+        assert!(
+            msg.contains("Grype binary not available"),
+            "NotFound spawn errors must surface as the binary-missing diagnostic; got {:?}",
+            msg
+        );
+        // Helpful remediation hint should be present so operators know
+        // where to find or install grype.
+        assert!(
+            msg.contains("PATH") || msg.contains("install"),
+            "binary-missing message should hint at remediation; got {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_classify_grype_spawn_error_permission_denied_is_not_binary_missing() {
+        // A PermissionDenied error means grype was found on PATH but the
+        // process could not exec it (chmod 000, SELinux denial, etc.).
+        // The classifier must distinguish this from "binary not available"
+        // so the operator does not spend hours hunting for a missing binary
+        // when the file is right there but unexecutable.
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let app = classify_grype_spawn_error(&io_err);
+        let msg = format!("{}", app);
+        assert!(
+            !msg.contains("not available"),
+            "non-NotFound spawn errors must NOT be labeled 'binary not available'; got {:?}",
+            msg
+        );
+        assert!(
+            msg.contains("Failed to execute Grype") && msg.contains("permission denied"),
+            "non-NotFound spawn errors must surface the underlying OS error; got {:?}",
+            msg
+        );
+    }
+
+    /// Regression guard for issue #1465: confirm the source no longer
+    /// substring-matches "not found" / "No such file" against grype's
+    /// stderr. The misleading classification this guarded against silently
+    /// turned every registry-mode 404 (a manifest the registry rejected,
+    /// auth failure, etc.) into "Grype binary not available", which is the
+    /// exact user-facing symptom on #1465. If a future refactor reintroduces
+    /// the heuristic this test catches it at the source level.
+    #[test]
+    fn test_run_grype_target_does_not_substring_match_stderr_for_binary_check() {
+        let src = include_str!("grype_scanner.rs");
+        // Locate the run_grype_target function body and inspect only it,
+        // so the regression-guard fixture (which intentionally mentions the
+        // forbidden phrases below in comments and string literals) does
+        // not produce a false positive against the tests module.
+        let start = src
+            .find("async fn run_grype_target")
+            .expect("run_grype_target must exist");
+        let after = &src[start..];
+        // Function body ends at the next top-level `}` at column 4 in this
+        // file. Slice up to the next blank-line + `/// ` doc boundary or
+        // function start, whichever comes first; covers the body cheaply.
+        let end_rel = after.find("\n    /// ").unwrap_or(after.len().min(8192));
+        let body = &after[..end_rel];
+        assert!(
+            !body.contains("stderr.contains(\"not found\")")
+                && !body.contains("stderr.contains(\"No such file\")"),
+            "run_grype_target must not substring-match stderr to detect a missing \
+             binary (#1465). Use io::ErrorKind::NotFound on the spawn result \
+             via classify_grype_spawn_error instead. Offending body: {}",
+            body
         );
     }
 
