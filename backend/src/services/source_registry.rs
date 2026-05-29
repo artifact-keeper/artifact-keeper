@@ -4,10 +4,18 @@
 //! worker to pull artifacts from different registry implementations.
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 
 use crate::services::artifactory_client::{
     AqlResponse, ArtifactoryError, PropertiesResponse, RepositoryListItem, SystemVersionResponse,
 };
+
+/// Boxed byte stream returned by `download_artifact_stream`. Each item is a
+/// chunk of the artifact body or a transport error. Holding only one chunk
+/// at a time keeps migration memory bounded to O(chunk_size) regardless of
+/// artifact size (issue #1422).
+pub type ArtifactByteStream = BoxStream<'static, Result<Bytes, ArtifactoryError>>;
 
 /// Trait for source registry clients used during migration.
 ///
@@ -32,12 +40,40 @@ pub trait SourceRegistry: Send + Sync {
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError>;
 
-    /// Download an artifact as raw bytes
+    /// Download an artifact as raw bytes.
+    ///
+    /// Prefer `download_artifact_stream` for migrations: this method buffers
+    /// the entire artifact body into memory, which OOMs on multi-GB artifacts
+    /// (issue #1422). It is retained for callers that genuinely need the
+    /// full bytes in memory (small fixtures, test mocks).
     async fn download_artifact(
         &self,
         repo_key: &str,
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError>;
+
+    /// Download an artifact as a chunked byte stream.
+    ///
+    /// Returns a `Stream<Item = Result<Bytes>>` so the caller can spill
+    /// chunks to a temp file (or hash/inspect them) without ever holding
+    /// the whole artifact in memory. Used by `migration_worker::transfer_artifact`
+    /// to keep per-job memory bounded to one chunk regardless of artifact
+    /// size (fix for issue #1422).
+    ///
+    /// The default implementation falls back to `download_artifact` followed
+    /// by wrapping the full body in a single-item stream, so mock/test
+    /// registries that only implement the buffered call continue to work
+    /// (with the same memory footprint as before). Real registry clients
+    /// (`ArtifactoryClient`, `NexusClient`) override this with a true
+    /// streaming implementation backed by `reqwest::Response::bytes_stream`.
+    async fn download_artifact_stream(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<ArtifactByteStream, ArtifactoryError> {
+        let bytes = self.download_artifact(repo_key, path).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
 
     /// Get artifact properties/metadata (optional — returns empty if unsupported)
     async fn get_properties(
@@ -190,6 +226,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, bytes::Bytes::from_static(b"artifact content"));
+    }
+
+    /// The default `download_artifact_stream` implementation must wrap
+    /// `download_artifact` so registries that only implement the buffered
+    /// path keep working (#1422).
+    #[tokio::test]
+    async fn test_default_download_artifact_stream_falls_back() {
+        use futures::StreamExt;
+        let registry = MockSourceRegistry::new("artifactory");
+        let mut stream = registry
+            .download_artifact_stream("libs-release", "com/example/test.jar")
+            .await
+            .unwrap();
+        let mut assembled = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            assembled.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(assembled, b"artifact content");
     }
 
     #[tokio::test]

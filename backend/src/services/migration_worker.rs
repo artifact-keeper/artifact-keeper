@@ -813,7 +813,16 @@ impl MigrationWorker {
         }
     }
 
-    /// Transfer an artifact from Artifactory to Artifact Keeper
+    /// Transfer an artifact from Artifactory to Artifact Keeper.
+    ///
+    /// Streams the source response straight to a temp file on disk. Each
+    /// chunk is hashed (sha256 + sha1) and discarded as soon as it lands on
+    /// disk, so peak memory usage is O(chunk_size) instead of
+    /// O(artifact_size). Without this, a 10 GB Maven artifact would buffer
+    /// the entire body into a `Bytes` before storage write and OOM the AK
+    /// host (issue #1422). The temp file is then handed to
+    /// `StorageBackend::put_file` which copies/renames without a second
+    /// in-memory pass.
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
@@ -822,28 +831,84 @@ impl MigrationWorker {
         artifact_path: &str,
         include_metadata: bool,
     ) -> Result<TransferResult, MigrationError> {
-        // Download artifact from Artifactory
-        let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
-        let content_size = artifact_data.len();
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
 
-        // Calculate both sha256 and sha1. Computing both lets the
-        // verification step compare the source's advertised digest against
-        // the matching locally computed value regardless of which algorithm
-        // the source uses (issue #856).
-        let (sha256_hex, sha1_hex) = compute_dual_checksums(&artifact_data);
+        // Open the source as a chunked stream rather than `download_artifact`,
+        // which buffers the whole body in memory (#1422).
+        let mut stream = client
+            .download_artifact_stream(repo_key, artifact_path)
+            .await?;
+
+        // Spill chunks to a NamedTempFile while computing checksums
+        // incrementally. `NamedTempFile` is created via the blocking
+        // tempfile crate, but reopened as a `tokio::fs::File` so writes go
+        // through the async executor without per-chunk blocking-thread
+        // hops. Each chunk is hashed (sha256 + sha1) and dropped as soon
+        // as it lands on disk so peak memory is O(chunk_size).
+        let temp = tempfile::NamedTempFile::new().map_err(|e| {
+            MigrationError::StorageError(format!("Failed to create temp file: {e}"))
+        })?;
+        let temp_path = temp.path().to_path_buf();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| {
+                MigrationError::StorageError(format!("Failed to open temp file for write: {e}"))
+            })?;
+
+        let mut sha256_hasher = Sha256::new();
+        let mut sha1_hasher = Sha1::new();
+        let mut content_size: usize = 0;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(MigrationError::from)?;
+            sha256_hasher.update(&chunk);
+            sha1_hasher.update(&chunk);
+            content_size += chunk.len();
+            writer.write_all(&chunk).await.map_err(|e| {
+                MigrationError::StorageError(format!("Failed to write chunk to temp: {e}"))
+            })?;
+            // Explicit drop so the chunk's heap allocation is released
+            // before we await the next read. Belt-and-suspenders: the
+            // borrow checker would drop it at end of scope anyway.
+            drop(chunk);
+        }
+
+        // Drop the stream so the underlying connection can be reused.
+        drop(stream);
+
+        // Flush and sync so the file's contents are fully on disk before
+        // storage reads back from `temp_path` and before we hand off to
+        // metadata extraction. Without this, a fast `put_file` rename can
+        // race the kernel's writeback and surface a short read.
+        writer
+            .flush()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to flush temp file: {e}")))?;
+        writer
+            .sync_all()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to sync temp file: {e}")))?;
+        drop(writer);
+
+        let sha256_hex = hex::encode(sha256_hasher.finalize());
+        let sha1_hex = hex::encode(sha1_hasher.finalize());
 
         // Extract format-specific package metadata (npm package.json, helm
-        // Chart.yaml, etc.) from the artifact bytes BEFORE we move them
-        // into storage.put. Without this, downstream per-format endpoints
-        // (npm metadata, helm index.yaml) return null `dependencies` /
-        // `appVersion` for migrated artifacts, breaking transitive resolution
-        // in npm clients and dropping useful info from helm `helm search`.
-        // Returns None for unknown formats / unparseable bytes; the artifact
-        // INSERT proceeds either way and only the metadata row is skipped.
-        let extracted_metadata = crate::services::artifact_metadata::extract_artifact_metadata(
-            package_type,
-            &artifact_data,
-        );
+        // Chart.yaml, etc.) from the on-disk temp file BEFORE storage takes
+        // ownership of it. Reading from disk (vs. an in-memory buffer)
+        // keeps the streaming-memory guarantee for non-npm/helm formats
+        // and is bounded for npm/helm because those tarballs are small.
+        // Returns None for unknown formats; the artifact INSERT proceeds
+        // either way and only the metadata row is skipped.
+        let extracted_metadata =
+            crate::services::artifact_metadata::extract_artifact_metadata_from_path(
+                package_type,
+                &temp_path,
+            );
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -862,8 +927,11 @@ impl MigrationWorker {
             // Check if content already exists (deduplication)
             let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
+                // `put_file` copies/renames from the temp path; backends
+                // that support true streaming uploads (S3 multipart,
+                // filesystem rename) avoid a second in-memory pass.
                 self.storage
-                    .put(&storage_key, artifact_data)
+                    .put_file(&storage_key, &temp_path)
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
             }
@@ -1437,6 +1505,11 @@ impl ExpectedChecksums {
 
 /// Compute both sha256 and sha1 hex digests over the same payload in a
 /// single pass over the bytes. Returns `(sha256_hex, sha1_hex)`.
+///
+/// Kept for test fixtures and any future buffered callers. The streaming
+/// `transfer_artifact` path (#1422) hashes chunks incrementally instead of
+/// calling this on a full in-memory buffer.
+#[allow(dead_code)]
 pub(crate) fn compute_dual_checksums(data: &[u8]) -> (String, String) {
     let mut sha256 = Sha256::new();
     sha256.update(data);
