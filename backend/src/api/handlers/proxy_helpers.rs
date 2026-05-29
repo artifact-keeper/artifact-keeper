@@ -3258,7 +3258,15 @@ mod tests {
         .expect("miss path should recover via refetch");
 
         assert_eq!(result, refetched_bytes);
-        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 1);
+        // The hydration coordinator uses a double-checked-locking pattern: the
+        // first `check()` happens at the top of the loop, and a second `check()`
+        // runs after the caller wins the leader election (to avoid duplicating
+        // work if another leader populated the cache between the first check
+        // and the lease acquisition). In a single-threaded test the cache is
+        // never populated by anyone else, so we observe both checks and the
+        // count is exactly 2. The invariant we care about is "refetch ran once
+        // and wrote back once", asserted below.
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 2);
         assert_eq!(storage.put_calls.load(Ordering::SeqCst), 1);
         assert_eq!(refetch_calls.load(Ordering::SeqCst), 1);
 
