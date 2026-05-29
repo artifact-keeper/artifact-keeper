@@ -138,9 +138,41 @@ pub struct SyncTaskResponse {
     pub status: String,
     /// When the task was enqueued. Lets clients tell a freshly-scheduled task
     /// apart from a stale queue entry (used by the replication-schedule check).
+    /// Serialized as whole-second RFC3339 with a `Z` suffix
+    /// (e.g. `2026-05-29T12:34:56Z`) so simple ISO8601 parsers can consume it.
+    #[serde(serialize_with = "serialize_ts_secs")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// When the worker began transferring, if it has started.
+    /// When the worker began transferring, if it has started. Same format as
+    /// `created_at`.
+    #[serde(serialize_with = "serialize_opt_ts_secs")]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Serialize a timestamp as whole-second RFC3339 with a `Z` suffix
+/// (e.g. `2026-05-29T12:34:56Z`). chrono's default RFC3339 includes
+/// fractional seconds and a `+00:00` offset, which strict ISO8601 parsers
+/// (jq's `fromdateiso8601`, some SDKs) reject.
+fn serialize_ts_secs<S>(
+    ts: &chrono::DateTime<chrono::Utc>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn serialize_opt_ts_secs<S>(
+    ts: &Option<chrono::DateTime<chrono::Utc>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match ts {
+        Some(t) => serialize_ts_secs(t, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -804,6 +836,33 @@ mod tests {
         assert!(v.get("created_at").is_some());
         assert!(v.get("status").is_some());
         assert!(v.as_object().unwrap().contains_key("started_at"));
+    }
+
+    #[test]
+    fn test_sync_task_created_at_serializes_whole_second_z() {
+        // jq's fromdateiso8601 (and strict ISO8601 parsers) only accept the
+        // whole-second `...Z` form. chrono's default RFC3339 (fractional secs,
+        // +00:00 offset) is rejected, so the field must use the second-precision
+        // Z serializer.
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-29T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let resp = SyncTaskResponse {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            storage_key: "k".to_string(),
+            artifact_size: 1,
+            priority: 0,
+            status: "pending".to_string(),
+            created_at: ts,
+            started_at: Some(ts),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["created_at"], "2026-05-29T12:34:56Z");
+        assert_eq!(v["started_at"], "2026-05-29T12:34:56Z");
+        // No fractional seconds, no numeric offset.
+        assert!(!v["created_at"].as_str().unwrap().contains('.'));
+        assert!(!v["created_at"].as_str().unwrap().contains('+'));
     }
 
     // -----------------------------------------------------------------------
