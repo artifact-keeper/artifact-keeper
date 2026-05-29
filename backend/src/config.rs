@@ -185,6 +185,18 @@ pub struct Config {
     /// Dependency-Track API URL for vulnerability management (optional)
     pub dependency_track_url: Option<String>,
 
+    /// Whether the Dependency-Track integration is enabled.
+    ///
+    /// This is the single source of truth for "is DT wired up?".
+    /// Controlled by the `DEPENDENCY_TRACK_ENABLED` env var. When `false`
+    /// (the default), no part of the backend will contact Dependency-Track:
+    /// the service is not initialized, the periodic health monitor skips
+    /// its probe, and the `/api/v1/system/config` endpoint reports it as
+    /// disabled so the frontend can render a consistent "disabled" state
+    /// instead of mixing "disabled" with "unavailable" messages
+    /// (issues #1395 and #1480).
+    pub dependency_track_enabled: bool,
+
     /// OpenTelemetry OTLP endpoint (optional, enables OTel when set).
     pub otel_exporter_otlp_endpoint: Option<String>,
 
@@ -434,6 +446,7 @@ redacted_debug!(Config {
     show peer_public_endpoint,
     redact peer_api_key,
     show dependency_track_url,
+    show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
     show gc_schedule,
@@ -518,6 +531,7 @@ impl Default for Config {
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
             dependency_track_url: None,
+            dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
@@ -647,6 +661,16 @@ impl Config {
                 key
             }),
             dependency_track_url: env::var("DEPENDENCY_TRACK_URL").ok(),
+            // Single source of truth for "DT is wired in". Defaults to false
+            // when unset, so DT integration must be explicitly opted into.
+            // Accepts "true" / "1" (case-insensitive); anything else (empty,
+            // garbage, unset) keeps DT disabled.
+            dependency_track_enabled: env::var("DEPENDENCY_TRACK_ENABLED")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
@@ -2212,6 +2236,163 @@ mod tests {
         match saved_search {
             Some(v) => env::set_var("RATE_LIMIT_SEARCH_PER_MIN", v),
             None => env::remove_var("RATE_LIMIT_SEARCH_PER_MIN"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dependency_track_enabled (issues #1395, #1480)
+    //
+    // Disabling Dependency-Track must be a single, authoritative kill
+    // switch read from `DEPENDENCY_TRACK_ENABLED`. These tests pin the
+    // parse behaviour: any value other than `true`/`1` (case-insensitive,
+    // whitespace trimmed) keeps the integration off, regardless of
+    // whether a stale `DEPENDENCY_TRACK_URL` is configured.
+    // -----------------------------------------------------------------------
+
+    /// Helper to set env, run a closure, and restore prior state. Keeps
+    /// the env-mutated tests below from leaking state into other tests.
+    fn with_dt_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        match value {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+        f();
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match saved_jwt {
+            Some(v) => env::set_var("JWT_SECRET", v),
+            None => env::remove_var("JWT_SECRET"),
+        }
+        match saved_dt {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+    }
+
+    #[test]
+    fn test_dt_enabled_defaults_false_when_unset() {
+        with_dt_env(None, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_default_in_struct_default_is_false() {
+        let cfg = Config::default();
+        assert!(!cfg.dependency_track_enabled);
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_true() {
+        with_dt_env(Some("true"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_one() {
+        with_dt_env(Some("1"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_case_insensitive_true() {
+        with_dt_env(Some("TRUE"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_with_whitespace() {
+        with_dt_env(Some("  true  "), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_false() {
+        with_dt_env(Some("false"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_empty_string_is_disabled() {
+        with_dt_env(Some(""), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_garbage_is_disabled() {
+        with_dt_env(Some("yes"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+        with_dt_env(Some("on"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    /// Regression for #1395: a stale `DEPENDENCY_TRACK_URL` must not flip
+    /// the enabled flag on its own. The flag is independent of URL
+    /// presence.
+    #[test]
+    fn test_dt_enabled_independent_of_url() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
+        let saved_url = env::var("DEPENDENCY_TRACK_URL").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("DEPENDENCY_TRACK_URL", "http://dt.example.com:8081");
+        env::remove_var("DEPENDENCY_TRACK_ENABLED");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(
+            cfg.dependency_track_url.as_deref(),
+            Some("http://dt.example.com:8081")
+        );
+        assert!(
+            !cfg.dependency_track_enabled,
+            "URL set without ENABLED=true must leave integration disabled (issue #1395)"
+        );
+
+        // Restore
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match saved_jwt {
+            Some(v) => env::set_var("JWT_SECRET", v),
+            None => env::remove_var("JWT_SECRET"),
+        }
+        match saved_dt {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+        match saved_url {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_URL", v),
+            None => env::remove_var("DEPENDENCY_TRACK_URL"),
         }
     }
 }
