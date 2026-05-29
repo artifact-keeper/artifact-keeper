@@ -2225,10 +2225,19 @@ async fn handle_patch_upload(
         }
     };
 
-    // Look up session
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be driven via repo B's URL
+    // (issue #1317). Same 404 shape for "no session" and "session in another
+    // repo" avoids leaking session existence across repos.
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -2236,11 +2245,6 @@ async fn handle_patch_upload(
         Ok(Some(s)) => s,
         Ok(None) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload session not found"),
         Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
-    };
-
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
     };
 
     let storage = match state.storage_for_repo(&repo.location) {
@@ -2338,9 +2342,18 @@ async fn handle_complete_upload(
         }
     };
 
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be completed via repo B's URL
+    // (issue #1317).
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -2360,11 +2373,6 @@ async fn handle_complete_upload(
                 &e.to_string(),
             )
         }
-    };
-
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
     };
 
     let storage = match state.storage_for_repo(&repo.location) {

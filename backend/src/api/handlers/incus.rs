@@ -755,17 +755,28 @@ async fn delete_image(
 // Chunked / resumable upload endpoints
 // ===========================================================================
 
-/// Look up an upload session by UUID.
-async fn get_session(db: &PgPool, session_id: Uuid) -> Result<UploadSession, Response> {
+/// Look up an upload session by UUID, scoped to a specific repository.
+///
+/// Issue #1317: chunked-upload session lookups must bind the URL's `repo_key`
+/// against `session.repository_id` so that a session created in repo A cannot
+/// be driven (chunked/finalized/cancelled) via repo B's URL. Returning the
+/// same 404 shape for "session does not exist" and "session does not belong
+/// to this repo" avoids leaking session existence across repos.
+async fn get_session(
+    db: &PgPool,
+    session_id: Uuid,
+    repo_id: Uuid,
+) -> Result<UploadSession, Response> {
     sqlx::query_as::<_, UploadSession>(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
                filename, bytes_received, storage_temp_path
         FROM incus_upload_sessions
-        WHERE id = $1
+        WHERE id = $1 AND repository_id = $2
         "#,
     )
     .bind(session_id)
+    .bind(repo_id)
     .fetch_optional(db)
     .await
     .map_err(db_err)?
@@ -880,7 +891,10 @@ async fn upload_chunk(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be driven via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append body to temp file (no read-back of existing data)
@@ -926,8 +940,10 @@ async fn complete_chunked_upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
-    let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be finalized via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append any final body data
@@ -1023,11 +1039,14 @@ async fn complete_chunked_upload(
 async fn cancel_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be cancelled via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     // Delete temp file
     let _ = tokio::fs::remove_file(&session.storage_temp_path).await;
@@ -1053,9 +1072,12 @@ async fn cancel_chunked_upload(
 
 async fn get_upload_progress(
     State(state): State<SharedState>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so progress for
+    // a session in repo A cannot be probed via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
