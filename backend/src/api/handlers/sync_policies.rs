@@ -78,6 +78,10 @@ pub struct SyncPolicyResponse {
     pub priority: i32,
     #[schema(value_type = Object)]
     pub artifact_filter: serde_json::Value,
+    /// Convenience glob filter, mirrored from `artifact_filter.include_paths`.
+    /// Round-trips the single-pattern shorthand accepted on create
+    /// (e.g. `"*.tar.gz"`). Empty when no include pattern is set.
+    pub filter: String,
     pub precedence: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -109,6 +113,12 @@ pub struct CreateSyncPolicyPayload {
     #[schema(value_type = Object)]
     #[serde(default)]
     pub artifact_filter: Option<serde_json::Value>,
+    /// Convenience glob filter (e.g. `"*.tar.gz"`). When set, it is folded
+    /// into `artifact_filter.include_paths` so only matching artifact paths
+    /// are eligible for sync. Ignored if `artifact_filter.include_paths` is
+    /// already provided.
+    #[serde(default)]
+    pub filter: Option<String>,
     #[serde(default = "default_precedence")]
     pub precedence: i32,
 }
@@ -257,7 +267,40 @@ fn default_precedence() -> i32 {
 // Converters
 // ---------------------------------------------------------------------------
 
+/// Fold a convenience glob `filter` into an artifact_filter JSON value's
+/// `include_paths`. If the caller already supplied `include_paths`, the
+/// explicit value wins and the shorthand is ignored.
+///
+/// Returns the (possibly modified) artifact_filter as parsed `ArtifactFilter`.
+fn apply_filter_shorthand(
+    artifact_filter: ArtifactFilter,
+    filter: Option<String>,
+) -> ArtifactFilter {
+    match filter {
+        Some(glob) if !glob.trim().is_empty() && artifact_filter.include_paths.is_empty() => {
+            ArtifactFilter {
+                include_paths: vec![glob],
+                ..artifact_filter
+            }
+        }
+        _ => artifact_filter,
+    }
+}
+
+/// Extract the convenience `filter` string from a stored artifact_filter
+/// JSON value. Mirrors the first `include_paths` entry, or "" when absent.
+fn filter_shorthand_from_value(artifact_filter: &serde_json::Value) -> String {
+    artifact_filter
+        .get("include_paths")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn policy_to_response(p: SyncPolicy) -> SyncPolicyResponse {
+    let filter = filter_shorthand_from_value(&p.artifact_filter);
     SyncPolicyResponse {
         id: p.id,
         name: p.name,
@@ -268,6 +311,7 @@ fn policy_to_response(p: SyncPolicy) -> SyncPolicyResponse {
         replication_mode: p.replication_mode,
         priority: p.priority,
         artifact_filter: p.artifact_filter,
+        filter,
         precedence: p.precedence,
         created_at: p.created_at,
         updated_at: p.updated_at,
@@ -388,6 +432,7 @@ async fn create_policy(
     let repo_selector: RepoSelector = parse_selector(payload.repo_selector)?;
     let peer_selector: PeerSelector = parse_selector(payload.peer_selector)?;
     let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter)?;
+    let artifact_filter = apply_filter_shorthand(artifact_filter, payload.filter);
 
     let req = CreateSyncPolicyRequest {
         name: payload.name,
@@ -625,6 +670,49 @@ async fn preview_policy(
 mod tests {
     use super::*;
 
+    /// DB-backed round-trip: create a policy with the convenience `filter`
+    /// glob, then read it back and confirm the glob survives via the
+    /// `filter` field (folded into and extracted from artifact_filter).
+    ///
+    /// Requires a migrated PostgreSQL at `DATABASE_URL`. Run with:
+    ///   DATABASE_URL=postgres://... cargo test --lib \
+    ///     api::handlers::sync_policies::tests::filter_round_trip -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn filter_round_trip_through_service() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let db = sqlx::PgPool::connect(&url).await.unwrap();
+        let svc = SyncPolicyService::new(db);
+
+        // Mirror the handler's create path: fold the shorthand into artifact_filter.
+        let artifact_filter =
+            apply_filter_shorthand(ArtifactFilter::default(), Some("*.tar.gz".to_string()));
+        let req = crate::services::sync_policy_service::CreateSyncPolicyRequest {
+            name: format!("filter-rt-{}", uuid::Uuid::new_v4()),
+            description: String::new(),
+            enabled: true,
+            repo_selector: RepoSelector::default(),
+            peer_selector: PeerSelector::default(),
+            replication_mode: "push".to_string(),
+            priority: 0,
+            artifact_filter,
+            precedence: 100,
+        };
+        let created = svc.create_policy(req).await.unwrap();
+
+        // Read back and surface the response (mirrors GET handler).
+        let fetched = svc.get_policy(created.id).await.unwrap();
+        let resp = policy_to_response(fetched);
+        assert_eq!(resp.filter, "*.tar.gz", "filter glob must round-trip");
+        assert_eq!(
+            resp.artifact_filter["include_paths"][0], "*.tar.gz",
+            "glob must persist in artifact_filter.include_paths"
+        );
+
+        // Cleanup.
+        svc.delete_policy(created.id).await.unwrap();
+    }
+
     #[test]
     fn test_create_payload_deserialization_minimal() {
         let json = r#"{"name": "test-policy"}"#;
@@ -691,6 +779,76 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_shorthand_folded_into_include_paths() {
+        let af = apply_filter_shorthand(ArtifactFilter::default(), Some("*.tar.gz".to_string()));
+        assert_eq!(af.include_paths, vec!["*.tar.gz".to_string()]);
+    }
+
+    #[test]
+    fn test_filter_shorthand_ignored_when_blank() {
+        let af = apply_filter_shorthand(ArtifactFilter::default(), Some("   ".to_string()));
+        assert!(af.include_paths.is_empty());
+        let af = apply_filter_shorthand(ArtifactFilter::default(), None);
+        assert!(af.include_paths.is_empty());
+    }
+
+    #[test]
+    fn test_filter_shorthand_explicit_include_paths_win() {
+        let explicit = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            ..Default::default()
+        };
+        // Shorthand must not clobber an explicit include_paths.
+        let af = apply_filter_shorthand(explicit, Some("*.tar.gz".to_string()));
+        assert_eq!(af.include_paths, vec!["release/*".to_string()]);
+    }
+
+    #[test]
+    fn test_filter_shorthand_roundtrip_from_value() {
+        // Create-side fold, then read-side extract -> the glob survives.
+        let af = apply_filter_shorthand(ArtifactFilter::default(), Some("*.tar.gz".to_string()));
+        let stored = serde_json::to_value(&af).unwrap();
+        assert_eq!(filter_shorthand_from_value(&stored), "*.tar.gz");
+    }
+
+    #[test]
+    fn test_filter_shorthand_from_empty_value() {
+        assert_eq!(filter_shorthand_from_value(&serde_json::json!({})), "");
+        assert_eq!(
+            filter_shorthand_from_value(&serde_json::json!({"include_paths": []})),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_create_payload_accepts_filter_field() {
+        let json = r#"{"name":"f","filter":"*.tar.gz","schedule":"manual","direction":"push"}"#;
+        let payload: CreateSyncPolicyPayload = serde_json::from_str(json).unwrap();
+        // Unknown fields (schedule, direction) are ignored; filter is captured.
+        assert_eq!(payload.filter.as_deref(), Some("*.tar.gz"));
+    }
+
+    #[test]
+    fn test_policy_to_response_surfaces_filter() {
+        let policy = SyncPolicy {
+            id: uuid::Uuid::nil(),
+            name: "t".to_string(),
+            description: String::new(),
+            enabled: true,
+            repo_selector: serde_json::json!({}),
+            peer_selector: serde_json::json!({}),
+            replication_mode: "push".to_string(),
+            priority: 0,
+            artifact_filter: serde_json::json!({"include_paths": ["*.tar.gz"]}),
+            precedence: 100,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let resp = policy_to_response(policy);
+        assert_eq!(resp.filter, "*.tar.gz");
+    }
+
+    #[test]
     fn test_policy_to_response_mapping() {
         let policy = SyncPolicy {
             id: uuid::Uuid::nil(),
@@ -724,6 +882,7 @@ mod tests {
             replication_mode: "push".to_string(),
             priority: 0,
             artifact_filter: serde_json::json!({}),
+            filter: String::new(),
             precedence: 100,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -880,6 +1039,7 @@ mod tests {
             replication_mode: "push".to_string(),
             priority: 0,
             artifact_filter: serde_json::json!({}),
+            filter: String::new(),
             precedence: 100,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -895,6 +1055,7 @@ mod tests {
             "replication_mode",
             "priority",
             "artifact_filter",
+            "filter",
             "precedence",
             "created_at",
             "updated_at",
@@ -905,6 +1066,6 @@ mod tests {
             );
         }
         let obj = json.as_object().unwrap();
-        assert_eq!(obj.len(), 12, "SyncPolicyResponse should have 12 fields");
+        assert_eq!(obj.len(), 13, "SyncPolicyResponse should have 13 fields");
     }
 }

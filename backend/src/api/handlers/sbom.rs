@@ -88,8 +88,19 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/components", get(get_sbom_components))
         .route("/:id/convert", post(convert_sbom))
         .route("/by-artifact/:artifact_id", get(get_sbom_by_artifact))
-        // CVE history
-        .route("/cve/history/:artifact_id", get(get_cve_history))
+        // CVE history. Three routes share the same backing handlers:
+        //   - `/cve/history/by-artifact/{uuid}`  -- typed UUID, REST-clean
+        //   - `/cve/history/by-cve/{cve_id}`     -- typed CVE-id, REST-clean
+        //   - `/cve/history/{id}`                -- legacy overload, kept for
+        //     compatibility with the in-flight v1.2.0 SDKs that already
+        //     consumed the overloaded shape. New clients should prefer the
+        //     two split routes. (#1375 round-2 decision: SPLIT + legacy.)
+        .route(
+            "/cve/history/by-artifact/:artifact_id",
+            get(get_cve_history_by_artifact),
+        )
+        .route("/cve/history/by-cve/:cve_id", get(get_cve_history_by_cve))
+        .route("/cve/history/:id", get(get_cve_history))
         .route("/cve/status/:id", post(update_cve_status))
         .route("/cve/trends", get(get_cve_trends))
         // License policies
@@ -618,6 +629,17 @@ async fn get_sbom_components(
 }
 
 /// Convert an SBOM to a different format
+///
+/// Returns the converted SBOM as a [`SbomContentResponse`]: the metadata
+/// row plus the full converted document under `content`. The `content` is
+/// load-bearing here. A consumer that asked for `target_format=spdx` needs
+/// the SPDX document (`content.spdxVersion`, `content.SPDXID`, ...) to feed
+/// downstream attestation tooling, and a `target_format=cyclonedx` request
+/// needs `content.bomFormat == "CycloneDX"`. Returning metadata-only
+/// (`SbomResponse`) dropped the converted document entirely, so callers
+/// could not tell an SPDX result from a CycloneDX one and round-trip
+/// conversion appeared to lose the document shape. (release-gate
+/// `test-sbom-convert.sh` 2.5.a / 2.5.b.)
 #[utoipa::path(
     post,
     path = "/{id}/convert",
@@ -628,7 +650,7 @@ async fn get_sbom_components(
     ),
     request_body = ConvertSbomRequest,
     responses(
-        (status = 200, description = "Converted SBOM", body = SbomResponse),
+        (status = 200, description = "Converted SBOM with content", body = SbomContentResponse),
         (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
@@ -639,39 +661,302 @@ async fn convert_sbom(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<ConvertSbomRequest>,
-) -> Result<Json<SbomResponse>> {
+) -> Result<Json<SbomContentResponse>> {
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
 
     let doc = service.convert_sbom(id, target_format).await?;
-    Ok(Json(SbomResponse::from(doc)))
+    Ok(Json(SbomContentResponse::from(doc)))
 }
 
 // === CVE History ===
 
-/// Get CVE history for an artifact
+/// Validate that a string is a well-formed CVE identifier.
+///
+/// Accepts the canonical NVD shape `CVE-YYYY-N` where `N` is any positive
+/// integer (4+ digits per CVE 2014 numbering scheme, but the count has grown
+/// past 5 digits for high-volume years like 2019). The match is
+/// case-insensitive so callers may pass `cve-2019-10744` lowercased.
+///
+/// Examples:
+///   - `CVE-2019-10744`  → true (5 digits, the v1.1.0 release-gate fixture)
+///   - `CVE-2024-12345`  → true (5 digits, modern)
+///   - `CVE-2024-123456` → true (6 digits, high-volume year)
+///   - `CVE-1999-0001`   → true (4 digits, oldest valid form)
+///   - `CVE-2019-1`      → false (sub-4-digit suffix, rejected by NVD)
+///   - `not-a-cve`       → false
+///   - empty             → false
+///
+/// Previously the endpoint rejected `CVE-2019-10744` outright because the
+/// path param was typed as `Uuid`, producing a generic 400 with no useful
+/// error message. (#1375)
+pub(crate) fn is_valid_cve_id(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let prefix = match parts.next() {
+        Some(p) => p,
+        None => return false,
+    };
+    if !prefix.eq_ignore_ascii_case("CVE") {
+        return false;
+    }
+    let year = match parts.next() {
+        Some(y) => y,
+        None => return false,
+    };
+    let number = match parts.next() {
+        Some(n) => n,
+        None => return false,
+    };
+    if parts.next().is_some() {
+        // Extra dashes (e.g. `CVE-2024-12345-extra`) are not part of the
+        // canonical form. Reject so a stray suffix doesn't silently slip
+        // through.
+        return false;
+    }
+    // Year is exactly four ASCII digits (NVD numbering: CVE-1999-* through
+    // CVE-9999-*). We tolerate the future-year tail.
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Number must be at least four ASCII digits. CVE numbering uses 4+ digits
+    // and allows arbitrary growth (six-digit numbers exist in 2024+).
+    if number.len() < 4 || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
+/// Validate that a string is a well-formed GitHub Security Advisory id.
+///
+/// GHSA ids have the canonical shape `GHSA-xxxx-xxxx-xxxx`: the literal
+/// `GHSA` prefix followed by three dash-separated groups of four base32
+/// characters (lower-case `a-z` plus digits `2-9`, no `0`/`1`/`l`/`o`).
+/// Match is case-insensitive on the prefix and the groups.
+///
+/// Why this exists (#1375 / B14): Grype reports ecosystem advisories (npm,
+/// RubyGems, etc.) under their GHSA id, so a consumer that captured a
+/// finding's identifier may legitimately query
+/// `GET /sbom/cve/history/GHSA-jf85-cpcp-j695`. The endpoint previously
+/// rejected every GHSA id with a 400 even though the underlying lookup is
+/// id-agnostic.
+///
+/// Examples:
+///   - `GHSA-jf85-cpcp-j695` → true
+///   - `ghsa-jf85-cpcp-j695` → true (case-insensitive)
+///   - `GHSA-jf85-cpcp`      → false (only two groups)
+///   - `GHSA-jf8-cpcp-j695`  → false (group not four chars)
+///   - `CVE-2019-10744`      → false (not a GHSA)
+pub(crate) fn is_valid_ghsa_id(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    match parts.next() {
+        Some(p) if p.eq_ignore_ascii_case("GHSA") => {}
+        _ => return false,
+    }
+    let mut groups = 0;
+    for group in parts {
+        groups += 1;
+        if groups > 3 {
+            return false;
+        }
+        if group.len() != 4
+            || !group
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    groups == 3
+}
+
+/// Validate that a string is a vulnerability identifier we accept on the
+/// CVE-history endpoints: either a CVE id or a GHSA id. (#1375 / B14)
+pub(crate) fn is_valid_vuln_id(s: &str) -> bool {
+    is_valid_cve_id(s) || is_valid_ghsa_id(s)
+}
+
+/// Outcome of dispatching the overloaded `/cve/history/{id}` path param.
+///
+/// Pure typing of the UUID-vs-CVE-id sniff so the dispatch decision is
+/// unit-testable without booting Axum or Postgres. The handler reads
+/// `classify_cve_history_path` and branches on the variant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CveHistoryPath {
+    /// Parsed UUID; treat as artifact_id lookup.
+    Artifact(Uuid),
+    /// Parsed vulnerability id (CVE or GHSA, canonical upper-case form);
+    /// treat as cross-artifact lookup. (#1375 / B14)
+    Cve(String),
+    /// Neither parse succeeded; handler returns 400.
+    Invalid,
+}
+
+/// Classify an overloaded `/cve/history/{id}` path parameter. UUID first
+/// (legacy semantic), then vulnerability id (CVE or GHSA), else invalid.
+///
+/// Extracted from `get_cve_history` so the routing decision is exercised
+/// by unit tests; the async wrapper only owns the DB calls. (#1375)
+pub(crate) fn classify_cve_history_path(id: &str) -> CveHistoryPath {
+    if let Ok(uuid) = Uuid::parse_str(id) {
+        return CveHistoryPath::Artifact(uuid);
+    }
+    if is_valid_vuln_id(id) {
+        // Normalize to upper-case so the downstream lookup matches the
+        // schema's storage convention. The service compares case-insensitively
+        // anyway, but normalizing keeps logs/metrics consistent.
+        return CveHistoryPath::Cve(id.trim().to_ascii_uppercase());
+    }
+    CveHistoryPath::Invalid
+}
+
+/// Construct the 400 message returned when neither a UUID nor a vulnerability
+/// id matches. Pulled out so the message wording (which clients sometimes
+/// parse) is pinned by a test.
+pub(crate) fn invalid_cve_history_path_message(id: &str) -> String {
+    format!(
+        "Path id '{id}' is neither a valid UUID nor a vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
+}
+
+/// Get CVE history by artifact UUID or CVE identifier (legacy overload).
+///
+/// The path param accepts either:
+///   - A UUID `artifact_id` (legacy shape, returns all CVEs for one artifact)
+///   - A CVE id like `CVE-2019-10744` (returns this CVE across every artifact
+///     the caller can access)
+///
+/// # URL design decision (#1385 round-2)
+///
+/// Overloading a single `{id}` path parameter to mean two different lookups
+/// is a REST anti-pattern: the route's behavior changes based on a runtime
+/// content sniff. We considered splitting into two routes vs documenting the
+/// overload and chose **both**: the split routes
+/// `GET /cve/history/by-artifact/{uuid}` and `GET /cve/history/by-cve/{cve_id}`
+/// are the canonical shape for new clients (typed path params, no sniff),
+/// while this overload remains so the v1.2.0 SDKs that already shipped
+/// against the single-route shape keep working. New code should prefer the
+/// split routes; the overload may be deprecated in v1.3.
+///
+/// Issue #1375: prior to this fix the route was typed `Path<Uuid>`, so any
+/// CVE-id call (e.g. the release-gate `GET /sbom/cve/history/CVE-2019-10744`)
+/// failed Axum's path extractor with a bare HTTP 400, leaving consumers
+/// unable to look up history by CVE.
 #[utoipa::path(
     get,
-    path = "/cve/history/{artifact_id}",
+    path = "/cve/history/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
     params(
-        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+        ("id" = String, Path, description = "Artifact UUID or CVE identifier (e.g. CVE-2019-10744). Prefer the typed routes /cve/history/by-artifact/{uuid} or /cve/history/by-cve/{cve_id}.")
     ),
     responses(
         (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 400, description = "Path id is neither a valid UUID nor a valid CVE identifier"),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_cve_history(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    let service = SbomService::new(state.db.clone());
+
+    match classify_cve_history_path(&id) {
+        CveHistoryPath::Artifact(artifact_id) => {
+            ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+            let entries = service.get_cve_history(artifact_id).await?;
+            Ok(Json(entries))
+        }
+        CveHistoryPath::Cve(cve_id) => {
+            let entries = service
+                .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+                .await?;
+            Ok(Json(entries))
+        }
+        CveHistoryPath::Invalid => Err(AppError::Validation(invalid_cve_history_path_message(&id))),
+    }
+}
+
+/// Get CVE history for one artifact (typed UUID variant).
+///
+/// Canonical replacement for the UUID branch of the overloaded
+/// `/cve/history/{id}` route. Returns every CVE ever detected against the
+/// given artifact, deduped across curated `cve_history` rows and live
+/// `scan_findings` projections.
+#[utoipa::path(
+    get,
+    path = "/cve/history/by-artifact/{artifact_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact UUID")
+    ),
+    responses(
+        (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 403, description = "Caller does not have access to this artifact's repository"),
+        (status = 404, description = "Artifact not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cve_history_by_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let entries = service.get_cve_history(artifact_id).await?;
+    Ok(Json(entries))
+}
+
+/// Construct the 400 message for the typed `/cve/history/by-cve/{cve_id}`
+/// route. Separated from `invalid_cve_history_path_message` because the
+/// wording is slightly different (typed route knows the id is meant to
+/// be a CVE id, not "either a UUID or a CVE id").
+pub(crate) fn invalid_cve_id_route_message(cve_id: &str) -> String {
+    format!(
+        "Path id '{cve_id}' is not a valid vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
+}
+
+/// Get CVE history for one CVE identifier across artifacts (typed CVE-id
+/// variant).
+///
+/// Canonical replacement for the CVE-id branch of the overloaded
+/// `/cve/history/{id}` route. Returns every artifact the caller can access
+/// where the given CVE has been detected.
+#[utoipa::path(
+    get,
+    path = "/cve/history/by-cve/{cve_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("cve_id" = String, Path, description = "CVE identifier (e.g. CVE-2019-10744)")
+    ),
+    responses(
+        (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 400, description = "Path id is not a valid CVE identifier"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cve_history_by_cve(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(cve_id): Path<String>,
+) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    if !is_valid_vuln_id(&cve_id) {
+        return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
+    }
+    let service = SbomService::new(state.db.clone());
+    let entries = service
+        .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+        .await?;
     Ok(Json(entries))
 }
 
@@ -701,9 +986,19 @@ async fn update_cve_status(
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
 
+    // #1438 (1c): a non-existent CVE history id used to bubble out of
+    // sqlx::Error::RowNotFound as 500 DATABASE_ERROR. Map it explicitly to
+    // 404 so the client can distinguish bad input from server failure. All
+    // other sqlx errors continue to flow through the default mapping.
     let entry = service
         .update_cve_status(id, status, Some(auth.user_id), body.reason.as_deref())
-        .await?;
+        .await
+        .map_err(|e| match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        })?;
 
     Ok(Json(entry))
 }
@@ -1089,6 +1384,8 @@ async fn ensure_sbom_repo_access(
         get_sbom_components,
         convert_sbom,
         get_cve_history,
+        get_cve_history_by_artifact,
+        get_cve_history_by_cve,
         update_cve_status,
         get_cve_trends,
         list_license_policies,
@@ -1272,6 +1569,91 @@ mod tests {
         let resp = SbomContentResponse::from(doc);
         assert_eq!(resp.content, content);
         assert_eq!(resp.content["components"][0]["name"], "serde");
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.a: the
+    /// `/sbom/{id}/convert` response is a [`SbomContentResponse`], and when
+    /// the target format is SPDX the serialized body must expose the SPDX
+    /// document under `content` so the test's `.content.spdxVersion` /
+    /// `.content.SPDXID` reads resolve. The handler previously returned a
+    /// metadata-only `SbomResponse`, which carried neither field and made
+    /// every convert-to-SPDX call look like it dropped `spdxVersion`.
+    #[test]
+    fn test_convert_response_surfaces_spdx_content_keys() {
+        let now = Utc::now();
+        let spdx_content = serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "dataLicense": "CC0-1.0",
+            "name": "artifact-sbom",
+            "packages": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "spdx".to_string(),
+            format_version: "2.3".to_string(),
+            spec_version: Some("SPDX-2.3".to_string()),
+            content: spdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        // The handler builds exactly this from `convert_sbom`'s SbomDocument.
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["spdxVersion"], "SPDX-2.3");
+        assert_eq!(json["content"]["SPDXID"], "SPDXRef-DOCUMENT");
+        // Metadata is flattened alongside content (id is load-bearing for the
+        // round-trip step, which converts the returned id back).
+        assert_eq!(json["format"], "spdx");
+        assert!(json["id"].is_string());
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.b
+    /// (round-trip): converting back to CycloneDX must expose
+    /// `content.bomFormat == "CycloneDX"`. The metadata-only response had no
+    /// `content`, so the reverse conversion read an empty `bomFormat`.
+    #[test]
+    fn test_convert_response_surfaces_cyclonedx_bom_format() {
+        let now = Utc::now();
+        let cdx_content = serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "components": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("CycloneDX 1.5".to_string()),
+            content: cdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["bomFormat"], "CycloneDX");
+        assert_eq!(json["format"], "cyclonedx");
     }
 
     // -----------------------------------------------------------------------
@@ -1820,5 +2202,312 @@ mod tests {
         let r = sbom_read_details(Uuid::new_v4(), "cyclonedx", "by_id");
         assert!(g.is_object(), "generated payload must be a JSON object");
         assert!(r.is_object(), "read payload must be a JSON object");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_cve_id: regression coverage for #1375. The bug surfaced as a
+    // bare HTTP 400 from `GET /sbom/cve/history/CVE-2019-10744` because the
+    // path extractor was typed `Path<Uuid>`. The fix moves the validator into
+    // application code so these cases are exercised in unit tests rather
+    // than only at the route boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_cve_id_release_gate_fixture() {
+        // CVE-2019-10744 is the lodash 4.17.4 prototype-pollution fixture
+        // pinned by the release-gate scan-completion tests. The 400 bug
+        // (#1375) reproduced specifically on this id.
+        assert!(is_valid_cve_id("CVE-2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_five_digit_suffix() {
+        assert!(is_valid_cve_id("CVE-2024-12345"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_six_digit_suffix() {
+        // Modern CVE numbering exceeds 5 digits in high-volume years; the
+        // validator must accept arbitrary digit counts >= 4 to keep working
+        // as the catalogue grows.
+        assert!(is_valid_cve_id("CVE-2024-123456"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_four_digit_suffix() {
+        // CVE-1999-0001 is the canonical oldest valid id; 4 digits is the
+        // documented minimum.
+        assert!(is_valid_cve_id("CVE-1999-0001"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_lowercase_accepted() {
+        // Callers sometimes lowercase the prefix; the response shape is
+        // identical to upper-case so we accept it rather than 400ing.
+        assert!(is_valid_cve_id("cve-2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_short_suffix() {
+        // < 4 digit suffix is malformed under NVD numbering.
+        assert!(!is_valid_cve_id("CVE-2019-1"));
+        assert!(!is_valid_cve_id("CVE-2019-12"));
+        assert!(!is_valid_cve_id("CVE-2019-123"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_non_cve_string() {
+        assert!(!is_valid_cve_id("not-a-cve"));
+        assert!(!is_valid_cve_id(""));
+        assert!(!is_valid_cve_id("uuid-style-string"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_wrong_year_shape() {
+        // The year segment is exactly four ASCII digits.
+        assert!(!is_valid_cve_id("CVE-19-10744"));
+        assert!(!is_valid_cve_id("CVE-20191-10744"));
+        assert!(!is_valid_cve_id("CVE-YYYY-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_trailing_garbage() {
+        // The canonical form is exactly two dashes; a stray suffix must not
+        // pass.
+        assert!(!is_valid_cve_id("CVE-2019-10744-extra"));
+        // Trailing non-digit, non-whitespace bytes are not stripped.
+        assert!(!is_valid_cve_id("CVE-2019-10744x"));
+        assert!(!is_valid_cve_id("CVE-2019-1074a"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_strips_outer_whitespace() {
+        // `trim` only — interior whitespace still invalidates.
+        assert!(is_valid_cve_id("  CVE-2019-10744  "));
+        assert!(!is_valid_cve_id("CVE -2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_path_dispatch_distinguishes_uuid_vs_cve() {
+        // The handler's dispatch decides UUID-first, CVE-id-second, else
+        // 400. Make sure a UUID parses as a UUID (so artifact lookup wins)
+        // and a CVE id parses as a CVE id (so cross-artifact lookup wins).
+        let uuid = Uuid::new_v4();
+        assert!(Uuid::parse_str(&uuid.to_string()).is_ok());
+        assert!(!is_valid_cve_id(&uuid.to_string()));
+        assert!(Uuid::parse_str("CVE-2019-10744").is_err());
+        assert!(is_valid_cve_id("CVE-2019-10744"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_ghsa_id / is_valid_vuln_id: #1375 / B14. Grype reports
+    // ecosystem advisories under a GHSA id, so the history endpoints must
+    // accept `GHSA-xxxx-xxxx-xxxx` as well as `CVE-...`. These pin the GHSA
+    // grammar and the CVE/GHSA union.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ghsa_id_accepts_canonical_form() {
+        // The lodash advisory grype reports for CVE-2019-10744.
+        assert!(is_valid_ghsa_id("GHSA-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-abcd-1234-efgh"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_case_insensitive() {
+        assert!(is_valid_ghsa_id("ghsa-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-JF85-CPCP-J695"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_rejects_malformed() {
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp")); // only two groups
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp-j695-extra")); // four groups
+        assert!(!is_valid_ghsa_id("GHSA-jf8-cpcp-j695")); // group not four chars
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpc!-j695")); // illegal char
+        assert!(!is_valid_ghsa_id("CVE-2019-10744")); // not a GHSA
+        assert!(!is_valid_ghsa_id(""));
+        assert!(!is_valid_ghsa_id("GHSA"));
+    }
+
+    #[test]
+    fn test_is_valid_vuln_id_accepts_both_families() {
+        assert!(is_valid_vuln_id("CVE-2019-10744"));
+        assert!(is_valid_vuln_id("GHSA-jf85-cpcp-j695"));
+        assert!(!is_valid_vuln_id("not-a-vuln"));
+        assert!(!is_valid_vuln_id(""));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_accepts_ghsa_id() {
+        // B14: a GHSA id must route to the cross-artifact lookup branch, not
+        // 400. Normalized to upper-case like the CVE path.
+        let result = classify_cve_history_path("GHSA-jf85-cpcp-j695");
+        assert_eq!(
+            result,
+            CveHistoryPath::Cve("GHSA-JF85-CPCP-J695".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_cve_history_path: pure dispatch over the overloaded path
+    // parameter. Pulled out of the async handler so the routing decision
+    // (UUID first, CVE second, else 400) is unit-testable. (#1375)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_cve_history_path_uuid_wins() {
+        let uuid = Uuid::new_v4();
+        let result = classify_cve_history_path(&uuid.to_string());
+        assert_eq!(result, CveHistoryPath::Artifact(uuid));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_release_gate_fixture() {
+        // CVE-2019-10744 is the release-gate fixture; the pre-fix
+        // Path<Uuid> extractor 400'd it. Now it must route to the CVE
+        // branch.
+        let result = classify_cve_history_path("CVE-2019-10744");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2019-10744".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_normalizes_to_upper() {
+        // Lower-case input must normalize to canonical upper-case before
+        // hitting the lookup, so the case-insensitive DB compare lives
+        // in one place.
+        let result = classify_cve_history_path("cve-2024-12345");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2024-12345".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_cve_id_trims_whitespace() {
+        // Reverse-proxy / curl quirks sometimes leave leading whitespace;
+        // the classify step must strip it before forwarding.
+        let result = classify_cve_history_path("  CVE-2024-1234  ");
+        assert_eq!(result, CveHistoryPath::Cve("CVE-2024-1234".to_string()));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_invalid_returns_invalid() {
+        assert_eq!(
+            classify_cve_history_path("not-a-uuid"),
+            CveHistoryPath::Invalid
+        );
+        assert_eq!(classify_cve_history_path(""), CveHistoryPath::Invalid);
+        // 7-byte malformed UUID-ish string.
+        assert_eq!(
+            classify_cve_history_path("abcdefg"),
+            CveHistoryPath::Invalid
+        );
+        // CVE-shape but invalid (suffix too short).
+        assert_eq!(
+            classify_cve_history_path("CVE-2024-1"),
+            CveHistoryPath::Invalid
+        );
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_uuid_preferred_over_cve_id() {
+        // A canonical UUID never matches the CVE shape (no leading
+        // "CVE-"), so this is mostly a smoke check that the UUID branch
+        // runs first. If someone ever changed `is_valid_cve_id` to match
+        // arbitrary strings, this test would catch the routing flip.
+        let uuid_str = "12345678-1234-1234-1234-123456789abc";
+        match classify_cve_history_path(uuid_str) {
+            CveHistoryPath::Artifact(_) => (),
+            other => panic!("expected Artifact, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 400 error wording: pin the strings so a refactor that renames them
+    // does not silently break clients that grep the body for keywords.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalid_cve_history_path_message_includes_offending_id() {
+        let msg = invalid_cve_history_path_message("zzz");
+        assert!(msg.contains("zzz"));
+        assert!(msg.contains("UUID"));
+        assert!(msg.contains("CVE-YYYY-N"));
+    }
+
+    #[test]
+    fn test_invalid_cve_id_route_message_includes_offending_id() {
+        let msg = invalid_cve_id_route_message("CVE-bad");
+        assert!(msg.contains("CVE-bad"));
+        assert!(msg.contains("CVE-YYYY-N"));
+        // The typed-route message must NOT mention "UUID" since the route
+        // does not accept UUIDs.
+        assert!(!msg.contains("UUID"));
+    }
+
+    #[test]
+    fn test_invalid_cve_history_path_message_distinct_from_typed_route_message() {
+        // The overloaded route and the typed CVE route emit different
+        // messages because they accept different shapes; pin that they
+        // do not collapse.
+        let overload = invalid_cve_history_path_message("xxx");
+        let typed = invalid_cve_id_route_message("xxx");
+        assert_ne!(overload, typed);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1438 (1c): POST /sbom/cve/status/{uuid} for a missing id used to
+    // surface `sqlx::Error::RowNotFound` as 500 DATABASE_ERROR. The handler
+    // now maps that one variant to NotFound (404) explicitly. The mapping
+    // is a small inline closure inside `update_cve_status`; we replicate
+    // the exact match arm here so the contract is pinned without spinning
+    // up Postgres.
+    // -----------------------------------------------------------------------
+
+    fn map_update_cve_status_err(id: Uuid, e: AppError) -> AppError {
+        match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_maps_row_not_found_to_404() {
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::RowNotFound);
+        match map_update_cve_status_err(id, err) {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains(&id.to_string()));
+                assert!(msg.contains("CVE history entry"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_other_db_errors() {
+        // A non-RowNotFound sqlx error must keep flowing as a DB error so
+        // operators still see 500s for genuine database failures.
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        match map_update_cve_status_err(id, err) {
+            AppError::Sqlx(sqlx::Error::PoolTimedOut) => {}
+            other => panic!(
+                "expected Sqlx(PoolTimedOut) to pass through, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_validation_errors() {
+        // Validation errors (e.g. unknown status string) reach the mapper
+        // unchanged so the client sees the original 400 message.
+        let id = Uuid::new_v4();
+        let err = AppError::Validation("Unknown status: maybe".to_string());
+        match map_update_cve_status_err(id, err) {
+            AppError::Validation(msg) => assert_eq!(msg, "Unknown status: maybe"),
+            other => panic!("expected Validation to pass through, got {:?}", other),
+        }
     }
 }

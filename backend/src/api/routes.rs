@@ -412,7 +412,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     optional_auth_middleware,
                 )),
         )
-        // Permission routes with auth middleware
+        // Permission routes with auth middleware.
+        //
+        // The permission handlers declare `Extension<Option<AuthExtension>>`
+        // and do their own authorization (require_auth + require_scope /
+        // require_admin). `auth_middleware` now injects BOTH the bare
+        // `AuthExtension` and an `Option<AuthExtension>` (see its body), so
+        // either extractor shape resolves. Before that fix the
+        // `Option<AuthExtension>` extractor failed during request extraction
+        // with HTTP 500 ("Missing request extension: Extension of type
+        // Option<AuthExtension>") before the in-handler scope check ran, so a
+        // read-scope service-account token got 500 instead of the canonical
+        // 403 on POST /api/v1/permissions. Hard auth (401 for anonymous) is
+        // preserved because auth_middleware still rejects unauthenticated
+        // requests up front. See #1438 (B10).
         .nest(
             "/permissions",
             handlers::permissions::router()

@@ -80,10 +80,38 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write content
-        let mut file = fs::File::create(&path).await?;
-        file.write_all(&content).await?;
-        file.sync_all().await?;
+        // Write to a unique temp file in the same directory, then atomically
+        // rename into place (same filesystem => atomic rename on POSIX). The
+        // previous implementation wrote directly to `path` via
+        // `File::create` + `write_all`, which is NOT atomic: under a
+        // cold-cache proxy stampede, N concurrent writers target the SAME
+        // cache file and race on truncate/write, and a reader interleaving
+        // with a sibling writer's truncate can observe a torn or
+        // transiently-missing file. Writing to a per-writer temp path and
+        // renaming gives each writer an isolated file and makes the visible
+        // `path` flip atomically from old bytes to new bytes, never to a
+        // partial/empty state. This closes the B6 stampede 502 leak at the
+        // storage layer (the proxy-service call site additionally treats a
+        // cache-write failure as best-effort).
+        let mut temp_name = path.as_os_str().to_os_string();
+        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
+        let temp_path = PathBuf::from(temp_name);
+
+        let mut file = fs::File::create(&temp_path).await?;
+        if let Err(e) = file.write_all(&content).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
 
         Ok(())
     }
@@ -383,6 +411,52 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, content);
+    }
+
+    /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +
+    /// atomic rename so concurrent writers to the SAME key never observe a
+    /// torn / transiently-missing file. Before the fix, `put` did
+    /// `File::create(&dest) + write_all`, which truncated `dest` in place and
+    /// let a reader interleave with a sibling writer's truncate. This test
+    /// fires many concurrent writers + readers at one key and asserts every
+    /// `put` succeeds, no `.tmp.` files leak, and the final read returns a
+    /// complete (non-empty) body.
+    #[tokio::test]
+    async fn test_concurrent_put_same_key_is_atomic() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FilesystemStorage::new(temp_dir.path()));
+        let key = "proxy-cache/stampede-repo/simple/pkg/__content__";
+        let content = Bytes::from(vec![b'x'; 4096]);
+
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let s = storage.clone();
+            let c = content.clone();
+            handles.push(tokio::spawn(async move {
+                // Each writer writes the same body; the read may race a
+                // concurrent rename but must never see a partial file.
+                s.put(key, c).await
+            }));
+        }
+        for h in handles {
+            // Every put must succeed (no ENOENT from the create_dir_all /
+            // File::create race the old non-atomic path exhibited).
+            h.await.unwrap().expect("concurrent put must not fail");
+        }
+
+        let got = storage.get(key).await.expect("final read must succeed");
+        assert_eq!(got.len(), content.len(), "body must be complete, not torn");
+
+        // No leftover temp files.
+        let mut leftovers = Vec::new();
+        let mut entries = fs::read_dir(temp_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            collect_tmp_files(entry.path(), &mut leftovers).await;
+        }
+        assert!(
+            leftovers.is_empty(),
+            "atomic put must not leave .tmp. files: {leftovers:?}"
+        );
     }
 
     // #1073 regression: a proxy-cache key written by the un-sharded writer

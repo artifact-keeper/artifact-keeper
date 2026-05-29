@@ -46,6 +46,22 @@ pub struct GrypeReport {
 pub struct GrypeMatch {
     pub vulnerability: GrypeVulnerability,
     pub artifact: GrypeArtifact,
+    /// Aliases Grype maps the primary match to. For ecosystem advisories
+    /// (npm, RubyGems, etc.) Grype's primary `vulnerability.id` is frequently
+    /// the GHSA identifier (e.g. `GHSA-jf85-cpcp-j695`) and the NVD `CVE-` id
+    /// lives here as a related vulnerability. Consumers and the release-gate
+    /// keyed on the canonical CVE id never see it unless we surface the alias.
+    ///
+    /// CRITICAL (#1375 / B15): in Grype's JSON this array is a TOP-LEVEL field
+    /// of the *match* object (a sibling of `vulnerability` and `artifact`),
+    /// NOT a field nested inside `vulnerability`. An earlier fix placed it
+    /// inside `GrypeVulnerability`, so it deserialized to an empty Vec against
+    /// real Grype output and the GHSA->CVE mapping silently never fired. It
+    /// must live here on `GrypeMatch`. Verified against grype v0.112.0 output
+    /// for lodash 4.17.4: `.matches[].relatedVulnerabilities[].id` ==
+    /// "CVE-2019-10744".
+    #[serde(default, rename = "relatedVulnerabilities")]
+    pub related_vulnerabilities: Vec<GrypeRelatedVulnerability>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +75,16 @@ pub struct GrypeVulnerability {
     pub fix: Option<GrypeFix>,
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+}
+
+/// A cross-referenced vulnerability id Grype attaches to a primary match.
+/// We only care about the `id` (the alias identifier); the `namespace`
+/// field is captured for completeness but unused.
+#[derive(Debug, Deserialize)]
+pub struct GrypeRelatedVulnerability {
+    pub id: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,12 +314,21 @@ impl GrypeScanner {
             .matches
             .iter()
             .map(|m| {
+                // B15: Grype's primary `id` for an ecosystem advisory is often
+                // the GHSA id, with the canonical NVD CVE in
+                // `relatedVulnerabilities`. Surface the CVE id as the finding's
+                // `cve_id` so downstream consumers (and the release-gate, which
+                // keys on `CVE-2019-10744`) can join on the well-known id. The
+                // GHSA id is retained in the title so neither identifier is
+                // lost.
+                let primary_id = &m.vulnerability.id;
+                let canonical_cve = canonical_cve_id(primary_id, &m.related_vulnerabilities);
                 RawFinding {
                     severity: Severity::from_str_loose(&m.vulnerability.severity)
                         .unwrap_or(Severity::Info),
-                    title: format!("{} in {}", m.vulnerability.id, m.artifact.name),
+                    title: format!("{} in {}", primary_id, m.artifact.name),
                     description: m.vulnerability.description.clone(),
-                    cve_id: Some(m.vulnerability.id.clone()),
+                    cve_id: Some(canonical_cve),
                     // Bare package name; matches scanner_service::convert_trivy_findings
                     // so SBOM / CVE-mapping consumers can join on the raw name.
                     affected_component: Some(m.artifact.name.clone()),
@@ -376,6 +411,53 @@ impl GrypeScanner {
         }
         packages
     }
+}
+
+/// Cheap structural check for a `CVE-YYYY-N` identifier. Case-insensitive on
+/// the `CVE` prefix; the suffix must be 4+ digits per NVD numbering. Mirrors
+/// the validation in the sbom handler (`is_valid_cve_id`) so the alias chosen
+/// here is one the CVE-history endpoint will also accept. (#1375 / B15)
+fn is_cve_id(id: &str) -> bool {
+    let mut parts = id.trim().split('-');
+    match parts.next() {
+        Some(p) if p.eq_ignore_ascii_case("CVE") => {}
+        _ => return false,
+    }
+    let year = match parts.next() {
+        Some(y) => y,
+        None => return false,
+    };
+    let number = match parts.next() {
+        Some(n) => n,
+        None => return false,
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    number.len() >= 4 && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Choose the canonical vulnerability id for a finding's `cve_id` field.
+///
+/// If the primary id is already a `CVE-` id we keep it. Otherwise (the common
+/// case for npm/RubyGems advisories where Grype's primary id is a GHSA) we
+/// look through `relatedVulnerabilities` for the first NVD CVE id and prefer
+/// it, so the well-known CVE identifier is surfaced. If no CVE alias exists we
+/// fall back to the primary id unchanged (e.g. a pure GHSA advisory with no
+/// assigned CVE). (#1375 / B15)
+fn canonical_cve_id(primary_id: &str, related: &[GrypeRelatedVulnerability]) -> String {
+    if is_cve_id(primary_id) {
+        return primary_id.to_string();
+    }
+    related
+        .iter()
+        .map(|r| r.id.as_str())
+        .find(|id| is_cve_id(id))
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| primary_id.to_string())
 }
 
 /// Resolve a PURL string for a Grype-matched artifact (#1273).
@@ -834,6 +916,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -886,6 +969,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -926,6 +1010,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -937,6 +1022,217 @@ mod tests {
         assert_eq!(findings[0].description, None);
         // Without artifact_type, component is just the name
         assert_eq!(findings[0].affected_component, Some("some-lib".to_string()));
+        // B15: a pure GHSA advisory with no related CVE keeps the GHSA id as
+        // its cve_id (we do not invent a CVE; the alias logic only prefers a
+        // CVE that grype actually emitted in relatedVulnerabilities).
+        assert_eq!(findings[0].cve_id, Some("GHSA-abcd-1234-efgh".to_string()));
+    }
+
+    /// B15: Grype reports the lodash 4.17.4 prototype-pollution advisory under
+    /// its GHSA id (`GHSA-jf85-cpcp-j695`) with the NVD `CVE-2019-10744` in
+    /// `relatedVulnerabilities`. The release-gate `grype-scanner` suite asserts
+    /// a finding with `cve_id == "CVE-2019-10744"` is present. Before this fix
+    /// `convert_findings` copied the primary GHSA id verbatim, so the CVE the
+    /// gate keys on never appeared. This pins the alias preference.
+    #[test]
+    fn test_convert_findings_prefers_related_cve_over_ghsa() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "GHSA-jf85-cpcp-j695".to_string(),
+                    severity: "Critical".to_string(),
+                    description: Some("Prototype pollution in lodash".to_string()),
+                    fix: Some(GrypeFix {
+                        versions: vec!["4.17.12".to_string()],
+                        state: Some("fixed".to_string()),
+                    }),
+                    urls: Some(vec![
+                        "https://github.com/advisories/GHSA-jf85-cpcp-j695".to_string()
+                    ]),
+                },
+                artifact: GrypeArtifact {
+                    name: "lodash".to_string(),
+                    version: "4.17.4".to_string(),
+                    artifact_type: Some("npm".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+                related_vulnerabilities: vec![GrypeRelatedVulnerability {
+                    id: "CVE-2019-10744".to_string(),
+                    namespace: Some("nvd:cpe".to_string()),
+                }],
+            }],
+        };
+
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].cve_id,
+            Some("CVE-2019-10744".to_string()),
+            "convert_findings must surface the related NVD CVE id when the \
+             primary match id is a GHSA (B15)"
+        );
+        // The GHSA id is not lost: it stays in the human-readable title.
+        assert!(
+            findings[0].title.contains("GHSA-jf85-cpcp-j695"),
+            "title should retain the GHSA id; got {:?}",
+            findings[0].title
+        );
+        // source attribution unchanged.
+        assert_eq!(findings[0].source, Some("grype".to_string()));
+    }
+
+    /// B15: when the primary match id is already a CVE, the alias logic is a
+    /// no-op even if relatedVulnerabilities also carries CVEs. The primary id
+    /// wins so we never silently swap a finding's identity.
+    #[test]
+    fn test_convert_findings_keeps_primary_cve_id() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2021-44228".to_string(),
+                    severity: "Critical".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "log4j-core".to_string(),
+                    version: "2.14.1".to_string(),
+                    artifact_type: Some("java-archive".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+                related_vulnerabilities: vec![GrypeRelatedVulnerability {
+                    id: "CVE-2021-45046".to_string(),
+                    namespace: Some("nvd:cpe".to_string()),
+                }],
+            }],
+        };
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings[0].cve_id, Some("CVE-2021-44228".to_string()));
+    }
+
+    /// B15: a GHSA primary with no CVE alias falls back to the GHSA id rather
+    /// than dropping the finding's identifier.
+    #[test]
+    fn test_canonical_cve_id_fallback_to_primary() {
+        assert_eq!(
+            canonical_cve_id("GHSA-aaaa-bbbb-cccc", &[]),
+            "GHSA-aaaa-bbbb-cccc"
+        );
+        assert_eq!(
+            canonical_cve_id(
+                "GHSA-aaaa-bbbb-cccc",
+                &[GrypeRelatedVulnerability {
+                    id: "GHSA-dddd-eeee-ffff".to_string(),
+                    namespace: None,
+                }]
+            ),
+            "GHSA-aaaa-bbbb-cccc",
+            "no CVE alias present -> keep primary GHSA id"
+        );
+    }
+
+    #[test]
+    fn test_is_cve_id_recognizes_valid_and_rejects_invalid() {
+        assert!(is_cve_id("CVE-2019-10744"));
+        assert!(is_cve_id("cve-1999-0001")); // case-insensitive, 4-digit suffix
+        assert!(is_cve_id("CVE-2024-123456")); // 6-digit suffix
+        assert!(!is_cve_id("GHSA-jf85-cpcp-j695"));
+        assert!(!is_cve_id("CVE-2019-1")); // sub-4-digit suffix
+        assert!(!is_cve_id("CVE-201-10744")); // 3-digit year
+        assert!(!is_cve_id("not-a-cve"));
+        assert!(!is_cve_id("CVE-2019-10744-extra")); // stray suffix
+    }
+
+    /// B15: grype JSON with a `relatedVulnerabilities` block deserializes the
+    /// alias ids and the GHSA->CVE mapping fires.
+    ///
+    /// CRITICAL: this fixture mirrors grype's REAL output shape, where
+    /// `relatedVulnerabilities` is a TOP-LEVEL field of the match object (a
+    /// sibling of `vulnerability` and `artifact`). Verified against grype
+    /// v0.112.0 for lodash 4.17.4. An earlier version of this test nested the
+    /// array inside `vulnerability`, which matched the (buggy) struct shape
+    /// and made the test pass while real scans produced GHSA ids -- the exact
+    /// B15 gate failure. Keep this fixture faithful to grype's wire format.
+    #[test]
+    fn test_grype_report_deserializes_related_vulnerabilities() {
+        let json = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "GHSA-jf85-cpcp-j695",
+                    "severity": "High"
+                },
+                "relatedVulnerabilities": [
+                    {"id": "CVE-2019-10744", "namespace": "nvd:cpe"}
+                ],
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report: GrypeReport = serde_json::from_str(json).unwrap();
+        let related = &report.matches[0].related_vulnerabilities;
+        assert_eq!(
+            related.len(),
+            1,
+            "match-level relatedVulnerabilities must deserialize"
+        );
+        assert_eq!(related[0].id, "CVE-2019-10744");
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(
+            findings[0].cve_id,
+            Some("CVE-2019-10744".to_string()),
+            "GHSA->CVE mapping must fire from match-level relatedVulnerabilities"
+        );
+    }
+
+    /// B15 regression guard: prove the JSON nesting matters. If a future
+    /// change moves `related_vulnerabilities` back inside `GrypeVulnerability`,
+    /// real grype output (which carries the array at the MATCH level) would
+    /// deserialize to an empty Vec and the mapping would silently regress to
+    /// the primary GHSA id. This test pins that the array is read from the
+    /// match level by feeding grype's real shape and asserting the CVE wins,
+    /// and that an array MISplaced inside `vulnerability` is ignored.
+    #[test]
+    fn test_related_vulnerabilities_is_read_from_match_level_not_vulnerability() {
+        // Correct (real grype) shape: array at match level -> CVE surfaces.
+        let correct = r#"{
+            "matches": [{
+                "vulnerability": {"id": "GHSA-jf85-cpcp-j695", "severity": "High"},
+                "relatedVulnerabilities": [{"id": "CVE-2019-10744"}],
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report: GrypeReport = serde_json::from_str(correct).unwrap();
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings[0].cve_id, Some("CVE-2019-10744".to_string()));
+
+        // Misplaced shape: array nested under vulnerability (the old bug's
+        // assumption). The match-level field is absent, so the alias is NOT
+        // picked up and the primary GHSA id is kept. This documents why the
+        // nesting is load-bearing.
+        let misplaced = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "GHSA-jf85-cpcp-j695",
+                    "severity": "High",
+                    "relatedVulnerabilities": [{"id": "CVE-2019-10744"}]
+                },
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report2: GrypeReport = serde_json::from_str(misplaced).unwrap();
+        assert!(
+            report2.matches[0].related_vulnerabilities.is_empty(),
+            "a relatedVulnerabilities array nested under vulnerability must NOT \
+             populate the match-level field"
+        );
+        let findings2 = GrypeScanner::convert_findings(&report2);
+        assert_eq!(
+            findings2[0].cve_id,
+            Some("GHSA-jf85-cpcp-j695".to_string()),
+            "with no match-level alias, the primary GHSA id is kept"
+        );
     }
 
     #[test]
@@ -1234,6 +1530,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -1281,6 +1578,7 @@ mod tests {
                 purl: None,
                 licenses: None,
             },
+            related_vulnerabilities: vec![],
         };
         let report = GrypeReport {
             matches: vec![
@@ -1321,6 +1619,7 @@ mod tests {
                     purl: Some("pkg:npm/%40types/node@20.0.0".to_string()),
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -1354,6 +1653,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
         assert!(GrypeScanner::convert_packages(&report).is_empty());
@@ -1381,6 +1681,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
         let packages = GrypeScanner::convert_packages(&report);

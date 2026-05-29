@@ -380,6 +380,7 @@ pub async fn restore_backup(
     responses(
         (status = 200, description = "Backup cancelled"),
         (status = 404, description = "Backup not found"),
+        (status = 409, description = "Backup is not in a cancellable state"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))

@@ -58,15 +58,25 @@ fn clamp_stuck_scan_interval(value: u64) -> u64 {
 /// Default cap for concurrent bcrypt-bound auth operations.
 ///
 /// bcrypt-cost-12 is CPU-bound and takes roughly 100-300 ms per verify; once
-/// in-flight verifies exceed `4 * cores`, additional requests just queue
-/// behind a saturated blocking-thread pool and the rest of the API starves.
-/// The floor of 8 keeps low-core dev environments usable, while the
-/// 4x multiplier keeps large machines from being capped artificially low.
+/// in-flight verifies exceed `8 * cores`, additional requests queue behind a
+/// saturated blocking-thread pool and the rest of the API starves.
+///
+/// The floor of 32 (raised from 8 in #1437/#1442 — see CHANGELOG) keeps
+/// low-core CI runners from shedding modest concurrent basic-auth load:
+/// previously a 2-core CI runner capped at 8 concurrent bcrypts, so a
+/// `cargo publish` job that issued 20 parallel requests would fail 12 of
+/// them with 503 (counted as "5xx" by upstream stress tests). The 8x
+/// multiplier keeps large machines from being capped artificially low.
+///
+/// Combined with the 3 s queue tolerance in
+/// [`acquire_auth_permit_for_bcrypt`](crate::services::auth_service)
+/// requests now *briefly wait* for a slot instead of failing instantly,
+/// so a burst of 50 concurrent verifies at cap=32 settles cleanly.
 fn default_auth_max_concurrency() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    std::cmp::max(8, cores.saturating_mul(4))
+    std::cmp::max(32, cores.saturating_mul(8))
 }
 
 /// Application configuration
