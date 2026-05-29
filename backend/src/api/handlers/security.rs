@@ -165,8 +165,22 @@ impl ScanResponse {
         artifact_name: Option<String>,
         artifact_version: Option<String>,
     ) -> Self {
+        // #1373 / B13: a reused row (cross-artifact dedup) is a thin pointer at
+        // a source scan that holds the real findings. Report the SOURCE scan id
+        // as this row's `id` so that two byte-identical artifacts surface the
+        // SAME logical scan_id to clients. The release-gate `scan-dedup-checksum`
+        // suite asserts exactly this: triggering a scan on a byte-identical
+        // second artifact must resolve to the same scan_id as the first. The
+        // row's own (placeholder) id is internal bookkeeping; clients that need
+        // the findings hit `GET /security/scans/{id}` which works against the
+        // source id because the findings live there. `source_scan_id` is still
+        // exposed verbatim below for provenance.
+        let reported_id = match (s.is_reused, s.source_scan_id) {
+            (true, Some(source_id)) => source_id,
+            _ => s.id,
+        };
         Self {
-            id: s.id,
+            id: reported_id,
             artifact_id: s.artifact_id,
             artifact_name,
             artifact_version,
@@ -1482,6 +1496,60 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["is_reused"], true);
         assert_eq!(json["source_scan_id"], source_id.to_string());
+    }
+
+    /// B13 / #1373: a reused row must report the SOURCE scan id as its `id`
+    /// so two byte-identical artifacts surface the same logical scan_id. The
+    /// release-gate `scan-dedup-checksum` suite reads `.items[0].id` from each
+    /// artifact's `/scans` list and asserts they are equal. Before this fix the
+    /// reused row reported its own placeholder id, so the ids differed and the
+    /// assertion failed.
+    #[test]
+    fn test_scan_response_reused_row_reports_source_scan_id_as_id() {
+        let placeholder_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let scan = ScanResult {
+            id: placeholder_id,
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            scan_type: "trivy".to_string(),
+            status: "completed".to_string(),
+            findings_count: 3,
+            critical_count: 1,
+            high_count: 1,
+            medium_count: 1,
+            low_count: 0,
+            info_count: 0,
+            scanner_version: None,
+            error_message: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            is_reused: true,
+            source_scan_id: Some(source_id),
+        };
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(
+            resp.id, source_id,
+            "reused row must report the source scan id as its id (B13)"
+        );
+        // provenance is still exposed verbatim.
+        assert_eq!(resp.source_scan_id, Some(source_id));
+        assert!(resp.is_reused);
+    }
+
+    /// A reused row with `source_scan_id == None` (should not happen in
+    /// practice, but guard against a partial write) falls back to its own id
+    /// rather than panicking or emitting a nil UUID.
+    #[test]
+    fn test_scan_response_reused_without_source_falls_back_to_own_id() {
+        let own_id = Uuid::new_v4();
+        let mut scan = make_scan_result();
+        scan.id = own_id;
+        scan.is_reused = true;
+        scan.source_scan_id = None;
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(resp.id, own_id);
     }
 
     #[test]

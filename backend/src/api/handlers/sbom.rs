@@ -717,6 +717,56 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
     true
 }
 
+/// Validate that a string is a well-formed GitHub Security Advisory id.
+///
+/// GHSA ids have the canonical shape `GHSA-xxxx-xxxx-xxxx`: the literal
+/// `GHSA` prefix followed by three dash-separated groups of four base32
+/// characters (lower-case `a-z` plus digits `2-9`, no `0`/`1`/`l`/`o`).
+/// Match is case-insensitive on the prefix and the groups.
+///
+/// Why this exists (#1375 / B14): Grype reports ecosystem advisories (npm,
+/// RubyGems, etc.) under their GHSA id, so a consumer that captured a
+/// finding's identifier may legitimately query
+/// `GET /sbom/cve/history/GHSA-jf85-cpcp-j695`. The endpoint previously
+/// rejected every GHSA id with a 400 even though the underlying lookup is
+/// id-agnostic.
+///
+/// Examples:
+///   - `GHSA-jf85-cpcp-j695` → true
+///   - `ghsa-jf85-cpcp-j695` → true (case-insensitive)
+///   - `GHSA-jf85-cpcp`      → false (only two groups)
+///   - `GHSA-jf8-cpcp-j695`  → false (group not four chars)
+///   - `CVE-2019-10744`      → false (not a GHSA)
+pub(crate) fn is_valid_ghsa_id(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    match parts.next() {
+        Some(p) if p.eq_ignore_ascii_case("GHSA") => {}
+        _ => return false,
+    }
+    let mut groups = 0;
+    for group in parts {
+        groups += 1;
+        if groups > 3 {
+            return false;
+        }
+        if group.len() != 4
+            || !group
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    groups == 3
+}
+
+/// Validate that a string is a vulnerability identifier we accept on the
+/// CVE-history endpoints: either a CVE id or a GHSA id. (#1375 / B14)
+pub(crate) fn is_valid_vuln_id(s: &str) -> bool {
+    is_valid_cve_id(s) || is_valid_ghsa_id(s)
+}
+
 /// Outcome of dispatching the overloaded `/cve/history/{id}` path param.
 ///
 /// Pure typing of the UUID-vs-CVE-id sniff so the dispatch decision is
@@ -726,15 +776,15 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
 pub(crate) enum CveHistoryPath {
     /// Parsed UUID; treat as artifact_id lookup.
     Artifact(Uuid),
-    /// Parsed CVE id (canonical upper-case form); treat as cross-artifact
-    /// CVE lookup.
+    /// Parsed vulnerability id (CVE or GHSA, canonical upper-case form);
+    /// treat as cross-artifact lookup. (#1375 / B14)
     Cve(String),
     /// Neither parse succeeded; handler returns 400.
     Invalid,
 }
 
 /// Classify an overloaded `/cve/history/{id}` path parameter. UUID first
-/// (legacy semantic), then CVE id, else invalid.
+/// (legacy semantic), then vulnerability id (CVE or GHSA), else invalid.
 ///
 /// Extracted from `get_cve_history` so the routing decision is exercised
 /// by unit tests; the async wrapper only owns the DB calls. (#1375)
@@ -742,19 +792,23 @@ pub(crate) fn classify_cve_history_path(id: &str) -> CveHistoryPath {
     if let Ok(uuid) = Uuid::parse_str(id) {
         return CveHistoryPath::Artifact(uuid);
     }
-    if is_valid_cve_id(id) {
+    if is_valid_vuln_id(id) {
         // Normalize to upper-case so the downstream lookup matches the
-        // schema's storage convention.
+        // schema's storage convention. The service compares case-insensitively
+        // anyway, but normalizing keeps logs/metrics consistent.
         return CveHistoryPath::Cve(id.trim().to_ascii_uppercase());
     }
     CveHistoryPath::Invalid
 }
 
-/// Construct the 400 message returned when neither a UUID nor a CVE id
-/// matches. Pulled out so the message wording (which clients sometimes
+/// Construct the 400 message returned when neither a UUID nor a vulnerability
+/// id matches. Pulled out so the message wording (which clients sometimes
 /// parse) is pinned by a test.
 pub(crate) fn invalid_cve_history_path_message(id: &str) -> String {
-    format!("Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)")
+    format!(
+        "Path id '{id}' is neither a valid UUID nor a vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
 }
 
 /// Get CVE history by artifact UUID or CVE identifier (legacy overload).
@@ -854,7 +908,10 @@ async fn get_cve_history_by_artifact(
 /// wording is slightly different (typed route knows the id is meant to
 /// be a CVE id, not "either a UUID or a CVE id").
 pub(crate) fn invalid_cve_id_route_message(cve_id: &str) -> String {
-    format!("Path id '{cve_id}' is not a valid CVE identifier (expected `CVE-YYYY-N`)")
+    format!(
+        "Path id '{cve_id}' is not a valid vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
 }
 
 /// Get CVE history for one CVE identifier across artifacts (typed CVE-id
@@ -882,7 +939,7 @@ async fn get_cve_history_by_cve(
     Extension(auth): Extension<AuthExtension>,
     Path(cve_id): Path<String>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
-    if !is_valid_cve_id(&cve_id) {
+    if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
     let service = SbomService::new(state.db.clone());
@@ -2144,6 +2201,56 @@ mod tests {
         assert!(!is_valid_cve_id(&uuid.to_string()));
         assert!(Uuid::parse_str("CVE-2019-10744").is_err());
         assert!(is_valid_cve_id("CVE-2019-10744"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_ghsa_id / is_valid_vuln_id: #1375 / B14. Grype reports
+    // ecosystem advisories under a GHSA id, so the history endpoints must
+    // accept `GHSA-xxxx-xxxx-xxxx` as well as `CVE-...`. These pin the GHSA
+    // grammar and the CVE/GHSA union.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ghsa_id_accepts_canonical_form() {
+        // The lodash advisory grype reports for CVE-2019-10744.
+        assert!(is_valid_ghsa_id("GHSA-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-abcd-1234-efgh"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_case_insensitive() {
+        assert!(is_valid_ghsa_id("ghsa-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-JF85-CPCP-J695"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_rejects_malformed() {
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp")); // only two groups
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp-j695-extra")); // four groups
+        assert!(!is_valid_ghsa_id("GHSA-jf8-cpcp-j695")); // group not four chars
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpc!-j695")); // illegal char
+        assert!(!is_valid_ghsa_id("CVE-2019-10744")); // not a GHSA
+        assert!(!is_valid_ghsa_id(""));
+        assert!(!is_valid_ghsa_id("GHSA"));
+    }
+
+    #[test]
+    fn test_is_valid_vuln_id_accepts_both_families() {
+        assert!(is_valid_vuln_id("CVE-2019-10744"));
+        assert!(is_valid_vuln_id("GHSA-jf85-cpcp-j695"));
+        assert!(!is_valid_vuln_id("not-a-vuln"));
+        assert!(!is_valid_vuln_id(""));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_accepts_ghsa_id() {
+        // B14: a GHSA id must route to the cross-artifact lookup branch, not
+        // 400. Normalized to upper-case like the CVE path.
+        let result = classify_cve_history_path("GHSA-jf85-cpcp-j695");
+        assert_eq!(
+            result,
+            CveHistoryPath::Cve("GHSA-JF85-CPCP-J695".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
