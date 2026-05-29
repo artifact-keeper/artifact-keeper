@@ -2601,8 +2601,8 @@ mod tests {
     fn test_peer_connect_timeout_default_is_bounded() {
         // The default must be small relative to the 300s request timeout so a
         // black-holed peer in a fan-out cannot hold a transfer slot for long.
+        // Pins the exact default; 10 is well under the 300s request timeout.
         assert_eq!(DEFAULT_PEER_CONNECT_TIMEOUT_SECS, 10);
-        assert!(DEFAULT_PEER_CONNECT_TIMEOUT_SECS < 300);
     }
 
     #[test]
