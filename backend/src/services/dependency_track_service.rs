@@ -33,7 +33,7 @@
 //! bring their own DT instance (or set `dependencyTrack.existingApiKeySecret`
 //! in the Helm chart) must grant the four permissions out of band, either
 //! via the DT UI (Administration -> Teams -> permissions tab) or via
-//! `PUT /api/v1/permission/{perm}/team/{uuid}`.
+//! `POST /api/v1/permission/{perm}/team/{uuid}`.
 //!
 //! When DT replies with 401 or 403, `dt_upstream_status_err` appends a
 //! permissions hint to the error message so the operator-facing log and the
@@ -92,7 +92,7 @@ pub(crate) const DT_PERMISSIONS_HINT: &str =
      VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default 'Automation' team has \
      none of these; grant them via the DT UI \
      (Administration -> Teams -> permissions) or \
-     PUT /api/v1/permission/{permission}/team/{uuid}.";
+     POST /api/v1/permission/{permission}/team/{uuid}.";
 
 /// True if the status indicates an authentication or authorization failure
 /// the operator can fix by adjusting the DT team permissions or API key.
@@ -2593,6 +2593,16 @@ mod tests {
         assert!(
             msg.contains("BOM upload"),
             "missing operation tag in: {}",
+            msg
+        );
+        // (5) HTTP verb in the permissions-hint curl example must be POST
+        // (DT's permission-grant endpoint is POST, not PUT). Regression guard
+        // for the doc/copy mismatch fixed alongside #1472 review feedback:
+        // operators copy this verb straight out of the log into `curl -X ...`,
+        // and `PUT` returns HTTP 405 against a real DT instance.
+        assert!(
+            msg.contains("POST /api/v1/permission"),
+            "permissions hint must specify POST verb in: {}",
             msg
         );
     }
