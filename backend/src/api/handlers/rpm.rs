@@ -57,11 +57,22 @@ pub fn router() -> Router<SharedState> {
         // Signing endpoints
         .route("/:repo_key/repodata/repomd.xml.asc", get(repomd_xml_asc))
         .route("/:repo_key/repodata/repomd.xml.key", get(repomd_xml_key))
+        // Hash-prefixed repodata files (e.g. abc123-primary.xml.gz). Upstream
+        // RPM repos checksum-prefix the actual metadata payloads referenced
+        // from repomd.xml. For Remote/Virtual repos we transparently proxy
+        // any /repodata/* path so dnf/yum can follow the upstream layout.
+        .route("/:repo_key/repodata/*path", get(repodata_proxy))
         // Package download and upload
         .route("/:repo_key/packages/*path", get(download_package))
         .route("/:repo_key/packages/*path", put(upload_package_put))
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_package_post))
+        // Proxy fallback for upstream package paths that do not live under
+        // /packages/ (many real-world RPM repos host RPMs at the repo root
+        // or under arbitrary subpaths like Packages/p/ or pool/...). Only
+        // Remote/Virtual repos are eligible; hosted repos 404 here. Kept
+        // last so explicit routes above always win.
+        .route("/:repo_key/*upstream_path", get(upstream_proxy))
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +81,46 @@ pub fn router() -> Router<SharedState> {
 
 async fn resolve_rpm_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["rpm", "yum"], "an RPM").await
+}
+
+/// For Remote RPM repos, proxy `upstream_path` from the configured
+/// `upstream_url`. Returns `Ok(Some(response))` on a successful proxy
+/// hit, `Ok(None)` when the repository is not a Remote that can serve
+/// `upstream_path` (Hosted falls through to the local-generation path,
+/// Virtual is currently treated the same as Hosted here pending a
+/// follow-up that walks member repos), or `Err(response)` when the
+/// upstream fetch itself fails.
+///
+/// This is the core of the fix for #1447: prior to this helper the
+/// repodata handlers always read from the local artifact table even
+/// when the repo was a proxy, so dnf saw an empty repository and
+/// silently did nothing.
+async fn try_proxy_repodata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+    default_content_type: &str,
+) -> Result<Option<Response>, Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Ok(None),
+    };
+
+    let (content, upstream_ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path).await?;
+
+    let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -233,8 +284,16 @@ async fn repomd_xml(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
 
+    // #1447: for Remote repos proxy the upstream repomd.xml instead of
+    // synthesizing an empty index from local artifacts.
+    if let Some(resp) =
+        try_proxy_repodata(&state, &repo, "repodata/repomd.xml", "application/xml").await?
+    {
+        return Ok(resp);
+    }
+
+    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
     let xml = generate_repomd_xml_content(&artifacts);
 
     Ok(Response::builder()
@@ -253,8 +312,20 @@ async fn repomd_xml_asc(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
 
+    // #1447: proxy the upstream detached signature for Remote repos.
+    if let Some(resp) = try_proxy_repodata(
+        &state,
+        &repo,
+        "repodata/repomd.xml.asc",
+        "application/pgp-signature",
+    )
+    .await?
+    {
+        return Ok(resp);
+    }
+
+    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
     let repomd_content = generate_repomd_xml_content(&artifacts);
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
@@ -329,7 +400,18 @@ async fn updateinfo_xml_gz(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
-    let _repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) = try_proxy_repodata(
+        &state,
+        &repo,
+        "repodata/updateinfo.xml.gz",
+        "application/gzip",
+    )
+    .await?
+    {
+        return Ok(resp);
+    }
 
     let updateinfo_xml = generate_updateinfo_xml();
     let gz = gzip_bytes(updateinfo_xml.as_bytes());
@@ -351,6 +433,13 @@ async fn primary_xml_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) =
+        try_proxy_repodata(&state, &repo, "repodata/primary.xml.gz", "application/gzip").await?
+    {
+        return Ok(resp);
+    }
+
     let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
 
     let primary_xml = generate_primary_xml(&artifacts);
@@ -373,6 +462,18 @@ async fn filelists_xml_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) = try_proxy_repodata(
+        &state,
+        &repo,
+        "repodata/filelists.xml.gz",
+        "application/gzip",
+    )
+    .await?
+    {
+        return Ok(resp);
+    }
+
     let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
 
     let filelists_xml = generate_filelists_xml(&artifacts);
@@ -395,6 +496,13 @@ async fn other_xml_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) =
+        try_proxy_repodata(&state, &repo, "repodata/other.xml.gz", "application/gzip").await?
+    {
+        return Ok(resp);
+    }
+
     let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
 
     let other_xml = generate_other_xml(&artifacts);
@@ -406,6 +514,118 @@ async fn other_xml_gz(
         .header(CONTENT_LENGTH, gz.len().to_string())
         .body(Body::from(gz))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/repodata/*path — Catch-all for hash-prefixed
+// repodata files. Upstream RPM repositories typically reference their
+// real metadata payloads via checksum-prefixed names listed inside
+// repomd.xml (e.g. `repodata/abc123...-primary.xml.gz`). When the
+// repository is Remote we proxy those paths verbatim; for Hosted
+// repos there is no such file so we 404.
+// ---------------------------------------------------------------------------
+
+async fn repodata_proxy(
+    State(state): State<SharedState>,
+    Path((repo_key, path)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    let upstream_path = format!("repodata/{}", path);
+    let default_ct = if path.ends_with(".gz") {
+        "application/gzip"
+    } else if path.ends_with(".xml") {
+        "application/xml"
+    } else if path.ends_with(".asc") {
+        "application/pgp-signature"
+    } else {
+        "application/octet-stream"
+    };
+
+    if let Some(resp) = try_proxy_repodata(&state, &repo, &upstream_path, default_ct).await? {
+        return Ok(resp);
+    }
+
+    Err((StatusCode::NOT_FOUND, "Not found").into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/*upstream_path — Proxy fallback for upstream
+// package locations that do not live under /packages/. Many real-world
+// yum/dnf repositories host RPMs at the repository root or under
+// vendor-specific subpaths (Packages/, pool/, el/6/x86_64/...).
+//
+// Hosted repos always 404 here (their packages must come via the
+// explicit /packages/ route). Remote repos try the local cache by
+// filename first, then fall back to streaming the upstream object.
+// ---------------------------------------------------------------------------
+
+async fn upstream_proxy(
+    State(state): State<SharedState>,
+    Path((repo_key, upstream_path)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type != RepositoryType::Remote {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+
+    // Cache hit by filename: serve the local copy.
+    if let Some(hit) =
+        proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await?
+    {
+        let artifact = sqlx::query!(
+            "SELECT id, size_bytes, checksum_sha256, storage_key FROM artifacts WHERE id = $1",
+            hit.id
+        )
+        .fetch_one(&state.db)
+        .await
+        .map_err(super::db_err)?;
+
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+            .await
+            .map_err(|e| e.into_response())?;
+        let content = storage.get(&artifact.storage_key).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/x-rpm")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from(content))
+            .unwrap());
+    }
+
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+    };
+
+    proxy_helpers::proxy_fetch_streaming_with_disposition(
+        proxy,
+        repo.id,
+        &repo_key,
+        upstream_url,
+        &upstream_path,
+        "application/x-rpm",
+        Some(filename),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,5 +1901,365 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1447: Remote RPM proxy must surface upstream repodata + packages.
+    //
+    // Prior to the fix, every /repodata/* handler called list_rpm_artifacts
+    // and synthesized an empty repomd.xml from local rows, so dnf saw an
+    // empty repo. These tests stand up a wiremock upstream, point a Remote
+    // fixture at it, and drive the router end to end.
+    // -----------------------------------------------------------------------
+
+    /// Repoint the fixture's Remote repo at `upstream_url` and rebuild a
+    /// SharedState that wires in a real ProxyService.
+    async fn rewire_remote(
+        fx: &tdh::Fixture,
+        upstream_url: &str,
+    ) -> (crate::api::SharedState, tempfile::TempDir) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        // Use a fresh tmp dir for the proxy cache so concurrent tests do
+        // not collide on cache_storage_key paths.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn test_rpm_remote_repomd_proxies_upstream_xml() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/abc123-primary.xml.gz"/>
+  </data>
+</repomd>"#;
+        Mock::given(method("GET"))
+            .and(path("/repodata/repomd.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_bytes(upstream_xml.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/repomd.xml", fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("repomd.xml proxy returned {}", status);
+        }
+        let bytes: &[u8] = &body;
+        assert_eq!(bytes, upstream_xml.as_ref());
+        // Sanity check: the response must NOT be the empty-local-repo
+        // template that the pre-fix handler used to emit.
+        assert!(
+            !std::str::from_utf8(bytes)
+                .unwrap_or("")
+                .contains("primary.xml.gz\"/>\n    <checksum"),
+            "repomd.xml should be the upstream body, not the locally generated one"
+        );
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_remote_repodata_wildcard_proxies_hash_prefixed_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let primary_gz: &[u8] = b"\x1f\x8b\x08mock-primary-xml-gz";
+        Mock::given(method("GET"))
+            .and(path("/repodata/abc123-primary.xml.gz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/gzip")
+                    .set_body_bytes(primary_gz),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/abc123-primary.xml.gz", fx.repo_key)),
+        )
+        .await;
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("repodata wildcard proxy returned {}", status);
+        }
+        assert_eq!(&body[..], primary_gz);
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_remote_upstream_proxy_serves_root_rpm() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let rpm_bytes: &[u8] = b"fake-rpm-binary";
+        // Many real-world repos (e.g. packages.gitlab.com) host the RPMs
+        // at the repository root, not under /packages/. The catch-all
+        // upstream_proxy route covers that layout.
+        Mock::given(method("GET"))
+            .and(path("/gitlab-runner-1.0.0-1.x86_64.rpm"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-rpm")
+                    .set_body_bytes(rpm_bytes),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gitlab-runner-1.0.0-1.x86_64.rpm", fx.repo_key)),
+        )
+        .await;
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("upstream_proxy returned {}", status);
+        }
+        assert_eq!(&body[..], rpm_bytes);
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_local_repomd_still_generated_from_artifacts() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/repomd.xml", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Hosted repos keep the local-generation behaviour: an empty repo
+        // still emits the repomd shell that references primary.xml.gz.
+        let text = std::str::from_utf8(&body).unwrap_or("");
+        assert!(text.contains("<repomd"));
+        assert!(text.contains("primary.xml.gz"));
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_hosted_upstream_proxy_404s() {
+        // Hosted repos must NOT honour the catch-all proxy route; otherwise
+        // a typo'd local download would unexpectedly hit the internet (or
+        // 502 confusingly). The route should 404 instead.
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/some-random-name.rpm", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage for the #1447 fix: every repodata sibling handler
+    // (primary/filelists/other/updateinfo) must also short-circuit to the
+    // upstream proxy for Remote repos, repomd_xml.asc must proxy the
+    // detached signature, and repodata_proxy must 404 for Hosted repos
+    // (otherwise dnf's hash-prefixed lookups would silently 502).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_remote_repodata_sibling_handlers_all_proxy_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        // Each sibling handler advertises a different default content type
+        // upstream; wiremock just needs to echo deterministic bodies so the
+        // test can confirm each handler proxied the right path.
+        let primary: &[u8] = b"\x1f\x8bPRIMARY";
+        let filelists: &[u8] = b"\x1f\x8bFILELISTS";
+        let other: &[u8] = b"\x1f\x8bOTHER";
+        let updateinfo: &[u8] = b"\x1f\x8bUPDATEINFO";
+
+        for (p, body) in [
+            ("/repodata/primary.xml.gz", primary),
+            ("/repodata/filelists.xml.gz", filelists),
+            ("/repodata/other.xml.gz", other),
+            ("/repodata/updateinfo.xml.gz", updateinfo),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/gzip")
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let teardown = || async { fx.teardown().await };
+
+        for (suffix, expected) in [
+            ("repodata/primary.xml.gz", primary),
+            ("repodata/filelists.xml.gz", filelists),
+            ("repodata/other.xml.gz", other),
+            ("repodata/updateinfo.xml.gz", updateinfo),
+        ] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, suffix))).await;
+            if status != StatusCode::OK {
+                teardown().await;
+                panic!("{} proxy returned {}", suffix, status);
+            }
+            assert_eq!(&body[..], expected, "wrong body for {}", suffix);
+        }
+
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_remote_repomd_asc_proxies_upstream_signature() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let sig: &[u8] =
+            b"-----BEGIN PGP SIGNATURE-----\nupstream-sig\n-----END PGP SIGNATURE-----\n";
+        Mock::given(method("GET"))
+            .and(path("/repodata/repomd.xml.asc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pgp-signature")
+                    .set_body_bytes(sig),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/repomd.xml.asc", fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("repomd.xml.asc proxy returned {}", status);
+        }
+        assert_eq!(&body[..], sig);
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_wildcard_404s_for_hosted_repos() {
+        // The /repodata/*path catch-all must 404 on Hosted repos. Without
+        // this guard, dnf's hash-prefixed metadata fetches would return
+        // the wrong status and confuse the client.
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/abc123-primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upstream_proxy_404s_when_proxy_service_unavailable() {
+        // Remote repo with NO proxy_service wired into SharedState (the
+        // default fixture state). upstream_proxy reaches the
+        // `(upstream_url, proxy) = (_, None)` fallback and must 404
+        // rather than panic. Covers the cache-miss + no-proxy branch.
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        let app = fx.router_anon(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/some-package.rpm", fx.repo_key))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_proxy_404s_for_remote_without_proxy_service() {
+        // Same idea for /repodata/*path catch-all: without a wired
+        // proxy_service, try_proxy_repodata returns Ok(None) and the
+        // handler falls through to 404. Also drives every branch of
+        // the content-type suffix detection (.xml, .asc, default).
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        for suffix in [
+            "repodata/abc-primary.xml",
+            "repodata/repomd.xml.asc",
+            "repodata/random-blob",
+        ] {
+            let app = fx.router_anon(super::router());
+            let (status, _) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, suffix))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "expected 404 for {}", suffix);
+        }
+        fx.teardown().await;
     }
 }

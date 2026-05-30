@@ -615,7 +615,12 @@ impl ArtifactoryClient {
             .await
     }
 
-    /// Download artifact as bytes (streaming)
+    /// Download artifact and buffer the full body into memory.
+    ///
+    /// Prefer `download_artifact_stream` for migrations: this method holds
+    /// the entire artifact in memory at once and OOMs on multi-GB artifacts
+    /// (issue #1422). It is kept for callers that genuinely need the bytes
+    /// in memory (small fixtures, tests).
     pub async fn download_artifact(
         &self,
         repo_key: &str,
@@ -626,6 +631,44 @@ impl ArtifactoryClient {
 
         if status.is_success() {
             Ok(response.bytes().await?)
+        } else if status.as_u16() == 404 {
+            Err(ArtifactoryError::NotFound(format!(
+                "Artifact not found: {}/{}",
+                repo_key, path
+            )))
+        } else {
+            Err(ArtifactoryError::ApiError {
+                status: status.as_u16(),
+                message: "Failed to download artifact".into(),
+            })
+        }
+    }
+
+    /// Download artifact as a chunked byte stream.
+    ///
+    /// Returns chunks from `reqwest::Response::bytes_stream()` so callers
+    /// can spill straight to disk without ever buffering the full payload.
+    /// This is the path used by `migration_worker::transfer_artifact` to
+    /// keep memory bounded to one chunk regardless of artifact size
+    /// (issue #1422).
+    pub async fn download_artifact_stream(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<bytes::Bytes, ArtifactoryError>>,
+        ArtifactoryError,
+    > {
+        use futures::StreamExt;
+
+        let response = self.download_response_with_fallback(repo_key, path).await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let stream = response
+                .bytes_stream()
+                .map(|res| res.map_err(ArtifactoryError::from));
+            Ok(Box::pin(stream))
         } else if status.as_u16() == 404 {
             Err(ArtifactoryError::NotFound(format!(
                 "Artifact not found: {}/{}",
@@ -690,6 +733,14 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
         self.download_artifact(repo_key, path).await
+    }
+
+    async fn download_artifact_stream(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<crate::services::source_registry::ArtifactByteStream, ArtifactoryError> {
+        self.download_artifact_stream(repo_key, path).await
     }
 
     async fn get_properties(

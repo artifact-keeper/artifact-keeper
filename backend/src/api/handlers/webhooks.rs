@@ -140,7 +140,15 @@ pub struct WebhookSecretCreatedResponse {
     /// Raw signing secret. Display this to the operator immediately and
     /// instruct them to record it; the server retains only the encrypted
     /// form and a short digest.
-    pub secret: String,
+    ///
+    /// Absent when the webhook was created without a signing secret. This
+    /// happens when no secret was supplied and the deployment has no
+    /// `AK_WEBHOOK_SECRET_KEY` configured: rather than fail the create with
+    /// a 500, the webhook is stored unsigned and deliveries omit the
+    /// signature header. Configure the key and rotate the secret later to
+    /// enable signing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 /// Response returned by the rotate-secret endpoint.
@@ -261,8 +269,9 @@ pub async fn list_webhooks(
     tag = "webhooks",
     request_body = CreateWebhookRequest,
     responses(
-        (status = 200, description = "Webhook created. Body includes the raw secret exactly once.", body = WebhookSecretCreatedResponse),
+        (status = 200, description = "Webhook created. Body includes the raw secret exactly once (omitted when created unsigned).", body = WebhookSecretCreatedResponse),
         (status = 422, description = "Validation error"),
+        (status = 503, description = "A secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -289,18 +298,17 @@ pub async fn create_webhook(
         .to_string();
     validate_event_version(&event_version)?;
 
-    // Use the caller-provided secret if any, otherwise generate one.
-    let raw_secret = payload
-        .secret
-        .clone()
-        .unwrap_or_else(webhook_secret_crypto::generate_secret);
-
-    // Encrypt at rest.
-    let secret_encrypted = webhook_secret_crypto::encrypt_secret(&raw_secret).map_err(|e| {
-        tracing::error!("webhook secret encryption failed: {}", e);
-        AppError::Internal("webhook secret encryption is not configured".to_string())
-    })?;
-    let secret_digest = webhook_secret_crypto::digest_for_display(&raw_secret);
+    // Decide how to handle the signing secret. The key insight (B4): a
+    // normal create with no secret and no `AK_WEBHOOK_SECRET_KEY` must
+    // succeed without storing any secret rather than 500ing. Encryption
+    // is only attempted when a secret is actually going to be stored AND
+    // a key is configured. See `prepare_secret_for_storage`.
+    let key_configured = webhook_secret_crypto::ensure_configured().is_ok();
+    let prepared = prepare_secret_for_storage(
+        payload.secret.as_deref(),
+        key_configured,
+        webhook_secret_crypto::generate_secret,
+    )?;
 
     use sqlx::Row;
 
@@ -322,8 +330,8 @@ pub async fn create_webhook(
     .bind(payload.repository_id)
     .bind(&payload.headers)
     .bind(&template_str)
-    .bind(&secret_encrypted)
-    .bind(&secret_digest)
+    .bind(prepared.encrypted.as_deref())
+    .bind(prepared.digest.as_deref())
     .bind(&event_version)
     .fetch_one(&state.db)
     .await
@@ -352,8 +360,81 @@ pub async fn create_webhook(
 
     Ok(Json(WebhookSecretCreatedResponse {
         webhook: response,
-        secret: raw_secret,
+        secret: prepared.raw_secret,
     }))
+}
+
+/// What a create request should store for the webhook signing secret, and
+/// the raw secret (if any) to surface back to the caller exactly once.
+///
+/// All three fields are `None` together when the webhook is stored without
+/// a signing secret.
+#[derive(Debug, Default)]
+struct PreparedSecret {
+    /// Raw secret to return in the 201 body once; `None` when unsigned.
+    raw_secret: Option<String>,
+    /// AES-GCM ciphertext for the `secret_encrypted` column; `None` when unsigned.
+    encrypted: Option<Vec<u8>>,
+    /// Display digest for the `secret_digest` column; `None` when unsigned.
+    digest: Option<String>,
+}
+
+/// Decide what to do with a webhook's signing secret at create time, and
+/// perform the encryption when (and only when) a secret will actually be
+/// stored.
+///
+/// Behavior (B4 fix):
+/// - Caller supplied a secret, key configured: encrypt and store it.
+/// - Caller supplied a secret, NO key configured: return a clear
+///   `ServiceUnavailable` (503) error, never a bare 500. The caller asked
+///   to sign but the deployment cannot encrypt the secret at rest.
+/// - No secret supplied, key configured: generate a fresh secret, encrypt
+///   and store it (preserves the pre-fix signing-by-default behavior).
+/// - No secret supplied, NO key configured: store nothing. The webhook is
+///   created unsigned and the create returns 201. This is the path that
+///   the release-gate test cluster hits, and the one that previously 500'd.
+///
+/// `gen_secret` is injected so unit tests can avoid pulling in the CSPRNG
+/// and assert on a deterministic value.
+fn prepare_secret_for_storage(
+    supplied_secret: Option<&str>,
+    key_configured: bool,
+    gen_secret: impl FnOnce() -> String,
+) -> Result<PreparedSecret> {
+    // Treat an empty/whitespace-only supplied secret as "no secret".
+    let supplied = supplied_secret.filter(|s| !s.trim().is_empty());
+
+    let raw_secret = match (supplied, key_configured) {
+        // Caller wants signing but we cannot encrypt: clear, non-500 error.
+        (Some(_), false) => {
+            return Err(AppError::ServiceUnavailable(
+                "webhook secret signing is not configured on this deployment \
+                 (AK_WEBHOOK_SECRET_KEY is unset); create the webhook without \
+                 a secret or configure the key"
+                    .to_string(),
+            ));
+        }
+        // Caller supplied a secret and we can encrypt it.
+        (Some(s), true) => s.to_string(),
+        // No secret supplied but a key exists: sign by default.
+        (None, true) => gen_secret(),
+        // No secret supplied and no key: store unsigned, succeed.
+        (None, false) => return Ok(PreparedSecret::default()),
+    };
+
+    let encrypted = webhook_secret_crypto::encrypt_secret(&raw_secret).map_err(|e| {
+        // ensure_configured() said the key was present, so a failure here is
+        // a genuine crypto/config fault, not the routine "no key" path.
+        tracing::error!("webhook secret encryption failed: {}", e);
+        AppError::Internal("webhook secret encryption failed".to_string())
+    })?;
+    let digest = webhook_secret_crypto::digest_for_display(&raw_secret);
+
+    Ok(PreparedSecret {
+        raw_secret: Some(raw_secret),
+        encrypted: Some(encrypted),
+        digest: Some(digest),
+    })
 }
 
 /// Get webhook by ID
@@ -2691,5 +2772,101 @@ mod tests {
         let (out, fails) = decide_active_secrets(Some(&cur), Some(&prev), None, now);
         assert_eq!(out, vec!["whsec_new".to_string()]);
         assert_eq!(fails, 0);
+    }
+
+    // ---------------- prepare_secret_for_storage (B4) ----------------
+    //
+    // Regression coverage for the webhook-create HTTP 500 (release-gate
+    // run 26613046674). A normal create (no secret, no AK_WEBHOOK_SECRET_KEY)
+    // must succeed and store nothing rather than 500ing on a missing key.
+
+    #[test]
+    fn prepare_secret_no_secret_no_key_stores_nothing_and_succeeds() {
+        // The release-gate cluster path: no caller secret, no key configured.
+        // Must NOT attempt encryption and must NOT error.
+        let prepared = prepare_secret_for_storage(None, false, || {
+            panic!("must not generate a secret when no key is configured")
+        })
+        .expect("create without secret must succeed when no key is configured");
+        assert!(prepared.raw_secret.is_none());
+        assert!(prepared.encrypted.is_none());
+        assert!(prepared.digest.is_none());
+    }
+
+    #[test]
+    fn prepare_secret_empty_string_secret_treated_as_no_secret() {
+        // An explicit but empty/whitespace secret is equivalent to "none".
+        let prepared =
+            prepare_secret_for_storage(Some("   "), false, || panic!("must not generate a secret"))
+                .expect("blank secret with no key must succeed unsigned");
+        assert!(prepared.raw_secret.is_none());
+        assert!(prepared.encrypted.is_none());
+    }
+
+    #[test]
+    fn prepare_secret_no_secret_with_key_generates_and_encrypts() {
+        // When a key IS configured, the pre-fix sign-by-default behavior is
+        // preserved: a secret is generated, encrypted, and returned once.
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let prepared = prepare_secret_for_storage(None, true, || "whsec_generated".to_string())
+            .expect("generate + encrypt must succeed when key is configured");
+        assert_eq!(prepared.raw_secret.as_deref(), Some("whsec_generated"));
+        assert!(prepared.encrypted.as_ref().is_some_and(|b| !b.is_empty()));
+        assert!(prepared.digest.is_some());
+    }
+
+    #[test]
+    fn prepare_secret_supplied_secret_with_key_encrypts_caller_value() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let prepared = prepare_secret_for_storage(Some("whsec_caller_supplied"), true, || {
+            panic!("must not generate when caller supplies a secret")
+        })
+        .expect("supplied secret + key must succeed");
+        assert_eq!(
+            prepared.raw_secret.as_deref(),
+            Some("whsec_caller_supplied")
+        );
+        let ct = prepared.encrypted.expect("ciphertext present");
+        let pt = crate::services::webhook_secret_crypto::decrypt_secret(&ct)
+            .expect("ciphertext must decrypt under the configured key");
+        assert_eq!(pt, "whsec_caller_supplied");
+    }
+
+    #[test]
+    fn prepare_secret_supplied_secret_without_key_is_clear_non_500_error() {
+        // The one case that must error: caller wants signing but the
+        // deployment cannot encrypt at rest. Must be a clear, non-500 error,
+        // not a bare AppError::Internal (which maps to 500 INTERNAL_ERROR).
+        let err = prepare_secret_for_storage(Some("whsec_caller_supplied"), false, || {
+            panic!("must not generate")
+        })
+        .expect_err("supplied secret with no key must error");
+        match err {
+            AppError::ServiceUnavailable(msg) => {
+                assert!(
+                    msg.contains("AK_WEBHOOK_SECRET_KEY"),
+                    "error should name the missing key var, got: {msg}"
+                );
+            }
+            other => panic!("expected ServiceUnavailable (503), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_secret_supplied_secret_without_key_maps_to_503_not_500() {
+        use axum::response::IntoResponse;
+        let err = prepare_secret_for_storage(Some("whsec_x"), false, || unreachable!())
+            .expect_err("must error");
+        // Drive the error through the real IntoResponse path the handler uses
+        // so we assert the wire status, not an internal detail. The whole
+        // point of B4: never a bare 500 on a normal-ish create.
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "supplied-secret-no-key must map to 503, not 500"
+        );
     }
 }

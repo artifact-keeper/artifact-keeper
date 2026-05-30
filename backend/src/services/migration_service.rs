@@ -725,11 +725,21 @@ impl MigrationService {
             })
             .collect();
 
-        // Insert report
+        // Insert (or refresh) the report. migration_reports.job_id is UNIQUE,
+        // so an ON CONFLICT upsert keeps report generation idempotent: a job
+        // that reaches a terminal state more than once (e.g. a cancel after a
+        // prior failed-assessment that already wrote a report) regenerates the
+        // audit envelope instead of erroring on the unique constraint.
         let report_id: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO migration_reports (job_id, summary, warnings, errors, recommendations)
             VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (job_id) DO UPDATE
+            SET generated_at = NOW(),
+                summary = EXCLUDED.summary,
+                warnings = EXCLUDED.warnings,
+                errors = EXCLUDED.errors,
+                recommendations = EXCLUDED.recommendations
             RETURNING id
             "#,
         )

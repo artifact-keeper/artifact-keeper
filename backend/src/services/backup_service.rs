@@ -728,9 +728,16 @@ impl BackupService {
         let backup = self.get_by_id(backup_id).await?;
 
         if backup.status != BackupStatus::InProgress && backup.status != BackupStatus::Pending {
-            return Err(AppError::Validation(
-                "Can only cancel pending or in-progress backups".to_string(),
-            ));
+            // A backup in a terminal state (completed/failed/cancelled) cannot be
+            // cancelled. This is a state conflict, not a malformed request, so it
+            // maps to HTTP 409 rather than 400. The executor for an empty backup
+            // can finish before the cancel call lands, so callers (and the E2E
+            // lifecycle test) must be able to distinguish "too late to cancel"
+            // (409) from "bad input" (400).
+            return Err(AppError::Conflict(format!(
+                "Cannot cancel backup in '{}' state; only pending or in-progress backups can be cancelled",
+                backup.status
+            )));
         }
 
         self.update_status(backup_id, BackupStatus::Cancelled, None)

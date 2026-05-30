@@ -623,6 +623,7 @@ impl MigrationWorker {
                 package_type,
                 artifact_path,
                 include_metadata,
+                &expected,
             )
             .await
         {
@@ -813,7 +814,33 @@ impl MigrationWorker {
         }
     }
 
-    /// Transfer an artifact from Artifactory to Artifact Keeper
+    /// Transfer an artifact from Artifactory to Artifact Keeper.
+    ///
+    /// Streams the source response straight to a temp file on disk. Each
+    /// chunk is hashed (sha256 + sha1) and discarded as soon as it lands on
+    /// disk, so peak memory usage is O(chunk_size) instead of
+    /// O(artifact_size). Without this, a 10 GB Maven artifact would buffer
+    /// the entire body into a `Bytes` before storage write and OOM the AK
+    /// host (issue #1422).
+    ///
+    /// The temp file is then handed to `StorageBackend::put_stream` (not
+    /// `put_file`) using a `ReaderStream`, so the upload path is also
+    /// memory-bounded. The previous default `put_file` impl called
+    /// `tokio::fs::read(path)` which reintroduced the full-body buffer at
+    /// the storage layer (#1512 review): cloud backends inherited it, so
+    /// streaming to a temp file but then loading 10 GB into RAM still OOM'd
+    /// the host. Routing through `put_stream` engages each backend's real
+    /// streaming primitive (S3 multipart, GCS resumable, filesystem
+    /// temp-and-rename, Azure single-PUT with `wrap_stream`).
+    ///
+    /// Checksum verification (when an expected sha256/sha1 was advertised
+    /// by the source) runs BEFORE the storage put, not after. A truncated
+    /// or corrupted body is detected on the temp file and returns
+    /// `MigrationError::ChecksumMismatch` without ever writing to permanent
+    /// storage or inserting an `artifacts` row. Previously, mismatch
+    /// detection happened in `finalize_transfer` AFTER the bytes were
+    /// committed, leaving corrupt blobs in storage on failure (#1512
+    /// review).
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
@@ -821,29 +848,112 @@ impl MigrationWorker {
         package_type: &str,
         artifact_path: &str,
         include_metadata: bool,
+        expected: &ExpectedChecksums,
     ) -> Result<TransferResult, MigrationError> {
-        // Download artifact from Artifactory
-        let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
-        let content_size = artifact_data.len();
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
 
-        // Calculate both sha256 and sha1. Computing both lets the
-        // verification step compare the source's advertised digest against
-        // the matching locally computed value regardless of which algorithm
-        // the source uses (issue #856).
-        let (sha256_hex, sha1_hex) = compute_dual_checksums(&artifact_data);
+        // Open the source as a chunked stream rather than `download_artifact`,
+        // which buffers the whole body in memory (#1422).
+        let mut stream = client
+            .download_artifact_stream(repo_key, artifact_path)
+            .await?;
+
+        // Spill chunks to a NamedTempFile while computing checksums
+        // incrementally. `NamedTempFile` is created via the blocking
+        // tempfile crate, but reopened as a `tokio::fs::File` so writes go
+        // through the async executor without per-chunk blocking-thread
+        // hops. Each chunk is hashed (sha256 + sha1) and dropped as soon
+        // as it lands on disk so peak memory is O(chunk_size).
+        let temp = tempfile::NamedTempFile::new().map_err(|e| {
+            MigrationError::StorageError(format!("Failed to create temp file: {e}"))
+        })?;
+        let temp_path = temp.path().to_path_buf();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| {
+                MigrationError::StorageError(format!("Failed to open temp file for write: {e}"))
+            })?;
+
+        let mut sha256_hasher = Sha256::new();
+        let mut sha1_hasher = Sha1::new();
+        let mut content_size: usize = 0;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(MigrationError::from)?;
+            sha256_hasher.update(&chunk);
+            sha1_hasher.update(&chunk);
+            content_size += chunk.len();
+            writer.write_all(&chunk).await.map_err(|e| {
+                MigrationError::StorageError(format!("Failed to write chunk to temp: {e}"))
+            })?;
+            // Explicit drop so the chunk's heap allocation is released
+            // before we await the next read. Belt-and-suspenders: the
+            // borrow checker would drop it at end of scope anyway.
+            drop(chunk);
+        }
+
+        // Drop the stream so the underlying connection can be reused.
+        drop(stream);
+
+        // Flush and sync so the file's contents are fully on disk before
+        // storage reads back from `temp_path` and before we hand off to
+        // metadata extraction. Without this, a fast `put_file` rename can
+        // race the kernel's writeback and surface a short read.
+        writer
+            .flush()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to flush temp file: {e}")))?;
+        writer
+            .sync_all()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to sync temp file: {e}")))?;
+        drop(writer);
+
+        let sha256_hex = hex::encode(sha256_hasher.finalize());
+        let sha1_hex = hex::encode(sha1_hasher.finalize());
+
+        // Verify advertised checksums against locally computed digests
+        // BEFORE committing the temp file to storage. This is the
+        // "fail-fast on corruption" guarantee added in #1512 review: prior
+        // versions of this code ran verification in `finalize_transfer`,
+        // AFTER `put_file` had already written the (potentially corrupt)
+        // bytes to storage and inserted an `artifacts` row. The
+        // `NamedTempFile` is dropped on the early return, so the
+        // truncated/tampered body never reaches permanent storage and no
+        // database rows are inserted.
+        if let Some(mismatch) = verify_expected_checksums(
+            self.config.verify_checksums,
+            expected,
+            Some(&sha256_hex),
+            Some(&sha1_hex),
+        ) {
+            return Err(MigrationError::ChecksumMismatch {
+                path: artifact_path.to_string(),
+                expected: format!(
+                    "sha256={} sha1={}",
+                    expected.sha256.as_deref().unwrap_or("none"),
+                    expected.sha1.as_deref().unwrap_or("none"),
+                ),
+                actual: mismatch,
+            });
+        }
 
         // Extract format-specific package metadata (npm package.json, helm
-        // Chart.yaml, etc.) from the artifact bytes BEFORE we move them
-        // into storage.put. Without this, downstream per-format endpoints
-        // (npm metadata, helm index.yaml) return null `dependencies` /
-        // `appVersion` for migrated artifacts, breaking transitive resolution
-        // in npm clients and dropping useful info from helm `helm search`.
-        // Returns None for unknown formats / unparseable bytes; the artifact
-        // INSERT proceeds either way and only the metadata row is skipped.
-        let extracted_metadata = crate::services::artifact_metadata::extract_artifact_metadata(
-            package_type,
-            &artifact_data,
-        );
+        // Chart.yaml, etc.) from the on-disk temp file BEFORE storage takes
+        // ownership of it. Reading from disk (vs. an in-memory buffer)
+        // keeps the streaming-memory guarantee for non-npm/helm formats
+        // and is bounded for npm/helm because those tarballs are small.
+        // Returns None for unknown formats; the artifact INSERT proceeds
+        // either way and only the metadata row is skipped.
+        let extracted_metadata =
+            crate::services::artifact_metadata::extract_artifact_metadata_from_path(
+                package_type,
+                &temp_path,
+            );
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -862,8 +972,34 @@ impl MigrationWorker {
             // Check if content already exists (deduplication)
             let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
+                // Open the temp file as a `ReaderStream` and hand it to
+                // `put_stream` so the upload itself is memory-bounded. The
+                // previous code called `put_file`, whose default trait impl
+                // loaded the whole file into a `Bytes` before forwarding to
+                // `put` -- which would OOM the host on a 10 GB Maven artifact
+                // even though the download path streamed to disk (#1512
+                // review). S3, GCS, and Azure all back `put_stream` with their
+                // native streaming upload primitives; filesystem still does a
+                // temp-and-rename internally.
+                use tokio::io::BufReader;
+                use tokio_util::io::ReaderStream;
+
+                let file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+                    MigrationError::StorageError(format!(
+                        "Failed to reopen temp file for upload: {e}"
+                    ))
+                })?;
+                let reader = BufReader::with_capacity(256 * 1024, file);
+                let stream = ReaderStream::with_capacity(reader, 256 * 1024);
+                let mapped = futures::StreamExt::map(stream, |r| {
+                    r.map_err(|e| {
+                        crate::error::AppError::Storage(format!(
+                            "Temp file read error during upload: {e}"
+                        ))
+                    })
+                });
                 self.storage
-                    .put(&storage_key, artifact_data)
+                    .put_stream(&storage_key, Box::pin(mapped))
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
             }
@@ -1437,6 +1573,11 @@ impl ExpectedChecksums {
 
 /// Compute both sha256 and sha1 hex digests over the same payload in a
 /// single pass over the bytes. Returns `(sha256_hex, sha1_hex)`.
+///
+/// Kept for test fixtures and any future buffered callers. The streaming
+/// `transfer_artifact` path (#1422) hashes chunks incrementally instead of
+/// calling this on a full in-memory buffer.
+#[allow(dead_code)]
 pub(crate) fn compute_dual_checksums(data: &[u8]) -> (String, String) {
     let mut sha256 = Sha256::new();
     sha256.update(data);
@@ -3113,5 +3254,438 @@ mod tests {
         assert_eq!(plan.missing, vec!["missing-repo".to_string()]);
         assert_eq!(plan.unsupported.len(), 1);
         assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1512 review fixes -- streaming + verify-before-write
+    // -----------------------------------------------------------------------
+
+    /// Hashing parity: feeding the same bytes through the chunked
+    /// streaming path (one `update` per chunk) must yield the exact same
+    /// hex digest as `compute_dual_checksums` on a single buffer. This is
+    /// the invariant `transfer_artifact` relies on -- if the digests
+    /// diverged between code paths, every checksum verification would
+    /// fail.
+    #[test]
+    fn test_chunked_hashing_matches_buffered_compute_dual_checksums() {
+        // Sample sizes: 1 MiB, 8 MiB, and a non-power-of-two off-by-one
+        // case (1 MiB + 17 bytes) that catches "block boundary" bugs in
+        // chunked hashers.
+        let sizes = [1024 * 1024, 8 * 1024 * 1024, 1024 * 1024 + 17];
+
+        for &size in &sizes {
+            // Deterministic non-zero payload.
+            let mut payload = Vec::with_capacity(size);
+            let mut x: u32 = 0xDEAD_BEEF;
+            for _ in 0..size {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                payload.push((x >> 16) as u8);
+            }
+
+            let (buffered_sha256, buffered_sha1) = compute_dual_checksums(&payload);
+
+            // Now hash the same payload as if it were arriving in
+            // arbitrary-size chunks (mirror what `transfer_artifact` does
+            // on each iteration of its `stream.next()` loop).
+            let mut sha256 = Sha256::new();
+            let mut sha1 = Sha1::new();
+            for chunk in payload.chunks(13 * 1024 + 7) {
+                sha256.update(chunk);
+                sha1.update(chunk);
+            }
+            let chunked_sha256 = hex::encode(sha256.finalize());
+            let chunked_sha1 = hex::encode(sha1.finalize());
+
+            assert_eq!(
+                chunked_sha256, buffered_sha256,
+                "sha256 parity broken at size {}",
+                size
+            );
+            assert_eq!(
+                chunked_sha1, buffered_sha1,
+                "sha1 parity broken at size {}",
+                size
+            );
+        }
+    }
+
+    /// End-to-end-ish test for the verify-before-write ordering fix.
+    /// Runs `transfer_artifact` against a mock source that emits a known
+    /// payload AND advertises a deliberately wrong sha256. The recording
+    /// storage backend must observe ZERO `put_stream` / `put_file` calls
+    /// because the worker should bail out at the checksum-verify step
+    /// BEFORE handing the temp file to storage. Pre-fix, the corrupted
+    /// body was committed to storage and an `artifacts` row was inserted,
+    /// and only THEN was the mismatch detected by `finalize_transfer`.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly when `DATABASE_URL`
+    /// is not set.
+    #[tokio::test]
+    async fn test_transfer_artifact_rejects_mismatch_without_writing_storage() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::ArtifactoryError;
+        use crate::services::source_registry::ArtifactByteStream;
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        struct ChunkedMockSource;
+
+        #[async_trait]
+        impl SourceRegistry for ChunkedMockSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                Ok(vec![])
+            }
+            async fn list_artifacts(
+                &self,
+                _repo_key: &str,
+                _offset: i64,
+                _limit: i64,
+            ) -> Result<crate::services::artifactory_client::AqlResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn download_artifact(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<Bytes, ArtifactoryError> {
+                Ok(Bytes::from_static(b"some payload here"))
+            }
+            async fn download_artifact_stream(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<ArtifactByteStream, ArtifactoryError> {
+                // Emit a known multi-chunk stream so the worker has to
+                // accumulate hashes across iterations.
+                let chunks: Vec<Result<Bytes, ArtifactoryError>> = vec![
+                    Ok(Bytes::from_static(b"hello ")),
+                    Ok(Bytes::from_static(b"world ")),
+                    Ok(Bytes::from_static(b"payload!")),
+                ];
+                Ok(Box::pin(futures::stream::iter(chunks)))
+            }
+            async fn get_properties(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<crate::services::artifactory_client::PropertiesResponse, ArtifactoryError>
+            {
+                Ok(crate::services::artifactory_client::PropertiesResponse {
+                    properties: None,
+                    uri: None,
+                })
+            }
+            fn source_type(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        /// Counts how many times the storage was asked to commit bytes.
+        struct CountingStorage {
+            put_stream_calls: Arc<AtomicUsize>,
+            put_file_calls: Arc<AtomicUsize>,
+            put_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for CountingStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                self.put_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_file(
+                &self,
+                _key: &str,
+                _path: &std::path::Path,
+            ) -> crate::error::Result<()> {
+                self.put_file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::storage::PutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        let put_stream_calls = Arc::new(AtomicUsize::new(0));
+        let put_file_calls = Arc::new(AtomicUsize::new(0));
+        let put_calls = Arc::new(AtomicUsize::new(0));
+
+        let storage = Arc::new(CountingStorage {
+            put_stream_calls: put_stream_calls.clone(),
+            put_file_calls: put_file_calls.clone(),
+            put_calls: put_calls.clone(),
+        });
+
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            storage,
+            WorkerConfig {
+                verify_checksums: true,
+                dry_run: false,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        // Advertised sha256 deliberately wrong. The real sha256 of
+        // "hello world payload!" is what the worker will compute; we set
+        // expected to something else so verify_expected_checksums returns
+        // Some(mismatch).
+        let expected = ExpectedChecksums {
+            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            sha1: None,
+        };
+
+        let result = worker
+            .transfer_artifact(
+                Arc::new(ChunkedMockSource),
+                "irrelevant-repo",
+                "generic",
+                "irrelevant/path",
+                false,
+                &expected,
+            )
+            .await;
+
+        // Must fail with ChecksumMismatch, NOT a storage error.
+        match result {
+            Err(MigrationError::ChecksumMismatch { .. }) => {}
+            other => panic!("expected ChecksumMismatch, got {:?}", other),
+        }
+
+        // The critical invariant: storage was never asked to commit the
+        // bytes. Pre-fix, `put_file` would have been called BEFORE
+        // verification.
+        assert_eq!(
+            put_stream_calls.load(Ordering::SeqCst),
+            0,
+            "put_stream must not run when checksum mismatches"
+        );
+        assert_eq!(
+            put_file_calls.load(Ordering::SeqCst),
+            0,
+            "put_file must not run when checksum mismatches"
+        );
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            0,
+            "put must not run when checksum mismatches"
+        );
+    }
+
+    /// Companion to the above: when checksums match, the worker
+    /// proceeds to call `put_stream` (NOT `put_file`). The PR review
+    /// blocker was that the worker called `put_file`, whose trait
+    /// default loaded the whole file into memory. After the fix the
+    /// migration path must invoke each backend's streaming primitive.
+    #[tokio::test]
+    async fn test_transfer_artifact_uses_put_stream_on_happy_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::ArtifactoryError;
+        use crate::services::source_registry::ArtifactByteStream;
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        struct ChunkedMockSource;
+        #[async_trait]
+        impl SourceRegistry for ChunkedMockSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                Ok(vec![])
+            }
+            async fn list_artifacts(
+                &self,
+                _r: &str,
+                _o: i64,
+                _l: i64,
+            ) -> Result<crate::services::artifactory_client::AqlResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn download_artifact(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<Bytes, ArtifactoryError> {
+                Ok(Bytes::from_static(b"x"))
+            }
+            async fn download_artifact_stream(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<ArtifactByteStream, ArtifactoryError> {
+                let chunks: Vec<Result<Bytes, ArtifactoryError>> =
+                    vec![Ok(Bytes::from_static(b"abc"))];
+                Ok(Box::pin(futures::stream::iter(chunks)))
+            }
+            async fn get_properties(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<crate::services::artifactory_client::PropertiesResponse, ArtifactoryError>
+            {
+                Ok(crate::services::artifactory_client::PropertiesResponse {
+                    properties: None,
+                    uri: None,
+                })
+            }
+            fn source_type(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        struct CountingStorage {
+            put_stream_calls: Arc<AtomicUsize>,
+            put_file_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for CountingStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_file(
+                &self,
+                _key: &str,
+                _path: &std::path::Path,
+            ) -> crate::error::Result<()> {
+                self.put_file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                mut stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                use futures::StreamExt;
+                self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
+                let mut total = 0u64;
+                while let Some(c) = stream.next().await {
+                    total += c?.len() as u64;
+                }
+                Ok(crate::storage::PutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: total,
+                })
+            }
+        }
+
+        let put_stream_calls = Arc::new(AtomicUsize::new(0));
+        let put_file_calls = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(CountingStorage {
+            put_stream_calls: put_stream_calls.clone(),
+            put_file_calls: put_file_calls.clone(),
+        });
+
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            storage,
+            WorkerConfig {
+                verify_checksums: true,
+                dry_run: false,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        // No expected checksums -> verification passes; worker proceeds
+        // through the storage write path.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: None,
+        };
+
+        let _ = worker
+            .transfer_artifact(
+                Arc::new(ChunkedMockSource),
+                "irrelevant-repo",
+                "generic",
+                "irrelevant/path",
+                false,
+                &expected,
+            )
+            .await;
+
+        // The migration path must use put_stream (the streaming upload
+        // primitive on each backend). put_file must NOT be invoked, since
+        // its trait default in this mock would buffer the whole body.
+        assert_eq!(
+            put_stream_calls.load(Ordering::SeqCst),
+            1,
+            "transfer_artifact must call put_stream once on the happy path"
+        );
+        assert_eq!(
+            put_file_calls.load(Ordering::SeqCst),
+            0,
+            "transfer_artifact must NOT call put_file (would buffer on cloud backends)"
+        );
     }
 }

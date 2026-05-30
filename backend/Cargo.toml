@@ -44,6 +44,7 @@ blake2 = "0.10"
 
 # Encryption
 aes-gcm.workspace = true
+zeroize.workspace = true
 
 # S3 storage using Apache object_store crate
 object_store.workspace = true

@@ -2,7 +2,6 @@
 //!
 //! Implements the minimum endpoints required for `docker login`, `docker push`,
 //! and `docker pull` per the OCI Distribution Specification.
-//!
 // TODO(#553): OCI errors use a spec-mandated JSON envelope (oci_error fn) and
 // cannot be converted to AppError without breaking Docker/OCI client compat.
 // Consider wrapping oci_error to also log via tracing for consistency.
@@ -18,9 +17,11 @@ use axum::routing::get;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -423,8 +424,185 @@ fn manifest_storage_key(digest: &str) -> String {
     format!("oci-manifests/{}", digest)
 }
 
+/// Legacy upload-key helper. Pre-#1449 OCI blob uploads accumulated
+/// PATCH chunks under this key in the storage backend; that path was
+/// the root cause of the upload-size-quadratic IO behaviour. The
+/// streaming path now keeps in-progress uploads on local disk via
+/// `oci_upload_temp_path` and only touches the storage backend once
+/// per upload, when the verified blob is promoted to `oci-blobs/...`.
+/// Kept only so the existing migration / GC code that reads sessions
+/// with the old prefix has a single named anchor in case operators
+/// need to drain leftover partial uploads after upgrade.
+#[allow(dead_code)]
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
+}
+
+/// Local filesystem path used to accumulate a chunked OCI blob upload
+/// before it is committed to the final storage backend (#1449).
+///
+/// We keep partial upload bytes on local disk rather than on the storage
+/// backend so PATCH continuations can simply `O_APPEND` instead of
+/// downloading the in-progress object, appending in memory, and rewriting
+/// it back. For a 10 GiB layer split across 100 PATCHes, the old path
+/// performed roughly N(N+1)/2 chunk-sized reads and writes through the
+/// storage backend (5 050x amplification). The local-disk path is a single
+/// stream through the kernel, then one final `put_stream` to the storage
+/// backend at completion time.
+///
+/// The path is rooted under `$AK_OCI_UPLOAD_TMP_DIR` if set, otherwise the
+/// process's `std::env::temp_dir()`. The session UUID is folded into the
+/// filename so concurrent uploads cannot collide.
+fn oci_upload_temp_path(uuid: &Uuid) -> std::path::PathBuf {
+    let root = std::env::var("AK_OCI_UPLOAD_TMP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    root.join(format!("ak-oci-upload-{}", uuid))
+}
+
+/// Result of streaming an HTTP request body to a local temp file while
+/// updating a running SHA-256 hasher and enforcing a byte cap.
+#[derive(Debug)]
+struct StreamToTempResult {
+    /// Bytes consumed from the request body during this call.
+    bytes_written: u64,
+}
+
+/// Maximum chunk size we read from the HTTP body before flushing to disk
+/// and yielding back to the executor. 256 KiB matches `tokio_util`'s
+/// default `ReaderStream` chunk size and the migration worker's value
+/// from #1512, so memory use per task is bounded to a single 256 KiB
+/// chunk regardless of total upload size.
+const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
+
+/// Stream an axum `Body` to `path` (creating or appending), updating
+/// `hasher` and `total_bytes` as data arrives. Returns the number of
+/// bytes consumed from this body.
+///
+/// `max_total_bytes == 0` disables the cap to match `MAX_UPLOAD_SIZE=0`
+/// semantics from `config.max_upload_size_bytes` (#1449 acceptance).
+/// A non-zero cap returns `Err(StatusCode::PAYLOAD_TOO_LARGE)` as soon as
+/// the running total would exceed the cap, without writing the offending
+/// chunk to disk.
+async fn stream_body_to_temp_file(
+    body: Body,
+    path: &std::path::Path,
+    hasher: &mut Sha256,
+    total_bytes: &mut u64,
+    max_total_bytes: u64,
+) -> Result<StreamToTempResult, (StatusCode, String)> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open temp file {}: {e}", path.display()),
+            )
+        })?;
+
+    let mut stream = body.into_data_stream();
+    let mut consumed: u64 = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_BUDGET);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
+        if chunk.is_empty() {
+            continue;
+        }
+
+        // Enforce MAX_UPLOAD_SIZE before touching disk. `0` is the
+        // documented "unlimited" sentinel and must short-circuit the
+        // check, not be treated as "every chunk overflows".
+        if max_total_bytes > 0 {
+            let projected = total_bytes.saturating_add(chunk.len() as u64);
+            if projected > max_total_bytes {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "upload would exceed MAX_UPLOAD_SIZE ({} bytes)",
+                        max_total_bytes
+                    ),
+                ));
+            }
+        }
+
+        hasher.update(&chunk);
+        *total_bytes += chunk.len() as u64;
+        consumed += chunk.len() as u64;
+
+        // Coalesce small chunks before issuing a write syscall, but cap
+        // the buffer at STREAM_CHUNK_BUDGET so memory stays bounded.
+        if buf.len() + chunk.len() > STREAM_CHUNK_BUDGET && !buf.is_empty() {
+            file.write_all(&buf).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write chunk to temp: {e}"),
+                )
+            })?;
+            buf.clear();
+        }
+        if chunk.len() >= STREAM_CHUNK_BUDGET {
+            file.write_all(&chunk).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write chunk to temp: {e}"),
+                )
+            })?;
+        } else {
+            buf.extend_from_slice(&chunk);
+        }
+        drop(chunk);
+    }
+
+    if !buf.is_empty() {
+        file.write_all(&buf).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write tail to temp: {e}"),
+            )
+        })?;
+    }
+
+    file.flush().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("flush temp file: {e}"),
+        )
+    })?;
+
+    Ok(StreamToTempResult {
+        bytes_written: consumed,
+    })
+}
+
+/// Open the local upload temp file as a `BoxStream<Result<Bytes>>` ready
+/// to feed `StorageBackend::put_stream`. Uses a 256 KiB-buffered
+/// `ReaderStream` so the upload from local disk to the storage backend
+/// is also memory-bounded. After #1512 every backend (S3, GCS, Azure,
+/// filesystem) routes this through its native streaming primitive.
+async fn open_upload_temp_as_stream(
+    path: &std::path::Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, std::io::Error> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path).await?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_BUDGET);
+    let mapped = stream
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("temp file read: {e}"))));
+    Ok(Box::pin(mapped))
+}
+
+/// Best-effort cleanup of a session's local temp file. Never returns an
+/// error; the caller has either completed the upload (file already gone
+/// via rename) or is abandoning the session.
+async fn cleanup_upload_temp(path: &std::path::Path) {
+    let _ = tokio::fs::remove_file(path).await;
 }
 
 fn upload_progress_range(bytes_received: i64) -> String {
@@ -764,6 +942,535 @@ fn normalize_docker_image(image: &str, upstream_url: &str) -> String {
     }
 }
 
+/// Build the list of upstream image names to try when fetching a blob /
+/// manifest from a remote member.
+///
+/// For Docker Hub, official images are only addressable under the
+/// `library/` namespace (e.g. `library/alpine`, never bare `alpine`). The
+/// previous implementation appended a non-`library/` fallback, which
+/// caused every cache-miss against Docker Hub to issue **two** upstream
+/// HTTP requests per member: one for `library/alpine`, then one for
+/// `alpine`. Reviewer flagged this on PR #1348 (round 1, concern #1).
+///
+/// The fix is to return a single canonical candidate when the upstream is
+/// Docker Hub. For non-Docker-Hub registries (GHCR, ECR, Quay, internal
+/// mirrors) we keep the previous behaviour of returning the image
+/// verbatim, since those registries do not have a `library/` convention.
+fn candidate_upstream_images(image: &str, upstream_url: &str) -> Vec<String> {
+    if image.is_empty() {
+        return Vec::new();
+    }
+
+    if is_docker_hub(upstream_url) {
+        // Docker Hub: only the `library/`-normalized form is correct. Trying
+        // the bare name as a fallback wastes a round-trip; Docker Hub does
+        // not serve official images at `/v2/{name}/...` without the
+        // `library/` prefix.
+        return vec![normalize_docker_image(image, upstream_url)];
+    }
+
+    // Non-Docker-Hub: single candidate, the image as given.
+    vec![image.to_string()]
+}
+
+/// Format the upstream HTTP path used to fetch a blob from a remote OCI
+/// member. Kept as a tiny pure helper so the format is exercised by unit
+/// tests without spinning up a wiremock upstream.
+///
+/// Spec: <https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-blobs>
+fn upstream_blob_path(image: &str, digest: &str) -> String {
+    format!("v2/{}/blobs/{}", image, digest)
+}
+
+/// Format the upstream HTTP path used to fetch a manifest by tag or
+/// digest from a remote OCI member.
+///
+/// Spec: <https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-manifests>
+fn upstream_manifest_path(image: &str, reference: &str) -> String {
+    format!("v2/{}/manifests/{}", image, reference)
+}
+
+/// Pure decision: given a requested `digest` reference and the actual
+/// `content` bytes served by an upstream, decide whether to *reject* the
+/// response on a digest mismatch.
+///
+/// Returns `true` only when (a) the requested reference is itself a
+/// content-addressable digest, and (b) the SHA-256 of the served bytes
+/// does not match it. Tags and other non-digest references always return
+/// `false` (nothing to compare against).
+///
+/// Extracted out of `resolve_virtual_blob` / `resolve_virtual_manifest`
+/// for unit-test coverage of the #1348 round-1 security fix without
+/// having to stand up a wiremock upstream.
+fn upstream_content_violates_digest(reference: &str, content: &[u8]) -> bool {
+    is_digest_reference(reference) && compute_sha256(content) != reference
+}
+
+/// Positive-sense counterpart to [`upstream_content_violates_digest`].
+///
+/// Returns `true` when the served `content` is acceptable to forward to the
+/// client: either the reference is a human-readable tag (no digest to
+/// verify against) or the SHA-256 of the bytes matches the requested
+/// content-addressable digest. Returns `false` only on a true digest
+/// mismatch, in which case the caller must "fall through" to the next
+/// virtual-repo member (or surface a 404).
+///
+/// Reads at call sites as
+/// `if !verify_digest_or_fall_through(content, reference) { continue }`,
+/// matching the resolver's existing control flow without the double
+/// negative of the older `if upstream_content_violates_digest(..)` form.
+/// Kept as a thin wrapper instead of replacing the original so existing
+/// call sites + their tests stay stable.
+fn verify_digest_or_fall_through(content: &[u8], reference: &str) -> bool {
+    !upstream_content_violates_digest(reference, content)
+}
+
+/// Where (and how) a virtual-repo blob was found.
+///
+/// `Local` carries the owning member's full `Repository`, boxed to keep
+/// the variant from inflating the enum's discriminant footprint to
+/// 336+ bytes when every other variant is ~56 bytes
+/// (clippy::large_enum_variant).
+pub enum VirtualBlobResolution {
+    Local {
+        size_bytes: i64,
+        storage_key: String,
+        member: Box<crate::models::repository::Repository>,
+    },
+    Remote {
+        content: Bytes,
+        content_type: Option<String>,
+    },
+}
+
+/// Pure constructor for the `Local` arm of [`VirtualBlobResolution`].
+///
+/// Extracted out of [`resolve_virtual_blob`] so the DB-row → enum
+/// mapping is exercised by unit tests without spinning up the DB. The
+/// resolver's hot path passes `None` when the per-member SELECT misses,
+/// and the helper short-circuits that branch the same way the inline
+/// code did.
+fn local_blob_resolution(
+    size_bytes_and_storage_key: Option<(i64, String)>,
+    member: &crate::models::repository::Repository,
+) -> Option<VirtualBlobResolution> {
+    let (size_bytes, storage_key) = size_bytes_and_storage_key?;
+    Some(VirtualBlobResolution::Local {
+        size_bytes,
+        storage_key,
+        member: Box::new(member.clone()),
+    })
+}
+
+/// Pure decision: is a virtual-repo member eligible for upstream
+/// delegation on this request?
+///
+/// Returns `true` only when (a) the member is a remote repo and (b) the
+/// proxy service is wired up. Encapsulates the predicate the resolver
+/// uses before issuing any upstream HTTP traffic, so the gate is testable
+/// without a real `ProxyService`.
+fn should_attempt_remote_member(
+    member: &crate::models::repository::Repository,
+    has_proxy_service: bool,
+    has_upstream_url: bool,
+) -> bool {
+    member.repo_type == RepositoryType::Remote && has_proxy_service && has_upstream_url
+}
+
+/// Pure post-processing of a successful upstream blob fetch.
+///
+/// Returns `Some(VirtualBlobResolution::Remote { .. })` when the
+/// upstream bytes match the requested content-addressable digest, and
+/// `None` when they do not (the caller must "fall through" to the next
+/// virtual-repo member). For blobs the requested reference is always a
+/// digest, so the verification is unconditional.
+///
+/// Extracted out of [`resolve_virtual_blob`] so the security-critical
+/// verify-then-wrap step can be unit-tested without a wiremock upstream.
+fn finalize_upstream_blob(
+    digest: &str,
+    content: Bytes,
+    content_type: Option<String>,
+) -> Option<VirtualBlobResolution> {
+    if !verify_digest_or_fall_through(&content, digest) {
+        return None;
+    }
+    Some(VirtualBlobResolution::Remote {
+        content,
+        content_type,
+    })
+}
+
+/// Pure post-processing of a successful upstream manifest fetch.
+///
+/// Returns `Some((computed_digest, content_type, content))` when the
+/// upstream bytes are acceptable to forward (tag reference, or the
+/// reference is a digest and the SHA-256 matches). Returns `None`
+/// when a digest-reference request was answered with bytes whose
+/// SHA-256 does not match, signalling the caller to "fall through" to
+/// the next virtual-repo member.
+///
+/// Extracted out of [`resolve_virtual_manifest`] so the verification
+/// step and the `compute_sha256`-as-returned-digest behaviour can be
+/// unit-tested without a wiremock upstream.
+fn finalize_upstream_manifest(
+    reference: &str,
+    content: Bytes,
+    content_type: Option<String>,
+) -> Option<(String, Option<String>, Bytes)> {
+    if !verify_digest_or_fall_through(&content, reference) {
+        return None;
+    }
+    let computed = compute_sha256(&content);
+    Some((computed, content_type, content))
+}
+
+// ---------------------------------------------------------------------------
+// Virtual-resolution negative cache (#1348 round 1, concern #2)
+// ---------------------------------------------------------------------------
+//
+// `resolve_virtual_blob` / `resolve_virtual_manifest` walk each remote
+// member in turn. When a virtual repo has N remote members and none of
+// them serve the requested blob (a common case for digest probes from
+// Docker pull retries), the resolver issues N upstream HTTP round-trips
+// **serially** before returning None, and then the next probe a few ms
+// later does it all over again.
+//
+// To bound the blast radius without changing the resolver's correctness
+// for hits, we keep a short-TTL ("a few seconds") in-process negative
+// cache keyed by `(repo_id, image, reference)`. Hits short-circuit
+// straight to None; the entry expires quickly so a real upstream
+// publishing event is not blocked for long.
+//
+// The cache is intentionally process-local (no Redis, no DB) — it's a
+// micro-optimisation, not a correctness primitive. Restarting the
+// process or scaling out re-pays the upstream walk once.
+const VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+const VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+struct VirtualResolveKey {
+    repo_id: Uuid,
+    kind: VirtualResolveKind,
+    image: String,
+    reference: String,
+}
+
+impl VirtualResolveKey {
+    /// Pure constructor. Centralised so call sites do not need to know
+    /// the field layout (and so unit tests can pin the construction
+    /// without touching the global cache).
+    fn new(repo_id: Uuid, kind: VirtualResolveKind, image: &str, reference: &str) -> Self {
+        Self {
+            repo_id,
+            kind,
+            image: image.to_string(),
+            reference: reference.to_string(),
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
+enum VirtualResolveKind {
+    Blob,
+    Manifest,
+}
+
+fn virtual_negative_cache(
+) -> &'static std::sync::RwLock<std::collections::HashMap<VirtualResolveKey, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<VirtualResolveKey, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Pure decision: given the wall-clock duration since an entry was
+/// inserted and the configured TTL, is the entry still a "hit"?
+///
+/// Extracted out of `virtual_negative_cache_hit` so the freshness window
+/// can be unit-tested without depending on `Instant::now()`.
+fn negative_cache_entry_is_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
+}
+
+/// Pure decision: given the current entry count and the configured
+/// maximum, should an insertion path attempt to evict expired entries
+/// before recording a new one?
+///
+/// Extracted out of `virtual_negative_cache_insert` so the cap policy
+/// is testable without poking at the global cache.
+fn negative_cache_should_evict_before_insert(current_len: usize, max_entries: usize) -> bool {
+    current_len >= max_entries
+}
+
+/// Returns true if a recent resolution attempt for this `(repo_id, kind,
+/// image, reference)` returned None, and the entry has not yet expired.
+fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+    let cache = virtual_negative_cache();
+    let read = match cache.read() {
+        Ok(g) => g,
+        Err(_) => return false, // poisoned: behave as miss
+    };
+    match read.get(key) {
+        Some(at) => negative_cache_entry_is_fresh(now.duration_since(*at), ttl),
+        None => false,
+    }
+}
+
+/// Pure cap-and-evict step on a negative-cache map. Returns `true` iff
+/// there is room to record a new entry after evicting expired ones; the
+/// caller refuses the insert when this returns `false`.
+///
+/// Extracted out of [`virtual_negative_cache_insert`] so the cap policy
+/// (and the precise "evict expired first, refuse insert only if still
+/// at cap" semantics) can be unit-tested against an inline `HashMap`
+/// without touching the process-global cache.
+fn negative_cache_evict_and_has_room<K: Eq + std::hash::Hash>(
+    map: &mut std::collections::HashMap<K, std::time::Instant>,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    max_entries: usize,
+) -> bool {
+    if !negative_cache_should_evict_before_insert(map.len(), max_entries) {
+        return true;
+    }
+    map.retain(|_, at| negative_cache_entry_is_fresh(now.duration_since(*at), ttl));
+    !negative_cache_should_evict_before_insert(map.len(), max_entries)
+}
+
+/// Record a None resolution. Best-effort: lock poisoning silently degrades
+/// to "no caching", which is still correct, just slower.
+fn virtual_negative_cache_insert(key: VirtualResolveKey) {
+    let cache = virtual_negative_cache();
+    let mut write = match cache.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+    let now = std::time::Instant::now();
+    if !negative_cache_evict_and_has_room(&mut write, ttl, now, VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES)
+    {
+        return;
+    }
+    write.insert(key, now);
+}
+
+/// Test-only: drop all negative-cache entries. Exposed to the
+/// integration test crate so tests can run in any order without
+/// stale-cache contamination.
+#[doc(hidden)]
+pub fn virtual_negative_cache_clear() {
+    if let Ok(mut g) = virtual_negative_cache().write() {
+        g.clear();
+    }
+}
+
+/// Walk a virtual OCI repo's members in priority order, returning the
+/// first one (local or remote) that serves the requested blob digest.
+///
+/// Exposed as `pub` so the integration tests in
+/// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
+/// upstream HTTP path. Handlers reach for this via the inline call
+/// site, not directly through the public API.
+pub async fn resolve_virtual_blob(
+    state: &SharedState,
+    repo_id: Uuid,
+    image_name: &str,
+    digest: &str,
+) -> Option<VirtualBlobResolution> {
+    // #1348 round 1, concern #2: short-circuit when we very recently saw
+    // none of the members serve this blob. Bounds the cost of probe
+    // storms (e.g. Docker pull retry loops) against a virtual repo with
+    // many remote members.
+    let cache_key = VirtualResolveKey::new(repo_id, VirtualResolveKind::Blob, image_name, digest);
+    if virtual_negative_cache_hit(&cache_key) {
+        return None;
+    }
+
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
+        .await
+        .ok()?;
+
+    for member in &members {
+        let local = sqlx::query!(
+            "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+            member.id,
+            digest
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| (row.size_bytes, row.storage_key));
+
+        if let Some(resolution) = local_blob_resolution(local, member) {
+            return Some(resolution);
+        }
+
+        if should_attempt_remote_member(
+            member,
+            state.proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        ) {
+            if let (Some(proxy), Some(upstream_url)) =
+                (&state.proxy_service, member.upstream_url.as_deref())
+            {
+                for image in candidate_upstream_images(image_name, upstream_url) {
+                    let upstream_path = upstream_blob_path(&image, digest);
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await
+                    {
+                        // #1348 round 1, concern #3 (digest verification):
+                        // for blobs the requested `digest` is always a
+                        // content-addressable digest. The verify-and-wrap
+                        // step lives in `finalize_upstream_blob` so it
+                        // can be unit-tested without a wiremock upstream.
+                        match finalize_upstream_blob(digest, content, content_type) {
+                            Some(resolution) => return Some(resolution),
+                            None => {
+                                warn!(
+                                    "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
+                                    upstream_url, digest
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    virtual_negative_cache_insert(cache_key);
+    None
+}
+
+/// Walk a virtual OCI repo's members in priority order, returning the
+/// first one (local or remote) that serves the requested manifest.
+///
+/// When `reference` is itself a content-addressable digest, the upstream
+/// body is sha256-verified against the requested digest before being
+/// returned (#1348 round 1, concern #3). A mismatch is treated as if
+/// that member did not have the manifest, so resolution continues with
+/// the next member.
+///
+/// Exposed as `pub` so the integration tests in
+/// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
+/// upstream HTTP path.
+pub async fn resolve_virtual_manifest(
+    state: &SharedState,
+    repo_id: Uuid,
+    image_name: &str,
+    reference: &str,
+    accept: Option<&str>,
+) -> Option<(String, Option<String>, Bytes)> {
+    let is_digest_ref = is_digest_reference(reference);
+
+    // #1348 round 1, concern #2: same negative-cache short-circuit as
+    // `resolve_virtual_blob`. Tags vs digest references share the cache
+    // because tag probes are themselves a common N-member fan-out.
+    let cache_key =
+        VirtualResolveKey::new(repo_id, VirtualResolveKind::Manifest, image_name, reference);
+    if virtual_negative_cache_hit(&cache_key) {
+        return None;
+    }
+
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
+        .await
+        .ok()?;
+
+    for member in &members {
+        let local = if is_digest_ref {
+            sqlx::query!(
+                "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+                member.id,
+                reference
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+        } else {
+            sqlx::query!(
+                "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+                member.id,
+                image_name,
+                reference
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+        };
+
+        if let Some((manifest_digest, content_type)) = local {
+            let manifest_key = manifest_storage_key(&manifest_digest);
+            if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
+                if let Ok(data) = storage.get(&manifest_key).await {
+                    return Some((manifest_digest, content_type, data));
+                }
+            }
+        }
+
+        if should_attempt_remote_member(
+            member,
+            state.proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        ) {
+            if let (Some(proxy), Some(upstream_url)) =
+                (&state.proxy_service, member.upstream_url.as_deref())
+            {
+                for image in candidate_upstream_images(image_name, upstream_url) {
+                    let upstream_path = upstream_manifest_path(&image, reference);
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_with_accept(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                        accept,
+                    )
+                    .await
+                    {
+                        // #1348 round 1, concern #3 (CRITICAL):
+                        // When the manifest reference is itself a digest
+                        // (e.g. `sha256:abc...`) the client is asserting
+                        // content-addressable semantics. A compromised or
+                        // misbehaving upstream could otherwise serve
+                        // arbitrary bytes under the requested digest.
+                        // The verify+compute step lives in
+                        // `finalize_upstream_manifest` so it can be unit-
+                        // tested without a wiremock upstream.
+                        match finalize_upstream_manifest(reference, content, content_type) {
+                            Some(triple) => return Some(triple),
+                            None => {
+                                warn!(
+                                    "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
+                                    upstream_url, reference
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    virtual_negative_cache_insert(cache_key);
+    None
+}
+
 /// Check whether `reference` looks like an OCI content-addressable digest
 /// rather than a human-readable tag. The grammar (from the OCI Distribution
 /// Spec) is:
@@ -830,12 +1537,188 @@ async fn cache_manifest_reference_locally(
     )
     .bind(repo.id)
     .bind(&repo.image)
-    .bind(cached_reference)
+    .bind(&cached_reference)
     .bind(&digest)
     .bind(&manifest_content_type)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
+
+    // #1357 (review feedback): also write a parallel `oci_tags` row keyed by
+    // the human-readable tag (the original `reference`) when the caller pulled
+    // by tag, not digest. The docker-tag listing in
+    // `fetch_docker_tag_rows` filters out rows whose tag contains `:` (via
+    // `POSITION(':' IN t.tag) = 0`), so the digest-keyed row written above
+    // for remote repos is invisible to the UI. Without this second row the
+    // WebUI's Docker tag panel still says "No image tags found" even though
+    // the manifest is cached.
+    //
+    // For local repos `cached_reference == reference`, so this insert is a
+    // no-op upsert against the row written above. For remote repos pulled by
+    // digest (e.g. `docker pull redis@sha256:...`), there is no human-readable
+    // tag to record, so we skip the second insert.
+    if repo.repo_type == RepositoryType::Remote && !is_digest_reference(reference) {
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+                 manifest_digest = EXCLUDED.manifest_digest,
+                 manifest_content_type = EXCLUDED.manifest_content_type,
+                 updated_at = NOW()"#,
+        )
+        .bind(repo.id)
+        .bind(&repo.image)
+        .bind(reference)
+        .bind(&digest)
+        .bind(&manifest_content_type)
+        .execute(&state.db)
+        .await
+        {
+            // Best-effort: the digest-keyed oci_tags row above is already
+            // persisted, so the manifest still resolves by digest. Only the
+            // human-readable tag in the UI listing is degraded.
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                error = %e,
+                "Failed to upsert tag-keyed oci_tags row for proxied manifest; \
+                 the digest-keyed row is still persisted but the Docker tag UI \
+                 listing will not include this tag until the next proxy refresh"
+            );
+        }
+    }
+
+    // #1357: mirror the push-path artifact row so proxied manifests surface
+    // in the repository artifact listing and the WebUI's Docker tag grouping.
+    //
+    // `list_artifacts_grouped_by_docker_tag` (repositories.rs) JOINs
+    // `oci_tags` to `artifacts` on
+    //     a.path = 'v2/' || t.name || '/manifests/' || t.tag
+    // For pushed manifests, `handle_put_manifest` writes both the oci_tags
+    // row AND the matching artifacts row, so the JOIN succeeds. For proxied
+    // manifests, only the oci_tags row was written -- the JOIN drops the
+    // tag and the UI shows "No image tags found" even after a successful
+    // `docker pull` through the proxy (#1357).
+    //
+    // This mirrors the push-path insert at line ~2832: same path shape,
+    // same storage_key (`oci-manifests/<digest>` under the per-repo
+    // backend), same ON CONFLICT semantics. Critically the storage_key
+    // resolves under `storage_for_repo(&repo.location)` -- the same
+    // per-repo backend used to write the manifest body above -- so this
+    // does NOT reintroduce the #1278 doubled-prefix bug. That bug was
+    // specific to `proxy_service::cache_artifact`, which writes to the
+    // global `proxy-cache/...` backend; manifests are stored to the
+    // per-repo location, so reads through `storage_for_repo` resolve
+    // correctly.
+    //
+    // `total_size` for proxied manifests is the manifest body length.
+    // The push path computes config+layers from the parsed manifest, but
+    // that requires already-cached blobs; for proxied manifests the body
+    // is what we have. The artifact row exists primarily to satisfy the
+    // JOIN; downstream byte-accounting uses the oci_tags-driven sizing in
+    // `list_artifacts_grouped_by_docker_tag`.
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let size_bytes = content.len() as i64;
+
+    // Write an artifacts row for every distinct oci_tags key that exists.
+    // For local repos or remote-by-digest, the digest-keyed and the
+    // "cached_reference" key are the same string, so this is a single row.
+    // For remote-by-tag, we write TWO artifacts rows -- one at the
+    // digest-keyed path (existing behaviour, satisfies the digest-keyed
+    // oci_tags row + GC + listing-by-digest), and one at the tag-keyed
+    // path so the docker-tag UI JOIN
+    //     a.path = 'v2/' || t.name || '/manifests/' || t.tag
+    // succeeds for the human-readable tag row that the
+    // `POSITION(':' IN t.tag) = 0` filter requires (#1357 review).
+    let mut artifact_paths: Vec<String> = Vec::with_capacity(2);
+    artifact_paths.push(format!("v2/{}/manifests/{}", repo.image, cached_reference));
+    if repo.repo_type == RepositoryType::Remote
+        && !is_digest_reference(reference)
+        && reference != cached_reference
+    {
+        artifact_paths.push(format!("v2/{}/manifests/{}", repo.image, reference));
+    }
+
+    for artifact_path in &artifact_paths {
+        // Use the path's tag segment for the version + name suffix so each
+        // row carries a stable identity matching its path; the digest-keyed
+        // row keeps the legacy shape and the tag-keyed row reads naturally.
+        let row_key = artifact_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(cached_reference.as_str());
+        let artifact_name = format!("{}:{}", repo.image, row_key);
+
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (repository_id, path) DO UPDATE SET
+                 version = EXCLUDED.version,
+                 size_bytes = EXCLUDED.size_bytes,
+                 checksum_sha256 = EXCLUDED.checksum_sha256,
+                 content_type = EXCLUDED.content_type,
+                 storage_key = EXCLUDED.storage_key,
+                 is_deleted = false,
+                 updated_at = NOW()"#,
+        )
+        .bind(repo.id)
+        .bind(artifact_path)
+        .bind(&artifact_name)
+        .bind(Some(row_key))
+        .bind(size_bytes)
+        .bind(checksum)
+        .bind(&manifest_content_type)
+        .bind(&manifest_key)
+        .execute(&state.db)
+        .await
+        {
+            // Best-effort: the oci_tags row + manifest body are already
+            // persisted, so we never fail the user's pull just because the
+            // listing-index row could not be written. The tag still resolves
+            // through `oci_tags`; only the UI listing is degraded until the
+            // next proxy refresh.
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                artifact_path = %artifact_path,
+                error = %e,
+                "Failed to upsert artifacts row for proxied manifest; manifest \
+                 body and oci_tags row are still persisted, but the repository \
+                 artifact listing will not include this tag until the next \
+                 proxy refresh succeeds"
+            );
+        }
+    }
+
+    // #1357 (review feedback): for multi-arch image-index manifests, record
+    // the (parent_digest -> child_digest) edges so:
+    //   1. The storage GC can protect per-architecture children for as long
+    //      as the index is still tagged (mirrors the push path #1179 guard).
+    //   2. The UI size accounting can walk the index children and report the
+    //      true multi-platform total, rather than just the index body size
+    //      (which is only a few KB for an image whose children sum to GBs).
+    //
+    // Best-effort, warn-on-error: matches the push-path semantics in
+    // `handle_put_manifest`. The manifest body and oci_tags rows are already
+    // persisted; failure here only affects GC/UI accounting until the
+    // startup backfill in main.rs runs again.
+    if is_index_content_type(&manifest_content_type) {
+        if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                parent_digest = %digest,
+                error = %e,
+                "Failed to record oci_manifest_refs for proxied index manifest; \
+                 storage GC may treat child manifests as orphaned and the UI \
+                 size accounting will under-report multi-arch totals until the \
+                 next backfill pass runs"
+            );
+        }
+    }
 
     Ok(digest)
 }
@@ -914,6 +1797,37 @@ async fn try_upstream_fetch_with_accept(
     .ok()
 }
 
+/// Canonical set of manifest media types we always advertise to an OCI
+/// upstream when proxying a manifest fetch.
+///
+/// Required for ghcr.io interop (#1360): GitHub Container Registry returns
+/// `404 not found` for `/v2/<image>/manifests/<ref>` when the request's
+/// `Accept` header does not list a media type the stored manifest matches.
+/// Stricter than Docker Hub and Quay, which fall back to a default Docker
+/// manifest representation when `Accept` is missing or restrictive. Older
+/// docker engines, podman, skopeo, buildah, and curl-driven clients all
+/// send narrower (or no) `Accept` headers; without supplementing them the
+/// proxy surfaces a spurious 404 to the user even though the manifest
+/// exists upstream.
+///
+/// Mirrors the Docker engine 24.x default Accept set plus the OCI image
+/// manifest and index types, which together cover every manifest shape an
+/// OCI Distribution v1.1 registry can serve.
+const OCI_MANIFEST_ACCEPT_TYPES: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v1+prettyjws",
+    "application/vnd.docker.distribution.manifest.v1+json",
+];
+
+/// Pre-rendered comma-joined value of [`OCI_MANIFEST_ACCEPT_TYPES`] used
+/// when the client supplied no `Accept` header at all.
+fn canonical_manifest_accept() -> String {
+    OCI_MANIFEST_ACCEPT_TYPES.join(", ")
+}
+
 /// Extract a sanitised `Accept` header value suitable for forwarding to an
 /// upstream OCI registry.
 ///
@@ -927,6 +1841,60 @@ fn forwarded_accept_header(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Build the `Accept` header value to send upstream for a manifest fetch.
+///
+/// Combines whatever the client sent with the canonical set of OCI/Docker
+/// manifest media types so registries like ghcr.io (which refuse to serve
+/// a manifest when the request's `Accept` does not list a media type they
+/// can match) always receive a workable header (#1360).
+///
+/// Rules:
+/// * If the client sent no `Accept`, return the canonical list.
+/// * If the client sent an `Accept` that already covers every canonical
+///   media type, pass it through unchanged so we do not gratuitously
+///   reorder a value the client carefully constructed.
+/// * Otherwise, append every missing canonical media type to the end of
+///   the client's value, preserving the client's preferred order at the
+///   front so q-values and primary preferences still win on the upstream
+///   side.
+///
+/// The returned value is always non-empty.
+fn manifest_accept_for_upstream(client_accept: Option<&str>) -> String {
+    let trimmed = client_accept.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        return canonical_manifest_accept();
+    }
+
+    // Build a lowercase token set from the client's Accept so we can
+    // detect which canonical media types are already covered. Strip the
+    // `;q=...` parameters and whitespace; comparison is case-insensitive
+    // because RFC 7231 media types are case-insensitive.
+    let existing: std::collections::HashSet<String> = trimmed
+        .split(',')
+        .map(|part| {
+            part.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    for ct in OCI_MANIFEST_ACCEPT_TYPES {
+        if !existing.contains(&ct.to_ascii_lowercase()) {
+            missing.push(ct);
+        }
+    }
+
+    if missing.is_empty() {
+        return trimmed.to_string();
+    }
+
+    format!("{}, {}", trimmed, missing.join(", "))
 }
 
 /// Build an OCI registry response from proxied upstream content.
@@ -1351,6 +2319,50 @@ async fn handle_head_blob(
         }
     }
 
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
+            return match resolution {
+                VirtualBlobResolution::Local {
+                    size_bytes,
+                    storage_key,
+                    member,
+                } => {
+                    let storage = match state.storage_for_repo(&member.storage_location()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return oci_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "INTERNAL_ERROR",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    if storage.exists(&storage_key).await.unwrap_or(false) {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Docker-Content-Digest", digest)
+                            .header(CONTENT_LENGTH, size_bytes.to_string())
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                    }
+                }
+                VirtualBlobResolution::Remote {
+                    content,
+                    content_type,
+                } => build_oci_proxy_response(
+                    &content,
+                    content_type,
+                    digest,
+                    "application/octet-stream",
+                    false,
+                ),
+            };
+        }
+    }
+
     // For remote repos, try fetching blob from upstream
     if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
@@ -1432,6 +2444,52 @@ async fn handle_get_blob(
         }
     }
 
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
+            return match resolution {
+                VirtualBlobResolution::Local {
+                    storage_key,
+                    member,
+                    ..
+                } => {
+                    let storage = match state.storage_for_repo(&member.storage_location()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return oci_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "INTERNAL_ERROR",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    match storage.get(&storage_key).await {
+                        Ok(data) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Docker-Content-Digest", digest)
+                            .header(CONTENT_LENGTH, data.len().to_string())
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .body(Body::from(data))
+                            .unwrap(),
+                        Err(e) => {
+                            warn!("Storage error reading virtual blob {}: {}", digest, e);
+                            oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                        }
+                    }
+                }
+                VirtualBlobResolution::Remote {
+                    content,
+                    content_type,
+                } => build_oci_proxy_response(
+                    &content,
+                    content_type,
+                    digest,
+                    "application/octet-stream",
+                    true,
+                ),
+            };
+        }
+    }
+
     // For remote repos, try fetching blob from upstream
     if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
@@ -1447,7 +2505,7 @@ async fn handle_start_upload(
     headers: &HeaderMap,
     image_name: &str,
     query_digest: Option<&str>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -1468,12 +2526,48 @@ async fn handle_start_upload(
     };
     let repo_id = repo.id;
     let location = repo.location;
+    let max_upload = state.config.max_upload_size_bytes;
 
-    // Monolithic upload: if digest is provided and body is non-empty
+    // Allocate a session UUID up front: the temp file path is keyed on
+    // it for both the monolithic-with-digest path AND the chunked
+    // path, so the same UUID survives the branch below.
+    let session_id = Uuid::new_v4();
+    let temp_path = oci_upload_temp_path(&session_id);
+
+    // Stream the body straight to a local temp file with incremental
+    // sha256. For the monolithic POST?digest=... path the resulting file
+    // is immediately verified and promoted to the final blob key. For
+    // the chunked path the same file is kept around for subsequent
+    // PATCH requests.
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
+    let stream_result =
+        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
+            .await
+        {
+            Ok(r) => r,
+            Err((status, msg)) => {
+                cleanup_upload_temp(&temp_path).await;
+                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "SIZE_INVALID"
+                } else {
+                    "BLOB_UPLOAD_INVALID"
+                };
+                return oci_error(status, code, &msg);
+            }
+        };
+    let body_bytes = stream_result.bytes_written;
+
+    // Monolithic upload: POST /uploads/?digest=... with the full blob
+    // inline. Verify digest BEFORE handing the temp file to storage so
+    // we never write a tampered/truncated body under the final blob key
+    // (#1449 acceptance: "monolithic upload digest validation without
+    // writing unverified bytes over the final digest key").
     if let Some(digest) = query_digest {
-        if !body.is_empty() {
-            let computed = compute_sha256(&body);
+        if body_bytes > 0 {
+            let computed = format!("sha256:{:x}", hasher.clone().finalize());
             if computed != digest {
+                cleanup_upload_temp(&temp_path).await;
                 return oci_error(
                     StatusCode::BAD_REQUEST,
                     "DIGEST_INVALID",
@@ -1487,15 +2581,29 @@ async fn handle_start_upload(
             let storage = match state.storage_for_repo(&location) {
                 Ok(s) => s,
                 Err(e) => {
+                    cleanup_upload_temp(&temp_path).await;
                     return oci_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "INTERNAL_ERROR",
                         &e.to_string(),
-                    )
+                    );
+                }
+            };
+
+            let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    cleanup_upload_temp(&temp_path).await;
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        &format!("reopen temp for streaming put: {e}"),
+                    );
                 }
             };
             let key = blob_storage_key(digest);
-            if let Err(e) = storage.put(&key, body.clone()).await {
+            if let Err(e) = storage.put_stream(&key, upload_stream).await {
+                cleanup_upload_temp(&temp_path).await;
                 return oci_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "BLOB_UPLOAD_UNKNOWN",
@@ -1506,10 +2614,12 @@ async fn handle_start_upload(
             // Record in oci_blobs
             let _ = sqlx::query!(
                 "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
-                repo_id, digest, body.len() as i64, key
+                repo_id, digest, body_bytes as i64, key
             )
             .execute(&state.db)
             .await;
+
+            cleanup_upload_temp(&temp_path).await;
 
             return Response::builder()
                 .status(StatusCode::CREATED)
@@ -1521,40 +2631,22 @@ async fn handle_start_upload(
         }
     }
 
-    // Create upload session
-    let session_id = Uuid::new_v4();
-    let temp_key = upload_storage_key(&session_id);
-
-    // If body is non-empty, store it as initial chunk
-    if !body.is_empty() {
-        let storage = match state.storage_for_repo(&location) {
-            Ok(s) => s,
-            Err(e) => {
-                return oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                )
-            }
-        };
-        if let Err(e) = storage.put(&temp_key, body.clone()).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "BLOB_UPLOAD_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    }
-
-    let bytes_received = body.len() as i64;
+    // Chunked path: persist the session and keep the (possibly empty)
+    // temp file around for subsequent PATCH and PUT requests. We
+    // continue to store an opaque-looking string in `storage_temp_key`
+    // for backwards compatibility with operators reading the column,
+    // but the value is now the local FS path. The semantics moved from
+    // a key in the storage backend to a path on the AK host.
+    let temp_key_value = temp_path.to_string_lossy().into_owned();
 
     if let Err(e) = sqlx::query!(
         "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, $4, $5)",
-        session_id, repo_id, claims.sub, bytes_received, temp_key
+        session_id, repo_id, claims.sub, body_bytes as i64, temp_key_value
     )
     .execute(&state.db)
     .await
     {
+        cleanup_upload_temp(&temp_path).await;
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
     }
 
@@ -1570,7 +2662,7 @@ async fn handle_start_upload(
             format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
         )
         .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", upload_progress_range(bytes_received))
+        .header("Range", upload_progress_range(body_bytes as i64))
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -1581,7 +2673,7 @@ async fn handle_patch_upload(
     headers: &HeaderMap,
     image_name: &str,
     uuid_str: &str,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -1607,10 +2699,19 @@ async fn handle_patch_upload(
         }
     };
 
-    // Look up session
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be driven via repo B's URL
+    // (issue #1317). Same 404 shape for "no session" and "session in another
+    // repo" avoids leaking session existence across repos.
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -1620,40 +2721,39 @@ async fn handle_patch_upload(
         Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    // Append PATCH bytes directly to the local temp file with
+    // O_APPEND. No storage-backend round trip, no full-file rewrite.
+    // Pre-#1449 this path called `storage.get(...)` to pull the entire
+    // in-progress object back into memory, extended it with the new
+    // chunk, and `storage.put(...)`-ed it back -- O(N^2) bytes moved
+    // for an N-chunk push.
+    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
+    let max_upload = state.config.max_upload_size_bytes;
 
-    let storage = match state.storage_for_repo(&repo.location) {
-        Ok(s) => s,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
+    // The session row tracks total bytes received but not the running
+    // sha256 state. We do not persist a partial Sha256 between PATCH
+    // requests; instead we recompute from the on-disk file at PUT time.
+    // PATCH responses do not return a digest, so this is correct and
+    // avoids a serialization-format dependency on the sha2 crate.
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = session.bytes_received as u64;
 
-    // Read existing data and append
-    let mut existing = match storage.get(&session.storage_temp_key).await {
-        Ok(data) => data.to_vec(),
-        Err(_) => Vec::new(),
-    };
-    existing.extend_from_slice(&body);
-
-    let new_bytes = existing.len() as i64;
-    if let Err(e) = storage
-        .put(&session.storage_temp_key, Bytes::from(existing))
-        .await
-    {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "BLOB_UPLOAD_UNKNOWN",
-            &e.to_string(),
-        );
-    }
+    let stream_result =
+        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
+            .await
+        {
+            Ok(r) => r,
+            Err((status, msg)) => {
+                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "SIZE_INVALID"
+                } else {
+                    "BLOB_UPLOAD_INVALID"
+                };
+                return oci_error(status, code, &msg);
+            }
+        };
+    let _ = stream_result;
+    let new_bytes = total_bytes as i64;
 
     // Update session
     let _ = sqlx::query!(
@@ -1683,7 +2783,7 @@ async fn handle_complete_upload(
     image_name: &str,
     uuid_str: &str,
     digest_query: Option<&str>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -1720,9 +2820,18 @@ async fn handle_complete_upload(
         }
     };
 
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be completed via repo B's URL
+    // (issue #1317).
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -1744,11 +2853,6 @@ async fn handle_complete_upload(
         }
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
         Err(e) => {
@@ -1760,32 +2864,84 @@ async fn handle_complete_upload(
         }
     };
 
-    // Read accumulated data and append final chunk
-    let mut data = match storage.get(&session.storage_temp_key).await {
-        Ok(d) => d.to_vec(),
-        Err(_) => Vec::new(),
-    };
-    if !body.is_empty() {
-        data.extend_from_slice(&body);
+    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
+    let max_upload = state.config.max_upload_size_bytes;
+
+    // If the client sent the final chunk inline on PUT, append it to
+    // the temp file. Otherwise the body is empty (chunked-upload finish
+    // pattern) and the temp file already holds the full blob.
+    let mut total_bytes: u64 = session.bytes_received as u64;
+    // We rehash from disk after appending. Updating an in-memory hasher
+    // here only catches the last chunk, but the source of truth is the
+    // file we're about to put_stream into storage, so rehashing from
+    // disk is what guarantees digest correctness end-to-end.
+    let mut throwaway_hasher = Sha256::new();
+    if let Err((status, msg)) = stream_body_to_temp_file(
+        body,
+        &temp_path,
+        &mut throwaway_hasher,
+        &mut total_bytes,
+        max_upload,
+    )
+    .await
+    {
+        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "SIZE_INVALID"
+        } else {
+            "BLOB_UPLOAD_INVALID"
+        };
+        return oci_error(status, code, &msg);
     }
 
-    // Verify digest
-    let computed = compute_sha256(&data);
-    if computed != digest {
+    // Recompute sha256 over the full assembled temp file, end-to-end.
+    // This is the authoritative verification step: the client's
+    // advertised digest must match the bytes we are about to commit.
+    // We do this BEFORE `put_stream` so a mismatched payload never
+    // reaches the final `oci-blobs/<digest>` key (#1449 acceptance).
+    let (computed_digest, size_on_disk) = match rehash_temp_file(&temp_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &format!("rehash temp file: {e}"),
+            );
+        }
+    };
+    if computed_digest != digest {
+        cleanup_upload_temp(&temp_path).await;
+        let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
+            .execute(&state.db)
+            .await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
             &format!(
                 "digest mismatch: computed {} != provided {}",
-                computed, digest
+                computed_digest, digest
             ),
         );
     }
 
-    // Store blob permanently
+    // Hand the temp file to put_stream so the upload to the storage
+    // backend is itself memory-bounded (S3 multipart, GCS resumable,
+    // Azure block-blob, filesystem temp-and-rename). Pre-#1449 this
+    // path called `storage.get(...)` on the in-progress key to pull
+    // every byte back into RAM, then `storage.put(...)` to write it
+    // out under the final digest key -- doubling I/O on every push.
+    let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &format!("reopen temp for streaming put: {e}"),
+            );
+        }
+    };
     let blob_key = blob_storage_key(&digest);
-    let size_bytes = data.len() as i64;
-    if let Err(e) = storage.put(&blob_key, Bytes::from(data)).await {
+    let size_bytes = size_on_disk as i64;
+    if let Err(e) = storage.put_stream(&blob_key, upload_stream).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BLOB_UPLOAD_UNKNOWN",
@@ -1801,8 +2957,8 @@ async fn handle_complete_upload(
     .execute(&state.db)
     .await;
 
-    // Cleanup: delete temp data and session
-    let _ = storage.delete(&session.storage_temp_key).await;
+    // Cleanup: drop local temp file and the session row
+    cleanup_upload_temp(&temp_path).await;
     let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
         .execute(&state.db)
         .await;
@@ -1819,6 +2975,27 @@ async fn handle_complete_upload(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// Recompute the sha256 of an on-disk upload temp file by streaming
+/// 256 KiB chunks through a `Sha256` hasher. Returns the OCI-formatted
+/// digest (`sha256:<hex>`) and the total byte count. Memory use is
+/// O(STREAM_CHUNK_BUDGET) regardless of file size.
+async fn rehash_temp_file(path: &std::path::Path) -> std::io::Result<(String, u64)> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BUDGET];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), total))
 }
 
 // ---------------------------------------------------------------------------
@@ -1901,13 +3078,32 @@ async fn handle_head_manifest(
 
     // For remote repos, try fetching manifest from upstream. Forward the
     // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.).
-    let accept = forwarded_accept_header(headers);
+    // representation the client can actually consume (#586 cont.). Always
+    // supplement it with the canonical OCI/Docker manifest media-type set
+    // so registries like ghcr.io (which return 404 when `Accept` does not
+    // list a media type the stored manifest matches) still serve the
+    // request even when the original client sent a sparse Accept (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some((manifest_digest, content_type, data)) =
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
+        {
+            return build_oci_proxy_response(
+                &data,
+                content_type,
+                &manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                false,
+            );
+        }
+    }
+
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
         &format!("manifests/{}", reference),
-        accept.as_deref(),
+        Some(&accept),
     )
     .await
     {
@@ -2015,13 +3211,32 @@ async fn handle_get_manifest(
 
     // For remote repos, try fetching manifest from upstream. Forward the
     // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.).
-    let accept = forwarded_accept_header(headers);
+    // representation the client can actually consume (#586 cont.). Always
+    // supplement it with the canonical OCI/Docker manifest media-type set
+    // so registries like ghcr.io (which return 404 when `Accept` does not
+    // list a media type the stored manifest matches) still serve the
+    // request even when the original client sent a sparse Accept (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some((manifest_digest, content_type, data)) =
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
+        {
+            return build_oci_proxy_response(
+                &data,
+                content_type,
+                &manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                true,
+            );
+        }
+    }
+
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
         &format!("manifests/{}", reference),
-        accept.as_deref(),
+        Some(&accept),
     )
     .await
     {
@@ -3076,7 +4291,7 @@ async fn catch_all(
     uri: axum::http::Uri,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // Extract path from URI — the nest strips /v2 prefix already
     let path = uri.path().to_string();
@@ -3097,6 +4312,25 @@ async fn catch_all(
         };
     }
 
+    // Helper to fully buffer the body for endpoints that legitimately
+    // need it in memory (HEAD/GET blobs carry no body; manifests are
+    // small JSON documents capped well under MAX_UPLOAD_SIZE). The cap
+    // here is the global MAX_UPLOAD_SIZE so a hostile client cannot
+    // dodge the limit by hitting a non-streaming route.
+    async fn buffer_body(body: Body, max: u64) -> Result<Bytes, Response> {
+        let limit = if max == 0 { usize::MAX } else { max as usize };
+        match axum::body::to_bytes(body, limit).await {
+            Ok(b) => Ok(b),
+            Err(e) => Err(oci_error(
+                StatusCode::BAD_REQUEST,
+                "SIZE_INVALID",
+                &format!("read request body: {e}"),
+            )),
+        }
+    }
+
+    let max_upload = state.config.max_upload_size_bytes;
+
     match (method.as_str(), operation.as_str()) {
         ("HEAD", "blobs") => {
             let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
@@ -3107,8 +4341,8 @@ async fn catch_all(
             handle_get_blob(&state, &headers, &image_name, &d).await
         }
         ("POST", "uploads") => {
-            let digest = query.get("digest").map(|s| s.as_str());
-            handle_start_upload(&state, &headers, &image_name, digest, body).await
+            let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
+            handle_start_upload(&state, &headers, &image_name, digest.as_deref(), body).await
         }
         ("PATCH", "uploads") => {
             let Some(u) = reference else {
@@ -3120,8 +4354,8 @@ async fn catch_all(
             let Some(u) = reference else {
                 return missing_upload_uuid_response();
             };
-            let digest = query.get("digest").map(|s| s.as_str());
-            handle_complete_upload(&state, &headers, &image_name, &u, digest, body).await
+            let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
+            handle_complete_upload(&state, &headers, &image_name, &u, digest.as_deref(), body).await
         }
         ("HEAD", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -3133,7 +4367,11 @@ async fn catch_all(
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_put_manifest(&state, &headers, &image_name, &r, body).await
+            let body_bytes = match buffer_body(body, max_upload).await {
+                Ok(b) => b,
+                Err(resp) => return resp,
+            };
+            handle_put_manifest(&state, &headers, &image_name, &r, body_bytes).await
         }
         ("DELETE", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -3289,6 +4527,121 @@ mod tests {
             headers.insert(axum::http::header::ACCEPT, val);
             assert_eq!(forwarded_accept_header(&headers), None);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // manifest_accept_for_upstream: canonical Accept supplementing.
+    //
+    // Regression coverage for #1360. ghcr.io returns 404 when the request's
+    // `Accept` does not list a media type that matches the stored manifest,
+    // so the proxy must always advertise the full OCI/Docker manifest
+    // media-type set on manifest fetches even if the original client sent
+    // a narrow or empty `Accept`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_accept_none_returns_canonical_set() {
+        let value = manifest_accept_for_upstream(None);
+        // All six canonical media types must appear.
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(
+                value.contains(ct),
+                "missing canonical media type {} in {}",
+                ct,
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_accept_empty_string_returns_canonical_set() {
+        let value = manifest_accept_for_upstream(Some(""));
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(value.contains(ct), "missing {} in {}", ct, value);
+        }
+        // Whitespace-only Accept must be treated the same.
+        let value = manifest_accept_for_upstream(Some("   "));
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(value.contains(ct), "missing {} in {}", ct, value);
+        }
+    }
+
+    #[test]
+    fn test_manifest_accept_passthrough_when_already_complete() {
+        // Modern docker engine sends exactly the canonical set; we should
+        // not gratuitously rewrite the value, only supplement when needed.
+        let docker_default = "application/vnd.docker.distribution.manifest.v2+json, \
+                              application/vnd.docker.distribution.manifest.list.v2+json, \
+                              application/vnd.oci.image.index.v1+json, \
+                              application/vnd.oci.image.manifest.v1+json, \
+                              application/vnd.docker.distribution.manifest.v1+prettyjws, \
+                              application/vnd.docker.distribution.manifest.v1+json";
+        let value = manifest_accept_for_upstream(Some(docker_default));
+        assert_eq!(value, docker_default);
+    }
+
+    #[test]
+    fn test_manifest_accept_supplements_sparse_client_value() {
+        // Older docker / curl-style clients often send just one media type
+        // (or only the Docker v2 types and not the OCI types). #1360 fails
+        // specifically because ghcr.io stores OCI image indexes and the
+        // sparse Accept never matches. We must append the missing
+        // canonical types while keeping the client's preferred ordering
+        // at the front so any q-values still bias the upstream pick.
+        let sparse = "application/vnd.docker.distribution.manifest.v2+json";
+        let value = manifest_accept_for_upstream(Some(sparse));
+        assert!(
+            value.starts_with(sparse),
+            "client preferred order must come first, got: {}",
+            value
+        );
+        assert!(
+            value.contains("application/vnd.oci.image.manifest.v1+json"),
+            "must append OCI manifest type for ghcr.io interop, got: {}",
+            value
+        );
+        assert!(
+            value.contains("application/vnd.oci.image.index.v1+json"),
+            "must append OCI image index type for ghcr.io interop, got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_manifest_accept_case_insensitive_dedup() {
+        // RFC 7231 media types are case-insensitive. If the client sends a
+        // canonical type with different casing, we should not duplicate it.
+        let client = "Application/Vnd.Oci.Image.Manifest.V1+JSON";
+        let value = manifest_accept_for_upstream(Some(client));
+        let lower = value.to_ascii_lowercase();
+        let occurrences = lower
+            .matches("application/vnd.oci.image.manifest.v1+json")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "case-insensitive dedup expected, got value: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_manifest_accept_ignores_q_value_parameters() {
+        // Clients commonly attach `;q=0.9` to media types. Dedup must
+        // strip the params before comparing so we do not append a
+        // redundant copy.
+        let client = "application/vnd.oci.image.manifest.v1+json;q=0.9";
+        let value = manifest_accept_for_upstream(Some(client));
+        let lower = value.to_ascii_lowercase();
+        let occurrences = lower
+            .matches("application/vnd.oci.image.manifest.v1+json")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "q-value-parameterised type should be deduped, got: {}",
+            value
+        );
+        // OCI image index was missing so it must be appended.
+        assert!(value.contains("application/vnd.oci.image.index.v1+json"));
     }
 
     // -----------------------------------------------------------------------
@@ -5036,6 +6389,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_candidate_upstream_images_returns_single_normalized_docker_hub_name() {
+        // Bare official image: only `library/alpine` should be tried.
+        // The pre-fix code returned ["library/alpine", "alpine"], causing
+        // two upstream round-trips per cache miss (#1348 round 1).
+        assert_eq!(
+            super::candidate_upstream_images("alpine", "https://registry-1.docker.io"),
+            vec!["library/alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_keeps_library_prefix_single_candidate() {
+        // Caller already passed `library/alpine` — no need to also try
+        // bare `alpine`. Docker Hub does not serve official images at the
+        // bare name.
+        assert_eq!(
+            super::candidate_upstream_images("library/alpine", "https://registry-1.docker.io"),
+            vec!["library/alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_preserves_non_docker_hub_name() {
+        assert_eq!(
+            super::candidate_upstream_images("org/app", "https://ghcr.io"),
+            vec!["org/app".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_empty_image_returns_empty() {
+        assert!(super::candidate_upstream_images("", "https://registry-1.docker.io").is_empty());
+        assert!(super::candidate_upstream_images("", "https://ghcr.io").is_empty());
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_non_official_docker_hub_user_image() {
+        // `bitnami/postgres` on Docker Hub is already correctly namespaced;
+        // no `library/` prefix should be injected.
+        assert_eq!(
+            super::candidate_upstream_images("bitnami/postgres", "https://registry-1.docker.io"),
+            vec!["bitnami/postgres".to_string()]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ANONYMOUS_TOKEN constant
     // -----------------------------------------------------------------------
@@ -5438,6 +6837,868 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual-repo OCI delegation (PR #1419, refs #1348)
+    //
+    // The async resolvers `resolve_virtual_blob` / `resolve_virtual_manifest`
+    // are exercised end-to-end by wiremock-backed `#[ignore]`d integration
+    // tests under `backend/tests/oci_virtual_resolution_tests.rs`. Those
+    // require a live Postgres so they do not count toward unit-test
+    // coverage. The unit tests below pin each of the *pure* decision
+    // helpers extracted out of the resolver hot path so the logic that
+    // serves cache hits, rejects digest-mismatched upstream content, and
+    // bounds the negative cache is covered without spinning up real
+    // infrastructure.
+    // -----------------------------------------------------------------------
+
+    // candidate_upstream_images: edge-case coverage beyond the existing
+    // happy-path tests above.
+
+    #[test]
+    fn test_candidate_upstream_images_http_docker_hub_normalises() {
+        // Protocol stripping in `is_docker_hub` must also handle `http://`
+        // (we sometimes see this in local-dev configs with TLS-terminating
+        // sidecars). Bare `redis` must still be normalised to `library/redis`.
+        assert_eq!(
+            super::candidate_upstream_images("redis", "http://registry-1.docker.io"),
+            vec!["library/redis".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_subdomain_docker_io() {
+        // `is_docker_hub` matches `host.ends_with(".docker.io")`. This
+        // covers `index.docker.io`, `registry.docker.io`, etc.
+        assert_eq!(
+            super::candidate_upstream_images("nginx", "https://index.docker.io"),
+            vec!["library/nginx".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_quay_preserved_verbatim() {
+        // Quay does not have a `library/` convention. The image must be
+        // returned unmodified so `quay.io/prometheus/node-exporter` resolves
+        // correctly.
+        assert_eq!(
+            super::candidate_upstream_images("prometheus/node-exporter", "https://quay.io"),
+            vec!["prometheus/node-exporter".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_internal_mirror_preserves_image() {
+        // Internal mirror with arbitrary host. We must return a single
+        // candidate equal to the input.
+        let result =
+            super::candidate_upstream_images("myorg/svc", "https://mirror.internal.example.com");
+        assert_eq!(result, vec!["myorg/svc".to_string()]);
+        assert_eq!(result.len(), 1, "no fallback round-trip must be emitted");
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_double_library_prefix_passthrough() {
+        // Defensive: if a caller already passed `library/library/foo` (rare,
+        // but possible via dockerd mirror-mode + a misconfigured upstream),
+        // we don't strip it. The function only *adds* `library/`, never
+        // rewrites an existing one.
+        assert_eq!(
+            super::candidate_upstream_images("library/library/foo", "https://registry-1.docker.io"),
+            vec!["library/library/foo".to_string()]
+        );
+    }
+
+    // upstream_blob_path / upstream_manifest_path: pure path formatters.
+
+    #[test]
+    fn test_upstream_blob_path_uses_v2_prefix() {
+        assert_eq!(
+            super::upstream_blob_path("library/alpine", "sha256:abc"),
+            "v2/library/alpine/blobs/sha256:abc"
+        );
+    }
+
+    #[test]
+    fn test_upstream_blob_path_preserves_nested_image_name() {
+        assert_eq!(
+            super::upstream_blob_path(
+                "myorg/sub/team/app",
+                "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            ),
+            "v2/myorg/sub/team/app/blobs/sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+    }
+
+    #[test]
+    fn test_upstream_manifest_path_tag_reference() {
+        assert_eq!(
+            super::upstream_manifest_path("library/postgres", "16-alpine"),
+            "v2/library/postgres/manifests/16-alpine"
+        );
+    }
+
+    #[test]
+    fn test_upstream_manifest_path_digest_reference() {
+        assert_eq!(
+            super::upstream_manifest_path("nginx", "sha256:1234"),
+            "v2/nginx/manifests/sha256:1234"
+        );
+    }
+
+    // upstream_content_violates_digest: pure decision used by both
+    // resolve_virtual_blob and resolve_virtual_manifest before serving
+    // upstream content. This is the #1348 round-1 security fix.
+
+    #[test]
+    fn test_upstream_content_violates_digest_tag_reference_never_rejects() {
+        // Tags carry no content-addressable contract: the resolver must
+        // accept whatever upstream serves and let the caller compute the
+        // digest itself.
+        assert!(!super::upstream_content_violates_digest(
+            "latest",
+            b"any bytes here"
+        ));
+        assert!(!super::upstream_content_violates_digest("v1.2.3", b""));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_matching_digest_accepts() {
+        // sha256 of "hello world" is a well-known value. The resolver must
+        // accept content whose computed digest equals the requested digest.
+        let bytes = b"hello world";
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(!super::upstream_content_violates_digest(digest, bytes));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_mismatch_rejects() {
+        // Requesting a digest that does *not* match the upstream's bytes
+        // must trip the violation guard. This is the bytes-substitution
+        // attack vector PR #1348 round 1 concern #3 closes.
+        let bytes = b"hello world";
+        // Anything other than the real sha256 of "hello world".
+        let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::upstream_content_violates_digest(fake_digest, bytes));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_empty_content_with_wrong_digest() {
+        // Real sha256 of "" is e3b0c44...b855. Anything else with empty
+        // content must be rejected.
+        assert!(super::upstream_content_violates_digest(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            b""
+        ));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_empty_content_with_correct_digest() {
+        // The canonical empty-string sha256 must pass.
+        assert!(!super::upstream_content_violates_digest(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            b""
+        ));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_invalid_digest_format_rejects() {
+        // A reference that *looks* like a digest but fails `is_digest_reference`
+        // (uppercase algorithm, empty algorithm, empty encoded) must not be
+        // treated as a content-addressable assertion, even when the bytes
+        // would not match. Belt-and-braces: violates_digest returns false
+        // because `is_digest_reference` short-circuits to false first.
+        assert!(!super::upstream_content_violates_digest(
+            "SHA256:abc",
+            b"hi"
+        ));
+        assert!(!super::upstream_content_violates_digest(":abc", b"hi"));
+        assert!(!super::upstream_content_violates_digest("sha256:", b"hi"));
+    }
+
+    #[test]
+    fn test_upstream_content_violates_digest_case_sensitive_hex_mismatch() {
+        // sha256 hex digests are lowercase per the OCI grammar. An uppercase
+        // hex reference does not equal the lowercase computed digest, so the
+        // helper must reject it as a mismatch.
+        let bytes = b"hello world";
+        let upper = "sha256:B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        assert!(super::upstream_content_violates_digest(upper, bytes));
+    }
+
+    // verify_digest_or_fall_through: positive-sense counterpart used by
+    // resolver call sites to keep the control flow readable. The wrapper is
+    // a strict negation of upstream_content_violates_digest; the tests here
+    // pin both that contract and the call-site idiom ("continue when false").
+
+    #[test]
+    fn test_verify_digest_or_fall_through_tag_reference_always_accepts() {
+        // Tags have no content-addressable contract — the caller must
+        // forward whatever upstream served and compute the digest itself.
+        assert!(super::verify_digest_or_fall_through(b"anything", "latest"));
+        assert!(super::verify_digest_or_fall_through(b"", "v1.2.3"));
+        assert!(super::verify_digest_or_fall_through(
+            b"\x00\x01\x02",
+            "release-candidate"
+        ));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_matching_digest_accepts() {
+        let bytes = b"hello world";
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(super::verify_digest_or_fall_through(bytes, digest));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_mismatched_digest_falls_through() {
+        // The exact resolver idiom: "false" means the caller should `continue`
+        // to the next virtual-repo member instead of forwarding bytes.
+        let bytes = b"hello world";
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!super::verify_digest_or_fall_through(bytes, wrong));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_empty_content_with_canonical_digest() {
+        // The canonical empty-string sha256 verifies correctly.
+        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(super::verify_digest_or_fall_through(b"", canonical));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_empty_content_with_wrong_digest_falls_through() {
+        // Empty body + non-canonical empty-digest = mismatch, must fall through.
+        let wrong = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        assert!(!super::verify_digest_or_fall_through(b"", wrong));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_invalid_digest_format_accepts() {
+        // Malformed digest references (uppercase algorithm, empty parts) are
+        // *not* content-addressable. The wrapper treats them as tag-like and
+        // accepts the content; the caller still computes a digest from the
+        // bytes for response headers.
+        assert!(super::verify_digest_or_fall_through(b"hi", "SHA256:abc"));
+        assert!(super::verify_digest_or_fall_through(b"hi", ":abc"));
+        assert!(super::verify_digest_or_fall_through(b"hi", "sha256:"));
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_is_inverse_of_violates_digest() {
+        // Property: the wrapper is the strict negation of the underlying
+        // helper across both branch outputs.
+        let cases: &[(&[u8], &str)] = &[
+            (b"hello world", "latest"),
+            (
+                b"hello world",
+                "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+            ),
+            (
+                b"hello world",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                b"",
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (b"hi", "SHA256:abc"),
+        ];
+        for (bytes, reference) in cases {
+            assert_eq!(
+                super::verify_digest_or_fall_through(bytes, reference),
+                !super::upstream_content_violates_digest(reference, bytes),
+                "wrapper must invert violates_digest for ({:?}, {:?})",
+                std::str::from_utf8(bytes).unwrap_or("<binary>"),
+                reference,
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_digest_or_fall_through_large_content_canonical_digest() {
+        // Realistic OCI blob size (~256KiB) of a deterministic byte pattern.
+        // Confirms the helper computes the digest over the *whole* slice,
+        // not just a prefix, by feeding a pattern whose sha256 we precompute.
+        let bytes: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let computed = super::compute_sha256(&bytes);
+        assert!(super::verify_digest_or_fall_through(&bytes, &computed));
+
+        // And a one-byte truncation must trip the mismatch path.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(!super::verify_digest_or_fall_through(truncated, &computed));
+    }
+
+    // VirtualResolveKey / VirtualResolveKind: constructor, equality,
+    // hashing. The cache uses this as a hashmap key so each field must
+    // participate in equality.
+
+    #[test]
+    fn test_virtual_resolve_key_new_roundtrip() {
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc");
+        assert_eq!(key.repo_id, id);
+        assert_eq!(key.kind, VirtualResolveKind::Blob);
+        assert_eq!(key.image, "alpine");
+        assert_eq!(key.reference, "sha256:abc");
+    }
+
+    #[test]
+    fn test_virtual_resolve_key_equality_uses_all_fields() {
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let base = VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc");
+
+        // Same fields are equal.
+        assert_eq!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:abc")
+        );
+        // Different repo_id differentiates.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(other, VirtualResolveKind::Blob, "alpine", "sha256:abc")
+        );
+        // Different kind differentiates: blob and manifest caches must not collide.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:abc")
+        );
+        // Different image differentiates.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "nginx", "sha256:abc")
+        );
+        // Different reference differentiates: a tag and digest miss for
+        // the same image must be cached separately.
+        assert_ne!(
+            base,
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:def")
+        );
+    }
+
+    #[test]
+    fn test_virtual_resolve_key_hashes_consistently() {
+        // HashMap relies on `Eq` and `Hash` agreeing. Two keys built with
+        // the same inputs must hash identically.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let id = Uuid::new_v4();
+        let k1 = VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "img", "latest");
+        let k2 = VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "img", "latest");
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        k1.hash(&mut h1);
+        k2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_virtual_resolve_kind_distinct() {
+        assert_ne!(VirtualResolveKind::Blob, VirtualResolveKind::Manifest);
+    }
+
+    // negative_cache_entry_is_fresh: TTL decision boundary.
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_well_within_ttl() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_millis(100),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_just_before_ttl() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_millis(4_999),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_exactly_at_ttl_is_stale() {
+        // Strict `<` comparison: an entry whose age equals the TTL is no
+        // longer fresh. This matters because Tokio's coarse timer can land
+        // exactly on the boundary on overloaded CI runners.
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::negative_cache_entry_is_fresh(ttl, ttl));
+    }
+
+    #[test]
+    fn test_negative_cache_entry_is_fresh_past_ttl_is_stale() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::negative_cache_entry_is_fresh(
+            std::time::Duration::from_secs(6),
+            ttl
+        ));
+    }
+
+    // negative_cache_should_evict_before_insert: capacity decision.
+
+    #[test]
+    fn test_negative_cache_should_not_evict_when_under_cap() {
+        assert!(!super::negative_cache_should_evict_before_insert(0, 4096));
+        assert!(!super::negative_cache_should_evict_before_insert(
+            4095, 4096
+        ));
+    }
+
+    #[test]
+    fn test_negative_cache_should_evict_at_cap() {
+        // `>=` boundary: when we hit the cap exactly, the insertion path
+        // must attempt eviction before recording a new entry, otherwise we
+        // would exceed the bound by one entry on every insert.
+        assert!(super::negative_cache_should_evict_before_insert(4096, 4096));
+    }
+
+    #[test]
+    fn test_negative_cache_should_evict_when_over_cap() {
+        assert!(super::negative_cache_should_evict_before_insert(
+            10_000, 4096
+        ));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_constants_are_sensible() {
+        // Pin the configured TTL and cap so an accidental edit (e.g.
+        // bumping TTL to 5 minutes) trips review attention.
+        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_TTL_MS, 5_000);
+        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES, 4096);
+    }
+
+    // virtual_negative_cache hit / insert: end-to-end roundtrip through the
+    // process-global cache. The cache is process-local and shared across
+    // tests, so we isolate per-test state by using a fresh random `repo_id`
+    // in every test rather than calling `virtual_negative_cache_clear()`
+    // (which would race against other tests' inserts under
+    // `cargo test`'s default parallel runner).
+
+    #[test]
+    fn test_virtual_negative_cache_hit_returns_false_on_unseen_key() {
+        // A freshly-generated repo_id has never been inserted, so the
+        // cache must report no hit. No `clear()` needed: the UUID is
+        // unique to this test.
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "never-inserted",
+            "sha256:zzz",
+        );
+        assert!(!super::virtual_negative_cache_hit(&key));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_insert_then_hit() {
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(
+            id,
+            VirtualResolveKind::Manifest,
+            "alpine",
+            "sha256:cachehit",
+        );
+        // Sanity: before insert, no hit for this unique key.
+        assert!(!super::virtual_negative_cache_hit(&key));
+        super::virtual_negative_cache_insert(key.clone());
+        assert!(super::virtual_negative_cache_hit(&key));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_blob_and_manifest_kinds_are_isolated() {
+        // The same image+reference cached as a Blob miss must not
+        // short-circuit a Manifest probe (and vice-versa). The `kind`
+        // field is part of the cache key for exactly this reason. We use
+        // a fresh repo_id so this test doesn't interact with any other
+        // running in parallel.
+        let id = Uuid::new_v4();
+        let blob_key =
+            VirtualResolveKey::new(id, VirtualResolveKind::Blob, "alpine", "sha256:shared");
+        let manifest_key =
+            VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:shared");
+        // Sanity: both kinds are uncached for this unique repo_id.
+        assert!(!super::virtual_negative_cache_hit(&blob_key));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+        super::virtual_negative_cache_insert(blob_key.clone());
+        assert!(super::virtual_negative_cache_hit(&blob_key));
+        // The manifest variant of the same image+reference must still
+        // miss: kinds are isolated.
+        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+    }
+
+    // Note: `virtual_negative_cache_clear()` is exercised by the
+    // wiremock-backed integration tests in
+    // `backend/tests/oci_virtual_resolution_tests.rs`, which run serially
+    // against a real DB. We deliberately do not invoke `clear()` from any
+    // unit test below because `cargo test`'s default parallel runner would
+    // let one test's `clear()` wipe another test's just-inserted entry.
+
+    // VirtualBlobResolution variant construction. The `Local` variant
+    // boxes the owning `Repository` to keep the enum small
+    // (clippy::large_enum_variant); the `Remote` variant carries a
+    // `Bytes` body. Pin the field layout so accidental reshuffles fail
+    // here rather than at a serialisation boundary.
+
+    #[test]
+    fn test_virtual_blob_resolution_remote_variant_fields() {
+        let resolution = VirtualBlobResolution::Remote {
+            content: Bytes::from_static(b"layer-bytes"),
+            content_type: Some("application/octet-stream".to_string()),
+        };
+        match resolution {
+            VirtualBlobResolution::Remote {
+                content,
+                content_type,
+            } => {
+                assert_eq!(content.as_ref(), b"layer-bytes");
+                assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+            }
+            VirtualBlobResolution::Local { .. } => {
+                panic!("Remote variant constructed but Local matched");
+            }
+        }
+    }
+
+    #[test]
+    fn test_virtual_blob_resolution_remote_variant_without_content_type() {
+        // Upstreams that omit Content-Type should still produce a usable
+        // resolution; the caller will fall back to a default media type.
+        let resolution = VirtualBlobResolution::Remote {
+            content: Bytes::new(),
+            content_type: None,
+        };
+        if let VirtualBlobResolution::Remote { content_type, .. } = resolution {
+            assert!(content_type.is_none());
+        } else {
+            panic!("expected Remote variant");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Extracted pure helpers for #1419 virtual-resolver coverage.
+    // -----------------------------------------------------------------------
+    //
+    // `negative_cache_evict_and_has_room`, `local_blob_resolution`,
+    // `should_attempt_remote_member`, `finalize_upstream_blob`, and
+    // `finalize_upstream_manifest` were carved out of the async resolver
+    // hot path so the decision logic that previously lived inline could
+    // be covered by unit tests without standing up a Postgres + wiremock
+    // pair. These tests exercise the small purified pieces; the
+    // wiremock-backed integration tests in
+    // `backend/tests/oci_virtual_resolution_tests.rs` still cover the
+    // end-to-end resolver behaviour with a real DB.
+
+    fn build_test_repository(
+        repo_type: RepositoryType,
+        upstream_url: Option<&str>,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: Uuid::new_v4(),
+            key: "test-repo".to_string(),
+            name: "test-repo".to_string(),
+            description: None,
+            format: RepositoryFormat::Docker,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/test-repo".to_string(),
+            upstream_url: upstream_url.map(|s| s.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // negative_cache_evict_and_has_room: pure cap-and-evict step on a
+    // fresh `HashMap`. Exercised here rather than against the process-
+    // global cache so capacity-edge behaviour can be pinned without
+    // affecting other tests' inserts.
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_under_cap_short_circuits() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        map.insert(1, std::time::Instant::now());
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        // Under the cap (1 < 4): no eviction required, returns true and
+        // leaves the map untouched.
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 4
+        ));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_evicts_all_expired_and_grants_room() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        // Two entries inserted "long ago" — both will be evicted as expired.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        map.insert(1, long_ago);
+        map.insert(2, long_ago);
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        // At the cap (2 >= 2): eviction kicks in, both expired entries
+        // are dropped, room is granted.
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert!(
+            map.is_empty(),
+            "expired entries must be evicted to make room"
+        );
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_refuses_when_all_fresh() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        // Two fresh entries at the cap — neither is expired, so the
+        // helper must refuse the insert by returning false.
+        let now = std::time::Instant::now();
+        map.insert(1, now);
+        map.insert(2, now);
+        let ttl = std::time::Duration::from_secs(60);
+        assert!(!super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert_eq!(
+            map.len(),
+            2,
+            "no entries should be evicted when none are expired"
+        );
+    }
+
+    #[test]
+    fn test_negative_cache_evict_and_has_room_evicts_only_expired_subset() {
+        let mut map: std::collections::HashMap<u32, std::time::Instant> =
+            std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        let long_ago = now - std::time::Duration::from_secs(60);
+        // One stale, one fresh, cap = 2. After eviction the fresh entry
+        // remains and there's room for one more.
+        map.insert(1, long_ago);
+        map.insert(2, now);
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(super::negative_cache_evict_and_has_room(
+            &mut map, ttl, now, 2
+        ));
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&2));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_clear_drops_existing_entries() {
+        // The integration tests rely on `virtual_negative_cache_clear()`
+        // to isolate themselves from sibling tests' inserts. Cover the
+        // wipe semantics here so the pure clear path is exercised
+        // without depending on the test harness ordering.
+        let id = Uuid::new_v4();
+        let key = VirtualResolveKey::new(
+            id,
+            VirtualResolveKind::Blob,
+            "clear-target",
+            "sha256:cleared",
+        );
+        super::virtual_negative_cache_insert(key.clone());
+        assert!(super::virtual_negative_cache_hit(&key));
+        super::virtual_negative_cache_clear();
+        assert!(
+            !super::virtual_negative_cache_hit(&key),
+            "clear() must drop the just-inserted entry"
+        );
+    }
+
+    // local_blob_resolution: pure DB-row → Local-variant constructor.
+
+    #[test]
+    fn test_local_blob_resolution_none_input_yields_none() {
+        let member = build_test_repository(RepositoryType::Local, None);
+        assert!(super::local_blob_resolution(None, &member).is_none());
+    }
+
+    #[test]
+    fn test_local_blob_resolution_some_input_constructs_local_variant() {
+        let member = build_test_repository(RepositoryType::Local, None);
+        let member_id = member.id;
+        let resolution =
+            super::local_blob_resolution(Some((1024, "oci-blobs/sha256:abc".into())), &member)
+                .expect("Some input must produce a Local resolution");
+        match resolution {
+            VirtualBlobResolution::Local {
+                size_bytes,
+                storage_key,
+                member,
+            } => {
+                assert_eq!(size_bytes, 1024);
+                assert_eq!(storage_key, "oci-blobs/sha256:abc");
+                assert_eq!(member.id, member_id);
+            }
+            VirtualBlobResolution::Remote { .. } => {
+                panic!("expected Local variant from local_blob_resolution");
+            }
+        }
+    }
+
+    // should_attempt_remote_member: 2x2x2 truth-table of the
+    // (repo_type == Remote, has_proxy_service, has_upstream_url)
+    // predicate. The function only returns true on `(true, true, true)`.
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_with_proxy_and_url() {
+        let m = build_test_repository(RepositoryType::Remote, Some("https://ghcr.io"));
+        assert!(super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_missing_proxy() {
+        let m = build_test_repository(RepositoryType::Remote, Some("https://ghcr.io"));
+        // ProxyService not wired up: must not attempt upstream.
+        assert!(!super::should_attempt_remote_member(&m, false, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_remote_missing_url() {
+        let m = build_test_repository(RepositoryType::Remote, None);
+        // Member has no upstream_url configured: nothing to fetch.
+        assert!(!super::should_attempt_remote_member(&m, true, false));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_local_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Local, Some("https://ghcr.io"));
+        // Local-typed member must never trigger an upstream fetch even
+        // if a stale `upstream_url` is present.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_virtual_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Virtual, Some("https://ghcr.io"));
+        // Virtual members would recurse — the resolver only delegates to
+        // genuinely remote members.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    #[test]
+    fn test_should_attempt_remote_member_staging_repo_is_skipped() {
+        let m = build_test_repository(RepositoryType::Staging, Some("https://ghcr.io"));
+        // Staging repos host promotion targets, not upstream proxies.
+        assert!(!super::should_attempt_remote_member(&m, true, true));
+    }
+
+    // finalize_upstream_blob: verify-then-wrap step for the resolver.
+
+    #[test]
+    fn test_finalize_upstream_blob_matching_digest_returns_remote() {
+        let bytes = Bytes::from_static(b"hello world");
+        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let result =
+            super::finalize_upstream_blob(digest, bytes.clone(), Some("application/json".into()))
+                .expect("matching digest must produce a Remote resolution");
+        match result {
+            VirtualBlobResolution::Remote {
+                content,
+                content_type,
+            } => {
+                assert_eq!(content, bytes);
+                assert_eq!(content_type.as_deref(), Some("application/json"));
+            }
+            VirtualBlobResolution::Local { .. } => {
+                panic!("finalize_upstream_blob must never construct a Local variant");
+            }
+        }
+    }
+
+    #[test]
+    fn test_finalize_upstream_blob_mismatched_digest_falls_through() {
+        // The exact bytes-substitution attack vector PR #1348 closes:
+        // upstream serves "hello world" under a non-matching digest.
+        // finalize_upstream_blob must refuse the response so the resolver
+        // can `continue` to the next virtual-repo member.
+        let bytes = Bytes::from_static(b"hello world");
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::finalize_upstream_blob(wrong, bytes, None).is_none());
+    }
+
+    #[test]
+    fn test_finalize_upstream_blob_empty_body_with_canonical_digest_accepts() {
+        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let result = super::finalize_upstream_blob(canonical, Bytes::new(), None)
+            .expect("canonical empty-string digest must verify against empty content");
+        if let VirtualBlobResolution::Remote { content, .. } = result {
+            assert!(content.is_empty());
+        } else {
+            panic!("expected Remote variant");
+        }
+    }
+
+    // finalize_upstream_manifest: verify-then-compute step for manifest
+    // resolution.
+
+    #[test]
+    fn test_finalize_upstream_manifest_tag_reference_always_accepts_and_computes_digest() {
+        let body = Bytes::from_static(b"{\"schemaVersion\":2}");
+        let (returned_digest, ct, content) =
+            super::finalize_upstream_manifest("latest", body.clone(), Some("ct".into()))
+                .expect("tag reference must always accept and return a computed digest");
+        assert_eq!(content, body);
+        assert_eq!(ct.as_deref(), Some("ct"));
+        assert_eq!(returned_digest, super::compute_sha256(&body));
+        // Sanity: the returned digest is `sha256:`-prefixed per the OCI
+        // grammar.
+        assert!(returned_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_matching_digest_returns_computed_digest() {
+        let body = Bytes::from_static(b"hello world");
+        let requested = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let (returned_digest, _ct, content) =
+            super::finalize_upstream_manifest(requested, body.clone(), None)
+                .expect("matching digest must accept");
+        // The resolver returns the COMPUTED digest (not the requested
+        // one), guaranteeing the response header is always honest about
+        // what was served. For a match, the two are byte-for-byte equal.
+        assert_eq!(returned_digest, requested);
+        assert_eq!(content, body);
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_mismatched_digest_ref_falls_through() {
+        // The #1348 concern-3 attack: upstream tampers with a manifest
+        // when the client asked for a specific digest. The resolver
+        // must refuse so the caller advances to the next member.
+        let body = Bytes::from_static(b"{\"evil\":true}");
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(super::finalize_upstream_manifest(wrong, body, None).is_none());
+    }
+
+    #[test]
+    fn test_finalize_upstream_manifest_invalid_digest_format_treated_as_tag() {
+        // A reference that is not a valid OCI digest is treated as a tag:
+        // the helper accepts the bytes and returns the computed sha256 as
+        // the response digest. (`is_digest_reference` rejects uppercase
+        // algorithm strings; everything else flows through the tag path.)
+        let body = Bytes::from_static(b"hi");
+        let (returned_digest, _ct, _content) =
+            super::finalize_upstream_manifest("SHA256:nope", body.clone(), None)
+                .expect("malformed digest reference must be treated as a tag");
+        assert_eq!(returned_digest, super::compute_sha256(&body));
     }
 }
 
@@ -5989,5 +8250,1638 @@ mod token_service_query_validation_tests {
             StatusCode::OK,
             "missing service param stays accepted (backward compat)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OCI blob upload streaming (#1449)
+    //
+    // These tests mirror the #1512 ChunkRecordingBackend pattern: a fake
+    // StorageBackend that asserts (a) `put` is never called for large
+    // bodies, (b) `put_stream` is what the upload path actually uses, and
+    // (c) per-chunk memory stays bounded to STREAM_CHUNK_BUDGET. None of
+    // these tests touch the database; the helpers under test are pure
+    // tokio + tempfile operations.
+    // -----------------------------------------------------------------------
+
+    /// Streaming PATCH-append parity: writing a payload as one big chunk
+    /// versus many small chunks must produce the same on-disk bytes and
+    /// the same sha256, exactly the way the streaming PATCH path
+    /// (`stream_body_to_temp_file` with O_APPEND) must compose.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_append_parity() {
+        // Deterministic 1 MiB + 17 bytes payload (off-by-one to catch
+        // boundary bugs).
+        let size = 1024 * 1024 + 17;
+        let mut payload = Vec::with_capacity(size);
+        let mut x: u32 = 0xCAFE_BABE;
+        for _ in 0..size {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            payload.push((x >> 16) as u8);
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let one_shot_path = tmp.path().join("oneshot.bin");
+        let many_chunks_path = tmp.path().join("many.bin");
+
+        // 1) Single Body::from in one go.
+        let body = Body::from(payload.clone());
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let max_upload: u64 = 0; // unlimited
+        stream_body_to_temp_file(body, &one_shot_path, &mut hasher, &mut total, max_upload)
+            .await
+            .expect("oneshot stream succeeds");
+        let digest_oneshot = format!("{:x}", hasher.finalize());
+
+        // 2) Same payload as many small chunks, appended via O_APPEND
+        //    across multiple calls -- this is the multi-PATCH shape.
+        let mut combined_hasher = Sha256::new();
+        let mut combined_total: u64 = 0;
+        for chunk in payload.chunks(13 * 1024 + 7) {
+            let body = Body::from(Bytes::copy_from_slice(chunk));
+            stream_body_to_temp_file(
+                body,
+                &many_chunks_path,
+                &mut combined_hasher,
+                &mut combined_total,
+                max_upload,
+            )
+            .await
+            .expect("multi-chunk append succeeds");
+        }
+        let digest_chunks = format!("{:x}", combined_hasher.finalize());
+
+        // Files should be byte-identical and same length.
+        let a = tokio::fs::read(&one_shot_path).await.unwrap();
+        let b = tokio::fs::read(&many_chunks_path).await.unwrap();
+        assert_eq!(a.len(), payload.len(), "oneshot file size matches payload");
+        assert_eq!(b.len(), payload.len(), "appended file size matches payload");
+        assert_eq!(a, b, "oneshot and appended file contents diverged");
+        assert_eq!(
+            digest_oneshot, digest_chunks,
+            "single-call vs append-multi sha256 must match"
+        );
+    }
+
+    /// MAX_UPLOAD_SIZE enforcement: a nonzero cap must reject a body
+    /// that overruns it BEFORE the offending bytes hit disk, and the
+    /// returned status must be 413 Payload Too Large.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_enforces_nonzero_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("capped.bin");
+        // 100 byte cap, 1 KiB body.
+        let payload = vec![0xA5u8; 1024];
+        let body = Body::from(payload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let err = stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 100)
+            .await
+            .expect_err("must reject body over cap");
+        assert_eq!(
+            err.0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "expected 413 on cap overrun, got {} ({})",
+            err.0,
+            err.1,
+        );
+    }
+
+    /// MAX_UPLOAD_SIZE = 0 must mean "unlimited", matching the
+    /// documented sentinel in `Config::max_upload_size_bytes`. A 0 cap
+    /// must NOT cause every chunk to overflow the cap.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_zero_cap_is_unlimited() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("unlimited.bin");
+        // 4 MiB payload -- vastly larger than any conceivable check
+        // window; if `0` were treated as a literal cap this would 413.
+        let payload = vec![0x11u8; 4 * 1024 * 1024];
+        let body = Body::from(payload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 0)
+            .await
+            .expect("zero cap must permit any size");
+        assert_eq!(
+            total,
+            4 * 1024 * 1024,
+            "all bytes counted under unlimited cap"
+        );
+        let on_disk = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            on_disk,
+            4 * 1024 * 1024,
+            "all bytes written under unlimited cap"
+        );
+    }
+
+    /// `rehash_temp_file` must produce a sha256 that matches the
+    /// `compute_sha256` helper run on the same payload buffered in
+    /// memory. This is the digest-verification parity that
+    /// `handle_complete_upload` depends on: pre-#1449 the verification
+    /// hashed an in-memory buffer; post-#1449 it hashes the on-disk
+    /// temp file, and the two must agree byte-for-byte.
+    #[tokio::test]
+    async fn test_rehash_temp_file_matches_compute_sha256() {
+        let payload = b"hello OCI streaming push -- 1449".repeat(4096);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("blob.bin");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let (digest_from_disk, size_from_disk) =
+            rehash_temp_file(&path).await.expect("rehash succeeds");
+        let digest_from_buf = compute_sha256(&payload);
+
+        assert_eq!(
+            digest_from_disk, digest_from_buf,
+            "on-disk rehash vs in-memory compute_sha256 must agree"
+        );
+        assert_eq!(size_from_disk as usize, payload.len());
+    }
+
+    /// Memory-bound put: when the upload temp file is fed to a
+    /// `StorageBackend` via `put_stream`, the backend must observe
+    /// multiple bounded chunks rather than a single Bytes containing
+    /// the whole payload. This is the #1449 invariant: a 10 GB layer
+    /// push must not buffer 10 GB in RAM at the storage interface.
+    ///
+    /// We use a `ChunkRecordingBackend` that captures chunk sizes from
+    /// the `put_stream` BoxStream and asserts:
+    ///   * `put` was never called (the legacy buffered path),
+    ///   * the chunk count is > 1 for a multi-MiB payload,
+    ///   * the largest single chunk is <= STREAM_CHUNK_BUDGET.
+    #[tokio::test]
+    async fn test_put_stream_is_chunked_not_buffered() {
+        use crate::storage::PutStreamResult;
+        use crate::storage::StorageBackend;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ChunkRecordingBackend {
+            put_calls: Arc<AtomicUsize>,
+            chunk_sizes: Arc<Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for ChunkRecordingBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                self.put_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<PutStreamResult> {
+                use futures::StreamExt;
+                let mut total: u64 = 0;
+                let mut hasher = Sha256::new();
+                tokio::pin!(stream);
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    self.chunk_sizes.lock().unwrap().push(chunk.len());
+                    hasher.update(&chunk);
+                    total += chunk.len() as u64;
+                }
+                Ok(PutStreamResult {
+                    checksum_sha256: format!("{:x}", hasher.finalize()),
+                    bytes_written: total,
+                })
+            }
+        }
+
+        // 4 MiB payload -- big enough to span > 1 STREAM_CHUNK_BUDGET
+        // window (256 KiB), so a non-chunked implementation would
+        // show up as a single Bytes of 4 MiB.
+        let payload = vec![0xCDu8; 4 * 1024 * 1024];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("blob.bin");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let put_calls = Arc::new(AtomicUsize::new(0));
+        let chunk_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let backend = ChunkRecordingBackend {
+            put_calls: put_calls.clone(),
+            chunk_sizes: chunk_sizes.clone(),
+        };
+
+        let upload_stream = open_upload_temp_as_stream(&path)
+            .await
+            .expect("open temp as stream");
+        let result = backend
+            .put_stream("oci-blobs/sha256:test", upload_stream)
+            .await
+            .expect("put_stream succeeds");
+
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            0,
+            "buffered `put` must NOT be called for a streaming upload"
+        );
+        let sizes = chunk_sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() > 1,
+            "expected multiple chunks for a 4 MiB payload, got {} chunks",
+            sizes.len()
+        );
+        let max_chunk = sizes.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_chunk <= STREAM_CHUNK_BUDGET,
+            "max chunk {} bytes exceeds STREAM_CHUNK_BUDGET ({})",
+            max_chunk,
+            STREAM_CHUNK_BUDGET,
+        );
+        assert_eq!(result.bytes_written as usize, payload.len());
+    }
+
+    /// Sanity: `oci_upload_temp_path` produces a deterministic per-UUID
+    /// path under a configurable root, so concurrent uploads don't
+    /// collide and operators can pin uploads to a fast local volume.
+    #[test]
+    fn test_oci_upload_temp_path_is_per_uuid() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let pa = oci_upload_temp_path(&a);
+        let pb = oci_upload_temp_path(&b);
+        assert_ne!(pa, pb, "distinct uuids must produce distinct paths");
+        let again = oci_upload_temp_path(&a);
+        assert_eq!(pa, again, "same uuid must produce same path");
+        assert!(
+            pa.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("ak-oci-upload-"))
+                .unwrap_or(false),
+            "filename must be prefixed with ak-oci-upload- for operator visibility"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1357: proxied manifests must be indexed in the `artifacts` table so the
+// Docker tag UI listing (`list_artifacts_grouped_by_docker_tag` in
+// repositories.rs) finds the JOIN row. Pre-fix, `cache_manifest_reference_locally`
+// inserted only the `oci_tags` row, so a successful `docker pull` through a
+// remote proxy populated `oci_tags` but left `artifacts` empty, and the UI
+// reported "No image tags found". This is the gap referenced in the #1278
+// fix's "Tradeoff" note for the OCI manifest path -- safe to close here
+// because the manifest write uses the per-repo backend, not the global
+// `proxy-cache/...` backend that drove the #1278 doubled-prefix bug.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proxy_manifest_artifact_indexing_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// After `cache_manifest_reference_locally` writes a proxied manifest,
+    /// the JOIN used by the docker-tag listing must succeed: there must be
+    /// an `artifacts` row at the deterministic path
+    /// `v2/{image}/manifests/{tag}` whose storage_key matches the
+    /// per-repo manifest_storage_key(digest).
+    #[tokio::test]
+    async fn cache_manifest_inserts_artifacts_row_for_listing_join() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Build an OciRepoInfo pointing at the per-repo storage. The path
+        // matches what `repo.storage_location()` would return for this
+        // repository row, so the per-repo backend reads/writes resolve
+        // under <storage_dir>/oci-manifests/<digest>.
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key.clone(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#;
+        let body = Bytes::from_static(manifest);
+        let digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // For remote repos with a tag reference, the cached tag is the digest.
+        let expected_tag = digest.clone();
+        let expected_path = format!("v2/{}/manifests/{}", image, expected_tag);
+        let expected_storage_key = format!("oci-manifests/{}", digest);
+
+        // oci_tags row exists (regression-safe: this was the only insert pre-fix).
+        let tag_row: Option<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_content_type \
+             FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(&expected_tag)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_tags");
+        assert!(
+            tag_row.is_some(),
+            "expected oci_tags row for repo={}, image={}, tag={}",
+            repo_key,
+            image,
+            expected_tag
+        );
+
+        // #1357 fix: artifacts row must exist at the JOIN-compatible path,
+        // pointing at the per-repo manifest_storage_key. Without this row
+        // `list_artifacts_grouped_by_docker_tag` drops the tag and the UI
+        // shows "No image tags found" for proxied images.
+        let art_row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT storage_key, content_type, size_bytes \
+             FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&expected_path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query artifacts");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let (storage_key, content_type, size_bytes) = art_row.expect(
+            "expected artifacts row at v2/<image>/manifests/<tag> after \
+             cache_manifest_reference_locally; without it the docker-tag UI \
+             listing JOIN drops proxied tags (#1357)",
+        );
+        assert_eq!(
+            storage_key, expected_storage_key,
+            "artifacts.storage_key must point at the per-repo manifest object \
+             so storage_for_repo(repo.location).get(storage_key) resolves \
+             under the same backend the manifest was written to"
+        );
+        assert_eq!(
+            content_type, "application/vnd.oci.image.manifest.v1+json",
+            "content_type should carry the manifest media type"
+        );
+        assert_eq!(
+            size_bytes,
+            body.len() as i64,
+            "size_bytes must equal manifest body length"
+        );
+    }
+
+    /// Repeated proxy hits for the same tag must upsert (not duplicate) the
+    /// artifacts row, mirroring the push-path ON CONFLICT DO UPDATE.
+    #[tokio::test]
+    async fn cache_manifest_repeated_calls_upsert_artifact_row() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/nginx";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+
+        // First and second proxy fetches both call cache_manifest_reference_locally.
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "stable",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("first cache call");
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "stable",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("second cache call");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        // Two rows: one keyed by digest path (digest-keyed oci_tags row),
+        // one keyed by tag path (tag-keyed oci_tags row, required so the
+        // `POSITION(':' IN t.tag) = 0` filter in the docker-tag listing
+        // returns the human-readable tag). Repeated calls must upsert
+        // BOTH rows via ON CONFLICT (repository_id, path), not duplicate
+        // them.
+        assert_eq!(
+            count, 2,
+            "repeated cache calls for the same (repo, image, tag) must \
+             upsert via ON CONFLICT (repository_id, path), not insert \
+             additional rows. Expected exactly 2 rows (digest-keyed + \
+             tag-keyed) after two calls."
+        );
+    }
+
+    /// The fix must NOT route any write back through
+    /// `proxy_service::cache_artifact`, which is forbidden from inserting
+    /// into `artifacts` (#1278). Pin the source-level invariant so a future
+    /// refactor that consolidates the manifest-cache and blob-proxy-cache
+    /// paths cannot silently reintroduce the doubled-prefix 500s.
+    #[test]
+    fn cache_manifest_reference_locally_does_not_call_proxy_cache_artifact() {
+        let source = include_str!("oci_v2.rs");
+        let fn_marker = "async fn cache_manifest_reference_locally(";
+        let fn_start = source
+            .find(fn_marker)
+            .expect("cache_manifest_reference_locally must exist");
+        let after_start = &source[fn_start..];
+        let fn_end_rel = after_start
+            .find("\n}\n")
+            .or_else(|| after_start.find("\n    }\n"))
+            .expect("function must terminate with a column-0 or column-4 closer");
+        let fn_body = &after_start[..fn_end_rel];
+
+        assert!(
+            !fn_body.contains("proxy_service.cache_artifact")
+                && !fn_body.contains("self.cache_artifact")
+                && !fn_body.contains("ProxyService"),
+            "cache_manifest_reference_locally MUST NOT delegate to \
+             ProxyService::cache_artifact (#1278). The manifest body is \
+             written through the per-repo backend at `oci-manifests/<digest>` \
+             and the artifacts row points at that key; routing through the \
+             proxy cache would put bytes under `proxy-cache/<repo>/...` on \
+             the global backend and break the `storage_for_repo` read path."
+        );
+    }
+
+    /// End-to-end coverage for the headline #1357 UX fix. The earlier tests
+    /// pin that the `artifacts` row exists at the right path, but they do
+    /// NOT exercise the JOIN+`POSITION(':' IN t.tag) = 0` filter that
+    /// `fetch_docker_tag_rows` applies to the Docker tag listing. Pre-fix,
+    /// the only `oci_tags` row for a proxied tag was keyed by the digest
+    /// (`sha256:...`), which the filter strips out, and the UI still said
+    /// "No image tags found". This test reproduces the listing query and
+    /// asserts the human-readable tag is returned.
+    #[tokio::test]
+    async fn cache_manifest_appears_in_docker_tag_listing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key.clone(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
+        );
+        let digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // Reproduce the exact JOIN+filter shape from
+        // `fetch_docker_tag_rows` (repositories.rs).  If the parallel
+        // tag-keyed oci_tags row + the artifacts row are both present,
+        // this query returns the human-readable tag.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT t.name, t.tag, t.manifest_digest
+             FROM oci_tags t
+             JOIN artifacts a
+               ON a.repository_id = t.repository_id
+              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+              AND a.is_deleted = false
+             WHERE t.repository_id = $1
+               AND POSITION(':' IN t.tag) = 0
+             ORDER BY t.name, t.tag
+             LIMIT 10",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("docker tag listing query");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            rows.iter()
+                .any(|(name, tag, md)| name == image && tag == "latest" && md == &digest),
+            "docker tag listing must include the human-readable 'latest' tag \
+             for a proxied manifest (#1357). The POSITION(':' IN t.tag) = 0 \
+             filter strips digest-keyed oci_tags rows, so a parallel \
+             tag-keyed row is required. Got rows: {:?}",
+            rows
+        );
+    }
+
+    /// For multi-arch image-index manifests the proxy path must also
+    /// populate `oci_manifest_refs`, mirroring the push-path behaviour in
+    /// `handle_put_manifest`. Without these rows the storage GC over-
+    /// deletes per-architecture child manifests and the UI's multi-arch
+    /// size accounting under-reports by orders of magnitude (#1357 review).
+    #[tokio::test]
+    async fn cache_manifest_records_refs_for_index_manifest() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // OCI image index with two child manifests (amd64, arm64).
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":100,"platform":{"architecture":"amd64","os":"linux"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":200,"platform":{"architecture":"arm64","os":"linux"}}]}"#,
+        );
+        let parent_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.index.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT parent_digest, child_digest
+             FROM oci_manifest_refs
+             WHERE repository_id = $1 AND parent_digest = $2
+             ORDER BY child_digest",
+        )
+        .bind(repo_id)
+        .bind(&parent_digest)
+        .fetch_all(&pool)
+        .await
+        .expect("query oci_manifest_refs");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs.len(),
+            2,
+            "cache_manifest_reference_locally must record one \
+             oci_manifest_refs row per child digest for image-index \
+             manifests, mirroring the push-path #1179 behaviour. Got: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().all(|(p, _)| p == &parent_digest),
+            "all rows must point at the index digest as parent"
+        );
+        assert!(
+            refs.iter().any(|(_, c)| c
+                == "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+            "amd64 child digest must be recorded"
+        );
+        assert!(
+            refs.iter().any(|(_, c)| c
+                == "sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+            "arm64 child digest must be recorded"
+        );
+    }
+
+    /// Local repos do not get the parallel tag-keyed oci_tags row -- the
+    /// `cached_reference == reference` branch in `cached_manifest_reference_key`
+    /// returns the original reference, so the digest-keyed insert IS the
+    /// tag-keyed insert. The `repo.repo_type == Remote` guard on both the
+    /// second oci_tags upsert and the second artifacts upsert must skip,
+    /// leaving exactly one row in each table for a local-repo push-equivalent
+    /// flow.
+    #[tokio::test]
+    async fn cache_manifest_local_repo_writes_single_pair() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/alpine";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Local.as_str().to_string(),
+            upstream_url: None,
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "v1.0",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for local repo");
+
+        let tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_tags");
+
+        let art_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            tag_count, 1,
+            "local repo must produce exactly one oci_tags row (the parallel \
+             tag-keyed insert is guarded on repo_type == Remote)"
+        );
+        assert_eq!(
+            art_count, 1,
+            "local repo must produce exactly one artifacts row (the second \
+             artifact_paths entry is guarded on repo_type == Remote)"
+        );
+    }
+
+    /// Remote-by-digest pulls (`docker pull repo@sha256:...`) hit the
+    /// `is_digest_reference(reference)` short-circuit on BOTH the parallel
+    /// oci_tags upsert AND the second artifacts upsert. The result is the
+    /// same shape as a local push: one oci_tags row + one artifacts row,
+    /// both keyed by the digest. This pins the by-digest branch so a future
+    /// refactor cannot accidentally double-insert under the tag path for a
+    /// digest reference (which would clutter the docker tag UI with a
+    /// `sha256:...` "tag" the `POSITION(':' IN t.tag) = 0` filter is
+    /// expressly designed to hide).
+    #[tokio::test]
+    async fn cache_manifest_remote_by_digest_writes_single_pair() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/busybox";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+        // Caller supplies a digest reference, NOT a human-readable tag.
+        let digest_ref = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(
+            is_digest_reference(digest_ref),
+            "test fixture must use a value that is_digest_reference recognises"
+        );
+
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            digest_ref,
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for remote-by-digest");
+
+        let tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_tags");
+
+        let art_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            tag_count, 1,
+            "remote-by-digest must produce exactly one oci_tags row (the \
+             parallel tag-keyed insert is skipped when reference is a digest)"
+        );
+        assert_eq!(
+            art_count, 1,
+            "remote-by-digest must produce exactly one artifacts row (the \
+             second artifact_paths entry is skipped when reference is a digest)"
+        );
+    }
+
+    /// Non-index content types (regular image manifests, including the
+    /// docker v2 schema and OCI image-manifest) must NOT trigger the
+    /// `record_oci_manifest_refs` call. The push path only records
+    /// parent->child edges for image-index manifests; the proxy path must
+    /// mirror that. Without this guard the function would parse a non-index
+    /// manifest as JSON looking for a `manifests` array, find nothing, and
+    /// silently no-op, but the cost (extra DB roundtrip per pull) would be
+    /// real.
+    #[tokio::test]
+    async fn cache_manifest_non_index_does_not_write_manifest_refs() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/curl";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // A regular image manifest body (NOT an index). Even if this body
+        // contained a `manifests` array, the content_type guard
+        // `is_index_content_type(&manifest_content_type)` must short-circuit
+        // before the parse + insert.
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"size":7,"digest":"sha256:aa"},"layers":[]}"#,
+        );
+        let parent_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "1.0",
+            &body,
+            Some("application/vnd.docker.distribution.manifest.v2+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for image manifest");
+
+        let refs_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_manifest_refs WHERE repository_id = $1 AND parent_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&parent_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_manifest_refs");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs_count, 0,
+            "non-index content types must NOT write to oci_manifest_refs; \
+             the is_index_content_type guard must short-circuit before \
+             record_oci_manifest_refs is called"
+        );
+    }
+}
+
+// ===========================================================================
+// Issue #1317 regression coverage (lib-side, picked up by the Coverage gate).
+//
+// The integration suite in `backend/tests/oci_chunked_upload_cross_repo_tests.rs`
+// is also wired into the CI integration matrix, but `cargo llvm-cov --lib`
+// excludes the `tests/` directory, so without these lib-side tests the
+// cross-repo session lookup branches in `handle_patch_upload` and
+// `handle_complete_upload` would appear uncovered to the coverage gate.
+// ===========================================================================
+
+#[cfg(test)]
+mod cross_repo_session_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Insert a second docker repo and return (id, key, storage_dir). The
+    /// storage_dir is created so the handler can read/write blob temp files
+    /// under it if needed during the same-repo happy path.
+    async fn create_docker_repo(pool: &PgPool, label: &str) -> (Uuid, String, std::path::PathBuf) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-docker-{}-{}", label, id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-docker-{}", id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert docker repo");
+        (id, key, storage_dir)
+    }
+
+    /// Create a user with a real bcrypt-hashed password so the OCI Basic-auth
+    /// flow (`authenticate_oci_with_scopes`) succeeds. Returns (user_id, username, password).
+    async fn create_pushable_user(pool: &PgPool) -> (Uuid, String, String) {
+        let id = Uuid::new_v4();
+        let username = format!("oci1317-{}", id);
+        let password = "pushpass".to_string();
+        let hash = bcrypt::hash(&password, 4).expect("bcrypt hash");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+            VALUES ($1, $2, $3, $4, 'local', true, true)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("insert user");
+        (id, username, password)
+    }
+
+    fn basic_auth(username: &str, password: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+        format!("Basic {}", encoded)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn cleanup_all(
+        pool: &PgPool,
+        repo_ids: &[Uuid],
+        user_id: Uuid,
+        storage_dirs: &[std::path::PathBuf],
+    ) {
+        for id in repo_ids {
+            let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        for dir in storage_dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// PATCH chunk under repo B must be 404 (session belongs to repo A).
+    /// Same-repo PATCH must still succeed. This pins both branches of the
+    /// new session lookup in `handle_patch_upload`.
+    #[tokio::test]
+    async fn handle_patch_upload_cross_repo_rejected_and_same_repo_ok() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_a_id, key_a, storage_a) = create_docker_repo(&pool, "a").await;
+        let (repo_b_id, key_b, storage_b) = create_docker_repo(&pool, "b").await;
+        let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let make_app = || router().with_state(state.clone());
+
+        // POST start under repo A.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", key_a))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "POST start under repo A should return 202"
+        );
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_a_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Cross-repo PATCH must be 404.
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_b, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(b"attacker-chunk".to_vec()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH chunk under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Same-repo PATCH must still succeed (covers happy-path lookup).
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_a, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(b"legitimate-chunk".to_vec()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "PATCH chunk under owning repo should return 202"
+        );
+
+        cleanup_all(
+            &pool,
+            &[repo_a_id, repo_b_id],
+            user_id,
+            &[storage_a, storage_b],
+        )
+        .await;
+    }
+
+    /// PUT complete under repo B must be 404 even with a valid digest query.
+    /// The legitimate session row must remain intact, and a same-repo PUT
+    /// complete with the right digest must succeed (covers happy-path
+    /// branch of the new lookup in `handle_complete_upload`).
+    #[tokio::test]
+    async fn handle_complete_upload_cross_repo_rejected_and_same_repo_ok() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_a_id, key_a, storage_a) = create_docker_repo(&pool, "a").await;
+        let (repo_b_id, key_b, storage_b) = create_docker_repo(&pool, "b").await;
+        let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", key_a))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_a_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PATCH the chunk under repo A so the temp blob is non-empty.
+        let chunk = b"chunk-bytes".to_vec();
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_a, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(chunk.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let digest = format!("sha256:{}", sha256_hex(&chunk));
+
+        // Cross-repo PUT must be 404.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                key_b, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PUT complete under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Session row must still exist (cross-repo attempts must not
+        // delete or finalize it).
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_there, 1, "cross-repo PUT must not delete session");
+
+        // Same-repo PUT must succeed.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                key_a, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "PUT complete under owning repo should return 201"
+        );
+
+        cleanup_all(
+            &pool,
+            &[repo_a_id, repo_b_id],
+            user_id,
+            &[storage_a, storage_b],
+        )
+        .await;
+    }
+
+    /// PUT complete with a digest that does not match the bytes on disk
+    /// must reject with 400 DIGEST_INVALID, drop the session row, and
+    /// remove the temp file. This pins the rehash-and-compare branch of
+    /// `handle_complete_upload` plus the cleanup path (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_complete_upload_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PATCH a known chunk into the temp file.
+        let chunk = b"actual-chunk-bytes".to_vec();
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::from(chunk.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // PUT with a digest that does NOT match the chunk on disk.
+        let bogus_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, bogus_digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "digest mismatch must reject with 400"
+        );
+
+        // The session row should be gone (handler deletes it on mismatch).
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session row must be deleted on digest mismatch"
+        );
+
+        // No blob row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(bogus_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// PUT complete without a digest query parameter must reject with
+    /// 400 DIGEST_INVALID. This pins the early-return branch of
+    /// `handle_complete_upload` before any temp-file work.
+    #[tokio::test]
+    async fn handle_complete_upload_missing_digest_query_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "nd").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PUT without `?digest=` query.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing digest query must reject with 400"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... with the full blob inline must verify
+    /// the digest, write the blob under the final `oci-blobs/<digest>`
+    /// key, record `oci_blobs`, and return 201. This pins the monolithic
+    /// branch of `handle_start_upload` (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_with_digest_creates_blob() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mono").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-blob-payload".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "monolithic POST with matching digest must return 201"
+        );
+
+        // oci_blobs row should be recorded under the final digest.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "oci_blobs row must be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... where the provided digest does NOT
+    /// match the body bytes must reject with 400 DIGEST_INVALID and not
+    /// record an oci_blobs row. This pins the pre-write verification in
+    /// `handle_start_upload`.
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "monomm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-bytes-A".to_vec();
+        // Digest of a DIFFERENT payload so verification must fail.
+        let wrong_digest = format!("sha256:{}", sha256_hex(b"some-other-bytes"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, wrong_digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "monolithic POST with mismatched digest must reject with 400"
+        );
+
+        // No oci_blobs row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&wrong_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Successive PATCH chunks must each be appended to the temp file
+    /// (O_APPEND) and the running `bytes_received` counter must reflect
+    /// the cumulative size. PUT complete with the digest of the
+    /// concatenated chunks must then succeed and record a single
+    /// `oci_blobs` row. This pins the multi-chunk happy path of
+    /// `handle_patch_upload` + `handle_complete_upload` together.
+    #[tokio::test]
+    async fn handle_patch_upload_multi_chunk_then_complete_succeeds() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mc").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Two PATCH chunks.
+        let chunk_a = b"first-chunk-".to_vec();
+        let chunk_b = b"second-chunk".to_vec();
+        for chunk in &[&chunk_a, &chunk_b] {
+            let req = Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}",
+                    repo_key, session_id
+                ))
+                .header("Authorization", &auth)
+                .body(Body::from((*chunk).clone()))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::ACCEPTED,
+                "PATCH chunk under owning repo should return 202"
+            );
+        }
+
+        // After two PATCHes, bytes_received must equal the sum of both
+        // chunks. Pre-#1449 the second PATCH would read+rewrite the
+        // whole file (O(N^2)); the new path appends with O_APPEND and
+        // updates the running counter only.
+        let bytes_received: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bytes_received,
+            (chunk_a.len() + chunk_b.len()) as i64,
+            "bytes_received must equal cumulative chunk size after two PATCHes"
+        );
+
+        let mut full = chunk_a.clone();
+        full.extend_from_slice(&chunk_b);
+        let digest = format!("sha256:{}", sha256_hex(&full));
+
+        // PUT complete with the digest of the concatenated chunks.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "multi-chunk PUT complete with matching digest should return 201"
+        );
+
+        // Exactly one oci_blobs row.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "exactly one oci_blobs row should be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 }

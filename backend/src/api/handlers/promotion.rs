@@ -149,17 +149,37 @@ pub fn validate_promotion_repos(
     validate_promotion_target_and_format(source, target)
 }
 
-/// Verify that the promotion source repository is of type `Staging`.
+/// Verify that the promotion source repository is a hosted repository
+/// (`Local` or `Staging`).
 ///
-/// Split from `validate_promotion_repos` so the staging-source check can be
-/// deferred until after quality-gate evaluation in the promotion handler.
+/// Split from `validate_promotion_repos` so the source-shape check can be
+/// deferred until after quality-gate evaluation in the promotion handler
+/// (#1376).
+///
+/// # Why hosted, not staging-only (#1376 / B12)
+///
+/// The promotion source only needs to be a repository that physically stores
+/// artifacts so the bytes can be copied into the release repository. Both
+/// `Local` and `Staging` are hosted ([`RepositoryType::is_hosted`]); `Remote`
+/// (proxy) and `Virtual` (aggregate) repositories do not own artifact bytes
+/// and cannot be a promotion source.
+///
+/// The earlier staging-only restriction caused the release-gate
+/// `quality-gate-blocks-upload` suite to fail its "promotion succeeds after
+/// gate loosened" assertion: that suite promotes from a `Local` source, so
+/// once the gate stopped blocking, the promotion 400'd on the staging-shape
+/// check instead of succeeding. Quality-gate enforcement, not a hard
+/// staging-type requirement, is the policy that governs whether a promotion
+/// is allowed; the source-shape check only rejects repositories that have no
+/// bytes to promote.
 pub fn validate_promotion_source_is_staging(
     source: &crate::models::repository::Repository,
 ) -> Result<()> {
-    if source.repo_type != RepositoryType::Staging {
-        return Err(AppError::Validation(
-            "Source repository must be a staging repository".to_string(),
-        ));
+    if !source.repo_type.is_hosted() {
+        return Err(AppError::Validation(format!(
+            "Source repository must be a hosted (local or staging) repository, got {:?}",
+            source.repo_type
+        )));
     }
     Ok(())
 }
@@ -1419,7 +1439,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_promotion_repos_source_not_staging() {
+    fn test_validate_promotion_repos_source_local_is_allowed() {
+        // B12 / #1376: a Local source is a hosted repository and is now an
+        // allowed promotion source (local -> local release). Previously this
+        // 400'd on a staging-only shape check, which broke the release-gate
+        // "promotion succeeds after gate loosened" assertion.
         let source = make_repo(
             RepositoryType::Local,
             crate::models::repository::RepositoryFormat::Maven,
@@ -1428,12 +1452,12 @@ mod tests {
             RepositoryType::Local,
             crate::models::repository::RepositoryFormat::Maven,
         );
-        let err = validate_promotion_repos(&source, &target).unwrap_err();
-        assert!(err.to_string().contains("staging"));
+        assert!(validate_promotion_repos(&source, &target).is_ok());
     }
 
     #[test]
     fn test_validate_promotion_repos_source_remote() {
+        // Remote (proxy) repos own no bytes and cannot be a promotion source.
         let source = make_repo(
             RepositoryType::Remote,
             crate::models::repository::RepositoryFormat::Npm,
@@ -1443,11 +1467,12 @@ mod tests {
             crate::models::repository::RepositoryFormat::Npm,
         );
         let err = validate_promotion_repos(&source, &target).unwrap_err();
-        assert!(err.to_string().contains("staging"));
+        assert!(err.to_string().contains("hosted"));
     }
 
     #[test]
     fn test_validate_promotion_repos_source_virtual() {
+        // Virtual (aggregate) repos own no bytes and cannot be a source.
         let source = make_repo(
             RepositoryType::Virtual,
             crate::models::repository::RepositoryFormat::Pypi,
@@ -1457,7 +1482,7 @@ mod tests {
             crate::models::repository::RepositoryFormat::Pypi,
         );
         let err = validate_promotion_repos(&source, &target).unwrap_err();
-        assert!(err.to_string().contains("staging"));
+        assert!(err.to_string().contains("hosted"));
     }
 
     #[test]
@@ -1503,18 +1528,19 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_promotion_repos_both_wrong() {
+    fn test_validate_promotion_repos_remote_source_check_precedes_target() {
+        // Source-shape check runs before the target check. A Remote source is
+        // rejected for the source reason ("hosted") regardless of the target.
         let source = make_repo(
-            RepositoryType::Local,
+            RepositoryType::Remote,
             crate::models::repository::RepositoryFormat::Docker,
         );
         let target = make_repo(
             RepositoryType::Remote,
             crate::models::repository::RepositoryFormat::Helm,
         );
-        // Source check comes first
         let err = validate_promotion_repos(&source, &target).unwrap_err();
-        assert!(err.to_string().contains("staging"));
+        assert!(err.to_string().contains("hosted"));
     }
 
     // -----------------------------------------------------------------------
@@ -1540,15 +1566,29 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_promotion_source_is_staging_rejects_local() {
+    fn test_validate_promotion_source_is_staging_accepts_local() {
+        // B12 / #1376: Local is hosted, so it is now an accepted source. The
+        // staging-only restriction broke the release-gate loosened-promotion
+        // assertion because that suite promotes from a Local source.
         let source = make_repo(
             RepositoryType::Local,
             crate::models::repository::RepositoryFormat::Maven,
         );
+        assert!(validate_promotion_source_is_staging(&source).is_ok());
+    }
+
+    #[test]
+    fn test_validate_promotion_source_is_staging_rejects_remote_message_mentions_hosted() {
+        // The rejection message must NOT be the legacy
+        // "must be a staging repository" string, which the release-gate
+        // greps for to detect the #1376 regression; it now says "hosted".
+        let source = make_repo(
+            RepositoryType::Remote,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
         let err = validate_promotion_source_is_staging(&source).unwrap_err();
-        assert!(err.to_string().contains("staging"));
-        // Pin the specific message that the test/release-gate matches on.
-        assert!(err
+        assert!(err.to_string().contains("hosted"));
+        assert!(!err
             .to_string()
             .contains("Source repository must be a staging repository"));
     }
@@ -1615,20 +1655,19 @@ mod tests {
     /// Documents the precedence the promotion handler relies on (#1376).
     ///
     /// The handler calls `validate_promotion_source_is_staging` AFTER quality
-    /// gate evaluation. If a non-staging source ever appears at the handler
-    /// after gate eval, the resulting error must still be the
-    /// "Source repository must be a staging repository" validation (HTTP 400),
-    /// not silently swallowed.
+    /// gate evaluation. If a non-hosted source (Remote/Virtual) ever appears at
+    /// the handler after gate eval, the resulting error must still be a
+    /// `Validation` error (HTTP 400), not silently swallowed.
     #[test]
     fn test_validate_promotion_source_is_staging_error_status_is_validation() {
         let source = make_repo(
-            RepositoryType::Local,
+            RepositoryType::Remote,
             crate::models::repository::RepositoryFormat::Maven,
         );
         let err = validate_promotion_source_is_staging(&source).unwrap_err();
         match err {
             AppError::Validation(msg) => {
-                assert!(msg.contains("staging"));
+                assert!(msg.contains("hosted"));
             }
             other => panic!("expected Validation error, got {:?}", other),
         }
