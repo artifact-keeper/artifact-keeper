@@ -17,9 +17,11 @@ use axum::routing::get;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -422,8 +424,185 @@ fn manifest_storage_key(digest: &str) -> String {
     format!("oci-manifests/{}", digest)
 }
 
+/// Legacy upload-key helper. Pre-#1449 OCI blob uploads accumulated
+/// PATCH chunks under this key in the storage backend; that path was
+/// the root cause of the upload-size-quadratic IO behaviour. The
+/// streaming path now keeps in-progress uploads on local disk via
+/// `oci_upload_temp_path` and only touches the storage backend once
+/// per upload, when the verified blob is promoted to `oci-blobs/...`.
+/// Kept only so the existing migration / GC code that reads sessions
+/// with the old prefix has a single named anchor in case operators
+/// need to drain leftover partial uploads after upgrade.
+#[allow(dead_code)]
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
+}
+
+/// Local filesystem path used to accumulate a chunked OCI blob upload
+/// before it is committed to the final storage backend (#1449).
+///
+/// We keep partial upload bytes on local disk rather than on the storage
+/// backend so PATCH continuations can simply `O_APPEND` instead of
+/// downloading the in-progress object, appending in memory, and rewriting
+/// it back. For a 10 GiB layer split across 100 PATCHes, the old path
+/// performed roughly N(N+1)/2 chunk-sized reads and writes through the
+/// storage backend (5 050x amplification). The local-disk path is a single
+/// stream through the kernel, then one final `put_stream` to the storage
+/// backend at completion time.
+///
+/// The path is rooted under `$AK_OCI_UPLOAD_TMP_DIR` if set, otherwise the
+/// process's `std::env::temp_dir()`. The session UUID is folded into the
+/// filename so concurrent uploads cannot collide.
+fn oci_upload_temp_path(uuid: &Uuid) -> std::path::PathBuf {
+    let root = std::env::var("AK_OCI_UPLOAD_TMP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    root.join(format!("ak-oci-upload-{}", uuid))
+}
+
+/// Result of streaming an HTTP request body to a local temp file while
+/// updating a running SHA-256 hasher and enforcing a byte cap.
+#[derive(Debug)]
+struct StreamToTempResult {
+    /// Bytes consumed from the request body during this call.
+    bytes_written: u64,
+}
+
+/// Maximum chunk size we read from the HTTP body before flushing to disk
+/// and yielding back to the executor. 256 KiB matches `tokio_util`'s
+/// default `ReaderStream` chunk size and the migration worker's value
+/// from #1512, so memory use per task is bounded to a single 256 KiB
+/// chunk regardless of total upload size.
+const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
+
+/// Stream an axum `Body` to `path` (creating or appending), updating
+/// `hasher` and `total_bytes` as data arrives. Returns the number of
+/// bytes consumed from this body.
+///
+/// `max_total_bytes == 0` disables the cap to match `MAX_UPLOAD_SIZE=0`
+/// semantics from `config.max_upload_size_bytes` (#1449 acceptance).
+/// A non-zero cap returns `Err(StatusCode::PAYLOAD_TOO_LARGE)` as soon as
+/// the running total would exceed the cap, without writing the offending
+/// chunk to disk.
+async fn stream_body_to_temp_file(
+    body: Body,
+    path: &std::path::Path,
+    hasher: &mut Sha256,
+    total_bytes: &mut u64,
+    max_total_bytes: u64,
+) -> Result<StreamToTempResult, (StatusCode, String)> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open temp file {}: {e}", path.display()),
+            )
+        })?;
+
+    let mut stream = body.into_data_stream();
+    let mut consumed: u64 = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_BUDGET);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
+        if chunk.is_empty() {
+            continue;
+        }
+
+        // Enforce MAX_UPLOAD_SIZE before touching disk. `0` is the
+        // documented "unlimited" sentinel and must short-circuit the
+        // check, not be treated as "every chunk overflows".
+        if max_total_bytes > 0 {
+            let projected = total_bytes.saturating_add(chunk.len() as u64);
+            if projected > max_total_bytes {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "upload would exceed MAX_UPLOAD_SIZE ({} bytes)",
+                        max_total_bytes
+                    ),
+                ));
+            }
+        }
+
+        hasher.update(&chunk);
+        *total_bytes += chunk.len() as u64;
+        consumed += chunk.len() as u64;
+
+        // Coalesce small chunks before issuing a write syscall, but cap
+        // the buffer at STREAM_CHUNK_BUDGET so memory stays bounded.
+        if buf.len() + chunk.len() > STREAM_CHUNK_BUDGET && !buf.is_empty() {
+            file.write_all(&buf).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write chunk to temp: {e}"),
+                )
+            })?;
+            buf.clear();
+        }
+        if chunk.len() >= STREAM_CHUNK_BUDGET {
+            file.write_all(&chunk).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write chunk to temp: {e}"),
+                )
+            })?;
+        } else {
+            buf.extend_from_slice(&chunk);
+        }
+        drop(chunk);
+    }
+
+    if !buf.is_empty() {
+        file.write_all(&buf).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write tail to temp: {e}"),
+            )
+        })?;
+    }
+
+    file.flush().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("flush temp file: {e}"),
+        )
+    })?;
+
+    Ok(StreamToTempResult {
+        bytes_written: consumed,
+    })
+}
+
+/// Open the local upload temp file as a `BoxStream<Result<Bytes>>` ready
+/// to feed `StorageBackend::put_stream`. Uses a 256 KiB-buffered
+/// `ReaderStream` so the upload from local disk to the storage backend
+/// is also memory-bounded. After #1512 every backend (S3, GCS, Azure,
+/// filesystem) routes this through its native streaming primitive.
+async fn open_upload_temp_as_stream(
+    path: &std::path::Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, std::io::Error> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path).await?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_BUDGET);
+    let mapped = stream
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("temp file read: {e}"))));
+    Ok(Box::pin(mapped))
+}
+
+/// Best-effort cleanup of a session's local temp file. Never returns an
+/// error; the caller has either completed the upload (file already gone
+/// via rename) or is abandoning the session.
+async fn cleanup_upload_temp(path: &std::path::Path) {
+    let _ = tokio::fs::remove_file(path).await;
 }
 
 fn upload_progress_range(bytes_received: i64) -> String {
@@ -2065,7 +2244,7 @@ async fn handle_start_upload(
     headers: &HeaderMap,
     image_name: &str,
     query_digest: Option<&str>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -2086,12 +2265,48 @@ async fn handle_start_upload(
     };
     let repo_id = repo.id;
     let location = repo.location;
+    let max_upload = state.config.max_upload_size_bytes;
 
-    // Monolithic upload: if digest is provided and body is non-empty
+    // Allocate a session UUID up front: the temp file path is keyed on
+    // it for both the monolithic-with-digest path AND the chunked
+    // path, so the same UUID survives the branch below.
+    let session_id = Uuid::new_v4();
+    let temp_path = oci_upload_temp_path(&session_id);
+
+    // Stream the body straight to a local temp file with incremental
+    // sha256. For the monolithic POST?digest=... path the resulting file
+    // is immediately verified and promoted to the final blob key. For
+    // the chunked path the same file is kept around for subsequent
+    // PATCH requests.
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
+    let stream_result =
+        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
+            .await
+        {
+            Ok(r) => r,
+            Err((status, msg)) => {
+                cleanup_upload_temp(&temp_path).await;
+                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "SIZE_INVALID"
+                } else {
+                    "BLOB_UPLOAD_INVALID"
+                };
+                return oci_error(status, code, &msg);
+            }
+        };
+    let body_bytes = stream_result.bytes_written;
+
+    // Monolithic upload: POST /uploads/?digest=... with the full blob
+    // inline. Verify digest BEFORE handing the temp file to storage so
+    // we never write a tampered/truncated body under the final blob key
+    // (#1449 acceptance: "monolithic upload digest validation without
+    // writing unverified bytes over the final digest key").
     if let Some(digest) = query_digest {
-        if !body.is_empty() {
-            let computed = compute_sha256(&body);
+        if body_bytes > 0 {
+            let computed = format!("sha256:{:x}", hasher.clone().finalize());
             if computed != digest {
+                cleanup_upload_temp(&temp_path).await;
                 return oci_error(
                     StatusCode::BAD_REQUEST,
                     "DIGEST_INVALID",
@@ -2105,15 +2320,29 @@ async fn handle_start_upload(
             let storage = match state.storage_for_repo(&location) {
                 Ok(s) => s,
                 Err(e) => {
+                    cleanup_upload_temp(&temp_path).await;
                     return oci_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "INTERNAL_ERROR",
                         &e.to_string(),
-                    )
+                    );
+                }
+            };
+
+            let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    cleanup_upload_temp(&temp_path).await;
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        &format!("reopen temp for streaming put: {e}"),
+                    );
                 }
             };
             let key = blob_storage_key(digest);
-            if let Err(e) = storage.put(&key, body.clone()).await {
+            if let Err(e) = storage.put_stream(&key, upload_stream).await {
+                cleanup_upload_temp(&temp_path).await;
                 return oci_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "BLOB_UPLOAD_UNKNOWN",
@@ -2124,10 +2353,12 @@ async fn handle_start_upload(
             // Record in oci_blobs
             let _ = sqlx::query!(
                 "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
-                repo_id, digest, body.len() as i64, key
+                repo_id, digest, body_bytes as i64, key
             )
             .execute(&state.db)
             .await;
+
+            cleanup_upload_temp(&temp_path).await;
 
             return Response::builder()
                 .status(StatusCode::CREATED)
@@ -2139,40 +2370,22 @@ async fn handle_start_upload(
         }
     }
 
-    // Create upload session
-    let session_id = Uuid::new_v4();
-    let temp_key = upload_storage_key(&session_id);
-
-    // If body is non-empty, store it as initial chunk
-    if !body.is_empty() {
-        let storage = match state.storage_for_repo(&location) {
-            Ok(s) => s,
-            Err(e) => {
-                return oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                )
-            }
-        };
-        if let Err(e) = storage.put(&temp_key, body.clone()).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "BLOB_UPLOAD_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    }
-
-    let bytes_received = body.len() as i64;
+    // Chunked path: persist the session and keep the (possibly empty)
+    // temp file around for subsequent PATCH and PUT requests. We
+    // continue to store an opaque-looking string in `storage_temp_key`
+    // for backwards compatibility with operators reading the column,
+    // but the value is now the local FS path. The semantics moved from
+    // a key in the storage backend to a path on the AK host.
+    let temp_key_value = temp_path.to_string_lossy().into_owned();
 
     if let Err(e) = sqlx::query!(
         "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, $4, $5)",
-        session_id, repo_id, claims.sub, bytes_received, temp_key
+        session_id, repo_id, claims.sub, body_bytes as i64, temp_key_value
     )
     .execute(&state.db)
     .await
     {
+        cleanup_upload_temp(&temp_path).await;
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
     }
 
@@ -2188,7 +2401,7 @@ async fn handle_start_upload(
             format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
         )
         .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", upload_progress_range(bytes_received))
+        .header("Range", upload_progress_range(body_bytes as i64))
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -2199,7 +2412,7 @@ async fn handle_patch_upload(
     headers: &HeaderMap,
     image_name: &str,
     uuid_str: &str,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -2247,35 +2460,39 @@ async fn handle_patch_upload(
         Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
     };
 
-    let storage = match state.storage_for_repo(&repo.location) {
-        Ok(s) => s,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
+    // Append PATCH bytes directly to the local temp file with
+    // O_APPEND. No storage-backend round trip, no full-file rewrite.
+    // Pre-#1449 this path called `storage.get(...)` to pull the entire
+    // in-progress object back into memory, extended it with the new
+    // chunk, and `storage.put(...)`-ed it back -- O(N^2) bytes moved
+    // for an N-chunk push.
+    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
+    let max_upload = state.config.max_upload_size_bytes;
 
-    // Read existing data and append
-    let mut existing = match storage.get(&session.storage_temp_key).await {
-        Ok(data) => data.to_vec(),
-        Err(_) => Vec::new(),
-    };
-    existing.extend_from_slice(&body);
+    // The session row tracks total bytes received but not the running
+    // sha256 state. We do not persist a partial Sha256 between PATCH
+    // requests; instead we recompute from the on-disk file at PUT time.
+    // PATCH responses do not return a digest, so this is correct and
+    // avoids a serialization-format dependency on the sha2 crate.
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = session.bytes_received as u64;
 
-    let new_bytes = existing.len() as i64;
-    if let Err(e) = storage
-        .put(&session.storage_temp_key, Bytes::from(existing))
-        .await
-    {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "BLOB_UPLOAD_UNKNOWN",
-            &e.to_string(),
-        );
-    }
+    let stream_result =
+        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
+            .await
+        {
+            Ok(r) => r,
+            Err((status, msg)) => {
+                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "SIZE_INVALID"
+                } else {
+                    "BLOB_UPLOAD_INVALID"
+                };
+                return oci_error(status, code, &msg);
+            }
+        };
+    let _ = stream_result;
+    let new_bytes = total_bytes as i64;
 
     // Update session
     let _ = sqlx::query!(
@@ -2305,7 +2522,7 @@ async fn handle_complete_upload(
     image_name: &str,
     uuid_str: &str,
     digest_query: Option<&str>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let host = request_host(headers);
     let scope = push_scope(image_name);
@@ -2351,7 +2568,7 @@ async fn handle_complete_upload(
     };
 
     let session = match sqlx::query!(
-        "SELECT repository_id, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
         session_id,
         repo.id
     )
@@ -2386,32 +2603,84 @@ async fn handle_complete_upload(
         }
     };
 
-    // Read accumulated data and append final chunk
-    let mut data = match storage.get(&session.storage_temp_key).await {
-        Ok(d) => d.to_vec(),
-        Err(_) => Vec::new(),
-    };
-    if !body.is_empty() {
-        data.extend_from_slice(&body);
+    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
+    let max_upload = state.config.max_upload_size_bytes;
+
+    // If the client sent the final chunk inline on PUT, append it to
+    // the temp file. Otherwise the body is empty (chunked-upload finish
+    // pattern) and the temp file already holds the full blob.
+    let mut total_bytes: u64 = session.bytes_received as u64;
+    // We rehash from disk after appending. Updating an in-memory hasher
+    // here only catches the last chunk, but the source of truth is the
+    // file we're about to put_stream into storage, so rehashing from
+    // disk is what guarantees digest correctness end-to-end.
+    let mut throwaway_hasher = Sha256::new();
+    if let Err((status, msg)) = stream_body_to_temp_file(
+        body,
+        &temp_path,
+        &mut throwaway_hasher,
+        &mut total_bytes,
+        max_upload,
+    )
+    .await
+    {
+        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "SIZE_INVALID"
+        } else {
+            "BLOB_UPLOAD_INVALID"
+        };
+        return oci_error(status, code, &msg);
     }
 
-    // Verify digest
-    let computed = compute_sha256(&data);
-    if computed != digest {
+    // Recompute sha256 over the full assembled temp file, end-to-end.
+    // This is the authoritative verification step: the client's
+    // advertised digest must match the bytes we are about to commit.
+    // We do this BEFORE `put_stream` so a mismatched payload never
+    // reaches the final `oci-blobs/<digest>` key (#1449 acceptance).
+    let (computed_digest, size_on_disk) = match rehash_temp_file(&temp_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &format!("rehash temp file: {e}"),
+            );
+        }
+    };
+    if computed_digest != digest {
+        cleanup_upload_temp(&temp_path).await;
+        let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
+            .execute(&state.db)
+            .await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
             &format!(
                 "digest mismatch: computed {} != provided {}",
-                computed, digest
+                computed_digest, digest
             ),
         );
     }
 
-    // Store blob permanently
+    // Hand the temp file to put_stream so the upload to the storage
+    // backend is itself memory-bounded (S3 multipart, GCS resumable,
+    // Azure block-blob, filesystem temp-and-rename). Pre-#1449 this
+    // path called `storage.get(...)` on the in-progress key to pull
+    // every byte back into RAM, then `storage.put(...)` to write it
+    // out under the final digest key -- doubling I/O on every push.
+    let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &format!("reopen temp for streaming put: {e}"),
+            );
+        }
+    };
     let blob_key = blob_storage_key(&digest);
-    let size_bytes = data.len() as i64;
-    if let Err(e) = storage.put(&blob_key, Bytes::from(data)).await {
+    let size_bytes = size_on_disk as i64;
+    if let Err(e) = storage.put_stream(&blob_key, upload_stream).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BLOB_UPLOAD_UNKNOWN",
@@ -2427,8 +2696,8 @@ async fn handle_complete_upload(
     .execute(&state.db)
     .await;
 
-    // Cleanup: delete temp data and session
-    let _ = storage.delete(&session.storage_temp_key).await;
+    // Cleanup: drop local temp file and the session row
+    cleanup_upload_temp(&temp_path).await;
     let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
         .execute(&state.db)
         .await;
@@ -2445,6 +2714,27 @@ async fn handle_complete_upload(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// Recompute the sha256 of an on-disk upload temp file by streaming
+/// 256 KiB chunks through a `Sha256` hasher. Returns the OCI-formatted
+/// digest (`sha256:<hex>`) and the total byte count. Memory use is
+/// O(STREAM_CHUNK_BUDGET) regardless of file size.
+async fn rehash_temp_file(path: &std::path::Path) -> std::io::Result<(String, u64)> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_BUDGET];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), total))
 }
 
 // ---------------------------------------------------------------------------
@@ -3732,7 +4022,7 @@ async fn catch_all(
     uri: axum::http::Uri,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // Extract path from URI — the nest strips /v2 prefix already
     let path = uri.path().to_string();
@@ -3753,6 +4043,25 @@ async fn catch_all(
         };
     }
 
+    // Helper to fully buffer the body for endpoints that legitimately
+    // need it in memory (HEAD/GET blobs carry no body; manifests are
+    // small JSON documents capped well under MAX_UPLOAD_SIZE). The cap
+    // here is the global MAX_UPLOAD_SIZE so a hostile client cannot
+    // dodge the limit by hitting a non-streaming route.
+    async fn buffer_body(body: Body, max: u64) -> Result<Bytes, Response> {
+        let limit = if max == 0 { usize::MAX } else { max as usize };
+        match axum::body::to_bytes(body, limit).await {
+            Ok(b) => Ok(b),
+            Err(e) => Err(oci_error(
+                StatusCode::BAD_REQUEST,
+                "SIZE_INVALID",
+                &format!("read request body: {e}"),
+            )),
+        }
+    }
+
+    let max_upload = state.config.max_upload_size_bytes;
+
     match (method.as_str(), operation.as_str()) {
         ("HEAD", "blobs") => {
             let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
@@ -3763,8 +4072,8 @@ async fn catch_all(
             handle_get_blob(&state, &headers, &image_name, &d).await
         }
         ("POST", "uploads") => {
-            let digest = query.get("digest").map(|s| s.as_str());
-            handle_start_upload(&state, &headers, &image_name, digest, body).await
+            let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
+            handle_start_upload(&state, &headers, &image_name, digest.as_deref(), body).await
         }
         ("PATCH", "uploads") => {
             let Some(u) = reference else {
@@ -3776,8 +4085,8 @@ async fn catch_all(
             let Some(u) = reference else {
                 return missing_upload_uuid_response();
             };
-            let digest = query.get("digest").map(|s| s.as_str());
-            handle_complete_upload(&state, &headers, &image_name, &u, digest, body).await
+            let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
+            handle_complete_upload(&state, &headers, &image_name, &u, digest.as_deref(), body).await
         }
         ("HEAD", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -3789,7 +4098,11 @@ async fn catch_all(
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_put_manifest(&state, &headers, &image_name, &r, body).await
+            let body_bytes = match buffer_body(body, max_upload).await {
+                Ok(b) => b,
+                Err(resp) => return resp,
+            };
+            handle_put_manifest(&state, &headers, &image_name, &r, body_bytes).await
         }
         ("DELETE", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -7554,6 +7867,280 @@ mod token_service_query_validation_tests {
             "missing service param stays accepted (backward compat)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // OCI blob upload streaming (#1449)
+    //
+    // These tests mirror the #1512 ChunkRecordingBackend pattern: a fake
+    // StorageBackend that asserts (a) `put` is never called for large
+    // bodies, (b) `put_stream` is what the upload path actually uses, and
+    // (c) per-chunk memory stays bounded to STREAM_CHUNK_BUDGET. None of
+    // these tests touch the database; the helpers under test are pure
+    // tokio + tempfile operations.
+    // -----------------------------------------------------------------------
+
+    /// Streaming PATCH-append parity: writing a payload as one big chunk
+    /// versus many small chunks must produce the same on-disk bytes and
+    /// the same sha256, exactly the way the streaming PATCH path
+    /// (`stream_body_to_temp_file` with O_APPEND) must compose.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_append_parity() {
+        // Deterministic 1 MiB + 17 bytes payload (off-by-one to catch
+        // boundary bugs).
+        let size = 1024 * 1024 + 17;
+        let mut payload = Vec::with_capacity(size);
+        let mut x: u32 = 0xCAFE_BABE;
+        for _ in 0..size {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            payload.push((x >> 16) as u8);
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let one_shot_path = tmp.path().join("oneshot.bin");
+        let many_chunks_path = tmp.path().join("many.bin");
+
+        // 1) Single Body::from in one go.
+        let body = Body::from(payload.clone());
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let max_upload: u64 = 0; // unlimited
+        stream_body_to_temp_file(body, &one_shot_path, &mut hasher, &mut total, max_upload)
+            .await
+            .expect("oneshot stream succeeds");
+        let digest_oneshot = format!("{:x}", hasher.finalize());
+
+        // 2) Same payload as many small chunks, appended via O_APPEND
+        //    across multiple calls -- this is the multi-PATCH shape.
+        let mut combined_hasher = Sha256::new();
+        let mut combined_total: u64 = 0;
+        for chunk in payload.chunks(13 * 1024 + 7) {
+            let body = Body::from(Bytes::copy_from_slice(chunk));
+            stream_body_to_temp_file(
+                body,
+                &many_chunks_path,
+                &mut combined_hasher,
+                &mut combined_total,
+                max_upload,
+            )
+            .await
+            .expect("multi-chunk append succeeds");
+        }
+        let digest_chunks = format!("{:x}", combined_hasher.finalize());
+
+        // Files should be byte-identical and same length.
+        let a = tokio::fs::read(&one_shot_path).await.unwrap();
+        let b = tokio::fs::read(&many_chunks_path).await.unwrap();
+        assert_eq!(a.len(), payload.len(), "oneshot file size matches payload");
+        assert_eq!(b.len(), payload.len(), "appended file size matches payload");
+        assert_eq!(a, b, "oneshot and appended file contents diverged");
+        assert_eq!(
+            digest_oneshot, digest_chunks,
+            "single-call vs append-multi sha256 must match"
+        );
+    }
+
+    /// MAX_UPLOAD_SIZE enforcement: a nonzero cap must reject a body
+    /// that overruns it BEFORE the offending bytes hit disk, and the
+    /// returned status must be 413 Payload Too Large.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_enforces_nonzero_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("capped.bin");
+        // 100 byte cap, 1 KiB body.
+        let payload = vec![0xA5u8; 1024];
+        let body = Body::from(payload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let err = stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 100)
+            .await
+            .expect_err("must reject body over cap");
+        assert_eq!(
+            err.0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "expected 413 on cap overrun, got {} ({})",
+            err.0,
+            err.1,
+        );
+    }
+
+    /// MAX_UPLOAD_SIZE = 0 must mean "unlimited", matching the
+    /// documented sentinel in `Config::max_upload_size_bytes`. A 0 cap
+    /// must NOT cause every chunk to overflow the cap.
+    #[tokio::test]
+    async fn test_stream_body_to_temp_file_zero_cap_is_unlimited() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("unlimited.bin");
+        // 4 MiB payload -- vastly larger than any conceivable check
+        // window; if `0` were treated as a literal cap this would 413.
+        let payload = vec![0x11u8; 4 * 1024 * 1024];
+        let body = Body::from(payload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 0)
+            .await
+            .expect("zero cap must permit any size");
+        assert_eq!(
+            total,
+            4 * 1024 * 1024,
+            "all bytes counted under unlimited cap"
+        );
+        let on_disk = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            on_disk,
+            4 * 1024 * 1024,
+            "all bytes written under unlimited cap"
+        );
+    }
+
+    /// `rehash_temp_file` must produce a sha256 that matches the
+    /// `compute_sha256` helper run on the same payload buffered in
+    /// memory. This is the digest-verification parity that
+    /// `handle_complete_upload` depends on: pre-#1449 the verification
+    /// hashed an in-memory buffer; post-#1449 it hashes the on-disk
+    /// temp file, and the two must agree byte-for-byte.
+    #[tokio::test]
+    async fn test_rehash_temp_file_matches_compute_sha256() {
+        let payload = b"hello OCI streaming push -- 1449".repeat(4096);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("blob.bin");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let (digest_from_disk, size_from_disk) =
+            rehash_temp_file(&path).await.expect("rehash succeeds");
+        let digest_from_buf = compute_sha256(&payload);
+
+        assert_eq!(
+            digest_from_disk, digest_from_buf,
+            "on-disk rehash vs in-memory compute_sha256 must agree"
+        );
+        assert_eq!(size_from_disk as usize, payload.len());
+    }
+
+    /// Memory-bound put: when the upload temp file is fed to a
+    /// `StorageBackend` via `put_stream`, the backend must observe
+    /// multiple bounded chunks rather than a single Bytes containing
+    /// the whole payload. This is the #1449 invariant: a 10 GB layer
+    /// push must not buffer 10 GB in RAM at the storage interface.
+    ///
+    /// We use a `ChunkRecordingBackend` that captures chunk sizes from
+    /// the `put_stream` BoxStream and asserts:
+    ///   * `put` was never called (the legacy buffered path),
+    ///   * the chunk count is > 1 for a multi-MiB payload,
+    ///   * the largest single chunk is <= STREAM_CHUNK_BUDGET.
+    #[tokio::test]
+    async fn test_put_stream_is_chunked_not_buffered() {
+        use crate::storage::PutStreamResult;
+        use crate::storage::StorageBackend;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ChunkRecordingBackend {
+            put_calls: Arc<AtomicUsize>,
+            chunk_sizes: Arc<Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for ChunkRecordingBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                self.put_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<PutStreamResult> {
+                use futures::StreamExt;
+                let mut total: u64 = 0;
+                let mut hasher = Sha256::new();
+                tokio::pin!(stream);
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    self.chunk_sizes.lock().unwrap().push(chunk.len());
+                    hasher.update(&chunk);
+                    total += chunk.len() as u64;
+                }
+                Ok(PutStreamResult {
+                    checksum_sha256: format!("{:x}", hasher.finalize()),
+                    bytes_written: total,
+                })
+            }
+        }
+
+        // 4 MiB payload -- big enough to span > 1 STREAM_CHUNK_BUDGET
+        // window (256 KiB), so a non-chunked implementation would
+        // show up as a single Bytes of 4 MiB.
+        let payload = vec![0xCDu8; 4 * 1024 * 1024];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("blob.bin");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let put_calls = Arc::new(AtomicUsize::new(0));
+        let chunk_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let backend = ChunkRecordingBackend {
+            put_calls: put_calls.clone(),
+            chunk_sizes: chunk_sizes.clone(),
+        };
+
+        let upload_stream = open_upload_temp_as_stream(&path)
+            .await
+            .expect("open temp as stream");
+        let result = backend
+            .put_stream("oci-blobs/sha256:test", upload_stream)
+            .await
+            .expect("put_stream succeeds");
+
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            0,
+            "buffered `put` must NOT be called for a streaming upload"
+        );
+        let sizes = chunk_sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() > 1,
+            "expected multiple chunks for a 4 MiB payload, got {} chunks",
+            sizes.len()
+        );
+        let max_chunk = sizes.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_chunk <= STREAM_CHUNK_BUDGET,
+            "max chunk {} bytes exceeds STREAM_CHUNK_BUDGET ({})",
+            max_chunk,
+            STREAM_CHUNK_BUDGET,
+        );
+        assert_eq!(result.bytes_written as usize, payload.len());
+    }
+
+    /// Sanity: `oci_upload_temp_path` produces a deterministic per-UUID
+    /// path under a configurable root, so concurrent uploads don't
+    /// collide and operators can pin uploads to a fast local volume.
+    #[test]
+    fn test_oci_upload_temp_path_is_per_uuid() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let pa = oci_upload_temp_path(&a);
+        let pb = oci_upload_temp_path(&b);
+        assert_ne!(pa, pb, "distinct uuids must produce distinct paths");
+        let again = oci_upload_temp_path(&a);
+        assert_eq!(pa, again, "same uuid must produce same path");
+        assert!(
+            pa.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("ak-oci-upload-"))
+                .unwrap_or(false),
+            "filename must be prefixed with ak-oci-upload- for operator visibility"
+        );
+    }
 }
 
 // ===========================================================================
@@ -7834,5 +8421,361 @@ mod cross_repo_session_regression_tests {
             &[storage_a, storage_b],
         )
         .await;
+    }
+
+    /// PUT complete with a digest that does not match the bytes on disk
+    /// must reject with 400 DIGEST_INVALID, drop the session row, and
+    /// remove the temp file. This pins the rehash-and-compare branch of
+    /// `handle_complete_upload` plus the cleanup path (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_complete_upload_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PATCH a known chunk into the temp file.
+        let chunk = b"actual-chunk-bytes".to_vec();
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::from(chunk.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // PUT with a digest that does NOT match the chunk on disk.
+        let bogus_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, bogus_digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "digest mismatch must reject with 400"
+        );
+
+        // The session row should be gone (handler deletes it on mismatch).
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session row must be deleted on digest mismatch"
+        );
+
+        // No blob row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(bogus_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// PUT complete without a digest query parameter must reject with
+    /// 400 DIGEST_INVALID. This pins the early-return branch of
+    /// `handle_complete_upload` before any temp-file work.
+    #[tokio::test]
+    async fn handle_complete_upload_missing_digest_query_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "nd").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PUT without `?digest=` query.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing digest query must reject with 400"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... with the full blob inline must verify
+    /// the digest, write the blob under the final `oci-blobs/<digest>`
+    /// key, record `oci_blobs`, and return 201. This pins the monolithic
+    /// branch of `handle_start_upload` (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_with_digest_creates_blob() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mono").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-blob-payload".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "monolithic POST with matching digest must return 201"
+        );
+
+        // oci_blobs row should be recorded under the final digest.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "oci_blobs row must be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... where the provided digest does NOT
+    /// match the body bytes must reject with 400 DIGEST_INVALID and not
+    /// record an oci_blobs row. This pins the pre-write verification in
+    /// `handle_start_upload`.
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "monomm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-bytes-A".to_vec();
+        // Digest of a DIFFERENT payload so verification must fail.
+        let wrong_digest = format!("sha256:{}", sha256_hex(b"some-other-bytes"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, wrong_digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "monolithic POST with mismatched digest must reject with 400"
+        );
+
+        // No oci_blobs row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&wrong_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Successive PATCH chunks must each be appended to the temp file
+    /// (O_APPEND) and the running `bytes_received` counter must reflect
+    /// the cumulative size. PUT complete with the digest of the
+    /// concatenated chunks must then succeed and record a single
+    /// `oci_blobs` row. This pins the multi-chunk happy path of
+    /// `handle_patch_upload` + `handle_complete_upload` together.
+    #[tokio::test]
+    async fn handle_patch_upload_multi_chunk_then_complete_succeeds() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mc").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Two PATCH chunks.
+        let chunk_a = b"first-chunk-".to_vec();
+        let chunk_b = b"second-chunk".to_vec();
+        for chunk in &[&chunk_a, &chunk_b] {
+            let req = Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}",
+                    repo_key, session_id
+                ))
+                .header("Authorization", &auth)
+                .body(Body::from((*chunk).clone()))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::ACCEPTED,
+                "PATCH chunk under owning repo should return 202"
+            );
+        }
+
+        // After two PATCHes, bytes_received must equal the sum of both
+        // chunks. Pre-#1449 the second PATCH would read+rewrite the
+        // whole file (O(N^2)); the new path appends with O_APPEND and
+        // updates the running counter only.
+        let bytes_received: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bytes_received,
+            (chunk_a.len() + chunk_b.len()) as i64,
+            "bytes_received must equal cumulative chunk size after two PATCHes"
+        );
+
+        let mut full = chunk_a.clone();
+        full.extend_from_slice(&chunk_b);
+        let digest = format!("sha256:{}", sha256_hex(&full));
+
+        // PUT complete with the digest of the concatenated chunks.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "multi-chunk PUT complete with matching digest should return 201"
+        );
+
+        // Exactly one oci_blobs row.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "exactly one oci_blobs row should be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 }
