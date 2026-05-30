@@ -393,6 +393,22 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> 
     .await
     .map_err(|e| fs_err("store metadata", e))?;
 
+    // Surface Incus images in the top-level package browser. The generic
+    // upload path (artifact_service) and the npm/pypi/nuget handlers populate
+    // these tables already; the Incus handler writes `artifacts` directly and
+    // so must call it explicitly. Best-effort — a failure must not fail upload.
+    crate::services::package_service::PackageService::new(db.clone())
+        .try_create_or_update_from_artifact(
+            repo_id,
+            product,
+            version,
+            size_bytes,
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "incus" })),
+        )
+        .await;
+
     Ok(artifact_id)
 }
 
@@ -2213,6 +2229,73 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Incus uploads must populate the `packages` /
+    // `package_versions` tables so images appear in the top-level package
+    // browser, matching npm/pypi/nuget and the generic upload path. Before
+    // the fix, `upsert_artifact` wrote only the `artifacts` row, so Incus
+    // images were invisible in `GET /api/v1/packages`.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn upsert_artifact_populates_packages_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let artifact_path = build_artifact_path("ubuntu-noble", "20240215", "incus.tar.xz");
+        let storage_key = build_storage_key(&f.repo_id, &artifact_path);
+        let metadata = serde_json::json!({ "format": "incus" });
+
+        let Ok(_id) = upsert_artifact(UpsertArtifactParams {
+            db: &f.pool,
+            repo_id: f.repo_id,
+            artifact_path: &artifact_path,
+            product: "ubuntu-noble",
+            version: "20240215",
+            size_bytes: 1234,
+            checksum: "deadbeef",
+            storage_key: &storage_key,
+            user_id: f.user_id,
+            metadata: &metadata,
+        })
+        .await
+        else {
+            panic!("upsert_artifact failed");
+        };
+
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT name, version FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("ubuntu-noble")
+        .bind("20240215")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+        let (name, version) = row.expect("packages row must exist after an Incus upload");
+        assert_eq!(
+            (name.as_str(), version.as_str()),
+            ("ubuntu-noble", "20240215")
+        );
+
+        let version_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("ubuntu-noble")
+        .bind("20240215")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(version_count.0, 1);
+
+        f.teardown().await;
     }
 }
 
