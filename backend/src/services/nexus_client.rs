@@ -271,7 +271,10 @@ impl NexusClient {
         })
     }
 
-    /// Download an artifact by repository name and path
+    /// Download an artifact by repository name and path.
+    ///
+    /// Buffers the full response body into memory. Prefer
+    /// `download_artifact_stream` for migrations (issue #1422).
     pub async fn download_artifact(
         &self,
         repo_name: &str,
@@ -288,6 +291,48 @@ impl NexusClient {
         let status = response.status();
         if status.is_success() {
             Ok(response.bytes().await?)
+        } else if status.as_u16() == 404 {
+            Err(ArtifactoryError::NotFound(format!(
+                "Artifact not found: {}/{}",
+                repo_name, path
+            )))
+        } else {
+            Err(ArtifactoryError::ApiError {
+                status: status.as_u16(),
+                message: "Failed to download artifact".into(),
+            })
+        }
+    }
+
+    /// Download an artifact as a chunked byte stream.
+    ///
+    /// Returns chunks from `reqwest::Response::bytes_stream()` so callers
+    /// can spill straight to disk without ever buffering the full payload
+    /// (issue #1422).
+    pub async fn download_artifact_stream(
+        &self,
+        repo_name: &str,
+        path: &str,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<bytes::Bytes, ArtifactoryError>>,
+        ArtifactoryError,
+    > {
+        use futures::StreamExt;
+
+        let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
+            .send()
+            .await?;
+
+        let status = response.status();
+        if status.is_success() {
+            let stream = response
+                .bytes_stream()
+                .map(|res| res.map_err(ArtifactoryError::from));
+            Ok(Box::pin(stream))
         } else if status.as_u16() == 404 {
             Err(ArtifactoryError::NotFound(format!(
                 "Artifact not found: {}/{}",
@@ -332,6 +377,14 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
         self.download_artifact(repo_key, path).await
+    }
+
+    async fn download_artifact_stream(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<crate::services::source_registry::ArtifactByteStream, ArtifactoryError> {
+        self.download_artifact_stream(repo_key, path).await
     }
 
     async fn get_properties(
@@ -613,5 +666,184 @@ mod tests {
         assert_eq!(component.assets[0].file_size, Some(100));
         assert_eq!(component.assets[1].file_size, Some(50));
         assert_eq!(component.assets[2].file_size, Some(200));
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming regression coverage (issue #1422)
+    //
+    // These tests assert that `download_artifact_stream` actually streams
+    // the response body in chunks rather than buffering the full payload
+    // before returning. Without this, a 10 GB artifact in the migration
+    // worker OOMs the AK host.
+    // ---------------------------------------------------------------------
+
+    /// 64 MiB synthetic artifact. Big enough that buffering the whole body
+    /// would be obviously visible in a memory profile, small enough to run
+    /// in CI within the unit-test budget.
+    #[tokio::test]
+    async fn test_download_artifact_stream_yields_chunks() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body_size: usize = 64 * 1024 * 1024;
+        let body = vec![0xABu8; body_size];
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/raw-local/big.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+        })
+        .unwrap();
+
+        let mut stream = client
+            .download_artifact_stream("raw-local", "big.bin")
+            .await
+            .expect("stream open");
+
+        let mut chunks = 0usize;
+        let mut total = 0usize;
+        let mut max_chunk = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("chunk");
+            chunks += 1;
+            total += chunk.len();
+            if chunk.len() > max_chunk {
+                max_chunk = chunk.len();
+            }
+        }
+
+        assert_eq!(total, body_size, "should receive entire body");
+        // Reqwest's bytes_stream chunk size is well under the body size for
+        // a 64 MiB payload. If this assertion fails it means the response
+        // is being buffered into one Bytes before yielding (the #1422 bug).
+        assert!(
+            max_chunk < body_size,
+            "expected chunked streaming, got single {max_chunk}-byte chunk for {body_size}-byte body"
+        );
+        assert!(
+            chunks > 1,
+            "expected >1 chunks for a 64 MiB body, got {chunks}"
+        );
+    }
+
+    /// Verifies the streaming path returns the same bytes as the buffered
+    /// `download_artifact` path. Guards against off-by-one chunking bugs
+    /// dropping or duplicating data.
+    #[tokio::test]
+    async fn test_download_artifact_stream_matches_buffered() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Mix of byte values so a byte-shift bug surfaces clearly.
+        let body: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/raw-local/mixed.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+        })
+        .unwrap();
+
+        let mut stream = client
+            .download_artifact_stream("raw-local", "mixed.bin")
+            .await
+            .expect("stream open");
+
+        let mut assembled = Vec::with_capacity(body.len());
+        while let Some(chunk) = stream.next().await {
+            assembled.extend_from_slice(&chunk.expect("chunk"));
+        }
+
+        assert_eq!(assembled, body, "streamed bytes must equal source body");
+    }
+
+    /// Regression test for the exact #1422 acceptance criterion: the
+    /// migration worker must be able to consume a large artifact from a
+    /// `SourceRegistry` without ever holding the full payload in memory.
+    /// We exercise the streaming path end-to-end through the
+    /// `SourceRegistry` trait (which is what `migration_worker` sees) and
+    /// assert that the peak in-flight buffer stays bounded.
+    #[tokio::test]
+    async fn test_source_registry_stream_keeps_memory_bounded() {
+        use crate::services::source_registry::SourceRegistry;
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body_size: usize = 32 * 1024 * 1024; // 32 MiB
+        let body = vec![0x5Au8; body_size];
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/raw-local/large.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let client: std::sync::Arc<dyn SourceRegistry> = std::sync::Arc::new(
+            NexusClient::new(NexusClientConfig {
+                base_url: server.uri(),
+                auth: NexusAuth {
+                    username: "u".into(),
+                    password: "p".into(),
+                },
+                timeout_secs: 30,
+                throttle_delay_ms: 0,
+            })
+            .unwrap(),
+        );
+
+        let mut stream = client
+            .download_artifact_stream("raw-local", "large.bin")
+            .await
+            .expect("stream open");
+
+        let mut peak_in_flight: usize = 0;
+        let mut total: usize = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("chunk");
+            if chunk.len() > peak_in_flight {
+                peak_in_flight = chunk.len();
+            }
+            total += chunk.len();
+            // Drop the chunk immediately, simulating the migration_worker
+            // path that writes to disk and forgets.
+            drop(chunk);
+        }
+
+        assert_eq!(total, body_size);
+        // Hard upper bound: any single chunk must be much smaller than the
+        // whole artifact. We pick body_size / 4 as a generous ceiling;
+        // reqwest typically yields ~8 KiB-64 KiB chunks. If this fails the
+        // streaming guarantee is broken.
+        assert!(
+            peak_in_flight < body_size / 4,
+            "peak in-flight chunk {peak_in_flight} approaches full body {body_size}; \
+             streaming is buffering"
+        );
     }
 }

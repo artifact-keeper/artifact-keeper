@@ -72,6 +72,35 @@ pub fn extract_artifact_metadata(
     }
 }
 
+/// Extract format-specific package metadata by reading from a file on disk.
+///
+/// Same semantics as `extract_artifact_metadata` but accepts a path instead
+/// of an in-memory slice. The migration worker uses this after streaming an
+/// artifact to a temp file so it never has to re-buffer the full artifact
+/// in memory (issue #1422). For formats with no metadata extractor
+/// (anything other than npm/helm today) this returns `None` without opening
+/// the file at all.
+pub fn extract_artifact_metadata_from_path(
+    package_type: &str,
+    path: &std::path::Path,
+) -> Option<serde_json::Value> {
+    let pt = package_type.to_lowercase();
+    let needs_read = matches!(
+        pt.as_str(),
+        "npm" | "yarn" | "pnpm" | "bower" | "helm" | "helm_oci"
+    );
+    if !needs_read {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    match pt.as_str() {
+        "npm" | "yarn" | "pnpm" | "bower" => extract_npm_metadata_reader(reader),
+        "helm" | "helm_oci" => extract_helm_metadata_reader(reader),
+        _ => None,
+    }
+}
+
 /// Extract npm package metadata from a `.tgz` tarball.
 ///
 /// Reads the first `package.json` found inside the gzipped tar. The
@@ -80,8 +109,12 @@ pub fn extract_artifact_metadata(
 /// `GET /npm/<repo>/<package>` (see `handlers::npm::build_npm_metadata_response`),
 /// where `version_data.dependencies` flows through to clients verbatim.
 fn extract_npm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
+    extract_npm_metadata_reader(artifact_data)
+}
+
+fn extract_npm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
     use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(artifact_data);
+    let gz = flate2::read::GzDecoder::new(reader);
     let mut tar = tar::Archive::new(gz);
     let entries = tar.entries().ok()?;
     for entry in entries.flatten() {
@@ -114,8 +147,12 @@ fn extract_npm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
 /// fidelity) and a couple of flat fields (`description`, `appVersion`)
 /// matching what the index builder probes individually.
 fn extract_helm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
+    extract_helm_metadata_reader(artifact_data)
+}
+
+fn extract_helm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
     use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(artifact_data);
+    let gz = flate2::read::GzDecoder::new(reader);
     let mut tar = tar::Archive::new(gz);
     let entries = tar.entries().ok()?;
     for entry in entries.flatten() {
