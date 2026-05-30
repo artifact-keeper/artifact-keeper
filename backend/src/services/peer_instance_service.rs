@@ -799,6 +799,92 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    /// DB-backed: a queued sync task must surface a populated `created_at`
+    /// through `get_pending_sync_tasks`, so callers can tell a freshly
+    /// scheduled task from a stale queue entry. (Backs the replication-schedule
+    /// e2e check, which keys on task timestamp recency.)
+    ///
+    /// Requires a migrated PostgreSQL at `DATABASE_URL`. Run with:
+    ///   DATABASE_URL=postgres://... cargo test --lib \
+    ///     services::peer_instance_service::tests::pending_task_exposes_created_at -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn pending_task_exposes_created_at() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let db = sqlx::PgPool::connect(&url).await.unwrap();
+
+        let suffix = Uuid::new_v4();
+        // Minimal repo.
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', $1) RETURNING id",
+        )
+        .bind(format!("ptask-repo-{suffix}"))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        // Minimal artifact in that repo.
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, name, path, storage_key, size_bytes, \
+             content_type, checksum_sha256) \
+             VALUES ($1, 'marker.txt', 'sched/marker.txt', $2, 12, 'text/plain', $3) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("storage/{suffix}"))
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        // Non-local online peer.
+        let svc = PeerInstanceService::new(db.clone());
+        let peer = svc
+            .register(RegisterPeerInstanceRequest {
+                name: format!("ptask-peer-{suffix}"),
+                endpoint_url: "http://127.0.0.1:65535".to_string(),
+                region: None,
+                cache_size_bytes: 0,
+                sync_filter: None,
+                api_key: "k".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+        svc.queue_sync_task(peer.id, artifact_id, 0).await.unwrap();
+
+        let tasks = svc.get_pending_sync_tasks(peer.id, 50).await.unwrap();
+        assert_eq!(tasks.len(), 1, "queued task must be listed");
+        assert!(
+            tasks[0].created_at >= before,
+            "created_at must be populated and recent (got {})",
+            tasks[0].created_at
+        );
+
+        // Cleanup (FK cascade order).
+        sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = $1")
+            .bind(peer.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------

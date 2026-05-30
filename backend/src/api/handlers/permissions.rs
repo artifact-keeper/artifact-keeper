@@ -1,6 +1,7 @@
 //! Permission management handlers.
 
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, Query, State},
     routing::get,
     Json, Router,
@@ -240,11 +241,20 @@ pub struct CreatedPermissionRow {
 pub async fn create_permission(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Json(payload): Json<CreatePermissionRequest>,
+    body: Bytes,
 ) -> Result<Json<PermissionResponse>> {
     // GHSA-vvc3-h39c-mrq5: read-scoped service-account tokens were being
     // accepted on this endpoint, enabling privilege escalation by creating
     // a fine-grained admin permission on the system sentinel.
+    //
+    // The body is taken as raw `Bytes` (not `Json<CreatePermissionRequest>`)
+    // so the authorization gate runs BEFORE the payload is parsed. A
+    // `Json<T>` extractor runs during request extraction, i.e. before this
+    // handler body executes, so a malformed/short payload from a read-scope
+    // caller would short-circuit to a body-shape error (422/500) before the
+    // scope check ever ran. By gating first we guarantee a non-admin or
+    // read-scope caller gets a clean 403 with the canonical scope-error body
+    // before any deserialization or DB work. See #1438 (B10).
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     // #1438 (1a): only admins may grant fine-grained permissions. Previously
@@ -254,6 +264,12 @@ pub async fn create_permission(
     // here with 403 before any DB write.
     auth.require_admin()?;
     let _ = auth;
+
+    // Only now, after the caller is authorized, parse the payload. Malformed
+    // or missing fields surface as 400 VALIDATION_ERROR (the canonical
+    // client-error envelope), never 422/500.
+    let payload: CreatePermissionRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
 
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
@@ -377,12 +393,19 @@ pub async fn update_permission(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreatePermissionRequest>,
+    body: Bytes,
 ) -> Result<Json<PermissionResponse>> {
-    // GHSA-vvc3-h39c-mrq5: enforce token scope on permission updates.
+    // GHSA-vvc3-h39c-mrq5: enforce token scope on permission updates. As in
+    // create_permission, take the body as raw `Bytes` and authorize before
+    // parsing so a read-scope caller gets 403 (not a body-shape 422/500)
+    // before any deserialization or DB work.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+    auth.require_admin()?;
     let _ = auth;
+
+    let payload: CreatePermissionRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
 
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
@@ -938,5 +961,57 @@ mod tests {
             ext.require_scope("write").is_err(),
             "admin user with read-only token must still be blocked by scope check"
         );
+    }
+
+    #[test]
+    fn test_create_permission_body_shape_does_not_short_circuit_scope_check() {
+        // B10 regression: the security release-gate sends a read-scope SA
+        // token with a body shaped like {"name": ..., "description": ...},
+        // which does NOT match the required CreatePermissionRequest
+        // (principal_type/principal_id/target_type/target_id/actions). Before
+        // the fix the handler took `Json<CreatePermissionRequest>`, so the
+        // extractor rejected the malformed body during request extraction
+        // (a 422/500 body-shape error) BEFORE the scope check ever ran -- the
+        // caller never saw the canonical 403. The handler now takes raw
+        // `Bytes` and parses only after the scope/admin gate, so the gate is
+        // independent of body shape. This test pins both halves: the scope
+        // predicate rejects the read-scope token, and the security-suite body
+        // genuinely fails to deserialize into CreatePermissionRequest (so the
+        // old ordering really would have masked the 403).
+        let read_scope = read_only_token();
+        match read_scope.require_scope("write") {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: write");
+            }
+            other => panic!(
+                "expected 403 Authorization before any parse, got {:?}",
+                other
+            ),
+        }
+
+        let security_suite_body = r#"{"name":"ghsa-perm","description":"should not be created"}"#;
+        assert!(
+            serde_json::from_str::<CreatePermissionRequest>(security_suite_body).is_err(),
+            "the security-suite probe body must not deserialize into \
+             CreatePermissionRequest -- that is exactly why parsing it before \
+             the scope check used to mask the 403"
+        );
+    }
+
+    #[test]
+    fn test_create_permission_authorized_then_malformed_body_is_validation() {
+        // The mirror case: an authorized caller (write scope) that sends an
+        // unparseable body must get a 400 VALIDATION_ERROR, never a 422/500.
+        // The handler maps serde_json failures to AppError::Validation after
+        // the gate. Pin that mapping at the predicate level.
+        let err = serde_json::from_slice::<CreatePermissionRequest>(b"{ not json }")
+            .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.starts_with("Invalid permission payload:"));
+            }
+            other => panic!("expected Validation error, got {:?}", other),
+        }
     }
 }

@@ -85,6 +85,24 @@ pub struct HealthMonitorService {
     http_client: Client,
 }
 
+/// Determine whether the periodic health monitor should probe
+/// Dependency-Track. Returns the configured URL only when both the
+/// integration is explicitly enabled (`DEPENDENCY_TRACK_ENABLED=true`) and
+/// a URL is configured. Any other combination returns `None`, meaning the
+/// monitor skips DT entirely (no HTTP probe, no log entry, no alert
+/// state).
+///
+/// This is the single point that gates every periodic DT touch from the
+/// monitoring pipeline. It exists as a free function so unit tests can
+/// pin the "disabled => no probe" invariant without spinning up a
+/// database (issues #1395, #1480).
+pub(crate) fn dependency_track_probe_url(config: &Config) -> Option<&str> {
+    if !config.dependency_track_enabled {
+        return None;
+    }
+    config.dependency_track_url.as_deref()
+}
+
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
@@ -243,7 +261,19 @@ impl HealthMonitorService {
         }
 
         // Dependency-Track
-        if let Some(url) = &app_config.dependency_track_url {
+        //
+        // Only probe when the integration is explicitly enabled. Previously
+        // this checked `dependency_track_url.is_some()` alone, which meant
+        // an operator running with `DEPENDENCY_TRACK_ENABLED=false` (or
+        // simply unset, which is now the default) but with a stale
+        // `DEPENDENCY_TRACK_URL` would still see periodic green/red status
+        // entries in the monitoring dashboard. That created the
+        // inconsistency reported in issues #1395 and #1480: monitoring
+        // would report DT as reachable while the Security dashboard
+        // simultaneously reported it as disabled or unavailable. Gating on
+        // the enabled flag ensures that a disabled DT integration produces
+        // no probes, no log entries, and no alert-state churn.
+        if let Some(url) = dependency_track_probe_url(app_config) {
             results.push(
                 self.check_service("dependency-track", url, "/api/version")
                     .await?,
@@ -752,5 +782,78 @@ mod tests {
         let last_alert = now - chrono::Duration::minutes(20);
         // 20 minutes > 15 minutes cooldown, so should re-alert
         assert!(now - last_alert >= cooldown);
+    }
+
+    // -----------------------------------------------------------------------
+    // dependency_track_probe_url gate (issues #1395, #1480)
+    //
+    // The periodic health monitor must not contact Dependency-Track when
+    // the integration is disabled, even if `DEPENDENCY_TRACK_URL` is still
+    // set in the environment. These tests pin that invariant at the
+    // single decision point used by `check_all_services`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dt_probe_url_disabled_without_url_returns_none() {
+        let cfg = Config {
+            dependency_track_enabled: false,
+            dependency_track_url: None,
+            ..Config::default()
+        };
+        assert!(
+            dependency_track_probe_url(&cfg).is_none(),
+            "DT disabled and no URL: monitor must not probe"
+        );
+    }
+
+    #[test]
+    fn test_dt_probe_url_disabled_with_stale_url_returns_none() {
+        // Regression for #1480: an operator unsetting
+        // DEPENDENCY_TRACK_ENABLED while leaving DEPENDENCY_TRACK_URL
+        // configured used to keep the monitor probing DT, which reported
+        // green/red in the dashboard while the rest of the backend
+        // claimed DT was disabled. The gate must return None here.
+        let cfg = Config {
+            dependency_track_enabled: false,
+            dependency_track_url: Some("http://dt.example.com:8081".into()),
+            ..Config::default()
+        };
+        assert!(
+            dependency_track_probe_url(&cfg).is_none(),
+            "DT disabled but URL set: monitor must not probe (issue #1480)"
+        );
+    }
+
+    #[test]
+    fn test_dt_probe_url_enabled_without_url_returns_none() {
+        // Defensive: even with the toggle on, an empty URL means no probe.
+        let cfg = Config {
+            dependency_track_enabled: true,
+            dependency_track_url: None,
+            ..Config::default()
+        };
+        assert!(dependency_track_probe_url(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_dt_probe_url_enabled_with_url_returns_url() {
+        let cfg = Config {
+            dependency_track_enabled: true,
+            dependency_track_url: Some("http://dt.example.com:8081".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            dependency_track_probe_url(&cfg),
+            Some("http://dt.example.com:8081")
+        );
+    }
+
+    #[test]
+    fn test_dt_probe_url_default_config_disabled() {
+        // The default Config has DT disabled. This pins the policy that
+        // operators must explicitly opt in via DEPENDENCY_TRACK_ENABLED.
+        let cfg = Config::default();
+        assert!(!cfg.dependency_track_enabled);
+        assert!(dependency_track_probe_url(&cfg).is_none());
     }
 }

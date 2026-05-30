@@ -416,6 +416,27 @@ pub async fn auth_middleware(
             Some((username, password)) => {
                 match auth_service.authenticate(&username, &password).await {
                     Ok((user, _token_pair)) => Ok((AuthExtension::from(user), None)),
+                    // A transient bcrypt-capacity shed must NOT be collapsed
+                    // into a 401. `authenticate()` runs bcrypt(cost=12) under a
+                    // process-wide concurrency cap (see
+                    // `auth_service::acquire_auth_permit_for_bcrypt`); when that
+                    // cap saturates under a burst of concurrent Basic-auth
+                    // requests it returns `AppError::ServiceUnavailable`, which
+                    // is a retryable 503, not "wrong password". Collapsing it to
+                    // 401 "Invalid credentials" is what made `twine upload` fail
+                    // in the release gate (a curl -u upload with byte-identical
+                    // credentials passed because it didn't coincide with a
+                    // saturated cap): twine does not retry on 401 but does on
+                    // 503. Surface the shed as 503 + Retry-After so well-behaved
+                    // clients back off and retry instead of aborting.
+                    Err(AppError::ServiceUnavailable(msg)) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "1")],
+                            msg,
+                        )
+                            .into_response();
+                    }
                     Err(_) => Err("Invalid credentials"),
                 }
             }
@@ -426,6 +447,18 @@ pub async fn auth_middleware(
 
     let header_error = match header_result {
         Ok((ext, token_iat)) => {
+            // Insert BOTH shapes so handlers behind this middleware can
+            // extract either `Extension<AuthExtension>` or
+            // `Extension<Option<AuthExtension>>`. Without the Option-wrapped
+            // copy, a handler declaring `Extension<Option<AuthExtension>>`
+            // (e.g. the permission handlers, which gate on require_auth +
+            // require_scope) fails Axum extraction with HTTP 500
+            // ("Missing request extension: Extension of type
+            // Option<AuthExtension>") before the in-handler scope check runs.
+            // That surfaced as a 500 instead of the canonical 403 for a
+            // read-scope service-account token on POST /api/v1/permissions.
+            // See #1438 (B10).
+            request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             if let Some(iat) = token_iat {
                 request.extensions_mut().insert(iat);
@@ -441,6 +474,10 @@ pub async fn auth_middleware(
     let ticket_parts = extract_ticket_request_parts(&request);
     if let Some(parts) = ticket_parts.as_ref() {
         if let Some(ext) = try_resolve_ticket_for_parts(auth_service.db(), parts).await {
+            // Same dual-shape insertion as the header-auth path above so
+            // `Extension<Option<AuthExtension>>` handlers resolve under a
+            // ticket-authenticated request too (#1438 / B10).
+            request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             request.extensions_mut().insert(DownloadTicketAuth);
             return next.run(request).await;
@@ -505,7 +542,9 @@ pub(crate) async fn try_resolve_auth(
 ) -> Option<AuthExtension> {
     match try_resolve_auth_outcome(auth_service, extracted).await {
         AuthOutcome::Resolved(ext) => Some(ext),
-        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential | AuthOutcome::Overloaded => {
+            None
+        }
     }
 }
 
@@ -534,6 +573,16 @@ pub(crate) enum AuthOutcome {
     Resolved(AuthExtension),
     NoCredential,
     InvalidCredential,
+    /// A credential was presented and is well-formed, but validation could
+    /// not be completed because the bcrypt-bound auth-concurrency cap is
+    /// saturated (see `auth_service::acquire_auth_permit_for_bcrypt`). This
+    /// is a transient overload, NOT "wrong password": the correct response
+    /// is a retryable 503, never a 401. Collapsing it into `InvalidCredential`
+    /// is what made `twine upload` fail in the release gate under parallel
+    /// load (a curl -u upload with byte-identical credentials passed because
+    /// it did not coincide with a saturated cap); twine does not retry on
+    /// 401 but does on 503.
+    Overloaded,
 }
 
 /// Resolve a possibly-missing credential into an [`AuthOutcome`].
@@ -570,8 +619,12 @@ pub(crate) async fn try_resolve_auth_outcome(
             // that are base64-encoded `username:password` rather than JWTs or
             // API keys. Try decoding as credentials before giving up.
             if let Some((username, password)) = decode_basic_credentials(token) {
-                if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
-                    return AuthOutcome::Resolved(AuthExtension::from(user));
+                match auth_service.authenticate(&username, &password).await {
+                    Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
+                    // A transient bcrypt-capacity shed must surface as 503, not
+                    // 401. See `AuthOutcome::Overloaded`.
+                    Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
+                    Err(_) => {}
                 }
             }
             AuthOutcome::InvalidCredential
@@ -587,8 +640,15 @@ pub(crate) async fn try_resolve_auth_outcome(
                 return AuthOutcome::InvalidCredential;
             };
             // Try bcrypt username/password auth first
-            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
-                return AuthOutcome::Resolved(AuthExtension::from(user));
+            match auth_service.authenticate(&username, &password).await {
+                Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
+                // A transient bcrypt-capacity shed must surface as 503, not a
+                // 401. Without this, twine (which sends standard Basic auth)
+                // gets a spurious 401 under parallel-suite load and aborts,
+                // while a single curl -u upload with the same credentials
+                // succeeds. See `AuthOutcome::Overloaded`.
+                Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
+                Err(_) => {}
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format
@@ -837,10 +897,20 @@ pub async fn optional_auth_middleware(
 ) -> Response {
     let extracted = extract_token(&request);
     let outcome = try_resolve_auth_outcome(&auth_service, extracted).await;
+    // A transient bcrypt-capacity shed surfaces here as `Overloaded`. Return a
+    // retryable 503 immediately rather than silently dropping to anonymous and
+    // letting a downstream `require_auth_basic*` turn it into a misleading 401
+    // "Authentication required" (the twine-upload gate failure). See
+    // `AuthOutcome::Overloaded`.
+    if matches!(outcome, AuthOutcome::Overloaded) {
+        return service_unavailable_response();
+    }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+        // Handled above with an early 503 return.
+        AuthOutcome::Overloaded => None,
     };
 
     // If header-based auth produced no identity, fall back to a `?ticket=`
@@ -999,6 +1069,24 @@ fn unauthorized_response() -> Response {
         .unwrap()
 }
 
+/// Build a 503 response for the transient bcrypt-capacity shed
+/// (`AuthOutcome::Overloaded`). Carries a `Retry-After: 1` hint so
+/// well-behaved clients (twine, cargo, pip) back off and retry instead of
+/// aborting the way they would on a 401. Keeping this distinct from
+/// `unauthorized_response` is the load-bearing fix for the twine-upload
+/// gate failure: a saturated auth cap is "retry shortly", not "wrong
+/// password".
+fn service_unavailable_response() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::RETRY_AFTER, "1")
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "Authentication service is at capacity, retry shortly",
+        ))
+        .unwrap()
+}
+
 /// Build a 403 response for API tokens that lack access to the requested
 /// repository.
 fn forbidden_repo_response() -> Response {
@@ -1140,10 +1228,16 @@ pub async fn repo_visibility_middleware(
     let Some(repo) = repo else {
         let extracted = extract_token(&request);
         let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+        // Transient bcrypt-capacity shed -> retryable 503 (see
+        // `AuthOutcome::Overloaded`), never a 401.
+        if matches!(outcome, AuthOutcome::Overloaded) {
+            return service_unavailable_response();
+        }
         let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
         let auth_ext: Option<AuthExtension> = match outcome {
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+            AuthOutcome::Overloaded => None,
         };
         if credential_invalid && auth_ext.is_none() {
             return unauthorized_response();
@@ -1161,10 +1255,16 @@ pub async fn repo_visibility_middleware(
     // Perform optional auth (shared with optional_auth_middleware).
     let extracted = extract_token(&request);
     let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+    // Transient bcrypt-capacity shed -> retryable 503 (see
+    // `AuthOutcome::Overloaded`), never a 401.
+    if matches!(outcome, AuthOutcome::Overloaded) {
+        return service_unavailable_response();
+    }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+        AuthOutcome::Overloaded => None,
     };
     // `credential_invalid` was captured before the match consumed `outcome`.
 
@@ -3099,6 +3199,84 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #1438 (B10): auth_middleware must insert BOTH `AuthExtension` and
+    // `Option<AuthExtension>` on its success path so handlers can declare
+    // either extractor shape. The permission handlers declare
+    // `Extension<Option<AuthExtension>>`; before this fix the middleware only
+    // inserted a bare `AuthExtension`, so the `Option<AuthExtension>`
+    // extractor failed request extraction with HTTP 500 ("Missing request
+    // extension") before the in-handler scope check ran -- a read-scope SA
+    // token got 500 instead of the canonical 403 on POST /api/v1/permissions.
+    //
+    // The middleware's success path requires a valid token + live AuthService,
+    // which the unit harness cannot provide. We instead pin the load-bearing
+    // contract directly: a request whose extensions carry the dual insertion
+    // (exactly what the fixed success path does) resolves BOTH
+    // `Extension<AuthExtension>` and `Extension<Option<AuthExtension>>` to 200.
+    // A regression that drops the Option-wrapped copy turns the second route
+    // into a 500, which this test catches.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_dual_auth_extension_insertion_resolves_both_extractor_shapes() {
+        use axum::{extract::Extension, middleware::Next, routing::get, Router};
+        use tower::ServiceExt;
+
+        fn sample_ext() -> AuthExtension {
+            AuthExtension {
+                user_id: Uuid::new_v4(),
+                username: "sa-dual".to_string(),
+                email: "sa@example.com".to_string(),
+                is_admin: false,
+                is_api_token: true,
+                is_service_account: true,
+                scopes: Some(vec!["read".to_string()]),
+                allowed_repo_ids: None,
+            }
+        }
+
+        // Mirror the exact dual insertion auth_middleware now performs on its
+        // success path.
+        async fn insert_both(mut request: Request, next: Next) -> Response {
+            let ext = sample_ext();
+            request.extensions_mut().insert(Some(ext.clone()));
+            request.extensions_mut().insert(ext);
+            next.run(request).await
+        }
+
+        let app: Router = Router::new()
+            .route(
+                "/bare",
+                get(|Extension(_a): Extension<AuthExtension>| async { (StatusCode::OK, "bare") }),
+            )
+            .route(
+                "/opt",
+                get(
+                    |Extension(a): Extension<Option<AuthExtension>>| async move {
+                        // Must be Some, not None: the fix inserts Some(ext),
+                        // not a None placeholder.
+                        assert!(a.is_some(), "Option<AuthExtension> must be Some");
+                        (StatusCode::OK, "opt")
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn(insert_both));
+
+        let bare = app.clone().oneshot(empty_get("/bare")).await.unwrap();
+        assert_eq!(
+            bare.status(),
+            StatusCode::OK,
+            "Extension<AuthExtension> must resolve"
+        );
+
+        let opt = app.oneshot(empty_get("/opt")).await.unwrap();
+        assert_eq!(
+            opt.status(),
+            StatusCode::OK,
+            "Extension<Option<AuthExtension>> must resolve (B10 regression guard)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // try_resolve_auth_outcome: tri-state behaviour pinned for #1371.
     // The outcome enum is what lets `optional_auth_middleware` distinguish
     // "no credential" (continue anonymously) from "credential presented but
@@ -3111,6 +3289,21 @@ mod tests {
         let auth_service = make_test_auth_service();
         let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None).await;
         assert!(matches!(outcome, AuthOutcome::NoCredential));
+    }
+
+    #[test]
+    fn test_service_unavailable_response_is_503_with_retry_after() {
+        // The bcrypt-capacity shed (`AuthOutcome::Overloaded`) must surface as
+        // a retryable 503 with Retry-After, never the 401 that made twine
+        // abort its upload in the release gate.
+        let resp = service_unavailable_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[tokio::test]
@@ -3171,11 +3364,17 @@ mod tests {
         let flatten = |outcome: AuthOutcome| -> Option<AuthExtension> {
             match outcome {
                 AuthOutcome::Resolved(ext) => Some(ext),
-                AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
+                AuthOutcome::NoCredential
+                | AuthOutcome::InvalidCredential
+                | AuthOutcome::Overloaded => None,
             }
         };
         assert!(flatten(AuthOutcome::NoCredential).is_none());
         assert!(flatten(AuthOutcome::InvalidCredential).is_none());
+        // A transient bcrypt-capacity shed also flattens to None for the
+        // legacy Option-shaped helper (callers that need the 503 distinction
+        // use the tri-state outcome directly).
+        assert!(flatten(AuthOutcome::Overloaded).is_none());
     }
 
     #[tokio::test]

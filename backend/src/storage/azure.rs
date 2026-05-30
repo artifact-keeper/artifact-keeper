@@ -913,6 +913,92 @@ impl StorageBackend for AzureBackend {
         }))
     }
 
+    /// Stream a file on disk into Azure Blob Storage as a single BlockBlob
+    /// without buffering the whole body in memory.
+    ///
+    /// The default trait implementation opens the file as a `ReaderStream`
+    /// and delegates to `put_stream`, but Azure has no streaming
+    /// `put_stream` override (single-PUT requires Content-Length, and a
+    /// staged-block implementation is non-trivial). For migration (#1422)
+    /// we know the file size from `fs::metadata`, so we can sign a single
+    /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
+    /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
+    /// not O(file_size).
+    async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        use futures::StreamExt;
+        use tokio::io::BufReader;
+        use tokio_util::io::ReaderStream;
+
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to stat file for Azure upload: {}", e))
+        })?;
+        let content_length = metadata.len();
+
+        let file = tokio::fs::File::open(path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to open file for Azure upload: {}", e))
+        })?;
+        let reader = BufReader::with_capacity(256 * 1024, file);
+        let stream = ReaderStream::with_capacity(reader, 256 * 1024)
+            .map(|r| r.map_err(|e| std::io::Error::other(format!("Read error: {}", e))));
+
+        let url = self.blob_url(key);
+        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        let response = match &self.auth {
+            AzureAuthMode::SharedKey { decoded_key } => {
+                let string_to_sign = format!(
+                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
+                    content_length,
+                    date_str,
+                    self.config.account_name,
+                    self.config.container_name,
+                    key
+                );
+                let auth_header =
+                    Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
+
+                self.client
+                    .put(&url)
+                    .header("Authorization", auth_header)
+                    .header("x-ms-date", &date_str)
+                    .header("x-ms-version", "2021-06-08")
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", content_length)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+            }
+            AzureAuthMode::TokenCredential { provider } => {
+                let token = provider.get_token().await?;
+                self.client
+                    .put(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-ms-date", &date_str)
+                    .header("x-ms-version", "2021-06-08")
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", content_length)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure upload failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or

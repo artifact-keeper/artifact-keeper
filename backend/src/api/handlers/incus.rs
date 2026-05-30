@@ -21,9 +21,9 @@
 //!   GET    /uploads/{uuid}                     - Check upload progress
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::Extension;
@@ -223,15 +223,20 @@ pub(crate) fn simplestreams_item_key(ftype: &str) -> &str {
 }
 
 /// Build the download URL for an image in the SimpleStreams catalog.
+///
+/// `prefix` is the mount prefix the request came in on (`/incus` or `/lxc`),
+/// so the emitted URL matches the request prefix (#1320). Callers should
+/// derive the prefix from `OriginalUri` via [`mount_prefix_from_uri`].
 pub(crate) fn build_download_url(
+    prefix: &str,
     repo_key: &str,
     product: &str,
     version: &str,
     filename: &str,
 ) -> String {
     format!(
-        "/incus/{}/images/{}/{}/{}",
-        repo_key, product, version, filename
+        "{}/{}/images/{}/{}/{}",
+        prefix, repo_key, product, version, filename
     )
 }
 
@@ -276,8 +281,31 @@ pub(crate) fn filename_from_path(path: &str) -> &str {
 }
 
 /// Build the Location header for chunked upload responses.
-pub(crate) fn build_upload_location(repo_key: &str, session_id: &Uuid) -> String {
-    format!("/incus/{}/uploads/{}", repo_key, session_id)
+///
+/// `prefix` is the mount prefix the request came in on (`/incus` or `/lxc`),
+/// so the emitted Location header matches the request prefix (#1320).
+pub(crate) fn build_upload_location(prefix: &str, repo_key: &str, session_id: &Uuid) -> String {
+    format!("{}/{}/uploads/{}", prefix, repo_key, session_id)
+}
+
+/// Determine the mount prefix from the request URI.
+///
+/// The Incus handler is mounted under both `/incus` and `/lxc` (see
+/// `backend/src/api/routes.rs`). URL builders need to emit the same prefix
+/// the client used so SimpleStreams catalog paths and chunked-upload
+/// `Location` headers don't cross prefixes (#1320).
+///
+/// Returns `"/lxc"` if the request path begins with `/lxc/` or is exactly
+/// `/lxc`; otherwise falls back to `"/incus"`. The fallback covers requests
+/// that arrive with a stripped path (e.g. behind a reverse proxy that
+/// rewrites the prefix) and preserves the historical default.
+pub(crate) fn mount_prefix_from_uri(uri: &Uri) -> &'static str {
+    let path = uri.path();
+    if path == "/lxc" || path.starts_with("/lxc/") {
+        "/lxc"
+    } else {
+        "/incus"
+    }
 }
 
 /// Build the SimpleStreams index JSON structure.
@@ -465,9 +493,11 @@ async fn streams_index(
 
 async fn streams_images(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath(repo_key): AxumPath<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     let rows = sqlx::query(
         r#"
@@ -507,7 +537,7 @@ async fn streams_images(
 
         let filename = filename_from_path(&path);
         let ftype = simplestreams_ftype(filename);
-        let download_url = build_download_url(&repo_key, &name, &version, filename);
+        let download_url = build_download_url(prefix, &repo_key, &name, &version, filename);
 
         let item = serde_json::json!({
             "ftype": ftype,
@@ -771,17 +801,28 @@ async fn delete_image(
 // Chunked / resumable upload endpoints
 // ===========================================================================
 
-/// Look up an upload session by UUID.
-async fn get_session(db: &PgPool, session_id: Uuid) -> Result<UploadSession, Response> {
+/// Look up an upload session by UUID, scoped to a specific repository.
+///
+/// Issue #1317: chunked-upload session lookups must bind the URL's `repo_key`
+/// against `session.repository_id` so that a session created in repo A cannot
+/// be driven (chunked/finalized/cancelled) via repo B's URL. Returning the
+/// same 404 shape for "session does not exist" and "session does not belong
+/// to this repo" avoids leaking session existence across repos.
+async fn get_session(
+    db: &PgPool,
+    session_id: Uuid,
+    repo_id: Uuid,
+) -> Result<UploadSession, Response> {
     sqlx::query_as::<_, UploadSession>(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
                filename, bytes_received, storage_temp_path
         FROM incus_upload_sessions
-        WHERE id = $1
+        WHERE id = $1 AND repository_id = $2
         "#,
     )
     .bind(session_id)
+    .bind(repo_id)
     .fetch_optional(db)
     .await
     .map_err(db_err)?
@@ -808,12 +849,14 @@ struct UploadSession {
 async fn start_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -870,7 +913,10 @@ async fn start_chunked_upload(
 
     Ok(Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header("Location", build_upload_location(&repo_key, &session_id))
+        .header(
+            "Location",
+            build_upload_location(prefix, &repo_key, &session_id),
+        )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", initial_bytes))
         .header(CONTENT_TYPE, "application/json")
@@ -891,13 +937,18 @@ async fn start_chunked_upload(
 async fn upload_chunk(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be driven via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     // Append body to temp file (no read-back of existing data)
     let bytes_written = append_body_to_file(body, &temp_path).await?;
@@ -922,7 +973,10 @@ async fn upload_chunk(
 
     Ok(Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header("Location", build_upload_location(&repo_key, &session_id))
+        .header(
+            "Location",
+            build_upload_location(prefix, &repo_key, &session_id),
+        )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", new_total))
         .body(Body::empty())
@@ -942,8 +996,10 @@ async fn complete_chunked_upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
-    let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be finalized via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append any final body data
@@ -1039,11 +1095,14 @@ async fn complete_chunked_upload(
 async fn cancel_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be cancelled via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     // Delete temp file
     let _ = tokio::fs::remove_file(&session.storage_temp_path).await;
@@ -1069,9 +1128,12 @@ async fn cancel_chunked_upload(
 
 async fn get_upload_progress(
     State(state): State<SharedState>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so progress for
+    // a session in repo A cannot be probed via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1401,7 +1463,13 @@ mod tests {
     #[test]
     fn test_build_download_url() {
         assert_eq!(
-            build_download_url("my-repo", "ubuntu-noble", "20240215", "incus.tar.xz"),
+            build_download_url(
+                "/incus",
+                "my-repo",
+                "ubuntu-noble",
+                "20240215",
+                "incus.tar.xz"
+            ),
             "/incus/my-repo/images/ubuntu-noble/20240215/incus.tar.xz"
         );
     }
@@ -1409,9 +1477,39 @@ mod tests {
     #[test]
     fn test_build_download_url_with_squashfs() {
         assert_eq!(
-            build_download_url("repo", "alpine", "v3.19", "rootfs.squashfs"),
+            build_download_url("/incus", "repo", "alpine", "v3.19", "rootfs.squashfs"),
             "/incus/repo/images/alpine/v3.19/rootfs.squashfs"
         );
+    }
+
+    /// #1320: when the request arrives via `/lxc/...`, the download URL emitted
+    /// in the SimpleStreams catalog must use the `/lxc` prefix, not `/incus`.
+    #[test]
+    fn test_build_download_url_with_lxc_prefix() {
+        assert_eq!(
+            build_download_url(
+                "/lxc",
+                "my-repo",
+                "ubuntu-noble",
+                "20240215",
+                "incus.tar.xz"
+            ),
+            "/lxc/my-repo/images/ubuntu-noble/20240215/incus.tar.xz"
+        );
+    }
+
+    /// #1320: `build_download_url` must not contain the literal `/incus/` when
+    /// invoked with the `/lxc` prefix. Pins prefix-independence at the
+    /// function level so a future refactor that re-hardcodes the prefix
+    /// fails loudly.
+    #[test]
+    fn test_build_download_url_does_not_leak_incus_under_lxc() {
+        let url = build_download_url("/lxc", "repo", "alpine", "v3.19", "rootfs.squashfs");
+        assert!(
+            !url.starts_with("/incus/"),
+            "/lxc request emitted /incus URL: {url}"
+        );
+        assert!(url.starts_with("/lxc/"), "expected /lxc prefix: {url}");
     }
 
     // -----------------------------------------------------------------------
@@ -1573,8 +1671,77 @@ mod tests {
     fn test_build_upload_location() {
         let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
-            build_upload_location("my-repo", &session_id),
+            build_upload_location("/incus", "my-repo", &session_id),
             "/incus/my-repo/uploads/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// #1320: chunked upload `Location` header must use the `/lxc` prefix
+    /// when the request came in via `/lxc/...`.
+    #[test]
+    fn test_build_upload_location_with_lxc_prefix() {
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            build_upload_location("/lxc", "my-repo", &session_id),
+            "/lxc/my-repo/uploads/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// #1320: `mount_prefix_from_uri` maps each known request prefix back to
+    /// the matching mount path, and falls back to `/incus` for anything
+    /// unrecognized (preserves the historical default).
+    #[test]
+    fn test_mount_prefix_from_uri_incus() {
+        let uri: Uri = "/incus/my-repo/streams/v1/images.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_lxc() {
+        let uri: Uri = "/lxc/my-repo/streams/v1/images.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/lxc");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_lxc_exact_root() {
+        // Defensive: the exact path `/lxc` (no trailing slash) is still /lxc.
+        let uri: Uri = "/lxc".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/lxc");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_does_not_match_substrings() {
+        // Defensive: a path that merely contains `lxc` somewhere else (e.g.
+        // a repo key) must not be misread as the /lxc mount.
+        let uri: Uri = "/incus/lxc-images/streams/v1/index.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_unknown_falls_back_to_incus() {
+        let uri: Uri = "/some/other/path".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    /// #1320: combined check -- if the request arrives under `/lxc/`, both the
+    /// download URL and the upload Location must consistently use `/lxc`,
+    /// never `/incus`.
+    #[test]
+    fn test_url_builders_prefix_consistent_for_lxc_request() {
+        let uri: Uri = "/lxc/my-repo/streams/v1/images.json".parse().unwrap();
+        let prefix = mount_prefix_from_uri(&uri);
+        let dl = build_download_url(prefix, "my-repo", "ubuntu", "20240215", "incus.tar.xz");
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let loc = build_upload_location(prefix, "my-repo", &session_id);
+        assert!(dl.starts_with("/lxc/"), "download URL not under /lxc: {dl}");
+        assert!(
+            loc.starts_with("/lxc/"),
+            "upload Location not under /lxc: {loc}"
+        );
+        assert!(!dl.contains("/incus/"), "download URL leaks /incus: {dl}");
+        assert!(
+            !loc.contains("/incus/"),
+            "upload Location leaks /incus: {loc}"
         );
     }
 
@@ -1975,7 +2142,7 @@ mod tests {
         let version = "20240215";
         let filename = "incus.tar.xz";
         let artifact_path = build_artifact_path(product, version, filename);
-        let download_url = build_download_url("my-repo", product, version, filename);
+        let download_url = build_download_url("/incus", "my-repo", product, version, filename);
 
         assert_eq!(artifact_path, "ubuntu-noble/20240215/incus.tar.xz");
         assert!(download_url.ends_with(&artifact_path));
@@ -2128,6 +2295,262 @@ mod tests {
         .expect("query package_versions");
         assert_eq!(version_count.0, 1);
 
+        f.teardown().await;
+    }
+}
+
+// ===========================================================================
+// Issue #1317 regression coverage (lib-side, picked up by the Coverage gate).
+//
+// The corresponding integration suite lives in
+// `backend/tests/incus_upload_tests.rs` and is also wired into the CI
+// integration matrix. These lib-side tests are intentionally redundant so
+// that `cargo llvm-cov --workspace --lib` instruments the cross-repo session
+// rejection branch in `upload_chunk`, `complete_chunked_upload`,
+// `cancel_chunked_upload`, and `get_upload_progress`. Without them the new
+// 404-on-cross-repo lines would appear uncovered to the coverage gate
+// (`--lib` excludes the `tests/` directory).
+//
+// Tests skip when `DATABASE_URL` is unset (matches the rest of the
+// `tdh::`-style suites).
+// ===========================================================================
+
+#[cfg(test)]
+mod cross_repo_session_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Insert a second Incus repository under the same fixture pool and
+    /// return its key. Used to drive cross-repo PATCH/PUT/DELETE/GET against
+    /// a session owned by the fixture's primary repo.
+    async fn create_second_incus_repo(pool: &PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-incus-b-{}", id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local'::repository_type, 'incus'::repository_format)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("create second repo");
+        (id, key)
+    }
+
+    /// POST start a chunked upload under the fixture's primary repo and
+    /// return the session UUID. Asserts a 202 response.
+    async fn start_session(f: &tdh::Fixture) -> Uuid {
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/images/alpine/3.20/rootfs.tar.gz/uploads",
+                f.repo_key
+            ))
+            .body(Body::from(b"initial-bytes".to_vec()))
+            .expect("build POST request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "POST start under owning repo should be 202: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON body");
+        let session_id_str = json["session_id"].as_str().expect("session_id field");
+        session_id_str.parse().expect("session_id is a UUID")
+    }
+
+    async fn cleanup_second_repo(pool: &PgPool, repo_b_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE repository_id = $1")
+            .bind(repo_b_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// PATCH chunk under repo B must be rejected with 404 even though the
+    /// session exists in repo A (issue #1317). The same-repo PATCH must
+    /// continue to succeed so we cover both branches of the new
+    /// `get_session(... repo_id ...)` lookup.
+    #[tokio::test]
+    async fn upload_chunk_cross_repo_rejected_and_same_repo_ok() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        // Cross-repo PATCH: must be 404 (does NOT touch the session row).
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::from(b"attacker-chunk".to_vec()))
+            .expect("build PATCH request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "PATCH chunk under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Same-repo PATCH: covers the happy-path branch of the new lookup.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(b"legitimate-chunk".to_vec()))
+            .expect("build PATCH request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "PATCH chunk under owning repo should still be 202"
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// PUT complete under repo B must be 404; the legitimate session in
+    /// repo A must remain intact so subsequent operations under repo A keep
+    /// working.
+    #[tokio::test]
+    async fn complete_chunked_upload_cross_repo_rejected() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build PUT request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "PUT complete under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Session row must still be there (cross-repo PUT must NOT have
+        // deleted or finalized it).
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count sessions");
+        assert_eq!(still_there, 1, "cross-repo PUT must not delete session");
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// DELETE cancel under repo B must be 404 and must NOT remove the
+    /// session row owned by repo A.
+    #[tokio::test]
+    async fn cancel_chunked_upload_cross_repo_rejected() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build DELETE request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "DELETE cancel under wrong repo must be 404 (issue #1317)"
+        );
+
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count sessions");
+        assert_eq!(
+            still_there, 1,
+            "cross-repo DELETE must not remove legitimate session"
+        );
+
+        // Legitimate DELETE under owning repo still works (covers
+        // happy-path branch of `cancel_chunked_upload`'s session lookup).
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "DELETE under owning repo should succeed"
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// GET progress under repo B must be 404; under repo A it must return
+    /// 200 with the expected JSON shape (covers both branches of the
+    /// session lookup in `get_upload_progress`).
+    #[tokio::test]
+    async fn get_upload_progress_cross_repo_rejected_and_same_repo_ok() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET progress under wrong repo must be 404 (issue #1317)"
+        );
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET progress under owning repo should be 200: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
         f.teardown().await;
     }
 }

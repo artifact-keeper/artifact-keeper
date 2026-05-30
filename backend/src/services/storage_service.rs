@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
@@ -126,6 +127,20 @@ impl FilesystemBackend {
             .collect();
         self.base_path.join(sanitized)
     }
+
+    fn temp_write_path(&self, path: &std::path::Path) -> Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "Cannot derive temporary storage path for {}",
+                    path.display()
+                ))
+            })?;
+
+        Ok(path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple())))
+    }
 }
 
 #[async_trait]
@@ -138,15 +153,22 @@ impl StorageBackend for FilesystemBackend {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write atomically via temp file
-        let temp_path = path.with_extension("tmp");
+        // Write atomically via a unique temp file so concurrent same-key writes
+        // do not stomp each other's staging path before rename.
+        let temp_path = self.temp_write_path(&path)?;
         let mut file = fs::File::create(&temp_path).await?;
-        file.write_all(&content).await?;
+        if let Err(e) = file.write_all(&content).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
         file.sync_all().await?;
         drop(file);
 
         // Rename to final location
-        fs::rename(&temp_path, &path).await?;
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
 
         Ok(())
     }
@@ -282,7 +304,7 @@ impl StorageBackend for FilesystemBackend {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp_path = path.with_extension("tmp");
+        let temp_path = self.temp_write_path(&path)?;
         let mut file = fs::File::create(&temp_path).await?;
 
         let mut hasher = Sha256::new();
@@ -311,7 +333,10 @@ impl StorageBackend for FilesystemBackend {
         }
         file.sync_all().await?;
         drop(file);
-        fs::rename(&temp_path, &path).await?;
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -737,6 +762,19 @@ mod tests {
         let backend = FilesystemBackend::new(PathBuf::from("/storage"));
         let path = backend.key_to_path("file.bin");
         assert_eq!(path, PathBuf::from("/storage/file.bin"));
+    }
+
+    #[test]
+    fn test_filesystem_backend_temp_write_path_is_unique() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("proxy-cache/repo/pkg/__content__");
+
+        let first = backend.temp_write_path(&path).expect("temp path");
+        let second = backend.temp_write_path(&path).expect("temp path");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
     }
 
     #[tokio::test]

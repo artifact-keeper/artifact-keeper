@@ -149,6 +149,29 @@ pub(crate) fn status_string_from_acknowledged(all_acknowledged: bool) -> &'stati
     }
 }
 
+/// Project a `CveStatus` request onto the boolean `scan_findings.is_acknowledged`
+/// column the Security tab acknowledge path actually writes to.
+///
+/// Returns:
+///   - `Ok(Some(true))`  for `Acknowledged` and `FalsePositive` (the
+///     boolean column collapses both; the reason field carries the
+///     audit distinction).
+///   - `Ok(Some(false))` for `Open` (revoke an existing acknowledgement).
+///   - `Ok(None)`        for `Fixed`, signalling the caller that no
+///     `scan_findings` mutation is possible -- "fixed" is a curated-only
+///     lifecycle state. The handler turns this into a 400 with a clear
+///     message rather than silently coercing.
+///
+/// Pulled out of `update_cve_status_by_artifact_cve` so the mapping is
+/// unit-testable without a Postgres pool. (#1426)
+pub(crate) fn cve_status_to_acknowledge_flag(status: CveStatus) -> Option<bool> {
+    match status {
+        CveStatus::Acknowledged | CveStatus::FalsePositive => Some(true),
+        CveStatus::Open => Some(false),
+        CveStatus::Fixed => None,
+    }
+}
+
 /// Map the `all_acknowledged` flag to a typed `CveStatus` for the timeline
 /// projection in `get_cve_trends`. Mirrors `status_string_from_acknowledged`
 /// but returns the enum directly because the timeline DTO is typed.
@@ -1218,6 +1241,126 @@ impl SbomService {
         .await?;
 
         Ok(entry)
+    }
+
+    /// Update CVE status for an (artifact, cve) pair by mutating the
+    /// underlying `scan_findings` rows.
+    ///
+    /// Why this exists (#1426): the Security tab read path projects
+    /// `scan_findings` rows into synthetic `CveHistoryEntry` values whose
+    /// `id` is a hash-derived UUID with no corresponding row in
+    /// `cve_history`. The legacy acknowledge endpoint
+    /// `POST /sbom/cve/status/{id}` writes to `cve_history` only, so an
+    /// "acknowledge" click on a scan-derived row returned 404 -- the second,
+    /// unwired acknowledge path called out in the issue. This method gives
+    /// the Security tab a working acknowledge path by updating the source
+    /// table (`scan_findings`) directly, keyed on (artifact_id, cve_id)
+    /// because that is the only stable identity a synth row carries.
+    ///
+    /// `status` mapping (the four-state `cve_history.status` does not exist
+    /// on `scan_findings`; the only acknowledge column there is the
+    /// boolean `is_acknowledged`):
+    ///
+    /// - `Acknowledged` / `FalsePositive` -- set `is_acknowledged = true`,
+    ///   record `acknowledged_by` / `acknowledged_at` / `acknowledged_reason`.
+    ///   `false_positive` collapses to `acknowledged` on `scan_findings` since
+    ///   the table has no separate column; the reason field carries the
+    ///   distinction for audit.
+    /// - `Open` -- clear acknowledgement (mirror of the `revoke` endpoint).
+    /// - `Fixed` -- not supported by `scan_findings`; returns `Validation`.
+    ///   "Fixed" is only meaningful on curated `cve_history` rows.
+    ///
+    /// Returns a synthetic `CveHistoryEntry` reflecting the post-update
+    /// aggregate state (same shape the read path returns). Returns
+    /// `AppError::NotFound` when no matching `scan_findings` rows exist;
+    /// the caller turns that into 404.
+    pub async fn update_cve_status_by_artifact_cve(
+        &self,
+        artifact_id: Uuid,
+        cve_id: &str,
+        status: CveStatus,
+        user_id: Option<Uuid>,
+        reason: Option<&str>,
+    ) -> Result<CveHistoryEntry> {
+        // `scan_findings` only models a binary acknowledge state. `fixed`
+        // has no representation; refuse rather than silently coerce.
+        let acknowledge = cve_status_to_acknowledge_flag(status).ok_or_else(|| {
+            AppError::Validation(
+                "Status 'fixed' is not supported on scan-derived CVE entries; \
+                 only 'open', 'acknowledged', and 'false_positive' map to scan_findings"
+                    .to_string(),
+            )
+        })?;
+
+        // Compare CVE id case-insensitively. The schema does not constrain
+        // case on `scan_findings.cve_id`, and the synth ids the read path
+        // emits are upper-case, so we LOWER both sides.
+        let affected = if acknowledge {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = TRUE,
+                    acknowledged_by = $3,
+                    acknowledged_reason = $4,
+                    acknowledged_at = NOW()
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .bind(user_id)
+            .bind(reason)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = FALSE,
+                    acknowledged_by = NULL,
+                    acknowledged_reason = NULL,
+                    acknowledged_at = NULL
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        };
+
+        if affected == 0 {
+            return Err(AppError::NotFound(format!(
+                "No scan_findings rows for artifact {} and CVE {}",
+                artifact_id, cve_id
+            )));
+        }
+
+        // Re-read the (now-mutated) aggregate so the response carries the
+        // same shape as the read path: synth id, aggregated severity, MIN/MAX
+        // detection timestamps, and an `all_acknowledged` flag that now
+        // reflects the just-written state.
+        let known: HashSet<String> = HashSet::new();
+        let entries = self
+            .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
+            .await?;
+        let cve_upper = cve_id.to_ascii_uppercase();
+        entries
+            .into_iter()
+            .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Updated scan_findings rows but could not re-read aggregate \
+                     for artifact {} and CVE {}",
+                    artifact_id, cve_id
+                ))
+            })
     }
 
     /// Get CVE trends for a repository.
@@ -2989,6 +3132,47 @@ mod tests {
         assert!(scan_row_passes_known_filter(Some("CVE-2019-10744"), &known));
     }
 
+    // --- cve_status_to_acknowledge_flag (#1426) ----------------------------
+    //
+    // The Security tab read path projects `scan_findings` into synth
+    // `CveHistoryEntry` rows; `update_cve_status_by_artifact_cve` writes the
+    // same table back. `scan_findings` only models a binary acknowledge
+    // state, so the four-state `CveStatus` enum has to collapse onto a
+    // `bool`. These tests pin the mapping rules so a future enum-variant
+    // addition doesn't silently coerce.
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_acknowledged_is_true() {
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::Acknowledged),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_false_positive_collapses_to_true() {
+        // `scan_findings` has no separate "false positive" column. The
+        // boolean column models "the user told us to hide this"; the reason
+        // field carries the audit distinction.
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::FalsePositive),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_open_is_false() {
+        // `Open` is the revoke-acknowledgement path on the Security tab.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Open), Some(false));
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_fixed_is_none() {
+        // "Fixed" has no representation on `scan_findings`. The handler
+        // must surface a 400, not silently set is_acknowledged = true.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Fixed), None);
+    }
+
     // --- severity_rank / severity_from_rank --------------------------------
     //
     // Round-2 regression coverage for the lexicographic-MAX bug (#1375). The
@@ -3907,5 +4091,472 @@ mod tests {
                 "all-repos SQL missing rank clause: {label_then}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // update_cve_status_by_artifact_cve (#1426)
+    //
+    // DB-backed coverage for the synth-id acknowledge path. These tests
+    // require a live `DATABASE_URL` (provided by CI's coverage job, which
+    // seeds Postgres + applies migrations before `cargo llvm-cov --lib`).
+    // Locally they no-op when `DATABASE_URL` is unset, so `cargo test --lib`
+    // stays green without Postgres.
+    //
+    // What we cover:
+    //   * Happy path Acknowledged: writes `is_acknowledged = true`,
+    //     populates the audit fields, and re-reads the synth aggregate.
+    //   * Happy path FalsePositive: collapses to `true` on `scan_findings`
+    //     (the table has no separate column), reason field carries the
+    //     audit distinction.
+    //   * Happy path Open: clears acknowledgement back to false and nulls
+    //     the audit fields (mirror of the revoke endpoint).
+    //   * Validation: `Fixed` is unrepresentable on `scan_findings`, so the
+    //     service surfaces `AppError::Validation` rather than silently
+    //     coercing.
+    //   * Not-found: no matching `scan_findings` rows for (artifact, cve)
+    //     produces `AppError::NotFound` (handler maps that to 404).
+    //   * Case-insensitive CVE match: lower/upper-case CVE strings on
+    //     either side of the comparison must still find the row.
+    //   * Multi-row aggregate: when two findings share (artifact, cve), the
+    //     update touches both, the post-write aggregate uses MIN/MAX of
+    //     detection timestamps, and `all_acknowledged` reflects both rows.
+    // -----------------------------------------------------------------------
+
+    /// Connect to the test database when `DATABASE_URL` is set; otherwise
+    /// return `None` so the test skips cleanly.
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    /// Seed a repository row with a unique key/storage path.
+    async fn seed_repo(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("sbom-cve-test-{}", id);
+        let storage = format!("/tmp/sbom-cve-test/{}", id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local', 'generic')",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(&storage)
+        .execute(pool)
+        .await
+        .expect("seed repository");
+        id
+    }
+
+    /// Seed an artifact row. `name` is uniquified to avoid (repository_id,
+    /// path) collisions across parallel test runs.
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{}/{}", repo_id, id);
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, repository_id, name, path, version,
+                                   size_bytes, checksum_sha256, content_type,
+                                   storage_key, is_deleted)
+            VALUES ($1, $2, $3, $4, '1.0.0', 1024, $5,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("a-{}", id))
+        .bind(&path)
+        .bind(format!("sha256-{}", id))
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+        id
+    }
+
+    /// Seed a completed scan_results row tied to (artifact, repo). Returns
+    /// the scan_result id so the caller can attach scan_findings to it.
+    async fn seed_scan_result(pool: &PgPool, artifact_id: Uuid, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (id, artifact_id, repository_id, scan_type,
+                                      status, findings_count, started_at,
+                                      completed_at)
+            VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW())
+            "#,
+        )
+        .bind(id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_result");
+        id
+    }
+
+    /// Seed an unacknowledged scan_findings row carrying the given CVE id.
+    async fn seed_finding(
+        pool: &PgPool,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        cve_id: &str,
+        severity: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_findings (id, scan_result_id, artifact_id, severity,
+                                       title, cve_id, source, is_acknowledged)
+            VALUES ($1, $2, $3, $4, $5, $6, 'trivy', false)
+            "#,
+        )
+        .bind(id)
+        .bind(scan_result_id)
+        .bind(artifact_id)
+        .bind(severity)
+        .bind(format!("Test finding for {}", cve_id))
+        .bind(cve_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_finding");
+        id
+    }
+
+    /// Drop everything owned by the given repo so tests don't leak state.
+    async fn teardown(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Read back is_acknowledged + audit fields for one (artifact, cve)
+    /// scan_findings row. Returns `None` when no row matches.
+    async fn read_ack(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        cve_id: &str,
+    ) -> Option<(bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)> {
+        sqlx::query_as::<_, (bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at \
+             FROM scan_findings \
+             WHERE artifact_id = $1 AND LOWER(cve_id) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(artifact_id)
+        .bind(cve_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read_ack")
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_acknowledged_sets_flag_and_audit_fields() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        let _finding = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-1111", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-1111",
+                CveStatus::Acknowledged,
+                None,
+                Some("triaged: not exploitable"),
+            )
+            .await
+            .expect("acknowledge happy path");
+
+        // The response carries the synth aggregate shape: the cve_id is
+        // surfaced upper-case (the read path normalizes) and the
+        // post-write `status` reflects all_acknowledged = true.
+        assert_eq!(entry.cve_id.to_ascii_uppercase(), "CVE-2024-1111");
+        assert_eq!(entry.status, "acknowledged");
+        assert_eq!(entry.artifact_id, artifact_id);
+
+        // The underlying scan_findings row must carry the flag + audit
+        // payload the handler wrote.
+        let (ack, _by, reason, at) = read_ack(&pool, artifact_id, "CVE-2024-1111")
+            .await
+            .expect("finding row still present");
+        assert!(ack, "is_acknowledged must be true after Acknowledged");
+        assert_eq!(reason.as_deref(), Some("triaged: not exploitable"));
+        assert!(at.is_some(), "acknowledged_at must be set");
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_false_positive_collapses_to_acknowledged() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-2222", "medium").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-2222",
+                CveStatus::FalsePositive,
+                None,
+                Some("false positive: code path not reachable"),
+            )
+            .await
+            .expect("false_positive happy path");
+
+        // scan_findings has no separate FP column, so the synth row's
+        // status collapses to "acknowledged"; the reason field carries
+        // the audit distinction.
+        assert_eq!(entry.status, "acknowledged");
+
+        let (ack, _by, reason, _at) = read_ack(&pool, artifact_id, "CVE-2024-2222")
+            .await
+            .expect("finding row still present");
+        assert!(ack);
+        assert_eq!(
+            reason.as_deref(),
+            Some("false positive: code path not reachable")
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_open_revokes_acknowledgement() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        let finding_id = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-3333", "low").await;
+
+        // Pre-acknowledge so we can verify Open clears the state.
+        sqlx::query(
+            "UPDATE scan_findings SET is_acknowledged = true, \
+             acknowledged_reason = 'pre-ack', acknowledged_at = NOW() WHERE id = $1",
+        )
+        .bind(finding_id)
+        .execute(&pool)
+        .await
+        .expect("pre-acknowledge");
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-3333",
+                CveStatus::Open,
+                None,
+                None,
+            )
+            .await
+            .expect("open happy path");
+
+        assert_eq!(entry.status, "open");
+
+        let (ack, by, reason, at) = read_ack(&pool, artifact_id, "CVE-2024-3333")
+            .await
+            .expect("finding row still present");
+        assert!(!ack, "is_acknowledged must be false after Open");
+        assert!(
+            by.is_none() && reason.is_none() && at.is_none(),
+            "audit fields must be cleared after Open"
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_fixed_returns_validation_error() {
+        // `Fixed` has no representation on scan_findings. The service must
+        // surface AppError::Validation rather than silently coerce
+        // is_acknowledged = true (which would hide the finding from the
+        // Security tab and mislead operators).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-4444", "critical").await;
+
+        let service = SbomService::new(pool.clone());
+        let err = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-4444",
+                CveStatus::Fixed,
+                None,
+                None,
+            )
+            .await
+            .expect_err("fixed must be rejected");
+
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("fixed"),
+                    "validation message must mention 'fixed': {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+
+        // And the row must remain untouched (no silent coercion).
+        let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-4444")
+            .await
+            .expect("finding row still present");
+        assert!(
+            !ack,
+            "scan_findings.is_acknowledged must NOT change on Fixed rejection"
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_no_matching_rows_returns_not_found() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        // Seed a finding for a DIFFERENT CVE so the artifact has scans but
+        // the (artifact, cve) pair the caller asks about has no rows.
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-5555", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let err = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-9999",
+                CveStatus::Acknowledged,
+                None,
+                Some("won't match"),
+            )
+            .await
+            .expect_err("no matching rows must 404");
+
+        match err {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("CVE-2024-9999"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_match_is_case_insensitive() {
+        // Synth ids returned by the read path are upper-case but scanners
+        // sometimes emit mixed case. The UPDATE must lower-case both sides
+        // so a click on the Security tab still lands on the right row.
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "cve-2024-6666", "medium").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-6666",
+                CveStatus::Acknowledged,
+                None,
+                Some("case-insensitive match"),
+            )
+            .await
+            .expect("case-insensitive match must succeed");
+
+        assert_eq!(entry.status, "acknowledged");
+
+        let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-6666")
+            .await
+            .expect("finding row still present");
+        assert!(ack);
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_updates_all_matching_findings() {
+        // Two scan_findings rows can share (artifact, cve) when the same
+        // CVE surfaces from multiple scans or multiple components. The
+        // UPDATE has no LIMIT, so both rows must flip and the synth
+        // aggregate's `all_acknowledged` flag must reflect that.
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-7777", "critical").await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-7777", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-7777",
+                CveStatus::Acknowledged,
+                None,
+                Some("ack both rows"),
+            )
+            .await
+            .expect("multi-row acknowledge");
+
+        // The aggregate must collapse to "acknowledged" only if BOTH rows
+        // are acknowledged (BOOL_AND semantics). The service uses an
+        // unbounded UPDATE, so this is the regression assertion.
+        assert_eq!(entry.status, "acknowledged");
+
+        // Direct count verification: both rows must be ack'd.
+        let acked: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scan_findings \
+             WHERE artifact_id = $1 AND cve_id = $2 AND is_acknowledged = true",
+        )
+        .bind(artifact_id)
+        .bind("CVE-2024-7777")
+        .fetch_one(&pool)
+        .await
+        .expect("count acked rows");
+        assert_eq!(acked.0, 2, "both scan_findings rows must be acknowledged");
+
+        teardown(&pool, repo_id).await;
     }
 }

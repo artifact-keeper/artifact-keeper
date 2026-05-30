@@ -1079,3 +1079,417 @@ async fn test_size_quota_under_limit_evicts_nothing() {
 
     cleanup_with_downloads(&pool, repo_id).await;
 }
+
+// =============================================================================
+// Regression coverage for issue #1407 across the remaining policy types.
+//
+// The original cascade tests covered `tag_pattern_delete` and `max_age_days`.
+// The four tests below close that gap so every code path that flips
+// `artifacts.is_deleted = true` is exercised against the cascade. A regression
+// that drops the cascade call (or routes a new policy type around
+// `execute_policy`) will fail at least one of these.
+// =============================================================================
+
+/// `max_versions` retains the latest N artifacts per name and soft-deletes the
+/// rest. Manifests pushed with the same `name` (e.g. multiple builds of the
+/// same image tag stream) and digest references need their `oci_tags` rows
+/// reclaimed too.
+#[tokio::test]
+#[ignore]
+async fn test_max_versions_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-mv-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Three artifacts share the same `name` ("img:rolling") so max_versions
+    // with keep=1 will soft-delete the two older ones. Each has its own
+    // (digest, tag) so the cascade has three distinct (path, storage_key)
+    // join targets to consider.
+    let digest_old = "sha256:1407aa00000000000000000000000000000000000000000000000000000001";
+    let digest_mid = "sha256:1407aa00000000000000000000000000000000000000000000000000000002";
+    let digest_new = "sha256:1407aa00000000000000000000000000000000000000000000000000000003";
+
+    // insert_oci_manifest_artifact sets `name = "{image}:{tag}"`. To make all
+    // three rows share the same name (the field max_versions partitions on),
+    // we insert them via a single-image, single-tag shape and override the
+    // tag per row to keep `(repository_id, path)` unique.
+    let _id_old =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "rolling-1", digest_old, 100).await;
+    let _id_mid =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "rolling-2", digest_mid, 100).await;
+    let _id_new =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "rolling-3", digest_new, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "rolling-1", digest_old).await;
+    insert_oci_tag(&pool, repo_id, "img", "rolling-2", digest_mid).await;
+    insert_oci_tag(&pool, repo_id, "img", "rolling-3", digest_new).await;
+
+    // Force all three rows to share the same `name` so they form one
+    // max_versions partition. The insert helper writes "img:<tag>"; rewrite
+    // it to a single canonical name. The cascade still keys on `path`, not
+    // `name`, so this rewrite does not weaken the join.
+    sqlx::query("UPDATE artifacts SET name = 'img:rolling' WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("failed to align names for max_versions partition");
+
+    // Backdate so created_at ordering is deterministic.
+    sqlx::query(
+        "UPDATE artifacts SET created_at = NOW() - INTERVAL '3 days' WHERE storage_key = $1",
+    )
+    .bind(format!("oci-manifests/{}", digest_old))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE artifacts SET created_at = NOW() - INTERVAL '2 days' WHERE storage_key = $1",
+    )
+    .bind(format!("oci-manifests/{}", digest_mid))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Keep latest".to_string(),
+            description: None,
+            policy_type: "max_versions".to_string(),
+            config: serde_json::json!({"keep": 1}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 2);
+
+    // Cascade must have removed the two older oci_tags rows; only the
+    // most-recent rolling-3 tag survives.
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "rolling-1").await,
+        "max_versions cascade must remove oci_tags for the oldest rolling artifact"
+    );
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "rolling-2").await,
+        "max_versions cascade must remove oci_tags for the middle rolling artifact"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "rolling-3").await,
+        "the kept tag must survive the cascade"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// `no_downloads_days` soft-deletes artifacts that have not been downloaded
+/// in the configured window. Manifests in this state are exactly the kind of
+/// long-tail content the production observation in #1407 saw piling up;
+/// without the cascade, the `oci_tags` row keeps them tethered.
+#[tokio::test]
+#[ignore]
+async fn test_no_downloads_days_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-nd-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // One cold manifest (no downloads, created 30 days ago) plus one warm
+    // one (downloaded yesterday, created 30 days ago). The policy targets
+    // anything older than 7 days with no recent downloads, so only the cold
+    // one is soft-deleted.
+    let cold_digest = "sha256:1407bb00000000000000000000000000000000000000000000000000000001";
+    let warm_digest = "sha256:1407bb00000000000000000000000000000000000000000000000000000002";
+    let cold_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "cold", cold_digest, 100).await;
+    let warm_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "warm", warm_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "cold", cold_digest).await;
+    insert_oci_tag(&pool, repo_id, "img", "warm", warm_digest).await;
+
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+        .bind(cold_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+        .bind(warm_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    record_download(&pool, warm_id, "2026-05-28T00:00:00Z").await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop cold".to_string(),
+            description: None,
+            policy_type: "no_downloads_days".to_string(),
+            config: serde_json::json!({"days": 7}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, cold_id).await);
+    assert!(!is_deleted(&pool, warm_id).await);
+
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "cold").await,
+        "no_downloads_days cascade must remove oci_tags for the cold manifest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "warm").await,
+        "the downloaded manifest's tag must survive"
+    );
+
+    cleanup_with_downloads(&pool, repo_id).await;
+}
+
+/// `tag_pattern_keep` is the inverse of `tag_pattern_delete`. The cascade
+/// runs at the end of `execute_policy` regardless of which side of the
+/// pattern split was matched, so the kept-vs-evicted bookkeeping must
+/// propagate correctly into the oci_tags removal.
+#[tokio::test]
+#[ignore]
+async fn test_tag_pattern_keep_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-tpk-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Keep anything that starts with "v" (semver tags); evict everything
+    // else. Insert one of each.
+    let release_digest = "sha256:1407cc00000000000000000000000000000000000000000000000000000001";
+    let snapshot_digest = "sha256:1407cc00000000000000000000000000000000000000000000000000000002";
+    let release_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "v1.0.0", release_digest, 100).await;
+    let snapshot_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "nightly", snapshot_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "v1.0.0", release_digest).await;
+    insert_oci_tag(&pool, repo_id, "img", "nightly", snapshot_digest).await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Keep semver".to_string(),
+            description: None,
+            policy_type: "tag_pattern_keep".to_string(),
+            // `tag_pattern_keep` matches on `artifacts.name`, which the OCI
+            // handler writes as "{image}:{tag}". Anchor on the colon so the
+            // pattern keys on the tag portion only.
+            config: serde_json::json!({"pattern": ":v"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(!is_deleted(&pool, release_id).await);
+    assert!(is_deleted(&pool, snapshot_id).await);
+
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "nightly").await,
+        "tag_pattern_keep cascade must remove oci_tags for the non-matching (evicted) manifest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "v1.0.0").await,
+        "the kept semver tag must survive"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// `size_quota_bytes` uses LRU eviction. The pool of candidate artifacts is
+/// picked by Rust code (`select_size_quota_evictions`) and executed with a
+/// single `UPDATE ... WHERE id = ANY($1)`. Even though no SQL predicate
+/// touches manifest paths, the cascade still has to fire — that is what makes
+/// `execute_policy`'s post-dispatch cascade contract repo-type agnostic.
+#[tokio::test]
+#[ignore]
+async fn test_size_quota_bytes_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-sq-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Two manifests of 100 bytes each, quota of 100 bytes -> evict one. The
+    // never-downloaded one goes first by LRU rules.
+    let evict_digest = "sha256:1407dd00000000000000000000000000000000000000000000000000000001";
+    let keep_digest = "sha256:1407dd00000000000000000000000000000000000000000000000000000002";
+    let evict_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "evict-me", evict_digest, 100).await;
+    let keep_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "keep-me", keep_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "evict-me", evict_digest).await;
+    insert_oci_tag(&pool, repo_id, "img", "keep-me", keep_digest).await;
+
+    // Mark keep-me as downloaded so it ranks ahead of evict-me in LRU
+    // ordering (NULLS FIRST puts never-downloaded artifacts at the front
+    // of the eviction queue).
+    record_download(&pool, keep_id, "2026-05-29T00:00:00Z").await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Tight quota".to_string(),
+            description: None,
+            policy_type: "size_quota_bytes".to_string(),
+            config: serde_json::json!({"quota_bytes": 100}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, evict_id).await);
+    assert!(!is_deleted(&pool, keep_id).await);
+
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "evict-me").await,
+        "size_quota_bytes cascade must remove oci_tags for the LRU-evicted manifest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "keep-me").await,
+        "the still-quota-fitting manifest's tag must survive"
+    );
+
+    cleanup_with_downloads(&pool, repo_id).await;
+}
+
+/// End-to-end check of the chain the issue describes:
+///   lifecycle policy -> soft-delete artifact -> cascade oci_tags ->
+///   storage GC's orphan predicate recognises the storage key as orphan.
+///
+/// We don't invoke the real `StorageGcService::run_gc` (it requires a
+/// `StorageRegistry` and would touch real storage backends). Instead we
+/// re-execute the exact orphan predicate from
+/// `backend/src/services/storage_gc_service.rs` (the `ORPHAN_PREDICATE_SQL`
+/// constant) against the database state the cascade leaves behind. If the
+/// cascade ever regresses (or someone weakens the join), this assertion
+/// catches it because the predicate counts the manifest as still-referenced
+/// by `oci_tags` and the test fails. Per-key assertions only — no global
+/// counter, so the test stays safe under parallel coverage runs (the
+/// pattern from #1499).
+#[tokio::test]
+#[ignore]
+async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-gc-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let digest = "sha256:1407ee00000000000000000000000000000000000000000000000000000001";
+    let storage_key = format!("oci-manifests/{}", digest);
+    let id = insert_oci_manifest_artifact(&pool, repo_id, "img", "drop-me", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "drop-me", digest).await;
+
+    // Helper: re-evaluate the storage GC orphan predicate for our specific
+    // (storage_key, repository_id) tuple. This mirrors the NOT EXISTS chain
+    // in storage_gc_service.rs::ORPHAN_PREDICATE_SQL. We deliberately scope
+    // to a single (key, repo) tuple so the parallel test isolation issue
+    // fixed in #1499 cannot affect this assertion.
+    async fn is_storage_key_orphan(pool: &PgPool, repo_id: Uuid, storage_key: &str) -> bool {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE a.storage_key = $1
+              AND a.repository_id = $2
+              AND a.is_deleted = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM artifacts a2
+                  WHERE a2.storage_key = a.storage_key
+                    AND a2.is_deleted = false
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM oci_tags ot
+                  JOIN repositories otr ON otr.id = ot.repository_id
+                  WHERE a.storage_key LIKE 'oci-manifests/%'
+                    AND ot.manifest_digest = SUBSTRING(
+                      a.storage_key FROM LENGTH('oci-manifests/') + 1
+                    )
+                    AND otr.storage_backend = r.storage_backend
+                    AND (
+                      r.storage_backend <> 'filesystem'
+                      OR otr.storage_path = r.storage_path
+                    )
+              )
+            "#,
+        )
+        .bind(storage_key)
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("orphan predicate query failed");
+        row.0 > 0
+    }
+
+    // Backdate so a max_age_days policy will pick it up.
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Pre-cascade sanity: the predicate must consider the key NOT orphan
+    // because the artifact is still live AND the oci_tags row is still
+    // present. (Either condition alone is enough; we assert against the
+    // post-state, not the cause.)
+    assert!(
+        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "pre-policy: storage_key must not be orphan (artifact is live + tag exists)"
+    );
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop > 7 days".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: serde_json::json!({"days": 7}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, id).await);
+
+    // The cascade reclaimed the oci_tags row. Now the orphan predicate
+    // should fire — exactly the chain the issue says was broken.
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "img", "drop-me").await,
+        "cascade must have removed the oci_tags row"
+    );
+    assert!(
+        is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "post-cascade: storage GC's orphan predicate must now recognise the manifest \
+         storage_key as reclaimable (this is the issue #1407 promise)"
+    );
+
+    cleanup(&pool, repo_id).await;
+}

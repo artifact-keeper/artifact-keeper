@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "bytes_received",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "storage_temp_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "85538eff744b81172f106545e6a4e58c353def584cff50f193acfa60954f213b"
+}
