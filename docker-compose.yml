@@ -104,10 +104,15 @@ services:
   # Changes the default Dependency-Track password and extracts an API key so
   # the backend can submit SBOMs automatically. Writes the key to a shared
   # volume that the backend reads at startup.
+  # Gated behind the `dtrack` profile so the default stack does not pull in
+  # Dependency-Track (issue #1432: DT consumes ~4 GiB RAM and pegs the
+  # bundled Postgres while idle).
   # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   dtrack-init:
     image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-dtrack-init
+    profiles:
+      - dtrack  # Only starts with: docker compose --profile dtrack up
     depends_on:
       postgres:
         condition: service_healthy
@@ -184,7 +189,11 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       # Dependency-Track integration (API key auto-provisioned by dtrack-init)
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
-      DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
+      # Default off: Dependency-Track is an optional integration that runs a
+      # heavyweight Java service plus its own NVD mirror. Operators opt in by
+      # setting DEPENDENCY_TRACK_ENABLED=true *and* starting the dtrack
+      # profile: `docker compose --profile dtrack up`. See issue #1432.
+      DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-false}
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
       # Generate with: openssl rand -base64 32, then set the variable in
@@ -291,12 +300,20 @@ services:
   # Dependency-Track API server (SBOM analysis)
   # ---------------------------------------------------------------------------
   # OWASP Dependency-Track provides SBOM ingestion, license analysis, and
-  # vulnerability tracking. Optional: set DEPENDENCY_TRACK_ENABLED=false on
-  # the backend and remove these services if you do not need SBOM analysis.
+  # vulnerability tracking. Gated behind the `dtrack` profile because the
+  # Java apiserver consumes ~4 GiB RAM and continuously drives the bundled
+  # Postgres even with no inbound load (issue #1432). Opt in with:
+  #   docker compose --profile dtrack up
+  # and set DEPENDENCY_TRACK_ENABLED=true on the backend so the integration
+  # actually fires. To also run the upstream DT UI alongside, combine the
+  # profiles:
+  #   docker compose --profile dtrack --profile dtrack-ui up
   # https://dependencytrack.org/
   dependency-track-apiserver:
     image: dependencytrack/apiserver:4.14.2
     container_name: artifact-keeper-dtrack-api
+    profiles:
+      - dtrack  # Only starts with: docker compose --profile dtrack up
     depends_on:
       postgres:
         condition: service_healthy
@@ -328,13 +345,15 @@ services:
 
   # Dependency-Track native frontend (optional, for debugging/admin).
   # Artifact Keeper integrates DT data into its own UI, so this is only
-  # useful for direct Dependency-Track access. Gated behind a profile:
-  #   docker compose --profile dtrack-ui up
+  # useful for direct Dependency-Track access. Gated behind the `dtrack-ui`
+  # profile, which implies `dtrack` (the upstream UI is useless without the
+  # apiserver). Run with:
+  #   docker compose --profile dtrack --profile dtrack-ui up
   dependency-track-frontend:
     image: dependencytrack/frontend:4.14.2
     container_name: artifact-keeper-dtrack-frontend
     profiles:
-      - dtrack-ui  # Only starts with: docker compose --profile dtrack-ui up
+      - dtrack-ui  # Requires the `dtrack` profile too; see comment above.
     depends_on:
       dependency-track-apiserver:
         condition: service_healthy

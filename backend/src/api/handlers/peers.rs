@@ -14,7 +14,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::peer_instance_service::{
     InstanceStatus, PeerInstanceService, RegisterPeerInstanceRequest as ServiceRegisterReq,
-    ReplicationMode,
+    ReplicationMode, SyncStatus,
 };
 use crate::services::peer_service::{PeerAnnouncement, PeerService};
 use crate::services::sync_policy_service::SyncPolicyService;
@@ -134,6 +134,45 @@ pub struct SyncTaskResponse {
     pub storage_key: String,
     pub artifact_size: i64,
     pub priority: i32,
+    /// Task status (e.g. "pending"). Listing currently returns pending tasks.
+    pub status: String,
+    /// When the task was enqueued. Lets clients tell a freshly-scheduled task
+    /// apart from a stale queue entry (used by the replication-schedule check).
+    /// Serialized as whole-second RFC3339 with a `Z` suffix
+    /// (e.g. `2026-05-29T12:34:56Z`) so simple ISO8601 parsers can consume it.
+    #[serde(serialize_with = "serialize_ts_secs")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the worker began transferring, if it has started. Same format as
+    /// `created_at`.
+    #[serde(serialize_with = "serialize_opt_ts_secs")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Serialize a timestamp as whole-second RFC3339 with a `Z` suffix
+/// (e.g. `2026-05-29T12:34:56Z`). chrono's default RFC3339 includes
+/// fractional seconds and a `+00:00` offset, which strict ISO8601 parsers
+/// (jq's `fromdateiso8601`, some SDKs) reject.
+fn serialize_ts_secs<S>(
+    ts: &chrono::DateTime<chrono::Utc>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn serialize_opt_ts_secs<S>(
+    ts: &Option<chrono::DateTime<chrono::Utc>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match ts {
+        Some(t) => serialize_ts_secs(t, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -155,6 +194,17 @@ pub struct IdentityResponse {
 
 fn require_admin(auth: &AuthExtension) -> Result<()> {
     auth.require_admin()
+}
+
+/// Map a `SyncStatus` to its wire label (snake_case, matching the DB enum).
+fn sync_status_label(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::Pending => "pending",
+        SyncStatus::InProgress => "in_progress",
+        SyncStatus::Completed => "completed",
+        SyncStatus::Failed => "failed",
+        SyncStatus::Cancelled => "cancelled",
+    }
 }
 
 fn parse_status(s: &str) -> Option<InstanceStatus> {
@@ -458,6 +508,10 @@ pub async fn get_sync_tasks(
             storage_key: t.storage_key,
             artifact_size: t.artifact_size,
             priority: t.priority,
+            // get_pending_sync_tasks only returns rows with status='pending'.
+            status: sync_status_label(t.status).to_string(),
+            created_at: t.created_at,
+            started_at: t.started_at,
         })
         .collect();
 
@@ -750,6 +804,66 @@ pub struct PeersApiDoc;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // sync_status_label tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_status_label_all_variants() {
+        assert_eq!(sync_status_label(SyncStatus::Pending), "pending");
+        assert_eq!(sync_status_label(SyncStatus::InProgress), "in_progress");
+        assert_eq!(sync_status_label(SyncStatus::Completed), "completed");
+        assert_eq!(sync_status_label(SyncStatus::Failed), "failed");
+        assert_eq!(sync_status_label(SyncStatus::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn test_sync_task_response_exposes_timestamps() {
+        // The replication-schedule e2e check reasons about task freshness via
+        // created_at; the response must serialize it.
+        let resp = SyncTaskResponse {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            storage_key: "k".to_string(),
+            artifact_size: 1,
+            priority: 0,
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v.get("created_at").is_some());
+        assert!(v.get("status").is_some());
+        assert!(v.as_object().unwrap().contains_key("started_at"));
+    }
+
+    #[test]
+    fn test_sync_task_created_at_serializes_whole_second_z() {
+        // jq's fromdateiso8601 (and strict ISO8601 parsers) only accept the
+        // whole-second `...Z` form. chrono's default RFC3339 (fractional secs,
+        // +00:00 offset) is rejected, so the field must use the second-precision
+        // Z serializer.
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-29T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let resp = SyncTaskResponse {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            storage_key: "k".to_string(),
+            artifact_size: 1,
+            priority: 0,
+            status: "pending".to_string(),
+            created_at: ts,
+            started_at: Some(ts),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["created_at"], "2026-05-29T12:34:56Z");
+        assert_eq!(v["started_at"], "2026-05-29T12:34:56Z");
+        // No fractional seconds, no numeric offset.
+        assert!(!v["created_at"].as_str().unwrap().contains('.'));
+        assert!(!v["created_at"].as_str().unwrap().contains('+'));
+    }
 
     // -----------------------------------------------------------------------
     // parse_status tests
@@ -1114,6 +1228,9 @@ mod tests {
             storage_key: "artifacts/maven/com/example/1.0/foo.jar".to_string(),
             artifact_size: 1024 * 1024,
             priority: 5,
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], id.to_string());
@@ -1124,6 +1241,7 @@ mod tests {
         );
         assert_eq!(json["artifact_size"], 1048576);
         assert_eq!(json["priority"], 5);
+        assert_eq!(json["status"], "pending");
     }
 
     // -----------------------------------------------------------------------

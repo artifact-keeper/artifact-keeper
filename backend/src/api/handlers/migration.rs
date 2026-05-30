@@ -573,14 +573,35 @@ async fn delete_connection(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
+    // A connection is the parent resource for its migration jobs. The
+    // migration_jobs.source_connection_id FK has no ON DELETE clause (it
+    // defaults to NO ACTION), so a raw DELETE on a connection that still has
+    // jobs surfaced a bare Postgres FK-violation as HTTP 500. Cascade the
+    // delete explicitly inside a transaction: remove the dependent jobs first
+    // (migration_items and migration_reports already CASCADE off migration_jobs),
+    // then the connection. This makes connection deletion idempotent and a
+    // second DELETE correctly returns 404 instead of repeating the 500.
+    let mut tx = state.db.begin().await?;
+
+    sqlx::query("DELETE FROM migration_jobs WHERE source_connection_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
     let result = sqlx::query("DELETE FROM source_connections WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
 
     if result.rows_affected() == 0 {
+        // Nothing was deleted: the connection did not exist. Roll the
+        // transaction back (the job-delete above was a no-op anyway) and
+        // report 404 so a repeat delete is distinguishable from a server error.
+        tx.rollback().await?;
         return Err(AppError::NotFound("Source connection not found".into()));
     }
+
+    tx.commit().await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1281,6 +1302,18 @@ async fn cancel_migration(
     .ok_or_else(|| {
         AppError::Conflict("Migration cannot be cancelled (wrong state or not found)".into())
     })?;
+
+    // Cancellation is a terminal transition, so materialise the migration
+    // report for the audit trail. Operators (and compliance tooling) fetch
+    // GET /{id}/report after a job stops; without this the report endpoint
+    // would 404 forever for cancelled jobs. generate_report upserts on the
+    // UNIQUE job_id, so this is safe even if a report already exists. A
+    // failure here is logged but does not roll back the cancel: the job is
+    // already cancelled and reporting is best-effort metadata.
+    let service = MigrationService::new(state.db.clone());
+    if let Err(e) = service.generate_report(job.id).await {
+        tracing::error!(job_id = %job.id, error = %e, "Failed to generate migration report on cancel");
+    }
 
     Ok(Json(job.into()))
 }

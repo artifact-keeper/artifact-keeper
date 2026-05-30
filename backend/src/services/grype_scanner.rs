@@ -28,8 +28,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
-    is_oci_image_artifact, parse_oci_manifest_path, validate_trivy_purl, ScanOutput, ScanWorkspace,
-    Scanner, VersionCache,
+    is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, validate_trivy_purl,
+    ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,22 @@ pub struct GrypeReport {
 pub struct GrypeMatch {
     pub vulnerability: GrypeVulnerability,
     pub artifact: GrypeArtifact,
+    /// Aliases Grype maps the primary match to. For ecosystem advisories
+    /// (npm, RubyGems, etc.) Grype's primary `vulnerability.id` is frequently
+    /// the GHSA identifier (e.g. `GHSA-jf85-cpcp-j695`) and the NVD `CVE-` id
+    /// lives here as a related vulnerability. Consumers and the release-gate
+    /// keyed on the canonical CVE id never see it unless we surface the alias.
+    ///
+    /// CRITICAL (#1375 / B15): in Grype's JSON this array is a TOP-LEVEL field
+    /// of the *match* object (a sibling of `vulnerability` and `artifact`),
+    /// NOT a field nested inside `vulnerability`. An earlier fix placed it
+    /// inside `GrypeVulnerability`, so it deserialized to an empty Vec against
+    /// real Grype output and the GHSA->CVE mapping silently never fired. It
+    /// must live here on `GrypeMatch`. Verified against grype v0.112.0 output
+    /// for lodash 4.17.4: `.matches[].relatedVulnerabilities[].id` ==
+    /// "CVE-2019-10744".
+    #[serde(default, rename = "relatedVulnerabilities")]
+    pub related_vulnerabilities: Vec<GrypeRelatedVulnerability>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +75,16 @@ pub struct GrypeVulnerability {
     pub fix: Option<GrypeFix>,
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+}
+
+/// A cross-referenced vulnerability id Grype attaches to a primary match.
+/// We only care about the `id` (the alias identifier); the `namespace`
+/// field is captured for completeness but unused.
+#[derive(Debug, Deserialize)]
+pub struct GrypeRelatedVulnerability {
+    pub id: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +153,37 @@ fn truncate_stream(s: &str, max: usize) -> String {
     format!("…[truncated]{}", &s[boundary..])
 }
 
+/// Classify a `std::io::Error` from spawning `grype` into an `AppError`.
+///
+/// Issue #1465: the prior implementation used a substring search on the
+/// child process's stderr (`"not found" || "No such file"`) to detect "grype
+/// is not installed". That heuristic mis-fired whenever grype itself printed
+/// "not found" in a normal runtime error, most commonly an HTTP 404 from
+/// registry-mode against an image ref the registry didn't recognize. The
+/// operator saw "Grype binary not available" when grype was perfectly
+/// installed; they patched their Dockerfile and the issue remained.
+///
+/// The correct signal is `io::ErrorKind::NotFound` returned by the spawn
+/// itself, which the kernel sets when `execve()` cannot resolve the program
+/// name on PATH. Any other spawn failure (permission denied, fork failure,
+/// etc.) is surfaced as a generic "failed to execute Grype" so the operator
+/// gets the underlying OS error.
+///
+/// Returned as a pure helper so the classification has a unit test that does
+/// not depend on whether `grype` happens to be installed on the test host.
+fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::Internal(
+            "Grype binary not available (the `grype` executable was not \
+             found on PATH; install it or use the prebuilt artifact-keeper \
+             backend image which bundles grype at /usr/local/bin/grype)"
+                .to_string(),
+        )
+    } else {
+        AppError::Internal(format!("Failed to execute Grype: {}", err))
+    }
+}
+
 /// Resolve the registry host string Grype's `registry:` mode targets. The
 /// first non-empty source wins, in priority order:
 ///   1. `AK_GRYPE_REGISTRY_HOST` — explicit override (full URL accepted).
@@ -183,8 +240,10 @@ impl GrypeScanner {
         }
     }
 
-    /// Build the `<host>/<name>:<reference>` image ref that Grype's
-    /// `registry:` mode expects. The host comes from the first non-empty of:
+    /// Build the `<host>/<name><sep><reference>` image ref that Grype's
+    /// `registry:` mode expects. `<sep>` is `:` for tags and `@` for digest
+    /// references per the OCI distribution spec; see `join_oci_image_ref`.
+    /// The host comes from the first non-empty of:
     ///   1. `AK_GRYPE_REGISTRY_HOST` (explicit override; full URL accepted,
     ///      scheme is stripped before Grype sees it).
     ///   2. `PEER_PUBLIC_ENDPOINT` (already configured for in-cluster distribution).
@@ -196,12 +255,9 @@ impl GrypeScanner {
     /// findings-on-manifest-JSON bug).
     pub(crate) fn build_registry_image_ref(artifact: &Artifact) -> Option<String> {
         let (name, reference) = parse_oci_manifest_path(&artifact.path)?;
-        Some(format!(
-            "{}/{}:{}",
-            resolve_registry_host(),
-            name,
-            reference
-        ))
+        let host = resolve_registry_host();
+        let qualified_name = format!("{}/{}", host, name);
+        Some(join_oci_image_ref(&qualified_name, reference))
     }
 
     /// Run grype against the workspace directory.
@@ -236,6 +292,18 @@ impl GrypeScanner {
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
     async fn run_grype_target(&self, target: &str) -> Result<GrypeReport> {
+        // Issue #1465: detect "grype binary missing from PATH" via the
+        // io::ErrorKind of the spawn failure, NOT a substring search on
+        // stderr. The previous implementation classified any non-zero exit
+        // whose stderr contained "not found" or "No such file" as a missing
+        // binary, but those phrases also appear in normal grype runtime
+        // errors (registry-mode HTTP 404 "manifest not found", DB cache
+        // "no such file" when the seeded DB volume is missing, etc.). The
+        // user-visible result was a misleading "Grype binary not available"
+        // log on a perfectly-installed grype with an unreachable registry
+        // ref, sending operators down a wild-goose chase patching their
+        // Docker image. The kernel already gives us a precise NotFound
+        // signal when execve() cannot resolve "grype"; use that.
         let output = tokio::process::Command::new("grype")
             .args([target, "-o", "json"])
             .env("GRYPE_DB_AUTO_UPDATE", "false")
@@ -243,13 +311,10 @@ impl GrypeScanner {
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false")
             .output()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Grype: {}", e)))?;
+            .map_err(|e| classify_grype_spawn_error(&e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not found") || stderr.contains("No such file") {
-                return Err(AppError::Internal("Grype binary not available".to_string()));
-            }
             // Include a stdout tail too: Grype writes its progress/ETUI to
             // stderr, but a hard failure during JSON encoding can leave a
             // partial payload on stdout that is the only clue to the cause.
@@ -288,12 +353,21 @@ impl GrypeScanner {
             .matches
             .iter()
             .map(|m| {
+                // B15: Grype's primary `id` for an ecosystem advisory is often
+                // the GHSA id, with the canonical NVD CVE in
+                // `relatedVulnerabilities`. Surface the CVE id as the finding's
+                // `cve_id` so downstream consumers (and the release-gate, which
+                // keys on `CVE-2019-10744`) can join on the well-known id. The
+                // GHSA id is retained in the title so neither identifier is
+                // lost.
+                let primary_id = &m.vulnerability.id;
+                let canonical_cve = canonical_cve_id(primary_id, &m.related_vulnerabilities);
                 RawFinding {
                     severity: Severity::from_str_loose(&m.vulnerability.severity)
                         .unwrap_or(Severity::Info),
-                    title: format!("{} in {}", m.vulnerability.id, m.artifact.name),
+                    title: format!("{} in {}", primary_id, m.artifact.name),
                     description: m.vulnerability.description.clone(),
-                    cve_id: Some(m.vulnerability.id.clone()),
+                    cve_id: Some(canonical_cve),
                     // Bare package name; matches scanner_service::convert_trivy_findings
                     // so SBOM / CVE-mapping consumers can join on the raw name.
                     affected_component: Some(m.artifact.name.clone()),
@@ -376,6 +450,53 @@ impl GrypeScanner {
         }
         packages
     }
+}
+
+/// Cheap structural check for a `CVE-YYYY-N` identifier. Case-insensitive on
+/// the `CVE` prefix; the suffix must be 4+ digits per NVD numbering. Mirrors
+/// the validation in the sbom handler (`is_valid_cve_id`) so the alias chosen
+/// here is one the CVE-history endpoint will also accept. (#1375 / B15)
+fn is_cve_id(id: &str) -> bool {
+    let mut parts = id.trim().split('-');
+    match parts.next() {
+        Some(p) if p.eq_ignore_ascii_case("CVE") => {}
+        _ => return false,
+    }
+    let year = match parts.next() {
+        Some(y) => y,
+        None => return false,
+    };
+    let number = match parts.next() {
+        Some(n) => n,
+        None => return false,
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    number.len() >= 4 && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Choose the canonical vulnerability id for a finding's `cve_id` field.
+///
+/// If the primary id is already a `CVE-` id we keep it. Otherwise (the common
+/// case for npm/RubyGems advisories where Grype's primary id is a GHSA) we
+/// look through `relatedVulnerabilities` for the first NVD CVE id and prefer
+/// it, so the well-known CVE identifier is surfaced. If no CVE alias exists we
+/// fall back to the primary id unchanged (e.g. a pure GHSA advisory with no
+/// assigned CVE). (#1375 / B15)
+fn canonical_cve_id(primary_id: &str, related: &[GrypeRelatedVulnerability]) -> String {
+    if is_cve_id(primary_id) {
+        return primary_id.to_string();
+    }
+    related
+        .iter()
+        .map(|r| r.id.as_str())
+        .find(|id| is_cve_id(id))
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| primary_id.to_string())
 }
 
 /// Resolve a PURL string for a Grype-matched artifact (#1273).
@@ -716,6 +837,33 @@ mod tests {
         assert_eq!(r, "localhost:8080/library/nginx:latest");
     }
 
+    /// Regression test for issue #1483. Digest-pinned OCI artifacts must
+    /// use `@` between the qualified name and the `sha256:...` digest, not
+    /// `:`. Every `docker buildx push` writes two such digest-referenced
+    /// manifests (platform + attestation), so this is the common case for
+    /// image scans. With the bug present, Grype rejects every digest scan
+    /// with "could not parse reference".
+    #[test]
+    fn test_build_registry_image_ref_digest_uses_at_separator() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "platform-manifest",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/etc-docker/gitlab-codex-review/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        );
+        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        assert_eq!(
+            r,
+            "localhost:8080/etc-docker/gitlab-codex-review@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+        // Defensive: the bad form (`name:sha256:...`) must never reappear.
+        assert!(
+            !r.contains("gitlab-codex-review:sha256:"),
+            "digest ref must not use ':' between name and digest: {}",
+            r
+        );
+    }
+
     #[test]
     fn test_build_registry_image_ref_uses_explicit_override() {
         let _env = EnvGuard::new();
@@ -834,6 +982,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -886,6 +1035,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -926,6 +1076,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -937,6 +1088,217 @@ mod tests {
         assert_eq!(findings[0].description, None);
         // Without artifact_type, component is just the name
         assert_eq!(findings[0].affected_component, Some("some-lib".to_string()));
+        // B15: a pure GHSA advisory with no related CVE keeps the GHSA id as
+        // its cve_id (we do not invent a CVE; the alias logic only prefers a
+        // CVE that grype actually emitted in relatedVulnerabilities).
+        assert_eq!(findings[0].cve_id, Some("GHSA-abcd-1234-efgh".to_string()));
+    }
+
+    /// B15: Grype reports the lodash 4.17.4 prototype-pollution advisory under
+    /// its GHSA id (`GHSA-jf85-cpcp-j695`) with the NVD `CVE-2019-10744` in
+    /// `relatedVulnerabilities`. The release-gate `grype-scanner` suite asserts
+    /// a finding with `cve_id == "CVE-2019-10744"` is present. Before this fix
+    /// `convert_findings` copied the primary GHSA id verbatim, so the CVE the
+    /// gate keys on never appeared. This pins the alias preference.
+    #[test]
+    fn test_convert_findings_prefers_related_cve_over_ghsa() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "GHSA-jf85-cpcp-j695".to_string(),
+                    severity: "Critical".to_string(),
+                    description: Some("Prototype pollution in lodash".to_string()),
+                    fix: Some(GrypeFix {
+                        versions: vec!["4.17.12".to_string()],
+                        state: Some("fixed".to_string()),
+                    }),
+                    urls: Some(vec![
+                        "https://github.com/advisories/GHSA-jf85-cpcp-j695".to_string()
+                    ]),
+                },
+                artifact: GrypeArtifact {
+                    name: "lodash".to_string(),
+                    version: "4.17.4".to_string(),
+                    artifact_type: Some("npm".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+                related_vulnerabilities: vec![GrypeRelatedVulnerability {
+                    id: "CVE-2019-10744".to_string(),
+                    namespace: Some("nvd:cpe".to_string()),
+                }],
+            }],
+        };
+
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].cve_id,
+            Some("CVE-2019-10744".to_string()),
+            "convert_findings must surface the related NVD CVE id when the \
+             primary match id is a GHSA (B15)"
+        );
+        // The GHSA id is not lost: it stays in the human-readable title.
+        assert!(
+            findings[0].title.contains("GHSA-jf85-cpcp-j695"),
+            "title should retain the GHSA id; got {:?}",
+            findings[0].title
+        );
+        // source attribution unchanged.
+        assert_eq!(findings[0].source, Some("grype".to_string()));
+    }
+
+    /// B15: when the primary match id is already a CVE, the alias logic is a
+    /// no-op even if relatedVulnerabilities also carries CVEs. The primary id
+    /// wins so we never silently swap a finding's identity.
+    #[test]
+    fn test_convert_findings_keeps_primary_cve_id() {
+        let report = GrypeReport {
+            matches: vec![GrypeMatch {
+                vulnerability: GrypeVulnerability {
+                    id: "CVE-2021-44228".to_string(),
+                    severity: "Critical".to_string(),
+                    description: None,
+                    fix: None,
+                    urls: None,
+                },
+                artifact: GrypeArtifact {
+                    name: "log4j-core".to_string(),
+                    version: "2.14.1".to_string(),
+                    artifact_type: Some("java-archive".to_string()),
+                    purl: None,
+                    licenses: None,
+                },
+                related_vulnerabilities: vec![GrypeRelatedVulnerability {
+                    id: "CVE-2021-45046".to_string(),
+                    namespace: Some("nvd:cpe".to_string()),
+                }],
+            }],
+        };
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings[0].cve_id, Some("CVE-2021-44228".to_string()));
+    }
+
+    /// B15: a GHSA primary with no CVE alias falls back to the GHSA id rather
+    /// than dropping the finding's identifier.
+    #[test]
+    fn test_canonical_cve_id_fallback_to_primary() {
+        assert_eq!(
+            canonical_cve_id("GHSA-aaaa-bbbb-cccc", &[]),
+            "GHSA-aaaa-bbbb-cccc"
+        );
+        assert_eq!(
+            canonical_cve_id(
+                "GHSA-aaaa-bbbb-cccc",
+                &[GrypeRelatedVulnerability {
+                    id: "GHSA-dddd-eeee-ffff".to_string(),
+                    namespace: None,
+                }]
+            ),
+            "GHSA-aaaa-bbbb-cccc",
+            "no CVE alias present -> keep primary GHSA id"
+        );
+    }
+
+    #[test]
+    fn test_is_cve_id_recognizes_valid_and_rejects_invalid() {
+        assert!(is_cve_id("CVE-2019-10744"));
+        assert!(is_cve_id("cve-1999-0001")); // case-insensitive, 4-digit suffix
+        assert!(is_cve_id("CVE-2024-123456")); // 6-digit suffix
+        assert!(!is_cve_id("GHSA-jf85-cpcp-j695"));
+        assert!(!is_cve_id("CVE-2019-1")); // sub-4-digit suffix
+        assert!(!is_cve_id("CVE-201-10744")); // 3-digit year
+        assert!(!is_cve_id("not-a-cve"));
+        assert!(!is_cve_id("CVE-2019-10744-extra")); // stray suffix
+    }
+
+    /// B15: grype JSON with a `relatedVulnerabilities` block deserializes the
+    /// alias ids and the GHSA->CVE mapping fires.
+    ///
+    /// CRITICAL: this fixture mirrors grype's REAL output shape, where
+    /// `relatedVulnerabilities` is a TOP-LEVEL field of the match object (a
+    /// sibling of `vulnerability` and `artifact`). Verified against grype
+    /// v0.112.0 for lodash 4.17.4. An earlier version of this test nested the
+    /// array inside `vulnerability`, which matched the (buggy) struct shape
+    /// and made the test pass while real scans produced GHSA ids -- the exact
+    /// B15 gate failure. Keep this fixture faithful to grype's wire format.
+    #[test]
+    fn test_grype_report_deserializes_related_vulnerabilities() {
+        let json = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "GHSA-jf85-cpcp-j695",
+                    "severity": "High"
+                },
+                "relatedVulnerabilities": [
+                    {"id": "CVE-2019-10744", "namespace": "nvd:cpe"}
+                ],
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report: GrypeReport = serde_json::from_str(json).unwrap();
+        let related = &report.matches[0].related_vulnerabilities;
+        assert_eq!(
+            related.len(),
+            1,
+            "match-level relatedVulnerabilities must deserialize"
+        );
+        assert_eq!(related[0].id, "CVE-2019-10744");
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(
+            findings[0].cve_id,
+            Some("CVE-2019-10744".to_string()),
+            "GHSA->CVE mapping must fire from match-level relatedVulnerabilities"
+        );
+    }
+
+    /// B15 regression guard: prove the JSON nesting matters. If a future
+    /// change moves `related_vulnerabilities` back inside `GrypeVulnerability`,
+    /// real grype output (which carries the array at the MATCH level) would
+    /// deserialize to an empty Vec and the mapping would silently regress to
+    /// the primary GHSA id. This test pins that the array is read from the
+    /// match level by feeding grype's real shape and asserting the CVE wins,
+    /// and that an array MISplaced inside `vulnerability` is ignored.
+    #[test]
+    fn test_related_vulnerabilities_is_read_from_match_level_not_vulnerability() {
+        // Correct (real grype) shape: array at match level -> CVE surfaces.
+        let correct = r#"{
+            "matches": [{
+                "vulnerability": {"id": "GHSA-jf85-cpcp-j695", "severity": "High"},
+                "relatedVulnerabilities": [{"id": "CVE-2019-10744"}],
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report: GrypeReport = serde_json::from_str(correct).unwrap();
+        let findings = GrypeScanner::convert_findings(&report);
+        assert_eq!(findings[0].cve_id, Some("CVE-2019-10744".to_string()));
+
+        // Misplaced shape: array nested under vulnerability (the old bug's
+        // assumption). The match-level field is absent, so the alias is NOT
+        // picked up and the primary GHSA id is kept. This documents why the
+        // nesting is load-bearing.
+        let misplaced = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "GHSA-jf85-cpcp-j695",
+                    "severity": "High",
+                    "relatedVulnerabilities": [{"id": "CVE-2019-10744"}]
+                },
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#;
+        let report2: GrypeReport = serde_json::from_str(misplaced).unwrap();
+        assert!(
+            report2.matches[0].related_vulnerabilities.is_empty(),
+            "a relatedVulnerabilities array nested under vulnerability must NOT \
+             populate the match-level field"
+        );
+        let findings2 = GrypeScanner::convert_findings(&report2);
+        assert_eq!(
+            findings2[0].cve_id,
+            Some("GHSA-jf85-cpcp-j695".to_string()),
+            "with no match-level alias, the primary GHSA id is kept"
+        );
     }
 
     #[test]
@@ -974,6 +1336,93 @@ mod tests {
         assert_scan_failed(
             &no_grype.scan(&artifact, None, &content).await,
             "Grype scan",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1465: classify_grype_spawn_error pins the contract that
+    // "Grype binary not available" is reserved for the *spawn* NotFound
+    // signal. Prior code substring-matched stderr for "not found" / "No
+    // such file", which mis-classified any grype runtime error whose log
+    // included those phrases (the common case: a registry-mode HTTP 404
+    // "manifest not found" against an unreachable image ref) as a missing
+    // binary. Operators saw the misleading "binary not available" log on
+    // a perfectly-installed grype and patched their Dockerfile in vain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_grype_spawn_error_notfound_maps_to_binary_missing() {
+        // The exact std::io::Error::Kind tokio surfaces when execve() fails
+        // to resolve the program name on PATH.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let app = classify_grype_spawn_error(&io_err);
+        let msg = format!("{}", app);
+        assert!(
+            msg.contains("Grype binary not available"),
+            "NotFound spawn errors must surface as the binary-missing diagnostic; got {:?}",
+            msg
+        );
+        // Helpful remediation hint should be present so operators know
+        // where to find or install grype.
+        assert!(
+            msg.contains("PATH") || msg.contains("install"),
+            "binary-missing message should hint at remediation; got {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_classify_grype_spawn_error_permission_denied_is_not_binary_missing() {
+        // A PermissionDenied error means grype was found on PATH but the
+        // process could not exec it (chmod 000, SELinux denial, etc.).
+        // The classifier must distinguish this from "binary not available"
+        // so the operator does not spend hours hunting for a missing binary
+        // when the file is right there but unexecutable.
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let app = classify_grype_spawn_error(&io_err);
+        let msg = format!("{}", app);
+        assert!(
+            !msg.contains("not available"),
+            "non-NotFound spawn errors must NOT be labeled 'binary not available'; got {:?}",
+            msg
+        );
+        assert!(
+            msg.contains("Failed to execute Grype") && msg.contains("permission denied"),
+            "non-NotFound spawn errors must surface the underlying OS error; got {:?}",
+            msg
+        );
+    }
+
+    /// Regression guard for issue #1465: confirm the source no longer
+    /// substring-matches "not found" / "No such file" against grype's
+    /// stderr. The misleading classification this guarded against silently
+    /// turned every registry-mode 404 (a manifest the registry rejected,
+    /// auth failure, etc.) into "Grype binary not available", which is the
+    /// exact user-facing symptom on #1465. If a future refactor reintroduces
+    /// the heuristic this test catches it at the source level.
+    #[test]
+    fn test_run_grype_target_does_not_substring_match_stderr_for_binary_check() {
+        let src = include_str!("grype_scanner.rs");
+        // Locate the run_grype_target function body and inspect only it,
+        // so the regression-guard fixture (which intentionally mentions the
+        // forbidden phrases below in comments and string literals) does
+        // not produce a false positive against the tests module.
+        let start = src
+            .find("async fn run_grype_target")
+            .expect("run_grype_target must exist");
+        let after = &src[start..];
+        // Function body ends at the next top-level `}` at column 4 in this
+        // file. Slice up to the next blank-line + `/// ` doc boundary or
+        // function start, whichever comes first; covers the body cheaply.
+        let end_rel = after.find("\n    /// ").unwrap_or(after.len().min(8192));
+        let body = &after[..end_rel];
+        assert!(
+            !body.contains("stderr.contains(\"not found\")")
+                && !body.contains("stderr.contains(\"No such file\")"),
+            "run_grype_target must not substring-match stderr to detect a missing \
+             binary (#1465). Use io::ErrorKind::NotFound on the spawn result \
+             via classify_grype_spawn_error instead. Offending body: {}",
+            body
         );
     }
 
@@ -1234,6 +1683,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -1281,6 +1731,7 @@ mod tests {
                 purl: None,
                 licenses: None,
             },
+            related_vulnerabilities: vec![],
         };
         let report = GrypeReport {
             matches: vec![
@@ -1321,6 +1772,7 @@ mod tests {
                     purl: Some("pkg:npm/%40types/node@20.0.0".to_string()),
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
 
@@ -1354,6 +1806,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
         assert!(GrypeScanner::convert_packages(&report).is_empty());
@@ -1381,6 +1834,7 @@ mod tests {
                     purl: None,
                     licenses: None,
                 },
+                related_vulnerabilities: vec![],
             }],
         };
         let packages = GrypeScanner::convert_packages(&report);

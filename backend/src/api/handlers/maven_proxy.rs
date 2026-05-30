@@ -153,7 +153,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     };
     let sibling_prefix = format!("{}/%", gav_dir);
     let primary = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 \
            AND path LIKE $2 \

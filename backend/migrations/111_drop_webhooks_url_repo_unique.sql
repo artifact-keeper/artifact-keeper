@@ -1,0 +1,27 @@
+-- Drop the over-broad unique index on webhooks(url, repository_id).
+--
+-- The index `idx_webhooks_url_repo_unique` was introduced in migration 081
+-- purely as an idempotency guard for the one-time notification_subscriptions
+-- -> webhooks data migration (its INSERT relied on ON CONFLICT DO NOTHING).
+-- As a side effect it permanently forbids two webhooks from sharing the same
+-- (url, repository_id) pair, which is a legitimate configuration: an operator
+-- can register two webhooks pointing at the same endpoint subscribed to
+-- different event sets (or pinned to different event_schema_versions).
+--
+-- That side effect surfaced as a hard failure for normal CRUD:
+--   - POST /api/v1/webhooks with a url already used by another global webhook
+--     hit the unique index, Postgres returned SQLSTATE 23505, and
+--     create_webhook surfaced it as a bare HTTP 500 DATABASE_ERROR instead of
+--     a meaningful response. Tests that legitimately register two webhooks at
+--     one receiver (webhook-multi-event-filter, webhook-event-versioning)
+--     failed on the second create.
+--
+-- Migration 081 has already run on every cluster that needs it; once the
+-- migrator records 081 as applied it never re-executes, so dropping the index
+-- now does not weaken the historical migration's idempotency. New clusters
+-- run 081 against an empty notification_subscriptions table (the index exists
+-- for that single INSERT) and then immediately run this migration to remove
+-- it. Webhook identity is the primary key `id`, not the URL, so no uniqueness
+-- on url is required for correctness.
+
+DROP INDEX IF EXISTS idx_webhooks_url_repo_unique;

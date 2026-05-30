@@ -324,6 +324,67 @@ pub fn normalize_lookup_path(path: &str) -> Option<String> {
     None
 }
 
+/// Translate the version-segmented stored path written by
+/// `api::handlers::npm::store_npm_version`
+/// (`<name>/<version>/<name>-<version>.tgz` or
+/// `@<scope>/<name>/<version>/<name>-<version>.tgz`) back into the
+/// canonical npm tarball download-URL shape that clients (and the npm
+/// download router) use (`<name>/-/<name>-<version>.tgz` or
+/// `@<scope>/<name>/-/<name>-<version>.tgz`).
+///
+/// Returns `None` if the input does not match the version-segmented
+/// stored tarball shape, so non-tarball rows (a `package.json` metadata
+/// path, a raw upload, or a path already in `/-/` URL form) are left
+/// untouched and surface verbatim.
+///
+/// This is the exact inverse of [`normalize_lookup_path`]. The
+/// repository artifact listing applies it for npm-family repos so the
+/// `.path` it reports matches the URL an npm client downloads from
+/// (and what the release-gate real-flow smoke test resolves against),
+/// rather than the internal version-segmented storage layout. See #1443
+/// (lookup-by-path) and the real-flow-smoke follow-up.
+#[must_use]
+pub fn tarball_url_path_from_stored(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    let last = parts.last().copied().unwrap_or("");
+
+    // Only tarball rows are rewritten. Everything else is stored under a
+    // literal path that already matches what clients request.
+    if last.is_empty() || !last.to_ascii_lowercase().ends_with(".tgz") {
+        return None;
+    }
+
+    // Scoped stored shape: ["@scope", "name", "<version>", "<file>.tgz"]
+    if parts.len() == 4 && parts[0].starts_with('@') {
+        let scope = parts[0];
+        let name = parts[1];
+        let version = parts[2];
+        let filename = parts[3];
+        // The middle segment must be the version embedded in the filename;
+        // otherwise this is not the store_npm_version layout (it might be
+        // a `/-/` URL path or some other four-segment shape) and we leave
+        // it alone.
+        if version != version_from_tarball_filename(filename, name)?.as_str() {
+            return None;
+        }
+        return Some(format!("{}/{}/-/{}", scope, name, filename));
+    }
+
+    // Unscoped stored shape: ["name", "<version>", "<file>.tgz"]
+    if parts.len() == 3 {
+        let name = parts[0];
+        let version = parts[1];
+        let filename = parts[2];
+        if version != version_from_tarball_filename(filename, name)?.as_str() {
+            return None;
+        }
+        return Some(format!("{}/-/{}", name, filename));
+    }
+
+    None
+}
+
 /// Extract `<version>` from `<name>-<version>.tgz`. Returns `None` when
 /// the prefix or suffix don't match so the caller can fall back to the
 /// raw path instead of guessing.
@@ -1148,5 +1209,103 @@ mod tests {
     #[test]
     fn test_normalize_lookup_path_returns_none_for_non_tgz_extension() {
         assert_eq!(normalize_lookup_path("foo/-/foo-1.0.0.zip"), None);
+    }
+
+    // tarball_url_path_from_stored is the inverse of normalize_lookup_path:
+    // it turns the version-segmented stored shape that store_npm_version
+    // writes into the `/-/` download-URL shape the listing should report.
+    #[test]
+    fn test_tarball_url_path_from_stored_unscoped() {
+        assert_eq!(
+            tarball_url_path_from_stored("lodash/4.17.21/lodash-4.17.21.tgz"),
+            Some("lodash/-/lodash-4.17.21.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_scoped() {
+        assert_eq!(
+            tarball_url_path_from_stored("@angular/core/17.0.0/core-17.0.0.tgz"),
+            Some("@angular/core/-/core-17.0.0.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_prerelease_version() {
+        assert_eq!(
+            tarball_url_path_from_stored("foo/1.0.0-rc.1/foo-1.0.0-rc.1.tgz"),
+            Some("foo/-/foo-1.0.0-rc.1.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_release_gate_pkg_shape() {
+        // The exact shape store_npm_version writes for the real-flow-smoke
+        // package, and the `/-/` URL shape the test matches `.path` against.
+        let stored =
+            "rfs-pkg-e2e1779850088106/1.0.1779850372/rfs-pkg-e2e1779850088106-1.0.1779850372.tgz";
+        let url_shape = "rfs-pkg-e2e1779850088106/-/rfs-pkg-e2e1779850088106-1.0.1779850372.tgz";
+        assert_eq!(
+            tarball_url_path_from_stored(stored),
+            Some(url_shape.to_string())
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_round_trips_with_normalize() {
+        // The two functions invert each other on the canonical shapes.
+        let url = "lodash/-/lodash-4.17.21.tgz";
+        let stored = normalize_lookup_path(url).unwrap();
+        assert_eq!(tarball_url_path_from_stored(&stored), Some(url.to_string()));
+
+        let scoped_url = "@angular/core/-/core-17.0.0.tgz";
+        let scoped_stored = normalize_lookup_path(scoped_url).unwrap();
+        assert_eq!(
+            tarball_url_path_from_stored(&scoped_stored),
+            Some(scoped_url.to_string())
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_idempotent_on_url_shape() {
+        // A path already in the `/-/` URL shape must be left alone so the
+        // listing never double-rewrites and proxy-cached rows that already
+        // store the URL form surface verbatim.
+        assert_eq!(
+            tarball_url_path_from_stored("lodash/-/lodash-4.17.21.tgz"),
+            None
+        );
+        assert_eq!(
+            tarball_url_path_from_stored("@angular/core/-/core-17.0.0.tgz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_returns_none_for_metadata_path() {
+        assert_eq!(tarball_url_path_from_stored("lodash"), None);
+        assert_eq!(tarball_url_path_from_stored("lodash/package.json"), None);
+        assert_eq!(
+            tarball_url_path_from_stored("@types/node/package.json"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_returns_none_when_version_mismatches() {
+        // If the middle segment is not the version embedded in the
+        // filename, this is not the store_npm_version layout; leave it.
+        assert_eq!(
+            tarball_url_path_from_stored("foo/9.9.9/foo-1.0.0.tgz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tarball_url_path_from_stored_returns_none_for_non_tgz_extension() {
+        assert_eq!(
+            tarball_url_path_from_stored("foo/1.0.0/foo-1.0.0.zip"),
+            None
+        );
     }
 }
