@@ -102,6 +102,14 @@ pub fn router() -> Router<SharedState> {
         .route("/cve/history/by-cve/:cve_id", get(get_cve_history_by_cve))
         .route("/cve/history/:id", get(get_cve_history))
         .route("/cve/status/:id", post(update_cve_status))
+        // #1426: synth-id rows returned by the Security tab don't exist in
+        // `cve_history`; this route lets clients update CVE status by the
+        // only stable key a synth row carries -- (artifact_id, cve_id) --
+        // which the handler maps onto the underlying `scan_findings` rows.
+        .route(
+            "/cve/status/by-artifact/:artifact_id/by-cve/:cve_id",
+            post(update_cve_status_by_artifact_cve),
+        )
         .route("/cve/trends", get(get_cve_trends))
         // License policies
         .route(
@@ -629,6 +637,17 @@ async fn get_sbom_components(
 }
 
 /// Convert an SBOM to a different format
+///
+/// Returns the converted SBOM as a [`SbomContentResponse`]: the metadata
+/// row plus the full converted document under `content`. The `content` is
+/// load-bearing here. A consumer that asked for `target_format=spdx` needs
+/// the SPDX document (`content.spdxVersion`, `content.SPDXID`, ...) to feed
+/// downstream attestation tooling, and a `target_format=cyclonedx` request
+/// needs `content.bomFormat == "CycloneDX"`. Returning metadata-only
+/// (`SbomResponse`) dropped the converted document entirely, so callers
+/// could not tell an SPDX result from a CycloneDX one and round-trip
+/// conversion appeared to lose the document shape. (release-gate
+/// `test-sbom-convert.sh` 2.5.a / 2.5.b.)
 #[utoipa::path(
     post,
     path = "/{id}/convert",
@@ -639,7 +658,7 @@ async fn get_sbom_components(
     ),
     request_body = ConvertSbomRequest,
     responses(
-        (status = 200, description = "Converted SBOM", body = SbomResponse),
+        (status = 200, description = "Converted SBOM with content", body = SbomContentResponse),
         (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
@@ -650,13 +669,13 @@ async fn convert_sbom(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<ConvertSbomRequest>,
-) -> Result<Json<SbomResponse>> {
+) -> Result<Json<SbomContentResponse>> {
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
 
     let doc = service.convert_sbom(id, target_format).await?;
-    Ok(Json(SbomResponse::from(doc)))
+    Ok(Json(SbomContentResponse::from(doc)))
 }
 
 // === CVE History ===
@@ -717,6 +736,56 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
     true
 }
 
+/// Validate that a string is a well-formed GitHub Security Advisory id.
+///
+/// GHSA ids have the canonical shape `GHSA-xxxx-xxxx-xxxx`: the literal
+/// `GHSA` prefix followed by three dash-separated groups of four base32
+/// characters (lower-case `a-z` plus digits `2-9`, no `0`/`1`/`l`/`o`).
+/// Match is case-insensitive on the prefix and the groups.
+///
+/// Why this exists (#1375 / B14): Grype reports ecosystem advisories (npm,
+/// RubyGems, etc.) under their GHSA id, so a consumer that captured a
+/// finding's identifier may legitimately query
+/// `GET /sbom/cve/history/GHSA-jf85-cpcp-j695`. The endpoint previously
+/// rejected every GHSA id with a 400 even though the underlying lookup is
+/// id-agnostic.
+///
+/// Examples:
+///   - `GHSA-jf85-cpcp-j695` → true
+///   - `ghsa-jf85-cpcp-j695` → true (case-insensitive)
+///   - `GHSA-jf85-cpcp`      → false (only two groups)
+///   - `GHSA-jf8-cpcp-j695`  → false (group not four chars)
+///   - `CVE-2019-10744`      → false (not a GHSA)
+pub(crate) fn is_valid_ghsa_id(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    match parts.next() {
+        Some(p) if p.eq_ignore_ascii_case("GHSA") => {}
+        _ => return false,
+    }
+    let mut groups = 0;
+    for group in parts {
+        groups += 1;
+        if groups > 3 {
+            return false;
+        }
+        if group.len() != 4
+            || !group
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    groups == 3
+}
+
+/// Validate that a string is a vulnerability identifier we accept on the
+/// CVE-history endpoints: either a CVE id or a GHSA id. (#1375 / B14)
+pub(crate) fn is_valid_vuln_id(s: &str) -> bool {
+    is_valid_cve_id(s) || is_valid_ghsa_id(s)
+}
+
 /// Outcome of dispatching the overloaded `/cve/history/{id}` path param.
 ///
 /// Pure typing of the UUID-vs-CVE-id sniff so the dispatch decision is
@@ -726,15 +795,15 @@ pub(crate) fn is_valid_cve_id(s: &str) -> bool {
 pub(crate) enum CveHistoryPath {
     /// Parsed UUID; treat as artifact_id lookup.
     Artifact(Uuid),
-    /// Parsed CVE id (canonical upper-case form); treat as cross-artifact
-    /// CVE lookup.
+    /// Parsed vulnerability id (CVE or GHSA, canonical upper-case form);
+    /// treat as cross-artifact lookup. (#1375 / B14)
     Cve(String),
     /// Neither parse succeeded; handler returns 400.
     Invalid,
 }
 
 /// Classify an overloaded `/cve/history/{id}` path parameter. UUID first
-/// (legacy semantic), then CVE id, else invalid.
+/// (legacy semantic), then vulnerability id (CVE or GHSA), else invalid.
 ///
 /// Extracted from `get_cve_history` so the routing decision is exercised
 /// by unit tests; the async wrapper only owns the DB calls. (#1375)
@@ -742,19 +811,23 @@ pub(crate) fn classify_cve_history_path(id: &str) -> CveHistoryPath {
     if let Ok(uuid) = Uuid::parse_str(id) {
         return CveHistoryPath::Artifact(uuid);
     }
-    if is_valid_cve_id(id) {
+    if is_valid_vuln_id(id) {
         // Normalize to upper-case so the downstream lookup matches the
-        // schema's storage convention.
+        // schema's storage convention. The service compares case-insensitively
+        // anyway, but normalizing keeps logs/metrics consistent.
         return CveHistoryPath::Cve(id.trim().to_ascii_uppercase());
     }
     CveHistoryPath::Invalid
 }
 
-/// Construct the 400 message returned when neither a UUID nor a CVE id
-/// matches. Pulled out so the message wording (which clients sometimes
+/// Construct the 400 message returned when neither a UUID nor a vulnerability
+/// id matches. Pulled out so the message wording (which clients sometimes
 /// parse) is pinned by a test.
 pub(crate) fn invalid_cve_history_path_message(id: &str) -> String {
-    format!("Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)")
+    format!(
+        "Path id '{id}' is neither a valid UUID nor a vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
 }
 
 /// Get CVE history by artifact UUID or CVE identifier (legacy overload).
@@ -854,7 +927,10 @@ async fn get_cve_history_by_artifact(
 /// wording is slightly different (typed route knows the id is meant to
 /// be a CVE id, not "either a UUID or a CVE id").
 pub(crate) fn invalid_cve_id_route_message(cve_id: &str) -> String {
-    format!("Path id '{cve_id}' is not a valid CVE identifier (expected `CVE-YYYY-N`)")
+    format!(
+        "Path id '{cve_id}' is not a valid vulnerability identifier \
+         (expected `CVE-YYYY-N` or `GHSA-xxxx-xxxx-xxxx`)"
+    )
 }
 
 /// Get CVE history for one CVE identifier across artifacts (typed CVE-id
@@ -882,7 +958,7 @@ async fn get_cve_history_by_cve(
     Extension(auth): Extension<AuthExtension>,
     Path(cve_id): Path<String>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
-    if !is_valid_cve_id(&cve_id) {
+    if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
     let service = SbomService::new(state.db.clone());
@@ -918,8 +994,80 @@ async fn update_cve_status(
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
 
+    // #1438 (1c): a non-existent CVE history id used to bubble out of
+    // sqlx::Error::RowNotFound as 500 DATABASE_ERROR. Map it explicitly to
+    // 404 so the client can distinguish bad input from server failure. All
+    // other sqlx errors continue to flow through the default mapping.
     let entry = service
         .update_cve_status(id, status, Some(auth.user_id), body.reason.as_deref())
+        .await
+        .map_err(|e| match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        })?;
+
+    Ok(Json(entry))
+}
+
+/// Update CVE status for a synth (scan_findings-derived) Security tab row.
+///
+/// Background (#1426): the Security tab read path projects `scan_findings`
+/// into `CveHistoryEntry` rows whose `id` is a deterministic SHA-256 hash
+/// (see `synth_cve_id`). Those ids have no corresponding row in the
+/// `cve_history` table, so calls to `POST /cve/status/{id}` always 404 -- a
+/// dead acknowledge path. This route operates on the only stable identity a
+/// synth row carries, the (artifact_id, cve_id) pair, and writes the
+/// underlying `scan_findings` rows instead.
+///
+/// The wider design choice between (A) populating `cve_history` from the
+/// scanner loop and (B) treating `scan_findings` as the source of truth for
+/// the Security tab is settled here in favour of B: less code, less risk of
+/// data drift between two parallel tables, and `cve_history` remains in
+/// place for the rare curated/admin write path via the legacy
+/// `POST /cve/status/{id}` route.
+#[utoipa::path(
+    post,
+    path = "/cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact UUID"),
+        ("cve_id" = String, Path, description = "CVE identifier (e.g. CVE-2019-10744)")
+    ),
+    request_body = UpdateCveStatusRequest,
+    responses(
+        (status = 200, description = "Updated synth CVE entry", body = crate::models::sbom::CveHistoryEntry),
+        (status = 400, description = "Validation error (e.g. invalid CVE id or unsupported status)", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller does not have access to this artifact's repository"),
+        (status = 404, description = "No scan_findings rows match (artifact_id, cve_id)"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_cve_status_by_artifact_cve(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((artifact_id, cve_id)): Path<(Uuid, String)>,
+    Json(body): Json<UpdateCveStatusRequest>,
+) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    if !is_valid_vuln_id(&cve_id) {
+        return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
+    }
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    let service = SbomService::new(state.db.clone());
+    let status = CveStatus::parse(&body.status)
+        .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
+    let cve_id_upper = cve_id.trim().to_ascii_uppercase();
+
+    let entry = service
+        .update_cve_status_by_artifact_cve(
+            artifact_id,
+            &cve_id_upper,
+            status,
+            Some(auth.user_id),
+            body.reason.as_deref(),
+        )
         .await?;
 
     Ok(Json(entry))
@@ -1309,6 +1457,7 @@ async fn ensure_sbom_repo_access(
         get_cve_history_by_artifact,
         get_cve_history_by_cve,
         update_cve_status,
+        update_cve_status_by_artifact_cve,
         get_cve_trends,
         list_license_policies,
         get_license_policy,
@@ -1491,6 +1640,91 @@ mod tests {
         let resp = SbomContentResponse::from(doc);
         assert_eq!(resp.content, content);
         assert_eq!(resp.content["components"][0]["name"], "serde");
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.a: the
+    /// `/sbom/{id}/convert` response is a [`SbomContentResponse`], and when
+    /// the target format is SPDX the serialized body must expose the SPDX
+    /// document under `content` so the test's `.content.spdxVersion` /
+    /// `.content.SPDXID` reads resolve. The handler previously returned a
+    /// metadata-only `SbomResponse`, which carried neither field and made
+    /// every convert-to-SPDX call look like it dropped `spdxVersion`.
+    #[test]
+    fn test_convert_response_surfaces_spdx_content_keys() {
+        let now = Utc::now();
+        let spdx_content = serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "dataLicense": "CC0-1.0",
+            "name": "artifact-sbom",
+            "packages": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "spdx".to_string(),
+            format_version: "2.3".to_string(),
+            spec_version: Some("SPDX-2.3".to_string()),
+            content: spdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        // The handler builds exactly this from `convert_sbom`'s SbomDocument.
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["spdxVersion"], "SPDX-2.3");
+        assert_eq!(json["content"]["SPDXID"], "SPDXRef-DOCUMENT");
+        // Metadata is flattened alongside content (id is load-bearing for the
+        // round-trip step, which converts the returned id back).
+        assert_eq!(json["format"], "spdx");
+        assert!(json["id"].is_string());
+    }
+
+    /// Contract pinned by release-gate `test-sbom-convert.sh` 2.5.b
+    /// (round-trip): converting back to CycloneDX must expose
+    /// `content.bomFormat == "CycloneDX"`. The metadata-only response had no
+    /// `content`, so the reverse conversion read an empty `bomFormat`.
+    #[test]
+    fn test_convert_response_surfaces_cyclonedx_bom_format() {
+        let now = Utc::now();
+        let cdx_content = serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "components": []
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("CycloneDX 1.5".to_string()),
+            content: cdx_content,
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp = SbomContentResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["content"]["bomFormat"], "CycloneDX");
+        assert_eq!(json["format"], "cyclonedx");
     }
 
     // -----------------------------------------------------------------------
@@ -2137,6 +2371,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // is_valid_ghsa_id / is_valid_vuln_id: #1375 / B14. Grype reports
+    // ecosystem advisories under a GHSA id, so the history endpoints must
+    // accept `GHSA-xxxx-xxxx-xxxx` as well as `CVE-...`. These pin the GHSA
+    // grammar and the CVE/GHSA union.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_ghsa_id_accepts_canonical_form() {
+        // The lodash advisory grype reports for CVE-2019-10744.
+        assert!(is_valid_ghsa_id("GHSA-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-abcd-1234-efgh"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_case_insensitive() {
+        assert!(is_valid_ghsa_id("ghsa-jf85-cpcp-j695"));
+        assert!(is_valid_ghsa_id("GHSA-JF85-CPCP-J695"));
+    }
+
+    #[test]
+    fn test_is_valid_ghsa_id_rejects_malformed() {
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp")); // only two groups
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpcp-j695-extra")); // four groups
+        assert!(!is_valid_ghsa_id("GHSA-jf8-cpcp-j695")); // group not four chars
+        assert!(!is_valid_ghsa_id("GHSA-jf85-cpc!-j695")); // illegal char
+        assert!(!is_valid_ghsa_id("CVE-2019-10744")); // not a GHSA
+        assert!(!is_valid_ghsa_id(""));
+        assert!(!is_valid_ghsa_id("GHSA"));
+    }
+
+    #[test]
+    fn test_is_valid_vuln_id_accepts_both_families() {
+        assert!(is_valid_vuln_id("CVE-2019-10744"));
+        assert!(is_valid_vuln_id("GHSA-jf85-cpcp-j695"));
+        assert!(!is_valid_vuln_id("not-a-vuln"));
+        assert!(!is_valid_vuln_id(""));
+    }
+
+    #[test]
+    fn test_classify_cve_history_path_accepts_ghsa_id() {
+        // B14: a GHSA id must route to the cross-artifact lookup branch, not
+        // 400. Normalized to upper-case like the CVE path.
+        let result = classify_cve_history_path("GHSA-jf85-cpcp-j695");
+        assert_eq!(
+            result,
+            CveHistoryPath::Cve("GHSA-JF85-CPCP-J695".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // classify_cve_history_path: pure dispatch over the overloaded path
     // parameter. Pulled out of the async handler so the routing decision
     // (UUID first, CVE second, else 400) is unit-testable. (#1375)
@@ -2238,5 +2522,486 @@ mod tests {
         let overload = invalid_cve_history_path_message("xxx");
         let typed = invalid_cve_id_route_message("xxx");
         assert_ne!(overload, typed);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1438 (1c): POST /sbom/cve/status/{uuid} for a missing id used to
+    // surface `sqlx::Error::RowNotFound` as 500 DATABASE_ERROR. The handler
+    // now maps that one variant to NotFound (404) explicitly. The mapping
+    // is a small inline closure inside `update_cve_status`; we replicate
+    // the exact match arm here so the contract is pinned without spinning
+    // up Postgres.
+    // -----------------------------------------------------------------------
+
+    fn map_update_cve_status_err(id: Uuid, e: AppError) -> AppError {
+        match e {
+            AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("CVE history entry {} not found", id))
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_maps_row_not_found_to_404() {
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::RowNotFound);
+        match map_update_cve_status_err(id, err) {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains(&id.to_string()));
+                assert!(msg.contains("CVE history entry"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_other_db_errors() {
+        // A non-RowNotFound sqlx error must keep flowing as a DB error so
+        // operators still see 500s for genuine database failures.
+        let id = Uuid::new_v4();
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        match map_update_cve_status_err(id, err) {
+            AppError::Sqlx(sqlx::Error::PoolTimedOut) => {}
+            other => panic!(
+                "expected Sqlx(PoolTimedOut) to pass through, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_update_cve_status_passes_through_validation_errors() {
+        // Validation errors (e.g. unknown status string) reach the mapper
+        // unchanged so the client sees the original 400 message.
+        let id = Uuid::new_v4();
+        let err = AppError::Validation("Unknown status: maybe".to_string());
+        match map_update_cve_status_err(id, err) {
+            AppError::Validation(msg) => assert_eq!(msg, "Unknown status: maybe"),
+            other => panic!("expected Validation to pass through, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1426: synth-id acknowledge path.
+    //
+    // The new route `POST /cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}`
+    // exists because synth ids returned by the Security tab have no row in
+    // `cve_history` and the legacy `POST /cve/status/{id}` route 404s on
+    // them. Tests below cover the pure input-validation portion of the
+    // handler (CVE id shape) so the contract is pinned without spinning up
+    // Postgres or Axum.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_rejects_malformed_cve_id() {
+        // The handler must short-circuit with a Validation error before
+        // hitting the DB if the CVE id is neither a CVE nor a GHSA id.
+        assert!(!is_valid_vuln_id("not-a-cve"));
+        assert!(!is_valid_vuln_id(""));
+        assert!(!is_valid_vuln_id("CVE-2024"));
+    }
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_accepts_cve_and_ghsa_ids() {
+        // Both CVE-YYYY-N and GHSA-xxxx-xxxx-xxxx ids must be accepted so
+        // the Security tab can surface findings from either source.
+        assert!(is_valid_vuln_id("CVE-2019-10744"));
+        assert!(is_valid_vuln_id("GHSA-jf85-cpcp-j695"));
+    }
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_validation_message_distinguishable() {
+        // Reuses the same wording the typed `/cve/history/by-cve/` route
+        // produces; pin that so a future split of the message doesn't
+        // silently regress the client-visible 400 body.
+        let msg = invalid_cve_id_route_message("not-a-cve");
+        assert!(msg.contains("not-a-cve"));
+        assert!(msg.contains("CVE-YYYY-N"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1426: DB-backed handler coverage for update_cve_status_by_artifact_cve
+    //
+    // These exercise the full handler call chain (CVE-id validation,
+    // ensure_artifact_repo_access, CveStatus::parse, service invocation,
+    // JSON serialization) against a real Postgres pool. They no-op when
+    // `DATABASE_URL` is unset so `cargo test --lib` still works locally,
+    // and run in CI's coverage job where Postgres is seeded.
+    // -----------------------------------------------------------------------
+
+    /// Seed one scan_findings row tied to (artifact, cve_id) using the same
+    /// shape the scanner ingest path writes. Mirrors the helpers in
+    /// `services::sbom_service::tests` but lives here so handler tests
+    /// don't depend on internal service plumbing.
+    async fn seed_finding_for_handler(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        cve_id: &str,
+        severity: &str,
+    ) {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (id, artifact_id, repository_id, scan_type,
+                                      status, findings_count, started_at, completed_at)
+            VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW())
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_result");
+
+        sqlx::query(
+            r#"
+            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
+                                       cve_id, source, is_acknowledged)
+            VALUES ($1, $2, $3, $4, $5, 'trivy', false)
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(severity)
+        .bind(format!("test {}", cve_id))
+        .bind(cve_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_finding");
+    }
+
+    /// Seed an artifact row attached to the fixture's repo so
+    /// `ensure_artifact_repo_access` finds it.
+    async fn seed_artifact_for_handler(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{}/{}", repo_id, id);
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, repository_id, name, path, version,
+                                   size_bytes, checksum_sha256, content_type,
+                                   storage_key, is_deleted)
+            VALUES ($1, $2, $3, $4, '1.0.0', 1024, $5,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("handler-art-{}", id))
+        .bind(&path)
+        .bind(format!("sha256-handler-{}", id))
+        .execute(pool)
+        .await
+        .expect("seed artifact for handler test");
+        id
+    }
+
+    /// Drop scan_findings/scan_results owned by this repo. Used in addition
+    /// to `tdh::cleanup` because that helper only knows about artifacts +
+    /// repositories.
+    async fn teardown_scans(pool: &sqlx::PgPool, repo_id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_malformed_cve_id_before_db_lookup() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "not-a-cve".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("not-a-cve"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_unknown_status_string() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        // `CveStatus::parse` returns None for any string outside the four
+        // known variants. Handler must surface that as 400 with the
+        // original status text echoed so the client can debug.
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-8888".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "definitely-not-a-status".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("definitely-not-a-status"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_acknowledge_happy_path_returns_synth_entry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-1010", "high").await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-1010".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: Some("handler test reason".to_string()),
+            }),
+        )
+        .await;
+
+        let entry = match &result {
+            Ok(axum::Json(e)) => e.clone(),
+            Err(err) => {
+                teardown_scans(&fx.pool, fx.repo_id).await;
+                fx.teardown().await;
+                panic!("expected Ok, got {:?}", err);
+            }
+        };
+
+        assert_eq!(entry.artifact_id, artifact_id);
+        assert_eq!(entry.cve_id.to_ascii_uppercase(), "CVE-2024-1010");
+        assert_eq!(entry.status, "acknowledged");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_fixed_status_returns_validation_error() {
+        // `Fixed` is the curated-only lifecycle state; the handler must
+        // surface a 400 (Validation) rather than 500 or silent coercion.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-2020", "low").await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-2020".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "fixed".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.to_lowercase().contains("fixed"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_no_matching_scan_findings_returns_not_found() {
+        // Artifact exists and access check passes, but no scan_findings
+        // row matches (artifact, cve) -- handler must turn the service's
+        // NotFound into a 404, never a 500.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-3030".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::NotFound(msg)) => {
+                assert!(msg.contains("CVE-2024-3030"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_normalizes_lowercase_cve_id_input() {
+        // The Security tab can surface mixed-case CVE ids depending on the
+        // scanner source; the handler must upper-case the input before
+        // calling the service so the canonical comparison still matches.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-4040", "medium")
+            .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        // Send the CVE id lower-cased: handler must still match.
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "cve-2024-4040".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        let ok = result.is_ok();
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        assert!(ok, "lower-case CVE id input must still match the row");
+    }
+
+    #[tokio::test]
+    async fn test_handler_accepts_ghsa_id() {
+        // GHSA-xxxx-xxxx-xxxx ids must reach the service path without
+        // being rejected by `is_valid_vuln_id`.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(
+            &fx.pool,
+            artifact_id,
+            fx.repo_id,
+            "GHSA-jf85-cpcp-j695",
+            "high",
+        )
+        .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "GHSA-jf85-cpcp-j695".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "false_positive".to_string(),
+                reason: Some("not exploitable".to_string()),
+            }),
+        )
+        .await;
+
+        let entry = match &result {
+            Ok(axum::Json(e)) => e.clone(),
+            Err(err) => {
+                teardown_scans(&fx.pool, fx.repo_id).await;
+                fx.teardown().await;
+                panic!("expected Ok for GHSA id, got {:?}", err);
+            }
+        };
+        // false_positive collapses to "acknowledged" on the synth aggregate
+        // (scan_findings has no separate FP column).
+        assert_eq!(entry.status, "acknowledged");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_caller_without_repo_access() {
+        // `ensure_artifact_repo_access` must enforce the auth extension's
+        // `allowed_repo_ids` whitelist: a caller scoped to some other repo
+        // must see the same 404 they'd see if the artifact didn't exist,
+        // never the contents of a repo they can't access.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-5050", "high").await;
+
+        // Build an auth extension whose allowed_repo_ids does NOT include
+        // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-5050".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        // Repo-scope mismatch is surfaced as the same NotFound used for a
+        // missing artifact (deliberate: don't leak existence of inaccessible
+        // repos through error shape).
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound for scoped-out caller, got {:?}", other),
+        }
     }
 }

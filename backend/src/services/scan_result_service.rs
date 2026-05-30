@@ -590,11 +590,28 @@ impl ScanResultService {
 
     /// Find a completed scan result for the same checksum + scan_type within a TTL window.
     /// Returns None if no reusable scan exists.
+    ///
+    /// Two TTLs are applied so a silently-broken prior scan does not mask a
+    /// real re-scan for 30 days (#1469):
+    ///
+    /// * `ttl_days` is the standard window for rows with at least one
+    ///   finding. Those rows are unambiguous: the scanner produced output
+    ///   for the given bytes.
+    /// * `zero_findings_ttl_days` is a shorter window applied to rows where
+    ///   `findings_count = 0`. A zero-finding completed row can mean
+    ///   "scanner ran and the artifact is clean" OR "scanner ran but the
+    ///   extraction step walked an empty tree" (e.g. the incus backup-format
+    ///   bug in #1427 / #1428). The shorter window bounds how long the
+    ///   latter case can mask a re-scan after the underlying bug is fixed,
+    ///   while still suppressing repeated full scans of genuinely clean
+    ///   artifacts within the shorter window. Callers that want a single
+    ///   uniform TTL can pass the same value for both arguments.
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
         ttl_days: i32,
+        zero_findings_ttl_days: i32,
     ) -> Result<Option<ScanResult>> {
         let result = sqlx::query_as!(
             ScanResult,
@@ -607,13 +624,16 @@ impl ScanResultService {
             WHERE checksum_sha256 = $1
               AND scan_type = $2
               AND status = 'completed'
-              AND completed_at > NOW() - ($3 || ' days')::interval
+              AND completed_at > NOW() - (
+                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
+              )::interval
             ORDER BY completed_at DESC
             LIMIT 1
             "#,
             checksum_sha256,
             scan_type,
             ttl_days.to_string(),
+            zero_findings_ttl_days.to_string(),
         )
         .fetch_optional(&self.db)
         .await
@@ -645,6 +665,7 @@ impl ScanResultService {
         checksum_sha256: &str,
         scan_type: &str,
         ttl_days: i32,
+        zero_findings_ttl_days: i32,
     ) -> Result<Option<ScanResult>> {
         let result = sqlx::query_as!(
             ScanResult,
@@ -658,7 +679,9 @@ impl ScanResultService {
               AND checksum_sha256 = $2
               AND scan_type = $3
               AND status = 'completed'
-              AND completed_at > NOW() - ($4 || ' days')::interval
+              AND completed_at > NOW() - (
+                  CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
+              )::interval
             ORDER BY completed_at DESC
             LIMIT 1
             "#,
@@ -666,6 +689,7 @@ impl ScanResultService {
             checksum_sha256,
             scan_type,
             ttl_days.to_string(),
+            zero_findings_ttl_days.to_string(),
         )
         .fetch_optional(&self.db)
         .await

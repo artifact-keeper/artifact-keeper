@@ -17,14 +17,84 @@ use uuid::Uuid;
 
 /// Default stale peer threshold in minutes (peers with no heartbeat for this
 /// long are marked offline).  Matches the admin settings default.
+///
+/// Override with `PEER_STALE_THRESHOLD_MINUTES` (positive integer).  In e2e
+/// mesh tests this is typically lowered to 1 minute so failover fits within
+/// a 90s test budget; production should keep the conservative default to
+/// avoid flapping under transient heartbeat loss.
 const STALE_PEER_THRESHOLD_MINUTES: i32 = 5;
 
 /// How many ticks (10s each) between stale peer detection runs.
 /// 6 ticks = 60 seconds.
+///
+/// Override with `PEER_STALE_CHECK_INTERVAL_TICKS` (positive integer).  Each
+/// tick is `TICK_INTERVAL_SECS` (10s); the failover detection latency is
+/// `(stale_check_interval_ticks * 10s) + (stale_threshold_minutes * 60s)`.
 const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
+
+/// Read the configured stale-peer threshold (minutes) from
+/// `PEER_STALE_THRESHOLD_MINUTES`, falling back to
+/// `STALE_PEER_THRESHOLD_MINUTES`.  Non-positive values are rejected so we
+/// never disable detection by accident.
+pub(crate) fn stale_peer_threshold_minutes() -> i32 {
+    std::env::var("PEER_STALE_THRESHOLD_MINUTES")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(STALE_PEER_THRESHOLD_MINUTES)
+}
+
+/// Read the configured stale-check tick interval from
+/// `PEER_STALE_CHECK_INTERVAL_TICKS`, falling back to
+/// `STALE_CHECK_INTERVAL_TICKS`.  Non-positive values are rejected.
+pub(crate) fn stale_check_interval_ticks() -> u64 {
+    std::env::var("PEER_STALE_CHECK_INTERVAL_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(STALE_CHECK_INTERVAL_TICKS)
+}
+
+/// Compute the worst-case failover-detection deadline (in seconds) for a
+/// given configuration. The deadline is the sum of the polling cadence and
+/// the heartbeat threshold: that is the latest point at which a healthy
+/// peer can be expected to discover an offline originating peer.
+pub(crate) fn failover_detection_deadline_secs(
+    stale_check_interval_ticks: u64,
+    stale_threshold_minutes: i32,
+    tick_interval_secs: u64,
+) -> u64 {
+    let poll_secs = stale_check_interval_ticks.saturating_mul(tick_interval_secs);
+    let threshold_secs = (stale_threshold_minutes.max(0) as u64).saturating_mul(60);
+    poll_secs.saturating_add(threshold_secs)
+}
 
 /// Duration of each worker tick in seconds.
 const TICK_INTERVAL_SECS: u64 = 10;
+
+/// Default per-peer TCP connect timeout (seconds) for sync transfers.
+///
+/// Bounds how long a single transfer waits to establish a connection to a
+/// peer. Without this, a peer whose endpoint black-holes connections (firewall
+/// DROP, dead host) would hold a transfer slot for the full request timeout
+/// (300s). In a fan-out to multiple peers, that unreachable peer would then
+/// occupy one of its own concurrency slots for minutes. Capping the connect
+/// phase lets the worker fail the broken leg quickly and retry under backoff,
+/// while healthy peers (separate tasks) are unaffected.
+///
+/// Override with `SYNC_PEER_CONNECT_TIMEOUT_SECS` (positive integer).
+const DEFAULT_PEER_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Read the configured per-peer connect timeout from
+/// `SYNC_PEER_CONNECT_TIMEOUT_SECS`, falling back to
+/// `DEFAULT_PEER_CONNECT_TIMEOUT_SECS`. Non-positive values are rejected.
+pub(crate) fn peer_connect_timeout_secs() -> u64 {
+    std::env::var("SYNC_PEER_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_PEER_CONNECT_TIMEOUT_SECS)
+}
 
 /// Default threshold (in bytes) above which chunked transfer is used instead
 /// of a single-request upload.  100 MB.
@@ -79,20 +149,37 @@ pub async fn spawn_sync_worker(db: PgPool) {
         // Small startup delay so the server can finish initializing.
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut tick = interval(Duration::from_secs(TICK_INTERVAL_SECS));
+        let connect_timeout = peer_connect_timeout_secs();
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(300))
+            // Bound the connect phase so an unreachable peer in a fan-out
+            // fails fast instead of holding a transfer slot for the full
+            // request timeout.
+            .connect_timeout(Duration::from_secs(connect_timeout))
             .build()
             .expect("Failed to build HTTP client for sync worker");
 
         let mut tick_count: u64 = 0;
+        let stale_interval_ticks = stale_check_interval_ticks();
+        let stale_threshold_min = stale_peer_threshold_minutes();
+        tracing::info!(
+            "Sync worker started: stale-check every {}s, threshold {}m, failover deadline ~{}s",
+            stale_interval_ticks * TICK_INTERVAL_SECS,
+            stale_threshold_min,
+            failover_detection_deadline_secs(
+                stale_interval_ticks,
+                stale_threshold_min,
+                TICK_INTERVAL_SECS,
+            )
+        );
 
         loop {
             tick.tick().await;
             tick_count += 1;
 
             // Periodically check for stale peers and mark them offline.
-            if should_run_stale_check(tick_count, STALE_CHECK_INTERVAL_TICKS) {
-                run_stale_peer_detection(&db).await;
+            if should_run_stale_check(tick_count, stale_interval_ticks) {
+                run_stale_peer_detection(&db, stale_threshold_min).await;
             }
 
             if let Err(e) = process_pending_tasks(&db, &client).await {
@@ -104,14 +191,11 @@ pub async fn spawn_sync_worker(db: PgPool) {
 
 /// Detect peers that have not sent a heartbeat within the threshold and
 /// mark them offline.
-async fn run_stale_peer_detection(db: &PgPool) {
+async fn run_stale_peer_detection(db: &PgPool, threshold_minutes: i32) {
     let peer_service = crate::services::peer_instance_service::PeerInstanceService::new(db.clone());
-    match peer_service
-        .mark_stale_offline(STALE_PEER_THRESHOLD_MINUTES)
-        .await
-    {
+    match peer_service.mark_stale_offline(threshold_minutes).await {
         Ok(count) => {
-            if let Some(msg) = format_stale_detection_log(count, STALE_PEER_THRESHOLD_MINUTES) {
+            if let Some(msg) = format_stale_detection_log(count, threshold_minutes) {
                 tracing::info!("{}", msg);
             }
         }
@@ -1977,6 +2061,85 @@ mod tests {
         assert!(msg.unwrap().contains("100 stale peer(s)"));
     }
 
+    // ── failover deadline / env override (Bug #1440 A) ────────────────────
+
+    #[test]
+    fn test_failover_deadline_production_defaults() {
+        // 6 ticks * 10s + 5min * 60s = 60 + 300 = 360s.
+        // This is the absolute floor for failover detection with stock config,
+        // which is why a 90s mesh-test budget cannot pass without overrides.
+        let d = failover_detection_deadline_secs(6, 5, 10);
+        assert_eq!(d, 360);
+    }
+
+    #[test]
+    fn test_failover_deadline_e2e_overrides_fit_90s_budget() {
+        // With PEER_STALE_CHECK_INTERVAL_TICKS=2 and
+        // PEER_STALE_THRESHOLD_MINUTES=1, the deadline is
+        // (2*10) + (1*60) = 80s, which fits the 90s test budget.
+        let d = failover_detection_deadline_secs(2, 1, 10);
+        assert_eq!(d, 80);
+        assert!(d < 90, "e2e override must leave room before 90s budget");
+    }
+
+    #[test]
+    fn test_failover_deadline_zero_threshold() {
+        // Threshold of 0 means "detect immediately after the next poll".
+        // We never enable this in code (the parser filters out 0), but the
+        // deadline math must not panic.
+        assert_eq!(failover_detection_deadline_secs(6, 0, 10), 60);
+        assert_eq!(failover_detection_deadline_secs(0, 0, 10), 0);
+    }
+
+    #[test]
+    fn test_failover_deadline_saturating_overflow() {
+        // u64 saturating math must not panic on absurd inputs.
+        let d = failover_detection_deadline_secs(u64::MAX, i32::MAX, u64::MAX);
+        assert_eq!(d, u64::MAX);
+    }
+
+    // Env-var tests share process state with the rest of the test binary;
+    // serialise them with a local mutex so parallel test runs don't race.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_stale_peer_threshold_env_override() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::set_var("PEER_STALE_THRESHOLD_MINUTES", "1");
+        let observed = stale_peer_threshold_minutes();
+        std::env::remove_var("PEER_STALE_THRESHOLD_MINUTES");
+        assert_eq!(observed, 1);
+        assert_eq!(stale_peer_threshold_minutes(), STALE_PEER_THRESHOLD_MINUTES);
+    }
+
+    #[test]
+    fn test_stale_peer_threshold_rejects_non_positive() {
+        let _g = ENV_GUARD.lock().unwrap();
+        for bad in ["0", "-1", "garbage"] {
+            std::env::set_var("PEER_STALE_THRESHOLD_MINUTES", bad);
+            let observed = stale_peer_threshold_minutes();
+            std::env::remove_var("PEER_STALE_THRESHOLD_MINUTES");
+            assert_eq!(
+                observed, STALE_PEER_THRESHOLD_MINUTES,
+                "rejected value {bad:?} should fall back to default"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stale_check_interval_ticks_env_override() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::set_var("PEER_STALE_CHECK_INTERVAL_TICKS", "2");
+        let observed = stale_check_interval_ticks();
+        std::env::remove_var("PEER_STALE_CHECK_INTERVAL_TICKS");
+        assert_eq!(observed, 2);
+
+        std::env::set_var("PEER_STALE_CHECK_INTERVAL_TICKS", "0");
+        let observed_zero = stale_check_interval_ticks();
+        std::env::remove_var("PEER_STALE_CHECK_INTERVAL_TICKS");
+        assert_eq!(observed_zero, STALE_CHECK_INTERVAL_TICKS);
+    }
+
     // ── pick_best_peer ────────────────────────────────────────────────────
 
     #[test]
@@ -2430,5 +2593,35 @@ mod tests {
     fn test_sync_chunk_size_bytes_default() {
         let val = DEFAULT_SYNC_CHUNK_SIZE_BYTES;
         assert_eq!(val, 52_428_800);
+    }
+
+    // ── peer_connect_timeout_secs ───────────────────────────────────────
+
+    #[test]
+    fn test_peer_connect_timeout_default_is_bounded() {
+        // The default must be small relative to the 300s request timeout so a
+        // black-holed peer in a fan-out cannot hold a transfer slot for long.
+        // Pins the exact default; 10 is well under the 300s request timeout.
+        assert_eq!(DEFAULT_PEER_CONNECT_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_peer_connect_timeout_env_override() {
+        // Guarded against parallel env mutation by using a unique read path:
+        // set, read, clear. Other tests don't touch this var.
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "3");
+        assert_eq!(peer_connect_timeout_secs(), 3);
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "0");
+        // Non-positive is rejected, falls back to default.
+        assert_eq!(
+            peer_connect_timeout_secs(),
+            DEFAULT_PEER_CONNECT_TIMEOUT_SECS
+        );
+        std::env::set_var("SYNC_PEER_CONNECT_TIMEOUT_SECS", "notanumber");
+        assert_eq!(
+            peer_connect_timeout_secs(),
+            DEFAULT_PEER_CONNECT_TIMEOUT_SECS
+        );
+        std::env::remove_var("SYNC_PEER_CONNECT_TIMEOUT_SECS");
     }
 }

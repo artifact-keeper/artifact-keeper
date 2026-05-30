@@ -187,3 +187,133 @@ async fn concurrent_add_virtual_member_assigns_distinct_priorities() {
         .await
         .ok();
 }
+
+/// Count the members of a virtual repository.
+async fn member_count(pool: &PgPool, virtual_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM virtual_repo_members WHERE virtual_repo_id = $1",
+    )
+    .bind(virtual_id)
+    .fetch_one(pool)
+    .await
+    .expect("count members")
+}
+
+/// B1: removing one member must delete exactly that member's row, leaving
+/// every other member intact. A DELETE scoped only by `virtual_repo_id`
+/// (missing the `member_repo_id` predicate) would empty the whole repo --
+/// the regression this test pins.
+#[tokio::test]
+#[ignore]
+async fn remove_virtual_member_deletes_only_the_targeted_row() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this integration test");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("failed to connect to database");
+
+    let suffix = Uuid::new_v4();
+    let virtual_id = insert_repo(
+        &pool,
+        &format!("test-virt-del-{}", suffix),
+        "virtual",
+        "generic",
+    )
+    .await;
+    let member_a = insert_repo(&pool, &format!("test-del-a-{}", suffix), "local", "generic").await;
+    let member_b = insert_repo(&pool, &format!("test-del-b-{}", suffix), "local", "generic").await;
+
+    let svc = RepositoryService::new(pool.clone());
+    svc.add_virtual_member(virtual_id, member_a, Some(1))
+        .await
+        .expect("add member a");
+    svc.add_virtual_member(virtual_id, member_b, Some(2))
+        .await
+        .expect("add member b");
+    assert_eq!(
+        member_count(&pool, virtual_id).await,
+        2,
+        "two members before delete"
+    );
+
+    // Remove only A.
+    svc.remove_virtual_member(virtual_id, member_a)
+        .await
+        .expect("remove member a must succeed");
+
+    // Exactly B must remain.
+    assert_eq!(
+        member_count(&pool, virtual_id).await,
+        1,
+        "removing one member must not empty the repo (B1 regression)"
+    );
+    let remaining = sqlx::query_scalar::<_, Uuid>(
+        "SELECT member_repo_id FROM virtual_repo_members WHERE virtual_repo_id = $1",
+    )
+    .bind(virtual_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch remaining member");
+    assert_eq!(remaining, member_b, "the surviving member must be B, not A");
+
+    sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+        .bind(virtual_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+        .bind(&[virtual_id, member_a, member_b][..])
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// B3: removing a member that is not present (e.g. a repeat DELETE of an
+/// already-removed member, where the repo still exists so key resolution
+/// succeeds) must return `AppError::NotFound` (HTTP 404), not silently
+/// succeed.
+#[tokio::test]
+#[ignore]
+async fn remove_already_removed_member_returns_not_found() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this integration test");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("failed to connect to database");
+
+    let suffix = Uuid::new_v4();
+    let virtual_id = insert_repo(
+        &pool,
+        &format!("test-virt-404-{}", suffix),
+        "virtual",
+        "generic",
+    )
+    .await;
+    let member_a = insert_repo(&pool, &format!("test-404-a-{}", suffix), "local", "generic").await;
+
+    let svc = RepositoryService::new(pool.clone());
+    svc.add_virtual_member(virtual_id, member_a, Some(1))
+        .await
+        .expect("add member a");
+
+    // First removal succeeds.
+    svc.remove_virtual_member(virtual_id, member_a)
+        .await
+        .expect("first remove must succeed");
+
+    // Second removal of the same (now-missing) member must be NotFound.
+    let err = svc
+        .remove_virtual_member(virtual_id, member_a)
+        .await
+        .expect_err("repeat remove of an already-removed member must fail");
+    assert!(
+        matches!(err, AppError::NotFound(_)),
+        "repeat remove must surface as NotFound (404), got {err:?}"
+    );
+
+    sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+        .bind(&[virtual_id, member_a][..])
+        .execute(&pool)
+        .await
+        .ok();
+}

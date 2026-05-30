@@ -107,6 +107,18 @@ impl AppError {
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             Self::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR"),
+            // SQLx pool exhaustion is a transient capacity problem, not a
+            // server bug: requests timed out waiting for a DB connection
+            // because peers held them all. Surfacing this as 500 trips
+            // alerts and makes saturation look like a fault; 503 +
+            // Retry-After lets clients back off and retry on the same
+            // path. See #1437 / #1442.
+            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
+            }
+            Self::Database(msg) if msg.contains("PoolTimedOut") => {
+                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
+            }
             Self::Database(_) | Self::Sqlx(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
             }
@@ -152,6 +164,12 @@ impl AppError {
     fn user_message(&self) -> String {
         match self {
             // Server-side errors: return generic messages (details are logged)
+            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
+                "Database connection pool is saturated, retry shortly".to_string()
+            }
+            Self::Database(msg) if msg.contains("PoolTimedOut") => {
+                "Database connection pool is saturated, retry shortly".to_string()
+            }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
             Self::Storage(msg) if is_name_too_long(msg) => {
@@ -220,6 +238,55 @@ mod tests {
         let err = AppError::Database("SELECT * FROM users WHERE id = 42".into());
         assert_eq!(err.user_message(), "Database operation failed");
         assert!(!err.user_message().contains("SELECT"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1437 / #1442: SQLx pool-timeout must map to 503 (transient capacity),
+    // not 500 (server fault). Operators alert on 500s; the previous mapping
+    // hid pool exhaustion behind alert fatigue and made saturated stress
+    // tests look like backend bugs instead of capacity-shed events.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sqlx_pool_timed_out_maps_to_503() {
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        let (status, code) = err.status_and_code();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "POOL_EXHAUSTED");
+    }
+
+    #[test]
+    fn test_sqlx_pool_timed_out_user_message_is_actionable() {
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        let msg = err.user_message();
+        // Operators see the actual cause in logs; clients see "retry shortly".
+        assert!(
+            msg.contains("retry"),
+            "user message should advise retry, got: {msg}"
+        );
+        // Generic non-pool-timeout SQLx errors still hide details.
+        let other = AppError::Sqlx(sqlx::Error::RowNotFound);
+        assert_eq!(other.user_message(), "Database operation failed");
+    }
+
+    #[test]
+    fn test_pool_timeout_string_wrapped_as_database_also_503s() {
+        // Some callers stringify the sqlx error (`map_err(|e| e.to_string())`)
+        // before wrapping it as `AppError::Database`. The 503 mapping must
+        // still fire so wrapped pool timeouts don't slip back to 500.
+        let err = AppError::Database("pool error: PoolTimedOut".into());
+        let (status, _) = err.status_and_code();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_other_sqlx_errors_still_map_to_500() {
+        // Only pool-timeout is reclassified; everything else stays 500 so
+        // genuine SQL faults still trip ops alerts.
+        let err = AppError::Sqlx(sqlx::Error::RowNotFound);
+        let (status, code) = err.status_and_code();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "DATABASE_ERROR");
     }
 
     #[test]

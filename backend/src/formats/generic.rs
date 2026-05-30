@@ -21,6 +21,49 @@ impl Default for GenericHandler {
     }
 }
 
+/// A single candidate member when resolving a generic artifact through a
+/// virtual repository, in priority order.
+#[derive(Debug, Clone)]
+pub struct GenericVirtualMember {
+    /// True when the member is a Remote (proxy) repo. Remote members are
+    /// suppressed by the shadowing guard when a non-Remote member owns the
+    /// requested path.
+    pub is_remote: bool,
+    /// The bytes this member would serve for the requested path, or `None`
+    /// when the member does not have the artifact.
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Pure model of the generic-format virtual download resolution (B9).
+///
+/// Mirrors the runtime behaviour of `download_artifact`'s Virtual arm:
+/// members are tried in priority order and the first one that produces
+/// bytes wins. The `local_owns_path` flag is the exact-path shadowing
+/// guard (`virtual_non_remote_owns_path`): when a non-Remote member owns
+/// the requested path, every Remote member is suppressed so it cannot
+/// shadow the local artifact with empty or unrelated bytes.
+///
+/// Without the guard, a Remote member earlier in priority order that
+/// returns bytes (including an empty body from a catch-all upstream) would
+/// win the first-match race and the local member's real bytes would never
+/// be served. This pure helper captures that contract so it has unit
+/// coverage without a database or storage backend.
+pub fn resolve_generic_virtual_bytes(
+    members: &[GenericVirtualMember],
+    local_owns_path: bool,
+) -> Option<Vec<u8>> {
+    for member in members {
+        if member.is_remote && local_owns_path {
+            // Shadowing guard: skip Remote members entirely.
+            continue;
+        }
+        if let Some(bytes) = &member.bytes {
+            return Some(bytes.clone());
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl FormatHandler for GenericHandler {
     fn format(&self) -> RepositoryFormat {
@@ -167,5 +210,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata["path"], "large.bin");
+    }
+
+    // ========================================================================
+    // resolve_generic_virtual_bytes tests (B9): a generic virtual repo MUST
+    // serve a present local member's artifact bytes, even when a Remote
+    // member earlier in priority order also responds.
+    // ========================================================================
+
+    fn remote(bytes: Option<&[u8]>) -> GenericVirtualMember {
+        GenericVirtualMember {
+            is_remote: true,
+            bytes: bytes.map(|b| b.to_vec()),
+        }
+    }
+
+    fn local(bytes: Option<&[u8]>) -> GenericVirtualMember {
+        GenericVirtualMember {
+            is_remote: false,
+            bytes: bytes.map(|b| b.to_vec()),
+        }
+    }
+
+    #[test]
+    fn test_generic_virtual_serves_local_member_bytes() {
+        // The member that actually has the artifact is local; the guard is
+        // off (no shadowing), so it is served.
+        let members = vec![remote(None), local(Some(b"PAYLOAD"))];
+        let served = resolve_generic_virtual_bytes(&members, /* local_owns_path = */ true);
+        assert_eq!(served.as_deref(), Some(&b"PAYLOAD"[..]));
+    }
+
+    #[test]
+    fn test_generic_virtual_guard_skips_remote_that_would_shadow_local() {
+        // Regression for B9: a Remote member earlier in priority order returns
+        // an EMPTY body for the same path. Without the shadowing guard the
+        // remote wins the first-match race and the download serves zero bytes,
+        // hiding the local member's real artifact. With the guard active
+        // (local owns the path) the remote is skipped and the local bytes win.
+        let members = vec![remote(Some(b"")), local(Some(b"REAL-BYTES"))];
+
+        // Guard ON (a non-Remote member owns the path): local bytes served.
+        let with_guard = resolve_generic_virtual_bytes(&members, true);
+        assert_eq!(
+            with_guard.as_deref(),
+            Some(&b"REAL-BYTES"[..]),
+            "with the shadowing guard the local member's bytes must be served"
+        );
+
+        // Guard OFF demonstrates the pre-fix bug: the empty remote shadows.
+        let without_guard = resolve_generic_virtual_bytes(&members, false);
+        assert_eq!(
+            without_guard.as_deref(),
+            Some(&b""[..]),
+            "without the guard the remote's empty body shadows the local artifact (the B9 bug)"
+        );
+    }
+
+    #[test]
+    fn test_generic_virtual_remote_serves_when_no_local_owner() {
+        // No local member owns the path: the remote proxy is allowed to serve.
+        let members = vec![remote(Some(b"UPSTREAM")), local(None)];
+        let served = resolve_generic_virtual_bytes(&members, false);
+        assert_eq!(served.as_deref(), Some(&b"UPSTREAM"[..]));
+    }
+
+    #[test]
+    fn test_generic_virtual_none_when_no_member_has_artifact() {
+        let members = vec![remote(None), local(None)];
+        assert!(resolve_generic_virtual_bytes(&members, false).is_none());
+        assert!(resolve_generic_virtual_bytes(&members, true).is_none());
     }
 }

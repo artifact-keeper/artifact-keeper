@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     extract::{Extension, Multipart, Path, Query, State},
     http::{header, HeaderMap},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -485,13 +485,33 @@ fn validate_virtual_repo_member_count(
     if *repo_type != RepositoryType::Virtual {
         return Ok(());
     }
-    let count = member_repos.map_or(0, <[_]>::len);
-    if count == 0 {
+    // #1444 follow-up: distinguish "field omitted entirely" (None) from
+    // "explicit empty list" (Some(vec![])).
+    //
+    // * None  -> caller is following the deferred-population pattern: create
+    //            the virtual, then add members via `POST /repositories/{key}/members`.
+    //            This is the shape every E2E test helper uses. Rejecting it
+    //            at create time (the original PR #1279 / #1281 behaviour)
+    //            breaks the create-then-add flow and surfaces as the
+    //            "members router returns 404" symptom in #1444 because
+    //            the follow-up POSTs target a nonexistent repo. We
+    //            therefore accept None and leave the empty-virtual state
+    //            visible at fetch time (NOT_FOUND on download) -- it
+    //            self-resolves on the first add_member.
+    //
+    // * Some(vec![]) -> caller explicitly said "no members". This is the
+    //            silent-drop trap from #1279 (mis-typed field name
+    //            deserialised to None pre-fix; the explicit empty form is
+    //            also a clear operator mistake). Keep rejecting it so the
+    //            mistake surfaces at create-time with an actionable
+    //            message, as #1281 intended.
+    if let Some([]) = member_repos {
         return Err(AppError::Validation(format!(
-            "Virtual repository '{}' requires at least one member. Provide \
-             `member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]` \
-             in the request body. Use `PUT /api/v1/repositories/{}/members` \
-             after creation to update the member list. (#1279)",
+            "Virtual repository '{}' was created with an explicit empty \
+             `member_repos: []`. Provide one or more members \
+             (`member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]`) \
+             at create time, or omit the field entirely and add members \
+             via `POST /api/v1/repositories/{}/members` afterwards. (#1279, #1444)",
             repo_key, repo_key
         )));
     }
@@ -816,10 +836,17 @@ pub async fn list_repositories(
 pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Json(payload): Json<CreateRepositoryRequest>,
+    body: Bytes,
 ) -> Result<Json<RepositoryResponse>> {
+    // #1438 (1b): authenticate BEFORE deserializing the body. The previous
+    // `Json<CreateRepositoryRequest>` extractor ran first and rejected
+    // unauth requests carrying a payload the schema didn't recognize with
+    // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    let payload: CreateRepositoryRequest =
+        serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Fine-grained permission check: non-admins need "admin" on the system sentinel.
     if !auth.is_admin {
@@ -850,8 +877,10 @@ pub async fn create_repository(
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Validate up-front that virtual repos arrive with at least one member.
-    // See `validate_virtual_repo_member_count` for the rationale (#1279).
+    // Validate up-front that virtual repos do not arrive with an explicit
+    // empty `member_repos: []`. Omitted-field (deferred-population) is
+    // accepted so the create-then-add pattern works.
+    // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
     // Resolve storage backend: use the requested one or fall back to the default.
@@ -921,31 +950,36 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
-    // Add virtual repository members. The up-front validation above
-    // guarantees `member_repos` is `Some(non-empty)` whenever
-    // `repo_type == Virtual`, so the empty / None arms are unreachable.
+    // Add virtual repository members. Post-#1444, the validator accepts
+    // `member_repos == None` (deferred-population pattern: caller will
+    // POST /members later) and only rejects `Some(empty_vec)`. Treat the
+    // None arm as a clean no-op here; the Some(non-empty) arm is the
+    // create-with-members path and runs the original loop.
     if repo_type == RepositoryType::Virtual {
-        let member_inputs = payload
-            .member_repos
-            .as_deref()
-            .expect("member_repos non-empty validated above");
-        tracing::info!(
-            repo_key = %repo.key,
-            member_count = member_inputs.len(),
-            "Adding virtual repository members during creation"
-        );
-        for (idx, input) in member_inputs.iter().enumerate() {
-            let member_repo = service.get_by_key(&input.repo_key).await?;
-            let priority = resolve_member_priority(input.priority, idx);
-            tracing::debug!(
-                virtual_repo = %repo.key,
-                member_key = %input.repo_key,
-                priority = priority,
-                "Adding virtual member"
+        if let Some(member_inputs) = payload.member_repos.as_deref() {
+            tracing::info!(
+                repo_key = %repo.key,
+                member_count = member_inputs.len(),
+                "Adding virtual repository members during creation"
             );
-            service
-                .add_virtual_member(repo.id, member_repo.id, Some(priority))
-                .await?;
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = resolve_member_priority(input.priority, idx);
+                tracing::debug!(
+                    virtual_repo = %repo.key,
+                    member_key = %input.repo_key,
+                    priority = priority,
+                    "Adding virtual member"
+                );
+                service
+                    .add_virtual_member(repo.id, member_repo.id, Some(priority))
+                    .await?;
+            }
+        } else {
+            tracing::info!(
+                repo_key = %repo.key,
+                "Virtual repo created with no members; deferring to POST /members (#1444)"
+            );
         }
     }
 
@@ -1325,9 +1359,19 @@ pub struct DockerTagResponse {
     pub is_index: bool,
     /// Last push (or update) timestamp from the underlying `oci_tags` row.
     pub last_pushed_at: chrono::DateTime<chrono::Utc>,
-    /// Latest scan status (`pending`, `running`, `completed`, `failed`) from
-    /// `scan_results`, if the manifest has ever been scanned.  `None` when
-    /// the artifact has never been scanned.
+    /// Rolled-up scan status across all scanners configured for this
+    /// artifact. `None` when the artifact has never been scanned.
+    ///
+    /// Values surface the aggregate state, not a single scanner's row
+    /// (see #1497). One of:
+    ///
+    /// * `pending` / `running` -- at least one scanner is still in flight
+    /// * `completed` -- every per-scan-type latest row is `completed`
+    /// * `failed` -- every per-scan-type latest row is `failed`
+    /// * `partial` -- mixed: at least one `completed` AND at least one
+    ///   `failed`. A green generic scanner (e.g. grype) no longer hides
+    ///   a failed format-native scanner (e.g. incus) behind a
+    ///   `completed` label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_status: Option<String>,
 }
@@ -1496,11 +1540,27 @@ pub async fn list_artifacts(
             std::collections::HashMap::new()
         };
 
+    // For npm-family repos the artifact is stored under the
+    // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
+    // (see `api::handlers::npm::store_npm_version`), but npm clients and
+    // every external consumer reference tarballs by the download-URL
+    // shape `<name>/-/<name>-<version>.tgz`. Surface the URL shape in the
+    // listing's `path` so callers that resolve an artifact by the path
+    // npm published (the management UI, SDKs, the release-gate real-flow
+    // smoke test) match against the same string they downloaded from.
+    // Lookup-by-path already accepts both shapes via
+    // `normalize_lookup_path` (#1443); this keeps the listing consistent.
+    let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
+
     let mut items = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
-        items.push(build_artifact_response(&artifact, &key, download_count));
+        let mut item = build_artifact_response(&artifact, &key, download_count);
+        if rewrite_npm_tarball_paths {
+            apply_npm_tarball_url_path(&mut item);
+        }
+        items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
             items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
@@ -1525,6 +1585,97 @@ pub async fn list_artifacts(
 /// Extracted from the inline listing loop so it can be unit-tested
 /// without a database. Pure transformation of `Artifact` fields plus
 /// the precomputed download count.
+/// Return the ordered list of paths to try when looking up an artifact
+/// by path under a repo of the given format.
+///
+/// The literal request path is always tried first so non-npm formats
+/// and already-stored paths keep working unchanged. For npm-family
+/// repos a second candidate is appended whenever the request path
+/// matches the canonical npm tarball URL shape
+/// (`<name>/-/<name>-<version>.tgz`); that second candidate is the
+/// version-segmented stored shape produced by `store_npm_version`. See
+/// #1443.
+///
+/// Returned without duplicates: if the literal path is already the
+/// stored shape (or `normalize_lookup_path` returns the same string),
+/// only one DB query runs.
+fn lookup_path_candidates(path: &str, format: &RepositoryFormat) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    if is_npm_family_format(format) {
+        if let Some(normalized) = crate::formats::npm::normalize_lookup_path(path) {
+            if normalized != path {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
+/// npm-family formats share the publish/download path conventions of
+/// the npm registry (`yarn`, `pnpm`, and `bower` all wrap the same
+/// upstream wire format). Keep this in sync with the `format` mapping
+/// in `parse_format` and with the publish handler in
+/// `api::handlers::npm`.
+fn is_npm_family_format(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Npm
+            | RepositoryFormat::Yarn
+            | RepositoryFormat::Bower
+            | RepositoryFormat::Pnpm
+    )
+}
+
+/// Try each candidate path in order, returning the first match. Skips
+/// soft-deleted rows. Used by `get_artifact_metadata` so the npm
+/// lookup-by-URL fallback only costs an extra DB roundtrip on a true
+/// cache miss.
+async fn lookup_artifact_by_paths(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    candidates: &[String],
+) -> Result<Option<crate::models::artifact::Artifact>> {
+    for candidate in candidates {
+        let found = sqlx::query_as!(
+            crate::models::artifact::Artifact,
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM artifacts
+            WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+            "#,
+            repository_id,
+            candidate
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+/// Rewrite an npm-family artifact listing row's `path` from the
+/// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
+/// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
+///
+/// No-op for any row whose path is not a stored npm tarball (metadata
+/// rows, raw uploads, paths already in URL form), so the listing keeps
+/// reporting those verbatim. See the real-flow-smoke follow-up to #1443:
+/// callers resolve a tarball by the URL path they downloaded from, which
+/// must match what the listing reports.
+fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
+    if let Some(url_path) = crate::formats::npm::tarball_url_path_from_stored(&item.path) {
+        item.path = url_path;
+    }
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -1911,6 +2062,66 @@ async fn list_artifacts_grouped_by_docker_tag(
     }))
 }
 
+/// Collapse the set of per-scan-type latest statuses for an artifact into
+/// a single rollup label (#1497).
+///
+/// The scan pipeline writes one `scan_results` row per (artifact,
+/// scan_type) pair (grype, dependency-track, openscap, incus, ...).
+/// Surfacing only the most-recent row's status silently masks a failed
+/// format-native scanner whenever a generic scanner finishes after it,
+/// which is a security-scanning gap (the operator sees `completed` and
+/// concludes the artifact was fully scanned).
+///
+/// Precedence, applied in order:
+///
+/// 1. Empty input -> `None` (artifact has never been scanned).
+/// 2. Any `running` -> `running` (in-flight beats anything terminal).
+/// 3. Any `pending` -> `pending` (queued beats terminal).
+/// 4. All `completed` -> `completed` (every configured scanner is green).
+/// 5. All `failed` -> `failed` (every configured scanner errored out).
+/// 6. Mixed terminal (at least one `completed` AND at least one `failed`)
+///    -> `partial`. This is the case #1497 was filed for: a green grype
+///    plus a failed incus scan now surfaces as `partial`, not
+///    `completed`.
+///
+/// Unknown status strings are pessimistically treated as a failure for
+/// the all-completed check (they will not collapse to `completed`).
+pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+
+    let mut has_running = false;
+    let mut has_pending = false;
+    let mut has_completed = false;
+    let mut has_failed = false;
+    let mut has_unknown = false;
+
+    for s in statuses {
+        match s.as_str() {
+            "running" => has_running = true,
+            "pending" => has_pending = true,
+            "completed" => has_completed = true,
+            "failed" => has_failed = true,
+            _ => has_unknown = true,
+        }
+    }
+
+    if has_running {
+        return Some("running".to_string());
+    }
+    if has_pending {
+        return Some("pending".to_string());
+    }
+    if has_completed && !has_failed && !has_unknown {
+        return Some("completed".to_string());
+    }
+    if has_failed && !has_completed && !has_unknown {
+        return Some("failed".to_string());
+    }
+    Some("partial".to_string())
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` row. Returns at most `limit` rows.
 ///
@@ -1933,9 +2144,16 @@ async fn fetch_docker_tag_rows(
     // not carry a back-reference to the oci_tags row; the push handler
     // composes `v2/{image}/manifests/{tag}` deterministically.
     //
-    // LEFT JOIN scan_results on the latest row per artifact is filtered
-    // by NOT EXISTS so we don't carry historical scans; this matches the
-    // partial-index pattern from migration 101.
+    // Scan-status rollup (#1497): an artifact can have multiple scan_results
+    // rows, one per scan_type (grype, dependency-track, openscap, incus,
+    // ...). Previously this query returned only the most-recent row's
+    // status via `ORDER BY created_at DESC LIMIT 1`, which silently masked
+    // a failed format-native scanner whenever a generic scanner (e.g.
+    // grype) finished after it. We now project per-scan-type latest rows
+    // and aggregate their statuses with `array_agg(DISTINCT ...)`; the
+    // Rust-side `rollup_scan_status` helper collapses the set into a
+    // single label (`completed`, `partial`, `failed`, `running`,
+    // `pending`) honoring the precedence in its doc comment.
     let sql = if search_query.is_some() {
         r#"SELECT
                 a.id            AS artifact_id,
@@ -1945,18 +2163,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -1972,18 +2193,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -2033,7 +2257,13 @@ async fn fetch_docker_tag_rows(
             last_pushed_at: r
                 .try_get("last_pushed_at")
                 .map_err(|e| AppError::Database(e.to_string()))?,
-            scan_status: r.try_get("scan_status").ok().flatten(),
+            scan_status: rollup_scan_status(
+                r.try_get::<Option<Vec<String>>, _>("scan_statuses")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .unwrap_or(&[]),
+            ),
         });
     }
     Ok(out)
@@ -2167,7 +2397,7 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
@@ -2175,42 +2405,105 @@ pub async fn get_artifact_metadata(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
-    let artifact = sqlx::query_as!(
-        crate::models::artifact::Artifact,
-        r#"
-        SELECT
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, is_deleted, uploaded_by,
-            quarantine_status, quarantine_until,
-            created_at, updated_at
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        "#,
-        repo.id,
-        path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    // #1443: npm publish stores tarballs under
+    // `<name>/<version>/<name>-<version>.tgz` (see
+    // `api::handlers::npm::store_npm_version`), but external callers
+    // (release-gate smoke test, JFrog/Artifactory-style consumers,
+    // webhook payloads) carry the canonical npm download-URL shape
+    // `<name>/-/<name>-<version>.tgz`. Without translating the request
+    // path, an exact-match lookup against `artifacts.path` never finds
+    // the row. Try the literal path first (so non-npm formats and
+    // already-stored npm paths still work), then fall back to the
+    // normalised stored shape for npm-family repos when the caller
+    // handed us the URL shape.
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    let direct = lookup_artifact_by_paths(&state.db, repo.id, &candidates).await?;
 
-    let downloads = artifact_service.get_download_stats(artifact.id).await?;
-    let metadata = artifact_service.get_metadata(artifact.id).await?;
+    if let Some(artifact) = direct {
+        let downloads = artifact_service.get_download_stats(artifact.id).await?;
+        let metadata = artifact_service.get_metadata(artifact.id).await?;
 
-    Ok(Json(ArtifactResponse {
-        id: artifact.id,
-        repository_key: key,
-        path: artifact.path,
-        name: artifact.name,
-        version: artifact.version,
-        size_bytes: artifact.size_bytes,
-        checksum_sha256: artifact.checksum_sha256,
-        content_type: artifact.content_type,
-        download_count: downloads,
-        created_at: artifact.created_at,
-        metadata: metadata.map(|m| m.metadata),
-    }))
+        return Ok(Json(ArtifactResponse {
+            id: artifact.id,
+            repository_key: key,
+            path: artifact.path,
+            name: artifact.name,
+            version: artifact.version,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256,
+            content_type: artifact.content_type,
+            download_count: downloads,
+            created_at: artifact.created_at,
+            metadata: metadata.map(|m| m.metadata),
+        })
+        .into_response());
+    }
+
+    // B9 / #1221 / #1217: a virtual repository owns no `artifacts` rows of
+    // its own -- its content lives in its member repositories. The generic
+    // GET /:key/artifacts/*path route is the format-agnostic artifact-fetch
+    // surface clients use to pull bytes through a virtual repo (the
+    // virtual-shadowing-guard E2E fetches L's trusted artifact this way).
+    // A virtual repo therefore has no direct row to describe, and returning
+    // 404 here would make the local member's artifact unreachable through
+    // the virtual. Resolve members in priority order and serve the winning
+    // member's BYTES, applying the same local-over-remote shadowing guard
+    // as `download_artifact`: if a non-Remote member owns the exact path,
+    // suppress the proxy so a Remote member cannot shadow the trusted
+    // local artifact.
+    if repo.repo_type == RepositoryType::Virtual {
+        let owns_locally = proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+            .await
+            .map_err(|_| AppError::Internal("virtual shadowing-guard query failed".to_string()))?;
+        let proxy_for_virtual = if owns_locally {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
+        let db = state.db.clone();
+        let path_clone = path.clone();
+        let state_clone = state.clone();
+        let (content, content_type) = proxy_helpers::resolve_virtual_download(
+            &state.db,
+            proxy_for_virtual,
+            repo.id,
+            &path,
+            move |member_id, location| {
+                let db = db.clone();
+                let state = state_clone.clone();
+                let p = path_clone.clone();
+                async move {
+                    proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &p).await
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            AppError::NotFound("Artifact not found in any member repository".to_string())
+        })?;
+
+        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        let filename = path.rsplit('/').next().unwrap_or(&path);
+
+        return Ok((
+            [
+                (header::CONTENT_TYPE, ct),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                ),
+                (header::CONTENT_LENGTH, content.len().to_string()),
+                (
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "virtual".to_string(),
+                ),
+            ],
+            content,
+        )
+            .into_response());
+    }
+
+    Err(AppError::NotFound("Artifact not found".to_string()))
 }
 
 /// Upload artifact
@@ -2694,12 +2987,32 @@ pub async fn download_artifact(
             }
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Virtual => {
-            // Virtual repo: try each member in priority order
+            // Virtual repo: try each member in priority order.
+            //
+            // Shadowing guard (B9): the generic-format download keys on the
+            // exact stored path. If a non-Remote member of this virtual repo
+            // owns the path, suppress the proxy service so Remote members are
+            // Skip'd and cannot shadow the local artifact. Without this a
+            // Remote member earlier in priority order that returns a 200 for
+            // the same path (catch-all upstream, or a different object at
+            // that path) would win the first-`Ok` race and serve the wrong
+            // or empty bytes, while a guarded format handler would 404-refuse.
+            let owns_locally =
+                proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+                    .await
+                    .map_err(|_| {
+                        AppError::Internal("virtual shadowing-guard query failed".to_string())
+                    })?;
+            let proxy_for_virtual = if owns_locally {
+                None
+            } else {
+                state.proxy_service.as_deref()
+            };
             let db = state.db.clone();
             let path_clone = path.clone();
             let (content, content_type) = proxy_helpers::resolve_virtual_download(
                 &state.db,
-                state.proxy_service.as_deref(),
+                proxy_for_virtual,
                 repo.id,
                 &path,
                 |member_id, location| {
@@ -3021,14 +3334,16 @@ pub async fn remove_virtual_member(
     let member_repo = service.get_by_key(&member_key).await?;
     authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "remove")?;
 
-    sqlx::query(
-        "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
-    )
-    .bind(virtual_repo.id)
-    .bind(member_repo.id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Delegate to the service, which scopes the DELETE to the single
+    // (virtual_repo_id, member_repo_id) row and returns `AppError::NotFound`
+    // (HTTP 404) when no row matched. Routing through the service keeps a
+    // single source of truth for the delete predicate so this handler cannot
+    // drift back to a virtual-repo-id-only DELETE that would empty every
+    // member (B1), and gives the repeat-delete-of-an-already-removed-member
+    // path its 404 instead of a misleading 200 (B3).
+    service
+        .remove_virtual_member(virtual_repo.id, member_repo.id)
+        .await?;
 
     Ok(())
 }
@@ -3151,36 +3466,24 @@ pub async fn update_virtual_members(
 
     // Single-statement bulk update via UNNEST(uuid[], int4[]). This is atomic
     // by construction in Postgres: the entire statement either succeeds and
-    // updates every matching row, or fails and updates none. Removes the
-    // need for an explicit transaction, the per-row lock-ordering sort, and
-    // the rows_affected loop guard. Concurrent PUTs serialise at the row-
-    // lock layer of this single statement and produce a deterministic final
-    // state (one wins, the other overwrites it; never a row-level mix).
+    // updates every matching row, or fails and updates none.
+    //
+    // The service runs the UPDATE inside a transaction that first takes the
+    // process-wide member-graph advisory lock (B2). Without that lock, two
+    // concurrent PUTs over an overlapping member set acquire row locks in
+    // planner-scan order and can deadlock on the shared row, which Postgres
+    // only breaks after `deadlock_timeout`; under a race loop that surfaces
+    // as multi-second stalls that exhaust the client timeout. The lock
+    // serialises every member-graph mutation so the UPDATEs never contend.
     //
     // RETURNING gives us the set of member_repo_ids that actually matched
     // the (virtual_repo_id, member_repo_id) predicate. If that set is
     // smaller than the input set, some member row was deleted between the
     // resolve pass and the UPDATE (TOCTOU), and we surface a 404 listing
     // the missing keys so the caller can retry with a fresh resolution.
-    let updated: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        UPDATE virtual_repo_members
-           SET priority = c.priority
-          FROM (
-            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
-                     AS t(member_repo_id, priority)
-          ) AS c
-         WHERE virtual_repo_members.virtual_repo_id = $1
-           AND virtual_repo_members.member_repo_id = c.member_repo_id
-        RETURNING virtual_repo_members.member_repo_id
-        "#,
-    )
-    .bind(virtual_repo.id)
-    .bind(&resolved_member_ids)
-    .bind(&priorities)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let updated = service
+        .update_virtual_member_priorities(virtual_repo.id, &resolved_member_ids, &priorities)
+        .await?;
 
     detect_bulk_update_misses(
         &virtual_repo.key,
@@ -3700,6 +4003,57 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_npm_tarball_url_path: the listing rewrite that lets npm clients
+    // (and the release-gate real-flow smoke test) resolve a tarball by the
+    // `<name>/-/<file>.tgz` URL path they downloaded from, even though it is
+    // stored under `<name>/<version>/<file>.tgz`. Follow-up to #1443.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_stored_tarball() {
+        let a = make_artifact_for_test("rfs-pkg/1.0.5/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_scoped_stored_tarball() {
+        let a = make_artifact_for_test("@angular/core/17.0.0/core-17.0.0.tgz");
+        let mut resp = build_artifact_response(&a, "npm-hosted", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "@angular/core/-/core-17.0.0.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_noop_for_metadata_row() {
+        // Non-tarball rows (a bare package metadata path) are left verbatim.
+        let a = make_artifact_for_test("rfs-pkg/package.json");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/package.json");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_idempotent_on_url_shape() {
+        // A path already in the `/-/` URL shape must not be rewritten again.
+        let a = make_artifact_for_test("rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_is_npm_family_format_covers_npm_aliases() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
     }
 
     #[test]
@@ -4830,6 +5184,88 @@ mod tests {
         let resp = build_docker_tag_response(row, "docker-hub", &children);
 
         assert_eq!(resp.scan_status.as_deref(), Some("completed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // rollup_scan_status (#1497)
+    // -----------------------------------------------------------------------
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn test_rollup_scan_status_empty_returns_none() {
+        // Never scanned -> no rollup.
+        assert_eq!(rollup_scan_status(&[]), None);
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_completed_returns_completed() {
+        // Every configured scanner finished cleanly -> green rollup.
+        let statuses = vec![s("completed"), s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_failed_returns_failed() {
+        // Every configured scanner errored out -> hard failure.
+        let statuses = vec![s("failed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_completed_and_failed_returns_partial() {
+        // The #1497 regression case: incus (format-native) failed, grype
+        // completed. Pre-fix this surfaced as `completed` and the operator
+        // had no visible signal that the rootfs scan was skipped. Post-fix
+        // it must surface as `partial` so the UI/CLI/release-gate can flag
+        // the silent gap.
+        let statuses = vec![s("completed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_with_running_returns_running() {
+        // An in-flight scan beats anything terminal so the UI does not
+        // prematurely call a still-running set `partial`.
+        let statuses = vec![s("completed"), s("failed"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_pending_beats_terminal_only() {
+        // pending beats completed/failed but loses to running (running ==
+        // already started, pending == not yet started).
+        let statuses = vec![s("completed"), s("pending")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("pending"));
+
+        let statuses = vec![s("pending"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_completed_stays_completed() {
+        // Only one scanner configured and it passed -> still `completed`.
+        // Guards against an overly-strict rollup that demanded N>=2.
+        let statuses = vec![s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_failed_stays_failed() {
+        let statuses = vec![s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_unknown_status_collapses_to_partial() {
+        // Pessimistic: an unrecognized status should NOT be allowed to
+        // collapse the set to `completed`. Belt-and-braces against a
+        // future scanner that writes a status value the rollup does not
+        // yet know about.
+        let statuses = vec![s("completed"), s("weird-state")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
     }
 
     #[test]
@@ -6878,19 +7314,37 @@ mod tests {
         }
     }
 
-    /// A virtual repo with no `member_repos` field at all (the shape that
-    /// happens when an operator types `members: [...]` because the struct
-    /// uses `member_repos` and doesn't `deny_unknown_fields`) must 400 with
-    /// an actionable message.
+    /// A virtual repo with no `member_repos` field at all (the deferred-
+    /// population pattern used by every E2E test helper: create, then
+    /// `POST /members`) must be accepted. Pre-#1444 this 400'd, which
+    /// broke the create-then-add flow and surfaced as the "members router
+    /// 404" symptom because the follow-up POSTs targeted a nonexistent
+    /// repo. Empty-virtual state is now surfaced at fetch time instead of
+    /// create time, and self-heals on the first add_member.
     #[test]
-    fn test_validate_virtual_repo_member_count_rejects_none() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None)
-            .expect_err("None members must reject");
+    fn test_validate_virtual_repo_member_count_accepts_none_for_deferred_add() {
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None).is_ok(),
+            "omitted member_repos must be accepted so the create-then-add \
+             flow works (regression of #1444)"
+        );
+    }
+
+    /// A virtual repo created with explicit `member_repos: []` is still a
+    /// clear operator mistake (caller has actively typed "zero members")
+    /// and must 400 with an actionable message. This preserves the #1279
+    /// discoverability win for the case where the operator's intent is
+    /// unambiguous, while the omitted-field case (above) flows through
+    /// to the deferred-add pattern.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_explicit_empty() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
+            .expect_err("explicit empty members must reject");
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("requires at least one member"),
-                    "message should explain the requirement; got: {}",
+                    msg.contains("explicit empty"),
+                    "message should call out the explicit-empty shape; got: {}",
                     msg
                 );
                 assert!(
@@ -6906,16 +7360,6 @@ mod tests {
             }
             other => panic!("expected AppError::Validation, got {:?}", other),
         }
-    }
-
-    /// A virtual repo created with `member_repos: []` is also unusable. The
-    /// validator must reject this with the same Validation error class as
-    /// the None case so the handler returns 400 (not 500) in both shapes.
-    #[test]
-    fn test_validate_virtual_repo_member_count_rejects_empty() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
-            .expect_err("empty members must reject");
-        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A virtual repo with one or more members passes validation. Pin both
@@ -7635,15 +8079,17 @@ mod tests {
         }
     }
 
-    /// Deserialize a `CreateRepositoryRequest` from a minimal JSON object,
-    /// merging in `overrides` so individual tests only specify the fields they
-    /// care about.
+    /// Build a `CreateRepositoryRequest` body as raw bytes from a minimal
+    /// JSON object, merging in `overrides` so individual tests only specify
+    /// the fields they care about. Returns bytes (matching the handler's
+    /// post-#1438 signature) so tests don't need to round-trip through the
+    /// `CreateRepositoryRequest` struct, which is `Deserialize`-only.
     fn make_create_request(
         key: &str,
         name: &str,
         format: &str,
         overrides: serde_json::Value,
-    ) -> CreateRepositoryRequest {
+    ) -> Bytes {
         let mut base = serde_json::json!({
             "key": key,
             "name": name,
@@ -7654,7 +8100,7 @@ mod tests {
         {
             b.extend(o);
         }
-        serde_json::from_value(base).expect("valid CreateRepositoryRequest")
+        Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
     }
 
     /// When a format string is not a built-in variant but there IS an
@@ -7688,7 +8134,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7757,7 +8203,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7802,7 +8248,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7871,7 +8317,7 @@ mod tests {
         let result = create_repository(
             State(state.clone()),
             Extension(Some(non_admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
 
@@ -7894,6 +8340,232 @@ mod tests {
         assert!(
             matches!(err, AppError::Authorization(_)),
             "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1443 regression: lookup_path_candidates + is_npm_family_format
+    //
+    // npm publish stores tarballs under the version-segmented shape, but
+    // external callers (release-gate smoke test, JFrog-compatible
+    // tooling) supply the canonical npm download-URL shape
+    // (`<name>/-/<name>-<version>.tgz`). `get_artifact_metadata` walks
+    // this list of candidates so the literal request always wins for
+    // formats that don't normalise, and npm-family repos quietly fall
+    // back to the stored path on the second probe.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_path_candidates_npm_url_shape_adds_stored_fallback() {
+        let candidates =
+            lookup_path_candidates("rfs-pkg/-/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "rfs-pkg/-/rfs-pkg-1.0.0.tgz".to_string(),
+                "rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_scoped_url_shape() {
+        let candidates =
+            lookup_path_candidates("@angular/core/-/core-17.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "@angular/core/-/core-17.0.0.tgz".to_string(),
+                "@angular/core/17.0.0/core-17.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_stored_shape_passthrough() {
+        // When the caller already supplies the stored shape,
+        // normalize_lookup_path returns None and we issue exactly one
+        // query against the literal path.
+        let candidates =
+            lookup_path_candidates("rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec!["rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_metadata_path_not_rewritten() {
+        // package.json / packument paths don't end in .tgz so
+        // normalize_lookup_path returns None and only the literal path
+        // is tried.
+        let candidates = lookup_path_candidates("lodash/package.json", &RepositoryFormat::Npm);
+        assert_eq!(candidates, vec!["lodash/package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_non_npm_format_unchanged() {
+        // Maven repos must never have their paths rewritten by the npm
+        // normaliser, even if a path coincidentally matches `/-/` (it
+        // doesn't here, but the guard fires before normalisation
+        // anyway).
+        let candidates =
+            lookup_path_candidates("com/example/lib/1.0/lib-1.0.jar", &RepositoryFormat::Maven);
+        assert_eq!(
+            candidates,
+            vec!["com/example/lib/1.0/lib-1.0.jar".to_string()]
+        );
+
+        // And even a path that looks npm-shaped is left alone outside
+        // npm-family repos.
+        let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &RepositoryFormat::Generic);
+        assert_eq!(candidates, vec!["foo/-/foo-1.0.0.tgz".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_yarn_pnpm_bower_apply_normalisation() {
+        // Yarn, pnpm, and bower all wrap the npm wire format. They
+        // share the publish/download layout so the same normalisation
+        // must fire for them.
+        for fmt in [
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+            RepositoryFormat::Bower,
+        ] {
+            let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &fmt);
+            assert_eq!(
+                candidates,
+                vec![
+                    "foo/-/foo-1.0.0.tgz".to_string(),
+                    "foo/1.0.0/foo-1.0.0.tgz".to_string(),
+                ],
+                "format {fmt:?} must inherit npm path normalisation",
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_npm_family_format_membership() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        // Negative cases: every format outside the npm wire-protocol
+        // family must NOT inherit npm path normalisation.
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Pypi));
+        assert!(!is_npm_family_format(&RepositoryFormat::Docker));
+        assert!(!is_npm_family_format(&RepositoryFormat::Generic));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
+    }
+
+    /// HTTP-level regression test for #1444: GET /:key/members against a
+    /// freshly-created virtual repo (no members yet) must return 2xx, not 404.
+    ///
+    /// This is the load-bearing assertion behind the user-reported "the
+    /// reproducer still fails" comment on #1444. Pre-fix, the chain was:
+    ///   1. test infra POSTs `/api/v1/repositories` for a virtual repo WITHOUT
+    ///      `member_repos` (the standard deferred-population shape).
+    ///   2. #1281's validator 400'd that request, so the virtual was never
+    ///      created.
+    ///   3. The follow-up POST `/repositories/{key}/members` then 404'd because
+    ///      the repo did not exist -- which the release-gate report classified
+    ///      as "the members sub-router is unmounted".
+    ///
+    /// Post-fix, step 1 succeeds with an empty-virtual repo. The /members
+    /// router has always been mounted; this test exercises it via the actual
+    /// axum `Router` (built from `router()`) so a future refactor that DOES
+    /// unmount the route fails this test in addition to the source-text pin
+    /// in `virtual_member_router_registration`.
+    #[tokio::test]
+    async fn test_members_route_returns_2xx_on_freshly_created_empty_virtual_1444() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::extract::{Extension, State};
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir =
+            std::env::temp_dir().join(format!("members-1444-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Step 1: create the virtual repo via the actual `create_repository`
+        // handler with `member_repos` OMITTED -- the deferred-population shape
+        // every E2E test helper uses.
+        let repo_key = format!("v-1444-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Virtual 1444 regression",
+            "generic",
+            serde_json::json!({ "repo_type": "virtual" }),
+        );
+        // Post-#1438 `create_repository` takes `body: Bytes` so auth runs
+        // before body deserialisation. `make_create_request` already returns
+        // `Bytes`; pass it through directly (no `Json(...)` wrapper).
+        let create_result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        // The whole point of #1444 is that this NO LONGER returns 400.
+        let _created = create_result
+            .expect("create_repository must accept virtual repo with member_repos omitted (#1444)");
+
+        // Step 2: drive the actual /members route via axum::Router::oneshot.
+        // We mount `router()` as-is, wrap it in the auth-injection layer the
+        // production router applies, and hit GET /{key}/members.
+        let router = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            admin_auth(user_id, &username),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/members", repo_key))
+            .body(Body::empty())
+            .expect("build GET /members request");
+        let (status, body) = tdh::send(router, req).await;
+
+        // Cleanup before asserting so a panic does not leak DB state.
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id IN \
+                     (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET /:key/members on a freshly-created empty virtual must NOT return \
+             404 (regression of #1444 -- the symptom that the release-gate Full \
+             Suite classified as \"members sub-router unmounted\"); got body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            status.is_success(),
+            "GET /:key/members on a freshly-created empty virtual must return 2xx; \
+             got {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body)
         );
     }
 }

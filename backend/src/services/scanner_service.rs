@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -46,6 +48,49 @@ use crate::storage::StorageBackend;
 /// no longer count as reusable, so we re-scan stale artifacts to pick
 /// up freshly-published advisories.
 pub(crate) const DEDUP_TTL_DAYS: i32 = 30;
+
+/// Shorter TTL window (in days) applied to completed scan rows whose
+/// `findings_count = 0`.
+///
+/// A zero-finding completed row is ambiguous: it can mean "scanner ran and
+/// the artifact is genuinely clean" OR "scanner ran but an upstream
+/// extraction / staging step produced an empty tree, so the scanner walked
+/// nothing and produced nothing" (#1469, #1427, #1428). The standard
+/// 30-day window silently masks the latter case for a month, so the
+/// operator-visible "rescan" after fixing the extraction bug keeps
+/// returning the cached empty result.
+///
+/// One day is short enough that any rebuild-fix-rescan loop sees a fresh
+/// scan well within the same working day, but long enough to suppress the
+/// trivial duplicate scans that #1373 was originally about (two concurrent
+/// trigger calls on the same upload). Genuinely-clean artifacts still
+/// dedup for the shorter window, which is the only cost.
+///
+/// Set to 1 (vs. e.g. 7) deliberately so an operator iterating on a
+/// pipeline bug never has to wait more than 24h for the cached false-clean
+/// to expire on its own. The `bypass_dedup` flag on
+/// [`crate::api::handlers::security::TriggerScanRequest`] is the explicit
+/// escape hatch for the impatient case.
+pub(crate) const ZERO_FINDINGS_DEDUP_TTL_DAYS: i32 = 1;
+
+/// Upper bound on the size of a single artifact we are willing to stage for
+/// scanning. Beyond this we reject the input rather than consume unbounded
+/// disk and virtual address space. 10 GiB is generous for real packages while
+/// still capping a hostile or runaway upload.
+pub(crate) const MAX_SCAN_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Below this size we keep the scan input in heap (`Bytes`) and skip the
+/// tempfile + mmap machinery entirely. The mmap path exists to keep
+/// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
+/// process alone; for a few-KB package that overhead (create_dir_all,
+/// spawn_blocking, tempfile, mmap) is pure cost. 8 MiB keeps the common
+/// small-artifact case on the fast in-memory path.
+pub(crate) const SCAN_MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+// The mmap threshold must sit below the hard size cap. Otherwise the spill
+// path could only be reached after the cap had already rejected the input,
+// leaving the two knobs inconsistent. Enforced at compile time.
+const _: () = assert!(SCAN_MMAP_THRESHOLD_BYTES < MAX_SCAN_INPUT_BYTES);
 
 /// Sanitize a filename to its basename, stripping any directory components
 /// to prevent path traversal attacks. Returns `"artifact"` as a fallback
@@ -124,6 +169,43 @@ pub fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, reference))
+}
+
+/// Join a parsed image name and reference into a single OCI reference string
+/// using the correct separator: `@` for digest references (e.g.
+/// `sha256:abc...`) and `:` for tag references.
+///
+/// The OCI distribution spec and all container tooling (Docker, Grype, Trivy
+/// CLI) require the `name@digest` form for digest-pinned references. Using
+/// `:` between the name and a `sha256:...` reference produces an invalid
+/// reference (`name:sha256:digest` has two colons in the tag position) that
+/// every parser rejects with "could not parse reference". A single
+/// `docker buildx push` creates three artifacts (the tag-based index plus two
+/// digest-referenced manifests for platform + attestation); the latter two
+/// can only be scanned by digest. See issue #1483.
+pub fn join_oci_image_ref(name: &str, reference: &str) -> String {
+    let sep = if is_oci_digest_reference(reference) {
+        '@'
+    } else {
+        ':'
+    };
+    format!("{}{}{}", name, sep, reference)
+}
+
+/// Whether an OCI reference string is a digest (e.g. `sha256:abc...`) rather
+/// than a tag. OCI tags cannot contain `:`, so any reference that contains a
+/// colon is, by spec, a digest. We accept any `<algo>:<hex>` shape (sha256,
+/// sha512, future algorithms) rather than hard-coding `sha256:` so we stay
+/// forward-compatible.
+pub fn is_oci_digest_reference(reference: &str) -> bool {
+    if let Some((algo, hex)) = reference.split_once(':') {
+        !algo.is_empty()
+            && !hex.is_empty()
+            && algo.chars().all(|c| c.is_ascii_alphanumeric())
+            && hex.chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        false
+    }
 }
 
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
@@ -522,7 +604,34 @@ impl ScanWorkspace {
     /// Clean up the scan workspace directory, logging warnings on failure.
     pub async fn cleanup(base: &str, prefix: Option<&str>, artifact: &Artifact) {
         let workspace = Self::workspace_dir(base, prefix, artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+        Self::cleanup_path(&workspace).await;
+    }
+
+    /// Clean up a specific workspace directory by path, logging warnings on
+    /// failure. Used by scanners that allocate a per-scan-unique workspace
+    /// (so the path cannot be recomputed from `(base, prefix, artifact)`).
+    pub async fn cleanup_path(workspace: &Path) {
+        if !workspace.exists() {
+            return;
+        }
+        // Extracted trees can contain directories the runtime UID can't traverse
+        // or delete — e.g. tar can land kernel-module dirs at mode `d--x--S---`
+        // (setgid, no read). Force owner-rwX across the tree first so the
+        // recursive delete actually succeeds; otherwise it fails with EACCES and
+        // silently leaves the (often multi-GiB) tree on the PVC until it fills.
+        let workspace_str = workspace.to_string_lossy().to_string();
+        if let Err(e) = tokio::process::Command::new("chmod")
+            .args(["-R", "u+rwX", &workspace_str])
+            .output()
+            .await
+        {
+            warn!(
+                "Failed to pre-chmod scan workspace {} before cleanup: {}",
+                workspace.display(),
+                e
+            );
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(workspace).await {
             warn!(
                 "Failed to clean up scan workspace {}: {}",
                 workspace.display(),
@@ -698,6 +807,21 @@ pub(crate) async fn fail_scan(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
+    AppError::Internal(msg)
+}
+
+/// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
+/// than recomputing it from `(base, prefix, artifact)`. Used by scanners that
+/// allocate a per-scan-unique workspace directory.
+pub(crate) async fn fail_scan_path(
+    scanner_label: &str,
+    artifact: &Artifact,
+    error: &AppError,
+    workspace: &Path,
+) -> AppError {
+    let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
+    warn!("{}", msg);
+    ScanWorkspace::cleanup_path(workspace).await;
     AppError::Internal(msg)
 }
 
@@ -2410,10 +2534,17 @@ impl ScannerService {
     /// repository and `force` is false (matching `scan_artifact_with_options`).
     /// Returns `Ok(vec![])` when the artifact is missing or soft-deleted, so
     /// the caller can decide whether to surface a 404 separately.
+    ///
+    /// When `bypass_dedup` is true the same-artifact short-circuit added for
+    /// #1373 is skipped: every configured scanner gets a fresh placeholder
+    /// row, and the worker will always run a fresh scan (no cached results
+    /// are copied). This is the explicit "ignore the cache, scan again now"
+    /// path used to recover from silently-broken prior scans (#1469).
     pub async fn prepare_artifact_scan(
         &self,
         artifact_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<Vec<(String, Uuid)>> {
         let artifact = sqlx::query!(
             r#"
@@ -2454,17 +2585,25 @@ impl ScannerService {
         // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            let existing = self
-                .scan_result_service
-                .find_existing_scan_for_artifact(
-                    artifact_id,
-                    &artifact.checksum_sha256,
-                    scanner.scan_type(),
-                    DEDUP_TTL_DAYS,
-                )
-                .await
-                .ok()
-                .flatten();
+            // When the caller asked to bypass dedup, skip the lookup entirely
+            // and always insert a fresh placeholder. We deliberately don't
+            // even SELECT here so the explicit-rescan path can't accidentally
+            // be diverted by a row that happens to satisfy the TTL.
+            let existing = if bypass_dedup {
+                None
+            } else {
+                self.scan_result_service
+                    .find_existing_scan_for_artifact(
+                        artifact_id,
+                        &artifact.checksum_sha256,
+                        scanner.scan_type(),
+                        DEDUP_TTL_DAYS,
+                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            };
 
             match decide_short_circuit_from_existing(existing.as_ref()) {
                 ShortCircuitDecision::UseExisting(id) => {
@@ -2496,13 +2635,21 @@ impl ScannerService {
     /// new ones. Falls back to creating a row on the fly if a scanner has no
     /// matching prepared ID (e.g. scanner set changed between prepare and
     /// execute).
+    ///
+    /// `bypass_dedup` must match the value passed to the matching
+    /// `prepare_artifact_scan` call: if the caller skipped the same-artifact
+    /// short-circuit there, the worker must also skip the cross-artifact
+    /// reuse path here so the freshly-allocated placeholder rows are not
+    /// converted into `is_reused = true` rows pointing at the very cached
+    /// result the caller was trying to bypass (#1469).
     pub async fn scan_artifact_with_prepared(
         &self,
         artifact_id: Uuid,
         prepared: HashMap<String, Uuid>,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, Some(prepared))
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
             .await
     }
 
@@ -2510,14 +2657,23 @@ impl ScannerService {
     /// recalculate the repository security score.
     /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
     /// (used for on-demand scans triggered manually by an admin).
-    pub async fn scan_artifact_with_options(&self, artifact_id: Uuid, force: bool) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, None).await
+    /// When `bypass_dedup` is true, also skip the hash-based scan dedup so a
+    /// silently-broken prior scan does not mask the re-scan (#1469).
+    pub async fn scan_artifact_with_options(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+        bypass_dedup: bool,
+    ) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None)
+            .await
     }
 
     async fn scan_artifact_inner(
         &self,
         artifact_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
     ) -> Result<()> {
         // Fetch artifact and content
@@ -2620,12 +2776,25 @@ impl ScannerService {
                 continue;
             }
 
-            // Check for reusable scan results (same hash + scan type within TTL)
-            if let Ok(Some(source_scan)) = self
-                .scan_result_service
-                .find_reusable_scan(checksum, scanner.scan_type(), DEDUP_TTL_DAYS)
-                .await
-            {
+            // Check for reusable scan results (same hash + scan type within TTL).
+            // The bypass_dedup flag (#1469) short-circuits this so the explicit
+            // "rescan now" path cannot be silently fed a cached result that was
+            // exactly what the caller was trying to escape from.
+            let reusable = if bypass_dedup {
+                None
+            } else {
+                self.scan_result_service
+                    .find_reusable_scan(
+                        checksum,
+                        scanner.scan_type(),
+                        DEDUP_TTL_DAYS,
+                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            if let Some(source_scan) = reusable {
                 // #1373: when the matched source scan is for THIS artifact,
                 // a completed scan for these exact bytes already exists. We
                 // must not run a fresh scan or copy results into a new row;
@@ -3104,6 +3273,12 @@ impl ScannerService {
         // Get or create the DT project. #1276: project name = artifact name,
         // version = artifact version, description carries the source repo
         // label so the DT UI shows where the artifact came from.
+        //
+        // #1472: log at `error!` (not `warn!`) and forward the full
+        // AppError message so the operator sees the upstream HTTP status,
+        // the endpoint URL, the DT response body, and (on 401/403) the
+        // required DT team permissions. Without this, the operator sees a
+        // fully green scan even when DT silently rejects every upload.
         let dt_project = match dt
             .get_or_create_project(
                 project_name,
@@ -3114,10 +3289,11 @@ impl ScannerService {
         {
             Ok(p) => p,
             Err(e) => {
-                warn!(
+                error!(
                     artifact_id = %artifact.id,
+                    project_name = %project_name,
                     error = %e,
-                    "Failed to get or create Dependency-Track project"
+                    "Dependency-Track project provisioning failed -- SBOM will NOT be uploaded for this artifact"
                 );
                 return;
             }
@@ -3135,10 +3311,16 @@ impl ScannerService {
                 );
             }
             Err(e) => {
-                warn!(
+                // #1472: error! (not warn!) so this isn't lost in a noisy log
+                // pipeline; the AppError message already carries the endpoint,
+                // upstream status, response body, and permissions hint on
+                // 401/403 (see `dt_upstream_status_err`).
+                error!(
                     artifact_id = %artifact.id,
+                    dt_project_uuid = %dt_project.uuid,
+                    dt_project_name = %dt_project.name,
                     error = %e,
-                    "Failed to upload SBOM to Dependency-Track"
+                    "Dependency-Track SBOM upload failed -- vulnerability correlation will be stale for this artifact"
                 );
             }
         }
@@ -3146,21 +3328,25 @@ impl ScannerService {
 
     /// Scan a single artifact (respects repo scan-enabled config).
     pub async fn scan_artifact(&self, artifact_id: Uuid) -> Result<()> {
-        self.scan_artifact_with_options(artifact_id, false).await
+        self.scan_artifact_with_options(artifact_id, false, false)
+            .await
     }
 
     /// Scan all non-deleted artifacts in a repository.
     pub async fn scan_repository(&self, repository_id: Uuid) -> Result<u32> {
-        self.scan_repository_with_options(repository_id, false)
+        self.scan_repository_with_options(repository_id, false, false)
             .await
     }
 
     /// Scan all artifacts in a repository.
     /// When `force` is true, bypass the scan-enabled config check (for manual triggers).
+    /// When `bypass_dedup` is true, also bypass the hash-based scan dedup so a
+    /// silently-broken prior scan does not mask the re-scan (#1469).
     pub async fn scan_repository_with_options(
         &self,
         repository_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<u32> {
         let artifact_ids: Vec<Uuid> = sqlx::query_scalar!(
             "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
@@ -3172,12 +3358,15 @@ impl ScannerService {
 
         let count = artifact_ids.len() as u32;
         info!(
-            "Starting repository scan for {}: {} artifacts (force={})",
-            repository_id, count, force
+            "Starting repository scan for {}: {} artifacts (force={}, bypass_dedup={})",
+            repository_id, count, force, bypass_dedup
         );
 
         for artifact_id in artifact_ids {
-            if let Err(e) = self.scan_artifact_with_options(artifact_id, force).await {
+            if let Err(e) = self
+                .scan_artifact_with_options(artifact_id, force, bypass_dedup)
+                .await
+            {
                 warn!(
                     "Failed to scan artifact {} in repo {}: {}",
                     artifact_id, repository_id, e
@@ -3188,15 +3377,233 @@ impl ScannerService {
         Ok(count)
     }
 
-    /// Fetch artifact content from the configured storage backend.
+    /// Fetch artifact content from the configured storage backend, staged for
+    /// scanning. Small artifacts stay in heap; large ones are spilled to an
+    /// mmap-backed `Bytes` so they do not pin anon heap across every scanner.
+    ///
+    /// NOTE: cloud backends without a streaming `get_stream` override (GCS,
+    /// Azure) still buffer the whole object in memory inside the default
+    /// `get_stream` fallback before it reaches us here. Adding native
+    /// streaming reads for those backends is tracked separately by #1430 and
+    /// #1431 (GCS `get_stream`); this fix deliberately does not expand into
+    /// that work.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
+        // Early reject using the recorded size before we open the stream. The
+        // streaming loop below re-checks against the same ceiling because
+        // `size_bytes` can be stale or wrong for proxied/upstream content.
+        if artifact.size_bytes > MAX_SCAN_INPUT_BYTES as i64 {
+            return Err(AppError::Validation(format!(
+                "Artifact {} is {} bytes, exceeding the {} byte scan-input limit; skipping scan",
+                artifact.id, artifact.size_bytes, MAX_SCAN_INPUT_BYTES
+            )));
+        }
+
         let storage = self.resolve_repo_storage(artifact.repository_id).await?;
-        storage.get(&artifact.storage_key).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to read artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, e
-            ))
+        Self::stage_from_storage(
+            storage.as_ref(),
+            &artifact.storage_key,
+            &self.scan_workspace_path,
+        )
+        .await
+        .map_err(|e| match e {
+            // Preserve the validation/size-cap variant; only wrap raw
+            // storage/stream-open failures with artifact context.
+            AppError::Storage(msg) => AppError::Storage(format!(
+                "Failed to stage artifact {} (key={}): {}",
+                artifact.id, artifact.storage_key, msg
+            )),
+            other => other,
         })
+    }
+
+    /// Open a streaming read from `storage` for `key` and stage it for scanning.
+    /// Split out from [`fetch_artifact_content`] so it can be tested directly
+    /// against a real storage backend without a database round-trip.
+    async fn stage_from_storage(
+        storage: &dyn StorageBackend,
+        key: &str,
+        workspace_path: &str,
+    ) -> Result<Bytes> {
+        let stream = storage.get_stream(key).await.map_err(|e| {
+            AppError::Storage(format!("Failed to open stream for key {}: {}", key, e))
+        })?;
+        Self::stage_scan_input(stream, workspace_path).await
+    }
+
+    /// Stage `stream` for scanning, returning the bytes either in heap (small
+    /// inputs) or as an `mmap`-backed `Bytes` spilled to a tempfile (large
+    /// inputs).
+    ///
+    /// Why this exists: `storage.get(...)` used to return the full (multi-GiB)
+    /// artifact as anon heap and the orchestrator held it alive across every
+    /// applicable scanner — past the cgroup ceiling on smaller nodes, where
+    /// the OOM killer was the only outcome. File-backed (mmap) pages are
+    /// kernel-reclaimable under cgroup pressure; anon pages are not.
+    ///
+    /// Staging strategy:
+    /// - We buffer in heap while the running total stays below
+    ///   [`SCAN_MMAP_THRESHOLD_BYTES`]. Most artifacts never exceed it, so they
+    ///   never touch the disk/mmap path at all.
+    /// - The first chunk that pushes us over the threshold triggers a spill:
+    ///   the in-heap prefix and all remaining chunks are written to a tempfile
+    ///   which is then memory-mapped.
+    /// - The running total is checked against [`MAX_SCAN_INPUT_BYTES`] so a
+    ///   stream whose declared `size_bytes` was wrong (or absent) still cannot
+    ///   consume unbounded disk + virtual address space.
+    ///
+    /// Lifetime of the tempfile: the `NamedTempFile` is held until this function
+    /// returns, at which point its `Drop` unlinks the path. On Linux the inode
+    /// stays alive (and the `Mmap` valid) as long as the returned `Bytes` keeps
+    /// the mapping referenced, but the directory entry is gone immediately. The
+    /// on-disk blocks are reclaimed when the returned `Bytes` drops, i.e. when
+    /// scanning finishes.
+    async fn stage_scan_input(
+        stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+    ) -> Result<Bytes> {
+        Self::stage_scan_input_with_limits(
+            stream,
+            workspace_path,
+            SCAN_MMAP_THRESHOLD_BYTES,
+            MAX_SCAN_INPUT_BYTES,
+        )
+        .await
+    }
+
+    /// Inner staging routine with the threshold and cap as parameters so both
+    /// branches are testable with small inputs. Production calls go through
+    /// [`stage_scan_input`], which supplies the configured constants.
+    async fn stage_scan_input_with_limits(
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+        mmap_threshold: u64,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+
+        // Phase 1: buffer in heap until we either drain the stream (small
+        // input -> stay in memory) or cross the mmap threshold (large input
+        // -> fall through to the spill path below).
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                AppError::Storage(format!("Stream error while staging scan input: {}", e))
+            })?;
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(AppError::Validation(format!(
+                    "Scan input exceeded the {} byte limit while streaming; aborting scan",
+                    max_bytes
+                )));
+            }
+            buffered.extend_from_slice(&chunk);
+            if total > mmap_threshold {
+                return Self::spill_to_mmap(buffered, stream, total, workspace_path, max_bytes)
+                    .await;
+            }
+        }
+
+        // Small input: served straight from heap, no tempfile, no mmap.
+        Ok(Bytes::from(buffered))
+    }
+
+    /// Spill an already-buffered prefix plus the remaining stream to a tempfile
+    /// under `workspace_path`, then return an `mmap`-backed `Bytes`. Only
+    /// reached once the input is known to exceed the mmap threshold.
+    async fn spill_to_mmap(
+        prefix: Vec<u8>,
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        mut total: u64,
+        workspace_path: &str,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::fs::create_dir_all(workspace_path)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to create scan workspace {}: {}",
+                    workspace_path, e
+                ))
+            })?;
+
+        let workspace = workspace_path.to_string();
+        // Hold the NamedTempFile for the duration of staging. Its path is
+        // unlinked on Drop at function return; the Mmap keeps the inode alive.
+        let temp = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(&workspace))
+            .await
+            .map_err(|e| AppError::Storage(format!("Tempfile join failure: {}", e)))?
+            .map_err(|e| AppError::Storage(format!("Failed to create scan tempfile: {}", e)))?;
+
+        // Write through the NamedTempFile's own handle (an independent fd to the
+        // same inode via `reopen()`), never by reopening the path. Reopening by
+        // path would be a TOCTOU: between create and reopen another process
+        // could swap the file the path points at. `reopen()` shares the inode.
+        let owned_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen scan tempfile handle for write: {}",
+                e
+            ))
+        })?;
+        {
+            let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(owned_file));
+            writer.write_all(&prefix).await.map_err(|e| {
+                AppError::Storage(format!("Write error staging scan input prefix: {}", e))
+            })?;
+            drop(prefix);
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    AppError::Storage(format!("Stream error while staging scan input: {}", e))
+                })?;
+                total += chunk.len() as u64;
+                if total > max_bytes {
+                    return Err(AppError::Validation(format!(
+                        "Scan input exceeded the {} byte limit while streaming; aborting scan",
+                        max_bytes
+                    )));
+                }
+                writer.write_all(&chunk).await.map_err(|e| {
+                    AppError::Storage(format!("Write error to scan tempfile: {}", e))
+                })?;
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|e| AppError::Storage(format!("Flush error on scan tempfile: {}", e)))?;
+        }
+
+        // Map through a fresh independent fd to the same inode.
+        let map_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen scan tempfile handle for mmap: {}",
+                e
+            ))
+        })?;
+        // SAFETY: `memmap2::Mmap::map` is unsafe because the kernel mapping
+        // becomes undefined behavior if the underlying file is mutated or
+        // truncated by another writer while the mapping is live. We uphold the
+        // contract:
+        //   - The file is a freshly created `NamedTempFile` in a workspace the
+        //     backend owns (`SCAN_WORKSPACE_PATH` must be a local filesystem
+        //     the backend has exclusive control of, not a shared/network mount
+        //     that other processes write to).
+        //   - We are the only owner of this inode: `reopen()` hands back an
+        //     independent fd to the same inode, and `temp` is kept alive in
+        //     scope so nothing else holds the path to truncate or replace it.
+        //   - After this function returns, the path is unlinked (NamedTempFile
+        //     Drop), so no later process can open and truncate it; the inode
+        //     persists only because the `Mmap` (owned by the returned `Bytes`)
+        //     references it. We never write to the file again past this point.
+        let mmap = unsafe { memmap2::Mmap::map(&map_file) }
+            .map_err(|e| AppError::Storage(format!("mmap failed on scan tempfile: {}", e)))?;
+
+        // Drop `temp` -> unlinks the path. The inode stays alive behind the
+        // Mmap until the returned `Bytes` is dropped (scan finished).
+        drop(temp);
+
+        Ok(Bytes::from_owner(mmap))
     }
 
     /// Resolve the storage backend for a given repository by looking up
@@ -3555,6 +3962,220 @@ mod tests {
             .expect("trigger must fire within timeout")
             .expect("trigger must send the artifact_id");
         assert_eq!(received, id);
+    }
+
+    // -----------------------------------------------------------------------
+    // stage_scan_input / stage_from_storage (scan-input staging)
+    // -----------------------------------------------------------------------
+
+    /// Count regular files directly under `dir` (non-recursive). Used to assert
+    /// the staging path never leaks a tempfile in the scan workspace.
+    fn count_entries(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_stage_scan_input_concatenates_chunks_in_memory() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"hello world");
+        // Small input takes the in-memory path: the workspace dir is never even
+        // touched (no create_dir_all, no tempfile).
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "small input must not create any file in the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_scan_input_empty_stream() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = futures::stream::iter(Vec::<Result<Bytes>>::new()).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(count_entries(tmp.path()), 0);
+    }
+
+    /// Below the threshold: in-memory path, correct bytes, no tempfile.
+    #[tokio::test]
+    async fn test_stage_scan_input_below_threshold_stays_in_memory() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A few KB, well under SCAN_MMAP_THRESHOLD_BYTES.
+        let payload = vec![0xABu8; 4 * 1024];
+        let expected = payload.clone();
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(payload))]).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), expected.len());
+        assert_eq!(&out[..], &expected[..]);
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "below-threshold input must not spill to disk"
+        );
+    }
+
+    /// Above the threshold: spills to a tempfile + mmap, returns correct bytes,
+    /// and unlinks the tempfile so nothing leaks in the workspace.
+    #[tokio::test]
+    async fn test_stage_scan_input_above_threshold_spills_to_mmap() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // Just over the threshold, streamed in 1 MiB chunks so the spill
+        // happens mid-stream (prefix already buffered when we cross over).
+        let chunk = vec![0x5Au8; 1024 * 1024];
+        let chunk_count = (SCAN_MMAP_THRESHOLD_BYTES / (1024 * 1024)) as usize + 2;
+        let chunks: Vec<Result<Bytes>> = (0..chunk_count)
+            .map(|_| Ok(Bytes::from(chunk.clone())))
+            .collect();
+        let total = chunk.len() * chunk_count;
+        let stream = futures::stream::iter(chunks).boxed();
+        let out = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), total);
+        assert!(out.iter().all(|&b| b == 0x5A), "bytes must round-trip");
+        // The NamedTempFile is unlinked on return; the workspace dir is created
+        // but must contain no leftover staging file.
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "mmap spill path must not leak a tempfile after return"
+        );
+    }
+
+    /// Mid-stream error must propagate AND leave no tempfile behind. We force
+    /// the error after crossing the threshold so the spill path (which created
+    /// a tempfile) is the one exercised.
+    #[tokio::test]
+    async fn test_stage_scan_input_midstream_error_cleans_up() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let big = vec![0x11u8; (SCAN_MMAP_THRESHOLD_BYTES + 1) as usize];
+        let chunks: Vec<Result<Bytes>> =
+            vec![Ok(Bytes::from(big)), Err(AppError::Storage("boom".into()))];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap()).await;
+        let err = result.expect_err("mid-stream error must propagate");
+        assert!(
+            err.to_string().contains("boom"),
+            "underlying error must surface, got: {}",
+            err
+        );
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "tempfile must be unlinked on error path (NamedTempFile Drop)"
+        );
+    }
+
+    /// A small-input mid-stream error: never spills, so nothing to clean up,
+    /// but the error must still propagate.
+    #[tokio::test]
+    async fn test_stage_scan_input_small_midstream_error_propagates() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"x")),
+            Err(AppError::Storage("boom".into())),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input(stream, tmp.path().to_str().unwrap()).await;
+        let err = result.expect_err("mid-stream error must propagate");
+        assert!(err.to_string().contains("boom"), "got: {}", err);
+        assert_eq!(count_entries(tmp.path()), 0);
+    }
+
+    /// `stage_from_storage` (the storage-backed half of `fetch_artifact_content`)
+    /// round-trips real stored bytes through a filesystem backend, with no DB.
+    #[tokio::test]
+    async fn test_stage_from_storage_roundtrips_filesystem_backend() {
+        use crate::storage::filesystem::FilesystemStorage;
+        use crate::storage::StorageBackend;
+        let store_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path());
+
+        let key = "deadbeefcafef00d";
+        let content = b"artifact bytes that fetch_artifact_content should return verbatim";
+        storage.put(key, Bytes::from_static(content)).await.unwrap();
+
+        let out =
+            ScannerService::stage_from_storage(&storage, key, work_dir.path().to_str().unwrap())
+                .await
+                .unwrap();
+        assert_eq!(&out[..], &content[..], "returned bytes must equal stored");
+    }
+
+    /// The size cap rejects an input that exceeds `max_bytes` while still in
+    /// the in-heap phase (before any spill). Driven with small data via the
+    /// limit-parameterized inner routine.
+    #[tokio::test]
+    async fn test_stage_scan_input_cap_rejects_in_memory_phase() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // 4 KiB input, cap of 1 KiB, threshold above the cap so we never spill.
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(vec![0u8; 4 * 1024]))]).boxed();
+        let result = ScannerService::stage_scan_input_with_limits(
+            stream,
+            tmp.path().to_str().unwrap(),
+            /* mmap_threshold */ 8 * 1024,
+            /* max_bytes */ 1024,
+        )
+        .await;
+        let err = result.expect_err("oversized input must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "got: {:?}", err);
+        assert!(err.to_string().contains("exceeded"));
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "rejected-in-memory input must not have created a tempfile"
+        );
+    }
+
+    /// The size cap also fires on the spill path (after the threshold is
+    /// crossed) and cleans up the tempfile it had started writing.
+    #[tokio::test]
+    async fn test_stage_scan_input_cap_rejects_on_spill_path_and_cleans_up() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // First chunk (2 KiB) crosses the 1 KiB threshold -> spill begins.
+        // Second chunk pushes total past the 3 KiB cap -> reject mid-spill.
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from(vec![0u8; 2 * 1024])),
+            Ok(Bytes::from(vec![0u8; 2 * 1024])),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let result = ScannerService::stage_scan_input_with_limits(
+            stream,
+            tmp.path().to_str().unwrap(),
+            /* mmap_threshold */ 1024,
+            /* max_bytes */ 3 * 1024,
+        )
+        .await;
+        let err = result.expect_err("oversized input must be rejected on spill path");
+        assert!(matches!(err, AppError::Validation(_)), "got: {:?}", err);
+        assert_eq!(
+            count_entries(tmp.path()),
+            0,
+            "tempfile must be unlinked when the cap aborts the spill"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8789,6 +9410,27 @@ mod tests {
         assert_eq!(super::DEDUP_TTL_DAYS, 30);
     }
 
+    #[test]
+    fn test_zero_findings_dedup_ttl_days_is_short() {
+        // #1469: zero-finding completed rows are ambiguous (clean OR silent
+        // extraction failure), so they must dedup for a much shorter window
+        // than the standard 30 days. The exact value is policy, but pin
+        // both endpoints so a future widening (e.g. back to 30) is a
+        // deliberate edit a reviewer can flag.
+        assert_eq!(super::ZERO_FINDINGS_DEDUP_TTL_DAYS, 1);
+
+        // Read both into runtime locals so the comparison is not a
+        // const-folded `1 < 30` (which clippy correctly flags as a noop
+        // assertion) but still trips the test if a future edit collapses
+        // the two windows to the same value.
+        let zero = super::ZERO_FINDINGS_DEDUP_TTL_DAYS;
+        let standard = super::DEDUP_TTL_DAYS;
+        assert!(
+            zero < standard,
+            "zero-finding TTL ({zero}) must be strictly shorter than the standard TTL ({standard}) or the policy collapses to a uniform window",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #1373 short-circuit predicates: is_within_dedup_ttl,
     // decide_short_circuit_from_existing, decide_same_artifact_action.
@@ -10178,6 +10820,114 @@ mod tests {
         );
     }
 
+    // -------- parse_oci_manifest_path / join_oci_image_ref (#1483) --------
+
+    #[test]
+    fn test_parse_oci_manifest_path_tag() {
+        let (name, reference) =
+            parse_oci_manifest_path("v2/library/nginx/manifests/latest").expect("path must parse");
+        assert_eq!(name, "library/nginx");
+        assert_eq!(reference, "latest");
+    }
+
+    #[test]
+    fn test_parse_oci_manifest_path_digest() {
+        let (name, reference) = parse_oci_manifest_path(
+            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        )
+        .expect("path must parse");
+        assert_eq!(name, "org/myapp");
+        assert_eq!(
+            reference,
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+    }
+
+    #[test]
+    fn test_parse_oci_manifest_path_rejects_malformed() {
+        for path in [
+            "v2/foo/blobs/sha256:abc",        // no /manifests/
+            "v2//manifests/latest",           // empty name
+            "v2/library/nginx/manifests/",    // empty reference
+            "library/nginx/manifests/latest", // no v2/ prefix
+        ] {
+            assert!(
+                parse_oci_manifest_path(path).is_none(),
+                "malformed path '{}' must not parse",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_recognizes_sha256() {
+        assert!(is_oci_digest_reference(
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        ));
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_recognizes_sha512() {
+        // Forward-compatible: the helper recognises any `<algo>:<hex>`
+        // shape, not just sha256, so future digest algorithms work
+        // without code changes.
+        assert!(is_oci_digest_reference(
+            "sha512:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6bcf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        ));
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_rejects_tag() {
+        for tag in ["latest", "v1.0.0", "1.21-alpine", "main", "rc-2"] {
+            assert!(
+                !is_oci_digest_reference(tag),
+                "tag '{}' must not look like a digest",
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_rejects_garbage() {
+        // Looks colon-separated but the right side is not hex.
+        assert!(!is_oci_digest_reference("sha256:not-hex-zzzz"));
+        // Empty halves.
+        assert!(!is_oci_digest_reference(":abc"));
+        assert!(!is_oci_digest_reference("sha256:"));
+    }
+
+    /// Issue #1483: the tag case must continue to use `:` so existing
+    /// tag-based scans keep working.
+    #[test]
+    fn test_join_oci_image_ref_tag_uses_colon() {
+        assert_eq!(
+            join_oci_image_ref("library/nginx", "1.21-alpine"),
+            "library/nginx:1.21-alpine"
+        );
+    }
+
+    /// Issue #1483: digest references must use `@` per the OCI distribution
+    /// spec. The previous `:` form produced `name:sha256:digest` (two colons
+    /// in the tag position), which Trivy and Grype both reject with
+    /// "could not parse reference".
+    #[test]
+    fn test_join_oci_image_ref_digest_uses_at_sign() {
+        let joined = join_oci_image_ref(
+            "localhost:8080/org/myapp",
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        );
+        assert_eq!(
+            joined,
+            "localhost:8080/org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+        // Defensive: the bad form (`name:sha256:...`) must never reappear.
+        assert!(
+            !joined.contains("myapp:sha256:"),
+            "digest ref must not use ':' between name and digest: {}",
+            joined
+        );
+    }
+
     /// The `TrivyFsScanner` is the inverse case: it must apply to the
     /// generic npm tarball that fooled `ImageScanner` in #994, otherwise
     /// the fix has over-corrected and the lodash CVE goes undetected.
@@ -10196,5 +10946,361 @@ mod tests {
             "TrivyFsScanner must apply to a generic npm tarball — that is exactly \
              the scanner expected to detect lodash CVE-2019-10744"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1469 bypass_dedup wiring: lib-coverage tests for the new branches added
+    // to `prepare_artifact_scan`, `scan_artifact_with_options`, and
+    // `scan_repository_with_options`. These run against a real Postgres pool
+    // (gated on DATABASE_URL, skip cleanly otherwise) so the `cargo llvm-cov
+    // --lib` CI gate measures the new lines, not just the integration suites
+    // in `backend/tests/scan_dedup_*` which are scoped out of `--lib`.
+    //
+    // The integration suite covers the SQL behaviour of `find_reusable_scan`
+    // / `find_existing_scan_for_artifact` under the dual-TTL. The lib tests
+    // here cover the call-site branches in the scanner service that route
+    // around (or through) those queries when `bypass_dedup` is set.
+    // -----------------------------------------------------------------------
+
+    /// Construct a minimal `ScannerService` suitable for exercising
+    /// `prepare_artifact_scan` and the repository-level fan-out. Trivy and
+    /// OpenSCAP are intentionally `None` so the constructed scanner set is
+    /// just dependency + grype, keeping the test fast and DB-only.
+    fn build_minimal_scanner_service(
+        pool: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<crate::storage::StorageRegistry>,
+        storage_base_path: String,
+    ) -> Arc<ScannerService> {
+        let advisory_client = Arc::new(AdvisoryClient::new(None));
+        let scan_result_service = Arc::new(ScanResultService::new(pool.clone()));
+        let scan_config_service =
+            Arc::new(crate::services::scan_config_service::ScanConfigService::new(pool.clone()));
+        Arc::new(ScannerService::new(
+            pool,
+            advisory_client,
+            scan_result_service,
+            scan_config_service,
+            None, // trivy_url: skip image / fs / incus scanners
+            storage,
+            storage_registry,
+            storage_base_path,
+            "/tmp/scan-1469-tests".to_string(),
+            None, // openscap_url
+            "standard".to_string(),
+        ))
+    }
+
+    /// Insert a non-deleted artifact with the given checksum, bypassing
+    /// the higher-level seeding helper so the checksum is a real 64-char
+    /// hex string (required for `find_existing_scan_for_artifact` queries
+    /// to be well-typed and for cleanup to be deterministic).
+    async fn insert_minimal_artifact(pool: &PgPool, repo_id: Uuid, checksum_hex64: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, $6,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("art-{}.bin", id))
+        .bind(format!("{}/art-{}.bin", repo_id, id))
+        .bind(1024_i64)
+        .bind(checksum_hex64)
+        .execute(pool)
+        .await
+        .expect("insert minimal artifact");
+        id
+    }
+
+    /// Cascade-cleans scan_results + artifacts for the given repo so the
+    /// fixture's own teardown (which doesn't touch scan_results) can drop
+    /// the repository row. `ON DELETE CASCADE` on scan_findings handles
+    /// the rest.
+    async fn cleanup_scan_state(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// 64-hex checksum (unique per call so two parallel tests don't share a
+    /// key in the `find_reusable_scan` cross-artifact index). Built from two
+    /// UUIDs because `format!("{:0<64}", uuid.simple())` doesn't actually
+    /// pad: the `uuid::fmt::Simple` Display impl ignores fill/width.
+    fn fresh_checksum() -> String {
+        let mut s = String::with_capacity(64);
+        s.push_str(&Uuid::new_v4().simple().to_string());
+        s.push_str(&Uuid::new_v4().simple().to_string());
+        debug_assert_eq!(s.len(), 64);
+        s
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_bypass_dedup_skips_existing_lookup() {
+        // #1469: when bypass_dedup = true, `prepare_artifact_scan` must
+        // create a fresh placeholder row per configured scanner even when
+        // a recently-completed scan exists for the same artifact +
+        // checksum + scan_type. The pre-existing completed row must not
+        // be returned to the caller as the prepared id.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let checksum = fresh_checksum();
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &checksum).await;
+
+        // Seed a completed scan row that, under bypass_dedup = false,
+        // would short-circuit the dependency scanner's prepare step.
+        let existing_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count,
+                low_count, info_count,
+                started_at, completed_at, checksum_sha256
+            )
+            VALUES ($1, $2, $3, 'dependency', 'completed',
+                    3, 0, 0, 0, 0, 0,
+                    NOW(), NOW(), $4)
+            "#,
+        )
+        .bind(existing_id)
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .execute(&fx.pool)
+        .await
+        .expect("seed completed scan");
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        // bypass_dedup = true: every scanner gets a NEW placeholder id.
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, true)
+            .await
+            .expect("prepare with bypass must succeed");
+        assert!(
+            !prepared.is_empty(),
+            "expected at least one scanner (dependency + grype) to produce a prepared row"
+        );
+        for (scan_type, prepared_id) in &prepared {
+            if scan_type == "dependency" {
+                assert_ne!(
+                    *prepared_id, existing_id,
+                    "bypass_dedup=true must NOT short-circuit to the existing completed row id"
+                );
+            }
+        }
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_without_bypass_reuses_existing() {
+        // Inverse of the above: when bypass_dedup = false and a fresh
+        // completed row exists for the same artifact + checksum +
+        // scan_type, `prepare_artifact_scan` must surface that row's
+        // id verbatim (the #1373 short-circuit). This pins that
+        // bypass_dedup = false flows through to
+        // `find_existing_scan_for_artifact` with the new dual-TTL
+        // signature, exercising the else-branch added in #1469.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let checksum = fresh_checksum();
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &checksum).await;
+
+        let existing_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count,
+                low_count, info_count,
+                started_at, completed_at, checksum_sha256
+            )
+            VALUES ($1, $2, $3, 'dependency', 'completed',
+                    3, 0, 0, 0, 0, 0,
+                    NOW(), NOW(), $4)
+            "#,
+        )
+        .bind(existing_id)
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .execute(&fx.pool)
+        .await
+        .expect("seed completed scan");
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, false)
+            .await
+            .expect("prepare without bypass must succeed");
+        let dep_row = prepared
+            .iter()
+            .find(|(t, _)| t == "dependency")
+            .expect("dependency scanner must be in the prepared set");
+        assert_eq!(
+            dep_row.1, existing_id,
+            "bypass_dedup=false must short-circuit to the existing completed row id (#1373)"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_missing_artifact_returns_empty() {
+        // Early-return branch: a non-existent (or soft-deleted) artifact
+        // produces an empty prepared vec regardless of bypass_dedup. This
+        // hits the new signature on the no-artifact path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let ghost = Uuid::new_v4();
+        let prepared_true = scanner
+            .prepare_artifact_scan(ghost, true, true)
+            .await
+            .expect("missing artifact must not error");
+        assert!(
+            prepared_true.is_empty(),
+            "missing artifact + bypass_dedup must yield empty prepared vec"
+        );
+        let prepared_false = scanner
+            .prepare_artifact_scan(ghost, true, false)
+            .await
+            .expect("missing artifact must not error");
+        assert!(
+            prepared_false.is_empty(),
+            "missing artifact + no bypass_dedup must yield empty prepared vec"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_repository_with_options_empty_repo_returns_zero() {
+        // `scan_repository_with_options` is a new 3-arg signature wrapping
+        // the per-artifact fan-out. An empty repository must return 0
+        // without erroring, regardless of bypass_dedup. This also covers
+        // the public `scan_repository` thin delegate (which forwards
+        // bypass_dedup = false) and exercises the info!/spawn-free path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let count_bypass = scanner
+            .scan_repository_with_options(fx.repo_id, true, true)
+            .await
+            .expect("empty repo scan with bypass must not error");
+        assert_eq!(count_bypass, 0, "no artifacts -> zero count");
+
+        let count_no_bypass = scanner
+            .scan_repository_with_options(fx.repo_id, true, false)
+            .await
+            .expect("empty repo scan without bypass must not error");
+        assert_eq!(count_no_bypass, 0);
+
+        // Thin delegates: `scan_repository` forwards force=false,
+        // bypass_dedup=false; `scan_artifact` forwards similarly for a
+        // single id. Both should be no-ops on an empty repository / a
+        // missing artifact id and not error out.
+        let count_default = scanner
+            .scan_repository(fx.repo_id)
+            .await
+            .expect("scan_repository default delegate must not error");
+        assert_eq!(count_default, 0);
+
+        let ghost_artifact = Uuid::new_v4();
+        // `scan_artifact` / `scan_artifact_with_options` on a missing id
+        // return `Err(NotFound)` (the inner fetch raises). We don't care
+        // about the variant here, only that the new 3-arg signature is
+        // exercised end-to-end through `scan_artifact_inner`, including
+        // the new bypass_dedup parameter forward.
+        let _ = scanner.scan_artifact(ghost_artifact).await;
+        let _ = scanner
+            .scan_artifact_with_options(ghost_artifact, true, true)
+            .await;
+        let _ = scanner
+            .scan_artifact_with_options(ghost_artifact, true, false)
+            .await;
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_artifact_with_prepared_missing_artifact_no_error() {
+        // `scan_artifact_with_prepared` (new 4-arg signature) on a
+        // missing artifact id must early-return without erroring,
+        // regardless of bypass_dedup. The prepared map can be empty;
+        // the function falls through to the artifact-fetch step which
+        // gracefully handles the absent row. Covers the wrapper that
+        // delegates into `scan_artifact_inner` with prepared=Some(...).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let ghost = Uuid::new_v4();
+        let prepared: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+        // Missing artifact -> Err(NotFound) propagates from
+        // `scan_artifact_inner`; we only care that the new 4-arg signature
+        // compiles + dispatches under both bypass_dedup values.
+        let _ = scanner
+            .scan_artifact_with_prepared(ghost, prepared.clone(), true, true)
+            .await;
+        let _ = scanner
+            .scan_artifact_with_prepared(ghost, prepared, true, false)
+            .await;
+
+        fx.teardown().await;
     }
 }

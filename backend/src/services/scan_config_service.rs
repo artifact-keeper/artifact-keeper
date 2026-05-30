@@ -7,13 +7,30 @@ use crate::error::Result;
 use crate::models::security::ScanConfig;
 
 /// Request to create or update a scan configuration.
-#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+///
+/// Every field is optional so a `PUT /repositories/{key}/security` can carry
+/// any subset of mutable columns; fields the client omits keep their existing
+/// value (or fall back to the documented default when the row does not exist
+/// yet). The previous shape required all of `scan_enabled`, `scan_on_upload`,
+/// `scan_on_proxy`, `block_on_policy_violation`, `severity_threshold` on every
+/// call. That was the #1374 bug class on a second entity: a partial PUT (for
+/// example just `{scan_enabled: true}`) either bounced as a 422 or, worse,
+/// silently reset every other column to its default so a follow-up GET showed
+/// the untouched fields stale. The upsert is now a read-modify-write that
+/// merges the patch over the existing row, so multiple fields persist together
+/// and an omitted field is never clobbered. See #1374 / B11.
+#[derive(Debug, Clone, Default, serde::Deserialize, utoipa::ToSchema)]
 pub struct UpsertScanConfigRequest {
-    pub scan_enabled: bool,
-    pub scan_on_upload: bool,
-    pub scan_on_proxy: bool,
-    pub block_on_policy_violation: bool,
-    pub severity_threshold: String,
+    #[serde(default)]
+    pub scan_enabled: Option<bool>,
+    #[serde(default)]
+    pub scan_on_upload: Option<bool>,
+    #[serde(default)]
+    pub scan_on_proxy: Option<bool>,
+    #[serde(default)]
+    pub block_on_policy_violation: Option<bool>,
+    #[serde(default)]
+    pub severity_threshold: Option<String>,
 }
 
 pub struct ScanConfigService {
@@ -45,11 +62,44 @@ impl ScanConfigService {
     }
 
     /// Create or update scan configuration for a repository.
+    ///
+    /// This is a partial (read-modify-write) upsert: any field the caller left
+    /// as `None` keeps its current value when a config row already exists, or
+    /// the documented default when one does not. A multi-field patch persists
+    /// every field it carries, and an omitted field is never reset. This fixes
+    /// the #1374 bug class on the repo scan-config entity (B11), where a PUT
+    /// that touched one field silently clobbered the others.
     pub async fn upsert_config(
         &self,
         repository_id: Uuid,
         req: &UpsertScanConfigRequest,
     ) -> Result<ScanConfig> {
+        // Defaults applied when no config row exists yet. These mirror the
+        // historical column defaults: scanning off, severity threshold "high".
+        let existing = self.get_config(repository_id).await?;
+
+        let scan_enabled = req
+            .scan_enabled
+            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_enabled).unwrap_or(false));
+        let scan_on_upload = req
+            .scan_on_upload
+            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_on_upload).unwrap_or(false));
+        let scan_on_proxy = req
+            .scan_on_proxy
+            .unwrap_or_else(|| existing.as_ref().map(|c| c.scan_on_proxy).unwrap_or(false));
+        let block_on_policy_violation = req.block_on_policy_violation.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|c| c.block_on_policy_violation)
+                .unwrap_or(false)
+        });
+        let severity_threshold = req.severity_threshold.clone().unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|c| c.severity_threshold.clone())
+                .unwrap_or_else(|| "high".to_string())
+        });
+
         let config = sqlx::query_as!(
             ScanConfig,
             r#"
@@ -68,11 +118,11 @@ impl ScanConfigService {
                       block_on_policy_violation, severity_threshold, created_at, updated_at
             "#,
             repository_id,
-            req.scan_enabled,
-            req.scan_on_upload,
-            req.scan_on_proxy,
-            req.block_on_policy_violation,
-            req.severity_threshold,
+            scan_enabled,
+            scan_on_upload,
+            scan_on_proxy,
+            block_on_policy_violation,
+            severity_threshold,
         )
         .fetch_one(&self.db)
         .await
@@ -145,11 +195,11 @@ mod tests {
             "severity_threshold": "high"
         }"#;
         let req: UpsertScanConfigRequest = serde_json::from_str(json).unwrap();
-        assert!(req.scan_enabled);
-        assert!(req.scan_on_upload);
-        assert!(!req.scan_on_proxy);
-        assert!(req.block_on_policy_violation);
-        assert_eq!(req.severity_threshold, "high");
+        assert_eq!(req.scan_enabled, Some(true));
+        assert_eq!(req.scan_on_upload, Some(true));
+        assert_eq!(req.scan_on_proxy, Some(false));
+        assert_eq!(req.block_on_policy_violation, Some(true));
+        assert_eq!(req.severity_threshold.as_deref(), Some("high"));
     }
 
     #[test]
@@ -162,21 +212,154 @@ mod tests {
             "severity_threshold": "critical"
         }"#;
         let req: UpsertScanConfigRequest = serde_json::from_str(json).unwrap();
-        assert!(!req.scan_enabled);
-        assert!(!req.scan_on_upload);
-        assert!(!req.scan_on_proxy);
-        assert!(!req.block_on_policy_violation);
-        assert_eq!(req.severity_threshold, "critical");
+        assert_eq!(req.scan_enabled, Some(false));
+        assert_eq!(req.scan_on_upload, Some(false));
+        assert_eq!(req.scan_on_proxy, Some(false));
+        assert_eq!(req.block_on_policy_violation, Some(false));
+        assert_eq!(req.severity_threshold.as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn test_upsert_scan_config_request_partial_omits_default_to_none() {
+        // B11 / #1374 class: a partial PUT carries only the fields the client
+        // wants to change. Omitted fields deserialize to None so the service
+        // can preserve the existing row value instead of clobbering it.
+        let json = r#"{ "scan_enabled": true }"#;
+        let req: UpsertScanConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.scan_enabled, Some(true));
+        assert_eq!(req.scan_on_upload, None);
+        assert_eq!(req.scan_on_proxy, None);
+        assert_eq!(req.block_on_policy_violation, None);
+        assert_eq!(req.severity_threshold, None);
+    }
+
+    #[test]
+    fn test_upsert_scan_config_request_empty_body_all_none() {
+        let req: UpsertScanConfigRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(req.scan_enabled, None);
+        assert_eq!(req.scan_on_upload, None);
+        assert_eq!(req.scan_on_proxy, None);
+        assert_eq!(req.block_on_policy_violation, None);
+        assert_eq!(req.severity_threshold, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge semantics: every provided field overrides; every omitted field
+    // falls back to the existing row (or the documented default on first
+    // insert). This is the pure-function core of the partial upsert; it does
+    // not touch the database, so it runs without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    /// Re-implements the merge logic in `upsert_config` against an optional
+    /// existing config so we can assert the field-preservation contract
+    /// without a live Postgres connection.
+    fn merge_for_test(
+        req: &UpsertScanConfigRequest,
+        existing: Option<&ScanConfig>,
+    ) -> (bool, bool, bool, bool, String) {
+        let scan_enabled = req
+            .scan_enabled
+            .unwrap_or_else(|| existing.map(|c| c.scan_enabled).unwrap_or(false));
+        let scan_on_upload = req
+            .scan_on_upload
+            .unwrap_or_else(|| existing.map(|c| c.scan_on_upload).unwrap_or(false));
+        let scan_on_proxy = req
+            .scan_on_proxy
+            .unwrap_or_else(|| existing.map(|c| c.scan_on_proxy).unwrap_or(false));
+        let block_on_policy_violation = req.block_on_policy_violation.unwrap_or_else(|| {
+            existing
+                .map(|c| c.block_on_policy_violation)
+                .unwrap_or(false)
+        });
+        let severity_threshold = req.severity_threshold.clone().unwrap_or_else(|| {
+            existing
+                .map(|c| c.severity_threshold.clone())
+                .unwrap_or_else(|| "high".to_string())
+        });
+        (
+            scan_enabled,
+            scan_on_upload,
+            scan_on_proxy,
+            block_on_policy_violation,
+            severity_threshold,
+        )
+    }
+
+    fn sample_config() -> ScanConfig {
+        ScanConfig {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            scan_enabled: true,
+            scan_on_upload: true,
+            scan_on_proxy: false,
+            block_on_policy_violation: true,
+            severity_threshold: "medium".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_partial_upsert_preserves_omitted_fields_b11() {
+        // The exact B11 symptom: flip scan_on_proxy only. Every other field
+        // must keep its existing value, not reset to a default.
+        let existing = sample_config();
+        let req = UpsertScanConfigRequest {
+            scan_on_proxy: Some(true),
+            ..Default::default()
+        };
+        let (enabled, on_upload, on_proxy, block, sev) = merge_for_test(&req, Some(&existing));
+        assert!(enabled, "scan_enabled must be preserved");
+        assert!(on_upload, "scan_on_upload must be preserved");
+        assert!(on_proxy, "scan_on_proxy must be the new value");
+        assert!(block, "block_on_policy_violation must be preserved");
+        assert_eq!(sev, "medium", "severity_threshold must be preserved");
+    }
+
+    #[test]
+    fn test_partial_upsert_multi_field_all_persist_b11() {
+        // A two-field patch must persist BOTH fields and leave the rest alone.
+        let existing = sample_config();
+        let req = UpsertScanConfigRequest {
+            scan_enabled: Some(false),
+            severity_threshold: Some("critical".to_string()),
+            ..Default::default()
+        };
+        let (enabled, on_upload, on_proxy, block, sev) = merge_for_test(&req, Some(&existing));
+        assert!(!enabled, "scan_enabled must take the new value");
+        assert_eq!(
+            sev, "critical",
+            "severity_threshold must take the new value"
+        );
+        assert!(on_upload, "scan_on_upload must be preserved");
+        assert!(!on_proxy, "scan_on_proxy must be preserved");
+        assert!(block, "block_on_policy_violation must be preserved");
+    }
+
+    #[test]
+    fn test_partial_upsert_first_insert_uses_defaults() {
+        // No existing row: omitted fields fall back to documented defaults
+        // (scanning off, severity "high"); provided fields take effect.
+        let req = UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            ..Default::default()
+        };
+        let (enabled, on_upload, on_proxy, block, sev) = merge_for_test(&req, None);
+        assert!(enabled);
+        assert!(!on_upload);
+        assert!(!on_proxy);
+        assert!(!block);
+        assert_eq!(sev, "high");
     }
 
     #[test]
     fn test_upsert_scan_config_request_clone() {
         let req = UpsertScanConfigRequest {
-            scan_enabled: true,
-            scan_on_upload: false,
-            scan_on_proxy: true,
-            block_on_policy_violation: true,
-            severity_threshold: "medium".to_string(),
+            scan_enabled: Some(true),
+            scan_on_upload: Some(false),
+            scan_on_proxy: Some(true),
+            block_on_policy_violation: Some(true),
+            severity_threshold: Some("medium".to_string()),
         };
         let cloned = req.clone();
         assert_eq!(cloned.scan_enabled, req.scan_enabled);
@@ -192,15 +375,15 @@ mod tests {
     #[test]
     fn test_upsert_scan_config_request_debug() {
         let req = UpsertScanConfigRequest {
-            scan_enabled: true,
-            scan_on_upload: true,
-            scan_on_proxy: false,
-            block_on_policy_violation: false,
-            severity_threshold: "low".to_string(),
+            scan_enabled: Some(true),
+            scan_on_upload: Some(true),
+            scan_on_proxy: Some(false),
+            block_on_policy_violation: Some(false),
+            severity_threshold: Some("low".to_string()),
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("UpsertScanConfigRequest"));
-        assert!(debug_str.contains("scan_enabled: true"));
+        assert!(debug_str.contains("scan_enabled: Some(true)"));
     }
 
     // -----------------------------------------------------------------------

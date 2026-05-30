@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE peer_repo_subscriptions SET last_replicated_at = NOW() WHERE peer_instance_id = $1 AND repository_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c48a1b8fc9889658fcf4bd063a5f86c49cf9ce9a7fb9703352d1f7c997707c8a"
+}
