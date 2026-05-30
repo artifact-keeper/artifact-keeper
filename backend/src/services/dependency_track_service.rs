@@ -11,6 +11,34 @@
 //! DEPENDENCY_TRACK_ENABLED=true
 //! ```
 //!
+//! ## Required Dependency-Track team permissions (#1472)
+//!
+//! The API key passed via `DEPENDENCY_TRACK_API_KEY` must belong to a team
+//! that has been granted ALL of the following permissions, or SBOM submission
+//! will silently 401/403 and DT will stay empty even when scans look green:
+//!
+//! - `PROJECT_CREATION_UPLOAD` -- required by [`Self::create_project`]
+//!   (`PUT /api/v1/project`).
+//! - `BOM_UPLOAD` -- required by [`Self::upload_sbom`]
+//!   (`PUT /api/v1/bom`).
+//! - `VIEW_PORTFOLIO` -- required by [`Self::find_project`],
+//!   [`Self::list_projects`], and project lookups
+//!   (`GET /api/v1/project/...`).
+//! - `VIEW_VULNERABILITY` -- required by [`Self::get_findings`]
+//!   (`GET /api/v1/finding/project/...`).
+//!
+//! The Dependency-Track default `Automation` team has NONE of these
+//! permissions. The bundled [`docker/init-dtrack.sh`](../../../docker/init-dtrack.sh)
+//! bootstrap script grants them after creating the API key. Operators who
+//! bring their own DT instance (or set `dependencyTrack.existingApiKeySecret`
+//! in the Helm chart) must grant the four permissions out of band, either
+//! via the DT UI (Administration -> Teams -> permissions tab) or via
+//! `POST /api/v1/permission/{perm}/team/{uuid}`.
+//!
+//! When DT replies with 401 or 403, `dt_upstream_status_err` appends a
+//! permissions hint to the error message so the operator-facing log and the
+//! `/api/v1/dependency-track/status` payload both name the missing grants.
+//!
 //! ## API Reference
 //!
 //! See: https://docs.dependencytrack.org/integrations/rest-api/
@@ -53,24 +81,69 @@ fn dt_transport_err(operation: &str, err: reqwest::Error) -> AppError {
     ))
 }
 
+/// Hint appended to the operator-facing error when DT replies with 401/403.
+/// Names every team permission the AK integration depends on so a misconfigured
+/// API key (default `Automation` team, custom team missing a grant, rotated key
+/// without re-granting, etc.) is diagnosable from the log line and the
+/// `/dependency-track/status` payload without cross-referencing source. #1472.
+pub(crate) const DT_PERMISSIONS_HINT: &str =
+    "Dependency-Track rejected the request (auth/permission failure). \
+     The API key's team must have ALL of: BOM_UPLOAD, PROJECT_CREATION_UPLOAD, \
+     VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default 'Automation' team has \
+     none of these; grant them via the DT UI \
+     (Administration -> Teams -> permissions) or \
+     POST /api/v1/permission/{permission}/team/{uuid}.";
+
+/// True if the status indicates an authentication or authorization failure
+/// the operator can fix by adjusting the DT team permissions or API key.
+fn is_dt_auth_failure(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
 /// Classify a non-2xx HTTP response from Dependency-Track as `BadGateway`. The
 /// upstream service replied, but with an error (auth failure, 5xx, etc.). The
-/// upstream status code is preserved in the message so the operator can tell
-/// 401 from 500.
+/// upstream status code, the endpoint hit, and (on 401/403) the required DT
+/// team permissions are preserved in the message so the operator can diagnose
+/// the failure without cross-referencing source. #1472.
 ///
 /// Body preview is truncated to keep logs bounded.
-fn dt_upstream_status_err(operation: &str, status: StatusCode, body: &str) -> AppError {
+fn dt_upstream_status_err(
+    operation: &str,
+    endpoint: &str,
+    status: StatusCode,
+    body: &str,
+) -> AppError {
     let truncated = &body[..body.len().min(DT_ERROR_BODY_PREVIEW_LEN)];
-    error!(
-        operation = operation,
-        status = status.as_u16(),
-        body = truncated,
-        "Dependency-Track returned non-success status"
+    let auth_failure = is_dt_auth_failure(status);
+    if auth_failure {
+        error!(
+            operation = operation,
+            endpoint = endpoint,
+            status = status.as_u16(),
+            body = truncated,
+            permissions_required =
+                "BOM_UPLOAD, PROJECT_CREATION_UPLOAD, VIEW_PORTFOLIO, VIEW_VULNERABILITY",
+            "Dependency-Track rejected request with auth/permission failure -- \
+             check that the API key's team has the required permissions"
+        );
+    } else {
+        error!(
+            operation = operation,
+            endpoint = endpoint,
+            status = status.as_u16(),
+            body = truncated,
+            "Dependency-Track returned non-success status"
+        );
+    }
+    let mut message = format!(
+        "Dependency-Track {} failed at {} (HTTP {}): {}",
+        operation, endpoint, status, truncated
     );
-    AppError::BadGateway(format!(
-        "Dependency-Track {} failed (HTTP {}): {}",
-        operation, status, truncated
-    ))
+    if auth_failure {
+        message.push_str("\nHint: ");
+        message.push_str(DT_PERMISSIONS_HINT);
+    }
+    AppError::BadGateway(message)
 }
 
 /// Classify a response-parse failure (malformed JSON, unexpected shape) as
@@ -650,7 +723,12 @@ impl DependencyTrackService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("project lookup", status, &body));
+            return Err(dt_upstream_status_err(
+                "project lookup",
+                &url,
+                status,
+                &body,
+            ));
         }
 
         let project: DtProject = response
@@ -689,7 +767,12 @@ impl DependencyTrackService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("create project", status, &body));
+            return Err(dt_upstream_status_err(
+                "create project",
+                &url,
+                status,
+                &body,
+            ));
         }
 
         let project = response
@@ -736,7 +819,7 @@ impl DependencyTrackService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("BOM upload", status, &body));
+            return Err(dt_upstream_status_err("BOM upload", &url, status, &body));
         }
 
         let result = response
@@ -836,6 +919,7 @@ impl DependencyTrackService {
                 // status code, not 200 with no data.
                 return Err(dt_upstream_status_err(
                     &format!("{} (page {}, {} items fetched)", operation, page, all.len()),
+                    &url,
                     status,
                     &body,
                 ));
@@ -936,7 +1020,12 @@ impl DependencyTrackService {
         if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("delete project", status, &body));
+            return Err(dt_upstream_status_err(
+                "delete project",
+                &url,
+                status,
+                &body,
+            ));
         }
 
         Ok(())
@@ -960,7 +1049,12 @@ impl DependencyTrackService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("get project metrics", status, &body));
+            return Err(dt_upstream_status_err(
+                "get project metrics",
+                &url,
+                status,
+                &body,
+            ));
         }
 
         let metrics = response
@@ -998,6 +1092,7 @@ impl DependencyTrackService {
             let body = response.text().await.unwrap_or_default();
             return Err(dt_upstream_status_err(
                 "get project metrics history",
+                &url,
                 status,
                 &body,
             ));
@@ -1028,6 +1123,7 @@ impl DependencyTrackService {
             let body = response.text().await.unwrap_or_default();
             return Err(dt_upstream_status_err(
                 "get portfolio metrics",
+                &url,
                 status,
                 &body,
             ));
@@ -1114,7 +1210,12 @@ impl DependencyTrackService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(dt_upstream_status_err("update analysis", status, &body));
+            return Err(dt_upstream_status_err(
+                "update analysis",
+                &url,
+                status,
+                &body,
+            ));
         }
 
         let analysis = response
@@ -2411,6 +2512,175 @@ mod tests {
             .expect_err("DT 403 must produce an error");
         assert_is_bad_gateway(&err);
         assert!(err.to_string().contains("403"));
+    }
+
+    /// Regression: #1472. When DT replies 403 to `PUT /api/v1/bom` (the
+    /// canonical "API key team is missing BOM_UPLOAD" failure mode), the
+    /// error surfaced to the operator MUST carry:
+    ///   1. the upstream HTTP status code (so 401 vs 403 vs 500 is visible),
+    ///   2. the endpoint that was hit (so the operator can curl it),
+    ///   3. the upstream body (so DT's own message survives),
+    ///   4. a permissions hint naming every required DT team permission.
+    /// Without (4) the operator has to grep source to find which DT team
+    /// permissions AK actually depends on. The default DT `Automation` team
+    /// has none of them, so every fresh install hits this 403.
+    #[tokio::test]
+    async fn test_dt_bom_upload_403_surfaces_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/bom"))
+            .and(header("X-Api-Key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("The principal does not have permission to upload BOMs."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .upload_sbom(
+                "11111111-1111-1111-1111-111111111111",
+                "{\"bomFormat\":\"CycloneDX\"}",
+            )
+            .await
+            .expect_err("DT 403 on BOM upload must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+
+        // (1) upstream status code preserved
+        assert!(msg.contains("403"), "missing status code in: {}", msg);
+        // (2) endpoint URL surfaced so the operator can reproduce with curl
+        assert!(
+            msg.contains("/api/v1/bom"),
+            "missing endpoint path in: {}",
+            msg
+        );
+        // (3) upstream body preserved verbatim (DT's own diagnostic)
+        assert!(
+            msg.contains("permission to upload BOMs"),
+            "missing upstream body in: {}",
+            msg
+        );
+        // (4) permissions hint naming EVERY required permission so the operator
+        // can fix the team grant without grepping source. The default DT
+        // `Automation` team has none of these.
+        assert!(
+            msg.contains("BOM_UPLOAD"),
+            "missing BOM_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("PROJECT_CREATION_UPLOAD"),
+            "missing PROJECT_CREATION_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("VIEW_PORTFOLIO"),
+            "missing VIEW_PORTFOLIO hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("VIEW_VULNERABILITY"),
+            "missing VIEW_VULNERABILITY hint in: {}",
+            msg
+        );
+        // Operation tag survives so log aggregators can group by integration
+        // step.
+        assert!(
+            msg.contains("BOM upload"),
+            "missing operation tag in: {}",
+            msg
+        );
+        // (5) HTTP verb in the permissions-hint curl example must be POST
+        // (DT's permission-grant endpoint is POST, not PUT). Regression guard
+        // for the doc/copy mismatch fixed alongside #1472 review feedback:
+        // operators copy this verb straight out of the log into `curl -X ...`,
+        // and `PUT` returns HTTP 405 against a real DT instance.
+        assert!(
+            msg.contains("POST /api/v1/permission"),
+            "permissions hint must specify POST verb in: {}",
+            msg
+        );
+    }
+
+    /// Companion to the BOM-upload test: `PUT /api/v1/project` returning 401
+    /// (API key invalid OR team missing PROJECT_CREATION_UPLOAD) must also
+    /// carry the permissions hint. `submit_sbom_to_dependency_track` hits
+    /// `create project` before `upload_sbom`, so this is the first wall a
+    /// misconfigured key meets in the scan pipeline.
+    #[tokio::test]
+    async fn test_dt_create_project_401_surfaces_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/project"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("The supplied credentials are invalid."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .create_project("myproj", Some("1.0.0"), None)
+            .await
+            .expect_err("DT 401 on create project must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "missing status code in: {}", msg);
+        assert!(
+            msg.contains("/api/v1/project"),
+            "missing endpoint path in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("PROJECT_CREATION_UPLOAD"),
+            "missing PROJECT_CREATION_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("BOM_UPLOAD"),
+            "missing BOM_UPLOAD hint in: {}",
+            msg
+        );
+    }
+
+    /// Non-auth upstream failures (500, 502, 504) must NOT include the
+    /// permissions hint, because the hint would mislead the operator into
+    /// rotating a key that is actually fine. The permissions hint is reserved
+    /// for 401/403.
+    #[tokio::test]
+    async fn test_dt_500_does_not_include_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/bom"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("DT internal failure"))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .upload_sbom("11111111-1111-1111-1111-111111111111", "{}")
+            .await
+            .expect_err("DT 500 must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "missing status code in: {}", msg);
+        // Hint is auth-failure-specific. Including it on 500 would push the
+        // operator to rotate a working key while the real issue is upstream.
+        assert!(
+            !msg.contains("BOM_UPLOAD"),
+            "permissions hint must NOT appear on 500: {}",
+            msg
+        );
     }
 
     /// DT pod down / TCP refused / DNS failure must surface as
