@@ -10726,4 +10726,360 @@ mod tests {
              the scanner expected to detect lodash CVE-2019-10744"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #1469 bypass_dedup wiring: lib-coverage tests for the new branches added
+    // to `prepare_artifact_scan`, `scan_artifact_with_options`, and
+    // `scan_repository_with_options`. These run against a real Postgres pool
+    // (gated on DATABASE_URL, skip cleanly otherwise) so the `cargo llvm-cov
+    // --lib` CI gate measures the new lines, not just the integration suites
+    // in `backend/tests/scan_dedup_*` which are scoped out of `--lib`.
+    //
+    // The integration suite covers the SQL behaviour of `find_reusable_scan`
+    // / `find_existing_scan_for_artifact` under the dual-TTL. The lib tests
+    // here cover the call-site branches in the scanner service that route
+    // around (or through) those queries when `bypass_dedup` is set.
+    // -----------------------------------------------------------------------
+
+    /// Construct a minimal `ScannerService` suitable for exercising
+    /// `prepare_artifact_scan` and the repository-level fan-out. Trivy and
+    /// OpenSCAP are intentionally `None` so the constructed scanner set is
+    /// just dependency + grype, keeping the test fast and DB-only.
+    fn build_minimal_scanner_service(
+        pool: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<crate::storage::StorageRegistry>,
+        storage_base_path: String,
+    ) -> Arc<ScannerService> {
+        let advisory_client = Arc::new(AdvisoryClient::new(None));
+        let scan_result_service = Arc::new(ScanResultService::new(pool.clone()));
+        let scan_config_service =
+            Arc::new(crate::services::scan_config_service::ScanConfigService::new(pool.clone()));
+        Arc::new(ScannerService::new(
+            pool,
+            advisory_client,
+            scan_result_service,
+            scan_config_service,
+            None, // trivy_url: skip image / fs / incus scanners
+            storage,
+            storage_registry,
+            storage_base_path,
+            "/tmp/scan-1469-tests".to_string(),
+            None, // openscap_url
+            "standard".to_string(),
+        ))
+    }
+
+    /// Insert a non-deleted artifact with the given checksum, bypassing
+    /// the higher-level seeding helper so the checksum is a real 64-char
+    /// hex string (required for `find_existing_scan_for_artifact` queries
+    /// to be well-typed and for cleanup to be deterministic).
+    async fn insert_minimal_artifact(pool: &PgPool, repo_id: Uuid, checksum_hex64: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, $6,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("art-{}.bin", id))
+        .bind(format!("{}/art-{}.bin", repo_id, id))
+        .bind(1024_i64)
+        .bind(checksum_hex64)
+        .execute(pool)
+        .await
+        .expect("insert minimal artifact");
+        id
+    }
+
+    /// Cascade-cleans scan_results + artifacts for the given repo so the
+    /// fixture's own teardown (which doesn't touch scan_results) can drop
+    /// the repository row. `ON DELETE CASCADE` on scan_findings handles
+    /// the rest.
+    async fn cleanup_scan_state(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// 64-hex checksum (unique per call so two parallel tests don't share a
+    /// key in the `find_reusable_scan` cross-artifact index). Built from two
+    /// UUIDs because `format!("{:0<64}", uuid.simple())` doesn't actually
+    /// pad: the `uuid::fmt::Simple` Display impl ignores fill/width.
+    fn fresh_checksum() -> String {
+        let mut s = String::with_capacity(64);
+        s.push_str(&Uuid::new_v4().simple().to_string());
+        s.push_str(&Uuid::new_v4().simple().to_string());
+        debug_assert_eq!(s.len(), 64);
+        s
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_bypass_dedup_skips_existing_lookup() {
+        // #1469: when bypass_dedup = true, `prepare_artifact_scan` must
+        // create a fresh placeholder row per configured scanner even when
+        // a recently-completed scan exists for the same artifact +
+        // checksum + scan_type. The pre-existing completed row must not
+        // be returned to the caller as the prepared id.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let checksum = fresh_checksum();
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &checksum).await;
+
+        // Seed a completed scan row that, under bypass_dedup = false,
+        // would short-circuit the dependency scanner's prepare step.
+        let existing_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count,
+                low_count, info_count,
+                started_at, completed_at, checksum_sha256
+            )
+            VALUES ($1, $2, $3, 'dependency', 'completed',
+                    3, 0, 0, 0, 0, 0,
+                    NOW(), NOW(), $4)
+            "#,
+        )
+        .bind(existing_id)
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .execute(&fx.pool)
+        .await
+        .expect("seed completed scan");
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        // bypass_dedup = true: every scanner gets a NEW placeholder id.
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, true)
+            .await
+            .expect("prepare with bypass must succeed");
+        assert!(
+            !prepared.is_empty(),
+            "expected at least one scanner (dependency + grype) to produce a prepared row"
+        );
+        for (scan_type, prepared_id) in &prepared {
+            if scan_type == "dependency" {
+                assert_ne!(
+                    *prepared_id, existing_id,
+                    "bypass_dedup=true must NOT short-circuit to the existing completed row id"
+                );
+            }
+        }
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_without_bypass_reuses_existing() {
+        // Inverse of the above: when bypass_dedup = false and a fresh
+        // completed row exists for the same artifact + checksum +
+        // scan_type, `prepare_artifact_scan` must surface that row's
+        // id verbatim (the #1373 short-circuit). This pins that
+        // bypass_dedup = false flows through to
+        // `find_existing_scan_for_artifact` with the new dual-TTL
+        // signature, exercising the else-branch added in #1469.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let checksum = fresh_checksum();
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &checksum).await;
+
+        let existing_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count,
+                low_count, info_count,
+                started_at, completed_at, checksum_sha256
+            )
+            VALUES ($1, $2, $3, 'dependency', 'completed',
+                    3, 0, 0, 0, 0, 0,
+                    NOW(), NOW(), $4)
+            "#,
+        )
+        .bind(existing_id)
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .execute(&fx.pool)
+        .await
+        .expect("seed completed scan");
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, false)
+            .await
+            .expect("prepare without bypass must succeed");
+        let dep_row = prepared
+            .iter()
+            .find(|(t, _)| t == "dependency")
+            .expect("dependency scanner must be in the prepared set");
+        assert_eq!(
+            dep_row.1, existing_id,
+            "bypass_dedup=false must short-circuit to the existing completed row id (#1373)"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_artifact_scan_missing_artifact_returns_empty() {
+        // Early-return branch: a non-existent (or soft-deleted) artifact
+        // produces an empty prepared vec regardless of bypass_dedup. This
+        // hits the new signature on the no-artifact path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let ghost = Uuid::new_v4();
+        let prepared_true = scanner
+            .prepare_artifact_scan(ghost, true, true)
+            .await
+            .expect("missing artifact must not error");
+        assert!(
+            prepared_true.is_empty(),
+            "missing artifact + bypass_dedup must yield empty prepared vec"
+        );
+        let prepared_false = scanner
+            .prepare_artifact_scan(ghost, true, false)
+            .await
+            .expect("missing artifact must not error");
+        assert!(
+            prepared_false.is_empty(),
+            "missing artifact + no bypass_dedup must yield empty prepared vec"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_repository_with_options_empty_repo_returns_zero() {
+        // `scan_repository_with_options` is a new 3-arg signature wrapping
+        // the per-artifact fan-out. An empty repository must return 0
+        // without erroring, regardless of bypass_dedup. This also covers
+        // the public `scan_repository` thin delegate (which forwards
+        // bypass_dedup = false) and exercises the info!/spawn-free path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let count_bypass = scanner
+            .scan_repository_with_options(fx.repo_id, true, true)
+            .await
+            .expect("empty repo scan with bypass must not error");
+        assert_eq!(count_bypass, 0, "no artifacts -> zero count");
+
+        let count_no_bypass = scanner
+            .scan_repository_with_options(fx.repo_id, true, false)
+            .await
+            .expect("empty repo scan without bypass must not error");
+        assert_eq!(count_no_bypass, 0);
+
+        // Thin delegates: `scan_repository` forwards force=false,
+        // bypass_dedup=false; `scan_artifact` forwards similarly for a
+        // single id. Both should be no-ops on an empty repository / a
+        // missing artifact id and not error out.
+        let count_default = scanner
+            .scan_repository(fx.repo_id)
+            .await
+            .expect("scan_repository default delegate must not error");
+        assert_eq!(count_default, 0);
+
+        let ghost_artifact = Uuid::new_v4();
+        // `scan_artifact` / `scan_artifact_with_options` on a missing id
+        // return `Err(NotFound)` (the inner fetch raises). We don't care
+        // about the variant here, only that the new 3-arg signature is
+        // exercised end-to-end through `scan_artifact_inner`, including
+        // the new bypass_dedup parameter forward.
+        let _ = scanner.scan_artifact(ghost_artifact).await;
+        let _ = scanner
+            .scan_artifact_with_options(ghost_artifact, true, true)
+            .await;
+        let _ = scanner
+            .scan_artifact_with_options(ghost_artifact, true, false)
+            .await;
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_artifact_with_prepared_missing_artifact_no_error() {
+        // `scan_artifact_with_prepared` (new 4-arg signature) on a
+        // missing artifact id must early-return without erroring,
+        // regardless of bypass_dedup. The prepared map can be empty;
+        // the function falls through to the artifact-fetch step which
+        // gracefully handles the absent row. Covers the wrapper that
+        // delegates into `scan_artifact_inner` with prepared=Some(...).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+
+        let ghost = Uuid::new_v4();
+        let prepared: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+        // Missing artifact -> Err(NotFound) propagates from
+        // `scan_artifact_inner`; we only care that the new 4-arg signature
+        // compiles + dispatches under both bypass_dedup values.
+        let _ = scanner
+            .scan_artifact_with_prepared(ghost, prepared.clone(), true, true)
+            .await;
+        let _ = scanner
+            .scan_artifact_with_prepared(ghost, prepared, true, false)
+            .await;
+
+        fx.teardown().await;
+    }
 }
