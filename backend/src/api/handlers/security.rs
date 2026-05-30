@@ -90,6 +90,27 @@ pub struct ScoreResponse {
 pub struct TriggerScanRequest {
     pub artifact_id: Option<Uuid>,
     pub repository_id: Option<Uuid>,
+    /// Skip the hash-based scan dedup short-circuit when running this scan.
+    ///
+    /// Defaults to `false`. Normal trigger calls dedup against prior
+    /// completed scans for the same checksum + scan_type so a freshly
+    /// uploaded byte-identical artifact reuses the existing result instead
+    /// of re-running the scanner. When `true`, that dedup is skipped: the
+    /// scanner runs against the bytes again and writes a fresh
+    /// `scan_results` row. Use this to recover from a silently-broken
+    /// prior scan (e.g. an extraction bug producing a completed,
+    /// zero-finding row that masks the real findings until the dedup TTL
+    /// expires; see #1469). Costs an extra scan run, so leave it unset
+    /// for routine trigger calls.
+    ///
+    /// **Admin only.** Setting this to `true` bypasses the dedup short-
+    /// circuit and fans out unbounded scanner work per artifact. The
+    /// `trigger_scan` handler rejects this field with 403 for non-admin
+    /// callers, since a non-admin force-rescan path would be a DoS
+    /// amplifier (the pre-existing `force=true` was naturally rate-limited
+    /// by dedup; `bypass_dedup` removes that safety).
+    #[serde(default)]
+    pub bypass_dedup: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -537,13 +558,14 @@ async fn list_scan_configs(
     responses(
         (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "bypass_dedup requested by non-admin caller", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn trigger_scan(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
     // 503 (not 500) because "scanner not configured" is a normal operational
@@ -555,19 +577,44 @@ async fn trigger_scan(
         .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
+    let bypass_dedup = body.bypass_dedup.unwrap_or(false);
+
+    // `bypass_dedup = true` skips the hash-based scan dedup short-circuit and
+    // fans out a fresh scanner run per artifact (and, at the repo level, one
+    // tokio::spawn worker per artifact in the repo). The pre-existing
+    // `force = true` path was naturally rate-limited because dedup would
+    // collapse repeated calls against the same checksum into a single cached
+    // result; `bypass_dedup` removes that safety. Gating on admin scope
+    // matches the inventory-backfill path in admin.rs which also touches
+    // every artifact in a repository (see issue #1469 review feedback).
+    if bypass_dedup && !auth.is_admin {
+        return Err(AppError::Authorization(
+            "bypass_dedup requires admin privileges".to_string(),
+        ));
+    }
+
     if let Some(artifact_id) = body.artifact_id {
         // Pre-allocate one scan_result row per configured scanner so the IDs
         // can be returned in this response. The actual scan work is still
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
         // instead of inserting new rows. See artifact-keeper#906.
-        let prepared = scanner.prepare_artifact_scan(artifact_id, true).await?;
+        //
+        // `bypass_dedup` (#1469) must be passed to BOTH prepare and execute:
+        // prepare needs it so the same-artifact short-circuit doesn't return
+        // the stale completed row's id (which would leave the worker with
+        // nothing to do); execute needs it so the cross-artifact reuse path
+        // doesn't copy the same stale row into a new `is_reused = true` row
+        // for the newly-allocated placeholder.
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, bypass_dedup)
+            .await?;
         let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
         let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
             if let Err(e) = scanner_for_spawn
-                .scan_artifact_with_prepared(artifact_id, prepared_map, true)
+                .scan_artifact_with_prepared(artifact_id, prepared_map, true, bypass_dedup)
                 .await
             {
                 tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
@@ -594,7 +641,7 @@ async fn trigger_scan(
 
     tokio::spawn(async move {
         if let Err(e) = scanner
-            .scan_repository_with_options(repository_id, true)
+            .scan_repository_with_options(repository_id, true, bypass_dedup)
             .await
         {
             tracing::error!("Repository scan failed for {}: {}", repository_id, e);
@@ -1644,6 +1691,32 @@ mod tests {
         let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.artifact_id, None);
         assert_eq!(req.repository_id, None);
+        assert_eq!(
+            req.bypass_dedup, None,
+            "bypass_dedup must default to None when the field is omitted, so existing \
+             clients that pre-date #1469 keep their cache-friendly trigger semantics"
+        );
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_true() {
+        // #1469: the explicit "rescan now, ignore cached results" path.
+        // Pinned because the handler maps None -> false, so a regression
+        // that drops the field from the struct or renames it would silently
+        // collapse `{"bypass_dedup": true}` back to the cached path.
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": true });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.artifact_id, Some(aid));
+        assert_eq!(req.bypass_dedup, Some(true));
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_false() {
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": false });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.bypass_dedup, Some(false));
     }
 
     // -----------------------------------------------------------------------
@@ -1711,6 +1784,190 @@ mod tests {
              service not configured\") when state.scanner_service is None, \
              so the response is HTTP 503 (not 500).",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: bypass_dedup must be admin-gated in trigger_scan.
+    //
+    // PR #1514 review feedback: `bypass_dedup` skips the hash-based scan
+    // dedup short-circuit and fans out unbounded tokio::spawn workers across
+    // an entire repository's artifacts. The pre-existing `force = true` path
+    // was naturally rate-limited because dedup collapsed repeated calls
+    // against the same checksum into a single cached result; `bypass_dedup`
+    // removes that safety, so a non-admin caller setting it to true would be
+    // a DoS amplifier.
+    //
+    // This test invokes the `trigger_scan` handler directly (not via the
+    // router) so it covers the actual 403 branch under `cargo llvm-cov`.
+    // It runs against a real Postgres pool when `DATABASE_URL` is set and
+    // no-ops cleanly otherwise, matching the `tdh::Fixture` pattern used
+    // by sibling handler tests.
+    //
+    // Coverage strategy: three call shapes prove the gate's behaviour
+    // without spinning up a real scan run:
+    //
+    //   1. non-admin + bypass_dedup=true  -> 403 Authorization (the gate)
+    //   2. admin + bypass_dedup=true + no ids -> 400 Validation
+    //      (the gate is bypassed for admins; we land on the next check)
+    //   3. non-admin + bypass_dedup omitted + no ids -> 400 Validation
+    //      (the gate does not fire for the normal trigger path)
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_trigger_scan_handler_admin_gates_bypass_dedup() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::Arc;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // no DATABASE_URL: skip cleanly
+        };
+
+        // Build a ScannerService so the handler gets past the 503 short-
+        // circuit. The 403 admin-gate check fires before any scanner method
+        // is invoked, so a vanilla constructor without trivy/openscap URLs
+        // is sufficient for this test.
+        let advisory_client = Arc::new(crate::services::scanner_service::AdvisoryClient::new(None));
+        let scan_result_service =
+            Arc::new(crate::services::scan_result_service::ScanResultService::new(fx.pool.clone()));
+        let scan_config_service =
+            Arc::new(crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone()));
+        let scanner = Arc::new(crate::services::scanner_service::ScannerService::new(
+            fx.pool.clone(),
+            advisory_client,
+            scan_result_service,
+            scan_config_service,
+            None, // trivy_url
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+            "/tmp/scan".to_string(),
+            None, // openscap_url
+            "standard".to_string(),
+        ));
+
+        // The fixture's SharedState is `Arc<AppState>` with `scanner_service:
+        // None`. Rebuild the inner AppState with the scanner wired in. We
+        // can't mutate the existing Arc once it's shared, so we construct a
+        // fresh AppState that points at the same pool / storage.
+        let mut state_inner = crate::api::AppState::new(
+            fx.state.config.clone(),
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+        );
+        state_inner.set_scanner_service(scanner);
+        let state: SharedState = Arc::new(state_inner);
+
+        let make_auth = |is_admin: bool| AuthExtension {
+            user_id: fx.user_id,
+            username: fx.username.clone(),
+            email: format!("{}@test.local", fx.username),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        // ---- Case 1: non-admin + bypass_dedup=true -> 403 Authorization
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(true),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("bypass_dedup"),
+                    "403 message should mention bypass_dedup, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected AppError::Authorization for non-admin bypass_dedup, got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 2: admin + bypass_dedup=true + no ids -> 400 Validation
+        // The gate is bypassed for admins; the handler falls through to the
+        // "either artifact_id or repository_id is required" validation.
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(true)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(true),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(
+                    msg.contains("artifact_id") || msg.contains("repository_id"),
+                    "admin bypass_dedup with no ids should hit the post-gate \
+                     validation check, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected AppError::Validation for admin bypass_dedup with no \
+                 ids (proves gate is bypassed for admins), got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 3: non-admin + bypass_dedup omitted + no ids -> 400 Validation
+        // The gate must not fire on the normal trigger path; non-admins
+        // should still be able to call trigger_scan without bypass_dedup.
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: None,
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(_)) => {} // expected
+            other => panic!(
+                "non-admin without bypass_dedup must not be 403'd; expected \
+                 AppError::Validation for the missing-ids case, got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 4: non-admin + bypass_dedup=false -> 400 Validation
+        // Explicit `false` must behave the same as omitted (gate condition
+        // is `bypass_dedup && !auth.is_admin`, so false short-circuits).
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(false),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(_)) => {} // expected
+            other => panic!(
+                "non-admin with bypass_dedup=false must not be 403'd; \
+                 expected AppError::Validation for the missing-ids case, \
+                 got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        fx.teardown().await;
     }
 
     #[test]

@@ -186,7 +186,7 @@ async fn test_find_existing_returns_some_for_matching_artifact_and_checksum() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30, 30)
         .await
         .expect("query must not error");
 
@@ -232,7 +232,7 @@ async fn test_find_existing_returns_none_for_different_artifact_same_checksum() 
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_b, CHECKSUM_A, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_b, CHECKSUM_A, "dependency", 30, 30)
         .await
         .expect("query must not error");
     assert!(
@@ -269,7 +269,7 @@ async fn test_find_existing_returns_none_when_checksum_differs() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_B, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_B, "dependency", 30, 30)
         .await
         .expect("query must not error");
     assert!(
@@ -306,7 +306,7 @@ async fn test_find_existing_returns_none_when_scan_type_differs() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "image", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "image", 30, 30)
         .await
         .expect("query must not error");
     assert!(
@@ -346,7 +346,7 @@ async fn test_find_existing_returns_none_for_running_scan() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30, 30)
         .await
         .expect("query must not error");
     assert!(
@@ -385,7 +385,7 @@ async fn test_find_existing_returns_none_when_scan_is_older_than_ttl() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30, 30)
         .await
         .expect("query must not error");
     assert!(
@@ -435,7 +435,7 @@ async fn test_find_existing_returns_most_recent_when_multiple_completed_exist() 
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+        .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30, 30)
         .await
         .expect("query must not error")
         .expect("must find a completed scan");

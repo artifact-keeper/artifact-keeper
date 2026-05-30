@@ -37,6 +37,12 @@ hmac = "0.12"
 # Encryption
 aes-gcm = "0.10"
 
+# Secret-material zeroization: wipes plaintext key buffers on drop so the
+# decrypted PEM / OpenPGP armor bytes don't linger in freed heap memory
+# between SigningService::load_openpgp_secret_key and the rPGP parser
+# (artifact-keeper #1328).
+zeroize = { version = "1.8", features = ["alloc", "derive"] }
+
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
 object_store = { version = "0.13", features = ["aws"] }
 
