@@ -14,6 +14,7 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::curation_service::version_compare;
 
 /// Check if the packages table exists in the database.
 async fn packages_table_exists(db: &sqlx::PgPool) -> bool {
@@ -343,18 +344,23 @@ pub async fn get_package_versions(
         return Ok(Json(PackageVersionsResponse { versions: vec![] }));
     }
 
-    let versions: Vec<PackageVersionRow> = sqlx::query_as(
+    let mut versions: Vec<PackageVersionRow> = sqlx::query_as(
         r#"
         SELECT version, size_bytes, download_count, created_at, checksum_sha256
         FROM package_versions
         WHERE package_id = $1
-        ORDER BY created_at DESC
         "#,
     )
     .bind(id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    versions.sort_by(|a, b| match version_compare(&a.version, &b.version) {
+        n if n < 0 => std::cmp::Ordering::Greater,
+        n if n > 0 => std::cmp::Ordering::Less,
+        _ => b.created_at.cmp(&a.created_at),
+    });
 
     Ok(Json(PackageVersionsResponse {
         versions: versions
