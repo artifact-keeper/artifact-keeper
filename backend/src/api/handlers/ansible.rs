@@ -3,12 +3,19 @@
 //! Implements the endpoints required for Ansible collection management.
 //!
 //! Routes are mounted at `/ansible/{repo_key}/...`:
+//!   GET  /ansible/{repo_key}/api/                                                      - API version discovery
+//!   GET  /ansible/{repo_key}/api/v3/                                                   - v3 service index
 //!   GET  /ansible/{repo_key}/api/v3/collections/                                      - List collections
 //!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/                   - Collection info
 //!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/           - Version list
 //!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/{version}/ - Version info
 //!   GET  /ansible/{repo_key}/download/{namespace}-{name}-{version}.tar.gz              - Download
 //!   POST /ansible/{repo_key}/api/v3/artifacts/collections/                             - Upload collection
+//!
+//! The discovery endpoints are required by the `ansible-galaxy` CLI: before
+//! any other call it performs `GET <server_url>/api/` to negotiate which
+//! Galaxy API version to use. Without it the CLI aborts with
+//! `Error when finding available api versions (HTTP Code: 404, Message: Not Found)`.
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
@@ -18,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -33,6 +41,8 @@ use crate::formats::ansible::AnsibleHandler;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
+        .route("/:repo_key/api/", get(api_root))
+        .route("/:repo_key/api/v3/", get(api_v3_root))
         .route("/:repo_key/api/v3/collections/", get(list_collections))
         .route(
             "/:repo_key/api/v3/collections/:namespace/:name/",
@@ -51,6 +61,51 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/api/v3/artifacts/collections/",
             post(upload_collection),
         )
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/ — API version discovery
+// ---------------------------------------------------------------------------
+//
+// Mirrors the Pulp Galaxy NG response shape so the `ansible-galaxy` CLI
+// negotiates v3 successfully. The CLI only checks `available_versions` keys.
+
+async fn api_root(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    // Validate the repo exists so misconfigured server URLs surface as 404.
+    let _ = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    let json = serde_json::json!({
+        "description": "Artifact Keeper Ansible Galaxy API",
+        "current_version": "v3",
+        "available_versions": {
+            "v3": "v3/"
+        },
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "version_name": "Artifact Keeper",
+    });
+    Ok(super::json_response(&json))
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/v3/ — v3 service index
+// ---------------------------------------------------------------------------
+
+async fn api_v3_root(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _ = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    let json = serde_json::json!({
+        "collections": format!("/ansible/{}/api/v3/collections/", repo_key),
+        "artifacts": {
+            "collections": format!("/ansible/{}/api/v3/artifacts/collections/", repo_key),
+        },
+    });
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -346,36 +401,111 @@ async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    multipart: Multipart,
+    mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic(auth, "ansible")?.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
-    let (tarball, collection_json) =
-        proxy_helpers::parse_multipart_file_with_json(multipart, &["collection", "metadata"])
-            .await?;
+    // The `ansible-galaxy collection publish` CLI sends a multipart body with:
+    //   * `file`: the tarball, with the canonical filename
+    //     `<namespace>-<name>-<version>.tar.gz` in the field's Content-Disposition
+    //   * `sha256`: a hex digest of the tarball (text field)
+    // It does NOT send a separate JSON metadata blob. galaxykit and some
+    // older clients still send a `collection` or `metadata` JSON field, so
+    // accept either source for the namespace/name/version. The filename
+    // takes precedence because it is what the CLI ships with.
+    let mut tarball: Option<Bytes> = None;
+    let mut file_name: Option<String> = None;
+    let mut declared_sha256: Option<String> = None;
+    let mut collection_json: Option<serde_json::Value> = None;
 
-    let (namespace, collection_name, collection_version) = if let Some(ref json) = collection_json {
-        let namespace = json
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let name = json
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = json
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        (namespace, name, version)
-    } else {
-        return Err((StatusCode::BAD_REQUEST, "Missing collection metadata JSON").into_response());
-    };
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "file" {
+            file_name = field.file_name().map(|s| s.to_string());
+            tarball = Some(field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read file: {}", e),
+                )
+                    .into_response()
+            })?);
+        } else if field_name == "sha256" {
+            declared_sha256 = Some(field.text().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read sha256: {}", e),
+                )
+                    .into_response()
+            })?);
+        } else if field_name == "collection" || field_name == "metadata" {
+            let data = field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?;
+            collection_json = Some(serde_json::from_slice(&data).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?);
+        }
+    }
+
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
+    if tarball.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
+    }
+
+    // 1. Try the filename (this is what ansible-galaxy CLI sends).
+    // 2. Fall back to the optional metadata JSON for older clients.
+    let (namespace, collection_name, collection_version) =
+        if let Some(ref fname) = file_name.as_ref().filter(|n| !n.is_empty()) {
+            let archive_path = format!("collections/{}", fname);
+            match AnsibleHandler::parse_path(&archive_path) {
+                Ok(info) => (info.namespace, info.name, info.version.unwrap_or_default()),
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid collection filename: {}", e),
+                    )
+                        .into_response());
+                }
+            }
+        } else if let Some(ref json) = collection_json {
+            let namespace = json
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = json
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let version = json
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            (namespace, name, version)
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Missing collection filename and metadata; cannot determine namespace/name/version",
+            )
+                .into_response());
+        };
 
     if namespace.is_empty() || collection_name.is_empty() || collection_version.is_empty() {
         return Err((
@@ -408,6 +538,22 @@ async fn upload_collection(
     let mut hasher = Sha256::new();
     hasher.update(&tarball);
     let computed_sha256 = format!("{:x}", hasher.finalize());
+
+    // If the client supplied a digest, verify the upload was not corrupted in
+    // transit. ansible-galaxy CLI always sends one.
+    if let Some(declared) = declared_sha256.as_deref() {
+        let declared = declared.trim();
+        if !declared.is_empty() && !declared.eq_ignore_ascii_case(&computed_sha256) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Collection sha256 mismatch: declared {} but computed {}",
+                    declared, computed_sha256
+                ),
+            )
+                .into_response());
+        }
+    }
 
     let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
 
@@ -687,6 +833,150 @@ mod tests {
         );
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1451: ansible-galaxy CLI requires a discovery
+    // endpoint at `<server>/api/` and accepts uploads whose namespace/name/
+    // version come from the multipart filename, not a JSON metadata blob.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ansible_api_discovery_returns_v3() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/api/", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["current_version"], "v3");
+        assert_eq!(json["available_versions"]["v3"], "v3/");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_api_discovery_unknown_repo_404() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(app, tdh::get("/no-such-repo/api/".into())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_api_v3_root_lists_collections_url() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/api/v3/", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let collections = json["collections"].as_str().unwrap();
+        assert!(collections.ends_with("/api/v3/collections/"));
+        let artifacts = json["artifacts"]["collections"].as_str().unwrap();
+        assert!(artifacts.ends_with("/api/v3/artifacts/collections/"));
+        f.teardown().await;
+    }
+
+    /// Build a minimal multipart body matching what `ansible-galaxy collection
+    /// publish` sends: a `file` part with the canonical filename and a
+    /// `sha256` text part. No JSON metadata field. See ansible/galaxy/api.py
+    /// in the ansible/ansible repo.
+    fn galaxy_cli_multipart(boundary: &str, filename: &str, body: &[u8], sha256: &str) -> Bytes {
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        out.extend_from_slice(b"Content-Disposition: form-data; name=\"sha256\"\r\n\r\n");
+        out.extend_from_slice(sha256.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        out.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+                filename
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+        Bytes::from(out)
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_accepts_galaxy_cli_payload() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let body = b"fake-tar-content";
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        let sha = format!("{:x}", hasher.finalize());
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-hashi_vault-7.1.0.tar.gz", body, &sha);
+
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart,
+        );
+        let (status, body_bytes) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "unexpected upload status, body={}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["namespace"], "community");
+        assert_eq!(json["name"], "hashi_vault");
+        assert_eq!(json["version"], "7.1.0");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_rejects_sha256_mismatch() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let body = b"fake-tar-content";
+        let bad_sha = "deadbeef".to_string();
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-general-1.0.0.tar.gz", body, &bad_sha);
+
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart,
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_rejects_bad_filename() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let body = b"fake-tar-content";
+        let multipart = galaxy_cli_multipart("BOUNDARY", "not-a-collection.zip", body, "");
+
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart,
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         f.teardown().await;
     }
 }

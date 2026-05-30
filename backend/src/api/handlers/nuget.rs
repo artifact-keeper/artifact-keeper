@@ -561,13 +561,60 @@ async fn flatcontainer_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let package_id_lower = package_id_lower.clone();
+            let version = version.clone();
+            let filename = filename.clone();
+            let repo_key = repo_key.clone();
+            proxy_helpers::get_cached_or_refetch(
+                &state.db,
+                artifact.id,
+                storage.as_ref(),
+                &artifact.storage_key,
+                || {
+                    let package_id_lower = package_id_lower.clone();
+                    let version = version.clone();
+                    let filename = filename.clone();
+                    let repo_key = repo_key.clone();
+                    async move {
+                        let upstream_path = format!(
+                            "v3/flatcontainer/{}/{}/{}",
+                            package_id_lower, version, filename
+                        );
+                        let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &upstream_path,
+                        )
+                        .await?;
+                        Ok(bytes)
+                    }
+                },
+            )
+            .await?
+        } else {
+            storage.get(&artifact.storage_key).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Storage error: {}", e),
+                )
+                    .into_response()
+            })?
+        }
+    } else {
+        storage.get(&artifact.storage_key).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     // Record download.
     let _ = sqlx::query!(
@@ -938,6 +985,9 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use bytes::Bytes;
+
     use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
@@ -1684,6 +1734,116 @@ mod tests {
             build_nuget_search_pattern("Newtonsoft.Json"),
             "%newtonsoft.json%"
         );
+    }
+
+    #[tokio::test]
+    async fn test_flatcontainer_download_remote_arm_routes_through_cached_or_refetch_helper() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+
+        let nupkg_bytes: &[u8] = b"cached-nupkg-from-disk";
+        let package_id = "newtonsoft.json";
+        let package_id_lower = package_id.to_lowercase();
+        let version = "13.0.1";
+        let filename = format!("{}.{}.nupkg", package_id_lower, version);
+
+        // Upstream URL only needs to parse; no network I/O is performed here.
+        let upstream = "https://upstream.example.test".to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let repo_info = fx.repo_info("remote", Some(&upstream));
+
+        // Seed storage and DB row. The handler looks up by name (lowercased)
+        // and version, so the exact `path` inserted is unimportant here.
+        let storage_key = format!("nuget/{}/{}/{}", package_id_lower, version, filename);
+        let artifact_path = format!(
+            "v3/flatcontainer/{}/{}/{}",
+            package_id_lower, version, filename
+        );
+
+        tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &repo_info,
+            &storage_key,
+            &artifact_path,
+            &package_id_lower,
+            version,
+            "application/octet-stream",
+            Bytes::from_static(nupkg_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Call the handler directly via extractors.
+        let result = super::flatcontainer_download(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                package_id_lower.clone(),
+                version.to_string(),
+                filename.clone(),
+            )),
+        )
+        .await;
+
+        // Cleanup first so a panic does not leave DB state behind.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!("flatcontainer_download Remote arm must serve cached payload, got {status}");
+            }
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("Content-Type")
+                .to_str()
+                .unwrap(),
+            "application/octet-stream",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("Content-Length")
+                .to_str()
+                .unwrap(),
+            nupkg_bytes.len().to_string(),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Disposition")
+                .expect("Content-Disposition")
+                .to_str()
+                .unwrap(),
+            format!("attachment; filename=\"{}\"", filename),
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(&body_bytes[..], nupkg_bytes);
+
+        cleanup().await;
     }
 }
 

@@ -97,10 +97,20 @@ pub struct SystemConfigResponse {
 pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemConfigResponse> {
     let config = &state.config;
 
+    // Dependency-Track is considered enabled only when the service was
+    // actually wired into application state at startup. That requires both
+    // `DEPENDENCY_TRACK_ENABLED=true` and a usable `DEPENDENCY_TRACK_URL`
+    // and `DEPENDENCY_TRACK_API_KEY`. Reporting `is_some()` here (instead
+    // of `config.dependency_track_url.is_some()`) guarantees the frontend
+    // sees a single, consistent disabled/enabled signal that matches both
+    // the `/api/v1/dependency-track/status` endpoint and the health
+    // monitor; this is the fix for the mixed "Disabled" vs "unavailable"
+    // banners reported in issue #1395, and the "monitoring green while DT
+    // unavailable" inconsistency in issue #1480.
     let scanners = ScannersConfig {
         trivy_enabled: config.trivy_url.is_some(),
         openscap_enabled: config.openscap_url.is_some(),
-        dependency_track_enabled: config.dependency_track_url.is_some(),
+        dependency_track_enabled: state.dependency_track.is_some(),
     };
 
     let auth = AuthConfig {
