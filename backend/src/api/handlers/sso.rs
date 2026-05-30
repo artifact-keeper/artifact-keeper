@@ -210,7 +210,7 @@ pub async fn oidc_callback(
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // Validate parameter shape BEFORE hitting the session store. Empty state
     // or code is a malformed callback (400), not a CSRF failure (401). See
     // `validate_oidc_callback_params` doc comment.
@@ -251,7 +251,7 @@ pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // Validate parameter shape BEFORE hitting the session store. See
     // `validate_oidc_callback_params` doc comment.
     validate_oidc_callback_params(&params)?;
@@ -278,7 +278,7 @@ async fn oidc_callback_inner(
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
     headers: HeaderMap,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
         AuthConfigService::get_oidc_decrypted(&state.db, provider_id).await?;
@@ -417,7 +417,25 @@ async fn oidc_callback_inner(
 
     let frontend_url = build_frontend_callback_url(&exchange_code);
 
-    Ok(Redirect::temporary(&frontend_url))
+    // Set auth cookies on the redirect itself (closes #1405).
+    //
+    // Without this, the browser arrives at `/callback?code=...` with no auth
+    // cookie set. The web AuthProvider mounts and fires `GET /auth/me` before
+    // the page-level `POST /exchange` completes, gets a 401 (no cookie), and
+    // redirects to `/login`. With multiple backend replicas the cookie-set
+    // response from `/exchange` and the cookieless `/auth/me` can interleave
+    // (the customer mitigation was ALB sticky sessions, confirming the race
+    // is per-replica state). Setting cookies on the 307 ensures the cookie is
+    // installed in the browser the instant it lands on `/callback`, so any
+    // eager `/auth/me` from the frontend succeeds. The `/exchange` POST still
+    // runs and re-sets cookies (idempotent) so the existing flow continues to
+    // work for frontends that read the response body.
+    build_sso_callback_redirect(
+        &frontend_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +605,7 @@ pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -639,7 +657,14 @@ pub async fn saml_acs(
 
     let frontend_url = build_frontend_callback_url(&exchange_code);
 
-    Ok(Redirect::temporary(&frontend_url))
+    // Set auth cookies on the redirect itself; see oidc_callback_inner for
+    // the rationale (closes #1405).
+    build_sso_callback_redirect(
+        &frontend_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +746,41 @@ pub struct SsoApiDoc;
 /// and passed as a query parameter so the frontend can exchange it for tokens.
 pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
     format!("/callback?code={}", urlencoding::encode(exchange_code))
+}
+
+/// Build a 307 redirect to the frontend `/callback` page that also carries
+/// the auth cookies (`Set-Cookie` headers).
+///
+/// This closes #1405. The web `AuthProvider` mounts on every route — including
+/// `/callback?code=...` — and eagerly fires `GET /api/v1/auth/me` to populate
+/// `user`. Before this change, that request raced the page-level `POST
+/// /api/v1/auth/sso/exchange` that installs the cookies: on multi-replica
+/// backends the eager `/auth/me` reached a replica without a cookie and 401-ed,
+/// which the frontend interpreted as "not authenticated" and bounced back to
+/// `/login` even though the exchange itself was about to (or had just) succeed.
+///
+/// Setting the cookies on the redirect itself means the browser stores them
+/// before it even loads the callback page, so the eager `/auth/me` always
+/// carries the JWT cookie and resolves to the authenticated user.
+///
+/// The exchange-code abstraction is preserved: the code is still single-use
+/// and the frontend still POSTs it to `/exchange` to retrieve raw tokens for
+/// JS-side storage. `/exchange` re-sets the same cookies (idempotent), so a
+/// frontend that ignores the redirect cookies continues to work.
+pub(crate) fn build_sso_callback_redirect(
+    frontend_url: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in: u64,
+) -> Result<Response> {
+    let mut response = Redirect::temporary(frontend_url).into_response();
+    set_auth_cookies(
+        response.headers_mut(),
+        access_token,
+        refresh_token,
+        expires_in,
+    );
+    Ok(response)
 }
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
@@ -1359,6 +1419,118 @@ mod tests {
         // urlencoding will percent-encode the non-ASCII bytes
         assert!(url.starts_with("/callback?code="));
         assert!(!url.contains('\u{00e9}'));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_sso_callback_redirect (#1405)
+    //
+    // The SSO callback must install the auth cookies on the 307 redirect
+    // itself, not only on the later POST /exchange response. Without cookies
+    // on the redirect, the web AuthProvider fires GET /auth/me as soon as the
+    // frontend mounts at /callback, and on multi-replica backends that
+    // request can land on a replica before /exchange has had a chance to set
+    // cookies, returning 401 and bouncing the user back to /login even
+    // though the SSO exchange itself succeeds a moment later.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sso_callback_redirect_is_307_to_frontend_callback() {
+        let response = build_sso_callback_redirect(
+            "/callback?code=abc",
+            "access_token_value",
+            "refresh_token_value",
+            3600,
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            "SSO callback must be a 307 redirect"
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/callback?code=abc");
+    }
+
+    #[test]
+    fn test_sso_callback_redirect_sets_access_and_refresh_cookies() {
+        // Regression for #1405: the 307 redirect must carry Set-Cookie
+        // headers for both tokens so the browser has the auth cookies
+        // installed by the time it lands on the frontend /callback page.
+        let response = build_sso_callback_redirect(
+            "/callback?code=xyz",
+            "the_access_token",
+            "the_refresh_token",
+            7200,
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "must set both access and refresh cookies on the redirect, got {cookies:?}"
+        );
+        let access = cookies
+            .iter()
+            .find(|c| c.contains("ak_access_token="))
+            .expect("must include ak_access_token Set-Cookie");
+        assert!(
+            access.contains("ak_access_token=the_access_token"),
+            "access cookie must carry the token value, got {access}"
+        );
+        assert!(
+            access.contains("HttpOnly"),
+            "access cookie must be HttpOnly so JS cannot exfiltrate the JWT, got {access}"
+        );
+        assert!(
+            access.contains("SameSite=Strict"),
+            "access cookie must be SameSite=Strict, got {access}"
+        );
+        let refresh = cookies
+            .iter()
+            .find(|c| c.contains("ak_refresh_token="))
+            .expect("must include ak_refresh_token Set-Cookie");
+        assert!(
+            refresh.contains("ak_refresh_token=the_refresh_token"),
+            "refresh cookie must carry the token value, got {refresh}"
+        );
+        assert!(
+            refresh.contains("Path=/api/v1/auth/refresh"),
+            "refresh cookie must be scoped to the refresh path, got {refresh}"
+        );
+    }
+
+    #[test]
+    fn test_sso_callback_redirect_uses_passed_access_token_max_age() {
+        // The access cookie Max-Age must match the token's `expires_in`
+        // (in seconds) so the cookie expires roughly when the JWT does.
+        let response = build_sso_callback_redirect(
+            "/callback?code=mm",
+            "at",
+            "rt",
+            1800, // 30 minutes
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        let access_cookie = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.contains("ak_access_token="))
+            .expect("must include access cookie");
+        assert!(
+            access_cookie.contains("Max-Age=1800"),
+            "access cookie Max-Age must equal expires_in (1800), got {access_cookie}"
+        );
     }
 
     // -----------------------------------------------------------------------

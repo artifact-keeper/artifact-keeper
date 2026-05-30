@@ -17,9 +17,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("OPENSCAP_PORT", "8091"))
 
-# Allowed base directories for scan paths (container-extracted filesystems)
+# Allowed base directories for scan paths (container-extracted filesystems).
+#
+# The backend writes per-artifact scan workspaces under SCAN_WORKSPACE_PATH
+# (defaults to /scan-workspace) and sends that path to the wrapper. The
+# wrapper container mounts the same volume at /scan-workspace. Keeping
+# /scan-workspace/ in the default allowlist means the out-of-the-box
+# docker-compose and Helm deployments work without per-deployment env
+# tweaks; otherwise every fresh install hits "scan path not found or not
+# allowed" (issue #1466).
+#
+# Operators who customise SCAN_WORKSPACE_PATH or want to lock the wrapper
+# down further can still override via the OPENSCAP_ALLOWED_SCAN_DIRS env
+# var (colon-separated list of allowed base dirs).
 ALLOWED_SCAN_DIRS = os.environ.get(
-    "OPENSCAP_ALLOWED_SCAN_DIRS", "/tmp/:/var/tmp/"
+    "OPENSCAP_ALLOWED_SCAN_DIRS", "/scan-workspace/:/tmp/:/var/tmp/"
 ).split(":")
 
 
