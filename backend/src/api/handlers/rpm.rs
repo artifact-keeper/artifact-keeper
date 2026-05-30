@@ -2102,4 +2102,164 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         f.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage for the #1447 fix: every repodata sibling handler
+    // (primary/filelists/other/updateinfo) must also short-circuit to the
+    // upstream proxy for Remote repos, repomd_xml.asc must proxy the
+    // detached signature, and repodata_proxy must 404 for Hosted repos
+    // (otherwise dnf's hash-prefixed lookups would silently 502).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_remote_repodata_sibling_handlers_all_proxy_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        // Each sibling handler advertises a different default content type
+        // upstream; wiremock just needs to echo deterministic bodies so the
+        // test can confirm each handler proxied the right path.
+        let primary: &[u8] = b"\x1f\x8bPRIMARY";
+        let filelists: &[u8] = b"\x1f\x8bFILELISTS";
+        let other: &[u8] = b"\x1f\x8bOTHER";
+        let updateinfo: &[u8] = b"\x1f\x8bUPDATEINFO";
+
+        for (p, body) in [
+            ("/repodata/primary.xml.gz", primary),
+            ("/repodata/filelists.xml.gz", filelists),
+            ("/repodata/other.xml.gz", other),
+            ("/repodata/updateinfo.xml.gz", updateinfo),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/gzip")
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let teardown = || async { fx.teardown().await };
+
+        for (suffix, expected) in [
+            ("repodata/primary.xml.gz", primary),
+            ("repodata/filelists.xml.gz", filelists),
+            ("repodata/other.xml.gz", other),
+            ("repodata/updateinfo.xml.gz", updateinfo),
+        ] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, suffix))).await;
+            if status != StatusCode::OK {
+                teardown().await;
+                panic!("{} proxy returned {}", suffix, status);
+            }
+            assert_eq!(&body[..], expected, "wrong body for {}", suffix);
+        }
+
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_remote_repomd_asc_proxies_upstream_signature() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let sig: &[u8] =
+            b"-----BEGIN PGP SIGNATURE-----\nupstream-sig\n-----END PGP SIGNATURE-----\n";
+        Mock::given(method("GET"))
+            .and(path("/repodata/repomd.xml.asc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pgp-signature")
+                    .set_body_bytes(sig),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/repomd.xml.asc", fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("repomd.xml.asc proxy returned {}", status);
+        }
+        assert_eq!(&body[..], sig);
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_wildcard_404s_for_hosted_repos() {
+        // The /repodata/*path catch-all must 404 on Hosted repos. Without
+        // this guard, dnf's hash-prefixed metadata fetches would return
+        // the wrong status and confuse the client.
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/abc123-primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upstream_proxy_404s_when_proxy_service_unavailable() {
+        // Remote repo with NO proxy_service wired into SharedState (the
+        // default fixture state). upstream_proxy reaches the
+        // `(upstream_url, proxy) = (_, None)` fallback and must 404
+        // rather than panic. Covers the cache-miss + no-proxy branch.
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        let app = fx.router_anon(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/some-package.rpm", fx.repo_key))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_proxy_404s_for_remote_without_proxy_service() {
+        // Same idea for /repodata/*path catch-all: without a wired
+        // proxy_service, try_proxy_repodata returns Ok(None) and the
+        // handler falls through to 404. Also drives every branch of
+        // the content-type suffix detection (.xml, .asc, default).
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        for suffix in [
+            "repodata/abc-primary.xml",
+            "repodata/repomd.xml.asc",
+            "repodata/random-blob",
+        ] {
+            let app = fx.router_anon(super::router());
+            let (status, _) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, suffix))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "expected 404 for {}", suffix);
+        }
+        fx.teardown().await;
+    }
 }
