@@ -2,12 +2,14 @@
 //!
 //! Auto-populates the `packages` and `package_versions` tables when artifacts
 //! are uploaded. Uses UPSERT semantics so repeated publishes of the same
-//! name+version are idempotent.
+//! package collapse into one `packages` row with many `package_versions`.
 
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::services::curation_service::version_compare;
 
 /// Service for managing package and package_version records.
 pub struct PackageService {
@@ -39,16 +41,13 @@ impl PackageService {
         description: Option<&str>,
         metadata: Option<JsonValue>,
     ) -> anyhow::Result<Uuid> {
-        // Upsert into `packages`
-        let row: (Uuid,) = sqlx::query_as(
+        // Keep one package row per repository/name and let that row reflect
+        // the latest known version.
+        let inserted: Option<(Uuid,)> = sqlx::query_as(
             r#"
             INSERT INTO packages (repository_id, name, version, description, size_bytes, metadata)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (repository_id, name, version) DO UPDATE SET
-                size_bytes   = EXCLUDED.size_bytes,
-                description  = COALESCE(EXCLUDED.description, packages.description),
-                metadata     = COALESCE(EXCLUDED.metadata, packages.metadata),
-                updated_at   = NOW()
+            ON CONFLICT (repository_id, name) DO NOTHING
             RETURNING id
             "#,
         )
@@ -58,10 +57,58 @@ impl PackageService {
         .bind(description)
         .bind(size_bytes)
         .bind(&metadata)
-        .fetch_one(&self.db)
+        .fetch_optional(&self.db)
         .await?;
 
-        let package_id = row.0;
+        let package_id = if let Some((package_id,)) = inserted {
+            package_id
+        } else {
+            let existing: (Uuid, String) = sqlx::query_as(
+                r#"
+                SELECT id, version
+                FROM packages
+                WHERE repository_id = $1 AND name = $2
+                "#,
+            )
+            .bind(repository_id)
+            .bind(name)
+            .fetch_one(&self.db)
+            .await?;
+
+            if version_compare(version, &existing.1) >= 0 {
+                sqlx::query(
+                    r#"
+                    UPDATE packages
+                    SET version = $2,
+                        description = COALESCE($3, description),
+                        size_bytes = $4,
+                        metadata = COALESCE($5, metadata),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(existing.0)
+                .bind(version)
+                .bind(description)
+                .bind(size_bytes)
+                .bind(&metadata)
+                .execute(&self.db)
+                .await?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE packages
+                    SET updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(existing.0)
+                .execute(&self.db)
+                .await?;
+            }
+
+            existing.0
+        };
 
         // Upsert into `package_versions`
         sqlx::query(

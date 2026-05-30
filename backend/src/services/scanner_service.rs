@@ -3881,12 +3881,88 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Fire-and-forget `scan_on_upload` trigger for a freshly-inserted artifact.
+///
+/// Mirrors the gate already inlined in [`ArtifactService::upload`] so that
+/// format-native upload paths (incus, oci, helm, the `proxy_helpers::insert_artifact`
+/// callers, …) can opt in with a single call after their DB insert instead of
+/// silently skipping the auto-scan. The caller resolves `should_scan` —
+/// typically:
+///
+/// ```ignore
+/// let should_scan = sqlx::query_scalar!(
+///     "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+///     repository_id
+/// )
+/// .fetch_optional(&db)
+/// .await
+/// .ok()
+/// .flatten()
+/// .unwrap_or(false);
+/// ```
+///
+/// — and passes a closure that calls `ScannerService::scan_artifact` (or no-ops
+/// when `state.scanner_service` is `None`).
+///
+/// When `should_scan` is true, the closure is spawned on a background task so
+/// the upload response isn't blocked by the scanner pipeline; the closure
+/// should log any error itself (the scan is best-effort here — the same
+/// artifact can be re-scanned via `POST /api/v1/security/scan`).
+///
+/// Returns whether a task was spawned (useful for tests and metrics).
+pub fn spawn_scan_on_upload<F, Fut>(should_scan: bool, artifact_id: Uuid, trigger: F) -> bool
+where
+    F: FnOnce(Uuid) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if !should_scan {
+        return false;
+    }
+    tokio::spawn(async move {
+        trigger(artifact_id).await;
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // spawn_scan_on_upload (scan-trigger helper for format-native handlers)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_scan_on_upload_skips_when_disabled() {
+        let id = Uuid::new_v4();
+        let spawned = spawn_scan_on_upload(false, id, |_| async {
+            panic!("trigger should not fire when scan_on_upload is false");
+        });
+        assert!(!spawned);
+        // Give any (erroneously) spawned task a tick to run and fail the test.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_scan_on_upload_fires_when_enabled() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Uuid>(1);
+        let id = Uuid::new_v4();
+        let spawned = spawn_scan_on_upload(true, id, move |aid| {
+            let tx = tx.clone();
+            async move {
+                tx.send(aid).await.expect("test rx open");
+            }
+        });
+        assert!(spawned);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("trigger must fire within timeout")
+            .expect("trigger must send the artifact_id");
+        assert_eq!(received, id);
+    }
 
     // -----------------------------------------------------------------------
     // stage_scan_input / stage_from_storage (scan-input staging)

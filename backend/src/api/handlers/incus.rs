@@ -440,6 +440,22 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> 
     .await
     .map_err(|e| fs_err("store metadata", e))?;
 
+    // Surface Incus images in the top-level package browser. The generic
+    // upload path (artifact_service) and the npm/pypi/nuget handlers populate
+    // these tables already; the Incus handler writes `artifacts` directly and
+    // so must call it explicitly. Best-effort — a failure must not fail upload.
+    crate::services::package_service::PackageService::new(db.clone())
+        .try_create_or_update_from_artifact(
+            repo_id,
+            product,
+            version,
+            size_bytes,
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "incus" })),
+        )
+        .await;
+
     Ok(artifact_id)
 }
 
@@ -776,6 +792,34 @@ async fn upload_image(
     })
     .await?;
 
+    // scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
+    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            repo.id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
+
     tracing::info!(
         "Uploaded Incus image: {}/{}/{} ({}B, sha256:{})",
         product,
@@ -1101,6 +1145,32 @@ async fn complete_chunked_upload(
         metadata: &metadata,
     })
     .await?;
+
+    // scan_on_upload trigger — see `upload_image` above.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            session.repository_id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
 
     // Clean up session
     let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
@@ -2466,6 +2536,73 @@ mod tests {
         }
         assert_eq!(collected, payload);
     }
+
+    // -----------------------------------------------------------------------
+    // Regression: Incus uploads must populate the `packages` /
+    // `package_versions` tables so images appear in the top-level package
+    // browser, matching npm/pypi/nuget and the generic upload path. Before
+    // the fix, `upsert_artifact` wrote only the `artifacts` row, so Incus
+    // images were invisible in `GET /api/v1/packages`.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn upsert_artifact_populates_packages_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let artifact_path = build_artifact_path("ubuntu-noble", "20240215", "incus.tar.xz");
+        let storage_key = build_storage_key(&f.repo_id, &artifact_path);
+        let metadata = serde_json::json!({ "format": "incus" });
+
+        let Ok(_id) = upsert_artifact(UpsertArtifactParams {
+            db: &f.pool,
+            repo_id: f.repo_id,
+            artifact_path: &artifact_path,
+            product: "ubuntu-noble",
+            version: "20240215",
+            size_bytes: 1234,
+            checksum: "deadbeef",
+            storage_key: &storage_key,
+            user_id: f.user_id,
+            metadata: &metadata,
+        })
+        .await
+        else {
+            panic!("upsert_artifact failed");
+        };
+
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT name, version FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("ubuntu-noble")
+        .bind("20240215")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+        let (name, version) = row.expect("packages row must exist after an Incus upload");
+        assert_eq!(
+            (name.as_str(), version.as_str()),
+            ("ubuntu-noble", "20240215")
+        );
+
+        let version_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("ubuntu-noble")
+        .bind("20240215")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(version_count.0, 1);
+
+        f.teardown().await;
+    }
 }
 
 // ===========================================================================
@@ -2720,6 +2857,306 @@ mod cross_repo_session_regression_tests {
         );
 
         cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+}
+
+// ===========================================================================
+// #1471 lib-side streaming regression coverage.
+//
+// `cargo llvm-cov --workspace --lib` does not instrument the `tests/`
+// directory, so the new `put_stream` / `get_stream` / temp-file pipeline in
+// `upload_image`, `download_image`, and `complete_chunked_upload` would
+// otherwise look uncovered on the New Code Coverage gate. These tests drive
+// the router end-to-end against the fixture's filesystem-backed
+// StorageBackend so every new line in those handlers gets exercised under
+// `--lib`.
+//
+// Tests no-op when `DATABASE_URL` is unset, matching every other tdh-style
+// suite in this crate.
+// ===========================================================================
+
+#[cfg(test)]
+mod streaming_pipeline_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::header;
+    use tower::ServiceExt;
+
+    /// PUT a monolithic image, then GET it back. Exercises `upload_image`'s
+    /// stream-to-temp-file → `put_temp_file_to_storage` → `put_stream`
+    /// pipeline and the matching `download_image` → `get_stream` →
+    /// streaming response body path.
+    #[tokio::test]
+    async fn monolithic_upload_then_download_roundtrip_via_put_stream() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        // 320 KiB payload guarantees the streamed download body and the
+        // ReaderStream-chunked upload both span multiple
+        // STREAM_CHUNK_BUDGET windows.
+        let payload: Vec<u8> = (0u32..(320 * 1024)).map(|i| (i % 251) as u8).collect();
+        let product = "ubuntu-noble";
+        let version = "20240215";
+        let filename = "incus.tar.gz";
+        let uri = format!(
+            "/{}/images/{}/{}/{}",
+            f.repo_key, product, version, filename
+        );
+
+        // --- PUT (upload_image) -------------------------------------------
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&uri)
+            .body(Body::from(payload.clone()))
+            .expect("build PUT request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "monolithic PUT must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let upload_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse upload response");
+        assert_eq!(upload_json["size"].as_i64(), Some(payload.len() as i64));
+        let returned_sha = upload_json["sha256"]
+            .as_str()
+            .expect("response has sha256 field")
+            .to_string();
+
+        // Confirm the artifact row was inserted with the storage key shape
+        // that `put_temp_file_to_storage` writes to.
+        let storage_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2 LIMIT 1",
+        )
+        .bind(f.repo_id)
+        .bind(build_artifact_path(product, version, filename))
+        .fetch_one(&f.pool)
+        .await
+        .expect("artifact row");
+        assert!(
+            storage_key.starts_with("incus/"),
+            "storage_key should be the put_stream key, got {}",
+            storage_key
+        );
+
+        // --- GET (download_image, streaming) ------------------------------
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .body(Body::empty())
+            .expect("build GET request");
+        let resp = app.oneshot(req).await.expect("download oneshot");
+        assert_eq!(resp.status(), StatusCode::OK, "GET must succeed");
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(
+            ct, "application/gzip",
+            "Content-Type must match content_type_for_download for .tar.gz"
+        );
+        let checksum_hdr = resp
+            .headers()
+            .get("X-Checksum-Sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(
+            checksum_hdr, returned_sha,
+            "X-Checksum-Sha256 must match the value computed during PUT"
+        );
+        let content_length_hdr = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .expect("Content-Length header parses");
+        assert_eq!(content_length_hdr, payload.len());
+
+        let downloaded = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("read download body");
+        assert_eq!(
+            downloaded.as_ref(),
+            payload.as_slice(),
+            "downloaded bytes must match uploaded bytes (round-trip via put_stream/get_stream)"
+        );
+
+        f.teardown().await;
+    }
+
+    /// GET for an artifact whose `storage_key` row exists but whose object
+    /// is missing from the StorageBackend must surface as a non-200 error.
+    /// Exercises `download_image`'s `get_stream` error-mapping closure.
+    /// The filesystem backend reports ENOENT as a generic Storage error
+    /// ("Failed to open ... No such file or directory") so this path falls
+    /// through to 500; cloud backends typically return a "not found"-shaped
+    /// message and surface as 404 via the same closure.
+    #[tokio::test]
+    async fn download_missing_object_exercises_get_stream_error_mapping() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        let product = "ubuntu-noble";
+        let version = "20240215";
+        let filename = "incus.tar.xz";
+        let artifact_path = build_artifact_path(product, version, filename);
+        let storage_key = build_storage_key(&f.repo_id, &artifact_path);
+
+        // Insert an artifact row but never write the object — get_stream
+        // will fail with "not found", which the handler must translate to
+        // HTTP 404.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (id, repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key, uploaded_by, is_deleted) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(f.repo_id)
+        .bind(&artifact_path)
+        .bind(product)
+        .bind(version)
+        .bind(42_i64)
+        .bind("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        .bind("application/x-xz")
+        .bind(&storage_key)
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert artifact row with no backing object");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/{}/images/{}/{}/{}",
+                f.repo_key, product, version, filename
+            ))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, _) = tdh::send(app, req).await;
+        assert!(
+            status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::NOT_FOUND,
+            "missing storage object must surface via get_stream error closure as 404 or 500, got {}",
+            status
+        );
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "must NOT return 200 when the storage object is absent"
+        );
+
+        f.teardown().await;
+    }
+
+    /// Drive a full chunked upload (POST start → PATCH chunk → PUT complete)
+    /// and confirm the assembled blob is downloadable via `get_stream`.
+    /// Exercises `complete_chunked_upload`'s new
+    /// `put_temp_file_to_storage` call site and temp-file cleanup.
+    #[tokio::test]
+    async fn chunked_upload_complete_then_download_roundtrip() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        let product = "alpine";
+        let version = "3.20";
+        let filename = "rootfs.squashfs";
+        let chunk_a = vec![0x11u8; 96 * 1024];
+        let chunk_b = vec![0x22u8; 96 * 1024];
+        let mut expected: Vec<u8> = Vec::with_capacity(chunk_a.len() + chunk_b.len());
+        expected.extend_from_slice(&chunk_a);
+        expected.extend_from_slice(&chunk_b);
+
+        // POST start
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/images/{}/{}/{}/uploads",
+                f.repo_key, product, version, filename
+            ))
+            .body(Body::from(chunk_a.clone()))
+            .expect("build POST start");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "POST start must be 202: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let start_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse start JSON");
+        let session_id: Uuid = start_json["session_id"]
+            .as_str()
+            .expect("session_id field")
+            .parse()
+            .expect("session_id is a UUID");
+
+        // PATCH chunk
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(chunk_b.clone()))
+            .expect("build PATCH chunk");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "PATCH chunk must be 202");
+
+        // PUT complete: this is where `put_temp_file_to_storage` runs and
+        // the temp file is removed.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build PUT complete");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "PUT complete must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Staging temp file MUST be gone after complete.
+        let temp_path = temp_upload_path(&session_id);
+        assert!(
+            !temp_path.exists(),
+            "staged temp file must be removed after complete_chunked_upload (path: {})",
+            temp_path.display()
+        );
+
+        // Download the assembled blob and confirm byte equality.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/{}/images/{}/{}/{}",
+                f.repo_key, product, version, filename
+            ))
+            .body(Body::empty())
+            .expect("build GET");
+        let resp = app.oneshot(req).await.expect("download oneshot");
+        assert_eq!(resp.status(), StatusCode::OK, "GET must succeed");
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("download body");
+        assert_eq!(
+            bytes.as_ref(),
+            expected.as_slice(),
+            "chunked upload must round-trip through put_stream/get_stream"
+        );
+
         f.teardown().await;
     }
 }
