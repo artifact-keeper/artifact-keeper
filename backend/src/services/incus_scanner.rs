@@ -466,6 +466,14 @@ impl IncusScanner {
     /// in-tree `var/run -> /run` (or any absolute link) cannot cause us to
     /// chmod a path outside the workspace — the property `chmod -R` cannot
     /// guarantee. Only owner bits are added; group/other are never widened.
+    ///
+    /// Unix-only: Windows has no POSIX permission bits and incus images are a
+    /// Linux concept, so the Windows lib build gets a no-op stub below (#1525)
+    /// to keep the crate cross-compiling cleanly for the Windows CLI target.
+    /// The Windows scanner code path is never reached in practice; the stub
+    /// just lets `extract_tarball_to_dir` stay platform-agnostic at the call
+    /// site.
+    #[cfg(unix)]
     fn make_tree_owner_traversable(root: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -520,6 +528,16 @@ impl IncusScanner {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Windows no-op stub for `make_tree_owner_traversable` (see #1525). Windows
+    /// has no POSIX mode bits, the incus scanner is never invoked on Windows in
+    /// practice, and the lib must still cross-compile cleanly for the Windows
+    /// CLI build. Returns `Ok(())` so the platform-agnostic call site at
+    /// `extract_tarball_to_dir` continues to work.
+    #[cfg(not(unix))]
+    fn make_tree_owner_traversable(_root: &Path) -> Result<()> {
         Ok(())
     }
 
