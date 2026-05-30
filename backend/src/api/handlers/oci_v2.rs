@@ -1365,6 +1365,51 @@ async fn cache_manifest_reference_locally(
     .await
     .map_err(|e| e.to_string())?;
 
+    // #1357 (review feedback): also write a parallel `oci_tags` row keyed by
+    // the human-readable tag (the original `reference`) when the caller pulled
+    // by tag, not digest. The docker-tag listing in
+    // `fetch_docker_tag_rows` filters out rows whose tag contains `:` (via
+    // `POSITION(':' IN t.tag) = 0`), so the digest-keyed row written above
+    // for remote repos is invisible to the UI. Without this second row the
+    // WebUI's Docker tag panel still says "No image tags found" even though
+    // the manifest is cached.
+    //
+    // For local repos `cached_reference == reference`, so this insert is a
+    // no-op upsert against the row written above. For remote repos pulled by
+    // digest (e.g. `docker pull redis@sha256:...`), there is no human-readable
+    // tag to record, so we skip the second insert.
+    if repo.repo_type == RepositoryType::Remote && !is_digest_reference(reference) {
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+                 manifest_digest = EXCLUDED.manifest_digest,
+                 manifest_content_type = EXCLUDED.manifest_content_type,
+                 updated_at = NOW()"#,
+        )
+        .bind(repo.id)
+        .bind(&repo.image)
+        .bind(reference)
+        .bind(&digest)
+        .bind(&manifest_content_type)
+        .execute(&state.db)
+        .await
+        {
+            // Best-effort: the digest-keyed oci_tags row above is already
+            // persisted, so the manifest still resolves by digest. Only the
+            // human-readable tag in the UI listing is degraded.
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                error = %e,
+                "Failed to upsert tag-keyed oci_tags row for proxied manifest; \
+                 the digest-keyed row is still persisted but the Docker tag UI \
+                 listing will not include this tag until the next proxy refresh"
+            );
+        }
+    }
+
     // #1357: mirror the push-path artifact row so proxied manifests surface
     // in the repository artifact listing and the WebUI's Docker tag grouping.
     //
@@ -1394,50 +1439,106 @@ async fn cache_manifest_reference_locally(
     // is what we have. The artifact row exists primarily to satisfy the
     // JOIN; downstream byte-accounting uses the oci_tags-driven sizing in
     // `list_artifacts_grouped_by_docker_tag`.
-    let artifact_path = format!("v2/{}/manifests/{}", repo.image, cached_reference);
-    let artifact_name = format!("{}:{}", repo.image, cached_reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
     let size_bytes = content.len() as i64;
 
-    if let Err(e) = sqlx::query(
-        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (repository_id, path) DO UPDATE SET
-             version = EXCLUDED.version,
-             size_bytes = EXCLUDED.size_bytes,
-             checksum_sha256 = EXCLUDED.checksum_sha256,
-             content_type = EXCLUDED.content_type,
-             storage_key = EXCLUDED.storage_key,
-             is_deleted = false,
-             updated_at = NOW()"#,
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .bind(&artifact_name)
-    .bind(Some(&cached_reference))
-    .bind(size_bytes)
-    .bind(checksum)
-    .bind(&manifest_content_type)
-    .bind(&manifest_key)
-    .execute(&state.db)
-    .await
+    // Write an artifacts row for every distinct oci_tags key that exists.
+    // For local repos or remote-by-digest, the digest-keyed and the
+    // "cached_reference" key are the same string, so this is a single row.
+    // For remote-by-tag, we write TWO artifacts rows -- one at the
+    // digest-keyed path (existing behaviour, satisfies the digest-keyed
+    // oci_tags row + GC + listing-by-digest), and one at the tag-keyed
+    // path so the docker-tag UI JOIN
+    //     a.path = 'v2/' || t.name || '/manifests/' || t.tag
+    // succeeds for the human-readable tag row that the
+    // `POSITION(':' IN t.tag) = 0` filter requires (#1357 review).
+    let mut artifact_paths: Vec<String> = Vec::with_capacity(2);
+    artifact_paths.push(format!("v2/{}/manifests/{}", repo.image, cached_reference));
+    if repo.repo_type == RepositoryType::Remote
+        && !is_digest_reference(reference)
+        && reference != cached_reference
     {
-        // Best-effort: the oci_tags row + manifest body are already
-        // persisted, so we never fail the user's pull just because the
-        // listing-index row could not be written. The tag still resolves
-        // through `oci_tags`; only the UI listing is degraded until the
-        // next proxy refresh.
-        tracing::warn!(
-            repo = %repo.key,
-            image = %repo.image,
-            reference = %reference,
-            artifact_path = %artifact_path,
-            error = %e,
-            "Failed to upsert artifacts row for proxied manifest; manifest \
-             body and oci_tags row are still persisted, but the repository \
-             artifact listing will not include this tag until the next \
-             proxy refresh succeeds"
-        );
+        artifact_paths.push(format!("v2/{}/manifests/{}", repo.image, reference));
+    }
+
+    for artifact_path in &artifact_paths {
+        // Use the path's tag segment for the version + name suffix so each
+        // row carries a stable identity matching its path; the digest-keyed
+        // row keeps the legacy shape and the tag-keyed row reads naturally.
+        let row_key = artifact_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(cached_reference.as_str());
+        let artifact_name = format!("{}:{}", repo.image, row_key);
+
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (repository_id, path) DO UPDATE SET
+                 version = EXCLUDED.version,
+                 size_bytes = EXCLUDED.size_bytes,
+                 checksum_sha256 = EXCLUDED.checksum_sha256,
+                 content_type = EXCLUDED.content_type,
+                 storage_key = EXCLUDED.storage_key,
+                 is_deleted = false,
+                 updated_at = NOW()"#,
+        )
+        .bind(repo.id)
+        .bind(artifact_path)
+        .bind(&artifact_name)
+        .bind(Some(row_key))
+        .bind(size_bytes)
+        .bind(checksum)
+        .bind(&manifest_content_type)
+        .bind(&manifest_key)
+        .execute(&state.db)
+        .await
+        {
+            // Best-effort: the oci_tags row + manifest body are already
+            // persisted, so we never fail the user's pull just because the
+            // listing-index row could not be written. The tag still resolves
+            // through `oci_tags`; only the UI listing is degraded until the
+            // next proxy refresh.
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                artifact_path = %artifact_path,
+                error = %e,
+                "Failed to upsert artifacts row for proxied manifest; manifest \
+                 body and oci_tags row are still persisted, but the repository \
+                 artifact listing will not include this tag until the next \
+                 proxy refresh succeeds"
+            );
+        }
+    }
+
+    // #1357 (review feedback): for multi-arch image-index manifests, record
+    // the (parent_digest -> child_digest) edges so:
+    //   1. The storage GC can protect per-architecture children for as long
+    //      as the index is still tagged (mirrors the push path #1179 guard).
+    //   2. The UI size accounting can walk the index children and report the
+    //      true multi-platform total, rather than just the index body size
+    //      (which is only a few KB for an image whose children sum to GBs).
+    //
+    // Best-effort, warn-on-error: matches the push-path semantics in
+    // `handle_put_manifest`. The manifest body and oci_tags rows are already
+    // persisted; failure here only affects GC/UI accounting until the
+    // startup backfill in main.rs runs again.
+    if is_index_content_type(&manifest_content_type) {
+        if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
+            tracing::warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                reference = %reference,
+                parent_digest = %digest,
+                error = %e,
+                "Failed to record oci_manifest_refs for proxied index manifest; \
+                 storage GC may treat child manifests as orphaned and the UI \
+                 size accounting will under-report multi-arch totals until the \
+                 next backfill pass runs"
+            );
+        }
     }
 
     Ok(digest)
@@ -7831,11 +7932,18 @@ mod proxy_manifest_artifact_indexing_tests {
             .await;
         let _ = std::fs::remove_dir_all(&storage_dir);
 
+        // Two rows: one keyed by digest path (digest-keyed oci_tags row),
+        // one keyed by tag path (tag-keyed oci_tags row, required so the
+        // `POSITION(':' IN t.tag) = 0` filter in the docker-tag listing
+        // returns the human-readable tag). Repeated calls must upsert
+        // BOTH rows via ON CONFLICT (repository_id, path), not duplicate
+        // them.
         assert_eq!(
-            count, 1,
+            count, 2,
             "repeated cache calls for the same (repo, image, tag) must \
-             upsert via ON CONFLICT (repository_id, path), not insert a \
-             second row"
+             upsert via ON CONFLICT (repository_id, path), not insert \
+             additional rows. Expected exactly 2 rows (digest-keyed + \
+             tag-keyed) after two calls."
         );
     }
 
@@ -7868,6 +7976,200 @@ mod proxy_manifest_artifact_indexing_tests {
              and the artifacts row points at that key; routing through the \
              proxy cache would put bytes under `proxy-cache/<repo>/...` on \
              the global backend and break the `storage_for_repo` read path."
+        );
+    }
+
+    /// End-to-end coverage for the headline #1357 UX fix. The earlier tests
+    /// pin that the `artifacts` row exists at the right path, but they do
+    /// NOT exercise the JOIN+`POSITION(':' IN t.tag) = 0` filter that
+    /// `fetch_docker_tag_rows` applies to the Docker tag listing. Pre-fix,
+    /// the only `oci_tags` row for a proxied tag was keyed by the digest
+    /// (`sha256:...`), which the filter strips out, and the UI still said
+    /// "No image tags found". This test reproduces the listing query and
+    /// asserts the human-readable tag is returned.
+    #[tokio::test]
+    #[ignore]
+    async fn cache_manifest_appears_in_docker_tag_listing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key.clone(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
+        );
+        let digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // Reproduce the exact JOIN+filter shape from
+        // `fetch_docker_tag_rows` (repositories.rs).  If the parallel
+        // tag-keyed oci_tags row + the artifacts row are both present,
+        // this query returns the human-readable tag.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT t.name, t.tag, t.manifest_digest
+             FROM oci_tags t
+             JOIN artifacts a
+               ON a.repository_id = t.repository_id
+              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+              AND a.is_deleted = false
+             WHERE t.repository_id = $1
+               AND POSITION(':' IN t.tag) = 0
+             ORDER BY t.name, t.tag
+             LIMIT 10",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("docker tag listing query");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            rows.iter()
+                .any(|(name, tag, md)| name == image && tag == "latest" && md == &digest),
+            "docker tag listing must include the human-readable 'latest' tag \
+             for a proxied manifest (#1357). The POSITION(':' IN t.tag) = 0 \
+             filter strips digest-keyed oci_tags rows, so a parallel \
+             tag-keyed row is required. Got rows: {:?}",
+            rows
+        );
+    }
+
+    /// For multi-arch image-index manifests the proxy path must also
+    /// populate `oci_manifest_refs`, mirroring the push-path behaviour in
+    /// `handle_put_manifest`. Without these rows the storage GC over-
+    /// deletes per-architecture child manifests and the UI's multi-arch
+    /// size accounting under-reports by orders of magnitude (#1357 review).
+    #[tokio::test]
+    #[ignore]
+    async fn cache_manifest_records_refs_for_index_manifest() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/redis";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // OCI image index with two child manifests (amd64, arm64).
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":100,"platform":{"architecture":"amd64","os":"linux"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":200,"platform":{"architecture":"arm64","os":"linux"}}]}"#,
+        );
+        let parent_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.index.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT parent_digest, child_digest
+             FROM oci_manifest_refs
+             WHERE repository_id = $1 AND parent_digest = $2
+             ORDER BY child_digest",
+        )
+        .bind(repo_id)
+        .bind(&parent_digest)
+        .fetch_all(&pool)
+        .await
+        .expect("query oci_manifest_refs");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs.len(),
+            2,
+            "cache_manifest_reference_locally must record one \
+             oci_manifest_refs row per child digest for image-index \
+             manifests, mirroring the push-path #1179 behaviour. Got: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().all(|(p, _)| p == &parent_digest),
+            "all rows must point at the index digest as parent"
+        );
+        assert!(
+            refs.iter().any(|(_, c)| c
+                == "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+            "amd64 child digest must be recorded"
+        );
+        assert!(
+            refs.iter().any(|(_, c)| c
+                == "sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+            "arm64 child digest must be recorded"
         );
     }
 }
