@@ -21,9 +21,9 @@
 //!   GET    /uploads/{uuid}                     - Check upload progress
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::Extension;
@@ -223,15 +223,20 @@ pub(crate) fn simplestreams_item_key(ftype: &str) -> &str {
 }
 
 /// Build the download URL for an image in the SimpleStreams catalog.
+///
+/// `prefix` is the mount prefix the request came in on (`/incus` or `/lxc`),
+/// so the emitted URL matches the request prefix (#1320). Callers should
+/// derive the prefix from `OriginalUri` via [`mount_prefix_from_uri`].
 pub(crate) fn build_download_url(
+    prefix: &str,
     repo_key: &str,
     product: &str,
     version: &str,
     filename: &str,
 ) -> String {
     format!(
-        "/incus/{}/images/{}/{}/{}",
-        repo_key, product, version, filename
+        "{}/{}/images/{}/{}/{}",
+        prefix, repo_key, product, version, filename
     )
 }
 
@@ -276,8 +281,31 @@ pub(crate) fn filename_from_path(path: &str) -> &str {
 }
 
 /// Build the Location header for chunked upload responses.
-pub(crate) fn build_upload_location(repo_key: &str, session_id: &Uuid) -> String {
-    format!("/incus/{}/uploads/{}", repo_key, session_id)
+///
+/// `prefix` is the mount prefix the request came in on (`/incus` or `/lxc`),
+/// so the emitted Location header matches the request prefix (#1320).
+pub(crate) fn build_upload_location(prefix: &str, repo_key: &str, session_id: &Uuid) -> String {
+    format!("{}/{}/uploads/{}", prefix, repo_key, session_id)
+}
+
+/// Determine the mount prefix from the request URI.
+///
+/// The Incus handler is mounted under both `/incus` and `/lxc` (see
+/// `backend/src/api/routes.rs`). URL builders need to emit the same prefix
+/// the client used so SimpleStreams catalog paths and chunked-upload
+/// `Location` headers don't cross prefixes (#1320).
+///
+/// Returns `"/lxc"` if the request path begins with `/lxc/` or is exactly
+/// `/lxc`; otherwise falls back to `"/incus"`. The fallback covers requests
+/// that arrive with a stripped path (e.g. behind a reverse proxy that
+/// rewrites the prefix) and preserves the historical default.
+pub(crate) fn mount_prefix_from_uri(uri: &Uri) -> &'static str {
+    let path = uri.path();
+    if path == "/lxc" || path.starts_with("/lxc/") {
+        "/lxc"
+    } else {
+        "/incus"
+    }
 }
 
 /// Build the SimpleStreams index JSON structure.
@@ -449,9 +477,11 @@ async fn streams_index(
 
 async fn streams_images(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath(repo_key): AxumPath<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     let rows = sqlx::query(
         r#"
@@ -491,7 +521,7 @@ async fn streams_images(
 
         let filename = filename_from_path(&path);
         let ftype = simplestreams_ftype(filename);
-        let download_url = build_download_url(&repo_key, &name, &version, filename);
+        let download_url = build_download_url(prefix, &repo_key, &name, &version, filename);
 
         let item = serde_json::json!({
             "ftype": ftype,
@@ -792,12 +822,14 @@ struct UploadSession {
 async fn start_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -854,7 +886,10 @@ async fn start_chunked_upload(
 
     Ok(Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header("Location", build_upload_location(&repo_key, &session_id))
+        .header(
+            "Location",
+            build_upload_location(prefix, &repo_key, &session_id),
+        )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", initial_bytes))
         .header(CONTENT_TYPE, "application/json")
@@ -875,6 +910,7 @@ async fn start_chunked_upload(
 async fn upload_chunk(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
     body: Body,
 ) -> Result<Response, Response> {
@@ -882,6 +918,7 @@ async fn upload_chunk(
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
     let session = get_session(&state.db, session_id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
+    let prefix = mount_prefix_from_uri(&original_uri);
 
     // Append body to temp file (no read-back of existing data)
     let bytes_written = append_body_to_file(body, &temp_path).await?;
@@ -906,7 +943,10 @@ async fn upload_chunk(
 
     Ok(Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header("Location", build_upload_location(&repo_key, &session_id))
+        .header(
+            "Location",
+            build_upload_location(prefix, &repo_key, &session_id),
+        )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", new_total))
         .body(Body::empty())
@@ -1385,7 +1425,13 @@ mod tests {
     #[test]
     fn test_build_download_url() {
         assert_eq!(
-            build_download_url("my-repo", "ubuntu-noble", "20240215", "incus.tar.xz"),
+            build_download_url(
+                "/incus",
+                "my-repo",
+                "ubuntu-noble",
+                "20240215",
+                "incus.tar.xz"
+            ),
             "/incus/my-repo/images/ubuntu-noble/20240215/incus.tar.xz"
         );
     }
@@ -1393,9 +1439,39 @@ mod tests {
     #[test]
     fn test_build_download_url_with_squashfs() {
         assert_eq!(
-            build_download_url("repo", "alpine", "v3.19", "rootfs.squashfs"),
+            build_download_url("/incus", "repo", "alpine", "v3.19", "rootfs.squashfs"),
             "/incus/repo/images/alpine/v3.19/rootfs.squashfs"
         );
+    }
+
+    /// #1320: when the request arrives via `/lxc/...`, the download URL emitted
+    /// in the SimpleStreams catalog must use the `/lxc` prefix, not `/incus`.
+    #[test]
+    fn test_build_download_url_with_lxc_prefix() {
+        assert_eq!(
+            build_download_url(
+                "/lxc",
+                "my-repo",
+                "ubuntu-noble",
+                "20240215",
+                "incus.tar.xz"
+            ),
+            "/lxc/my-repo/images/ubuntu-noble/20240215/incus.tar.xz"
+        );
+    }
+
+    /// #1320: `build_download_url` must not contain the literal `/incus/` when
+    /// invoked with the `/lxc` prefix. Pins prefix-independence at the
+    /// function level so a future refactor that re-hardcodes the prefix
+    /// fails loudly.
+    #[test]
+    fn test_build_download_url_does_not_leak_incus_under_lxc() {
+        let url = build_download_url("/lxc", "repo", "alpine", "v3.19", "rootfs.squashfs");
+        assert!(
+            !url.starts_with("/incus/"),
+            "/lxc request emitted /incus URL: {url}"
+        );
+        assert!(url.starts_with("/lxc/"), "expected /lxc prefix: {url}");
     }
 
     // -----------------------------------------------------------------------
@@ -1557,8 +1633,77 @@ mod tests {
     fn test_build_upload_location() {
         let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
-            build_upload_location("my-repo", &session_id),
+            build_upload_location("/incus", "my-repo", &session_id),
             "/incus/my-repo/uploads/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// #1320: chunked upload `Location` header must use the `/lxc` prefix
+    /// when the request came in via `/lxc/...`.
+    #[test]
+    fn test_build_upload_location_with_lxc_prefix() {
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            build_upload_location("/lxc", "my-repo", &session_id),
+            "/lxc/my-repo/uploads/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// #1320: `mount_prefix_from_uri` maps each known request prefix back to
+    /// the matching mount path, and falls back to `/incus` for anything
+    /// unrecognized (preserves the historical default).
+    #[test]
+    fn test_mount_prefix_from_uri_incus() {
+        let uri: Uri = "/incus/my-repo/streams/v1/images.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_lxc() {
+        let uri: Uri = "/lxc/my-repo/streams/v1/images.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/lxc");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_lxc_exact_root() {
+        // Defensive: the exact path `/lxc` (no trailing slash) is still /lxc.
+        let uri: Uri = "/lxc".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/lxc");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_does_not_match_substrings() {
+        // Defensive: a path that merely contains `lxc` somewhere else (e.g.
+        // a repo key) must not be misread as the /lxc mount.
+        let uri: Uri = "/incus/lxc-images/streams/v1/index.json".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    #[test]
+    fn test_mount_prefix_from_uri_unknown_falls_back_to_incus() {
+        let uri: Uri = "/some/other/path".parse().unwrap();
+        assert_eq!(mount_prefix_from_uri(&uri), "/incus");
+    }
+
+    /// #1320: combined check -- if the request arrives under `/lxc/`, both the
+    /// download URL and the upload Location must consistently use `/lxc`,
+    /// never `/incus`.
+    #[test]
+    fn test_url_builders_prefix_consistent_for_lxc_request() {
+        let uri: Uri = "/lxc/my-repo/streams/v1/images.json".parse().unwrap();
+        let prefix = mount_prefix_from_uri(&uri);
+        let dl = build_download_url(prefix, "my-repo", "ubuntu", "20240215", "incus.tar.xz");
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let loc = build_upload_location(prefix, "my-repo", &session_id);
+        assert!(dl.starts_with("/lxc/"), "download URL not under /lxc: {dl}");
+        assert!(
+            loc.starts_with("/lxc/"),
+            "upload Location not under /lxc: {loc}"
+        );
+        assert!(!dl.contains("/incus/"), "download URL leaks /incus: {dl}");
+        assert!(
+            !loc.contains("/incus/"),
+            "upload Location leaks /incus: {loc}"
         );
     }
 
@@ -1959,7 +2104,7 @@ mod tests {
         let version = "20240215";
         let filename = "incus.tar.xz";
         let artifact_path = build_artifact_path(product, version, filename);
-        let download_url = build_download_url("my-repo", product, version, filename);
+        let download_url = build_download_url("/incus", "my-repo", product, version, filename);
 
         assert_eq!(artifact_path, "ubuntu-noble/20240215/incus.tar.xz");
         assert!(download_url.ends_with(&artifact_path));

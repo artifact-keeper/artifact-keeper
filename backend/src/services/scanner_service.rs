@@ -3167,6 +3167,12 @@ impl ScannerService {
         // Get or create the DT project. #1276: project name = artifact name,
         // version = artifact version, description carries the source repo
         // label so the DT UI shows where the artifact came from.
+        //
+        // #1472: log at `error!` (not `warn!`) and forward the full
+        // AppError message so the operator sees the upstream HTTP status,
+        // the endpoint URL, the DT response body, and (on 401/403) the
+        // required DT team permissions. Without this, the operator sees a
+        // fully green scan even when DT silently rejects every upload.
         let dt_project = match dt
             .get_or_create_project(
                 project_name,
@@ -3177,10 +3183,11 @@ impl ScannerService {
         {
             Ok(p) => p,
             Err(e) => {
-                warn!(
+                error!(
                     artifact_id = %artifact.id,
+                    project_name = %project_name,
                     error = %e,
-                    "Failed to get or create Dependency-Track project"
+                    "Dependency-Track project provisioning failed -- SBOM will NOT be uploaded for this artifact"
                 );
                 return;
             }
@@ -3198,10 +3205,16 @@ impl ScannerService {
                 );
             }
             Err(e) => {
-                warn!(
+                // #1472: error! (not warn!) so this isn't lost in a noisy log
+                // pipeline; the AppError message already carries the endpoint,
+                // upstream status, response body, and permissions hint on
+                // 401/403 (see `dt_upstream_status_err`).
+                error!(
                     artifact_id = %artifact.id,
+                    dt_project_uuid = %dt_project.uuid,
+                    dt_project_name = %dt_project.name,
                     error = %e,
-                    "Failed to upload SBOM to Dependency-Track"
+                    "Dependency-Track SBOM upload failed -- vulnerability correlation will be stale for this artifact"
                 );
             }
         }
