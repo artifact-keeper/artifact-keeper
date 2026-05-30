@@ -1442,6 +1442,37 @@ async fn try_upstream_fetch_with_accept(
     .ok()
 }
 
+/// Canonical set of manifest media types we always advertise to an OCI
+/// upstream when proxying a manifest fetch.
+///
+/// Required for ghcr.io interop (#1360): GitHub Container Registry returns
+/// `404 not found` for `/v2/<image>/manifests/<ref>` when the request's
+/// `Accept` header does not list a media type the stored manifest matches.
+/// Stricter than Docker Hub and Quay, which fall back to a default Docker
+/// manifest representation when `Accept` is missing or restrictive. Older
+/// docker engines, podman, skopeo, buildah, and curl-driven clients all
+/// send narrower (or no) `Accept` headers; without supplementing them the
+/// proxy surfaces a spurious 404 to the user even though the manifest
+/// exists upstream.
+///
+/// Mirrors the Docker engine 24.x default Accept set plus the OCI image
+/// manifest and index types, which together cover every manifest shape an
+/// OCI Distribution v1.1 registry can serve.
+const OCI_MANIFEST_ACCEPT_TYPES: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v1+prettyjws",
+    "application/vnd.docker.distribution.manifest.v1+json",
+];
+
+/// Pre-rendered comma-joined value of [`OCI_MANIFEST_ACCEPT_TYPES`] used
+/// when the client supplied no `Accept` header at all.
+fn canonical_manifest_accept() -> String {
+    OCI_MANIFEST_ACCEPT_TYPES.join(", ")
+}
+
 /// Extract a sanitised `Accept` header value suitable for forwarding to an
 /// upstream OCI registry.
 ///
@@ -1455,6 +1486,60 @@ fn forwarded_accept_header(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Build the `Accept` header value to send upstream for a manifest fetch.
+///
+/// Combines whatever the client sent with the canonical set of OCI/Docker
+/// manifest media types so registries like ghcr.io (which refuse to serve
+/// a manifest when the request's `Accept` does not list a media type they
+/// can match) always receive a workable header (#1360).
+///
+/// Rules:
+/// * If the client sent no `Accept`, return the canonical list.
+/// * If the client sent an `Accept` that already covers every canonical
+///   media type, pass it through unchanged so we do not gratuitously
+///   reorder a value the client carefully constructed.
+/// * Otherwise, append every missing canonical media type to the end of
+///   the client's value, preserving the client's preferred order at the
+///   front so q-values and primary preferences still win on the upstream
+///   side.
+///
+/// The returned value is always non-empty.
+fn manifest_accept_for_upstream(client_accept: Option<&str>) -> String {
+    let trimmed = client_accept.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        return canonical_manifest_accept();
+    }
+
+    // Build a lowercase token set from the client's Accept so we can
+    // detect which canonical media types are already covered. Strip the
+    // `;q=...` parameters and whitespace; comparison is case-insensitive
+    // because RFC 7231 media types are case-insensitive.
+    let existing: std::collections::HashSet<String> = trimmed
+        .split(',')
+        .map(|part| {
+            part.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    for ct in OCI_MANIFEST_ACCEPT_TYPES {
+        if !existing.contains(&ct.to_ascii_lowercase()) {
+            missing.push(ct);
+        }
+    }
+
+    if missing.is_empty() {
+        return trimmed.to_string();
+    }
+
+    format!("{}, {}", trimmed, missing.join(", "))
 }
 
 /// Build an OCI registry response from proxied upstream content.
@@ -2519,12 +2604,16 @@ async fn handle_head_manifest(
 
     // For remote repos, try fetching manifest from upstream. Forward the
     // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.).
-    let accept = forwarded_accept_header(headers);
+    // representation the client can actually consume (#586 cont.). Always
+    // supplement it with the canonical OCI/Docker manifest media-type set
+    // so registries like ghcr.io (which return 404 when `Accept` does not
+    // list a media type the stored manifest matches) still serve the
+    // request even when the original client sent a sparse Accept (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
     if repo.repo_type == RepositoryType::Virtual {
         if let Some((manifest_digest, content_type, data)) =
-            resolve_virtual_manifest(state, repo.id, &repo.image, reference, accept.as_deref())
-                .await
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
         {
             return build_oci_proxy_response(
                 &data,
@@ -2540,7 +2629,7 @@ async fn handle_head_manifest(
         &repo,
         state,
         &format!("manifests/{}", reference),
-        accept.as_deref(),
+        Some(&accept),
     )
     .await
     {
@@ -2648,12 +2737,16 @@ async fn handle_get_manifest(
 
     // For remote repos, try fetching manifest from upstream. Forward the
     // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.).
-    let accept = forwarded_accept_header(headers);
+    // representation the client can actually consume (#586 cont.). Always
+    // supplement it with the canonical OCI/Docker manifest media-type set
+    // so registries like ghcr.io (which return 404 when `Accept` does not
+    // list a media type the stored manifest matches) still serve the
+    // request even when the original client sent a sparse Accept (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
     if repo.repo_type == RepositoryType::Virtual {
         if let Some((manifest_digest, content_type, data)) =
-            resolve_virtual_manifest(state, repo.id, &repo.image, reference, accept.as_deref())
-                .await
+            resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
         {
             return build_oci_proxy_response(
                 &data,
@@ -2669,7 +2762,7 @@ async fn handle_get_manifest(
         &repo,
         state,
         &format!("manifests/{}", reference),
-        accept.as_deref(),
+        Some(&accept),
     )
     .await
     {
@@ -3937,6 +4030,121 @@ mod tests {
             headers.insert(axum::http::header::ACCEPT, val);
             assert_eq!(forwarded_accept_header(&headers), None);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // manifest_accept_for_upstream: canonical Accept supplementing.
+    //
+    // Regression coverage for #1360. ghcr.io returns 404 when the request's
+    // `Accept` does not list a media type that matches the stored manifest,
+    // so the proxy must always advertise the full OCI/Docker manifest
+    // media-type set on manifest fetches even if the original client sent
+    // a narrow or empty `Accept`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_accept_none_returns_canonical_set() {
+        let value = manifest_accept_for_upstream(None);
+        // All six canonical media types must appear.
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(
+                value.contains(ct),
+                "missing canonical media type {} in {}",
+                ct,
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_accept_empty_string_returns_canonical_set() {
+        let value = manifest_accept_for_upstream(Some(""));
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(value.contains(ct), "missing {} in {}", ct, value);
+        }
+        // Whitespace-only Accept must be treated the same.
+        let value = manifest_accept_for_upstream(Some("   "));
+        for ct in OCI_MANIFEST_ACCEPT_TYPES {
+            assert!(value.contains(ct), "missing {} in {}", ct, value);
+        }
+    }
+
+    #[test]
+    fn test_manifest_accept_passthrough_when_already_complete() {
+        // Modern docker engine sends exactly the canonical set; we should
+        // not gratuitously rewrite the value, only supplement when needed.
+        let docker_default = "application/vnd.docker.distribution.manifest.v2+json, \
+                              application/vnd.docker.distribution.manifest.list.v2+json, \
+                              application/vnd.oci.image.index.v1+json, \
+                              application/vnd.oci.image.manifest.v1+json, \
+                              application/vnd.docker.distribution.manifest.v1+prettyjws, \
+                              application/vnd.docker.distribution.manifest.v1+json";
+        let value = manifest_accept_for_upstream(Some(docker_default));
+        assert_eq!(value, docker_default);
+    }
+
+    #[test]
+    fn test_manifest_accept_supplements_sparse_client_value() {
+        // Older docker / curl-style clients often send just one media type
+        // (or only the Docker v2 types and not the OCI types). #1360 fails
+        // specifically because ghcr.io stores OCI image indexes and the
+        // sparse Accept never matches. We must append the missing
+        // canonical types while keeping the client's preferred ordering
+        // at the front so any q-values still bias the upstream pick.
+        let sparse = "application/vnd.docker.distribution.manifest.v2+json";
+        let value = manifest_accept_for_upstream(Some(sparse));
+        assert!(
+            value.starts_with(sparse),
+            "client preferred order must come first, got: {}",
+            value
+        );
+        assert!(
+            value.contains("application/vnd.oci.image.manifest.v1+json"),
+            "must append OCI manifest type for ghcr.io interop, got: {}",
+            value
+        );
+        assert!(
+            value.contains("application/vnd.oci.image.index.v1+json"),
+            "must append OCI image index type for ghcr.io interop, got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_manifest_accept_case_insensitive_dedup() {
+        // RFC 7231 media types are case-insensitive. If the client sends a
+        // canonical type with different casing, we should not duplicate it.
+        let client = "Application/Vnd.Oci.Image.Manifest.V1+JSON";
+        let value = manifest_accept_for_upstream(Some(client));
+        let lower = value.to_ascii_lowercase();
+        let occurrences = lower
+            .matches("application/vnd.oci.image.manifest.v1+json")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "case-insensitive dedup expected, got value: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_manifest_accept_ignores_q_value_parameters() {
+        // Clients commonly attach `;q=0.9` to media types. Dedup must
+        // strip the params before comparing so we do not append a
+        // redundant copy.
+        let client = "application/vnd.oci.image.manifest.v1+json;q=0.9";
+        let value = manifest_accept_for_upstream(Some(client));
+        let lower = value.to_ascii_lowercase();
+        let occurrences = lower
+            .matches("application/vnd.oci.image.manifest.v1+json")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "q-value-parameterised type should be deduped, got: {}",
+            value
+        );
+        // OCI image index was missing so it must be appended.
+        assert!(value.contains("application/vnd.oci.image.index.v1+json"));
     }
 
     // -----------------------------------------------------------------------

@@ -5474,6 +5474,188 @@ SHA256:
         assert_eq!(&body[..], b"blob-bytes");
     }
 
+    // -----------------------------------------------------------------------
+    // #1360: ghcr.io manifest pull. GitHub Container Registry returns 404
+    // when the request's `Accept` header does not list a media type that
+    // matches the stored manifest. The OCI handler's
+    // `manifest_accept_for_upstream` helper supplements the client's
+    // Accept with the canonical OCI/Docker manifest media-type set so
+    // these strict upstreams still serve the request. This test pins the
+    // wire-level contract: a wiremock upstream that only responds 200
+    // when the request's Accept contains the OCI image-index media type
+    // must succeed when the proxy is given the supplemented Accept value.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_manifest_with_canonical_accept_succeeds_against_strict_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        // Strict ghcr-shaped upstream: respond 200 only when the request
+        // carries the OCI image-index media type in Accept; otherwise the
+        // wiremock default (404) fires, matching the user's reproducer
+        // for `gurucomputing/headscale-ui:2026.03.17`.
+        let manifest_body =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        Mock::given(method("GET"))
+            .and(path("/v2/gurucomputing/headscale-ui/manifests/2026.03.17"))
+            .and(AcceptHeaderContains {
+                expected_substring: "application/vnd.oci.image.index.v1+json",
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.index.v1+json")
+                    .set_body_bytes(manifest_body.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ghcr-1360-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "remote-container-ghcr".to_string(),
+            name: "remote-container-ghcr".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // The canonical Accept value that the OCI manifest handler now
+        // always sends. Contains the OCI image-index media type that the
+        // strict upstream requires; older docker engines that only sent
+        // the Docker manifest types would fail this match before #1360.
+        let canonical_accept = "application/vnd.docker.distribution.manifest.v2+json, \
+                                application/vnd.docker.distribution.manifest.list.v2+json, \
+                                application/vnd.oci.image.index.v1+json, \
+                                application/vnd.oci.image.manifest.v1+json";
+
+        let result = proxy
+            .fetch_artifact_with_accept(
+                &repo,
+                "v2/gurucomputing/headscale-ui/manifests/2026.03.17",
+                Some(canonical_accept),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (body, ct) = result.expect(
+            "ghcr-shaped upstream must succeed when proxy advertises the \
+             canonical OCI Accept header set on manifest fetches (#1360)",
+        );
+        assert_eq!(&body[..], manifest_body.as_ref());
+        assert_eq!(
+            ct.as_deref(),
+            Some("application/vnd.oci.image.index.v1+json"),
+        );
+    }
+
+    /// Companion: the same strict upstream MUST 404 when the proxy sends
+    /// only the Docker manifest media types (the pre-#1360 behaviour for
+    /// older Docker clients). This pins the test fixture itself: if a
+    /// future change makes the wiremock match too lax (e.g. matches on
+    /// the absence of Accept) the regression value of the test above
+    /// collapses.
+    #[tokio::test]
+    async fn test_strict_upstream_rejects_sparse_accept_header() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/gurucomputing/headscale-ui/manifests/2026.03.17"))
+            .and(AcceptHeaderContains {
+                expected_substring: "application/vnd.oci.image.index.v1+json",
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ghcr-1360-neg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "remote-container-ghcr".to_string(),
+            name: "remote-container-ghcr".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Sparse pre-#1360 Accept: only docker media types, no OCI ones.
+        let sparse = "application/vnd.docker.distribution.manifest.v2+json";
+
+        let result = proxy
+            .fetch_artifact_with_accept(
+                &repo,
+                "v2/gurucomputing/headscale-ui/manifests/2026.03.17",
+                Some(sparse),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // The strict upstream must reject this request (default 404), so
+        // the proxy surfaces NotFound. This confirms the wiremock fixture
+        // actually discriminates on the OCI Accept content.
+        match result {
+            Err(crate::error::AppError::NotFound(_)) => {}
+            other => panic!(
+                "expected NotFound from strict upstream when proxy sends \
+                 only Docker manifest media types in Accept, got: {:?}",
+                other
+            ),
+        }
+    }
+
     /// #1445 (A): the buffered proxy fetch path MUST persist the
     /// upstream bytes AND make them visible to the next request through
     /// the same proxy_service. The reproducer "cached artifacts should
