@@ -785,17 +785,28 @@ async fn delete_image(
 // Chunked / resumable upload endpoints
 // ===========================================================================
 
-/// Look up an upload session by UUID.
-async fn get_session(db: &PgPool, session_id: Uuid) -> Result<UploadSession, Response> {
+/// Look up an upload session by UUID, scoped to a specific repository.
+///
+/// Issue #1317: chunked-upload session lookups must bind the URL's `repo_key`
+/// against `session.repository_id` so that a session created in repo A cannot
+/// be driven (chunked/finalized/cancelled) via repo B's URL. Returning the
+/// same 404 shape for "session does not exist" and "session does not belong
+/// to this repo" avoids leaking session existence across repos.
+async fn get_session(
+    db: &PgPool,
+    session_id: Uuid,
+    repo_id: Uuid,
+) -> Result<UploadSession, Response> {
     sqlx::query_as::<_, UploadSession>(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
                filename, bytes_received, storage_temp_path
         FROM incus_upload_sessions
-        WHERE id = $1
+        WHERE id = $1 AND repository_id = $2
         "#,
     )
     .bind(session_id)
+    .bind(repo_id)
     .fetch_optional(db)
     .await
     .map_err(db_err)?
@@ -916,7 +927,10 @@ async fn upload_chunk(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be driven via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
     let prefix = mount_prefix_from_uri(&original_uri);
 
@@ -966,8 +980,10 @@ async fn complete_chunked_upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
-    let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be finalized via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
     // Append any final body data
@@ -1063,11 +1079,14 @@ async fn complete_chunked_upload(
 async fn cancel_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so a session
+    // created in repo A cannot be cancelled via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     // Delete temp file
     let _ = tokio::fs::remove_file(&session.storage_temp_path).await;
@@ -1093,9 +1112,12 @@ async fn cancel_chunked_upload(
 
 async fn get_upload_progress(
     State(state): State<SharedState>,
-    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
-    let session = get_session(&state.db, session_id).await?;
+    // Issue #1317: scope the session lookup to the URL repo so progress for
+    // a session in repo A cannot be probed via repo B's URL.
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let session = get_session(&state.db, session_id, repo.id).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2191,5 +2213,261 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+}
+
+// ===========================================================================
+// Issue #1317 regression coverage (lib-side, picked up by the Coverage gate).
+//
+// The corresponding integration suite lives in
+// `backend/tests/incus_upload_tests.rs` and is also wired into the CI
+// integration matrix. These lib-side tests are intentionally redundant so
+// that `cargo llvm-cov --workspace --lib` instruments the cross-repo session
+// rejection branch in `upload_chunk`, `complete_chunked_upload`,
+// `cancel_chunked_upload`, and `get_upload_progress`. Without them the new
+// 404-on-cross-repo lines would appear uncovered to the coverage gate
+// (`--lib` excludes the `tests/` directory).
+//
+// Tests skip when `DATABASE_URL` is unset (matches the rest of the
+// `tdh::`-style suites).
+// ===========================================================================
+
+#[cfg(test)]
+mod cross_repo_session_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Insert a second Incus repository under the same fixture pool and
+    /// return its key. Used to drive cross-repo PATCH/PUT/DELETE/GET against
+    /// a session owned by the fixture's primary repo.
+    async fn create_second_incus_repo(pool: &PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-incus-b-{}", id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local'::repository_type, 'incus'::repository_format)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("create second repo");
+        (id, key)
+    }
+
+    /// POST start a chunked upload under the fixture's primary repo and
+    /// return the session UUID. Asserts a 202 response.
+    async fn start_session(f: &tdh::Fixture) -> Uuid {
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/images/alpine/3.20/rootfs.tar.gz/uploads",
+                f.repo_key
+            ))
+            .body(Body::from(b"initial-bytes".to_vec()))
+            .expect("build POST request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "POST start under owning repo should be 202: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON body");
+        let session_id_str = json["session_id"].as_str().expect("session_id field");
+        session_id_str.parse().expect("session_id is a UUID")
+    }
+
+    async fn cleanup_second_repo(pool: &PgPool, repo_b_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE repository_id = $1")
+            .bind(repo_b_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// PATCH chunk under repo B must be rejected with 404 even though the
+    /// session exists in repo A (issue #1317). The same-repo PATCH must
+    /// continue to succeed so we cover both branches of the new
+    /// `get_session(... repo_id ...)` lookup.
+    #[tokio::test]
+    async fn upload_chunk_cross_repo_rejected_and_same_repo_ok() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        // Cross-repo PATCH: must be 404 (does NOT touch the session row).
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::from(b"attacker-chunk".to_vec()))
+            .expect("build PATCH request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "PATCH chunk under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Same-repo PATCH: covers the happy-path branch of the new lookup.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(b"legitimate-chunk".to_vec()))
+            .expect("build PATCH request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "PATCH chunk under owning repo should still be 202"
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// PUT complete under repo B must be 404; the legitimate session in
+    /// repo A must remain intact so subsequent operations under repo A keep
+    /// working.
+    #[tokio::test]
+    async fn complete_chunked_upload_cross_repo_rejected() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build PUT request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "PUT complete under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Session row must still be there (cross-repo PUT must NOT have
+        // deleted or finalized it).
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count sessions");
+        assert_eq!(still_there, 1, "cross-repo PUT must not delete session");
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// DELETE cancel under repo B must be 404 and must NOT remove the
+    /// session row owned by repo A.
+    #[tokio::test]
+    async fn cancel_chunked_upload_cross_repo_rejected() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build DELETE request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "DELETE cancel under wrong repo must be 404 (issue #1317)"
+        );
+
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count sessions");
+        assert_eq!(
+            still_there, 1,
+            "cross-repo DELETE must not remove legitimate session"
+        );
+
+        // Legitimate DELETE under owning repo still works (covers
+        // happy-path branch of `cancel_chunked_upload`'s session lookup).
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "DELETE under owning repo should succeed"
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
+    }
+
+    /// GET progress under repo B must be 404; under repo A it must return
+    /// 200 with the expected JSON shape (covers both branches of the
+    /// session lookup in `get_upload_progress`).
+    #[tokio::test]
+    async fn get_upload_progress_cross_repo_rejected_and_same_repo_ok() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (repo_b_id, key_b) = create_second_incus_repo(&f.pool).await;
+        let session_id = start_session(&f).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/uploads/{}", key_b, session_id))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET progress under wrong repo must be 404 (issue #1317)"
+        );
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET progress under owning repo should be 200: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_second_repo(&f.pool, repo_b_id).await;
+        f.teardown().await;
     }
 }
