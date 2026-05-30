@@ -50,6 +50,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
+        # Cap parallel rustc invocations so the lib-test compile doesn't OOM
+        # the ARC runner pod ("sccache: Compile terminated by signal 9", #1515).
+        # 4 is conservative for the runner's memory budget while still keeping
+        # the step under the Tier-1 < 5min target.
+        env:
+          CARGO_BUILD_JOBS: "4"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test-backend-unit:
