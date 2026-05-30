@@ -100,10 +100,21 @@ pub struct DependencyTrackConfig {
 }
 
 impl DependencyTrackConfig {
-    /// Load configuration from environment variables
+    /// Load configuration from environment variables.
+    ///
+    /// Returns `None` when `DEPENDENCY_TRACK_ENABLED` is anything other than
+    /// `true`/`1` (case-insensitive, leading/trailing whitespace ignored).
+    /// When disabled, no other env vars are read and no client is built;
+    /// `main.rs` therefore wires no DT service into application state, the
+    /// health monitor skips its probe (see `health_monitor_service.rs`),
+    /// and the system-config endpoint reports DT as disabled. This is the
+    /// canonical kill-switch for the integration (issues #1395, #1480).
     pub fn from_env() -> Option<Self> {
         let enabled = std::env::var("DEPENDENCY_TRACK_ENABLED")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
             .unwrap_or(false);
 
         if !enabled {
