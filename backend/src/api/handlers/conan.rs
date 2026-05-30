@@ -21,7 +21,7 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -36,6 +36,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -311,28 +312,56 @@ async fn users_authenticate(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, Response> {
     // Validate repo exists and is conan format
     let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
-    // Authenticate user via Basic auth
-    let _user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Authenticate user via Basic auth (middleware has already resolved the
+    // credential into an AuthExtension).
+    let user_id = require_auth_basic(auth, "conan")?.user_id;
 
-    // Return a simple token (the Conan client expects a token string in the body).
-    // In a production system this would be a proper JWT; for now we echo back the
-    // Basic auth value so the client can keep using it.
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .unwrap_or("")
-        .to_string();
+    // Issue a real JWT access token. The Conan client stores the body of this
+    // response and sends it back as `Authorization: Bearer <token>` on later
+    // requests (e.g. check_credentials, uploads). Echoing the base64 Basic
+    // value here (issue #1433) produced a string the Bearer/JWT validator in
+    // the auth middleware rejected, so every privileged action returned 401.
+    // A signed JWT is accepted by `validate_access_token_async`, which is the
+    // first thing the Bearer path tries.
+    let user = sqlx::query_as!(
+        crate::models::user::User,
+        r#"SELECT id, username, email, password_hash, display_name,
+           auth_provider as "auth_provider: crate::models::user::AuthProvider",
+           external_id, is_admin, is_active, is_service_account, must_change_password,
+           totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+           failed_login_attempts, locked_until, last_failed_login_at,
+           password_changed_at, last_login_at, created_at, updated_at
+           FROM users WHERE id = $1 AND is_active = true"#,
+        user_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db_err)?
+    .ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"conan\"")
+            .body(Body::from("Authentication required"))
+            .unwrap()
+    })?;
+
+    let auth_service =
+        AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
+    let tokens = auth_service.generate_tokens(&user).map_err(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("token generation failed"))
+            .unwrap()
+    })?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain")
-        .body(Body::from(token))
+        .body(Body::from(tokens.access_token))
         .unwrap())
 }
 
@@ -3520,22 +3549,34 @@ mod tests {
     #[cfg(test)]
     mod agent1_auth_search {
         use super::test_helpers::*;
-        use axum::body::Body;
+        use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
         use uuid::Uuid;
 
         // ---------------- users_authenticate ----------------
 
+        /// Regression for issue #1433. The authenticate endpoint used to echo
+        /// back the base64 Basic credential as the "token". Conan then sent
+        /// that string as `Authorization: Bearer <token>`, which the Bearer
+        /// validator rejected (it is not a JWT or API token), so every
+        /// privileged action returned 401.
+        ///
+        /// This test proves the body is now a signed JWT access token that the
+        /// same AuthService used by the middleware validates back to the
+        /// authenticating user, so it works as a Bearer credential.
         #[tokio::test]
-        async fn users_authenticate_echoes_basic_token_on_200() {
+        async fn users_authenticate_returns_jwt_valid_for_bearer() {
+            use crate::services::auth_service::AuthService;
+            use std::sync::Arc;
+
             let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
 
             let app = f.router();
             let basic = basic_auth(&f.username, "irrelevant");
-            let expected_token = basic.strip_prefix("Basic ").unwrap().to_string();
+            let basic_payload = basic.strip_prefix("Basic ").unwrap().to_string();
             let req = Request::builder()
                 .method("POST")
                 .uri(format!("/{}/v2/users/authenticate", f.repo_key))
@@ -3545,10 +3586,28 @@ mod tests {
 
             let (status, body) = send(app, req).await;
             assert_eq!(status, StatusCode::OK, "body={:?}", body);
+
+            let token = String::from_utf8_lossy(&body).to_string();
+            assert!(
+                !token.is_empty(),
+                "authenticate must return a non-empty token"
+            );
+            assert_ne!(
+                token, basic_payload,
+                "authenticate must not echo the base64 Basic credential back (issue #1433)",
+            );
+
+            // The returned token must validate as a JWT access token through the
+            // exact path the Bearer auth middleware uses, and resolve to the
+            // authenticating user.
+            let auth_service = AuthService::new(f.pool.clone(), Arc::new(f.state.config.clone()));
+            let claims = auth_service
+                .validate_access_token_async(&token)
+                .await
+                .expect("authenticate token must validate as a Bearer JWT");
             assert_eq!(
-                String::from_utf8_lossy(&body),
-                expected_token,
-                "handler should echo the base64 Basic value back to the client",
+                claims.sub, f.user_id,
+                "JWT subject must be the authenticating user",
             );
 
             f.teardown().await;
@@ -3573,6 +3632,102 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND);
 
             f.teardown().await;
+        }
+
+        /// Coverage for the post-`require_auth_basic` user lookup in
+        /// `users_authenticate`. The PR #1488 fix loads the user row from the
+        /// database to mint a JWT; if `AuthExtension.user_id` does not resolve
+        /// to an active row (account deleted between request arrival and the
+        /// handler running, or deactivated), the handler must return 401 with
+        /// `WWW-Authenticate: Basic realm="conan"` rather than mint a token
+        /// for a phantom user.
+        ///
+        /// Exercises the `ok_or_else` UNAUTHORIZED branch of the
+        /// `fetch_optional` result, which the happy-path test
+        /// `users_authenticate_returns_jwt_valid_for_bearer` does not reach.
+        /// Covered for both the user-id-does-not-exist case and the
+        /// is_active=false case (both filtered by the same SQL `WHERE`).
+        #[tokio::test]
+        async fn users_authenticate_401_when_user_row_missing_or_inactive() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (real_user_id, real_username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+            // Case 1: AuthExtension carries a user_id that does not exist in
+            // the `users` table at all (e.g. row deleted after auth middleware
+            // resolved the credential). The SQL `fetch_optional` returns None
+            // and the handler must 401 via the `ok_or_else` closure.
+            let phantom_user_id = Uuid::new_v4();
+            let phantom_auth = make_auth(phantom_user_id, "phantom-user");
+            let app = router_with_auth(state.clone(), phantom_auth);
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .header("Authorization", basic_auth("phantom-user", "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+            let resp = app.oneshot(req).await.expect("oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "phantom user_id must not mint a JWT",
+            );
+            let www = resp
+                .headers()
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                www.contains("Basic") && www.contains("conan"),
+                "phantom-user 401 must advertise Basic realm=\"conan\", got: {}",
+                www,
+            );
+            let body = to_bytes(resp.into_body(), 4096)
+                .await
+                .expect("collect body");
+            assert_eq!(
+                &body[..],
+                b"Authentication required",
+                "phantom-user 401 body must be the handler's literal, not a JWT",
+            );
+
+            // Case 2: AuthExtension carries the real user_id but the row was
+            // flipped to is_active=false. The same SQL filter (`AND is_active
+            // = true`) excludes it, and the handler must 401 the same way.
+            // This proves the inactive-user branch is also defended.
+            sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+                .bind(real_user_id)
+                .execute(&pool)
+                .await
+                .expect("deactivate user");
+
+            let real_auth = make_auth(real_user_id, &real_username);
+            let app2 = router_with_auth(state, real_auth);
+            let req2 = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .header("Authorization", basic_auth(&real_username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+            let (status2, body2) = send(app2, req2).await;
+            assert_eq!(
+                status2,
+                StatusCode::UNAUTHORIZED,
+                "deactivated user must not mint a JWT, body={:?}",
+                body2,
+            );
+            assert_eq!(
+                &body2[..],
+                b"Authentication required",
+                "deactivated-user 401 body must be the handler's literal",
+            );
+
+            cleanup(&pool, repo_id, real_user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
         }
 
         #[tokio::test]
