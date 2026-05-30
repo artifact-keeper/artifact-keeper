@@ -147,6 +147,43 @@ pub fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
     Some((name, reference))
 }
 
+/// Join a parsed image name and reference into a single OCI reference string
+/// using the correct separator: `@` for digest references (e.g.
+/// `sha256:abc...`) and `:` for tag references.
+///
+/// The OCI distribution spec and all container tooling (Docker, Grype, Trivy
+/// CLI) require the `name@digest` form for digest-pinned references. Using
+/// `:` between the name and a `sha256:...` reference produces an invalid
+/// reference (`name:sha256:digest` has two colons in the tag position) that
+/// every parser rejects with "could not parse reference". A single
+/// `docker buildx push` creates three artifacts (the tag-based index plus two
+/// digest-referenced manifests for platform + attestation); the latter two
+/// can only be scanned by digest. See issue #1483.
+pub fn join_oci_image_ref(name: &str, reference: &str) -> String {
+    let sep = if is_oci_digest_reference(reference) {
+        '@'
+    } else {
+        ':'
+    };
+    format!("{}{}{}", name, sep, reference)
+}
+
+/// Whether an OCI reference string is a digest (e.g. `sha256:abc...`) rather
+/// than a tag. OCI tags cannot contain `:`, so any reference that contains a
+/// colon is, by spec, a digest. We accept any `<algo>:<hex>` shape (sha256,
+/// sha512, future algorithms) rather than hard-coding `sha256:` so we stay
+/// forward-compatible.
+pub fn is_oci_digest_reference(reference: &str) -> bool {
+    if let Some((algo, hex)) = reference.split_once(':') {
+        !algo.is_empty()
+            && !hex.is_empty()
+            && algo.chars().all(|c| c.is_ascii_alphanumeric())
+            && hex.chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        false
+    }
+}
+
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
 /// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
 /// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
@@ -10607,6 +10644,114 @@ mod tests {
         assert!(
             !Scanner::is_applicable(&image_scanner, &npm),
             "ImageScanner must not apply to an npm tarball (#961)"
+        );
+    }
+
+    // -------- parse_oci_manifest_path / join_oci_image_ref (#1483) --------
+
+    #[test]
+    fn test_parse_oci_manifest_path_tag() {
+        let (name, reference) =
+            parse_oci_manifest_path("v2/library/nginx/manifests/latest").expect("path must parse");
+        assert_eq!(name, "library/nginx");
+        assert_eq!(reference, "latest");
+    }
+
+    #[test]
+    fn test_parse_oci_manifest_path_digest() {
+        let (name, reference) = parse_oci_manifest_path(
+            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        )
+        .expect("path must parse");
+        assert_eq!(name, "org/myapp");
+        assert_eq!(
+            reference,
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+    }
+
+    #[test]
+    fn test_parse_oci_manifest_path_rejects_malformed() {
+        for path in [
+            "v2/foo/blobs/sha256:abc",        // no /manifests/
+            "v2//manifests/latest",           // empty name
+            "v2/library/nginx/manifests/",    // empty reference
+            "library/nginx/manifests/latest", // no v2/ prefix
+        ] {
+            assert!(
+                parse_oci_manifest_path(path).is_none(),
+                "malformed path '{}' must not parse",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_recognizes_sha256() {
+        assert!(is_oci_digest_reference(
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        ));
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_recognizes_sha512() {
+        // Forward-compatible: the helper recognises any `<algo>:<hex>`
+        // shape, not just sha256, so future digest algorithms work
+        // without code changes.
+        assert!(is_oci_digest_reference(
+            "sha512:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6bcf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        ));
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_rejects_tag() {
+        for tag in ["latest", "v1.0.0", "1.21-alpine", "main", "rc-2"] {
+            assert!(
+                !is_oci_digest_reference(tag),
+                "tag '{}' must not look like a digest",
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_oci_digest_reference_rejects_garbage() {
+        // Looks colon-separated but the right side is not hex.
+        assert!(!is_oci_digest_reference("sha256:not-hex-zzzz"));
+        // Empty halves.
+        assert!(!is_oci_digest_reference(":abc"));
+        assert!(!is_oci_digest_reference("sha256:"));
+    }
+
+    /// Issue #1483: the tag case must continue to use `:` so existing
+    /// tag-based scans keep working.
+    #[test]
+    fn test_join_oci_image_ref_tag_uses_colon() {
+        assert_eq!(
+            join_oci_image_ref("library/nginx", "1.21-alpine"),
+            "library/nginx:1.21-alpine"
+        );
+    }
+
+    /// Issue #1483: digest references must use `@` per the OCI distribution
+    /// spec. The previous `:` form produced `name:sha256:digest` (two colons
+    /// in the tag position), which Trivy and Grype both reject with
+    /// "could not parse reference".
+    #[test]
+    fn test_join_oci_image_ref_digest_uses_at_sign() {
+        let joined = join_oci_image_ref(
+            "localhost:8080/org/myapp",
+            "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        );
+        assert_eq!(
+            joined,
+            "localhost:8080/org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+        // Defensive: the bad form (`name:sha256:...`) must never reappear.
+        assert!(
+            !joined.contains("myapp:sha256:"),
+            "digest ref must not use ':' between name and digest: {}",
+            joined
         );
     }
 

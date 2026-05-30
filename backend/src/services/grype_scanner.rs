@@ -28,8 +28,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
-    is_oci_image_artifact, parse_oci_manifest_path, validate_trivy_purl, ScanOutput, ScanWorkspace,
-    Scanner, VersionCache,
+    is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, validate_trivy_purl,
+    ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -240,8 +240,10 @@ impl GrypeScanner {
         }
     }
 
-    /// Build the `<host>/<name>:<reference>` image ref that Grype's
-    /// `registry:` mode expects. The host comes from the first non-empty of:
+    /// Build the `<host>/<name><sep><reference>` image ref that Grype's
+    /// `registry:` mode expects. `<sep>` is `:` for tags and `@` for digest
+    /// references per the OCI distribution spec; see `join_oci_image_ref`.
+    /// The host comes from the first non-empty of:
     ///   1. `AK_GRYPE_REGISTRY_HOST` (explicit override; full URL accepted,
     ///      scheme is stripped before Grype sees it).
     ///   2. `PEER_PUBLIC_ENDPOINT` (already configured for in-cluster distribution).
@@ -253,12 +255,9 @@ impl GrypeScanner {
     /// findings-on-manifest-JSON bug).
     pub(crate) fn build_registry_image_ref(artifact: &Artifact) -> Option<String> {
         let (name, reference) = parse_oci_manifest_path(&artifact.path)?;
-        Some(format!(
-            "{}/{}:{}",
-            resolve_registry_host(),
-            name,
-            reference
-        ))
+        let host = resolve_registry_host();
+        let qualified_name = format!("{}/{}", host, name);
+        Some(join_oci_image_ref(&qualified_name, reference))
     }
 
     /// Run grype against the workspace directory.
@@ -836,6 +835,33 @@ mod tests {
         );
         let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
         assert_eq!(r, "localhost:8080/library/nginx:latest");
+    }
+
+    /// Regression test for issue #1483. Digest-pinned OCI artifacts must
+    /// use `@` between the qualified name and the `sha256:...` digest, not
+    /// `:`. Every `docker buildx push` writes two such digest-referenced
+    /// manifests (platform + attestation), so this is the common case for
+    /// image scans. With the bug present, Grype rejects every digest scan
+    /// with "could not parse reference".
+    #[test]
+    fn test_build_registry_image_ref_digest_uses_at_separator() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "platform-manifest",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/etc-docker/gitlab-codex-review/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+        );
+        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        assert_eq!(
+            r,
+            "localhost:8080/etc-docker/gitlab-codex-review@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+        );
+        // Defensive: the bad form (`name:sha256:...`) must never reappear.
+        assert!(
+            !r.contains("gitlab-codex-review:sha256:"),
+            "digest ref must not use ':' between name and digest: {}",
+            r
+        );
     }
 
     #[test]
