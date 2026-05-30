@@ -3862,6 +3862,7 @@ mod tests {
                 peer_public_endpoint: "http://localhost:8080".into(),
                 peer_api_key: "test-key".into(),
                 dependency_track_url: None,
+                dependency_track_enabled: false,
                 otel_exporter_otlp_endpoint: None,
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
