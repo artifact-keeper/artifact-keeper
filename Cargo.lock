@@ -264,6 +264,7 @@ dependencies = [
  "windows-service",
  "wiremock",
  "xz2",
+ "zeroize",
  "zip 8.5.1",
  "zstd",
  "zxcvbn",

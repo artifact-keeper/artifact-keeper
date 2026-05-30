@@ -118,11 +118,17 @@ impl ImageScanner {
     /// OCI paths look like: v2/<name>/manifests/<reference>. Parsing is
     /// shared with `GrypeScanner::build_registry_image_ref` via
     /// `parse_oci_manifest_path` so both scanners agree on what counts as
-    /// a well-formed image artifact (#1160).
+    /// a well-formed image artifact (#1160). The name and reference are
+    /// joined via `join_oci_image_ref`, which uses `@` for digest refs and
+    /// `:` for tags per the OCI distribution spec (#1483). Using `:` for
+    /// digest refs produces a string the Trivy CLI rejects with
+    /// "could not parse reference".
     fn extract_image_ref(artifact: &Artifact) -> Option<String> {
         let (name, reference) =
             crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
-        Some(format!("{}:{}", name, reference))
+        Some(crate::services::scanner_service::join_oci_image_ref(
+            name, reference,
+        ))
     }
 
     /// Number of `/healthz` attempts before declaring the Trivy server down.
@@ -434,14 +440,36 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_image_ref_with_namespace() {
+    fn test_extract_image_ref_with_namespace_tag() {
         let artifact = make_test_artifact(
-            "v2/org/myapp/manifests/sha256:abc123",
+            "v2/org/myapp/manifests/v1.0.0",
             "application/vnd.docker.distribution.manifest.v2+json",
         );
         assert_eq!(
             ImageScanner::extract_image_ref(&artifact),
-            Some("org/myapp:sha256:abc123".to_string())
+            Some("org/myapp:v1.0.0".to_string())
+        );
+    }
+
+    /// Regression test for issue #1483. Digest-pinned manifests must use
+    /// the `name@sha256:...` form so the Trivy CLI can parse them. The
+    /// previous code emitted `name:sha256:...` which Trivy and Grype reject
+    /// with "could not parse reference". A single `docker buildx push`
+    /// creates two such digest-referenced manifests (platform manifest +
+    /// attestation manifest), so this case is the common case for image
+    /// scans, not an edge case.
+    #[test]
+    fn test_extract_image_ref_digest_uses_at_separator() {
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact),
+            Some(
+                "org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+                    .to_string()
+            )
         );
     }
 

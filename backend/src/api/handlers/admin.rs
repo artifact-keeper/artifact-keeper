@@ -920,8 +920,15 @@ pub async fn rescan_for_inventory(
             // operator already chose to rescan; respecting per-repo config
             // here would silently skip exactly the repos the inventory
             // gap most likely affects.
+            //
+            // `bypass_dedup = true` (#1469) is required here too: the
+            // inventory backfill is the user-visible "rescan to populate
+            // SBOM rows" admin path. If a prior scan completed with zero
+            // findings due to a silent extraction failure, the cached row
+            // would short-circuit this rescan too and the inventory would
+            // stay empty.
             if let Err(e) = scanner_for_spawn
-                .scan_artifact_with_options(artifact_id, true)
+                .scan_artifact_with_options(artifact_id, true, true)
                 .await
             {
                 tracing::error!(

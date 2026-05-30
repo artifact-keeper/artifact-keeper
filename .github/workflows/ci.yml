@@ -441,16 +441,25 @@ jobs:
       #   - lifecycle_policy_tests, api_token_cache_flush_tests,
       #     search_reindex_tests, scan_convert_to_reused_tests,
       #     virtual_members_atomicity_test, virtual_members_duplicate_test,
-      #     grpc_sbom_tests (in-process gRPC, no HTTP server).
+      #     grpc_sbom_tests (in-process gRPC, no HTTP server),
+      #     oci_chunked_upload_cross_repo_tests (#1317 cross-repo session
+      #     rejection regression).
       #
       # Deliberately excluded (would panic on first .expect() without
       # extra infra, so `--ignored` stays the right gate):
       #
-      #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration,
-      #     incus_upload_tests  (live cloud creds via std::env::var().expect)
+      #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration
+      #     (live cloud creds via std::env::var().expect)
       #   - integration_tests, replication_integration,
       #     tag_filtered_replication_tests, storage_backend_tests
       #     (read TEST_BASE_URL, need a running HTTP backend)
+      #   - incus_upload_tests (most cases construct the router without the
+      #     optional_auth middleware, so handler `Extension<AuthExtension>`
+      #     extracts panic with a 500. Only
+      #     `test_chunked_upload_cross_repo_session_rejected` wires the
+      #     middleware in, so we run that case specifically as a named
+      #     filter below to cover issue #1317 without dragging in the
+      #     broken siblings).
       #
       # `--test-threads=1` because the DB-backed suites share schema state
       # through global DELETEs in their cleanup helpers and would race under
@@ -469,6 +478,21 @@ jobs:
             --test stuck_scan_janitor_tests \
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
+            --test oci_chunked_upload_cross_repo_tests \
+            -- --ignored --test-threads=1
+
+      # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
+      # is the only case in that file currently wired to run without an HTTP
+      # server. Run it explicitly so the #1317 incus regression has matrix
+      # coverage too.
+      - name: Run incus cross-repo session regression
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+        run: |
+          cargo test --workspace --verbose \
+            --test incus_upload_tests \
+            test_chunked_upload_cross_repo_session_rejected \
             -- --ignored --test-threads=1
 
   # ════════════════════════════════════════════════════════════════════════════
