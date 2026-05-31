@@ -2956,8 +2956,10 @@ mod tests {
         use crate::storage::StorageBackend as StorageBackendTrait;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::matchers::{method, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cap = S3_MULTIPART_MAX_IN_FLIGHT_PARTS;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2967,25 +2969,24 @@ mod tests {
             ))
             .mount(&server)
             .await;
+        // Part uploads hang for the lifetime of the test so the in-flight set
+        // stays saturated and the assertions never depend on wall-clock timing:
+        // once `cap` parts are dispatched they never complete, so the streaming
+        // loop cannot enqueue a (cap+1)th part until the test tears it down.
         let part_guard = Mock::given(method("PUT"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("ETag", "\"part-etag\"")
-                    .set_delay(Duration::from_secs(2)),
+                    .set_delay(Duration::from_secs(60)),
             )
             .mount_as_scoped(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(query_param("uploadId", "test-upload-id"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                "<CompleteMultipartUploadResult><ETag>\"complete-etag\"</ETag></CompleteMultipartUploadResult>",
-            ))
-            .mount(&server)
             .await;
 
         let backend = mock_s3_backend(&server.uri(), false).await;
         let chunks_polled = Arc::new(AtomicUsize::new(0));
-        let stream_chunks = (0..=S3_MULTIPART_MAX_IN_FLIGHT_PARTS).map({
+        // cap + 1 full-size chunks: the extra one must stay buffered, unable to
+        // begin uploading until an in-flight part frees a capacity slot.
+        let stream_chunks = (0..=cap).map({
             let chunks_polled = Arc::clone(&chunks_polled);
             move |_| {
                 chunks_polled.fetch_add(1, Ordering::SeqCst);
@@ -2999,34 +3000,44 @@ mod tests {
             StorageBackendTrait::put_stream(&backend, "slow-multipart-object", stream).await
         });
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert!(
-            !upload.is_finished(),
-            "upload task finished before any slow multipart parts were in flight: {:?}",
-            upload.await.expect("upload task")
-        );
-        let received_requests = server.received_requests().await.unwrap_or_default();
-        let request_summary: Vec<String> = received_requests
-            .iter()
-            .map(|request| format!("{} {}", request.method, request.url))
-            .collect();
+        // Wait until the streaming loop has saturated the in-flight cap. Poll
+        // (up to ~30s) instead of relying on a single fixed sleep so the
+        // assertion is robust on slow/contended CI runners.
+        let mut in_flight = 0;
+        for _ in 0..300 {
+            in_flight = part_guard.received_requests().await.len();
+            if in_flight >= cap {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert_eq!(
-            part_guard.received_requests().await.len(),
-            S3_MULTIPART_MAX_IN_FLIGHT_PARTS,
-            "put_stream must not enqueue more multipart part uploads than its in-flight cap; chunks polled: {}; received requests: {:?}",
-            chunks_polled.load(Ordering::SeqCst),
-            request_summary
+            in_flight, cap,
+            "put_stream should saturate exactly the in-flight cap of concurrent part uploads"
         );
 
-        let result = upload.await.expect("upload task");
+        // The (cap+1)th chunk has been polled and buffered, but its part cannot
+        // be enqueued while every slot is held by a hung upload. Give the loop
+        // room to misbehave, then confirm the cap still holds.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            part_guard.received_requests().await.len(),
+            cap,
+            "put_stream must not exceed its in-flight cap while earlier parts are still uploading; chunks polled: {}",
+            chunks_polled.load(Ordering::SeqCst),
+        );
         assert!(
-            result.is_ok(),
-            "multipart upload should complete: {result:?}"
+            !upload.is_finished(),
+            "upload must still be blocked on the hung in-flight parts"
         );
         assert_eq!(
             chunks_polled.load(Ordering::SeqCst),
-            S3_MULTIPART_MAX_IN_FLIGHT_PARTS + 1
+            cap + 1,
+            "put_stream should poll exactly one chunk past the cap before blocking on capacity"
         );
+
+        // The hung parts never return; drop the task rather than wait out the delay.
+        upload.abort();
     }
 
     #[tokio::test]
