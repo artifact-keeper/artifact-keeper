@@ -2420,19 +2420,24 @@ async fn handle_get_blob(
                     )
                 }
             };
-            match storage.get(&b.storage_key).await {
-                Ok(data) => {
-                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: serving from migrated oci_blobs (CAS hit)");
+            // Stream the blob straight from the backend instead of buffering the
+            // whole (potentially multi-GiB) layer in heap. Content-Length comes
+            // from the authoritative oci_blobs.size_bytes column. (#1528)
+            match storage.get_stream(&b.storage_key).await {
+                Ok(stream) => {
+                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: streaming from migrated oci_blobs (CAS hit)");
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header("Docker-Content-Digest", digest)
-                        .header(CONTENT_LENGTH, data.len().to_string())
+                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
                         .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(Body::from(data))
+                        .body(Body::from_stream(stream.map(|chunk| {
+                            chunk.map_err(|e| std::io::Error::other(e.to_string()))
+                        })))
                         .unwrap();
                 }
                 Err(e) => {
-                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get failed - will proxy from upstream: {}", e);
+                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
                 }
             }
         }
@@ -2448,9 +2453,9 @@ async fn handle_get_blob(
         if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
             return match resolution {
                 VirtualBlobResolution::Local {
+                    size_bytes,
                     storage_key,
                     member,
-                    ..
                 } => {
                     let storage = match state.storage_for_repo(&member.storage_location()) {
                         Ok(s) => s,
@@ -2462,16 +2467,19 @@ async fn handle_get_blob(
                             )
                         }
                     };
-                    match storage.get(&storage_key).await {
-                        Ok(data) => Response::builder()
+                    // Stream rather than buffer the resolved member blob. (#1528)
+                    match storage.get_stream(&storage_key).await {
+                        Ok(stream) => Response::builder()
                             .status(StatusCode::OK)
                             .header("Docker-Content-Digest", digest)
-                            .header(CONTENT_LENGTH, data.len().to_string())
+                            .header(CONTENT_LENGTH, size_bytes.to_string())
                             .header(CONTENT_TYPE, "application/octet-stream")
-                            .body(Body::from(data))
+                            .body(Body::from_stream(stream.map(|chunk| {
+                                chunk.map_err(|e| std::io::Error::other(e.to_string()))
+                            })))
                             .unwrap(),
                         Err(e) => {
-                            warn!("Storage error reading virtual blob {}: {}", digest, e);
+                            warn!("Storage error streaming virtual blob {}: {}", digest, e);
                             oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
                         }
                     }
@@ -7778,6 +7786,91 @@ mod token_claims_isactive_regression_tests {
             status,
             StatusCode::UNAUTHORIZED,
             "deactivated user must not be able to swap Bearer JWT for fresh OCI token"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blob_pull_streaming_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// GET blob (CAS hit) must STREAM the object from the storage backend with a
+    /// `Content-Length` sourced from `oci_blobs.size_bytes`, not buffer the
+    /// whole (potentially multi-GiB) layer in heap. (#1528)
+    #[tokio::test]
+    async fn get_blob_streams_from_backend_with_size_bytes_content_length() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // Public repo so an anonymous token can pull.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+
+        let body_bytes = b"a layer blob served by streaming from the storage backend".to_vec();
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let blob_key = format!("oci-blobs/{digest}");
+        storage
+            .put(&blob_key, bytes::Bytes::from(body_bytes.clone()))
+            .await
+            .expect("write blob object");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .bind(body_bytes.len() as i64)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        let app = fx.router_anon(router());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/myimage/blobs/{}", fx.repo_key, digest))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let got = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("collect streamed body");
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "CAS-hit GET blob must return 200");
+        assert_eq!(
+            content_length.as_deref(),
+            Some(body_bytes.len().to_string().as_str()),
+            "Content-Length must come from oci_blobs.size_bytes"
+        );
+        assert_eq!(
+            &got[..],
+            &body_bytes[..],
+            "streamed body must round-trip the stored blob bytes"
         );
     }
 }
