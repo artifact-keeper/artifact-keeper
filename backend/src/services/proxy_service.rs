@@ -4145,6 +4145,76 @@ SHA256:
         );
     }
 
+    // -----------------------------------------------------------------
+    // get_cache_metadata (#1541)
+    //
+    // The handler-side structural test (in repositories.rs) only pins the
+    // source-shape; these tests exercise the actual runtime path through
+    // the new pub method to make sure (a) the metadata key derivation
+    // hands the right key to the storage, (b) the deserialise path
+    // returns the populated struct, (c) a missing blob collapses cleanly
+    // to `Ok(None)`, and (d) a path the metadata-key validator rejects
+    // (e.g. `..` traversal) returns `Ok(None)` rather than bubbling --
+    // matching the handler's "cache fields just stay None on a bad
+    // input" tolerance.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_metadata_for_existing_path() {
+        let mock = Arc::new(CacheFreshMock::new(Some(fresh_metadata_bytes()), true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let meta = service
+            .get_cache_metadata("npm-proxy", "lodash")
+            .await
+            .expect("get_cache_metadata should not error on a present blob");
+
+        let meta = meta.expect("metadata should be Some when the blob exists");
+        // The fresh_metadata_bytes() helper pins these two fields; the
+        // others are exercised by the existing is_cache_fresh tests.
+        assert_eq!(meta.size_bytes, 42);
+        assert!(
+            meta.expires_at > Utc::now(),
+            "fresh metadata should not be already-expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_when_blob_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "never-fetched")
+            .await
+            .expect("missing blob must NOT bubble as Err");
+
+        assert!(
+            result.is_none(),
+            "missing metadata blob must collapse to Ok(None) so the \
+             handler can leave cache_expires_at / cache_cached_at unset \
+             rather than failing the whole metadata response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_for_path_traversal() {
+        // The metadata-key derivation rejects `..` segments before the
+        // storage is ever touched. The new pub wrapper translates that
+        // rejection into Ok(None) (rather than bubbling the Err) so the
+        // handler does not have to special-case it; the cache rows
+        // simply don't render for the request.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "../etc/passwd")
+            .await
+            .expect("path-traversal must NOT surface as Err on this path");
+
+        assert!(result.is_none(), "expected Ok(None) for invalid path");
+    }
+
     #[tokio::test]
     async fn test_invalidate_dist_packages_cache_evicts_each_path() {
         // Driven by the Release-file parser: every path under the
