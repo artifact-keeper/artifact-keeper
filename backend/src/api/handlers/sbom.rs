@@ -364,11 +364,20 @@ async fn generate_sbom(
         }
     }
 
-    // Generate SBOM (extract dependencies from scan results if available)
-    let deps = extract_dependencies_for_artifact(&state.db, body.artifact_id).await?;
+    // Extract dependencies, merging scanner inventory with the artifact's own
+    // declared dependencies, and carry an honest completeness signal so an
+    // unscanned or scanner-opaque artifact does not produce an authoritative
+    // empty SBOM (#870).
+    let (deps, completeness) = extract_dependencies_for_artifact(&state, body.artifact_id).await?;
 
     let doc = service
-        .generate_sbom(body.artifact_id, repository_id, format, deps)
+        .generate_sbom_with_completeness(
+            body.artifact_id,
+            repository_id,
+            format,
+            deps,
+            completeness,
+        )
         .await?;
 
     // #1156: SBOMs are an attestation surface relied on for SOC 2 / EU CRA
@@ -1296,38 +1305,39 @@ fn build_dep(
     }
 }
 
-/// Extract dependencies for SBOM generation.
+/// Extract dependencies for SBOM generation, merging scanner output with the
+/// artifact's own declared dependencies (#870).
 ///
-/// Read-path order (#903):
+/// Sources, unioned by [`crate::services::declared_dependencies::merge_dependencies`]:
 ///
-/// 1. **`scan_packages`** restricted to each scan_type's latest completed
-///    scan per artifact. This mirrors the #1126 / #1136 DISTINCT-ON CTE
-///    used for `scan_findings` aggregation; without it, a rescan that
-///    removed a dep would still surface the removed dep forever because
-///    the old scan's row lingers.
-/// 2. **`scan_findings`** legacy fallback for artifacts scanned before
-///    the inventory table existed, or by scanners that do not enumerate
-///    packages (Grype, OpenSCAP, custom WASM plugins). Returns only
-///    CVE-bearing components — exactly the bug #903 fixes for new scans,
-///    but the best we can do for legacy data.
+/// 1. **`scan_packages`** (full scanner inventory) windowed to each scan_type's
+///    latest completed scan. When present, the SBOM is `complete`. The
+///    DISTINCT ON picks the most recent scan per (artifact, scan_type); the
+///    outer DISTINCT collapses identical cross-scanner rows (#903 / #1126).
+/// 2. **`scan_findings`** legacy CVE-only fallback for artifacts scanned
+///    before the inventory table existed. Marks the SBOM `partial`.
+/// 3. **Declared dependencies** parsed from the artifact's own manifest (Maven
+///    POM, npm `package.json`, Helm `Chart.yaml`). This is what keeps a bare
+///    Maven jar that no scanner could enumerate from producing an empty,
+///    authoritative-looking SBOM (the #870 defect). A declared-only result is
+///    marked `declared`.
 ///
-/// Soft-deleted artifacts (`artifacts.is_deleted = true`) are excluded
-/// from both paths so consumers cannot rehydrate dep trees for content
-/// the operator has deliberately retired.
+/// Returns the merged dependency list plus the completeness signal for
+/// `generate_sbom_with_completeness` (`None` == `complete`, so fully scanned
+/// artifacts keep byte-identical output and a warm content-hash cache).
+///
+/// Soft-deleted artifacts (`artifacts.is_deleted = true`) are excluded from
+/// the scanner paths.
 async fn extract_dependencies_for_artifact(
-    db: &sqlx::PgPool,
+    state: &SharedState,
     artifact_id: Uuid,
-) -> Result<Vec<DependencyInfo>> {
-    // Primary path: the inventory table, windowed to each scan_type's
-    // latest completed scan. The DISTINCT ON inside `latest_scans`
-    // picks the most recent scan per (artifact, scan_type); the outer
-    // DISTINCT collapses cross-scan-type packages with identical
-    // (name, version, purl, license) tuples (e.g. Trivy fs + Grype
-    // both reporting the same lockfile dep).
-    //
-    // Row tuple: (name, version, purl, license). Tuple is local to this
-    // read path — the SBOM endpoint is the only consumer, so a derived
-    // FromRow type would pay no dividend.
+) -> Result<(Vec<DependencyInfo>, Option<&'static str>)> {
+    use crate::services::declared_dependencies as dd;
+
+    let db = &state.db;
+
+    // --- Source 1: scanner full inventory (scan_packages). Row tuple
+    // (name, version, purl, license) is local to this read path. ---
     let packages_sql = format!(
         "{}
         SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
@@ -1346,47 +1356,184 @@ async fn extract_dependencies_for_artifact(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if !packages.is_empty() {
-        if packages.len() as i64 >= SBOM_INVENTORY_ROW_CAP {
-            tracing::warn!(
-                "SBOM read for artifact {} hit the {} row cap; output may \
-                 be truncated. Investigate scanner output sizes.",
-                artifact_id,
-                SBOM_INVENTORY_ROW_CAP
-            );
-        }
-        return Ok(packages
-            .into_iter()
-            .filter_map(|(name, version, purl, license)| build_dep(name, version, purl, license))
-            .collect());
+    let package_inventory = !packages.is_empty();
+    if package_inventory && packages.len() as i64 >= SBOM_INVENTORY_ROW_CAP {
+        tracing::warn!(
+            "SBOM read for artifact {} hit the {} row cap; output may \
+             be truncated. Investigate scanner output sizes.",
+            artifact_id,
+            SBOM_INVENTORY_ROW_CAP
+        );
     }
 
-    // Legacy fallback: derive a component list from scan_findings, also
-    // windowed to the latest scan per scan_type for consistency with
-    // the primary path. This is the pre-#903 vulnerability-only shape;
-    // preferable to returning empty for artifacts scanned before the
-    // inventory table existed.
-    let findings_sql = format!(
-        "{}
-        SELECT DISTINCT
-            COALESCE(sf.affected_component, sf.title) AS name,
-            sf.affected_version AS version
-        FROM scan_findings sf
-        WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
-        ORDER BY name
-        LIMIT 1000",
-        crate::services::scanner_service::LATEST_SCANS_FOR_ARTIFACT_CTE,
-    );
-    let findings: Vec<(String, Option<String>)> = sqlx::query_as(&findings_sql)
-        .bind(artifact_id)
-        .fetch_all(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    Ok(findings
+    let mut scanner_deps: Vec<DependencyInfo> = packages
         .into_iter()
-        .filter_map(|(name, version)| build_dep(name, version, None, None))
-        .collect())
+        .filter_map(|(name, version, purl, license)| build_dep(name, version, purl, license))
+        .collect();
+
+    // --- Source 2: legacy scan_findings (CVE-only) when no inventory. ---
+    let mut findings_only = false;
+    if !package_inventory {
+        let findings_sql = format!(
+            "{}
+            SELECT DISTINCT
+                COALESCE(sf.affected_component, sf.title) AS name,
+                sf.affected_version AS version
+            FROM scan_findings sf
+            WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
+            ORDER BY name
+            LIMIT 1000",
+            crate::services::scanner_service::LATEST_SCANS_FOR_ARTIFACT_CTE,
+        );
+        let findings: Vec<(String, Option<String>)> = sqlx::query_as(&findings_sql)
+            .bind(artifact_id)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        scanner_deps = findings
+            .into_iter()
+            .filter_map(|(name, version)| build_dep(name, version, None, None))
+            .collect();
+        findings_only = !scanner_deps.is_empty();
+    }
+
+    // --- Source 3: the artifact's own declared dependencies. ---
+    let (declared, declared_unresolved) = declared_deps_for_artifact(state, artifact_id).await;
+
+    Ok(dd::assemble_dependencies(
+        scanner_deps,
+        declared,
+        package_inventory,
+        findings_only,
+        declared_unresolved,
+    ))
+}
+
+/// Load an artifact's declared (direct) dependencies from its stored manifest
+/// metadata, with a Maven-only fallback that reads the `.pom` from object
+/// storage when the stored metadata is missing or carries unresolved
+/// `${property}` versions.
+///
+/// Best-effort: any error (missing metadata, unreadable storage, unparseable
+/// manifest) yields an empty list rather than failing SBOM generation. Returns
+/// `(deps, any_version_unresolved)`.
+async fn declared_deps_for_artifact(
+    state: &SharedState,
+    artifact_id: Uuid,
+) -> (Vec<DependencyInfo>, bool) {
+    use crate::services::declared_dependencies as dd;
+
+    // Repository format + stored manifest metadata in one lookup.
+    let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT r.format, am.metadata
+         FROM artifacts a
+         JOIN repositories r ON r.id = a.repository_id
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+         WHERE a.id = $1 AND NOT a.is_deleted",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (format, metadata) = match row {
+        Some((fmt, meta)) => (fmt.to_lowercase(), meta.unwrap_or(serde_json::Value::Null)),
+        None => return (Vec::new(), false),
+    };
+
+    // Maven gets a storage-backed POM fallback (for property resolution and
+    // pre-existing artifacts whose deps were never stored in metadata). Every
+    // other format is metadata-only via the shared dispatcher.
+    if format == "maven" {
+        return maven_declared_deps(state, artifact_id, &metadata).await;
+    }
+    dd::declared_deps_from_manifest(&format, &metadata)
+}
+
+/// Maven declared dependencies: prefer the list stored in
+/// `metadata["dependencies"]` at upload, but when it is empty or carries
+/// unresolved `${property}` versions, read the sibling `.pom` from storage and
+/// re-parse it with full property context. Returns `(deps, any_unresolved)`.
+async fn maven_declared_deps(
+    state: &SharedState,
+    artifact_id: Uuid,
+    metadata: &serde_json::Value,
+) -> (Vec<DependencyInfo>, bool) {
+    use crate::services::declared_dependencies as dd;
+
+    let stored = metadata.get("dependencies");
+    let stored_unresolved = stored
+        .map(dd::maven_metadata_has_unresolved)
+        .unwrap_or(false);
+    let stored_deps = stored.map(dd::maven_deps_from_metadata).unwrap_or_default();
+
+    if stored_deps.is_empty() || stored_unresolved {
+        if let Some(pom) = load_maven_pom(state, artifact_id, metadata).await {
+            let pom_deps = dd::maven_deps_from_pom(&pom);
+            if !pom_deps.is_empty() {
+                let unresolved = pom_deps.iter().any(|d| d.version.is_none());
+                return (pom_deps, unresolved);
+            }
+        }
+    }
+
+    let unresolved = stored_unresolved || stored_deps.iter().any(|d| d.version.is_none());
+    (stored_deps, unresolved)
+}
+
+/// Locate and parse the Maven POM for an artifact from object storage. Tries
+/// the `.pom` recorded in `metadata["files"]` first, then derives the POM key
+/// from the jar's own storage key. Returns `None` on any failure.
+async fn load_maven_pom(
+    state: &SharedState,
+    artifact_id: Uuid,
+    metadata: &serde_json::Value,
+) -> Option<crate::formats::maven::PomProject> {
+    use crate::formats::maven::MavenHandler;
+
+    let (jar_key, backend, path): (String, String, String) = sqlx::query_as(
+        "SELECT a.storage_key, r.storage_backend, r.storage_path
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id
+         WHERE a.id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()?;
+
+    let location = crate::storage::StorageLocation { backend, path };
+    let storage = state.storage_for_repo(&location).ok()?;
+
+    let mut candidates: Vec<String> = Vec::new();
+    // 1. A `.pom` recorded among the artifact's secondary files.
+    if let Some(files) = metadata.get("files").and_then(|v| v.as_array()) {
+        for f in files {
+            let key = f.get("storageKey").and_then(|v| v.as_str());
+            let ext = f.get("extension").and_then(|v| v.as_str());
+            let is_pom = ext == Some("pom") || key.map(|k| k.ends_with(".pom")).unwrap_or(false);
+            if is_pom {
+                if let Some(k) = key {
+                    candidates.push(k.to_string());
+                }
+            }
+        }
+    }
+    // 2. Derive `<jar-key-without-ext>.pom` from the primary storage key.
+    if let Some((stem, _ext)) = jar_key.rsplit_once('.') {
+        candidates.push(format!("{}.pom", stem));
+    }
+
+    for key in candidates {
+        if let Ok(bytes) = storage.get(&key).await {
+            if let Ok(pom) = MavenHandler::parse_pom(&bytes) {
+                return Some(pom);
+            }
+        }
+    }
+    None
 }
 
 /// Decide whether a caller can access a repo-scoped resource, returning

@@ -3137,6 +3137,40 @@ impl ScannerService {
         Ok(())
     }
 
+    /// Load an artifact's declared (direct) dependencies from its stored
+    /// manifest metadata for SBOM enrichment (#870).
+    ///
+    /// Metadata-only: no object-storage read, so a Maven POM whose
+    /// `${property}` versions were not resolved at upload stays unresolved
+    /// here. The on-demand `/sbom` endpoint performs the storage-backed POM
+    /// fallback for that case. Returns `(deps, any_version_unresolved)`.
+    async fn declared_deps_from_metadata(
+        &self,
+        artifact_id: Uuid,
+        format: Option<&str>,
+    ) -> (Vec<crate::services::sbom_service::DependencyInfo>, bool) {
+        use crate::services::declared_dependencies as dd;
+
+        let format = match format {
+            Some(f) => f.to_lowercase(),
+            None => return (Vec::new(), false),
+        };
+
+        let metadata: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+        let metadata = match metadata {
+            Some(m) => m,
+            None => return (Vec::new(), false),
+        };
+
+        dd::declared_deps_from_manifest(&format, &metadata)
+    }
+
     /// Generate a CycloneDX SBOM for the given artifact and submit it to
     /// Dependency-Track. Components come from the `scan_packages` inventory
     /// (latest scan per scan_type), falling back to `scan_findings` for
@@ -3168,6 +3202,7 @@ impl ScannerService {
         // description so operators can still trace a project back to its
         // source repo. `purl_type` comes from the repo format because
         // purl encoding is a property of the format, not the artifact.
+        let repo_format = repo_row.as_ref().and_then(|(_, fmt)| fmt.clone());
         let (repo_label, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
         let project_name = artifact.name.as_str();
@@ -3198,11 +3233,13 @@ impl ScannerService {
                 .await
                 .unwrap_or_default();
 
+        let package_inventory = !package_rows.is_empty();
         let mut deps = build_dependency_info_from_packages(package_rows, purl_type);
 
         // Legacy fallback: artifacts scanned before migration 085 (scan_packages)
         // existed only have scan_findings rows. Same DISTINCT ON window so the
         // CVE-only component list matches the latest scan, not stale history.
+        let mut findings_only = false;
         if deps.is_empty() {
             let findings_sql = format!(
                 "{}
@@ -3221,16 +3258,33 @@ impl ScannerService {
                     .unwrap_or_default();
 
             deps = build_dependency_info_from_findings(findings_rows, purl_type);
+            findings_only = !deps.is_empty();
         }
 
-        // Only skip when there is literally no signal: neither an inventory
-        // row nor a finding for any completed scan. A clean scan with 30
-        // packages and 0 CVEs must still submit to DT so DT can run its own
-        // independent vulnerability correlation against the dep tree. #965.
+        // Merge the artifact's own declared dependencies (#870) so the stored
+        // and DT-submitted SBOM carries the dep tree even when no scanner
+        // enumerated packages, and carry an honest completeness signal.
+        // Metadata-only here (no object-storage read); the on-demand /sbom
+        // endpoint adds the POM storage fallback for older artifacts.
+        let (declared, declared_unresolved) = self
+            .declared_deps_from_metadata(artifact.id, repo_format.as_deref())
+            .await;
+        let (deps, completeness) = crate::services::declared_dependencies::assemble_dependencies(
+            deps,
+            declared,
+            package_inventory,
+            findings_only,
+            declared_unresolved,
+        );
+
+        // Only skip when there is literally no signal: no inventory row, no
+        // finding, and no declared dependency. A clean scan with 30 packages
+        // and 0 CVEs must still submit to DT so DT can run its own independent
+        // vulnerability correlation against the dep tree. #965.
         if deps.is_empty() {
             info!(
                 artifact_id = %artifact.id,
-                "No scan inventory or findings recorded, skipping Dependency-Track SBOM submission"
+                "No scan inventory, findings, or declared dependencies recorded, skipping Dependency-Track SBOM submission"
             );
             return;
         }
@@ -3238,11 +3292,12 @@ impl ScannerService {
         // Generate the CycloneDX SBOM
         let sbom_service = SbomService::new(self.db.clone());
         let sbom_doc = match sbom_service
-            .generate_sbom(
+            .generate_sbom_with_completeness(
                 artifact.id,
                 artifact.repository_id,
                 SbomFormat::CycloneDX,
                 deps,
+                completeness,
             )
             .await
         {
