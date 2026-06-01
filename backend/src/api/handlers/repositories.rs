@@ -216,6 +216,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Cache invalidation for a specific path on a Remote (proxy) repository
+        // (#1539). POST keeps the action explicit; the underlying
+        // `ProxyService::invalidate_cache` is idempotent so a second call for
+        // an already-evicted path still returns 200.
+        .route("/:key/cache/invalidate", post(invalidate_cache))
         // Routing rules for path rewriting on remote repositories
         .route(
             "/:key/routing-rules",
@@ -649,6 +654,88 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct InvalidateCacheQuery {
+    /// Artifact path to evict from the proxy cache. Same shape as the path
+    /// segment of `GET /api/v1/repositories/{key}/artifacts/{path}`.
+    /// Path-traversal segments such as `..` are rejected by
+    /// `ProxyService::cache_storage_key` (covered by
+    /// `test_invalidate_cache_by_key_rejects_invalid_path`).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InvalidateCacheResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub invalidated: bool,
+}
+
+/// Invalidate a single cached artifact entry on a Remote (proxy) repository
+/// (#1539).
+///
+/// Mirrors the auth + repo-access pattern of `set_cache_ttl`. Idempotent:
+/// invalidating a path that was never cached (or was already evicted) still
+/// returns 200, matching the underlying `ProxyService::invalidate_cache`
+/// contract (which ignores delete-of-missing on the storage backend).
+#[utoipa::path(
+    post,
+    path = "/{key}/cache/invalidate",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        InvalidateCacheQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cache entry invalidated (or was already absent)", body = InvalidateCacheResponse),
+        (status = 400, description = "Validation error (e.g. non-remote repo or invalid path)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+        (status = 503, description = "Proxy service not configured on this deployment"),
+    )
+)]
+pub async fn invalidate_cache(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<InvalidateCacheQuery>,
+) -> Result<Json<InvalidateCacheResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Cache invalidation is meaningless on Local / Virtual / Staging repos --
+    // only Remote (proxy) repos own a cache. Reject up front before touching
+    // storage so the failure mode is a clear 400, not a silent no-op.
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "cache invalidation is only supported on remote (proxy) repositories".to_string(),
+        ));
+    }
+
+    // No proxy service => storage backend not configured on this deployment.
+    // Surface as 503 so operators can distinguish "feature off" from
+    // "server bug" (mirrors the `AppError::ServiceUnavailable` doc comment
+    // in `error.rs`). Avoids `unwrap()` on the optional field.
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("proxy service not configured".to_string()))?;
+
+    proxy.invalidate_cache(&repo, &query.path).await?;
+
+    Ok(Json(InvalidateCacheResponse {
+        repository_key: key,
+        path: query.path,
+        invalidated: true,
     }))
 }
 
@@ -3849,6 +3936,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         delete_repository,
         set_cache_ttl,
         get_cache_ttl,
+        invalidate_cache,
         list_artifacts,
         get_artifact_metadata,
         upload_artifact,
@@ -3872,6 +3960,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryListResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        InvalidateCacheQuery,
+        InvalidateCacheResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -6429,6 +6519,125 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"repository_key\":\"my-remote-repo\""));
         assert!(json.contains("\"cache_ttl_seconds\":7200"));
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /repositories/:key/cache/invalidate (#1539)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalidate_cache_query_deserialization() {
+        // serde_urlencoded backs `Query<T>` in axum, but exercising the
+        // serde::Deserialize impl through serde_json is sufficient to pin
+        // the field name and required-ness. axum-side wiring is exercised
+        // by the structural test below.
+        let json = r#"{"path": "foo/bar-1.2.3.tgz"}"#;
+        let q: InvalidateCacheQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "foo/bar-1.2.3.tgz");
+    }
+
+    #[test]
+    fn test_invalidate_cache_query_rejects_missing_path() {
+        // `path` is required: an empty object must fail to deserialize so
+        // the handler never sees a default-empty path that would silently
+        // evict the wrong cache key.
+        let json = r#"{}"#;
+        let result: std::result::Result<InvalidateCacheQuery, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing `path` must fail deserialization, got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_invalidate_cache_response_serialization() {
+        let resp = InvalidateCacheResponse {
+            repository_key: "pypi-remote".to_string(),
+            path: "simple/requests/".to_string(),
+            invalidated: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repository_key\":\"pypi-remote\""));
+        assert!(json.contains("\"path\":\"simple/requests/\""));
+        assert!(json.contains("\"invalidated\":true"));
+    }
+
+    /// Structural regression test (#1539): the `invalidate_cache` handler
+    /// must guard on (a) `repo.repo_type != RepositoryType::Remote` (returns
+    /// 400) and (b) `state.proxy_service.as_ref()` (returns 503 when None),
+    /// and BOTH guards must run before the actual `proxy.invalidate_cache(`
+    /// call. Otherwise a Local/Virtual repo or a deployment without a
+    /// configured storage backend would either silently no-op (worse:
+    /// produce a misleading 200) or panic on `unwrap` of an
+    /// `Option<Arc<ProxyService>>`. Pins the contract this PR adds.
+    #[test]
+    fn invalidate_cache_handler_guards_repo_type_and_proxy_service() {
+        let source = include_str!("repositories.rs");
+
+        let signature = format!("pub async fn {}(", "invalidate_cache");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{}` in repositories.rs", signature));
+
+        // Bound the search at the closing `}` of the handler. The next
+        // top-level `pub` item gives a safe upper bound: the handler's body
+        // ends well before that.
+        let end = source[start + signature.len()..]
+            .find("\npub ")
+            .map(|offset| start + signature.len() + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        // Marker strings are built via format! so this test body itself does
+        // not satisfy the search.
+        let type_check = format!("{} != RepositoryType::Remote", "repo.repo_type");
+        // The 503 guard chain (`state.proxy_service.as_ref().ok_or_else(...)`)
+        // gets reformatted across multiple lines by rustfmt, so we anchor on
+        // the unique `ServiceUnavailable` error construction inside the
+        // `ok_or_else` closure -- that marker only exists when the guard is
+        // present.
+        let proxy_guard = format!(
+            "{}::ServiceUnavailable(\"proxy service not configured\"",
+            "AppError",
+        );
+        let evict_call = format!("{}.invalidate_cache(", "proxy");
+
+        let type_idx = body.find(&type_check).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must check `{}` to reject non-Remote repos (#1539)",
+                type_check,
+            )
+        });
+        let proxy_idx = body.find(&proxy_guard).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must guard `{}` to surface a 503 instead of unwrap-panic when no storage backend is configured (#1539)",
+                proxy_guard,
+            )
+        });
+        let evict_idx = body.find(&evict_call).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must call `{}` on the resolved proxy service (#1539)",
+                evict_call,
+            )
+        });
+
+        assert!(
+            type_idx < evict_idx,
+            "type-check `{}` must run BEFORE `{}` (#1539). type_idx={}, evict_idx={}",
+            type_check,
+            evict_call,
+            type_idx,
+            evict_idx,
+        );
+        assert!(
+            proxy_idx < evict_idx,
+            "proxy-service guard `{}` must run BEFORE `{}` (#1539). proxy_idx={}, evict_idx={}",
+            proxy_guard,
+            evict_call,
+            proxy_idx,
+            evict_idx,
+        );
     }
 
     // -----------------------------------------------------------------------
