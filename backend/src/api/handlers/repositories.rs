@@ -6640,6 +6640,144 @@ mod tests {
         );
     }
 
+    /// Runtime regression (#1539): on a Remote repo with the proxy service
+    /// configured, `POST /:key/cache/invalidate?path=...` returns 200 with
+    /// `invalidated: true`. Idempotent: invalidating a path that was never
+    /// cached must still succeed (mirrors `ProxyService::invalidate_cache`,
+    /// which ignores delete-of-missing on the storage backend).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_200_for_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/cache/invalidate?path=foo%2Fbar-1.2.3.tgz",
+                fx.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Remote repo + proxy configured must return 200 (idempotent on \
+             never-cached paths); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("\"invalidated\":true"),
+            "response body must contain `invalidated: true` (#1539); got: {}",
+            body_str,
+        );
+        assert!(
+            body_str.contains("\"path\":\"foo/bar-1.2.3.tgz\""),
+            "response body must echo the URL-decoded `path` (#1539); got: {}",
+            body_str,
+        );
+    }
+
+    /// Runtime regression (#1539): on a Local (or Virtual / Staging) repo,
+    /// the handler MUST return 400 *before* touching the proxy service --
+    /// cache invalidation is meaningless on non-Remote repos. The proxy
+    /// service is wired up here on purpose so the test fails if the type
+    /// guard is removed (otherwise the call would no-op-success on a Local
+    /// repo and silently mask the contract).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_400_for_non_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Local repo MUST surface as 400 BadRequest, not silent 200 \
+             (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// Runtime regression (#1539): on a Remote repo *without* a proxy
+    /// service in `SharedState`, the handler MUST return 503 (not 500,
+    /// not panic on unwrap). Pins `AppError::ServiceUnavailable` as the
+    /// surfaced status so operators can distinguish "feature off" from
+    /// "server bug" -- see the doc comment on the guard.
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_503_when_proxy_service_missing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        // Plain `build_state` does NOT install a proxy_service, so the
+        // handler hits the `state.proxy_service.as_ref().ok_or_else(...)`
+        // arm.
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing proxy_service MUST surface as 503 ServiceUnavailable, \
+             not 500 / not unwrap-panic (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Virtual repository member list response
     // -----------------------------------------------------------------------
