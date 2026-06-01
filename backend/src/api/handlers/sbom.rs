@@ -1425,8 +1425,8 @@ async fn declared_deps_for_artifact(
     use crate::services::declared_dependencies as dd;
 
     // Repository format + stored manifest metadata in one lookup.
-    let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT r.format, am.metadata
+    let row = sqlx::query_as::<_, (String, Option<serde_json::Value>)>(
+        "SELECT r.format::text, am.metadata
          FROM artifacts a
          JOIN repositories r ON r.id = a.repository_id
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
@@ -1434,9 +1434,22 @@ async fn declared_deps_for_artifact(
     )
     .bind(artifact_id)
     .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
+    .await;
+
+    // Never swallow this silently: a decode/query failure here would drop the
+    // artifact's declared dependencies and produce an empty SBOM that looks
+    // authoritative (the #870 silent-success class). Log, then degrade.
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "declared-dependency metadata lookup failed; SBOM will omit declared deps"
+            );
+            None
+        }
+    };
 
     let (format, metadata) = match row {
         Some((fmt, meta)) => (fmt.to_lowercase(), meta.unwrap_or(serde_json::Value::Null)),

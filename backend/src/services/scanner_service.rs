@@ -3189,7 +3189,7 @@ impl ScannerService {
 
         // Fetch repository name and format for the DT project
         let repo_row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT name, format FROM repositories WHERE id = $1")
+            sqlx::query_as("SELECT name, format::text FROM repositories WHERE id = $1")
                 .bind(artifact.repository_id)
                 .fetch_optional(&self.db)
                 .await
