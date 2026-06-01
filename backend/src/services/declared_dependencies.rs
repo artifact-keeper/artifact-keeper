@@ -341,7 +341,7 @@ pub fn merge_dependencies(
 ) -> Vec<DependencyInfo> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<DependencyInfo> = Vec::with_capacity(scanner.len() + declared.len());
-    for dep in scanner.into_iter().chain(declared.into_iter()) {
+    for dep in scanner.into_iter().chain(declared) {
         let key = match &dep.purl {
             Some(p) => format!("purl\u{0}{}", p),
             None => format!(
