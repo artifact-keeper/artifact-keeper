@@ -1049,6 +1049,33 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
+    /// `upstream_etag`, `storage_etag`, `content_type`, `size_bytes`) for
+    /// a given path on a repository, without checking expiry.
+    ///
+    /// Returns `Ok(None)` when no metadata blob exists (e.g. a Remote-typed
+    /// artifact that was direct-uploaded and has never been fetched through
+    /// the proxy) or when the underlying storage rejects the path
+    /// (path-traversal segments are rejected by `cache_metadata_key`).
+    /// Errors from a transient storage failure on the GET propagate as
+    /// `Err(...)` so callers can choose between bubbling up and tolerating.
+    ///
+    /// Used by `get_artifact_metadata` (#1541) to surface cache freshness
+    /// alongside the static artifact metadata in a single round-trip,
+    /// without exposing the metadata-blob storage key derivation to
+    /// handlers.
+    pub async fn get_cache_metadata(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<CacheMetadata>> {
+        let metadata_key = match Self::cache_metadata_key(repo_key, path) {
+            Ok(k) => k,
+            Err(_) => return Ok(None),
+        };
+        self.load_cache_metadata(&metadata_key).await
+    }
+
     /// Fetch an artifact from upstream and report whether the content
     /// differs from what was previously cached.
     ///

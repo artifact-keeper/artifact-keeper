@@ -1309,6 +1309,19 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
+    /// When the proxy cache entry for this artifact was last written.
+    /// Only populated for Remote (proxy) repositories whose proxy service is
+    /// configured AND that have a cache-metadata blob for this path. None
+    /// for Local / Virtual / Staging repos and for Remote repos whose cache
+    /// hasn't been populated yet (e.g. an artifact that exists as a DB row
+    /// from a direct upload but has never been fetched through the proxy).
+    /// (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the proxy cache entry for this artifact will expire and be
+    /// re-validated against upstream. Same gating as `cache_cached_at`. (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1693,6 +1706,12 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
+        // Cache metadata is surfaced only by the per-artifact metadata
+        // endpoint to avoid fanning out a storage GET per artifact in
+        // listings (#1541). Helpers used by listings leave these as None;
+        // get_artifact_metadata populates them after the fact.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }
 }
 
@@ -1737,6 +1756,8 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         });
     }
     out
@@ -2423,6 +2444,29 @@ pub async fn get_artifact_metadata(
         let downloads = artifact_service.get_download_stats(artifact.id).await?;
         let metadata = artifact_service.get_metadata(artifact.id).await?;
 
+        // #1541: surface proxy cache freshness on Remote repos so the UI
+        // can render "expires in 4 hours" / "expired" without a separate
+        // round-trip. Single storage GET, gated on `repo.repo_type ==
+        // Remote` AND `state.proxy_service.is_some()`. Tolerant of failure:
+        // a missing or unreadable metadata blob is a normal state for an
+        // artifact that has never been fetched through the proxy (e.g.
+        // direct-uploaded into a Remote repo, edge case but observed),
+        // so any error or `Ok(None)` collapses to None on both fields
+        // rather than failing the whole metadata response.
+        let cache_meta = if repo.repo_type == RepositoryType::Remote {
+            if let Some(proxy) = state.proxy_service.as_ref() {
+                proxy
+                    .get_cache_metadata(&key, &artifact.path)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         return Ok(Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
@@ -2435,6 +2479,8 @@ pub async fn get_artifact_metadata(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata.map(|m| m.metadata),
+            cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
+            cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
         })
         .into_response());
     }
@@ -2649,6 +2695,10 @@ pub async fn upload_artifact(
         download_count: downloads,
         created_at: artifact.created_at,
         metadata: metadata_json,
+        // Just-uploaded artifacts have no proxy cache state yet -- the
+        // cache is populated lazily on the first proxy fetch.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }))
 }
 
@@ -5296,10 +5346,101 @@ mod tests {
             download_count: 42,
             created_at: chrono::Utc::now(),
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
+        // Cache fields are omitted when None so the wire shape stays the
+        // same for non-Remote repos and for Remote repos without cache
+        // metadata (#1541).
+        assert!(!json.contains("cache_cached_at"));
+        assert!(!json.contains("cache_expires_at"));
+    }
+
+    #[test]
+    fn test_artifact_response_serialization_with_cache_metadata() {
+        // (#1541) When populated -- which only happens for Remote repos
+        // whose proxy is configured AND have a cache-metadata blob for
+        // the path -- both timestamps appear as ISO-8601 strings so the
+        // web client can render relative time without parsing custom
+        // formats.
+        let cached = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expires = chrono::DateTime::parse_from_rfc3339("2026-06-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let resp = ArtifactResponse {
+            id: Uuid::new_v4(),
+            repository_key: "pypi-remote".to_string(),
+            path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
+            name: "requests-2.31.0-py3-none-any.whl".to_string(),
+            version: Some("2.31.0".to_string()),
+            size_bytes: 62500,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: cached,
+            metadata: None,
+            cache_cached_at: Some(cached),
+            cache_expires_at: Some(expires),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
+        assert!(json.contains("\"cache_expires_at\":\"2026-06-02T10:00:00Z\""));
+    }
+
+    #[test]
+    fn get_artifact_metadata_populates_cache_fields_only_for_remote() {
+        // (#1541) Structural assertion: the per-artifact metadata handler
+        // must (a) gate the cache-metadata read on `repo.repo_type ==
+        // RepositoryType::Remote`, (b) further guard on
+        // `state.proxy_service.as_ref()` so a non-proxy deployment doesn't
+        // panic, and (c) call the new public ProxyService method
+        // `get_cache_metadata`. Pinning the source string here keeps the
+        // cost-control invariant from quietly drifting if someone later
+        // refactors the handler -- e.g. moving the storage GET ahead of
+        // the type guard would silently fan out a per-list-item cost we
+        // explicitly chose to avoid.
+        //
+        // The pattern is intentionally tolerant of `cargo fmt` reformatting
+        // the chain across multiple lines, the way the proxy-service guard
+        // in `invalidate_cache` has to be (#1539). We assert on the pieces,
+        // not on a single multi-line string match.
+        let source = include_str!("repositories.rs");
+
+        // Find the body of the get_artifact_metadata handler (between its
+        // `pub async fn get_artifact_metadata(` opener and the next
+        // top-level `pub async fn` / `pub fn` / unindented `}` -- in
+        // practice the upload_artifact attribute that follows).
+        let start = source
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata handler not found");
+        let after = &source[start..];
+        let end_rel = after
+            .find("\n/// Upload artifact")
+            .expect("expected upload_artifact doc-comment to terminate the handler");
+        let body = &after[..end_rel];
+
+        assert!(
+            body.contains("RepositoryType::Remote"),
+            "handler must gate cache lookup on RepositoryType::Remote"
+        );
+        assert!(
+            body.contains("state.proxy_service.as_ref()"),
+            "handler must guard on state.proxy_service.as_ref() before calling the proxy"
+        );
+        assert!(
+            body.contains(".get_cache_metadata("),
+            "handler must call ProxyService::get_cache_metadata"
+        );
+        assert!(
+            body.contains("cache_cached_at:") && body.contains("cache_expires_at:"),
+            "handler must populate both cache_cached_at and cache_expires_at"
+        );
     }
 
     #[test]
