@@ -1896,6 +1896,8 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        cache_cached_at: None,
+        cache_expires_at: None,
     }
 }
 
