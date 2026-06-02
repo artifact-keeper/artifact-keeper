@@ -1542,6 +1542,26 @@ pub async fn list_artifacts(
         .await;
     }
 
+    // Remote (proxy) repositories no longer record cached items in the
+    // `artifacts` table (#1278 / #1280): doing so reintroduced a doubled-prefix
+    // storage path bug on filesystem backends. The cached bodies and metadata
+    // sidecars still live in the storage backend under `proxy-cache/<key>/`, so
+    // the listing is reconstructed from there. Without this, packages pulled
+    // through a remote repo fill up storage but never appear in the UI, so they
+    // can't be browsed or scanned (#1548, web #424).
+    if repo.repo_type == RepositoryType::Remote {
+        return list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
+
     let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
         // Members are returned in priority order; local/hosted members are
@@ -1641,6 +1661,142 @@ pub async fn list_artifacts(
         components: None,
         docker_tags: None,
     }))
+}
+
+/// List the artifacts a remote (proxy) repository has cached.
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so they are
+/// reconstructed from the storage backend by [`ProxyService::list_cached_artifacts`].
+/// Each entry is mapped to an [`ArtifactResponse`]; entries carry no DB id,
+/// version, or download count, so those fields take their natural defaults
+/// (a deterministic synthetic id derived from `repo_key + path`, `None`
+/// version, zero downloads). Filtering and pagination happen in-process over
+/// the recovered set, since there is no DB query to push them into. See #1548
+/// and web #424.
+async fn list_remote_cached_artifacts(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    key: &str,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    let entries = match state.proxy_service.as_deref() {
+        Some(proxy) => proxy.list_cached_artifacts(&repo.key).await,
+        // No proxy service configured (e.g. proxying disabled): nothing cached.
+        None => Vec::new(),
+    };
+
+    let (page_entries, total) = filter_and_paginate_cached(entries, path_prefix, q, page, per_page);
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    let items = page_entries
+        .into_iter()
+        .map(|entry| build_cached_artifact_response(&entry, key))
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items,
+        pagination: Pagination {
+            page,
+            per_page,
+            total: total as i64,
+            total_pages,
+        },
+        components: None,
+        docker_tags: None,
+    }))
+}
+
+/// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
+/// cache entries, then return the slice for the requested page along with the
+/// total match count.
+///
+/// `path_prefix` matches against the start of the logical path; `q` is a
+/// case-insensitive substring match against the path. Pure so the
+/// filter/paginate logic is unit-testable without a storage backend.
+fn filter_and_paginate_cached(
+    entries: Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> (
+    Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    usize,
+) {
+    let q_lower = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let mut matched: Vec<_> = entries
+        .into_iter()
+        .filter(|e| match path_prefix {
+            Some(prefix) if !prefix.is_empty() => e.path.starts_with(prefix),
+            _ => true,
+        })
+        .filter(|e| match &q_lower {
+            Some(needle) => e.path.to_lowercase().contains(needle),
+            None => true,
+        })
+        .collect();
+
+    // Stable ordering for deterministic pagination across requests.
+    matched.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let total = matched.len();
+    let offset = ((page.saturating_sub(1)) as usize).saturating_mul(per_page as usize);
+    let page_items = matched
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+    (page_items, total)
+}
+
+/// Deterministic artifact id for a proxy-cached object.
+///
+/// The `uuid` crate is built with only the `v4` feature, so a UUIDv5 is not
+/// available. Instead the id is the first 16 bytes of a SHA-256 over the
+/// cache storage key `proxy-cache/<repo_key>/<path>`. This is stable across
+/// listing calls for a given object and effectively never collides with the
+/// random v4 ids the database assigns to hosted artifacts.
+fn cached_artifact_id(repo_key: &str, path: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("proxy-cache/{}/{}", repo_key, path).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Map a recovered proxy cache entry to the listing's [`ArtifactResponse`].
+///
+/// The id is deterministic over `<repo_key>/<path>` (see
+/// [`cached_artifact_id`]) so the same cached object always reports the same
+/// id across listing calls (useful for client-side keying) without colliding
+/// with the random v4 ids hosted artifacts get from the database.
+fn build_cached_artifact_response(
+    entry: &crate::services::proxy_service::CachedArtifactEntry,
+    repo_key: &str,
+) -> ArtifactResponse {
+    let id = cached_artifact_id(repo_key, &entry.path);
+    ArtifactResponse {
+        id,
+        repository_key: repo_key.to_string(),
+        path: entry.path.clone(),
+        name: entry.name.clone(),
+        version: None,
+        size_bytes: entry.size_bytes,
+        checksum_sha256: entry.checksum_sha256.clone(),
+        content_type: entry.content_type.clone(),
+        download_count: 0,
+        created_at: entry.cached_at,
+        metadata: None,
+    }
 }
 
 /// Build the `ArtifactResponse` representing a single primary artifact row.
@@ -4029,6 +4185,94 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // Remote proxy-cache listing (#1548, web #424)
+    // -----------------------------------------------------------------------
+
+    fn make_cached_entry(path: &str) -> crate::services::proxy_service::CachedArtifactEntry {
+        crate::services::proxy_service::CachedArtifactEntry {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size_bytes: 1234,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            cached_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_returns_all_sorted() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, None, 1, 20);
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        // Sorted by path.
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[1].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_path_prefix() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, Some("lodash/"), None, 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_case_insensitive_query() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, Some("IS-ODD"), 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_paginates() {
+        let entries = vec![
+            make_cached_entry("a"),
+            make_cached_entry("b"),
+            make_cached_entry("c"),
+        ];
+        let (page2, total) = filter_and_paginate_cached(entries, None, None, 2, 2);
+        assert_eq!(total, 3);
+        // page size 2, page 2 -> just "c"
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].path, "c");
+    }
+
+    #[test]
+    fn test_build_cached_artifact_response_maps_fields_and_is_deterministic() {
+        let entry = make_cached_entry("express/-/express-4.18.2.tgz");
+        let resp = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.repository_key, "npm-remote");
+        assert_eq!(resp.path, "express/-/express-4.18.2.tgz");
+        assert_eq!(resp.name, "express-4.18.2.tgz");
+        assert_eq!(resp.size_bytes, 1234);
+        assert_eq!(resp.checksum_sha256, "deadbeef");
+        assert_eq!(resp.download_count, 0);
+        assert!(resp.version.is_none());
+        // Same repo_key + path always yields the same id.
+        let resp2 = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.id, resp2.id);
+        // Different path yields a different id.
+        let other = make_cached_entry("express/-/express-4.18.3.tgz");
+        assert_ne!(
+            resp.id,
+            build_cached_artifact_response(&other, "npm-remote").id
+        );
+    }
 
     // -----------------------------------------------------------------------
     // expand_maven_secondary_files & build_artifact_response (#1092)

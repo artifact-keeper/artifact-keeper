@@ -113,7 +113,13 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Setting workspace version to ${VERSION}"
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          # Portable in-place edit: GNU `sed -i` and BSD/macOS `sed -i` take
+          # incompatible arguments (BSD requires a backup suffix), which broke
+          # the macOS release builds (#1538: "sed: 1: Cargo.toml: invalid
+          # command code C"). Use a temp file so the same step works on the
+          # Linux and macOS runners alike.
+          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
           head -5 Cargo.toml
 
       - name: Build
