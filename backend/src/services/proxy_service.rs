@@ -5106,6 +5106,184 @@ SHA256:
     }
 
     // -----------------------------------------------------------------------
+    // list_cached_artifacts: storage-backed read path (#1548 / web #424).
+    // Exercises the full method against a mock backend: the prefix list, the
+    // sidecar read per logical path, the missing-sidecar skip, the
+    // content-type default, and the listing-error -> empty fallback. The
+    // pure key parsing is covered by the cached_artifact_paths tests above.
+    // -----------------------------------------------------------------------
+
+    /// Storage backend that returns a fixed key set from `list()` and serves
+    /// sidecar JSON from `get()` for keys present in `sidecars`. `list_fails`
+    /// drives the listing-error path.
+    struct CachedListingMock {
+        keys: Vec<String>,
+        sidecars: std::collections::HashMap<String, Bytes>,
+        list_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CachedListingMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            match self.sidecars.get(key) {
+                Some(b) => Ok(b.clone()),
+                None => Err(AppError::NotFound(key.to_string())),
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn sidecar_bytes(
+        size: i64,
+        checksum: &str,
+        content_type: Option<&str>,
+        cached_at: chrono::DateTime<chrono::Utc>,
+    ) -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at,
+            upstream_etag: None,
+            storage_etag: None,
+            expires_at: cached_at + chrono::Duration::hours(1),
+            content_type: content_type.map(|s| s.to_string()),
+            size_bytes: size,
+            checksum_sha256: checksum.to_string(),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn content_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__content__", repo, path)
+    }
+    fn meta_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__cache_meta__.json", repo, path)
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_returns_entries_from_sidecars() {
+        let repo = "npm-remote";
+        let pa = "is-odd/-/is-odd-3.0.1.tgz";
+        let pb = "lodash/-/lodash-4.17.21.tgz";
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, pa),
+            sidecar_bytes(123, &"a".repeat(64), Some("application/gzip"), now),
+        );
+        // pb sidecar has no content_type -> entry should default it.
+        sidecars.insert(
+            meta_key(repo, pb),
+            sidecar_bytes(456, &"b".repeat(64), None, now),
+        );
+        let keys = vec![
+            content_key(repo, pa),
+            meta_key(repo, pa),
+            content_key(repo, pb),
+            meta_key(repo, pb),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let mut entries = service.list_cached_artifacts(repo).await;
+        entries.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(entries.len(), 2);
+
+        let a = &entries[0];
+        assert_eq!(a.path, pa);
+        assert_eq!(a.name, "is-odd-3.0.1.tgz");
+        assert_eq!(a.size_bytes, 123);
+        assert_eq!(a.checksum_sha256, "a".repeat(64));
+        assert_eq!(a.content_type, "application/gzip");
+
+        let b = &entries[1];
+        assert_eq!(b.name, "lodash-4.17.21.tgz");
+        assert_eq!(
+            b.content_type, "application/octet-stream",
+            "missing content_type must default to application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_skips_entry_with_missing_sidecar() {
+        let repo = "npm-remote";
+        let good = "ok/-/ok-1.0.0.tgz";
+        let bad = "broken/-/broken-1.0.0.tgz"; // content listed, no sidecar
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, good),
+            sidecar_bytes(10, &"c".repeat(64), Some("application/octet-stream"), now),
+        );
+        let keys = vec![
+            content_key(repo, good),
+            meta_key(repo, good),
+            content_key(repo, bad),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let entries = service.list_cached_artifacts(repo).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an entry whose sidecar is missing must be skipped"
+        );
+        assert_eq!(entries[0].path, good);
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_empty_when_listing_fails() {
+        let mock = Arc::new(CachedListingMock {
+            keys: Vec::new(),
+            sidecars: std::collections::HashMap::new(),
+            list_fails: true,
+        });
+        let service = build_proxy_service_with_storage(mock);
+        assert!(
+            service.list_cached_artifacts("npm-remote").await.is_empty(),
+            "a storage listing error must yield no cached artifacts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // extract_streaming_headers: pure header parsing. Verifies the
     // Content-Length parse-or-skip behaviour and the etag/content-type
     // round-trip without a reqwest::Response. #895.
