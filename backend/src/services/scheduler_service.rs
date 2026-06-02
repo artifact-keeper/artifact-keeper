@@ -420,9 +420,13 @@ pub fn spawn_all(
         });
     }
 
-    // Chunked upload session cleanup (every hour)
+    // Upload cleanup (every hour): expired chunked-upload session rows, plus a
+    // filesystem sweep of staged temp files orphaned by crashed receives
+    // (OOM / eviction / restart skip the handler's own cleanup). Both expire on
+    // the same max-age (`UPLOAD_STAGING_MAX_AGE_HOURS`).
     {
         let db = db.clone();
+        let storage_path = config.storage_path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
@@ -437,6 +441,23 @@ pub fn spawn_all(
                     }
                     Err(e) => {
                         tracing::warn!("Upload session cleanup failed: {}", e);
+                    }
+                    _ => {}
+                }
+
+                // Reap staged incus upload temp files left under <STORAGE_PATH>/
+                // .incoming by uploads that died before their own cleanup ran.
+                match crate::api::handlers::staging::sweep_stale(
+                    &storage_path,
+                    crate::api::handlers::staging::UPLOAD_STAGING_MAX_AGE_HOURS,
+                )
+                .await
+                {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Reaped {} stale upload staging entr(ies)", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Upload staging sweep failed: {}", e);
                     }
                     _ => {}
                 }

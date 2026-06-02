@@ -159,6 +159,7 @@ pub mod signing;
 pub mod smtp;
 pub mod sso;
 pub mod sso_admin;
+pub mod staging;
 pub mod storage_gc;
 pub mod swift;
 pub mod sync_policies;

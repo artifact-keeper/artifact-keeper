@@ -189,17 +189,16 @@ pub(crate) fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
 /// Uploads stage to this on-disk path so PATCH continuations can append
 /// without re-downloading the in-progress object from the storage backend.
 /// The final, durable copy is written via `StorageBackend::put_stream` at
-/// completion time. The base directory is `$AK_INCUS_UPLOAD_TMP_DIR` if
-/// set, otherwise `std::env::temp_dir()`. This is intentionally NOT the
-/// repository's configured storage path: when the backend is S3/GCS, the
-/// repo's `storage_path` is a bucket-relative key prefix, not a local
-/// filesystem path, so staging there would either fail (the path isn't
-/// writable on disk) or land bytes in a location nothing reads back.
-pub(crate) fn temp_upload_path(session_id: &Uuid) -> PathBuf {
-    let root = std::env::var("AK_INCUS_UPLOAD_TMP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    root.join(format!("ak-incus-upload-{}", session_id))
+/// completion time.
+///
+/// Staging goes through the shared [`crate::api::handlers::staging`] facility,
+/// which roots under `<STORAGE_PATH>/.incoming` (the data volume) rather than
+/// `/tmp` — a multi-GiB image staged on the small `/tmp` emptyDir evicts the
+/// pod mid-receive. `config.storage_path` here is the local writable mount,
+/// NOT a repo's bucket-relative `storage_path`, so it's always a real on-disk
+/// location regardless of `STORAGE_BACKEND`.
+pub(crate) fn temp_upload_path(storage_path: &str, session_id: &Uuid) -> PathBuf {
+    crate::api::handlers::staging::staging_temp_path(storage_path, "incus", session_id)
 }
 
 /// Open the staged upload temp file as a `BoxStream<Result<Bytes>>` ready
@@ -763,7 +762,7 @@ async fn upload_image(
     // filesystem temp-and-rename), so peak memory per upload is bounded
     // to STREAM_CHUNK_BUDGET regardless of image size.
     let temp_id = Uuid::new_v4();
-    let temp_path = temp_upload_path(&temp_id);
+    let temp_path = temp_upload_path(&state.config.storage_path, &temp_id);
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
     // Extract metadata from the file on disk
@@ -963,7 +962,7 @@ async fn start_chunked_upload(
     // The chosen path is persisted to `incus_upload_sessions.storage_temp_path`,
     // so subsequent chunk/complete/cancel calls read it back from the
     // session row and don't need to re-derive it.
-    let temp_path = temp_upload_path(&session_id);
+    let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
 
     // Stream initial body (may be empty) to temp file
     let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
@@ -1431,35 +1430,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_temp_upload_path_uses_env_override() {
-        // SAFETY: tests in this crate are run serially per #[test] but
-        // env mutation can still race. Snapshot + restore around the
-        // assertion.
-        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
-        std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", "/var/tmp/ak-incus");
+    fn test_temp_upload_path_stages_under_storage_path() {
+        // Delegates to the shared staging facility: incus-namespaced, rooted
+        // at <storage_path>/.incoming (the data volume), never /tmp. The env
+        // override (AK_UPLOAD_STAGING_DIR) is covered by the staging module's
+        // own tests; here we just pin the incus default + naming.
+        // SAFETY: snapshot/restore the staging env so a stray override in the
+        // process env can't perturb the default assertion.
+        let prev = std::env::var("AK_UPLOAD_STAGING_DIR").ok();
+        std::env::remove_var("AK_UPLOAD_STAGING_DIR");
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let path = temp_upload_path(&id);
         assert_eq!(
-            path,
-            PathBuf::from("/var/tmp/ak-incus/ak-incus-upload-550e8400-e29b-41d4-a716-446655440000")
+            temp_upload_path("/data/storage", &id),
+            PathBuf::from(
+                "/data/storage/.incoming/ak-incus-upload-550e8400-e29b-41d4-a716-446655440000"
+            )
         );
-        match prev {
-            Some(v) => std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v),
-            None => std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR"),
-        }
-    }
-
-    #[test]
-    fn test_temp_upload_path_falls_back_to_temp_dir() {
-        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
-        std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR");
-        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let path = temp_upload_path(&id);
-        let expected =
-            std::env::temp_dir().join("ak-incus-upload-00000000-0000-0000-0000-000000000001");
-        assert_eq!(path, expected);
         if let Some(v) = prev {
-            std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v);
+            std::env::set_var("AK_UPLOAD_STAGING_DIR", v);
         }
     }
 
@@ -3129,7 +3117,7 @@ mod streaming_pipeline_regression_tests {
         );
 
         // Staging temp file MUST be gone after complete.
-        let temp_path = temp_upload_path(&session_id);
+        let temp_path = temp_upload_path(&f.state.config.storage_path, &session_id);
         assert!(
             !temp_path.exists(),
             "staged temp file must be removed after complete_chunked_upload (path: {})",

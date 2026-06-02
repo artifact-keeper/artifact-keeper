@@ -732,9 +732,11 @@ pub async fn run_cleanup(
 
     if request.cleanup_stale_uploads.unwrap_or(false) {
         use crate::api::handlers::incus::cleanup_stale_sessions;
-        result.stale_uploads_deleted = cleanup_stale_sessions(&state.db, 24)
-            .await
-            .map_err(AppError::Internal)?;
+        use crate::api::handlers::staging::UPLOAD_STAGING_MAX_AGE_HOURS;
+        result.stale_uploads_deleted =
+            cleanup_stale_sessions(&state.db, UPLOAD_STAGING_MAX_AGE_HOURS as i64)
+                .await
+                .map_err(AppError::Internal)?;
     }
 
     Ok(Json(result))
