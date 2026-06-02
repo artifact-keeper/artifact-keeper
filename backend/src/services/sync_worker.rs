@@ -2,16 +2,18 @@
 //!
 //! Processes the `sync_tasks` queue by transferring artifacts to remote peer
 //! instances.  Runs on a 10-second tick, respects per-peer concurrency limits,
-//! sync windows, and exponential backoff on failures.
+//! sync windows, and configurable backoff on failures.
 //!
 //! For artifacts larger than `SYNC_CHUNKED_THRESHOLD_BYTES`, the worker uses
 //! the swarm-based chunked transfer system instead of sending the full file
 //! in a single HTTP request.  This prevents timeouts and memory exhaustion
 //! when syncing large Docker images, ML models, etc.
 
+use crate::storage::{StorageLocation, StorageRegistry};
 use chrono::{NaiveTime, Timelike, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
@@ -23,6 +25,12 @@ use uuid::Uuid;
 /// a 90s test budget; production should keep the conservative default to
 /// avoid flapping under transient heartbeat loss.
 const STALE_PEER_THRESHOLD_MINUTES: i32 = 5;
+
+/// Default interval between active peer liveness probes.
+const PEER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+
+/// Default timeout for one peer liveness probe request.
+const PEER_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
 
 /// How many ticks (10s each) between stale peer detection runs.
 /// 6 ticks = 60 seconds.
@@ -105,12 +113,30 @@ const DEFAULT_CHUNKED_THRESHOLD_BYTES: i64 = 100 * 1024 * 1024;
 /// Override with the `SYNC_CHUNK_SIZE_BYTES` env var.
 const DEFAULT_SYNC_CHUNK_SIZE_BYTES: i32 = 50 * 1024 * 1024;
 
+const REPLICATION_REQUEST_HEADER: &str = "X-Artifact-Keeper-Replication";
+const REPLICATION_REQUEST_VALUE: &str = "true";
+
+/// Default retry backoff cap for sync tasks.
+///
+/// The default base backoff is the same value, so retries happen every five
+/// minutes unless operators explicitly opt back into exponential backoff.
+pub(crate) const DEFAULT_SYNC_TASK_RETRY_BACKOFF_MAX_SECS: u64 = 300;
+
+/// Default maximum retries for sync tasks (matches migration default).
+#[allow(dead_code)]
+pub(crate) const DEFAULT_MAX_RETRIES: i32 = 3;
+
 /// Check whether the current tick should trigger a stale peer detection run.
 ///
 /// Returns `true` every `interval_ticks` ticks (e.g. every 6th tick = 60s
 /// when each tick is 10s).
 pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bool {
     interval_ticks > 0 && tick_count % interval_ticks == 0
+}
+
+/// Check whether the current tick should trigger an active peer heartbeat probe.
+pub(crate) fn should_run_peer_heartbeat_probe(tick_count: u64, interval_ticks: u64) -> bool {
+    tick_count > 0 && interval_ticks > 0 && (tick_count == 1 || tick_count % interval_ticks == 0)
 }
 
 /// Compute the effective stale check period in seconds.
@@ -144,7 +170,7 @@ pub(crate) fn format_stale_detection_log(
 /// The worker runs in an infinite loop on a 10-second interval, picking up
 /// pending sync tasks and dispatching transfers to remote peers.  Every 60
 /// seconds it also checks for stale peers and marks them offline.
-pub async fn spawn_sync_worker(db: PgPool) {
+pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry>) {
     tokio::spawn(async move {
         // Small startup delay so the server can finish initializing.
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -162,6 +188,20 @@ pub async fn spawn_sync_worker(db: PgPool) {
         let mut tick_count: u64 = 0;
         let stale_interval_ticks = stale_check_interval_ticks();
         let stale_threshold_min = stale_peer_threshold_minutes();
+        let peer_heartbeat_enabled = env_bool("PEER_HEARTBEAT_ENABLED", true);
+        let peer_heartbeat_interval_secs = env_u64_min(
+            "PEER_HEARTBEAT_INTERVAL_SECS",
+            PEER_HEARTBEAT_INTERVAL_SECS,
+            TICK_INTERVAL_SECS,
+        );
+        let peer_heartbeat_interval_ticks =
+            interval_ticks_for_secs(peer_heartbeat_interval_secs, TICK_INTERVAL_SECS);
+        let peer_heartbeat_timeout_secs = env_u64_min(
+            "PEER_HEARTBEAT_TIMEOUT_SECS",
+            PEER_HEARTBEAT_TIMEOUT_SECS,
+            1,
+        );
+        let retry_policy = SyncRetryPolicy::from_env();
         tracing::info!(
             "Sync worker started: stale-check every {}s, threshold {}m, failover deadline ~{}s",
             stale_interval_ticks * TICK_INTERVAL_SECS,
@@ -172,17 +212,46 @@ pub async fn spawn_sync_worker(db: PgPool) {
                 TICK_INTERVAL_SECS,
             )
         );
+        tracing::info!(
+            "Peer heartbeat probes are {} (interval={}s, timeout={}s)",
+            if peer_heartbeat_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            peer_heartbeat_interval_secs,
+            peer_heartbeat_timeout_secs,
+        );
+        tracing::info!(
+            "Sync task retry policy: max_retries={}, backoff_base={}s, backoff_max={}s",
+            retry_policy.max_retries,
+            retry_policy.backoff_base_secs,
+            retry_policy.backoff_max_secs,
+        );
 
         loop {
             tick.tick().await;
             tick_count += 1;
+
+            if peer_heartbeat_enabled
+                && should_run_peer_heartbeat_probe(tick_count, peer_heartbeat_interval_ticks)
+            {
+                run_peer_heartbeat_probes(
+                    &db,
+                    &client,
+                    Duration::from_secs(peer_heartbeat_timeout_secs),
+                )
+                .await;
+            }
 
             // Periodically check for stale peers and mark them offline.
             if should_run_stale_check(tick_count, stale_interval_ticks) {
                 run_stale_peer_detection(&db, stale_threshold_min).await;
             }
 
-            if let Err(e) = process_pending_tasks(&db, &client).await {
+            if let Err(e) =
+                process_pending_tasks(&db, &client, storage_registry.clone(), retry_policy).await
+            {
                 tracing::error!("Sync worker error: {e}");
             }
         }
@@ -205,6 +274,177 @@ async fn run_stale_peer_detection(db: &PgPool, threshold_minutes: i32) {
     }
 }
 
+async fn run_peer_heartbeat_probes(
+    db: &PgPool,
+    client: &reqwest::Client,
+    request_timeout: Duration,
+) {
+    let peers: Vec<PeerHeartbeatRow> = match sqlx::query_as(
+        r#"
+        SELECT id, name, endpoint_url, api_key
+        FROM peer_instances
+        WHERE is_local = false
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(peers) => peers,
+        Err(e) => {
+            tracing::warn!("Failed to load peers for heartbeat probe: {e}");
+            return;
+        }
+    };
+
+    for peer in peers {
+        match probe_peer(client, &peer, request_timeout).await {
+            Ok(()) => {
+                if let Err(e) = mark_peer_online(db, peer.id).await {
+                    tracing::warn!(
+                        "Peer heartbeat probe succeeded for '{}', but status update failed: {e}",
+                        peer.name
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Peer heartbeat probe failed for '{}': {e}", peer.name);
+                if let Err(update_err) = mark_peer_probe_failed(db, peer.id).await {
+                    tracing::warn!(
+                        "Failed to record heartbeat probe failure for '{}': {update_err}",
+                        peer.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn probe_peer(
+    client: &reqwest::Client,
+    peer: &PeerHeartbeatRow,
+    request_timeout: Duration,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/peers", peer.endpoint_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", peer.api_key))
+        .timeout(request_timeout)
+        .send()
+        .await
+        .map_err(|e| format!("request to {url} failed: {e}"))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "request to {url} returned HTTP {}",
+            response.status()
+        ))
+    }
+}
+
+async fn mark_peer_online(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE peer_instances
+        SET status = 'online',
+            last_heartbeat_at = NOW(),
+            consecutive_failures = 0,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(peer_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_peer_probe_failed(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE peer_instances
+        SET consecutive_failures = CASE
+                WHEN consecutive_failures < 2147483647 THEN consecutive_failures + 1
+                ELSE consecutive_failures
+            END,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(peer_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+fn env_u64_min(key: &str, default: u64, min: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(min)
+}
+
+fn env_i32_min(key: &str, default: i32, min: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+        .max(min)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncRetryPolicy {
+    max_retries: i32,
+    backoff_base_secs: u64,
+    backoff_max_secs: u64,
+}
+
+impl SyncRetryPolicy {
+    fn from_env() -> Self {
+        let backoff_max_secs = env_u64_min(
+            "SYNC_TASK_RETRY_BACKOFF_MAX_SECS",
+            DEFAULT_SYNC_TASK_RETRY_BACKOFF_MAX_SECS,
+            1,
+        );
+        let backoff_base_secs =
+            env_u64_min("SYNC_TASK_RETRY_BACKOFF_BASE_SECS", backoff_max_secs, 1);
+        let max_retries = env_i32_min("SYNC_TASK_MAX_RETRIES", DEFAULT_MAX_RETRIES, 1);
+
+        Self {
+            max_retries,
+            backoff_base_secs,
+            backoff_max_secs,
+        }
+    }
+
+    fn calculate_backoff(self, consecutive_failures: i32) -> Duration {
+        calculate_configured_backoff(
+            consecutive_failures,
+            self.backoff_base_secs,
+            self.backoff_max_secs,
+        )
+    }
+}
+
+fn interval_ticks_for_secs(interval_secs: u64, tick_secs: u64) -> u64 {
+    interval_secs.div_ceil(tick_secs).max(1)
+}
+
 // ── Internal row types ──────────────────────────────────────────────────────
 
 /// Lightweight projection of `peer_instances` used by the worker.
@@ -219,6 +459,15 @@ struct PeerRow {
     sync_window_timezone: Option<String>,
     concurrent_transfers_limit: Option<i32>,
     active_transfers: i32,
+}
+
+/// Lightweight projection used by active peer heartbeat probes.
+#[derive(Debug, sqlx::FromRow)]
+struct PeerHeartbeatRow {
+    id: Uuid,
+    name: String,
+    endpoint_url: String,
+    api_key: String,
 }
 
 /// Lightweight projection of a pending sync task joined with the artifact.
@@ -236,6 +485,8 @@ struct TaskRow {
     artifact_path: String,
     repository_key: String,
     repository_id: Uuid,
+    repository_storage_backend: String,
+    repository_storage_path: String,
     content_type: String,
     checksum_sha256: String,
     task_type: String,
@@ -330,7 +581,12 @@ async fn get_local_peer_id(db: &PgPool) -> Option<Uuid> {
 // ── Core logic ──────────────────────────────────────────────────────────────
 
 /// Process all eligible peers and their pending sync tasks.
-async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<(), String> {
+async fn process_pending_tasks(
+    db: &PgPool,
+    client: &reqwest::Client,
+    storage_registry: Arc<StorageRegistry>,
+    retry_policy: SyncRetryPolicy,
+) -> Result<(), String> {
     // Fetch non-local peers that are online or syncing and not in backoff.
     let peers: Vec<PeerRow> = sqlx::query_as(
         r#"
@@ -363,7 +619,13 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
         UPDATE sync_tasks
         SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL
         WHERE status = 'failed'
-          AND retry_count < max_retries
+          AND retry_count < GREATEST(max_retries, $1)
+          AND EXISTS (
+              SELECT 1
+              FROM artifacts a
+              WHERE a.id = sync_tasks.artifact_id
+                AND (sync_tasks.task_type = 'delete' OR a.is_deleted = false)
+          )
           AND peer_instance_id = ANY(
               SELECT id FROM peer_instances
               WHERE is_local = false
@@ -372,6 +634,7 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
           )
         "#,
     )
+    .bind(retry_policy.max_retries)
     .execute(db)
     .await
     .map_err(|e| format!("Failed to reset retriable tasks: {e}"))?;
@@ -434,12 +697,14 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                 a.path AS artifact_path,
                 r.key AS repository_key,
                 r.id AS repository_id,
+                r.storage_backend AS repository_storage_backend,
+                r.storage_path AS repository_storage_path,
                 a.content_type,
                 a.checksum_sha256,
                 st.task_type,
                 prs.replication_filter,
                 st.retry_count,
-                st.max_retries
+                GREATEST(st.max_retries, $3)::INT AS max_retries
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
             JOIN repositories r ON r.id = a.repository_id
@@ -448,12 +713,14 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                AND prs.repository_id = r.id
             WHERE st.peer_instance_id = $1
               AND st.status = 'pending'
+              AND (st.task_type = 'delete' OR a.is_deleted = false)
             ORDER BY st.priority DESC, st.created_at ASC
             LIMIT $2
             "#,
         )
         .bind(peer.id)
         .bind(available_slots as i64)
+        .bind(retry_policy.max_retries)
         .fetch_all(db)
         .await
         .map_err(|e| format!("Failed to fetch tasks for peer '{}': {e}", peer.name))?;
@@ -500,10 +767,19 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
             let db = db.clone();
             let client = client.clone();
             let peer_name = peer.name.clone();
+            let storage_registry = storage_registry.clone();
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    execute_transfer(&db, &client, &task, &peer_endpoint, &peer_api_key).await
+                if let Err(e) = execute_transfer(
+                    &db,
+                    &client,
+                    storage_registry,
+                    &task,
+                    &peer_endpoint,
+                    &peer_api_key,
+                    retry_policy,
+                )
+                .await
                 {
                     tracing::error!(
                         "Transfer failed for task {} to peer '{}': {e}",
@@ -522,9 +798,11 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
 async fn execute_transfer(
     db: &PgPool,
     client: &reqwest::Client,
+    storage_registry: Arc<StorageRegistry>,
     task: &TaskRow,
     peer_endpoint: &str,
     peer_api_key: &str,
+    retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
     // 1. Mark task as in_progress, increment active_transfers.
     sqlx::query(
@@ -552,35 +830,48 @@ async fn execute_transfer(
     .map_err(|e| format!("Failed to increment active_transfers: {e}"))?;
 
     if task.task_type == "delete" {
-        return execute_delete(db, client, task, peer_endpoint, peer_api_key).await;
+        return execute_delete(db, client, task, peer_endpoint, peer_api_key, retry_policy).await;
     }
 
     // Push flow: decide between single-request upload and chunked transfer
     // based on the artifact size.
     let threshold = chunked_threshold_bytes();
     if should_use_chunked_transfer(task.artifact_size, threshold) {
-        return execute_chunked_transfer(db, client, task, peer_endpoint, peer_api_key).await;
+        return execute_chunked_transfer(
+            db,
+            client,
+            &storage_registry,
+            task,
+            peer_endpoint,
+            peer_api_key,
+            retry_policy,
+        )
+        .await;
     }
 
-    // Fast path for small artifacts: read entire file and POST in one request.
+    // Fast path for small artifacts: read entire file and PUT it to the same
+    // artifact path on the remote peer. POST /artifacts is the multipart upload
+    // endpoint.
 
     // 2. Read the artifact bytes from local storage.
-    let file_bytes = match read_artifact_from_storage(db, &task.storage_key).await {
+    let file_bytes = match read_artifact_from_storage(&storage_registry, task).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            handle_transfer_failure(db, task, &format!("Storage read error: {e}")).await;
+            handle_transfer_failure(db, task, &format!("Storage read error: {e}"), retry_policy)
+                .await;
             return Err(format!("Storage read error: {e}"));
         }
     };
 
     let bytes_len = file_bytes.len() as i64;
 
-    // 3. POST the artifact to the remote peer.
-    let url = build_transfer_url(peer_endpoint, &task.repository_key);
+    // 3. PUT the artifact to the remote peer.
+    let url = build_transfer_url(peer_endpoint, &task.repository_key, &task.artifact_path);
 
     let result = client
-        .post(&url)
+        .put(&url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
         .header("Content-Type", &task.content_type)
         .header("X-Artifact-Name", &task.artifact_name)
         .header(
@@ -612,12 +903,12 @@ async fn execute_transfer(
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             let msg = format!("Remote peer returned {status}: {body}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
         Err(e) => {
             let msg = format!("HTTP request failed: {e}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
     }
@@ -632,9 +923,11 @@ async fn execute_transfer(
 async fn execute_chunked_transfer(
     db: &PgPool,
     client: &reqwest::Client,
+    storage_registry: &StorageRegistry,
     task: &TaskRow,
     peer_endpoint: &str,
     peer_api_key: &str,
+    retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
     let chunk_size = sync_chunk_size_bytes();
 
@@ -656,6 +949,7 @@ async fn execute_chunked_transfer(
     let init_response = client
         .post(&init_url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
         .header("Content-Type", "application/json")
         .json(&init_body)
         .send()
@@ -669,7 +963,7 @@ async fn execute_chunked_transfer(
             .await
             .unwrap_or_else(|_| "<unreadable>".to_string());
         let msg = format!("Chunked transfer init returned {status}: {body}");
-        handle_transfer_failure(db, task, &msg).await;
+        handle_transfer_failure(db, task, &msg, retry_policy).await;
         return Err(msg);
     }
 
@@ -690,7 +984,8 @@ async fn execute_chunked_transfer(
     for (chunk_index, byte_offset, byte_length) in &chunk_ranges {
         // Read just this chunk from storage.
         let chunk_data = match read_artifact_chunk_from_storage(
-            &task.storage_key,
+            storage_registry,
+            task,
             *byte_offset as u64,
             *byte_length as usize,
         )
@@ -702,7 +997,7 @@ async fn execute_chunked_transfer(
                     "Failed to read chunk {} (offset={}, len={}): {e}",
                     chunk_index, byte_offset, byte_length
                 );
-                handle_transfer_failure(db, task, &msg).await;
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
         };
@@ -725,6 +1020,7 @@ async fn execute_chunked_transfer(
         let upload_result = client
             .put(&chunk_upload_url)
             .header("Authorization", format!("Bearer {}", peer_api_key))
+            .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
             .header("Content-Type", "application/octet-stream")
             .header("X-Chunk-Offset", byte_offset.to_string())
             .header("X-Chunk-Length", byte_length.to_string())
@@ -750,6 +1046,7 @@ async fn execute_chunked_transfer(
                 let _ = client
                     .post(&complete_url)
                     .header("Authorization", format!("Bearer {}", peer_api_key))
+                    .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
                     .header("Content-Type", "application/json")
                     .json(&complete_body)
                     .send()
@@ -771,12 +1068,12 @@ async fn execute_chunked_transfer(
                     .await
                     .unwrap_or_else(|_| "<unreadable>".to_string());
                 let msg = format!("Chunk {} upload returned {status}: {body}", chunk_index);
-                handle_transfer_failure(db, task, &msg).await;
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
             Err(e) => {
                 let msg = format!("Chunk {} upload failed: {e}", chunk_index);
-                handle_transfer_failure(db, task, &msg).await;
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
         }
@@ -789,6 +1086,7 @@ async fn execute_chunked_transfer(
     let complete_result = client
         .post(&session_complete_url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
         .send()
         .await;
 
@@ -811,12 +1109,12 @@ async fn execute_chunked_transfer(
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             let msg = format!("Chunked transfer session complete returned {status}: {body}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
         Err(e) => {
             let msg = format!("Chunked transfer session complete failed: {e}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
     }
@@ -829,12 +1127,14 @@ async fn execute_delete(
     task: &TaskRow,
     peer_endpoint: &str,
     peer_api_key: &str,
+    retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
     let url = build_delete_url(peer_endpoint, &task.repository_key, &task.artifact_path);
 
     let result = client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
         .send()
         .await;
 
@@ -856,62 +1156,123 @@ async fn execute_delete(
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             let msg = format!("Remote peer returned {status} for delete: {body}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
         Err(e) => {
             let msg = format!("HTTP delete request failed: {e}");
-            handle_transfer_failure(db, task, &msg).await;
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
     }
 }
 
-/// Read artifact bytes from the storage backend using the storage_key.
-///
-/// Uses the `STORAGE_PATH` environment variable (same as the main server) to
-/// locate the filesystem storage root.  For S3 backends the storage_key is
-/// fetched directly.
-async fn read_artifact_from_storage(_db: &PgPool, storage_key: &str) -> Result<Vec<u8>, String> {
-    // Determine storage path from env (fallback to default).
-    let storage_path = std::env::var("STORAGE_PATH")
-        .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into());
-    let full_path = std::path::PathBuf::from(&storage_path).join(storage_key);
-
-    tokio::fs::read(&full_path)
-        .await
-        .map_err(|e| format!("Failed to read '{}': {e}", full_path.display()))
+fn storage_location_for_task(task: &TaskRow) -> StorageLocation {
+    StorageLocation {
+        backend: task.repository_storage_backend.clone(),
+        path: task.repository_storage_path.clone(),
+    }
 }
 
-/// Read a specific byte range from a stored artifact.
-///
-/// Seeks to `offset` and reads exactly `length` bytes.  Used by the chunked
-/// transfer path to avoid loading the entire artifact into memory.
+fn storage_for_task(
+    storage_registry: &StorageRegistry,
+    task: &TaskRow,
+) -> Result<Arc<dyn crate::storage::StorageBackend>, String> {
+    let location = storage_location_for_task(task);
+    storage_registry.backend_for(&location).map_err(|e| {
+        format!(
+            "Failed to resolve storage backend '{}': {e}",
+            location.backend
+        )
+    })
+}
+
+/// Read artifact bytes through the repository's configured storage backend.
+async fn read_artifact_from_storage(
+    storage_registry: &StorageRegistry,
+    task: &TaskRow,
+) -> Result<Vec<u8>, String> {
+    let storage = storage_for_task(storage_registry, task)?;
+
+    storage
+        .get(&task.storage_key)
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| {
+            let location = storage_location_for_task(task);
+            format!(
+                "Failed to read '{}' from storage backend '{}': {e}",
+                task.storage_key, location.backend
+            )
+        })
+}
+
+/// Read a specific byte range through the repository's configured storage backend.
 async fn read_artifact_chunk_from_storage(
-    storage_key: &str,
+    storage_registry: &StorageRegistry,
+    task: &TaskRow,
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    use futures::StreamExt;
 
-    let storage_path = std::env::var("STORAGE_PATH")
-        .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into());
-    let full_path = std::path::PathBuf::from(&storage_path).join(storage_key);
+    if length == 0 {
+        return Ok(Vec::new());
+    }
 
-    let mut file = tokio::fs::File::open(&full_path)
-        .await
-        .map_err(|e| format!("Failed to open '{}': {e}", full_path.display()))?;
+    let storage = storage_for_task(storage_registry, task)?;
+    let mut stream = storage.get_stream(&task.storage_key).await.map_err(|e| {
+        let location = storage_location_for_task(task);
+        format!(
+            "Failed to open stream for '{}' from storage backend '{}': {e}",
+            task.storage_key, location.backend
+        )
+    })?;
 
-    file.seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(|e| format!("Failed to seek in '{}': {e}", full_path.display()))?;
+    let mut consumed = 0u64;
+    let mut remaining = length;
+    let mut out = Vec::with_capacity(length);
 
-    let mut buf = vec![0u8; length];
-    file.read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("Failed to read chunk from '{}': {e}", full_path.display()))?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            let location = storage_location_for_task(task);
+            format!(
+                "Failed to read stream for '{}' from storage backend '{}': {e}",
+                task.storage_key, location.backend
+            )
+        })?;
+        let chunk_len = chunk.len() as u64;
+        let chunk_end = consumed.saturating_add(chunk_len);
 
-    Ok(buf)
+        if chunk_end <= offset {
+            consumed = chunk_end;
+            continue;
+        }
+
+        let start = offset.saturating_sub(consumed) as usize;
+        let available = &chunk[start..];
+        let take = available.len().min(remaining);
+        out.extend_from_slice(&available[..take]);
+        remaining -= take;
+
+        if remaining == 0 {
+            break;
+        }
+
+        consumed = chunk_end;
+    }
+
+    if out.len() == length {
+        Ok(out)
+    } else {
+        Err(format!(
+            "Failed to read complete chunk for '{}' (offset={}, length={}, got={})",
+            task.storage_key,
+            offset,
+            length,
+            out.len()
+        ))
+    }
 }
 
 /// Handle a successful transfer: mark task completed, update peer counters.
@@ -1028,17 +1389,18 @@ pub(crate) fn format_retry_log(
     }
 }
 
-/// Default maximum retries for sync tasks (matches migration default).
-#[allow(dead_code)]
-pub(crate) const DEFAULT_MAX_RETRIES: i32 = 3;
-
 /// Handle a failed transfer: mark task, apply backoff, update peer counters.
 ///
 /// If the task has remaining retries (`retry_count < max_retries`), it is
 /// marked `failed` with an incremented `retry_count`. The peer-recovery
 /// reset at the top of `process_pending_tasks` will flip it back to
 /// `pending` once the peer's backoff expires.
-async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &str) {
+async fn handle_transfer_failure(
+    db: &PgPool,
+    task: &TaskRow,
+    error_message: &str,
+    retry_policy: SyncRetryPolicy,
+) {
     let decision = evaluate_task_failure(task.retry_count, task.max_retries);
 
     // Mark task as failed with updated retry count.
@@ -1073,7 +1435,7 @@ async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &st
             .await
             .unwrap_or(0);
 
-    let backoff = calculate_backoff(consecutive);
+    let backoff = retry_policy.calculate_backoff(consecutive);
 
     // Update peer instance: decrement active_transfers, bump failure counters, set backoff.
     let _ = sqlx::query(
@@ -1094,12 +1456,17 @@ async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &st
     .await;
 }
 
-/// Build the full URL for posting an artifact to a remote peer.
-pub(crate) fn build_transfer_url(peer_endpoint: &str, repository_key: &str) -> String {
+/// Build the full URL for uploading an artifact to a remote peer.
+pub(crate) fn build_transfer_url(
+    peer_endpoint: &str,
+    repository_key: &str,
+    artifact_path: &str,
+) -> String {
     format!(
-        "{}/api/v1/repositories/{}/artifacts",
+        "{}/api/v1/repositories/{}/artifacts/{}",
         peer_endpoint.trim_end_matches('/'),
-        repository_key
+        repository_key,
+        encode_artifact_path(artifact_path)
     )
 }
 
@@ -1113,8 +1480,30 @@ pub(crate) fn build_delete_url(
         "{}/api/v1/repositories/{}/artifacts/{}",
         peer_endpoint.trim_end_matches('/'),
         repository_key,
-        artifact_path
+        encode_artifact_path(artifact_path)
     )
+}
+
+fn encode_artifact_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+
+    for byte in segment.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+
+    encoded
 }
 
 /// Build the URL to initialize a chunked transfer session on a peer.
@@ -1274,13 +1663,23 @@ fn matches_replication_filter(
     true
 }
 
-/// Calculate exponential backoff duration from consecutive failure count.
-///
-/// Formula: `min(300, 10 * 2^failures)` seconds.
+/// Calculate backoff duration from consecutive failure count using the default
+/// retry policy.
 pub fn calculate_backoff(consecutive_failures: i32) -> Duration {
+    SyncRetryPolicy::from_env().calculate_backoff(consecutive_failures)
+}
+
+pub(crate) fn calculate_configured_backoff(
+    consecutive_failures: i32,
+    base_secs: u64,
+    max_secs: u64,
+) -> Duration {
+    let failures = consecutive_failures.max(0) as u32;
+    let capped_base = base_secs.max(1);
+    let capped_max = max_secs.max(1);
     let secs = std::cmp::min(
-        300u64,
-        10u64.saturating_mul(2u64.saturating_pow(consecutive_failures as u32)),
+        capped_max,
+        capped_base.saturating_mul(2u64.saturating_pow(failures)),
     );
     Duration::from_secs(secs)
 }
@@ -1381,42 +1780,38 @@ mod tests {
 
     #[test]
     fn test_backoff_zero_failures() {
-        // 10 * 2^0 = 10s
+        // Default policy retries every five minutes.
         let d = calculate_backoff(0);
-        assert_eq!(d, Duration::from_secs(10));
+        assert_eq!(d, Duration::from_secs(300));
     }
 
     #[test]
     fn test_backoff_one_failure() {
-        // 10 * 2^1 = 20s
+        // Default base and max are both 300s, so there is no ramp-up.
         let d = calculate_backoff(1);
-        assert_eq!(d, Duration::from_secs(20));
+        assert_eq!(d, Duration::from_secs(300));
     }
 
     #[test]
     fn test_backoff_two_failures() {
-        // 10 * 2^2 = 40s
         let d = calculate_backoff(2);
-        assert_eq!(d, Duration::from_secs(40));
+        assert_eq!(d, Duration::from_secs(300));
     }
 
     #[test]
     fn test_backoff_three_failures() {
-        // 10 * 2^3 = 80s
         let d = calculate_backoff(3);
-        assert_eq!(d, Duration::from_secs(80));
+        assert_eq!(d, Duration::from_secs(300));
     }
 
     #[test]
     fn test_backoff_four_failures() {
-        // 10 * 2^4 = 160s
         let d = calculate_backoff(4);
-        assert_eq!(d, Duration::from_secs(160));
+        assert_eq!(d, Duration::from_secs(300));
     }
 
     #[test]
     fn test_backoff_five_failures_capped() {
-        // 10 * 2^5 = 320 → capped at 300
         let d = calculate_backoff(5);
         assert_eq!(d, Duration::from_secs(300));
     }
@@ -1431,10 +1826,28 @@ mod tests {
     #[test]
     fn test_backoff_negative_failures_treated_as_zero() {
         // Negative shouldn't happen but handle gracefully.
-        // 2^(u32::MAX wrap) would overflow; saturating_pow returns u64::MAX,
-        // then saturating_mul caps and min caps to 300.
         let d = calculate_backoff(-1);
         assert_eq!(d, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_configured_backoff_can_use_old_exponential_shape() {
+        assert_eq!(
+            calculate_configured_backoff(0, 10, 300),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            calculate_configured_backoff(1, 10, 300),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            calculate_configured_backoff(4, 10, 300),
+            Duration::from_secs(160)
+        );
+        assert_eq!(
+            calculate_configured_backoff(5, 10, 300),
+            Duration::from_secs(300)
+        );
     }
 
     // ── is_within_sync_window ───────────────────────────────────────────
@@ -1549,40 +1962,52 @@ mod tests {
     #[test]
     fn test_build_transfer_url_basic() {
         assert_eq!(
-            build_transfer_url("https://peer.example.com", "maven-releases"),
-            "https://peer.example.com/api/v1/repositories/maven-releases/artifacts"
+            build_transfer_url("https://peer.example.com", "maven-releases", "org/acme/app.jar"),
+            "https://peer.example.com/api/v1/repositories/maven-releases/artifacts/org/acme/app.jar"
         );
     }
 
     #[test]
     fn test_build_transfer_url_trailing_slash() {
         assert_eq!(
-            build_transfer_url("https://peer.example.com/", "npm-proxy"),
-            "https://peer.example.com/api/v1/repositories/npm-proxy/artifacts"
+            build_transfer_url("https://peer.example.com/", "npm-proxy", "@scope/pkg.tgz"),
+            "https://peer.example.com/api/v1/repositories/npm-proxy/artifacts/%40scope/pkg.tgz"
         );
     }
 
     #[test]
     fn test_build_transfer_url_multiple_trailing_slashes() {
         assert_eq!(
-            build_transfer_url("https://peer.example.com///", "cargo-local"),
-            "https://peer.example.com/api/v1/repositories/cargo-local/artifacts"
+            build_transfer_url(
+                "https://peer.example.com///",
+                "cargo-local",
+                "crates/foo crate"
+            ),
+            "https://peer.example.com/api/v1/repositories/cargo-local/artifacts/crates/foo%20crate"
         );
     }
 
     #[test]
     fn test_build_transfer_url_with_port() {
         assert_eq!(
-            build_transfer_url("http://localhost:8080", "docker-hub"),
-            "http://localhost:8080/api/v1/repositories/docker-hub/artifacts"
+            build_transfer_url("http://localhost:8080", "docker-hub", "v2/name/manifests/latest"),
+            "http://localhost:8080/api/v1/repositories/docker-hub/artifacts/v2/name/manifests/latest"
         );
     }
 
     #[test]
     fn test_build_transfer_url_with_path_prefix() {
         assert_eq!(
-            build_transfer_url("https://peer.example.com/v2", "pypi-local"),
-            "https://peer.example.com/v2/api/v1/repositories/pypi-local/artifacts"
+            build_transfer_url("https://peer.example.com/v2", "pypi-local", "pkg/file?x=1"),
+            "https://peer.example.com/v2/api/v1/repositories/pypi-local/artifacts/pkg/file%3Fx%3D1"
+        );
+    }
+
+    #[test]
+    fn test_build_delete_url_encodes_artifact_path() {
+        assert_eq!(
+            build_delete_url("https://peer.example.com", "raw", "dir/file name.txt"),
+            "https://peer.example.com/api/v1/repositories/raw/artifacts/dir/file%20name.txt"
         );
     }
 
@@ -1942,10 +2367,10 @@ mod tests {
     #[test]
     fn test_default_max_retries() {
         assert_eq!(DEFAULT_MAX_RETRIES, 3);
-        // First two failures are retriable with default max
+        // First two failures are retriable with default max.
         assert!(evaluate_task_failure(0, DEFAULT_MAX_RETRIES).is_retriable());
         assert!(evaluate_task_failure(1, DEFAULT_MAX_RETRIES).is_retriable());
-        // Third failure exhausts retries
+        // Third failure exhausts retries.
         assert!(!evaluate_task_failure(2, DEFAULT_MAX_RETRIES).is_retriable());
     }
 
@@ -2004,6 +2429,21 @@ mod tests {
         assert_eq!(STALE_CHECK_INTERVAL_TICKS, 6);
         assert!(should_run_stale_check(6, STALE_CHECK_INTERVAL_TICKS));
         assert!(!should_run_stale_check(5, STALE_CHECK_INTERVAL_TICKS));
+    }
+
+    #[test]
+    fn test_peer_heartbeat_probe_fires_on_first_tick_and_interval() {
+        assert!(should_run_peer_heartbeat_probe(1, 6));
+        assert!(should_run_peer_heartbeat_probe(6, 6));
+        assert!(should_run_peer_heartbeat_probe(12, 6));
+        assert!(!should_run_peer_heartbeat_probe(2, 6));
+        assert!(!should_run_peer_heartbeat_probe(0, 6));
+    }
+
+    #[test]
+    fn test_peer_heartbeat_probe_interval_zero_never_fires() {
+        assert!(!should_run_peer_heartbeat_probe(1, 0));
+        assert!(!should_run_peer_heartbeat_probe(6, 0));
     }
 
     #[test]

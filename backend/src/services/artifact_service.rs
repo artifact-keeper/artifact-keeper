@@ -213,6 +213,32 @@ impl ArtifactService {
         data: Bytes,
         uploaded_by: Option<Uuid>,
     ) -> Result<Artifact> {
+        self.upload_with_sync_options(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            data,
+            uploaded_by,
+            true,
+        )
+        .await
+    }
+
+    /// Upload an artifact, optionally suppressing peer sync task fan-out.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        data: Bytes,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+    ) -> Result<Artifact> {
         let size_bytes = data.len() as i64;
 
         // Check quota
@@ -417,7 +443,7 @@ impl ArtifactService {
             .await;
 
         // Queue sync tasks for peer replication (non-blocking)
-        {
+        if enqueue_sync_tasks {
             let db = self.db.clone();
             let artifact_id = artifact.id;
             let repository_id = artifact.repository_id;
@@ -846,6 +872,11 @@ impl ArtifactService {
 
     /// Soft-delete an artifact
     pub async fn delete(&self, id: Uuid) -> Result<()> {
+        self.delete_with_sync_options(id, true).await
+    }
+
+    /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
+    pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
         // Get artifact info for plugin hooks
         let artifact = self.get_by_id(id).await?;
         let artifact_info = ArtifactInfo::from(&artifact);
@@ -866,19 +897,16 @@ impl ArtifactService {
             return Err(AppError::NotFound("Artifact not found".to_string()));
         }
 
-        // Enqueue delete sync tasks for all eligible peers (non-blocking)
+        // A delete supersedes any upload retries for the same artifact.
         let _ = sqlx::query(
             r#"
-            INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-            SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
-            FROM peer_instances pi
-            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
-            JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
-            WHERE pi.is_local = false
-              AND pi.status IN ('online', 'syncing')
-              AND prs.replication_mode::text IN ('push', 'mirror')
-              AND prs.sync_enabled = true
-            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+            UPDATE sync_tasks
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                error_message = 'superseded by artifact delete'
+            WHERE artifact_id = $1
+              AND task_type = 'push'
+              AND status IN ('pending', 'failed')
             "#,
         )
         .bind(id)
@@ -886,12 +914,41 @@ impl ArtifactService {
         .await
         .map_err(|e| {
             tracing::warn!(
-                "Failed to enqueue delete sync tasks for artifact {}: {}",
+                "Failed to cancel superseded push sync tasks for artifact {}: {}",
                 id,
                 e
             );
             e
         });
+
+        // Enqueue delete sync tasks for all eligible peers (non-blocking)
+        if enqueue_sync_tasks {
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                FROM peer_instances pi
+                JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
+                JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                WHERE pi.is_local = false
+                  AND pi.status IN ('online', 'syncing')
+                  AND prs.replication_mode::text IN ('push', 'mirror')
+                  AND prs.sync_enabled = true
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Failed to enqueue delete sync tasks for artifact {}: {}",
+                    id,
+                    e
+                );
+                e
+            });
+        }
 
         // Trigger AfterDelete hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)

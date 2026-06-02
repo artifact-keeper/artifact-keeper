@@ -43,6 +43,14 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+fn is_replication_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-artifact-keeper-replication")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Coerce the requested `is_public` value against the server-wide guest-access
 /// policy (issue #850).
 ///
@@ -2975,7 +2983,7 @@ pub async fn upload_artifact(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
 
     let artifact = artifact_service
-        .upload(
+        .upload_with_sync_options(
             repo.id,
             &path,
             &name,
@@ -2983,6 +2991,7 @@ pub async fn upload_artifact(
             &content_type,
             body,
             Some(auth.user_id),
+            !is_replication_request(&headers),
         )
         .await?;
 
@@ -3431,6 +3440,7 @@ pub async fn delete_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
@@ -3452,7 +3462,9 @@ pub async fn delete_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-    artifact_service.delete(artifact).await?;
+    artifact_service
+        .delete_with_sync_options(artifact, !is_replication_request(&headers))
+        .await?;
 
     Ok(())
 }

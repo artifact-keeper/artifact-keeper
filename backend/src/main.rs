@@ -669,7 +669,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let grpc_db_pool = db_pool.clone();
 
     // Spawn background sync worker for peer replication
-    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
+    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(
+        db_pool,
+        storage_registry.clone(),
+    )
+    .await;
     tracing::info!("Sync worker started");
 
     // Conditionally clone state for the metrics listener before the router takes
