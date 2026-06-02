@@ -10,6 +10,7 @@ pub mod auth_config_service;
 pub mod auth_service;
 pub mod backup_service;
 pub mod build_service;
+pub mod declared_dependencies;
 pub mod dependency_track_service;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;
