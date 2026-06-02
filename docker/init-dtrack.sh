@@ -56,12 +56,19 @@ for i in $(seq 1 60); do
 done
 echo "[dtrack-init] Dependency-Track is up"
 
-# If API key file already exists from a previous run, skip all provisioning.
-# This is the fast path on helm upgrades. We don't rotate unless the shared
-# volume has been wiped.
+# If the API key file already exists from a previous run we skip the
+# rotate/mint path below, but we still log in and re-apply the permission
+# grants (#1530). Operators upgrading from a pre-#1511 build have a valid
+# key on the shared volume but the team behind it has none of the four
+# permissions the AK integration needs, so the integration silently fails
+# on every PUT /api/v1/project until the team is granted BOM_UPLOAD,
+# PROJECT_CREATION_UPLOAD, VIEW_PORTFOLIO, VIEW_VULNERABILITY. The grants
+# are idempotent (POST returns 200 on first grant, 304 on subsequent calls)
+# so re-running them on the fast path is safe.
+KEY_ALREADY_PROVISIONED=false
 if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
-  echo "[dtrack-init] API key already provisioned at $API_KEY_FILE, skipping"
-  exit 0
+  echo "[dtrack-init] API key already provisioned at $API_KEY_FILE, skipping rotation"
+  KEY_ALREADY_PROVISIONED=true
 fi
 
 # Try login with the new password first (already changed in a previous partial run)
@@ -110,6 +117,8 @@ if [ -z "$TEAM_UUID" ]; then
   exit 1
 fi
 echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
+
+if [ "$KEY_ALREADY_PROVISIONED" = "false" ]; then
 
 # Rotate: delete the publicId we previously minted (tracked in
 # PUBLIC_ID_MARKER), then PUT a new one below.
@@ -238,11 +247,19 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
+fi  # end: rotate/mint block (skipped on fast path)
+
 # Grant the DT team the permissions the backend integration depends on
-# (#1472). Without these, SBOM uploads from the scan pipeline silently
-# 401/403 and DT stays empty even when AK scans look green. The DT default
-# Automation team has NONE of these permissions, so without the loop below
-# the AK integration is broken-on-bootstrap.
+# (#1472, #1530). Without these, SBOM uploads from the scan pipeline
+# silently 401/403 and DT stays empty even when AK scans look green. The DT
+# default Automation team has NONE of these permissions.
+#
+# This runs UNCONDITIONALLY, including on the fast path where the API key
+# was minted by a pre-#1511 build. Operators upgrading from an older bundle
+# had a valid key but a team with no permissions; without re-applying the
+# grants on every boot, the upgrade path would never repair itself (#1530).
+# The DT permission endpoint is idempotent: POST returns 200 on first
+# grant and 304 on subsequent calls, so repeated invocations are cheap.
 #
 # Source of truth for the permission list lives in
 # backend/src/services/dependency_track_service.rs (module docs + the
