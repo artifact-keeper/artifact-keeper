@@ -444,6 +444,32 @@ fn tee_upstream_to_cache(
     Box::pin(tee_stream)
 }
 
+/// A single proxy-cached artifact, reconstructed from the storage backend
+/// for the repository artifact-listing endpoint (#1548, web #424).
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so this is
+/// assembled from the on-disk `__content__` key and its `__cache_meta__.json`
+/// sidecar rather than from a database row. There is no DB id, version, or
+/// download count to report, so the listing handler synthesizes the parts of
+/// `ArtifactResponse` it can and leaves the rest at their natural defaults.
+#[derive(Debug, Clone)]
+pub struct CachedArtifactEntry {
+    /// Logical artifact path relative to the repository root, e.g.
+    /// `is-odd/-/is-odd-3.0.1.tgz`.
+    pub path: String,
+    /// Final path segment, used as the display name.
+    pub name: String,
+    /// Cached body size in bytes (from the sidecar).
+    pub size_bytes: i64,
+    /// SHA-256 of the cached body (from the sidecar).
+    pub checksum_sha256: String,
+    /// Content type recorded at cache-write time, defaulting to
+    /// `application/octet-stream` when upstream did not send one.
+    pub content_type: String,
+    /// When the entry was first cached (from the sidecar).
+    pub cached_at: DateTime<Utc>,
+}
+
 /// Cache metadata for a proxied artifact
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
@@ -1164,6 +1190,99 @@ impl ProxyService {
             names.insert(name.to_string());
         }
         names.into_iter().collect()
+    }
+
+    /// List the artifacts a remote repository has cached through the proxy.
+    ///
+    /// Proxy-cached items are not tracked in the `artifacts` table (#1278 /
+    /// #1280): caching them there reintroduced a doubled-prefix storage path
+    /// bug on filesystem backends. The body and a JSON metadata sidecar still
+    /// live on disk under `proxy-cache/<repo_key>/<path>/{__content__,
+    /// __cache_meta__.json}`, so this walks that prefix to recover the set of
+    /// objects the proxy has actually served. The repository artifact-listing
+    /// endpoint merges these into its response so remote-cached packages show
+    /// up in the UI and can be scanned (#1548, web #424).
+    ///
+    /// Returns an empty list when the storage backend cannot list the prefix.
+    /// Each entry's `size_bytes`, `checksum_sha256`, `content_type`, and
+    /// `cached_at` come from the sidecar; entries whose sidecar is missing or
+    /// unreadable are skipped (a half-written or legacy cache write).
+    pub async fn list_cached_artifacts(&self, repo_key: &str) -> Vec<CachedArtifactEntry> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = match self.storage.list(Some(&prefix)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    error = %e,
+                    "listing proxy cache for repository artifact listing failed; \
+                     returning no cached artifacts"
+                );
+                return Vec::new();
+            }
+        };
+
+        let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
+        let mut entries = Vec::with_capacity(logical_paths.len());
+        for path in logical_paths {
+            let Ok(metadata_key) = Self::cache_metadata_key(repo_key, &path) else {
+                continue;
+            };
+            let metadata = match self.load_cache_metadata(&metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        repo_key = %repo_key,
+                        path = %path,
+                        error = %e,
+                        "reading proxy cache sidecar failed; skipping entry"
+                    );
+                    continue;
+                }
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            entries.push(CachedArtifactEntry {
+                path,
+                name,
+                size_bytes: metadata.size_bytes,
+                checksum_sha256: metadata.checksum_sha256,
+                content_type: metadata
+                    .content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                cached_at: metadata.cached_at,
+            });
+        }
+        entries
+    }
+
+    /// Recover the distinct logical artifact paths from a set of proxy-cache
+    /// storage keys.
+    ///
+    /// Content lives at `proxy-cache/<repo_key>/<path>/__content__`; the
+    /// sibling `__cache_meta__.json` and any other leaf are ignored. Strips
+    /// the `proxy-cache/<repo_key>/` prefix and the `/__content__` suffix to
+    /// return `<path>`, deduped and sorted. Pure so the parsing can be
+    /// unit-tested without a storage backend.
+    fn cached_artifact_paths<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(path) = rest.strip_suffix("/__content__") else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            paths.insert(path.to_string());
+        }
+        paths.into_iter().collect()
     }
 
     /// Invalidate every cached file referenced from an APT Release file
@@ -4949,6 +5068,41 @@ SHA256:
         ];
         let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
         assert_eq!(names, vec!["flask"]);
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_extracts_content_keys() {
+        let keys = vec![
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__content__",
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__cache_meta__.json",
+            "proxy-cache/npm-remote/lodash/__content__",
+            "proxy-cache/npm-remote/lodash/__cache_meta__.json",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        // Only content keys, sidecars dropped, prefix + suffix stripped, sorted.
+        assert_eq!(
+            paths,
+            vec![
+                "is-odd/-/is-odd-3.0.1.tgz".to_string(),
+                "lodash".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_skips_other_repos_and_empty() {
+        let keys = vec![
+            // different repo's cache — must not leak in
+            "proxy-cache/other-remote/express/__content__",
+            // non-content leaf — skipped
+            "proxy-cache/npm-remote/express/__cache_meta__.json",
+            // empty logical path (bare repo root) — skipped
+            "proxy-cache/npm-remote/__content__",
+            // a real entry — kept
+            "proxy-cache/npm-remote/express/__content__",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        assert_eq!(paths, vec!["express".to_string()]);
     }
 
     // -----------------------------------------------------------------------
