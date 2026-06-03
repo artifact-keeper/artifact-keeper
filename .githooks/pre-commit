@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# Artifact Keeper pre-commit hook (fast: formatting only).
+#
+# Enable once (also done by `./scripts/dev.sh setup`):
+#   git config core.hooksPath .githooks
+#
+# This stage is intentionally cheap so commits stay instant. The heavier
+# checks (cargo check + unit tests) run on `git push` via .githooks/pre-push.
+#
+# Bypass in an emergency with `git commit --no-verify`. CI is the real
+# enforcement; this is just fast local feedback.
+
+# 1) Rust formatting, only when Rust files are staged (matches CI: cargo fmt --all -- --check)
+if git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+    if command -v cargo >/dev/null 2>&1; then
+        echo "pre-commit: cargo fmt --check"
+        if ! cargo fmt --all -- --check; then
+            echo >&2
+            echo "Formatting check failed. Run 'cargo fmt --all', then re-stage and commit." >&2
+            exit 1
+        fi
+    else
+        echo "pre-commit: cargo not found, skipping fmt check" >&2
+    fi
+fi
+
+# 2) beads (bd) JSONL flush. Maintainer workflow; silently skipped when bd or
+#    a .beads workspace is absent, so external contributors are unaffected.
+if command -v bd >/dev/null 2>&1; then
+    BEADS_DIR=""
+    if [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
+        MAIN_ROOT="$(dirname "$(git rev-parse --git-common-dir)")"
+        [ -d "$MAIN_ROOT/.beads" ] && BEADS_DIR="$MAIN_ROOT/.beads"
+    elif [ -d .beads ]; then
+        BEADS_DIR=".beads"
+    fi
+    if [ -n "$BEADS_DIR" ]; then
+        # Skip Dolt backend (uses its own sync, not JSONL)
+        if ! grep -q '"backend"[[:space:]]*:[[:space:]]*"dolt"' "$BEADS_DIR/metadata.json" 2>/dev/null; then
+            bd sync --flush-only >/dev/null 2>&1 || true
+            if [ -f "$BEADS_DIR/issues.jsonl" ] && \
+               [ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ]; then
+                git add "$BEADS_DIR/issues.jsonl" 2>/dev/null || true
+            fi
+        fi
+    fi
+fi
+
+exit 0

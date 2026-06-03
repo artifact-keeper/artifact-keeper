@@ -6,11 +6,51 @@ Thanks for your interest in contributing! Here's how to get started.
 
 1. Fork the repository
 2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/artifact-keeper.git`
-3. Create a feature branch: `git checkout -b feature/your-feature`
-4. Make your changes
-5. Run checks: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --lib`
-6. Commit and push to your fork
-7. Open a Pull Request against `main`
+3. Enable the git hooks: `./scripts/setup-hooks.sh` (one time, see [Git hooks](#git-hooks))
+4. Create a feature branch: `git checkout -b feat/your-feature` (use `fix/`, `chore/`, or `docs/` as appropriate)
+5. Make your changes
+6. Run the same checks CI runs (see [What CI checks](#what-ci-checks))
+7. Commit and push to your fork
+8. Open a Pull Request against `main`, referencing an issue (`Closes #N`)
+
+## Git hooks
+
+Run `./scripts/setup-hooks.sh` once after cloning (or `./scripts/dev.sh setup`). It points
+git at the version-controlled hooks in `.githooks/`, which require only git and cargo, no
+extra tooling to install:
+
+- **pre-commit** runs `cargo fmt --all -- --check` when Rust files are staged (instant).
+- **pre-push** runs `cargo check --workspace --all-targets` and `cargo test --workspace --lib`
+  with `SQLX_OFFLINE=true`, so compile errors and unit-test failures are caught before they
+  reach a red PR. No database needed.
+
+The hooks are fast local feedback, not a substitute for CI. Bypass once with
+`git commit --no-verify` / `git push --no-verify` only when you genuinely need to.
+
+## What CI checks
+
+Every PR must be fully green before merge. The pipeline (`.github/workflows/ci.yml` and
+related workflows) enforces, in order of how fast you can reproduce each locally:
+
+| Gate | What it runs | Reproduce locally |
+| --- | --- | --- |
+| Formatting | `cargo fmt --all -- --check` | `cargo fmt --all -- --check` (pre-commit hook) |
+| Lint | `cargo clippy --workspace --all-targets -- -D warnings` | same command |
+| Migration slots | migration files must have unique numeric prefixes | `ls backend/migrations/ \| tail` |
+| Unit tests | `cargo test --workspace --lib` | same command (pre-push hook) |
+| Shell tests | dtrack-init regression test | `./docker/test-init-dtrack.sh` |
+| Coverage floor | `cargo llvm-cov --workspace --lib --fail-under-lines 50` | `cargo llvm-cov --workspace --lib --summary-only` |
+| New-code coverage | new/changed lines must be >= 70% covered (skipped under 10 new lines) | add tests for the lines you changed |
+| Duplication | jscpd over changed `.rs` files, <= 3% | `jscpd --min-lines 10 --threshold 3 --format rust <files>` |
+| Integration tests | `cargo test --workspace` (needs Postgres) | `./scripts/dev.sh start` then `cargo test --workspace` |
+| Smoke E2E | docker compose up + smoke profile | `./scripts/run-e2e-tests.sh` |
+| Security audit | `cargo audit` on the dependency tree | `cargo audit` |
+| Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
+| CodeQL | static analysis | n/a (runs in CI) |
+
+The fmt/clippy/unit-test gates are the ones the hooks cover. The coverage, duplication, and
+linked-issue gates run only in CI, so check those before pushing a large change. Do not use
+"push and see if CI passes" as a workflow, and do not bypass a failing gate with `--admin`.
 
 ## Development Setup
 

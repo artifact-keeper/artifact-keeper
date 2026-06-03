@@ -45,8 +45,13 @@ case "${1:-start}" in
     exec "$0" start
     ;;
 
+  setup)
+    echo "==> Enabling git hooks..."
+    exec ./scripts/setup-hooks.sh
+    ;;
+
   *)
-    echo "Usage: $0 {start|stop|reset}"
+    echo "Usage: $0 {start|stop|reset|setup}"
     exit 1
     ;;
 esac
