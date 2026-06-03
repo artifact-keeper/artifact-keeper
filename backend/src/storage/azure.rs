@@ -1205,11 +1205,9 @@ impl StorageBackend for AzureBackend {
 
         if block_ids.is_empty() {
             self.put(key, Bytes::new()).await?;
-        } else {
-            if let Err(e) = self.commit_stream_blocks(key, &block_ids).await {
-                self.report_uncommitted_stream_blocks(key, &block_ids).await;
-                return Err(e);
-            }
+        } else if let Err(e) = self.commit_stream_blocks(key, &block_ids).await {
+            self.report_uncommitted_stream_blocks(key, &block_ids).await;
+            return Err(e);
         }
 
         Ok(PutStreamResult {

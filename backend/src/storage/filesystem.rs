@@ -5,9 +5,10 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -277,6 +278,44 @@ impl StorageBackend for FilesystemStorage {
         Ok(Box::pin(mapped))
     }
 
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let path = self.key_to_path(key);
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
+
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to seek {}: {}", key, e)))?;
+
+        let mut remaining = length;
+        let mut out = Vec::with_capacity(length);
+
+        while remaining > 0 {
+            let mut buf = vec![0u8; remaining.min(STREAM_CHUNK_SIZE)];
+            let read = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+            if read == 0 {
+                break;
+            }
+            buf.truncate(read);
+            out.extend_from_slice(&buf);
+            remaining -= read;
+        }
+
+        Ok(Bytes::from(out))
+    }
+
     async fn put_stream(
         &self,
         key: &str,
@@ -518,6 +557,35 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, content);
+    }
+
+    #[tokio::test]
+    async fn test_get_range_reads_requested_window() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "range-key";
+        storage
+            .put(key, Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"))
+            .await
+            .unwrap();
+
+        let range = storage.get_range(key, 5, 8).await.unwrap();
+
+        assert_eq!(range, Bytes::from_static(b"fghijklm"));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_past_eof_returns_empty() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "short-range-key";
+        storage.put(key, Bytes::from_static(b"abc")).await.unwrap();
+
+        let range = storage.get_range(key, 10, 4).await.unwrap();
+
+        assert!(range.is_empty());
     }
 
     /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +

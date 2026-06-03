@@ -4,14 +4,13 @@
 //! instances.  Runs on a 10-second tick, respects per-peer concurrency limits,
 //! sync windows, and configurable backoff on failures.
 //!
-//! For artifacts larger than `SYNC_CHUNKED_THRESHOLD_BYTES`, the worker uses
-//! the swarm-based chunked transfer system instead of sending the full file
-//! in a single HTTP request.  This prevents timeouts and memory exhaustion
+//! For artifacts larger than `SYNC_CHUNKED_THRESHOLD_BYTES`, the worker creates
+//! a resumable upload session on the remote peer instead of sending the full
+//! file in a single HTTP request. This prevents timeouts and memory exhaustion
 //! when syncing large Docker images, ML models, etc.
 
 use crate::storage::{StorageLocation, StorageRegistry};
 use chrono::{NaiveTime, Timelike, Utc};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -115,6 +114,7 @@ const DEFAULT_SYNC_CHUNK_SIZE_BYTES: i32 = 50 * 1024 * 1024;
 
 const REPLICATION_REQUEST_HEADER: &str = "X-Artifact-Keeper-Replication";
 const REPLICATION_REQUEST_VALUE: &str = "true";
+const CHECKSUM_SHA256_HEADER: &str = "x-checksum-sha256";
 
 /// Default retry backoff cap for sync tasks.
 ///
@@ -879,7 +879,7 @@ async fn execute_transfer(
             task.artifact_version.as_deref().unwrap_or(""),
         )
         .header("X-Artifact-Path", &task.artifact_path)
-        .header("X-Artifact-Checksum-SHA256", &task.checksum_sha256)
+        .header(CHECKSUM_SHA256_HEADER, &task.checksum_sha256)
         .body(file_bytes)
         .send()
         .await;
@@ -914,12 +914,15 @@ async fn execute_transfer(
     }
 }
 
-/// Execute a chunked transfer for a large artifact.
+/// Execute a chunked upload for a large replicated artifact.
 ///
 /// Instead of reading the entire artifact into memory and sending it in one
-/// request, this splits the file into chunks and uploads each one individually.
-/// The remote peer's transfer session API tracks progress so transfers can
-/// resume after partial failures.
+/// request, this creates a regular upload session on the remote peer, sends
+/// each byte range as one PATCH request, then asks the peer to finalize the
+/// upload into its repository storage. This is intentionally the same API used
+/// by direct large uploads: it works when the target peer has never seen the
+/// artifact before, verifies the final checksum, and materializes the target
+/// artifact row + storage object on completion.
 async fn execute_chunked_transfer(
     db: &PgPool,
     client: &reqwest::Client,
@@ -939,12 +942,9 @@ async fn execute_chunked_transfer(
         task.id
     );
 
-    // 1. Initialize a transfer session on the remote peer.
-    let init_url = build_chunked_init_url(peer_endpoint, &task.peer_instance_id);
-    let init_body = serde_json::json!({
-        "artifact_id": task.artifact_id,
-        "chunk_size": chunk_size,
-    });
+    // 1. Initialize a resumable upload session on the remote peer.
+    let init_url = build_chunked_upload_session_url(peer_endpoint);
+    let init_body = build_chunked_upload_session_body(task, chunk_size);
 
     let init_response = client
         .post(&init_url)
@@ -954,7 +954,7 @@ async fn execute_chunked_transfer(
         .json(&init_body)
         .send()
         .await
-        .map_err(|e| format!("Failed to init chunked transfer: {e}"))?;
+        .map_err(|e| format!("Failed to init chunked upload: {e}"))?;
 
     if !init_response.status().is_success() {
         let status = init_response.status();
@@ -962,22 +962,35 @@ async fn execute_chunked_transfer(
             .text()
             .await
             .unwrap_or_else(|_| "<unreadable>".to_string());
-        let msg = format!("Chunked transfer init returned {status}: {body}");
+        let msg = format!("Chunked upload init returned {status}: {body}");
         handle_transfer_failure(db, task, &msg, retry_policy).await;
         return Err(msg);
     }
 
-    let session: serde_json::Value = init_response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse transfer session response: {e}"))?;
+    let session: serde_json::Value = match init_response.json().await {
+        Ok(session) => session,
+        Err(e) => {
+            let msg = format!("Failed to parse upload session response: {e}");
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            return Err(msg);
+        }
+    };
 
-    let session_id = session["id"]
+    let session_id = match session["session_id"]
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| "Missing session id in transfer init response".to_string())?;
+    {
+        Some(session_id) => session_id,
+        None => {
+            let msg = "Missing session_id in chunked upload init response".to_string();
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            return Err(msg);
+        }
+    };
 
-    // 2. Upload chunks one at a time, streaming each from disk.
+    // 2. Upload chunks one at a time. Each chunk is read through the
+    // repository's storage backend using `get_range`; for S3 this is a
+    // true HTTP Range GET rather than a full-object re-download.
     let chunk_ranges = compute_chunk_ranges(task.artifact_size, chunk_size);
     let mut bytes_transferred: i64 = 0;
 
@@ -997,61 +1010,31 @@ async fn execute_chunked_transfer(
                     "Failed to read chunk {} (offset={}, len={}): {e}",
                     chunk_index, byte_offset, byte_length
                 );
+                cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
+                    .await;
                 handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
         };
 
-        // Compute SHA-256 of this chunk for verification.
-        let mut hasher = Sha256::new();
-        hasher.update(&chunk_data);
-        let chunk_checksum = format!("{:x}", hasher.finalize());
-
-        // Upload the chunk data to the peer's artifact storage. The chunk is
-        // sent as a PUT with the byte range headers so the peer can reassemble.
-        let chunk_upload_url = format!(
-            "{}/api/v1/repositories/{}/artifacts/chunks/{}/{}",
-            peer_endpoint.trim_end_matches('/'),
-            task.repository_key,
-            session_id,
-            chunk_index
-        );
+        // Upload the chunk to the peer's resumable upload session. The
+        // Content-Range header lets the receiver write it at the correct
+        // offset in its temp file before final checksum verification.
+        let chunk_upload_url = build_chunked_upload_chunk_url(peer_endpoint, &session_id);
+        let content_range = build_content_range(*byte_offset, *byte_length, task.artifact_size);
 
         let upload_result = client
-            .put(&chunk_upload_url)
+            .patch(&chunk_upload_url)
             .header("Authorization", format!("Bearer {}", peer_api_key))
             .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
             .header("Content-Type", "application/octet-stream")
-            .header("X-Chunk-Offset", byte_offset.to_string())
-            .header("X-Chunk-Length", byte_length.to_string())
-            .header("X-Chunk-Checksum-SHA256", &chunk_checksum)
+            .header("Content-Range", content_range)
             .body(chunk_data)
             .send()
             .await;
 
         match upload_result {
             Ok(resp) if resp.status().is_success() => {
-                // Mark chunk as completed on the remote session.
-                let complete_url = build_chunk_complete_url(
-                    peer_endpoint,
-                    &task.peer_instance_id,
-                    &session_id,
-                    *chunk_index,
-                );
-                let complete_body = serde_json::json!({
-                    "checksum": chunk_checksum,
-                    "source_peer_id": null,
-                });
-
-                let _ = client
-                    .post(&complete_url)
-                    .header("Authorization", format!("Bearer {}", peer_api_key))
-                    .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
-                    .header("Content-Type", "application/json")
-                    .json(&complete_body)
-                    .send()
-                    .await;
-
                 bytes_transferred += *byte_length as i64;
                 tracing::debug!(
                     "Chunk {}/{} uploaded for task {} ({} bytes)",
@@ -1068,23 +1051,28 @@ async fn execute_chunked_transfer(
                     .await
                     .unwrap_or_else(|_| "<unreadable>".to_string());
                 let msg = format!("Chunk {} upload returned {status}: {body}", chunk_index);
+                cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
+                    .await;
                 handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
             Err(e) => {
                 let msg = format!("Chunk {} upload failed: {e}", chunk_index);
+                cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
+                    .await;
                 handle_transfer_failure(db, task, &msg, retry_policy).await;
                 return Err(msg);
             }
         }
     }
 
-    // 3. Finalize the transfer session.
-    let session_complete_url =
-        build_session_complete_url(peer_endpoint, &task.peer_instance_id, &session_id);
+    // 3. Finalize the upload session. The remote peer verifies the complete
+    // file SHA-256, writes to the repository's configured storage backend, and
+    // creates/updates the target artifact row.
+    let session_complete_url = build_chunked_upload_complete_url(peer_endpoint, &session_id);
 
     let complete_result = client
-        .post(&session_complete_url)
+        .put(&session_complete_url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
         .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
         .send()
@@ -1108,12 +1096,14 @@ async fn execute_chunked_transfer(
                 .text()
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
-            let msg = format!("Chunked transfer session complete returned {status}: {body}");
+            let msg = format!("Chunked upload session complete returned {status}: {body}");
+            cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
             handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
         Err(e) => {
-            let msg = format!("Chunked transfer session complete failed: {e}");
+            let msg = format!("Chunked upload session complete failed: {e}");
+            cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
             handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
@@ -1214,63 +1204,33 @@ async fn read_artifact_chunk_from_storage(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
-    use futures::StreamExt;
-
     if length == 0 {
         return Ok(Vec::new());
     }
 
     let storage = storage_for_task(storage_registry, task)?;
-    let mut stream = storage.get_stream(&task.storage_key).await.map_err(|e| {
-        let location = storage_location_for_task(task);
-        format!(
-            "Failed to open stream for '{}' from storage backend '{}': {e}",
-            task.storage_key, location.backend
-        )
-    })?;
-
-    let mut consumed = 0u64;
-    let mut remaining = length;
-    let mut out = Vec::with_capacity(length);
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
+    let bytes = storage
+        .get_range(&task.storage_key, offset, length)
+        .await
+        .map_err(|e| {
             let location = storage_location_for_task(task);
             format!(
-                "Failed to read stream for '{}' from storage backend '{}': {e}",
-                task.storage_key, location.backend
+                "Failed to read range for '{}' from storage backend '{}' (offset={}, length={}): {e}",
+                task.storage_key, location.backend, offset, length
             )
         })?;
-        let chunk_len = chunk.len() as u64;
-        let chunk_end = consumed.saturating_add(chunk_len);
 
-        if chunk_end <= offset {
-            consumed = chunk_end;
-            continue;
-        }
-
-        let start = offset.saturating_sub(consumed) as usize;
-        let available = &chunk[start..];
-        let take = available.len().min(remaining);
-        out.extend_from_slice(&available[..take]);
-        remaining -= take;
-
-        if remaining == 0 {
-            break;
-        }
-
-        consumed = chunk_end;
-    }
-
-    if out.len() == length {
-        Ok(out)
+    if bytes.len() == length {
+        Ok(bytes.to_vec())
     } else {
+        let location = storage_location_for_task(task);
         Err(format!(
-            "Failed to read complete chunk for '{}' (offset={}, length={}, got={})",
+            "Failed to read complete chunk for '{}' from storage backend '{}' (offset={}, length={}, got={})",
             task.storage_key,
+            location.backend,
             offset,
             length,
-            out.len()
+            bytes.len()
         ))
     }
 }
@@ -1506,43 +1466,68 @@ fn percent_encode_path_segment(segment: &str) -> String {
     encoded
 }
 
-/// Build the URL to initialize a chunked transfer session on a peer.
-pub(crate) fn build_chunked_init_url(peer_endpoint: &str, peer_id: &Uuid) -> String {
-    format!(
-        "{}/api/v1/peers/{}/transfer/init",
-        peer_endpoint.trim_end_matches('/'),
-        peer_id
-    )
+/// Build the URL to initialize a resumable upload session on a peer.
+pub(crate) fn build_chunked_upload_session_url(peer_endpoint: &str) -> String {
+    format!("{}/api/v1/uploads", peer_endpoint.trim_end_matches('/'))
 }
 
-/// Build the URL to complete a single chunk within a transfer session.
-pub(crate) fn build_chunk_complete_url(
-    peer_endpoint: &str,
-    peer_id: &Uuid,
-    session_id: &Uuid,
-    chunk_index: i32,
-) -> String {
-    format!(
-        "{}/api/v1/peers/{}/transfer/{}/chunk/{}/complete",
-        peer_endpoint.trim_end_matches('/'),
-        peer_id,
-        session_id,
-        chunk_index
-    )
+fn build_chunked_upload_session_body(task: &TaskRow, chunk_size: i32) -> serde_json::Value {
+    serde_json::json!({
+        "repository_key": task.repository_key,
+        "artifact_path": task.artifact_path,
+        "artifact_name": task.artifact_name,
+        "artifact_version": task.artifact_version,
+        "total_size": task.artifact_size,
+        "checksum_sha256": task.checksum_sha256,
+        "chunk_size": chunk_size,
+        "content_type": task.content_type,
+    })
 }
 
-/// Build the URL to finalize an entire transfer session.
-pub(crate) fn build_session_complete_url(
-    peer_endpoint: &str,
-    peer_id: &Uuid,
-    session_id: &Uuid,
-) -> String {
+/// Build the URL to upload one chunk to a resumable upload session.
+pub(crate) fn build_chunked_upload_chunk_url(peer_endpoint: &str, session_id: &Uuid) -> String {
     format!(
-        "{}/api/v1/peers/{}/transfer/{}/complete",
+        "{}/api/v1/uploads/{}",
         peer_endpoint.trim_end_matches('/'),
-        peer_id,
         session_id
     )
+}
+
+/// Build the URL to finalize a resumable upload session.
+pub(crate) fn build_chunked_upload_complete_url(peer_endpoint: &str, session_id: &Uuid) -> String {
+    format!(
+        "{}/api/v1/uploads/{}/complete",
+        peer_endpoint.trim_end_matches('/'),
+        session_id
+    )
+}
+
+/// Build the RFC 9110 byte range header for one chunk.
+pub(crate) fn build_content_range(byte_offset: i64, byte_length: i32, total_size: i64) -> String {
+    let end = byte_offset + byte_length as i64 - 1;
+    format!("bytes {}-{}/{}", byte_offset, end, total_size)
+}
+
+async fn cancel_chunked_upload_session(
+    client: &reqwest::Client,
+    peer_endpoint: &str,
+    peer_api_key: &str,
+    session_id: &Uuid,
+) {
+    let url = build_chunked_upload_chunk_url(peer_endpoint, session_id);
+    if let Err(e) = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
+        .send()
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "Failed to cancel remote chunked upload session after transfer error"
+        );
+    }
 }
 
 /// Read the configured chunked transfer threshold from `SYNC_CHUNKED_THRESHOLD_BYTES`,
@@ -1773,8 +1758,143 @@ fn parse_utc_offset_secs(tz: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use chrono::NaiveTime;
+    use futures::stream::BoxStream;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::time::Duration;
+
+    struct RangeRecordingBackend {
+        data: Bytes,
+        range_calls: Mutex<Vec<(String, u64, usize)>>,
+        stream_calls: AtomicUsize,
+    }
+
+    impl RangeRecordingBackend {
+        fn new(data: &'static [u8]) -> Self {
+            Self {
+                data: Bytes::from_static(data),
+                range_calls: Mutex::new(Vec::new()),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for RangeRecordingBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(self.data.clone())
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get_stream(
+            &self,
+            _key: &str,
+        ) -> crate::error::Result<BoxStream<'static, crate::error::Result<Bytes>>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            Err(crate::error::AppError::Storage(
+                "get_stream should not be used for chunk reads".to_string(),
+            ))
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            length: usize,
+        ) -> crate::error::Result<Bytes> {
+            self.range_calls
+                .lock()
+                .unwrap()
+                .push((key.to_string(), offset, length));
+
+            let start = offset as usize;
+            if start >= self.data.len() {
+                return Ok(Bytes::new());
+            }
+
+            let end = start.saturating_add(length).min(self.data.len());
+            Ok(self.data.slice(start..end))
+        }
+    }
+
+    fn test_task(storage_backend: &str) -> TaskRow {
+        TaskRow {
+            id: Uuid::new_v4(),
+            peer_instance_id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            priority: 0,
+            storage_key: "object-key".to_string(),
+            artifact_size: 26,
+            artifact_name: "artifact.bin".to_string(),
+            artifact_version: None,
+            artifact_path: "path/artifact.bin".to_string(),
+            repository_key: "repo".to_string(),
+            repository_id: Uuid::new_v4(),
+            repository_storage_backend: storage_backend.to_string(),
+            repository_storage_path: String::new(),
+            content_type: "application/octet-stream".to_string(),
+            checksum_sha256: "source-sha256".to_string(),
+            task_type: "push".to_string(),
+            replication_filter: None,
+            retry_count: 0,
+            max_retries: DEFAULT_MAX_RETRIES,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_chunk_uses_storage_range_read() {
+        let backend = Arc::new(RangeRecordingBackend::new(b"abcdefghijklmnopqrstuvwxyz"));
+        let mut backends: HashMap<String, Arc<dyn crate::storage::StorageBackend>> = HashMap::new();
+        backends.insert("s3-peer".to_string(), backend.clone());
+        let registry = StorageRegistry::new(backends, "s3-peer".to_string());
+        let task = test_task("s3-peer");
+
+        let chunk = read_artifact_chunk_from_storage(&registry, &task, 5, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(chunk, b"fghijklm");
+        assert_eq!(
+            *backend.range_calls.lock().unwrap(),
+            vec![("object-key".to_string(), 5, 8)]
+        );
+        assert_eq!(backend.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_chunk_rejects_short_range_read() {
+        let backend = Arc::new(RangeRecordingBackend::new(b"abcdefghijklmnopqrstuvwxyz"));
+        let mut backends: HashMap<String, Arc<dyn crate::storage::StorageBackend>> = HashMap::new();
+        backends.insert("s3-peer".to_string(), backend);
+        let registry = StorageRegistry::new(backends, "s3-peer".to_string());
+        let task = test_task("s3-peer");
+
+        let err = read_artifact_chunk_from_storage(&registry, &task, 24, 4)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("Failed to read complete chunk"));
+        assert!(err.contains("got=2"));
+    }
+
+    #[test]
+    fn test_replication_upload_checksum_header_matches_put_handler() {
+        assert_eq!(CHECKSUM_SHA256_HEADER, "x-checksum-sha256");
+    }
 
     // ── calculate_backoff ───────────────────────────────────────────────
 
@@ -2955,67 +3075,97 @@ mod tests {
         }
     }
 
-    // ── build_chunked_init_url ─────────────────────────────────────────
+    // ── chunked upload URL helpers ─────────────────────────────────────
 
     #[test]
-    fn test_build_chunked_init_url() {
-        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    fn test_build_chunked_upload_session_url() {
         assert_eq!(
-            build_chunked_init_url("https://peer.example.com", &peer_id),
-            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/init"
+            build_chunked_upload_session_url("https://peer.example.com"),
+            "https://peer.example.com/api/v1/uploads"
         );
     }
 
     #[test]
-    fn test_build_chunked_init_url_trailing_slash() {
-        let peer_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    fn test_build_chunked_upload_session_url_trailing_slash() {
         assert_eq!(
-            build_chunked_init_url("https://peer.example.com/", &peer_id),
-            "https://peer.example.com/api/v1/peers/22222222-2222-2222-2222-222222222222/transfer/init"
+            build_chunked_upload_session_url("https://peer.example.com/"),
+            "https://peer.example.com/api/v1/uploads"
         );
     }
 
-    // ── build_chunk_complete_url ───────────────────────────────────────
+    #[test]
+    fn test_build_chunked_upload_session_body_preserves_artifact_metadata() {
+        let mut task = test_task("filesystem");
+        task.artifact_name = "name-check".to_string();
+        task.artifact_version = Some("20260603T072902Z".to_string());
+        task.artifact_path = "name-check/20260603T072902Z/large-160m.bin".to_string();
+
+        let body = build_chunked_upload_session_body(&task, 52_428_800);
+
+        assert_eq!(body["repository_key"], "repo");
+        assert_eq!(
+            body["artifact_path"],
+            "name-check/20260603T072902Z/large-160m.bin"
+        );
+        assert_eq!(body["artifact_name"], "name-check");
+        assert_eq!(body["artifact_version"], "20260603T072902Z");
+        assert_eq!(body["chunk_size"], 52_428_800);
+    }
 
     #[test]
-    fn test_build_chunk_complete_url() {
-        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    fn test_build_chunked_upload_chunk_url() {
         let session_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         assert_eq!(
-            build_chunk_complete_url("https://peer.example.com", &peer_id, &session_id, 3),
-            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/chunk/3/complete"
+            build_chunked_upload_chunk_url("https://peer.example.com", &session_id),
+            "https://peer.example.com/api/v1/uploads/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         );
     }
 
     #[test]
-    fn test_build_chunk_complete_url_trailing_slash() {
-        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    fn test_build_chunked_upload_chunk_url_trailing_slash() {
         let session_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
         assert_eq!(
-            build_chunk_complete_url("https://peer.example.com/", &peer_id, &session_id, 0),
-            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb/chunk/0/complete"
+            build_chunked_upload_chunk_url("https://peer.example.com/", &session_id),
+            "https://peer.example.com/api/v1/uploads/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
         );
     }
 
-    // ── build_session_complete_url ─────────────────────────────────────
-
     #[test]
-    fn test_build_session_complete_url() {
-        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    fn test_build_chunked_upload_complete_url() {
         let session_id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
         assert_eq!(
-            build_session_complete_url("https://peer.example.com", &peer_id, &session_id),
-            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/cccccccc-cccc-cccc-cccc-cccccccccccc/complete"
+            build_chunked_upload_complete_url("https://peer.example.com", &session_id),
+            "https://peer.example.com/api/v1/uploads/cccccccc-cccc-cccc-cccc-cccccccccccc/complete"
         );
     }
 
     #[test]
-    fn test_build_session_complete_url_trailing_slash() {
-        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    fn test_build_chunked_upload_complete_url_trailing_slash() {
         let session_id = Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap();
         assert_eq!(
-            build_session_complete_url("https://peer.example.com/", &peer_id, &session_id),
-            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/dddddddd-dddd-dddd-dddd-dddddddddddd/complete"
+            build_chunked_upload_complete_url("https://peer.example.com/", &session_id),
+            "https://peer.example.com/api/v1/uploads/dddddddd-dddd-dddd-dddd-dddddddddddd/complete"
+        );
+    }
+
+    #[test]
+    fn test_build_content_range_first_chunk() {
+        assert_eq!(build_content_range(0, 1024, 4096), "bytes 0-1023/4096");
+    }
+
+    #[test]
+    fn test_build_content_range_middle_chunk() {
+        assert_eq!(
+            build_content_range(1_048_576, 1_048_576, 3_145_728),
+            "bytes 1048576-2097151/3145728"
+        );
+    }
+
+    #[test]
+    fn test_build_content_range_last_short_chunk() {
+        assert_eq!(
+            build_content_range(104_857_600, 10, 104_857_610),
+            "bytes 104857600-104857609/104857610"
         );
     }
 

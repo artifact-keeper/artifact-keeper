@@ -148,6 +148,51 @@ pub trait StorageBackend: Send + Sync {
         Ok(Box::pin(futures::stream::once(async { Ok(content) })))
     }
 
+    /// Retrieve a byte range from an object.
+    ///
+    /// Backends with native random/ranged reads should override this method
+    /// so large-object consumers do not have to re-download and discard bytes
+    /// for every chunk. The default implementation remains correct for
+    /// backends without native ranges by streaming once and collecting only
+    /// the requested window.
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        use futures::StreamExt;
+
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let mut stream = self.get_stream(key).await?;
+        let mut consumed = 0u64;
+        let mut remaining = length;
+        let mut out = Vec::with_capacity(length);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let chunk_len = chunk.len() as u64;
+            let chunk_end = consumed.saturating_add(chunk_len);
+
+            if chunk_end <= offset {
+                consumed = chunk_end;
+                continue;
+            }
+
+            let start = offset.saturating_sub(consumed) as usize;
+            let available = &chunk[start..];
+            let take = available.len().min(remaining);
+            out.extend_from_slice(&available[..take]);
+            remaining -= take;
+
+            if remaining == 0 {
+                break;
+            }
+
+            consumed = chunk_end;
+        }
+
+        Ok(Bytes::from(out))
+    }
+
     /// Store content from a byte stream, computing a SHA-256 checksum
     /// incrementally as data arrives. The default implementation collects
     /// the stream into memory and delegates to `put()`.
@@ -399,6 +444,24 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, "dest-key");
         assert_eq!(writes[0].1, Bytes::from_static(b"copied bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_default_get_range_slices_streamed_bytes() {
+        let backend = TestBackend;
+
+        let range = backend.get_range("any-key", 1, 2).await.unwrap();
+
+        assert_eq!(range, Bytes::from_static(b"es"));
+    }
+
+    #[tokio::test]
+    async fn test_default_get_range_zero_length() {
+        let backend = TestBackend;
+
+        let range = backend.get_range("any-key", 2, 0).await.unwrap();
+
+        assert!(range.is_empty());
     }
 
     #[tokio::test]
