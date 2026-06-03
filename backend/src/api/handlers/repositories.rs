@@ -1934,6 +1934,29 @@ fn lookup_path_candidates(path: &str, format: &RepositoryFormat) -> Vec<String> 
     out
 }
 
+/// Map a stored artifact path to the path the proxy cache is keyed under,
+/// for the purpose of looking up cache-freshness metadata (#1541 follow-up).
+///
+/// npm-family tarballs are stored under the version-segmented layout
+/// (`<name>/<version>/<file>.tgz`) by `npm::store_npm_version`, but the proxy
+/// cached them under the upstream download-URL shape (`<name>/-/<file>.tgz`)
+/// because `npm::serve_tarball` fetches via `build_tarball_upstream_path`.
+/// Looking up cache metadata by the stored path therefore always missed.
+/// Translating the stored tarball path back to the URL shape makes the cache
+/// key match what the proxy wrote.
+///
+/// Returns the literal `path` unchanged for non-npm formats and for npm rows
+/// that are not stored tarballs (metadata paths, raw uploads, paths already
+/// in URL form) — `tarball_url_path_from_stored` returns `None` for those.
+fn cache_metadata_lookup_path(path: &str, format: &RepositoryFormat) -> String {
+    if is_npm_family_format(format) {
+        if let Some(url_path) = crate::formats::npm::tarball_url_path_from_stored(path) {
+            return url_path;
+        }
+    }
+    path.to_string()
+}
+
 /// npm-family formats share the publish/download path conventions of
 /// the npm registry (`yarn`, `pnpm`, and `bower` all wrap the same
 /// upstream wire format). Keep this in sync with the `format` mapping
@@ -2763,10 +2786,22 @@ pub async fn get_artifact_metadata(
         // direct-uploaded into a Remote repo, edge case but observed),
         // so any error or `Ok(None)` collapses to None on both fields
         // rather than failing the whole metadata response.
+        //
+        // #1541 follow-up (npm path mismatch): npm-family tarballs are stored
+        // under the version-segmented layout (`<name>/<version>/<file>.tgz`)
+        // but the proxy cached them under the upstream download-URL shape
+        // (`<name>/-/<file>.tgz`, see `npm::serve_tarball` ->
+        // `build_tarball_upstream_path`). Keying the cache lookup on the
+        // stored `artifact.path` therefore always missed, leaving the
+        // freshness fields `None` even when a valid cache entry existed.
+        // `cache_metadata_lookup_path` maps the stored path back to the URL
+        // shape for npm-family tarballs so the cache key matches what the
+        // proxy wrote.
+        let cache_lookup_path = cache_metadata_lookup_path(&artifact.path, &repo.format);
         let cache_meta = if repo.repo_type == RepositoryType::Remote {
             if let Some(proxy) = state.proxy_service.as_ref() {
                 proxy
-                    .get_cache_metadata(&key, &artifact.path)
+                    .get_cache_metadata(&key, &cache_lookup_path)
                     .await
                     .ok()
                     .flatten()
@@ -4407,6 +4442,12 @@ mod tests {
         assert_eq!(resp.checksum_sha256, "deadbeef");
         assert_eq!(resp.download_count, 0);
         assert!(resp.version.is_none());
+        // A cached-listing entry is a live proxy-cache object, so its
+        // freshness timestamp is exactly when it was cached; the sidecar
+        // projection carries no expiry. (Asserting these guards the
+        // #1542/#1567 field-collision regression that broke the build.)
+        assert_eq!(resp.cache_cached_at, Some(entry.cached_at));
+        assert!(resp.cache_expires_at.is_none());
         // Same repo_key + path always yields the same id.
         let resp2 = build_cached_artifact_response(&entry, "npm-remote");
         assert_eq!(resp.id, resp2.id);
@@ -5841,6 +5882,65 @@ mod tests {
         assert!(
             body.contains("cache_cached_at:") && body.contains("cache_expires_at:"),
             "handler must populate both cache_cached_at and cache_expires_at"
+        );
+    }
+
+    #[test]
+    fn cache_metadata_lookup_path_maps_npm_stored_to_url_shape() {
+        // (#1541 follow-up) The proxy caches npm tarballs under the upstream
+        // download-URL shape, but the artifact row stores the version-
+        // segmented shape. The cache lookup must translate so it hits.
+
+        // Unscoped: stored `<name>/<version>/<file>.tgz` -> URL `<name>/-/<file>.tgz`.
+        assert_eq!(
+            cache_metadata_lookup_path("lodash/4.17.21/lodash-4.17.21.tgz", &RepositoryFormat::Npm),
+            "lodash/-/lodash-4.17.21.tgz",
+        );
+
+        // Scoped: stored `@scope/name/<version>/<file>.tgz` -> URL `@scope/name/-/<file>.tgz`.
+        assert_eq!(
+            cache_metadata_lookup_path(
+                "@types/node/20.1.0/node-20.1.0.tgz",
+                &RepositoryFormat::Npm
+            ),
+            "@types/node/-/node-20.1.0.tgz",
+        );
+
+        // The whole npm family shares the convention.
+        assert_eq!(
+            cache_metadata_lookup_path(
+                "left-pad/1.3.0/left-pad-1.3.0.tgz",
+                &RepositoryFormat::Yarn
+            ),
+            "left-pad/-/left-pad-1.3.0.tgz",
+        );
+        assert_eq!(
+            cache_metadata_lookup_path(
+                "left-pad/1.3.0/left-pad-1.3.0.tgz",
+                &RepositoryFormat::Pnpm
+            ),
+            "left-pad/-/left-pad-1.3.0.tgz",
+        );
+    }
+
+    #[test]
+    fn cache_metadata_lookup_path_is_identity_for_non_npm_and_non_tarball() {
+        // Non-npm formats are never rewritten, even if the path happens to
+        // look tarball-shaped.
+        assert_eq!(
+            cache_metadata_lookup_path("foo/1.0.0/foo-1.0.0.tgz", &RepositoryFormat::Maven),
+            "foo/1.0.0/foo-1.0.0.tgz",
+        );
+
+        // npm rows that aren't stored tarballs (metadata, already-URL-shape,
+        // raw uploads) fall through unchanged so we don't fabricate a key.
+        assert_eq!(
+            cache_metadata_lookup_path("lodash/package.json", &RepositoryFormat::Npm),
+            "lodash/package.json",
+        );
+        assert_eq!(
+            cache_metadata_lookup_path("lodash/-/lodash-4.17.21.tgz", &RepositoryFormat::Npm),
+            "lodash/-/lodash-4.17.21.tgz",
         );
     }
 
