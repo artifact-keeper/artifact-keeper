@@ -1598,6 +1598,27 @@ pub async fn virtual_non_remote_owns_name(
     virtual_repo_id: Uuid,
     package_name: &str,
 ) -> Result<bool, Response> {
+    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None).await
+}
+
+/// Version-aware variant of [`virtual_non_remote_owns_name`].
+///
+/// When `version` is supplied the guard only fires when a local member owns
+/// **that specific version** of the package. This prevents a locally-published
+/// v2.0.0 from blocking proxy resolution of v1.x that was never published
+/// locally — the canonical dependency-confusion attack requires the local
+/// member to own the *same* version the client is requesting, not merely any
+/// version of the same package.
+///
+/// When `version` is `None` the behaviour is identical to the name-only guard
+/// (any local version suppresses the proxy), which is correct for the simple
+/// index listing path where no specific version is requested yet.
+pub async fn virtual_non_remote_owns_name_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+    version: Option<&str>,
+) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
         .iter()
@@ -1609,17 +1630,33 @@ pub async fn virtual_non_remote_owns_name(
         return Ok(false);
     }
 
-    let exists = sqlx::query(
-        "SELECT 1 FROM artifacts \
-                              WHERE repository_id = ANY($1) \
-                                AND is_deleted = false \
-                                AND LOWER(name) = LOWER($2) \
-                              LIMIT 1",
-    )
-    .bind(&non_remote_ids)
-    .bind(package_name)
-    .fetch_optional(db)
-    .await
+    let exists = if let Some(ver) = version {
+        sqlx::query(
+            "SELECT 1 FROM artifacts \
+             WHERE repository_id = ANY($1) \
+               AND is_deleted = false \
+               AND LOWER(name) = LOWER($2) \
+               AND LOWER(version) = LOWER($3) \
+             LIMIT 1",
+        )
+        .bind(&non_remote_ids)
+        .bind(package_name)
+        .bind(ver)
+        .fetch_optional(db)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT 1 FROM artifacts \
+             WHERE repository_id = ANY($1) \
+               AND is_deleted = false \
+               AND LOWER(name) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(&non_remote_ids)
+        .bind(package_name)
+        .fetch_optional(db)
+        .await
+    }
     .map_err(|e| {
         tracing::error!(
             event = "shadowing_guard_db_error",

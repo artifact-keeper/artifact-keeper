@@ -203,6 +203,45 @@ impl PypiHandler {
         result
     }
 
+    /// Extract the version from a PyPI filename given the normalised package name.
+    ///
+    /// Handles both wheel (`{name}-{version}-{python}-{abi}-{platform}.whl`)
+    /// and sdist (`{name}-{version}.tar.gz` / `.zip`) filename conventions.
+    /// Returns `None` when the filename does not start with the expected
+    /// name prefix or the version segment cannot be isolated.
+    pub fn version_from_filename(filename: &str, normalized_name: &str) -> Option<String> {
+        // Strip known extensions (.whl.metadata and .tar.gz.metadata are PEP 658
+        // metadata sidecar files; strip the inner extension first so the stem
+        // produced is the same as for the artifact itself).
+        let filename = filename
+            .strip_suffix(".metadata")
+            .unwrap_or(filename);
+
+        let stem = filename
+            .strip_suffix(".whl")
+            .or_else(|| filename.strip_suffix(".tar.gz"))
+            .or_else(|| filename.strip_suffix(".zip"))
+            .or_else(|| filename.strip_suffix(".tar.bz2"))?;
+
+        // Wheels use underscores in the distribution segment (PEP 427).
+        // Sdists use hyphens (PEP 625 / historical practice).
+        // Try both forms so celery-message-consumer-1.1.1.tar.gz and
+        // celery_message_consumer-1.1.1-py3-none-any.whl both parse correctly.
+        let name_underscored = normalized_name.replace('-', "_");
+        let name_hyphenated = normalized_name.to_string();
+
+        let rest = [name_underscored, name_hyphenated]
+            .iter()
+            .find_map(|name| stem.strip_prefix(format!("{}-", name).as_str()))?;
+
+        // The version is everything up to the next '-' (wheel) or end of string (sdist)
+        let version = rest.split('-').next()?;
+        if version.is_empty() {
+            return None;
+        }
+        Some(version.to_string())
+    }
+
     /// Extract metadata from PKG-INFO or METADATA file in sdist
     pub fn extract_sdist_metadata(content: &[u8]) -> Result<PkgInfo> {
         let gz = GzDecoder::new(content);

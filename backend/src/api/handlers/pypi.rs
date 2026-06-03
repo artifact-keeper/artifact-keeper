@@ -1004,20 +1004,35 @@ async fn serve_file(
                 // PEP 503 normalizes project names (lowercase, runs of
                 // non-alphanumeric collapsed to `-`), so the canonical
                 // identity we compare against `artifacts.name` is the
-                // normalized form. If any non-Remote member already owns
-                // the normalized name, refuse to fan out to Remote
-                // members. This mirrors the hex / cargo / npm /
-                // rubygems behavior; for PyPI specifically, this defeats
-                // the "operator publishes `mycompany-utils` to a Local
-                // member; attacker publishes the same name on pypi.org"
-                // dependency-confusion attack.
+                // normalized form.
+                //
+                // The guard is version-aware when the requested version can be
+                // parsed from the filename: if no local member owns that
+                // specific version the remote proxy is allowed to serve it.
+                // This unblocks legitimate proxy access for versions of a
+                // package that exist both locally and on the upstream registry
+                // (e.g. an open-source fork where only some versions are
+                // published internally).
+                //
+                // Trade-off: this narrows the dependency-confusion protection.
+                // The name-only guard (any local version suppresses the proxy)
+                // was the safer default because dependency-confusion attacks
+                // can target any version, not just the one currently in the
+                // local repo. Operators who want strict name-level isolation
+                // should not publish packages to a local member that also exist
+                // on the upstream registry — use a dedicated local-only virtual
+                // instead. See issue #1582 for the full discussion.
                 let normalized_project = PypiHandler::normalize_name(project);
-                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name(
-                    &state.db,
-                    repo.id,
-                    &normalized_project,
-                )
-                .await?;
+                let requested_version =
+                    PypiHandler::version_from_filename(filename, &normalized_project);
+                let suppress_remote_members =
+                    proxy_helpers::virtual_non_remote_owns_name_version(
+                        &state.db,
+                        repo.id,
+                        &normalized_project,
+                        requested_version.as_deref(),
+                    )
+                    .await?;
 
                 for member in &members {
                     // Try local storage first (works for hosted repos and
