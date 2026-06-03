@@ -1041,12 +1041,28 @@ impl MigrationWorker {
                 // Falls back to the legacy `<repo>/<source-path>` shape only
                 // when the format-aware parser couldn't recover a version
                 // (unknown format / unparseable filename).
-                let path_str = match parsed.version.as_deref() {
-                    Some(ver) if !ver.is_empty() => {
-                        format!("{}/{}/{}", parsed.name, ver, filename)
-                    }
-                    _ => format!("{}/{}", repo_key, artifact_path),
+                let path_str = match package_type {
+                    // Maven/sbt/ivy paths include a group prefix
+                    // (e.g. com/example/artifact/version/file.jar) that
+                    // clients use verbatim when resolving. Reconstructing
+                    // as name/version/filename strips the group and
+                    // breaks resolution via /maven/ and /sbt/ endpoints.
+                    "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
+                    _ => match parsed.version.as_deref() {
+                        Some(ver) if !ver.is_empty() => {
+                            format!("{}/{}/{}", parsed.name, ver, filename)
+                        }
+                        _ => format!("{}/{}", repo_key, artifact_path),
+                    },
                 };
+                // Path-traversal guard: `path_str` is stored verbatim and
+                // used as the load-bearing lookup path, so reject anything
+                // with a leading `/` or a `..` segment rather than writing it.
+                if has_unsafe_path(&path_str) {
+                    return Err(MigrationError::Other(format!(
+                        "Rejected unsafe artifact path: {path_str}"
+                    )));
+                }
                 sqlx::query(
                     r#"
                     INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
@@ -1756,6 +1772,14 @@ pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
 }
 
+/// Reject artifact paths that could escape the repository root once stored
+/// verbatim. The migration now persists the raw external path as the
+/// load-bearing `path`, so a crafted export with a leading `/` or a `..`
+/// segment must never reach the INSERT.
+fn has_unsafe_path(path: &str) -> bool {
+    path.starts_with('/') || path.split('/').any(|seg| seg == "..")
+}
+
 /// Detect Docker/OCI manifest paths laid out by Artifactory's filesystem
 /// layout (`.../sha256__<digest>/manifest.json` or `.../list.manifest.json`).
 ///
@@ -2048,6 +2072,28 @@ mod tests {
             "cargo-cache",
             "requests/requests-2.28.0-py3-none-any.whl"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_unsafe_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_unsafe_path_rejects_traversal_and_absolute() {
+        assert!(has_unsafe_path("../etc/passwd"));
+        assert!(has_unsafe_path("com/example/../../secret/file.jar"));
+        assert!(has_unsafe_path("/etc/passwd"));
+        assert!(has_unsafe_path(".."));
+    }
+
+    #[test]
+    fn test_has_unsafe_path_allows_normal_paths() {
+        assert!(!has_unsafe_path(
+            "com/example/artifact/1.0.0/artifact-1.0.0.jar"
+        ));
+        assert!(!has_unsafe_path("requests/1.0.0/requests-1.0.0.whl"));
+        // A `..` substring inside a segment is not a traversal segment.
+        assert!(!has_unsafe_path("my..pkg/1.0.0/my..pkg-1.0.0.tgz"));
     }
 
     // -----------------------------------------------------------------------
