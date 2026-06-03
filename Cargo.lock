@@ -195,6 +195,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "http-body-util",
  "jsonwebtoken",
  "ldap3",
  "lettre",

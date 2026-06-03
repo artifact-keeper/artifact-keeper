@@ -55,6 +55,7 @@ services:
       SKIP_ADMIN_PROVISIONING: "true"
 
       # OIDC env vars that should be bootstrapped into oidc_configs table
+      OIDC_NAME: Test Keycloak OIDC
       OIDC_ISSUER: http://keycloak:8080/realms/artifact-keeper
       OIDC_CLIENT_ID: artifact-keeper
       OIDC_CLIENT_SECRET: artifact-keeper-secret

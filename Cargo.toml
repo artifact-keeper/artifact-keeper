@@ -48,6 +48,7 @@ object_store = { version = "0.13", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"
+http-body-util = "0.1"
 
 # Logging/Tracing
 tracing = "0.1"

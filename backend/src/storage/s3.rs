@@ -37,17 +37,155 @@
 //!   - "migration": Write native, read from both (for zero-downtime migration)
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
+
+const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
+const S3_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 4;
+const S3_MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// S3 caps a multipart upload at 10,000 parts. With a fixed `S3_MULTIPART_CHUNK_SIZE`
+/// part this bounds a single streamed object at ~50 GiB. We reject the part that
+/// would exceed the cap *before* spawning it (see [`ensure_s3_part_within_limit`])
+/// so the upload fails fast with a clear error instead of transferring the whole
+/// object and then failing opaquely at `complete_multipart`.
+const S3_MULTIPART_MAX_PARTS: usize = 10_000;
+
+type S3PartUploadResult = object_store::Result<(usize, PartId)>;
+
+struct S3PartUploadContext<'a> {
+    store: &'a AmazonS3,
+    path: &'a ObjectPath,
+    upload_id: &'a object_store::MultipartId,
+    key: &'a str,
+}
+
+async fn collect_finished_s3_part(
+    tasks: &mut JoinSet<S3PartUploadResult>,
+    parts: &mut Vec<(usize, PartId)>,
+    key: &str,
+) -> Result<()> {
+    let result = tasks
+        .join_next()
+        .await
+        .expect("multipart upload task set should not be empty");
+    match result {
+        Ok(Ok(part)) => {
+            parts.push(part);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(AppError::Storage(format!(
+            "Multipart upload part failed for '{}': {}",
+            key, e
+        ))),
+        Err(e) => Err(AppError::Storage(format!(
+            "Multipart upload task failed for '{}': {}",
+            key, e
+        ))),
+    }
+}
+
+async fn wait_for_s3_part_capacity(
+    tasks: &mut JoinSet<S3PartUploadResult>,
+    parts: &mut Vec<(usize, PartId)>,
+    key: &str,
+) -> Result<()> {
+    while tasks.len() >= S3_MULTIPART_MAX_IN_FLIGHT_PARTS {
+        collect_finished_s3_part(tasks, parts, key).await?;
+    }
+    Ok(())
+}
+
+/// Reject a multipart part index that would exceed S3's 10,000-part limit.
+///
+/// Returns a clear, actionable error *before* the offending part is uploaded so
+/// an over-large object fails fast instead of transferring ~50 GiB and then
+/// failing opaquely at `complete_multipart`.
+fn ensure_s3_part_within_limit(next_part_index: usize, key: &str) -> Result<()> {
+    if next_part_index >= S3_MULTIPART_MAX_PARTS {
+        let approx_gib =
+            (S3_MULTIPART_MAX_PARTS as u64 * S3_MULTIPART_CHUNK_SIZE as u64) / (1024 * 1024 * 1024);
+        return Err(AppError::Storage(format!(
+            "Multipart upload for '{}' exceeded S3's {}-part limit at {} MiB per part; \
+             objects larger than ~{} GiB cannot be streamed with the current part size",
+            key,
+            S3_MULTIPART_MAX_PARTS,
+            S3_MULTIPART_CHUNK_SIZE / (1024 * 1024),
+            approx_gib,
+        )));
+    }
+    Ok(())
+}
+
+async fn enqueue_s3_part_upload(
+    tasks: &mut JoinSet<S3PartUploadResult>,
+    parts: &mut Vec<(usize, PartId)>,
+    context: S3PartUploadContext<'_>,
+    next_part_index: &mut usize,
+    part: Bytes,
+) -> Result<()> {
+    wait_for_s3_part_capacity(tasks, parts, context.key).await?;
+    // Reject before spawning the part that would exceed S3's 10,000-part limit.
+    // The predicate is unit-tested (`test_s3_part_within_limit_*`); keep the call
+    // here so a refactor of the streaming loop can't silently drop the guard.
+    ensure_s3_part_within_limit(*next_part_index, context.key)?;
+
+    let store = context.store.clone();
+    let part_path = context.path.clone();
+    let part_upload_id = context.upload_id.clone();
+    let part_index = *next_part_index;
+    *next_part_index += 1;
+    tasks.spawn(async move {
+        let part_id = store
+            .put_part(
+                &part_path,
+                &part_upload_id,
+                part_index,
+                PutPayload::from(part),
+            )
+            .await?;
+        Ok((part_index, part_id))
+    });
+
+    Ok(())
+}
+
+async fn drain_s3_part_uploads(
+    tasks: &mut JoinSet<S3PartUploadResult>,
+    parts: &mut Vec<(usize, PartId)>,
+    key: &str,
+) -> Result<()> {
+    while !tasks.is_empty() {
+        collect_finished_s3_part(tasks, parts, key).await?;
+    }
+    Ok(())
+}
+
+async fn abort_s3_multipart(
+    store: &AmazonS3,
+    path: &ObjectPath,
+    upload_id: &object_store::MultipartId,
+    key: &str,
+) {
+    if let Err(e) = store.abort_multipart(path, upload_id).await {
+        tracing::warn!(
+            key = %key,
+            upload_id = %upload_id,
+            "Failed to abort S3 multipart upload after put_stream error: {}",
+            e
+        );
+    }
+}
 
 /// S3 storage backend configuration
 #[derive(Debug, Clone)]
@@ -878,6 +1016,15 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        S3Backend::copy(self, source, dest).await
+    }
+
+    // Note: `put_file` is intentionally NOT overridden — the trait default in
+    // storage/mod.rs already streams the file through `put_stream` with a
+    // 256 KiB ReaderStream (memory-bounded), so a bespoke S3 override would only
+    // duplicate that behavior.
+
     /// Surface S3's ETag from a HEAD on `key`. For single-part PUTs the
     /// ETag equals the MD5 of the object; for multipart uploads it is an
     /// opaque per-upload value. Either way the value is stable per object
@@ -987,6 +1134,16 @@ impl super::StorageBackend for S3Backend {
         Ok(Box::pin(stream))
     }
 
+    /// Streams `stream` to S3 as a multipart upload.
+    ///
+    /// Cancellation note: if this future is dropped after the multipart upload
+    /// is created but before it finishes (client disconnect, request timeout,
+    /// task cancellation), the in-flight part tasks are aborted but the
+    /// server-side multipart upload is NOT explicitly aborted — it is reclaimed
+    /// by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule (set one
+    /// in deployment). The OCI upload path issues each PATCH chunk as its own
+    /// short-lived `put_stream` to a discrete key, so the cancellation window is
+    /// small.
     async fn put_stream(
         &self,
         key: &str,
@@ -995,14 +1152,11 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        let upload = self.store.put_multipart(&path).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to start multipart upload for '{}': {}",
-                key, e
-            ))
-        })?;
-
-        let mut write = WriteMultipart::new(upload);
+        let mut upload_id: Option<object_store::MultipartId> = None;
+        let mut upload_tasks: JoinSet<S3PartUploadResult> = JoinSet::new();
+        let mut uploaded_parts: Vec<(usize, PartId)> = Vec::new();
+        let mut next_part_index = 0_usize;
+        let mut pending_part = BytesMut::with_capacity(S3_MULTIPART_CHUNK_SIZE);
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
 
@@ -1010,25 +1164,138 @@ impl super::StorageBackend for S3Backend {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(data) => {
+                    if data.is_empty() {
+                        continue;
+                    }
                     hasher.update(&data);
                     total += data.len() as u64;
-                    write.put(data);
+                    if upload_id.is_none() {
+                        let id = self.store.create_multipart(&path).await.map_err(|e| {
+                            AppError::Storage(format!(
+                                "Failed to start multipart upload for '{}': {}",
+                                key, e
+                            ))
+                        })?;
+                        upload_id = Some(id);
+                    }
+                    let mut data = data;
+                    while !data.is_empty() {
+                        if pending_part.is_empty() && data.len() >= S3_MULTIPART_CHUNK_SIZE {
+                            let part = data.split_to(S3_MULTIPART_CHUNK_SIZE);
+                            if let Err(e) = enqueue_s3_part_upload(
+                                &mut upload_tasks,
+                                &mut uploaded_parts,
+                                S3PartUploadContext {
+                                    store: &self.store,
+                                    path: &path,
+                                    upload_id: upload_id
+                                        .as_ref()
+                                        .expect("multipart upload id initialized above"),
+                                    key,
+                                },
+                                &mut next_part_index,
+                                part,
+                            )
+                            .await
+                            {
+                                if let Some(upload_id) = upload_id.as_ref() {
+                                    upload_tasks.shutdown().await;
+                                    abort_s3_multipart(&self.store, &path, upload_id, key).await;
+                                }
+                                return Err(e);
+                            }
+                            continue;
+                        }
+
+                        let remaining_capacity = S3_MULTIPART_CHUNK_SIZE - pending_part.len();
+                        let bytes_to_buffer = remaining_capacity.min(data.len());
+                        pending_part.extend_from_slice(&data.split_to(bytes_to_buffer));
+
+                        if pending_part.len() == S3_MULTIPART_CHUNK_SIZE {
+                            let part = pending_part.split().freeze();
+                            if let Err(e) = enqueue_s3_part_upload(
+                                &mut upload_tasks,
+                                &mut uploaded_parts,
+                                S3PartUploadContext {
+                                    store: &self.store,
+                                    path: &path,
+                                    upload_id: upload_id
+                                        .as_ref()
+                                        .expect("multipart upload id initialized above"),
+                                    key,
+                                },
+                                &mut next_part_index,
+                                part,
+                            )
+                            .await
+                            {
+                                if let Some(upload_id) = upload_id.as_ref() {
+                                    upload_tasks.shutdown().await;
+                                    abort_s3_multipart(&self.store, &path, upload_id, key).await;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     // Abort the multipart upload on stream error to avoid
                     // leaving partial objects in S3.
-                    let _ = write.abort().await;
+                    if let Some(upload_id) = upload_id.as_ref() {
+                        upload_tasks.shutdown().await;
+                        abort_s3_multipart(&self.store, &path, upload_id, key).await;
+                    }
                     return Err(e);
                 }
             }
         }
 
-        write.finish().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to complete multipart upload for '{}': {}",
-                key, e
-            ))
-        })?;
+        if let Some(upload_id) = upload_id {
+            if !pending_part.is_empty() {
+                if let Err(e) = enqueue_s3_part_upload(
+                    &mut upload_tasks,
+                    &mut uploaded_parts,
+                    S3PartUploadContext {
+                        store: &self.store,
+                        path: &path,
+                        upload_id: &upload_id,
+                        key,
+                    },
+                    &mut next_part_index,
+                    pending_part.freeze(),
+                )
+                .await
+                {
+                    upload_tasks.shutdown().await;
+                    abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                    return Err(e);
+                }
+            }
+            if let Err(e) = drain_s3_part_uploads(&mut upload_tasks, &mut uploaded_parts, key).await
+            {
+                upload_tasks.shutdown().await;
+                abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                return Err(e);
+            }
+            uploaded_parts.sort_by_key(|(part_index, _)| *part_index);
+            let parts = uploaded_parts
+                .into_iter()
+                .map(|(_, part_id)| part_id)
+                .collect();
+            if let Err(e) = self
+                .store
+                .complete_multipart(&path, &upload_id, parts)
+                .await
+            {
+                abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                return Err(AppError::Storage(format!(
+                    "Failed to complete multipart upload for '{}': {}",
+                    key, e
+                )));
+            }
+        } else {
+            self.put(key, Bytes::new()).await?;
+        }
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -1067,6 +1334,19 @@ impl S3Backend {
 
     /// Copy content from one key to another
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let size = self.size(source).await?;
+        if size > S3_MAX_SINGLE_COPY_SIZE {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                size,
+                "S3 source is too large for CopyObject; streaming through multipart upload"
+            );
+            let stream = <Self as super::StorageBackend>::get_stream(self, source).await?;
+            <Self as super::StorageBackend>::put_stream(self, dest, stream).await?;
+            return Ok(());
+        }
+
         let source_key = self.full_key(source);
         let dest_key = self.full_key(dest);
 
@@ -1187,6 +1467,31 @@ mod tests {
         assert_eq!(
             make_full_key(Some("artifacts/"), "test/file.txt"),
             "artifacts/test/file.txt"
+        );
+    }
+
+    // --- free function tests: ensure_s3_part_within_limit ---
+
+    #[test]
+    fn test_s3_part_within_limit_accepts_below_cap() {
+        // The last valid index is S3_MULTIPART_MAX_PARTS - 1 (the 10,000th part).
+        assert!(ensure_s3_part_within_limit(0, "k").is_ok());
+        assert!(ensure_s3_part_within_limit(S3_MULTIPART_MAX_PARTS - 1, "k").is_ok());
+    }
+
+    #[test]
+    fn test_s3_part_within_limit_rejects_at_cap() {
+        // Index == cap would be the 10,001st part: rejected with a clear error.
+        let err = ensure_s3_part_within_limit(S3_MULTIPART_MAX_PARTS, "blobs/abc")
+            .expect_err("part index at the cap must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blobs/abc"),
+            "error should name the key: {msg}"
+        );
+        assert!(
+            msg.contains(&S3_MULTIPART_MAX_PARTS.to_string()),
+            "error should state the part limit: {msg}"
         );
     }
 
@@ -2644,6 +2949,316 @@ mod tests {
         let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
         // Not asserting success because the mock may not perfectly satisfy
         // the object_store S3 multi-delete protocol, but the branch is exercised.
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_limits_in_flight_multipart_parts() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cap = S3_MULTIPART_MAX_IN_FLIGHT_PARTS;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        // Part uploads hang for the lifetime of the test so the in-flight set
+        // stays saturated and the assertions never depend on wall-clock timing:
+        // once `cap` parts are dispatched they never complete, so the streaming
+        // loop cannot enqueue a (cap+1)th part until the test tears it down.
+        let part_guard = Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"part-etag\"")
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let chunks_polled = Arc::new(AtomicUsize::new(0));
+        // cap + 1 full-size chunks: the extra one must stay buffered, unable to
+        // begin uploading until an in-flight part frees a capacity slot.
+        let stream_chunks = (0..=cap).map({
+            let chunks_polled = Arc::clone(&chunks_polled);
+            move |_| {
+                chunks_polled.fetch_add(1, Ordering::SeqCst);
+                Ok(Bytes::from(vec![b'x'; S3_MULTIPART_CHUNK_SIZE]))
+            }
+        });
+        let stream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(stream_chunks));
+
+        let upload = tokio::spawn(async move {
+            StorageBackendTrait::put_stream(&backend, "slow-multipart-object", stream).await
+        });
+
+        // Wait until the streaming loop has saturated the in-flight cap. Poll
+        // (up to ~30s) instead of relying on a single fixed sleep so the
+        // assertion is robust on slow/contended CI runners.
+        let mut in_flight = 0;
+        for _ in 0..300 {
+            in_flight = part_guard.received_requests().await.len();
+            if in_flight >= cap {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            in_flight, cap,
+            "put_stream should saturate exactly the in-flight cap of concurrent part uploads"
+        );
+
+        // The (cap+1)th chunk has been polled and buffered, but its part cannot
+        // be enqueued while every slot is held by a hung upload. Give the loop
+        // room to misbehave, then confirm the cap still holds.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            part_guard.received_requests().await.len(),
+            cap,
+            "put_stream must not exceed its in-flight cap while earlier parts are still uploading; chunks polled: {}",
+            chunks_polled.load(Ordering::SeqCst),
+        );
+        assert!(
+            !upload.is_finished(),
+            "upload must still be blocked on the hung in-flight parts"
+        );
+        assert_eq!(
+            chunks_polled.load(Ordering::SeqCst),
+            cap + 1,
+            "put_stream should poll exactly one chunk past the cap before blocking on capacity"
+        );
+
+        // The hung parts never return; drop the task rather than wait out the delay.
+        upload.abort();
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_buffers_small_chunks_into_valid_s3_parts() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const ONE_MIB: usize = 1024 * 1024;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        let part_guard = Mock::given(method("PUT"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"part-etag\""))
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-etag\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let stream = futures::stream::iter((0..6).map(|_| Ok(Bytes::from(vec![b'x'; ONE_MIB]))));
+
+        let result =
+            StorageBackendTrait::put_stream(&backend, "small-chunks-object", Box::pin(stream))
+                .await
+                .expect("multipart upload should complete");
+
+        assert_eq!(result.bytes_written, 6 * ONE_MIB as u64);
+
+        let mut part_lengths: Vec<(usize, usize)> = part_guard
+            .received_requests()
+            .await
+            .into_iter()
+            .map(|request| {
+                let part_number = request
+                    .url
+                    .query_pairs()
+                    .find_map(|(key, value)| {
+                        (key == "partNumber")
+                            .then(|| value.parse::<usize>().expect("partNumber must be numeric"))
+                    })
+                    .expect("UploadPart request must include partNumber");
+                (part_number, request.body.len())
+            })
+            .collect();
+        part_lengths.sort_by_key(|(part_number, _)| *part_number);
+        let part_lengths: Vec<usize> = part_lengths.into_iter().map(|(_, len)| len).collect();
+
+        assert_eq!(
+            part_lengths,
+            vec![S3_MULTIPART_CHUNK_SIZE, ONE_MIB],
+            "small input chunks must be buffered so only the final S3 part is below 5 MiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_aborts_multipart_when_complete_fails() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"part-etag\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+        let abort_guard = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let stream = futures::stream::iter([Ok(Bytes::from(vec![b'x'; S3_MULTIPART_CHUNK_SIZE]))]);
+
+        let result =
+            StorageBackendTrait::put_stream(&backend, "complete-fails-object", Box::pin(stream))
+                .await;
+
+        assert!(result.is_err(), "complete failure must surface to caller");
+        assert_eq!(
+            abort_guard.received_requests().await.len(),
+            1,
+            "failed CompleteMultipartUpload must abort the pending multipart upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_aborts_multipart_when_final_part_upload_fails() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("part failed"))
+            .mount(&server)
+            .await;
+        let abort_guard = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "test-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let stream = futures::stream::iter([Ok(Bytes::from(vec![b'x'; S3_MULTIPART_CHUNK_SIZE]))]);
+
+        let result =
+            StorageBackendTrait::put_stream(&backend, "part-fails-object", Box::pin(stream)).await;
+
+        assert!(
+            result.is_err(),
+            "part upload failure must surface to caller"
+        );
+        assert_eq!(
+            abort_guard.received_requests().await.len(),
+            1,
+            "failed final UploadPart must abort the pending multipart upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_streams_large_source_instead_of_single_copy_object() {
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Content-Length",
+                        (5_u64 * 1024 * 1024 * 1024 + 1).to_string(),
+                    )
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"large-copy"[..])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"copy-part\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        S3Backend::copy(&backend, "source-object", "dest-object")
+            .await
+            .expect("large copy should stream through multipart upload");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.method.as_str() == "GET"
+                    && request.url.path().ends_with("/source-object")),
+            "large copy should read the source as a stream"
+        );
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "uploadId" && value == "copy-upload-id")),
+            "large copy should write the destination via multipart upload"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.headers.contains_key("x-amz-copy-source")),
+            "large copy must not use single-request S3 CopyObject"
+        );
     }
 
     // ---- classify_s3_error: issue #981 diagnostic classifier ----

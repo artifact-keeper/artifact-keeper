@@ -6,9 +6,14 @@
 // cannot be converted to AppError without breaking Docker/OCI client compat.
 // Consider wrapping oci_error to also log via tracing for consistency.
 
-use std::sync::Arc;
+use std::error::Error as StdError;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -17,16 +22,17 @@ use axum::routing::get;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
-use tokio::io::AsyncWriteExt;
+use sqlx::{postgres::PgRow, PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
 
@@ -61,6 +67,10 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(json))
         .unwrap()
+}
+
+fn oci_internal_error(message: &str) -> Response {
+    oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message)
 }
 
 /// Escape a string so it is safe to embed in an HTTP `quoted-string` body
@@ -424,185 +434,12 @@ fn manifest_storage_key(digest: &str) -> String {
     format!("oci-manifests/{}", digest)
 }
 
-/// Legacy upload-key helper. Pre-#1449 OCI blob uploads accumulated
-/// PATCH chunks under this key in the storage backend; that path was
-/// the root cause of the upload-size-quadratic IO behaviour. The
-/// streaming path now keeps in-progress uploads on local disk via
-/// `oci_upload_temp_path` and only touches the storage backend once
-/// per upload, when the verified blob is promoted to `oci-blobs/...`.
-/// Kept only so the existing migration / GC code that reads sessions
-/// with the old prefix has a single named anchor in case operators
-/// need to drain leftover partial uploads after upgrade.
-#[allow(dead_code)]
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
 
-/// Local filesystem path used to accumulate a chunked OCI blob upload
-/// before it is committed to the final storage backend (#1449).
-///
-/// We keep partial upload bytes on local disk rather than on the storage
-/// backend so PATCH continuations can simply `O_APPEND` instead of
-/// downloading the in-progress object, appending in memory, and rewriting
-/// it back. For a 10 GiB layer split across 100 PATCHes, the old path
-/// performed roughly N(N+1)/2 chunk-sized reads and writes through the
-/// storage backend (5 050x amplification). The local-disk path is a single
-/// stream through the kernel, then one final `put_stream` to the storage
-/// backend at completion time.
-///
-/// The path is rooted under `$AK_OCI_UPLOAD_TMP_DIR` if set, otherwise the
-/// process's `std::env::temp_dir()`. The session UUID is folded into the
-/// filename so concurrent uploads cannot collide.
-fn oci_upload_temp_path(uuid: &Uuid) -> std::path::PathBuf {
-    let root = std::env::var("AK_OCI_UPLOAD_TMP_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    root.join(format!("ak-oci-upload-{}", uuid))
-}
-
-/// Result of streaming an HTTP request body to a local temp file while
-/// updating a running SHA-256 hasher and enforcing a byte cap.
-#[derive(Debug)]
-struct StreamToTempResult {
-    /// Bytes consumed from the request body during this call.
-    bytes_written: u64,
-}
-
-/// Maximum chunk size we read from the HTTP body before flushing to disk
-/// and yielding back to the executor. 256 KiB matches `tokio_util`'s
-/// default `ReaderStream` chunk size and the migration worker's value
-/// from #1512, so memory use per task is bounded to a single 256 KiB
-/// chunk regardless of total upload size.
-const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
-
-/// Stream an axum `Body` to `path` (creating or appending), updating
-/// `hasher` and `total_bytes` as data arrives. Returns the number of
-/// bytes consumed from this body.
-///
-/// `max_total_bytes == 0` disables the cap to match `MAX_UPLOAD_SIZE=0`
-/// semantics from `config.max_upload_size_bytes` (#1449 acceptance).
-/// A non-zero cap returns `Err(StatusCode::PAYLOAD_TOO_LARGE)` as soon as
-/// the running total would exceed the cap, without writing the offending
-/// chunk to disk.
-async fn stream_body_to_temp_file(
-    body: Body,
-    path: &std::path::Path,
-    hasher: &mut Sha256,
-    total_bytes: &mut u64,
-    max_total_bytes: u64,
-) -> Result<StreamToTempResult, (StatusCode, String)> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("open temp file {}: {e}", path.display()),
-            )
-        })?;
-
-    let mut stream = body.into_data_stream();
-    let mut consumed: u64 = 0;
-    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_BUDGET);
-
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
-        if chunk.is_empty() {
-            continue;
-        }
-
-        // Enforce MAX_UPLOAD_SIZE before touching disk. `0` is the
-        // documented "unlimited" sentinel and must short-circuit the
-        // check, not be treated as "every chunk overflows".
-        if max_total_bytes > 0 {
-            let projected = total_bytes.saturating_add(chunk.len() as u64);
-            if projected > max_total_bytes {
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "upload would exceed MAX_UPLOAD_SIZE ({} bytes)",
-                        max_total_bytes
-                    ),
-                ));
-            }
-        }
-
-        hasher.update(&chunk);
-        *total_bytes += chunk.len() as u64;
-        consumed += chunk.len() as u64;
-
-        // Coalesce small chunks before issuing a write syscall, but cap
-        // the buffer at STREAM_CHUNK_BUDGET so memory stays bounded.
-        if buf.len() + chunk.len() > STREAM_CHUNK_BUDGET && !buf.is_empty() {
-            file.write_all(&buf).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("write chunk to temp: {e}"),
-                )
-            })?;
-            buf.clear();
-        }
-        if chunk.len() >= STREAM_CHUNK_BUDGET {
-            file.write_all(&chunk).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("write chunk to temp: {e}"),
-                )
-            })?;
-        } else {
-            buf.extend_from_slice(&chunk);
-        }
-        drop(chunk);
-    }
-
-    if !buf.is_empty() {
-        file.write_all(&buf).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("write tail to temp: {e}"),
-            )
-        })?;
-    }
-
-    file.flush().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("flush temp file: {e}"),
-        )
-    })?;
-
-    Ok(StreamToTempResult {
-        bytes_written: consumed,
-    })
-}
-
-/// Open the local upload temp file as a `BoxStream<Result<Bytes>>` ready
-/// to feed `StorageBackend::put_stream`. Uses a 256 KiB-buffered
-/// `ReaderStream` so the upload from local disk to the storage backend
-/// is also memory-bounded. After #1512 every backend (S3, GCS, Azure,
-/// filesystem) routes this through its native streaming primitive.
-async fn open_upload_temp_as_stream(
-    path: &std::path::Path,
-) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, std::io::Error> {
-    use tokio::io::BufReader;
-    use tokio_util::io::ReaderStream;
-
-    let file = tokio::fs::File::open(path).await?;
-    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file);
-    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_BUDGET);
-    let mapped = stream
-        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("temp file read: {e}"))));
-    Ok(Box::pin(mapped))
-}
-
-/// Best-effort cleanup of a session's local temp file. Never returns an
-/// error; the caller has either completed the upload (file already gone
-/// via rename) or is abandoning the session.
-async fn cleanup_upload_temp(path: &std::path::Path) {
-    let _ = tokio::fs::remove_file(path).await;
+fn upload_part_storage_key(upload_key: &str, part_index: i32, part_id: &Uuid) -> String {
+    format!("{}.part.{:08}.{}", upload_key, part_index, part_id)
 }
 
 fn upload_progress_range(bytes_received: i64) -> String {
@@ -613,10 +450,1031 @@ fn upload_progress_range(bytes_received: i64) -> String {
     }
 }
 
+fn upload_patch_accepted_response(
+    image_name: &str,
+    session_id: Uuid,
+    bytes_received: i64,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(
+            LOCATION,
+            format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
+        )
+        .header("Docker-Upload-UUID", session_id.to_string())
+        .header("Range", upload_progress_range(bytes_received))
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn upload_complete_created_response(image_name: &str, digest: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, digest))
+        .header("Docker-Content-Digest", digest)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn request_body_stream(
+    body: Body,
+    initial_bytes_read: u64,
+    max_upload_size_bytes: u64,
+    limit_exceeded: Arc<AtomicBool>,
+) -> BoxStream<'static, crate::error::Result<Bytes>> {
+    let mut bytes_read: u64 = initial_bytes_read;
+    Box::pin(body.into_data_stream().map(move |chunk| {
+        let data =
+            chunk.map_err(|e| AppError::Validation(format!("request body read failed: {}", e)))?;
+
+        if max_upload_size_bytes != 0 {
+            bytes_read = bytes_read
+                .checked_add(data.len() as u64)
+                .unwrap_or(max_upload_size_bytes.saturating_add(1));
+            if bytes_read > max_upload_size_bytes {
+                limit_exceeded.store(true, Ordering::Relaxed);
+                return Err(AppError::Validation(format!(
+                    "request body exceeds configured max upload size of {} bytes",
+                    max_upload_size_bytes
+                )));
+            }
+        }
+
+        Ok(data)
+    }))
+}
+
+async fn put_request_body_stream(
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    key: &str,
+    body: Body,
+    initial_bytes_read: u64,
+    max_upload_size_bytes: u64,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stream = request_body_stream(
+        body,
+        initial_bytes_read,
+        max_upload_size_bytes,
+        Arc::clone(&limit_exceeded),
+    );
+    match storage.put_stream(key, stream).await {
+        Ok(result) => Ok(result),
+        Err(e)
+            if limit_exceeded.load(Ordering::Relaxed) || matches!(&e, AppError::Validation(_)) =>
+        {
+            Err(oci_error(
+                StatusCode::BAD_REQUEST,
+                "BLOB_UPLOAD_INVALID",
+                &e.to_string(),
+            ))
+        }
+        Err(e) => Err(oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn collect_request_body(body: Body, limit: usize) -> Result<Bytes, Response> {
+    // Config uses MAX_UPLOAD_SIZE=0 to mean "unlimited" (the router disables
+    // DefaultBodyLimit for the same value). axum::body::to_bytes interprets 0
+    // literally, so translate it before collecting legacy small-body paths.
+    let limit = if limit == 0 { usize::MAX } else { limit };
+    collect_request_body_with_exact_limit(body, limit).await
+}
+
+async fn collect_request_body_with_exact_limit(
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Response> {
+    to_bytes(body, limit).await.map_err(|e| {
+        if error_chain_contains::<http_body_util::LengthLimitError>(&e) {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "BLOB_UPLOAD_INVALID",
+                &format!("request body exceeds configured limit: {}", e),
+            );
+        }
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &format!("request body read failed: {}", e),
+        )
+    })
+}
+
+fn error_chain_contains<T>(error: &(dyn StdError + 'static)) -> bool
+where
+    T: StdError + 'static,
+{
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<T>() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn upload_session_size_error(max_upload_size_bytes: u64) -> Response {
+    oci_error(
+        StatusCode::BAD_REQUEST,
+        "BLOB_UPLOAD_INVALID",
+        &format!(
+            "upload session exceeds configured max upload size of {} bytes",
+            max_upload_size_bytes
+        ),
+    )
+}
+
+fn upload_session_body_limit(existing_bytes: i64, max_upload_size_bytes: u64) -> usize {
+    if max_upload_size_bytes == 0 {
+        return usize::MAX;
+    }
+    let existing_bytes = match u64::try_from(existing_bytes) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    max_upload_size_bytes
+        .saturating_sub(existing_bytes)
+        .try_into()
+        .unwrap_or(usize::MAX)
+}
+
+fn reject_oversized_content_length(
+    headers: &HeaderMap,
+    body_limit: usize,
+    max_upload_size_bytes: u64,
+) -> Option<Response> {
+    if body_limit == usize::MAX {
+        return None;
+    }
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())?;
+    if content_length > body_limit as u64 {
+        return Some(upload_session_size_error(max_upload_size_bytes));
+    }
+    None
+}
+
+fn parse_upload_content_range(value: &str) -> Option<(i64, i64)> {
+    let range = value
+        .trim()
+        .strip_prefix("bytes ")
+        .unwrap_or_else(|| value.trim());
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<i64>().ok()?;
+    let end = end.trim().parse::<i64>().ok()?;
+    if start < 0 || end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn validate_patch_content_range(headers: &HeaderMap, expected_start: i64) -> Option<Response> {
+    let value = headers.get("Content-Range")?;
+    let Ok(value) = value.to_str() else {
+        return Some(oci_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "BLOB_UPLOAD_INVALID",
+            "invalid Content-Range header",
+        ));
+    };
+    let Some((start, end)) = parse_upload_content_range(value) else {
+        return Some(oci_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "BLOB_UPLOAD_INVALID",
+            "invalid Content-Range header",
+        ));
+    };
+    if start != expected_start {
+        return Some(oci_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "BLOB_UPLOAD_INVALID",
+            &format!(
+                "Content-Range starts at {}, expected {}",
+                start, expected_start
+            ),
+        ));
+    }
+    if let Some(content_length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        // `end` may be as large as i64::MAX (parse_upload_content_range only
+        // rejects start < 0 / end < start), so the span must be computed with
+        // checked arithmetic: a plain `end - start + 1` overflows for a hostile
+        // `Content-Range: 0-9223372036854775807`, which panics in debug builds
+        // and wraps to a negative value in release.
+        let Some(span) = end.checked_sub(start).and_then(|v| v.checked_add(1)) else {
+            return Some(oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range is out of range",
+            ));
+        };
+        if span != content_length {
+            return Some(oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range length does not match Content-Length",
+            ));
+        }
+    }
+    None
+}
+
+async fn delete_storage_key_best_effort(
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    key: &str,
+    context: &'static str,
+) {
+    if let Err(e) = storage.delete(key).await {
+        warn!(
+            storage_key = %key,
+            context,
+            error = %e,
+            "Failed to delete storage object during OCI upload cleanup"
+        );
+    }
+}
+
+async fn register_oci_upload_cleanup_key(
+    db: &PgPool,
+    repository_id: Uuid,
+    upload_session_id: Option<Uuid>,
+    storage_key: &str,
+) -> Result<(), Response> {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (storage_key) DO NOTHING
+        "#,
+    )
+    .bind(repository_id)
+    .bind(upload_session_id)
+    .bind(storage_key)
+    .execute(db)
+    .await
+    .map(|_| ())
+    .map_err(|e| oci_internal_error(&e.to_string()))
+}
+
+async fn mark_oci_upload_cleanup_key_committed(
+    db: &PgPool,
+    storage_key: &str,
+) -> Result<(), Response> {
+    let result = sqlx::query(
+        r#"
+        UPDATE oci_upload_cleanup_keys
+        SET storage_write_completed_at = COALESCE(storage_write_completed_at, NOW())
+        WHERE storage_key = $1
+        "#,
+    )
+    .bind(storage_key)
+    .execute(db)
+    .await
+    .map_err(|e| oci_internal_error(&e.to_string()))?;
+
+    // The journal row is always registered before the storage write it tracks,
+    // so a 0-row update means the register/mark pairing was broken (row deleted
+    // out from under us, or the wrong key). It is not fatal — the pending
+    // (NULL-marked) reaper still backstops the temp object — but it should never
+    // happen, so surface it instead of silently succeeding.
+    if result.rows_affected() == 0 {
+        warn!(
+            storage_key = %storage_key,
+            "OCI upload cleanup key was missing when marking its storage write committed"
+        );
+    }
+
+    Ok(())
+}
+
+async fn delete_storage_key_for_upload_cancel(
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    key: &str,
+    session_id: Uuid,
+) -> std::result::Result<(), Response> {
+    match storage.delete(key).await {
+        Ok(()) | Err(AppError::NotFound(_)) => Ok(()),
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                storage_key = %key,
+                error = %e,
+                "Failed to delete storage object during OCI upload cancellation"
+            );
+            Err(oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+/// A SHA-256 content digest.
+///
+/// The codebase moves a sha256 digest between two interchangeable string
+/// representations and relies on each call site picking the right one:
+///   * the "prefixed" wire/DB form `"sha256:<hex>"` (the OCI digest query
+///     param, `oci_upload_sessions.computed_digest`), and
+///   * the "bare hex" form `"<hex>"` (`StorageBackend` checksums,
+///     `oci_upload_parts.digest_sha256`).
+///
+/// This newtype carries the **bare lowercase hex** internally as the canonical
+/// form and exposes [`Sha256Digest::as_hex`]/[`Sha256Digest::as_prefixed`] so
+/// each SQL bind / comparison serializes through the right accessor. Equality is
+/// canonical hex equality, so two values constructed from the two different
+/// string forms compare equal. The on-the-wire / DB byte representations are
+/// unchanged: bind `as_prefixed()` where the column stores `"sha256:<hex>"` and
+/// `as_hex()` where it stores bare hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sha256Digest(String);
+
+impl Sha256Digest {
+    /// Parse the OCI `digest` query parameter, e.g. `"sha256:abc123..."`.
+    ///
+    /// Only the `sha256` algorithm is accepted (the registry computes sha256
+    /// checksums); the hex must be exactly 64 hex characters. Upper-case hex is
+    /// accepted and normalized to lower-case (see [`Sha256Digest::from_hex`]).
+    fn parse_digest_param(value: &str) -> std::result::Result<Self, String> {
+        let hex = value
+            .strip_prefix("sha256:")
+            .ok_or_else(|| format!("invalid sha256 digest, missing 'sha256:' prefix: {value}"))?;
+        Self::from_hex(hex)
+    }
+
+    /// Construct from a bare hex string such as a `StorageBackend` checksum.
+    fn from_hex(hex: &str) -> std::result::Result<Self, String> {
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("invalid sha256 hex digest: {hex}"));
+        }
+        Ok(Self(hex.to_ascii_lowercase()))
+    }
+
+    /// The prefixed wire/DB form `"sha256:<hex>"`.
+    fn as_prefixed(&self) -> String {
+        format!("sha256:{}", self.0)
+    }
+
+    /// The bare lowercase hex form `"<hex>"`.
+    fn as_hex(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The lifecycle state of an `oci_upload_sessions` row.
+///
+/// Mirrors the SQL `CHECK (state IN ('open', 'committing'))` constraint
+/// (migration 115) so a typo can no longer silently break the completion lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadSessionState {
+    /// Accepting PATCH appends; not yet being committed.
+    Open,
+    /// A PUT completion holds the lease and is concatenating/committing parts.
+    Committing,
+}
+
+impl UploadSessionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            UploadSessionState::Open => "open",
+            UploadSessionState::Committing => "committing",
+        }
+    }
+
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "open" => Ok(UploadSessionState::Open),
+            "committing" => Ok(UploadSessionState::Committing),
+            other => Err(format!("invalid oci_upload_sessions.state: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OciUploadSessionRecord {
+    repository_id: Uuid,
+    storage_temp_key: String,
+    bytes_received: i64,
+    computed_digest: Option<Sha256Digest>,
+    state: UploadSessionState,
+    part_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OciUploadPartRecord {
+    storage_key: String,
+    size_bytes: i64,
+}
+
+fn upload_session_conflict(message: &str) -> Response {
+    oci_error(StatusCode::CONFLICT, "BLOB_UPLOAD_INVALID", message)
+}
+
+fn is_pg_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(db_error)
+            if db_error.code().as_deref() == Some("23505")
+    )
+}
+
+fn row_decode_error(context: &str, error: sqlx::Error) -> String {
+    format!("{context}: {error}")
+}
+
+/// Decode a session row into [`OciUploadSessionRecord`].
+///
+/// Both the claiming `RETURNING` path and the read-path `SELECT` now project the
+/// same columns (`repository_id`, `storage_temp_key`, `bytes_received`,
+/// `computed_digest`, `state`, `part_count`), so a single decoder reads every
+/// field honestly off the row instead of fabricating `state`/`part_count`.
+/// `repo_mismatch` lets the two call sites phrase the cross-repo error
+/// distinctly without duplicating the decode logic.
+fn decode_upload_session_row_with(
+    row: PgRow,
+    context_repository_id: Uuid,
+    repo_mismatch: &str,
+) -> std::result::Result<OciUploadSessionRecord, String> {
+    let repository_id = row
+        .try_get::<Uuid, _>("repository_id")
+        .map_err(|e| row_decode_error("invalid oci_upload_sessions.repository_id", e))?;
+    if repository_id != context_repository_id {
+        return Err(repo_mismatch.to_string());
+    }
+    let bytes_received = row
+        .try_get::<i64, _>("bytes_received")
+        .map_err(|e| row_decode_error("invalid oci_upload_sessions.bytes_received", e))?;
+    let part_count = row
+        .try_get::<i64, _>("part_count")
+        .map_err(|e| row_decode_error("invalid oci_upload_sessions.part_count", e))?;
+    if bytes_received < 0 {
+        return Err("invalid oci_upload_sessions.bytes_received: negative value".to_string());
+    }
+    if part_count < 0 {
+        return Err("invalid oci_upload_sessions.part_count: negative value".to_string());
+    }
+    let computed_digest = row
+        .try_get::<Option<String>, _>("computed_digest")
+        .map_err(|e| row_decode_error("invalid oci_upload_sessions.computed_digest", e))?
+        .map(|value| Sha256Digest::parse_digest_param(&value))
+        .transpose()
+        .map_err(|e| format!("invalid oci_upload_sessions.computed_digest: {e}"))?;
+    let state = UploadSessionState::parse(
+        &row.try_get::<String, _>("state")
+            .map_err(|e| row_decode_error("invalid oci_upload_sessions.state", e))?,
+    )?;
+    Ok(OciUploadSessionRecord {
+        repository_id,
+        storage_temp_key: row
+            .try_get::<String, _>("storage_temp_key")
+            .map_err(|e| row_decode_error("invalid oci_upload_sessions.storage_temp_key", e))?,
+        bytes_received,
+        computed_digest,
+        state,
+        part_count,
+    })
+}
+
+fn decode_claimed_upload_session_row(
+    row: PgRow,
+    context_repository_id: Uuid,
+) -> std::result::Result<OciUploadSessionRecord, String> {
+    decode_upload_session_row_with(
+        row,
+        context_repository_id,
+        "claimed upload session repository_id does not match request repository",
+    )
+}
+
+fn decode_upload_session_row(
+    row: PgRow,
+    context_repository_id: Uuid,
+) -> std::result::Result<OciUploadSessionRecord, String> {
+    decode_upload_session_row_with(
+        row,
+        context_repository_id,
+        "upload session repository_id does not match request repository",
+    )
+}
+
+fn decode_upload_part_row(row: PgRow) -> std::result::Result<OciUploadPartRecord, String> {
+    let size_bytes = row
+        .try_get::<i64, _>("size_bytes")
+        .map_err(|e| row_decode_error("invalid oci_upload_parts.size_bytes", e))?;
+    if size_bytes < 0 {
+        return Err("invalid oci_upload_parts.size_bytes: negative value".to_string());
+    }
+    Ok(OciUploadPartRecord {
+        storage_key: row
+            .try_get::<String, _>("storage_key")
+            .map_err(|e| row_decode_error("invalid oci_upload_parts.storage_key", e))?,
+        size_bytes,
+    })
+}
+
+/// Atomically take the completion lease on an upload session.
+///
+/// Flips the row `open -> committing` and stamps `state_token` so exactly one
+/// PUT completion (or cancel) can own the session at a time. A session already
+/// `committing` is only reclaimed once its `updated_at` is older than the 6h
+/// staleness window — far larger than the 60s heartbeat
+/// ([`start_oci_upload_completion_heartbeat`]) that keeps a live lease fresh, so
+/// an in-flight completion is never stolen out from under itself. Returns `None`
+/// when the session is owned by another live completion (the caller maps this to
+/// `409 CONFLICT`).
+async fn claim_oci_upload_session_for_completion(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+) -> Result<Option<OciUploadSessionRecord>, Response> {
+    let row = sqlx::query(
+        r#"
+        UPDATE oci_upload_sessions
+        SET state = $4, state_token = $3, updated_at = NOW()
+        WHERE id = $1
+          AND repository_id = $2
+          AND (
+            state = $5
+            OR (state = $4 AND updated_at < NOW() - INTERVAL '6 hours')
+          )
+        RETURNING
+            repository_id,
+            storage_temp_key,
+            bytes_received,
+            computed_digest,
+            state,
+            (
+                SELECT COALESCE(COUNT(p.id), 0)::BIGINT
+                FROM oci_upload_parts p
+                WHERE p.upload_session_id = oci_upload_sessions.id
+            ) AS part_count
+        "#,
+    )
+    .bind(session_id)
+    .bind(repository_id)
+    .bind(state_token)
+    .bind(UploadSessionState::Committing.as_str())
+    .bind(UploadSessionState::Open.as_str())
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?;
+
+    row.map(|row| decode_claimed_upload_session_row(row, repository_id))
+        .transpose()
+        .map_err(|e| oci_internal_error(&e))
+}
+
+/// RAII guard over the background task that renews a completion lease.
+///
+/// While the guard is alive a spawned task refreshes `updated_at` so the 6h
+/// staleness reclaim in [`claim_oci_upload_session_for_completion`] cannot steal
+/// the session. `Drop` aborts the task, so the heartbeat can never outlive the
+/// guard's scope — every early return in `handle_complete_upload` cancels it
+/// automatically. The shared `lease_valid` flag flips to `false` (and stays
+/// false) once the renew UPDATE touches 0 rows or after repeated DB errors;
+/// callers poll [`lease_is_valid`](Self::lease_is_valid) before each
+/// storage-mutating step to fail fast. The flag is only an optimization — the
+/// authoritative lease check is the `state_token` predicate on the terminal
+/// DELETE/UPDATE, which rolls back if the lease was lost.
+struct OciUploadCompletionHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
+    lease_valid: Arc<AtomicBool>,
+}
+
+impl Drop for OciUploadCompletionHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl OciUploadCompletionHeartbeat {
+    fn lease_is_valid(&self) -> bool {
+        self.lease_valid.load(Ordering::Relaxed)
+    }
+}
+
+fn start_oci_upload_completion_heartbeat(
+    db: PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+) -> OciUploadCompletionHeartbeat {
+    start_oci_upload_completion_heartbeat_with_options(
+        db,
+        session_id,
+        repository_id,
+        state_token,
+        Duration::from_secs(60),
+        3,
+    )
+}
+
+fn start_oci_upload_completion_heartbeat_with_options(
+    db: PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+    interval_duration: Duration,
+    max_consecutive_failures: u32,
+) -> OciUploadCompletionHeartbeat {
+    let lease_valid = Arc::new(AtomicBool::new(true));
+    let heartbeat_lease_valid = Arc::clone(&lease_valid);
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval_duration);
+        let mut consecutive_failures = 0_u32;
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            match sqlx::query(
+                r#"
+                UPDATE oci_upload_sessions
+                SET updated_at = NOW()
+                WHERE id = $1
+                  AND repository_id = $2
+                  AND state = $4
+                  AND state_token = $3
+                "#,
+            )
+            .bind(session_id)
+            .bind(repository_id)
+            .bind(state_token)
+            .bind(UploadSessionState::Committing.as_str())
+            .execute(&db)
+            .await
+            {
+                Ok(result) if result.rows_affected() == 1 => {
+                    consecutive_failures = 0;
+                }
+                Ok(_) => {
+                    heartbeat_lease_valid.store(false, Ordering::Relaxed);
+                    break;
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        upload_session_id = %session_id,
+                        consecutive_failures,
+                        error = %e,
+                        "Failed to heartbeat OCI upload completion lease"
+                    );
+                    if consecutive_failures >= max_consecutive_failures {
+                        heartbeat_lease_valid.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    OciUploadCompletionHeartbeat {
+        handle,
+        lease_valid,
+    }
+}
+
+#[cfg(test)]
+fn start_oci_upload_completion_heartbeat_for_tests(
+    db: PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+    interval_duration: Duration,
+    max_consecutive_failures: u32,
+) -> OciUploadCompletionHeartbeat {
+    start_oci_upload_completion_heartbeat_with_options(
+        db,
+        session_id,
+        repository_id,
+        state_token,
+        interval_duration,
+        max_consecutive_failures,
+    )
+}
+
+fn completion_lease_lost_response() -> Response {
+    upload_session_conflict("upload completion lease was lost")
+}
+
+async fn fetch_oci_upload_session(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+) -> Result<Option<OciUploadSessionRecord>, Response> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            s.repository_id,
+            s.storage_temp_key,
+            s.bytes_received,
+            s.computed_digest,
+            s.state,
+            COALESCE(COUNT(p.id), 0)::BIGINT AS part_count
+        FROM oci_upload_sessions s
+        LEFT JOIN oci_upload_parts p ON p.upload_session_id = s.id
+        WHERE s.id = $1 AND s.repository_id = $2
+        GROUP BY s.id
+        "#,
+    )
+    .bind(session_id)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?;
+
+    row.map(|row| decode_upload_session_row(row, repository_id))
+        .transpose()
+        .map_err(|e| oci_internal_error(&e))
+}
+
+async fn fetch_oci_upload_parts(
+    db: &PgPool,
+    session_id: Uuid,
+    storage_temp_key: &str,
+    bytes_received: i64,
+) -> Result<Vec<OciUploadPartRecord>, Response> {
+    let rows = sqlx::query(
+        r#"
+        SELECT storage_key, size_bytes
+        FROM oci_upload_parts
+        WHERE upload_session_id = $1
+        ORDER BY part_index
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?;
+
+    let mut parts = Vec::with_capacity(rows.len());
+    for row in rows {
+        parts.push(decode_upload_part_row(row).map_err(|e| oci_internal_error(&e))?);
+    }
+
+    if parts.is_empty() {
+        parts.push(OciUploadPartRecord {
+            storage_key: storage_temp_key.to_string(),
+            size_bytes: bytes_received,
+        });
+    }
+
+    Ok(parts)
+}
+
+fn storage_concat_stream(
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    parts: Vec<OciUploadPartRecord>,
+) -> BoxStream<'static, crate::error::Result<Bytes>> {
+    Box::pin(async_stream::try_stream! {
+        for part in parts {
+            if part.size_bytes == 0 {
+                continue;
+            }
+            let mut stream = storage.get_stream(&part.storage_key).await?;
+            while let Some(chunk) = stream.next().await {
+                yield chunk?;
+            }
+        }
+    })
+}
+
+async fn reset_oci_upload_session_state(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+) -> Result<(), Response> {
+    let result = sqlx::query(
+        "UPDATE oci_upload_sessions SET state = $4, state_token = NULL, updated_at = NOW() WHERE id = $1 AND repository_id = $2 AND state_token = $3",
+    )
+    .bind(session_id)
+    .bind(repository_id)
+    .bind(state_token)
+    .bind(UploadSessionState::Open.as_str())
+    .execute(db)
+    .await
+    .map_err(|e| {
+        warn!(
+            upload_session_id = %session_id,
+            error = %e,
+            "Failed to reset OCI upload session state after completion error"
+        );
+        oci_internal_error(&e.to_string())
+    })?;
+
+    if result.rows_affected() != 1 {
+        warn!(
+            upload_session_id = %session_id,
+            rows_affected = result.rows_affected(),
+            "Failed to reset OCI upload session state because lease token no longer owns the session"
+        );
+        return Err(completion_lease_lost_response());
+    }
+
+    Ok(())
+}
+
+async fn completion_lease_lost_after_reset(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+) -> Response {
+    if let Err(resp) =
+        reset_oci_upload_session_state(db, session_id, repository_id, state_token).await
+    {
+        return resp;
+    }
+
+    completion_lease_lost_response()
+}
+
+/// Disambiguate a PATCH whose `tx.commit()` returned an error.
+///
+/// A failed COMMIT can mean either "the transaction rolled back" or "it actually
+/// landed but the ack was lost." This re-reads the session+part: if the expected
+/// part row exists and the byte counts match, the PATCH committed (`Ok(true)`);
+/// if no such row exists, it rolled back and the caller cleans up (`Ok(false)`).
+/// A row that exists but with *mismatched* byte counts is escalated as an error
+/// rather than silently retried, because it means the recovered state is not the
+/// state this request wrote.
+async fn recover_committed_patch_after_commit_error(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    part_index: i32,
+    part_key: &str,
+    expected_bytes_received: i64,
+    expected_part_size: i64,
+) -> Result<bool, Response> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.bytes_received, p.size_bytes
+        FROM oci_upload_sessions s
+        JOIN oci_upload_parts p ON p.upload_session_id = s.id
+        WHERE s.id = $1
+          AND s.repository_id = $2
+          AND s.state = $5
+          AND p.part_index = $3
+          AND p.storage_key = $4
+        "#,
+    )
+    .bind(session_id)
+    .bind(repository_id)
+    .bind(part_index)
+    .bind(part_key)
+    .bind(UploadSessionState::Open.as_str())
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+
+    let bytes_received: i64 = row.try_get("bytes_received").map_err(|e| {
+        oci_internal_error(&format!(
+            "failed to decode recovered upload session bytes_received: {}",
+            e
+        ))
+    })?;
+    let part_size: i64 = row.try_get("size_bytes").map_err(|e| {
+        oci_internal_error(&format!(
+            "failed to decode recovered upload part size: {}",
+            e
+        ))
+    })?;
+    if bytes_received < 0 || part_size < 0 {
+        return Err(oci_internal_error(
+            "recovered OCI upload session contains negative byte counts",
+        ));
+    }
+    if bytes_received != expected_bytes_received || part_size != expected_part_size {
+        return Err(oci_internal_error(
+            "recovered OCI upload PATCH state did not match expected byte counts",
+        ));
+    }
+
+    Ok(true)
+}
+
+/// Disambiguate a completion whose `tx.commit()` returned an error.
+///
+/// The completion transaction inserts the `oci_blobs` row and deletes the
+/// session atomically. After an ambiguous COMMIT this re-reads both: the session
+/// gone *and* the matching blob present means the commit landed (`Ok(true)`,
+/// return 201); the session still present means it rolled back (`Ok(false)`, the
+/// caller resets the lease and retries). The session gone but blob missing is
+/// genuinely ambiguous (a half-applied state that should never occur for an
+/// atomic tx) and is surfaced as an internal error rather than swallowed.
+async fn recover_committed_completion_after_commit_error(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    digest: &str,
+    expected_size_bytes: i64,
+    expected_storage_key: &str,
+) -> Result<bool, Response> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM oci_upload_sessions
+                WHERE id = $1 AND repository_id = $2
+            ) AS session_exists,
+            EXISTS (
+                SELECT 1
+                FROM oci_blobs
+                WHERE repository_id = $2
+                  AND digest = $3
+                  AND size_bytes = $4
+                  AND storage_key = $5
+            ) AS blob_exists
+        "#,
+    )
+    .bind(session_id)
+    .bind(repository_id)
+    .bind(digest)
+    .bind(expected_size_bytes)
+    .bind(expected_storage_key)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?;
+
+    let session_exists: bool = row.try_get("session_exists").map_err(|e| {
+        oci_internal_error(&format!(
+            "failed to decode recovered completion session state: {}",
+            e
+        ))
+    })?;
+    let blob_exists: bool = row.try_get("blob_exists").map_err(|e| {
+        oci_internal_error(&format!(
+            "failed to decode recovered completion blob state: {}",
+            e
+        ))
+    })?;
+
+    if !session_exists && blob_exists {
+        return Ok(true);
+    }
+    if !session_exists {
+        return Err(oci_internal_error(
+            "OCI upload completion commit status is ambiguous: session is gone but blob row is missing",
+        ));
+    }
+
+    Ok(false)
 }
 
 /// Whether a content-type string identifies an OCI / Docker image index
@@ -906,17 +1764,17 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
     })?;
 
     let location = crate::storage::StorageLocation {
-        backend: repo.try_get("storage_backend").unwrap_or_default(),
-        path: repo.try_get("storage_path").unwrap_or_default(),
+        backend: repo.try_get("storage_backend").map_err(map_db_err)?,
+        path: repo.try_get("storage_path").map_err(map_db_err)?,
     };
 
     Ok(OciRepoInfo {
-        id: repo.try_get("id").unwrap_or_default(),
-        key: repo.try_get("key").unwrap_or_default(),
+        id: repo.try_get("id").map_err(map_db_err)?,
+        key: repo.try_get("key").map_err(map_db_err)?,
         location,
-        repo_type: repo.try_get("repo_type").unwrap_or_default(),
-        upstream_url: repo.try_get("upstream_url").ok(),
-        is_public: repo.try_get("is_public").unwrap_or(false),
+        repo_type: repo.try_get("repo_type").map_err(map_db_err)?,
+        upstream_url: repo.try_get("upstream_url").map_err(map_db_err)?,
+        is_public: repo.try_get("is_public").map_err(map_db_err)?,
         image: effective_image,
     })
 }
@@ -2251,6 +3109,20 @@ fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
 // Blob handlers
 // ---------------------------------------------------------------------------
 
+/// Canonicalize an inbound blob digest for a local `oci_blobs` lookup.
+///
+/// Completed uploads persist sha256 digests in canonical lowercase form (the
+/// monolithic POST and completion paths both store `Sha256Digest::as_prefixed`),
+/// so a pull must look up by that same canonical form to resolve a
+/// locally-stored blob regardless of the casing the client put in the URL.
+/// A reference that does not parse as a sha256 digest (e.g. a proxy-passthrough
+/// reference) is returned unchanged so upstream forwarding is unaffected.
+fn canonical_blob_lookup_digest(digest: &str) -> String {
+    Sha256Digest::parse_digest_param(digest)
+        .map(|d| d.as_prefixed())
+        .unwrap_or_else(|_| digest.to_string())
+}
+
 async fn handle_head_blob(
     state: &SharedState,
     headers: &HeaderMap,
@@ -2278,11 +3150,13 @@ async fn handle_head_blob(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
-    // Check oci_blobs table
+    // Check oci_blobs table. Look up by the canonical digest so an upper-case
+    // pull still resolves a blob stored under its canonical lowercase digest.
+    let lookup_digest = canonical_blob_lookup_digest(digest);
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
         repo.id,
-        digest
+        lookup_digest
     )
     .fetch_optional(&state.db)
     .await;
@@ -2299,17 +3173,33 @@ async fn handle_head_blob(
                     )
                 }
             };
-            if storage.exists(&b.storage_key).await.unwrap_or(false) {
-                tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: serving from migrated oci_blobs (CAS hit)");
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Docker-Content-Digest", digest)
-                    .header(CONTENT_LENGTH, b.size_bytes.to_string())
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(Body::empty())
-                    .unwrap();
+            match storage.exists(&b.storage_key).await {
+                Ok(true) => {
+                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: serving from migrated oci_blobs (CAS hit)");
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Docker-Content-Digest", digest)
+                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                Ok(false) => {
+                    tracing::warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: oci_blobs row found but storage file missing - will proxy from upstream");
+                }
+                Err(e) => {
+                    // A transport/auth error from the storage backend must not be
+                    // silently downgraded to "blob absent" (which would surface as
+                    // a 404). Surface it as an internal error instead, mirroring the
+                    // GET-blob path.
+                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: storage.exists failed: {}", e);
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        &e.to_string(),
+                    );
+                }
             }
-            tracing::warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "HEAD blob: oci_blobs row found but storage file missing - will proxy from upstream");
         }
         Ok(None) => {
             tracing::debug!(repo = %repo.key, digest = %digest, "HEAD blob: no oci_blobs row - will proxy from upstream");
@@ -2400,10 +3290,13 @@ async fn handle_get_blob(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
+    // Look up by the canonical digest so an upper-case pull still resolves a
+    // blob stored under its canonical lowercase digest.
+    let lookup_digest = canonical_blob_lookup_digest(digest);
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
         repo.id,
-        digest
+        lookup_digest
     )
     .fetch_optional(&state.db)
     .await;
@@ -2420,19 +3313,24 @@ async fn handle_get_blob(
                     )
                 }
             };
-            match storage.get(&b.storage_key).await {
-                Ok(data) => {
-                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: serving from migrated oci_blobs (CAS hit)");
+            // Stream the blob straight from the backend instead of buffering the
+            // whole (potentially multi-GiB) layer in heap. Content-Length comes
+            // from the authoritative oci_blobs.size_bytes column. (#1528)
+            match storage.get_stream(&b.storage_key).await {
+                Ok(stream) => {
+                    tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: streaming from migrated oci_blobs (CAS hit)");
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header("Docker-Content-Digest", digest)
-                        .header(CONTENT_LENGTH, data.len().to_string())
+                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
                         .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(Body::from(data))
+                        .body(Body::from_stream(stream.map(|chunk| {
+                            chunk.map_err(|e| std::io::Error::other(e.to_string()))
+                        })))
                         .unwrap();
                 }
                 Err(e) => {
-                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get failed - will proxy from upstream: {}", e);
+                    warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
                 }
             }
         }
@@ -2448,9 +3346,9 @@ async fn handle_get_blob(
         if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
             return match resolution {
                 VirtualBlobResolution::Local {
+                    size_bytes,
                     storage_key,
                     member,
-                    ..
                 } => {
                     let storage = match state.storage_for_repo(&member.storage_location()) {
                         Ok(s) => s,
@@ -2462,16 +3360,19 @@ async fn handle_get_blob(
                             )
                         }
                     };
-                    match storage.get(&storage_key).await {
-                        Ok(data) => Response::builder()
+                    // Stream rather than buffer the resolved member blob. (#1528)
+                    match storage.get_stream(&storage_key).await {
+                        Ok(stream) => Response::builder()
                             .status(StatusCode::OK)
                             .header("Docker-Content-Digest", digest)
-                            .header(CONTENT_LENGTH, data.len().to_string())
+                            .header(CONTENT_LENGTH, size_bytes.to_string())
                             .header(CONTENT_TYPE, "application/octet-stream")
-                            .body(Body::from(data))
+                            .body(Body::from_stream(stream.map(|chunk| {
+                                chunk.map_err(|e| std::io::Error::other(e.to_string()))
+                            })))
                             .unwrap(),
                         Err(e) => {
-                            warn!("Storage error reading virtual blob {}: {}", digest, e);
+                            warn!("Storage error streaming virtual blob {}: {}", digest, e);
                             oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
                         }
                     }
@@ -2526,128 +3427,229 @@ async fn handle_start_upload(
     };
     let repo_id = repo.id;
     let location = repo.location;
-    let max_upload = state.config.max_upload_size_bytes;
 
-    // Allocate a session UUID up front: the temp file path is keyed on
-    // it for both the monolithic-with-digest path AND the chunked
-    // path, so the same UUID survives the branch below.
-    let session_id = Uuid::new_v4();
-    let temp_path = oci_upload_temp_path(&session_id);
+    let storage = match state.storage_for_repo(&location) {
+        Ok(s) => s,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
 
-    // Stream the body straight to a local temp file with incremental
-    // sha256. For the monolithic POST?digest=... path the resulting file
-    // is immediately verified and promoted to the final blob key. For
-    // the chunked path the same file is kept around for subsequent
-    // PATCH requests.
-    let mut hasher = Sha256::new();
-    let mut total_bytes: u64 = 0;
-    let stream_result =
-        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
-            .await
+    // Monolithic upload: if digest is provided, stream to an upload key first.
+    // The final blob key is digest-global, so it must not be overwritten until
+    // the request body has been verified against the provided digest.
+    if let Some(digest) = query_digest {
+        // Validate the digest syntax BEFORE streaming the body to storage, so a
+        // malformed `?digest=` is rejected immediately instead of paying for a
+        // full (potentially multi-GiB) write that is then discarded.
+        let provided_digest = match Sha256Digest::parse_digest_param(digest) {
+            Ok(d) => d,
+            Err(e) => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &e),
+        };
+        let upload_id = Uuid::new_v4();
+        let temp_key = upload_storage_key(&upload_id);
+        if let Err(resp) =
+            register_oci_upload_cleanup_key(&state.db, repo_id, None, &temp_key).await
+        {
+            return resp;
+        }
+        let put_result = match put_request_body_stream(
+            &storage,
+            &temp_key,
+            body,
+            0,
+            state.config.max_upload_size_bytes,
+        )
+        .await
         {
             Ok(r) => r,
-            Err((status, msg)) => {
-                cleanup_upload_temp(&temp_path).await;
-                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    "SIZE_INVALID"
-                } else {
-                    "BLOB_UPLOAD_INVALID"
-                };
-                return oci_error(status, code, &msg);
+            Err(resp) => return resp,
+        };
+        if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic cleanup mark failed")
+                .await;
+            return resp;
+        }
+        let computed = match Sha256Digest::from_hex(&put_result.checksum_sha256) {
+            Ok(d) => d,
+            Err(e) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &temp_key,
+                    "monolithic checksum decode failed",
+                )
+                .await;
+                return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e);
             }
         };
-    let body_bytes = stream_result.bytes_written;
-
-    // Monolithic upload: POST /uploads/?digest=... with the full blob
-    // inline. Verify digest BEFORE handing the temp file to storage so
-    // we never write a tampered/truncated body under the final blob key
-    // (#1449 acceptance: "monolithic upload digest validation without
-    // writing unverified bytes over the final digest key").
-    if let Some(digest) = query_digest {
-        if body_bytes > 0 {
-            let computed = format!("sha256:{:x}", hasher.clone().finalize());
-            if computed != digest {
-                cleanup_upload_temp(&temp_path).await;
-                return oci_error(
-                    StatusCode::BAD_REQUEST,
-                    "DIGEST_INVALID",
-                    &format!(
-                        "digest mismatch: computed {} != provided {}",
-                        computed, digest
-                    ),
-                );
-            }
-
-            let storage = match state.storage_for_repo(&location) {
-                Ok(s) => s,
-                Err(e) => {
-                    cleanup_upload_temp(&temp_path).await;
-                    return oci_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "INTERNAL_ERROR",
-                        &e.to_string(),
-                    );
-                }
-            };
-
-            let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    cleanup_upload_temp(&temp_path).await;
-                    return oci_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "INTERNAL_ERROR",
-                        &format!("reopen temp for streaming put: {e}"),
-                    );
-                }
-            };
-            let key = blob_storage_key(digest);
-            if let Err(e) = storage.put_stream(&key, upload_stream).await {
-                cleanup_upload_temp(&temp_path).await;
-                return oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "BLOB_UPLOAD_UNKNOWN",
-                    &e.to_string(),
-                );
-            }
-
-            // Record in oci_blobs
-            let _ = sqlx::query!(
-                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
-                repo_id, digest, body_bytes as i64, key
-            )
-            .execute(&state.db)
-            .await;
-
-            cleanup_upload_temp(&temp_path).await;
-
-            return Response::builder()
-                .status(StatusCode::CREATED)
-                .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, digest))
-                .header("Docker-Content-Digest", digest)
-                .header(CONTENT_LENGTH, "0")
-                .body(Body::empty())
-                .unwrap();
+        // Syntax was validated up front; here we only compare the already-parsed
+        // client digest against the digest computed from the streamed bytes.
+        if provided_digest != computed {
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic digest mismatch").await;
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                &format!(
+                    "digest mismatch: computed {} != provided {}",
+                    computed.as_prefixed(),
+                    digest
+                ),
+            );
         }
+
+        // Persist under the canonical digest derived from the streamed bytes,
+        // never the raw `digest` query param. `Sha256Digest` accepts upper-case
+        // hex and normalizes it to lowercase, so the verified `computed` value
+        // can differ byte-for-byte from `digest`; binding the raw param would
+        // store the blob under a key/row that a later canonical lookup misses.
+        let canonical_digest = computed.as_prefixed();
+        let key = blob_storage_key(&canonical_digest);
+
+        if let Err(e) = storage.copy(&temp_key, &key).await {
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob copy failed")
+                .await;
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+
+        // Record in oci_blobs
+        if let Err(e) = sqlx::query!(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+            repo_id, canonical_digest.as_str(), put_result.bytes_written as i64, key
+        )
+        .execute(&state.db)
+        .await
+        {
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob row insert failed")
+                .await;
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+
+        delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
+
+        return Response::builder()
+            .status(StatusCode::CREATED)
+            .header(
+                LOCATION,
+                format!("/v2/{}/blobs/{}", image_name, canonical_digest),
+            )
+            .header("Docker-Content-Digest", canonical_digest.as_str())
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
     }
 
-    // Chunked path: persist the session and keep the (possibly empty)
-    // temp file around for subsequent PATCH and PUT requests. We
-    // continue to store an opaque-looking string in `storage_temp_key`
-    // for backwards compatibility with operators reading the column,
-    // but the value is now the local FS path. The semantics moved from
-    // a key in the storage backend to a path on the AK host.
-    let temp_key_value = temp_path.to_string_lossy().into_owned();
-
-    if let Err(e) = sqlx::query!(
-        "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, $4, $5)",
-        session_id, repo_id, claims.sub, body_bytes as i64, temp_key_value
+    // Create upload session
+    let session_id = Uuid::new_v4();
+    let temp_key = upload_storage_key(&session_id);
+    if let Err(resp) =
+        register_oci_upload_cleanup_key(&state.db, repo_id, Some(session_id), &temp_key).await
+    {
+        return resp;
+    }
+    let put_result = match put_request_body_stream(
+        &storage,
+        &temp_key,
+        body,
+        0,
+        state.config.max_upload_size_bytes,
     )
-    .execute(&state.db)
     .await
     {
-        cleanup_upload_temp(&temp_path).await;
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+        delete_storage_key_best_effort(&storage, &temp_key, "upload session cleanup mark failed")
+            .await;
+        return resp;
+    }
+
+    let bytes_received = put_result.bytes_written as i64;
+    let computed_digest = if bytes_received > 0 {
+        match Sha256Digest::from_hex(&put_result.checksum_sha256) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &temp_key,
+                    "upload session checksum decode failed",
+                )
+                .await;
+                return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            delete_storage_key_best_effort(&storage, &temp_key, "upload session begin failed")
+                .await;
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key, computed_digest) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(session_id)
+    .bind(repo_id)
+    .bind(claims.sub)
+    .bind(bytes_received)
+    .bind(&temp_key)
+    .bind(computed_digest.as_ref().map(Sha256Digest::as_prefixed))
+    .execute(&mut *tx)
+    .await
+    {
+        delete_storage_key_best_effort(&storage, &temp_key, "upload session insert failed").await;
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+    }
+    if let Some(part_digest) = computed_digest.as_ref() {
+        // `computed_digest` is Some exactly when bytes_received > 0, i.e. a real
+        // first part was streamed. digest_sha256 stores bare hex.
+        if let Err(e) = sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) VALUES ($1, 0, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(&temp_key)
+        .bind(bytes_received)
+        .bind(part_digest.as_hex())
+        .execute(&mut *tx)
+        .await
+        {
+            delete_storage_key_best_effort(&storage, &temp_key, "initial upload part insert failed")
+                .await;
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        warn!(
+            session_id = %session_id,
+            storage_key = %temp_key,
+            "OCI upload session commit failed after storage write; leaving temp object for scheduled OCI upload cleanup because COMMIT outcome may be ambiguous"
+        );
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
     }
 
     info!(
@@ -2662,7 +3664,7 @@ async fn handle_start_upload(
             format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
         )
         .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", upload_progress_range(body_bytes as i64))
+        .header("Range", upload_progress_range(bytes_received))
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -2708,70 +3710,415 @@ async fn handle_patch_upload(
         Err(e) => return e,
     };
 
-    let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
-        session_id,
-        repo.id
+    let storage = match state.storage_for_repo(&repo.location) {
+        Ok(s) => s,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let session = match fetch_oci_upload_session(&state.db, session_id, repo.id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "upload session not found",
+            )
+        }
+        Err(resp) => return resp,
+    };
+    if session.state != UploadSessionState::Open {
+        return upload_session_conflict("upload session is not open for PATCH");
+    }
+    if let Some(resp) = validate_patch_content_range(headers, session.bytes_received) {
+        return resp;
+    }
+
+    let body_limit =
+        upload_session_body_limit(session.bytes_received, state.config.max_upload_size_bytes);
+    if let Some(resp) =
+        reject_oversized_content_length(headers, body_limit, state.config.max_upload_size_bytes)
+    {
+        return resp;
+    }
+
+    let part_index = if session.bytes_received == 0 && session.part_count == 0 {
+        0
+    } else if session.part_count == 0 {
+        1
+    } else {
+        session.part_count as i32
+    };
+    let part_key = upload_part_storage_key(&session.storage_temp_key, part_index, &Uuid::new_v4());
+    if let Err(resp) =
+        register_oci_upload_cleanup_key(&state.db, repo.id, Some(session_id), &part_key).await
+    {
+        return resp;
+    }
+
+    let put_result = match put_request_body_stream(
+        &storage,
+        &part_key,
+        body,
+        session.bytes_received as u64,
+        state.config.max_upload_size_bytes,
     )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &part_key).await {
+        delete_storage_key_best_effort(&storage, &part_key, "PATCH cleanup mark failed").await;
+        return resp;
+    }
+    let incoming_bytes = put_result.bytes_written as i64;
+    let new_bytes = session.bytes_received + incoming_bytes;
+    let computed_digest = if session.bytes_received == 0 && part_index == 0 {
+        match Sha256Digest::from_hex(&put_result.checksum_sha256) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                delete_storage_key_best_effort(&storage, &part_key, "PATCH checksum decode failed")
+                    .await;
+                return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            delete_storage_key_best_effort(&storage, &part_key, "PATCH transaction begin failed")
+                .await;
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+
+    if session.part_count == 0 && session.bytes_received > 0 {
+        if let Err(e) = sqlx::query(
+            // Migration 117 makes digest_sha256 nullable: the synthesized legacy
+            // first part has no honest per-part SHA-256, so store NULL rather than
+            // the dishonest '' sentinel.
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) VALUES ($1, 0, $2, $3, NULL) ON CONFLICT (upload_session_id, part_index) DO NOTHING",
+        )
+        .bind(session_id)
+        .bind(&session.storage_temp_key)
+        .bind(session.bytes_received)
+        .execute(&mut *tx)
+        .await
+        {
+            delete_storage_key_best_effort(&storage, &part_key, "legacy first part backfill failed")
+                .await;
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        }
+    }
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(session_id)
+    .bind(part_index)
+    .bind(&part_key)
+    .bind(incoming_bytes)
+    .bind(&put_result.checksum_sha256)
+    .execute(&mut *tx)
+    .await
+    {
+        delete_storage_key_best_effort(&storage, &part_key, "PATCH part insert failed").await;
+        if is_pg_unique_violation(&e) {
+            return upload_session_conflict("upload session changed while PATCH body was streaming");
+        }
+        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+    }
+
+    let update_result = match sqlx::query(
+        "UPDATE oci_upload_sessions SET bytes_received = $3, computed_digest = $4, updated_at = NOW() WHERE id = $1 AND repository_id = $2 AND state = $6 AND bytes_received = $5",
+    )
+    .bind(session_id)
+    .bind(repo.id)
+    .bind(new_bytes)
+    .bind(computed_digest.as_ref().map(Sha256Digest::as_prefixed))
+    .bind(session.bytes_received)
+    .bind(UploadSessionState::Open.as_str())
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            delete_storage_key_best_effort(&storage, &part_key, "PATCH session update failed").await;
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        }
+    };
+    if update_result.rows_affected() != 1 {
+        delete_storage_key_best_effort(&storage, &part_key, "PATCH optimistic update lost").await;
+        return upload_session_conflict("upload session changed while PATCH body was streaming");
+    }
+    if let Err(e) = tx.commit().await {
+        warn!(
+            session_id = %session_id,
+            storage_key = %part_key,
+            "OCI upload PATCH commit failed after storage write; leaving part object for scheduled OCI upload cleanup because COMMIT outcome may be ambiguous"
+        );
+        match recover_committed_patch_after_commit_error(
+            &state.db,
+            session_id,
+            repo.id,
+            part_index,
+            &part_key,
+            new_bytes,
+            incoming_bytes,
+        )
+        .await
+        {
+            Ok(true) => {
+                warn!(
+                    session_id = %session_id,
+                    storage_key = %part_key,
+                    bytes_received = new_bytes,
+                    "Recovered committed OCI upload PATCH after COMMIT returned an error"
+                );
+                return upload_patch_accepted_response(image_name, session_id, new_bytes);
+            }
+            Ok(false) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &part_key,
+                    "PATCH commit failed and DB recovery found no committed part",
+                )
+                .await;
+            }
+            Err(resp) => return resp,
+        }
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    upload_patch_accepted_response(image_name, session_id, new_bytes)
+}
+
+async fn handle_cancel_upload(
+    state: &SharedState,
+    headers: &HeaderMap,
+    image_name: &str,
+    uuid_str: &str,
+) -> Response {
+    let host = request_host(headers);
+    let scope = push_scope(image_name);
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+        };
+    let _ = claims;
+    if !oci_scopes_grant(&token_scopes, "write") {
+        return oci_forbidden_scope("write");
+    }
+
+    let session_id: Uuid = match uuid_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "invalid upload UUID",
+            )
+        }
+    };
+
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let storage = match state.storage_for_repo(&repo.location) {
+        Ok(s) => s,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let cancel_state_token = Uuid::new_v4();
+    let session_row = match sqlx::query(
+        r#"
+        UPDATE oci_upload_sessions
+        SET state = $4, state_token = $3, updated_at = NOW()
+        WHERE id = $1 AND repository_id = $2
+          AND state = $5
+        RETURNING storage_temp_key
+        "#,
+    )
+    .bind(session_id)
+    .bind(repo.id)
+    .bind(cancel_state_token)
+    .bind(UploadSessionState::Committing.as_str())
+    .bind(UploadSessionState::Open.as_str())
     .fetch_optional(&state.db)
     .await
     {
-        Ok(Some(s)) => s,
-        Ok(None) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload session not found"),
-        Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return match sqlx::query(
+                "SELECT state FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+            )
+            .bind(session_id)
+            .bind(repo.id)
+            .fetch_optional(&state.db)
+            .await
+            {
+                Ok(Some(_)) => upload_session_conflict("upload session is already being modified"),
+                Ok(None) => oci_error(
+                    StatusCode::NOT_FOUND,
+                    "BLOB_UPLOAD_UNKNOWN",
+                    "upload session not found",
+                ),
+                Err(e) => oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                ),
+            };
+        }
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    let storage_temp_key = match session_row.try_get::<String, _>("storage_temp_key") {
+        Ok(key) => key,
+        Err(e) => {
+            if let Err(reset_resp) =
+                reset_oci_upload_session_state(&state.db, session_id, repo.id, cancel_state_token)
+                    .await
+            {
+                return reset_resp;
+            }
+            return oci_internal_error(&row_decode_error(
+                "invalid oci_upload_sessions.storage_temp_key",
+                e,
+            ));
+        }
     };
 
-    // Append PATCH bytes directly to the local temp file with
-    // O_APPEND. No storage-backend round trip, no full-file rewrite.
-    // Pre-#1449 this path called `storage.get(...)` to pull the entire
-    // in-progress object back into memory, extended it with the new
-    // chunk, and `storage.put(...)`-ed it back -- O(N^2) bytes moved
-    // for an N-chunk push.
-    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
-    let max_upload = state.config.max_upload_size_bytes;
-
-    // The session row tracks total bytes received but not the running
-    // sha256 state. We do not persist a partial Sha256 between PATCH
-    // requests; instead we recompute from the on-disk file at PUT time.
-    // PATCH responses do not return a digest, so this is correct and
-    // avoids a serialization-format dependency on the sha2 crate.
-    let mut hasher = Sha256::new();
-    let mut total_bytes: u64 = session.bytes_received as u64;
-
-    let stream_result =
-        match stream_body_to_temp_file(body, &temp_path, &mut hasher, &mut total_bytes, max_upload)
-            .await
-        {
-            Ok(r) => r,
-            Err((status, msg)) => {
-                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    "SIZE_INVALID"
-                } else {
-                    "BLOB_UPLOAD_INVALID"
-                };
-                return oci_error(status, code, &msg);
-            }
-        };
-    let _ = stream_result;
-    let new_bytes = total_bytes as i64;
-
-    // Update session
-    let _ = sqlx::query!(
-        "UPDATE oci_upload_sessions SET bytes_received = $2, updated_at = NOW() WHERE id = $1",
-        session_id,
-        new_bytes
+    let part_rows = match sqlx::query(
+        "SELECT storage_key FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
     )
+    .bind(session_id)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(reset_resp) =
+                reset_oci_upload_session_state(&state.db, session_id, repo.id, cancel_state_token)
+                    .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    let mut cleanup_keys = Vec::with_capacity(part_rows.len() + 1);
+    cleanup_keys.push(storage_temp_key);
+    for row in part_rows {
+        match row.try_get::<String, _>("storage_key") {
+            Ok(key) => cleanup_keys.push(key),
+            Err(e) => {
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    repo.id,
+                    cancel_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return oci_internal_error(&row_decode_error(
+                    "invalid oci_upload_parts.storage_key",
+                    e,
+                ));
+            }
+        }
+    }
+    cleanup_keys.sort();
+    cleanup_keys.dedup();
+
+    // Once we start deleting parts we must NOT reset the session back to `open`:
+    // a partial delete would leave it resumable with some part objects already
+    // gone (a wedged, holed session). Leave it in `committing` — PATCH rejects a
+    // non-open session and the abandoned-session GC sweep reaps it — and surface
+    // the error so the client retries the cancel. Every key is in the cleanup
+    // journal, so storage GC reclaims whatever was already deleted or remains.
+    for key in &cleanup_keys {
+        if let Err(resp) = delete_storage_key_for_upload_cancel(&storage, key, session_id).await {
+            return resp;
+        }
+    }
+
+    let deleted = match sqlx::query(
+        "DELETE FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2 AND state = $4 AND state_token = $3",
+    )
+    .bind(session_id)
+    .bind(repo.id)
+    .bind(cancel_state_token)
+    .bind(UploadSessionState::Committing.as_str())
     .execute(&state.db)
-    .await;
+    .await
+    {
+        Ok(result) => result.rows_affected(),
+        Err(e) => {
+            if let Err(reset_resp) =
+                reset_oci_upload_session_state(&state.db, session_id, repo.id, cancel_state_token)
+                    .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    if deleted != 1 {
+        if let Err(reset_resp) =
+            reset_oci_upload_session_state(&state.db, session_id, repo.id, cancel_state_token).await
+        {
+            return reset_resp;
+        }
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "upload session vanished during cancel",
+        );
+    }
 
     Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(
-            LOCATION,
-            format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
-        )
-        .header("Docker-Upload-UUID", session_id.to_string())
-        .header("Range", upload_progress_range(new_bytes))
+        .status(StatusCode::NO_CONTENT)
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -2798,8 +4145,11 @@ async fn handle_complete_upload(
         return oci_forbidden_scope("write");
     }
 
-    let digest = match digest_query {
-        Some(d) => d.to_string(),
+    let requested_digest = match digest_query {
+        Some(d) => match Sha256Digest::parse_digest_param(d) {
+            Ok(d) => d,
+            Err(e) => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &e),
+        },
         None => {
             return oci_error(
                 StatusCode::BAD_REQUEST,
@@ -2808,6 +4158,10 @@ async fn handle_complete_upload(
             )
         }
     };
+    // Canonical prefixed form used for downstream binds (oci_blobs.digest),
+    // storage keys, recovery and response headers — byte-identical to the
+    // previous wire representation.
+    let digest = requested_digest.as_prefixed();
 
     let session_id: Uuid = match uuid_str.parse() {
         Ok(id) => id,
@@ -2828,31 +4182,6 @@ async fn handle_complete_upload(
         Err(e) => return e,
     };
 
-    let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
-        session_id,
-        repo.id
-    )
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return oci_error(
-                StatusCode::NOT_FOUND,
-                "BLOB_UPLOAD_UNKNOWN",
-                "upload session not found",
-            )
-        }
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
         Err(e) => {
@@ -2864,138 +4193,716 @@ async fn handle_complete_upload(
         }
     };
 
-    let temp_path = std::path::PathBuf::from(&session.storage_temp_key);
-    let max_upload = state.config.max_upload_size_bytes;
-
-    // If the client sent the final chunk inline on PUT, append it to
-    // the temp file. Otherwise the body is empty (chunked-upload finish
-    // pattern) and the temp file already holds the full blob.
-    let mut total_bytes: u64 = session.bytes_received as u64;
-    // We rehash from disk after appending. Updating an in-memory hasher
-    // here only catches the last chunk, but the source of truth is the
-    // file we're about to put_stream into storage, so rehashing from
-    // disk is what guarantees digest correctness end-to-end.
-    let mut throwaway_hasher = Sha256::new();
-    if let Err((status, msg)) = stream_body_to_temp_file(
-        body,
-        &temp_path,
-        &mut throwaway_hasher,
-        &mut total_bytes,
-        max_upload,
+    let completion_state_token = Uuid::new_v4();
+    let session = match claim_oci_upload_session_for_completion(
+        &state.db,
+        session_id,
+        repo.id,
+        completion_state_token,
     )
     .await
     {
-        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "SIZE_INVALID"
-        } else {
-            "BLOB_UPLOAD_INVALID"
-        };
-        return oci_error(status, code, &msg);
+        Ok(Some(session)) => session,
+        Ok(None) => match fetch_oci_upload_session(&state.db, session_id, repo.id).await {
+            Ok(Some(_)) => {
+                return upload_session_conflict("upload session is already being modified")
+            }
+            Ok(None) => {
+                return oci_error(
+                    StatusCode::NOT_FOUND,
+                    "BLOB_UPLOAD_UNKNOWN",
+                    "upload session not found",
+                )
+            }
+            Err(resp) => return resp,
+        },
+        Err(resp) => return resp,
+    };
+    let completion_heartbeat = start_oci_upload_completion_heartbeat(
+        state.db.clone(),
+        session_id,
+        session.repository_id,
+        completion_state_token,
+    );
+
+    let final_body_limit =
+        upload_session_body_limit(session.bytes_received, state.config.max_upload_size_bytes);
+    if let Some(resp) = reject_oversized_content_length(
+        headers,
+        final_body_limit,
+        state.config.max_upload_size_bytes,
+    ) {
+        if let Err(reset_resp) = reset_oci_upload_session_state(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await
+        {
+            return reset_resp;
+        }
+        return resp;
     }
 
-    // Recompute sha256 over the full assembled temp file, end-to-end.
-    // This is the authoritative verification step: the client's
-    // advertised digest must match the bytes we are about to commit.
-    // We do this BEFORE `put_stream` so a mismatched payload never
-    // reaches the final `oci-blobs/<digest>` key (#1449 acceptance).
-    let (computed_digest, size_on_disk) = match rehash_temp_file(&temp_path).await {
-        Ok(v) => v,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &format!("rehash temp file: {e}"),
-            );
+    let final_part_key =
+        upload_part_storage_key(&session.storage_temp_key, i32::MAX, &Uuid::new_v4());
+    let final_part = if body.size_hint().exact() == Some(0) {
+        None
+    } else {
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &final_part_key,
+        )
+        .await
+        {
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
+        match put_request_body_stream(
+            &storage,
+            &final_part_key,
+            body,
+            session.bytes_received as u64,
+            state.config.max_upload_size_bytes,
+        )
+        .await
+        {
+            Ok(result) => {
+                if let Err(resp) =
+                    mark_oci_upload_cleanup_key_committed(&state.db, &final_part_key).await
+                {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &final_part_key,
+                        "final upload part cleanup mark failed",
+                    )
+                    .await;
+                    if let Err(reset_resp) = reset_oci_upload_session_state(
+                        &state.db,
+                        session_id,
+                        session.repository_id,
+                        completion_state_token,
+                    )
+                    .await
+                    {
+                        return reset_resp;
+                    }
+                    return resp;
+                }
+                Some((
+                    OciUploadPartRecord {
+                        storage_key: final_part_key.clone(),
+                        size_bytes: result.bytes_written as i64,
+                    },
+                    result.checksum_sha256,
+                ))
+            }
+            Err(resp) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "final upload part stream failed",
+                )
+                .await;
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return resp;
+            }
         }
     };
-    if computed_digest != digest {
-        cleanup_upload_temp(&temp_path).await;
-        let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
-            .execute(&state.db)
+    if !completion_heartbeat.lease_is_valid() {
+        if final_part.is_some() {
+            delete_storage_key_best_effort(
+                &storage,
+                &final_part_key,
+                "completion lease lost after final part upload",
+            )
             .await;
-        return oci_error(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            &format!(
-                "digest mismatch: computed {} != provided {}",
-                computed_digest, digest
-            ),
-        );
+        }
+        return completion_lease_lost_after_reset(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await;
     }
 
-    // Hand the temp file to put_stream so the upload to the storage
-    // backend is itself memory-bounded (S3 multipart, GCS resumable,
-    // Azure block-blob, filesystem temp-and-rename). Pre-#1449 this
-    // path called `storage.get(...)` on the in-progress key to pull
-    // every byte back into RAM, then `storage.put(...)` to write it
-    // out under the final digest key -- doubling I/O on every push.
-    let upload_stream = match open_upload_temp_as_stream(&temp_path).await {
-        Ok(s) => s,
+    let mut parts = match fetch_oci_upload_parts(
+        &state.db,
+        session_id,
+        &session.storage_temp_key,
+        session.bytes_received,
+    )
+    .await
+    {
+        Ok(parts) => parts,
+        Err(resp) => {
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "fetch upload parts failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
+    };
+    if let Some((part, _checksum)) = final_part.as_ref() {
+        parts.push(part.clone());
+    }
+    let size_bytes: i64 = parts.iter().map(|part| part.size_bytes).sum();
+    let blob_key = blob_storage_key(&digest);
+
+    // Single-part fast path: one streamed part whose digest was already computed
+    // and cached during PATCH/POST and already equals the client's requested
+    // digest. Promote it to the blob key with a server-side `copy()`, skipping
+    // the concatenate-and-rehash that the multi-part `else` branch performs (the
+    // bytes have not changed, so re-reading them to recompute the digest would
+    // be redundant). All three conditions are required: a non-empty final PUT
+    // body, a part count other than exactly one, or a stale/absent cached digest
+    // must fall through to the re-verifying path.
+    if final_part.is_none()
+        && parts.len() == 1
+        && session.computed_digest.as_ref() == Some(&requested_digest)
+    {
+        if !completion_heartbeat.lease_is_valid() {
+            return completion_lease_lost_after_reset(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await;
+        }
+        if let Err(e) = storage.copy(&parts[0].storage_key, &blob_key).await {
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    } else {
+        if final_part.is_none() {
+            if let Some(computed) = session.computed_digest.as_ref() {
+                if computed != &requested_digest {
+                    if let Err(reset_resp) = reset_oci_upload_session_state(
+                        &state.db,
+                        session_id,
+                        session.repository_id,
+                        completion_state_token,
+                    )
+                    .await
+                    {
+                        return reset_resp;
+                    }
+                    return oci_error(
+                        StatusCode::BAD_REQUEST,
+                        "DIGEST_INVALID",
+                        &format!(
+                            "digest mismatch: computed {} != provided {}",
+                            computed.as_prefixed(),
+                            digest
+                        ),
+                    );
+                }
+            }
+        }
+
+        // The concatenated completion object is never recorded in
+        // `oci_upload_parts`, so the abandoned-session sweep (which only walks
+        // `storage_temp_key` + part keys) cannot reclaim it. Its *only* cleanup
+        // path is the `oci_upload_cleanup_keys` journal, so this register MUST
+        // stay ordered before the `put_stream` below — never reorder it after.
+        let completion_temp_key =
+            format!("{}.complete.{}", session.storage_temp_key, Uuid::new_v4());
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &completion_temp_key,
+        )
+        .await
+        {
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion cleanup registration failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
+        if !completion_heartbeat.lease_is_valid() {
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion lease lost before concatenating parts",
+                )
+                .await;
+            }
+            return completion_lease_lost_after_reset(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await;
+        }
+        let concat_stream = storage_concat_stream(Arc::clone(&storage), parts.clone());
+        let put_result = match storage
+            .put_stream(&completion_temp_key, concat_stream)
+            .await
+        {
+            Ok(result) => {
+                if let Err(resp) =
+                    mark_oci_upload_cleanup_key_committed(&state.db, &completion_temp_key).await
+                {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &completion_temp_key,
+                        "completion temp cleanup mark failed",
+                    )
+                    .await;
+                    if final_part.is_some() {
+                        delete_storage_key_best_effort(
+                            &storage,
+                            &final_part_key,
+                            "completion temp cleanup mark failed",
+                        )
+                        .await;
+                    }
+                    if let Err(reset_resp) = reset_oci_upload_session_state(
+                        &state.db,
+                        session_id,
+                        session.repository_id,
+                        completion_state_token,
+                    )
+                    .await
+                    {
+                        return reset_resp;
+                    }
+                    return resp;
+                }
+                result
+            }
+            Err(e) => {
+                if final_part.is_some() {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &final_part_key,
+                        "completion concat stream failed",
+                    )
+                    .await;
+                }
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_UPLOAD_UNKNOWN",
+                    &e.to_string(),
+                );
+            }
+        };
+        if !completion_heartbeat.lease_is_valid() {
+            delete_storage_key_best_effort(
+                &storage,
+                &completion_temp_key,
+                "completion lease lost after concatenating parts",
+            )
+            .await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion lease lost after concatenating parts",
+                )
+                .await;
+            }
+            return completion_lease_lost_after_reset(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await;
+        }
+        let computed = match Sha256Digest::from_hex(&put_result.checksum_sha256) {
+            Ok(d) => d,
+            Err(e) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &completion_temp_key,
+                    "completion checksum decode failed",
+                )
+                .await;
+                if final_part.is_some() {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &final_part_key,
+                        "completion checksum decode failed",
+                    )
+                    .await;
+                }
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e);
+            }
+        };
+        if computed != requested_digest {
+            delete_storage_key_best_effort(
+                &storage,
+                &completion_temp_key,
+                "completion digest mismatch",
+            )
+            .await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion digest mismatch",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                &format!(
+                    "digest mismatch: computed {} != provided {}",
+                    computed.as_prefixed(),
+                    digest
+                ),
+            );
+        }
+        if let Err(e) = storage.copy(&completion_temp_key, &blob_key).await {
+            delete_storage_key_best_effort(
+                &storage,
+                &completion_temp_key,
+                "completion blob copy failed",
+            )
+            .await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion blob copy failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+        delete_storage_key_best_effort(&storage, &completion_temp_key, "completion temp promoted")
+            .await;
+    }
+    // Last fast-fail before the commit transaction. This atomic flag is only an
+    // optimization: it is NOT re-checked across `tx.begin()`/`tx.commit()`
+    // below. The authoritative lease guard is the `state_token` predicate on the
+    // terminal DELETE — if the lease was stolen in the meantime the DELETE
+    // touches 0 rows and the transaction rolls back. Do not "simplify away" that
+    // predicate believing this check suffices.
+    if !completion_heartbeat.lease_is_valid() {
+        if final_part.is_some() {
+            delete_storage_key_best_effort(
+                &storage,
+                &final_part_key,
+                "completion lease lost before DB commit",
+            )
+            .await;
+        }
+        return completion_lease_lost_after_reset(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await;
+    }
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
         Err(e) => {
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion DB begin failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
-                &format!("reopen temp for streaming put: {e}"),
+                &e.to_string(),
             );
         }
     };
-    let blob_key = blob_storage_key(&digest);
-    let size_bytes = size_on_disk as i64;
-    if let Err(e) = storage.put_stream(&blob_key, upload_stream).await {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+    )
+    .bind(session.repository_id)
+    .bind(&digest)
+    .bind(size_bytes)
+    .bind(&blob_key)
+    .execute(&mut *tx)
+    .await
+    {
+        let _ = tx.rollback().await;
+        if final_part.is_some() {
+            delete_storage_key_best_effort(&storage, &final_part_key, "oci_blobs insert failed")
+                .await;
+        }
+        if let Err(reset_resp) = reset_oci_upload_session_state(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await
+        {
+            return reset_resp;
+        }
+        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+    }
+
+    let deleted = match sqlx::query(
+        "DELETE FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2 AND state = $4 AND state_token = $3",
+    )
+    .bind(session_id)
+    .bind(session.repository_id)
+    .bind(completion_state_token)
+    .bind(UploadSessionState::Committing.as_str())
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(result) => result.rows_affected(),
+        Err(e) => {
+            let _ = tx.rollback().await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "upload session delete failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        }
+    };
+    if deleted != 1 {
+        let _ = tx.rollback().await;
+        if final_part.is_some() {
+            delete_storage_key_best_effort(
+                &storage,
+                &final_part_key,
+                "upload session vanished during completion",
+            )
+            .await;
+        }
+        if let Err(reset_resp) = reset_oci_upload_session_state(
+            &state.db,
+            session_id,
+            session.repository_id,
+            completion_state_token,
+        )
+        .await
+        {
+            return reset_resp;
+        }
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "BLOB_UPLOAD_UNKNOWN",
+            "INTERNAL_ERROR",
+            "upload session vanished during completion",
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        match recover_committed_completion_after_commit_error(
+            &state.db,
+            session_id,
+            session.repository_id,
+            &digest,
+            size_bytes,
+            &blob_key,
+        )
+        .await
+        {
+            Ok(true) => {
+                let mut cleanup_keys: Vec<String> =
+                    parts.iter().map(|part| part.storage_key.clone()).collect();
+                cleanup_keys.push(session.storage_temp_key.clone());
+                cleanup_keys.sort();
+                cleanup_keys.dedup();
+                for key in cleanup_keys {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &key,
+                        "upload completed after commit recovery",
+                    )
+                    .await;
+                }
+                warn!(
+                    session_id = %session_id,
+                    digest = %digest,
+                    size_bytes,
+                    "Recovered committed OCI upload completion after COMMIT returned an error"
+                );
+                return upload_complete_created_response(image_name, &digest);
+            }
+            Ok(false) => {
+                if final_part.is_some() {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &final_part_key,
+                        "completion DB commit failed",
+                    )
+                    .await;
+                }
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+            }
+            Err(resp) => return resp,
+        }
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
             &e.to_string(),
         );
     }
 
-    // Record in oci_blobs
-    let _ = sqlx::query!(
-        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
-        session.repository_id, digest, size_bytes, blob_key
-    )
-    .execute(&state.db)
-    .await;
-
-    // Cleanup: drop local temp file and the session row
-    cleanup_upload_temp(&temp_path).await;
-    let _ = sqlx::query!("DELETE FROM oci_upload_sessions WHERE id = $1", session_id)
-        .execute(&state.db)
-        .await;
+    let mut cleanup_keys: Vec<String> = parts.iter().map(|part| part.storage_key.clone()).collect();
+    cleanup_keys.push(session.storage_temp_key.clone());
+    cleanup_keys.sort();
+    cleanup_keys.dedup();
+    for key in cleanup_keys {
+        delete_storage_key_best_effort(&storage, &key, "upload completed").await;
+    }
 
     info!(
         "Completed blob upload {}: {} ({} bytes)",
         session_id, digest, size_bytes
     );
 
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, digest))
-        .header("Docker-Content-Digest", &digest)
-        .header(CONTENT_LENGTH, "0")
-        .body(Body::empty())
-        .unwrap()
-}
-
-/// Recompute the sha256 of an on-disk upload temp file by streaming
-/// 256 KiB chunks through a `Sha256` hasher. Returns the OCI-formatted
-/// digest (`sha256:<hex>`) and the total byte count. Memory use is
-/// O(STREAM_CHUNK_BUDGET) regardless of file size.
-async fn rehash_temp_file(path: &std::path::Path) -> std::io::Result<(String, u64)> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; STREAM_CHUNK_BUDGET];
-    let mut total: u64 = 0;
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
-    Ok((format!("sha256:{:x}", hasher.finalize()), total))
+    upload_complete_created_response(image_name, &digest)
 }
 
 // ---------------------------------------------------------------------------
@@ -4312,25 +6219,6 @@ async fn catch_all(
         };
     }
 
-    // Helper to fully buffer the body for endpoints that legitimately
-    // need it in memory (HEAD/GET blobs carry no body; manifests are
-    // small JSON documents capped well under MAX_UPLOAD_SIZE). The cap
-    // here is the global MAX_UPLOAD_SIZE so a hostile client cannot
-    // dodge the limit by hitting a non-streaming route.
-    async fn buffer_body(body: Body, max: u64) -> Result<Bytes, Response> {
-        let limit = if max == 0 { usize::MAX } else { max as usize };
-        match axum::body::to_bytes(body, limit).await {
-            Ok(b) => Ok(b),
-            Err(e) => Err(oci_error(
-                StatusCode::BAD_REQUEST,
-                "SIZE_INVALID",
-                &format!("read request body: {e}"),
-            )),
-        }
-    }
-
-    let max_upload = state.config.max_upload_size_bytes;
-
     match (method.as_str(), operation.as_str()) {
         ("HEAD", "blobs") => {
             let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
@@ -4357,6 +6245,12 @@ async fn catch_all(
             let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
             handle_complete_upload(&state, &headers, &image_name, &u, digest.as_deref(), body).await
         }
+        ("DELETE", "uploads") => {
+            let Some(u) = reference else {
+                return missing_upload_uuid_response();
+            };
+            handle_cancel_upload(&state, &headers, &image_name, &u).await
+        }
         ("HEAD", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
             handle_head_manifest(&state, &headers, &image_name, &r).await
@@ -4367,11 +6261,13 @@ async fn catch_all(
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            let body_bytes = match buffer_body(body, max_upload).await {
+            let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize)
+                .await
+            {
                 Ok(b) => b,
                 Err(resp) => return resp,
             };
-            handle_put_manifest(&state, &headers, &image_name, &r, body_bytes).await
+            handle_put_manifest(&state, &headers, &image_name, &r, body).await
         }
         ("DELETE", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -4451,6 +6347,198 @@ mod tests {
     fn test_oci_error_internal() {
         let resp = oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "oops");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sha256Digest newtype
+    // -----------------------------------------------------------------------
+
+    const TEST_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn sha256_digest_prefixed_hex_round_trip() {
+        let prefixed = format!("sha256:{TEST_HEX}");
+        let from_param =
+            Sha256Digest::parse_digest_param(&prefixed).expect("valid prefixed digest");
+        assert_eq!(from_param.as_hex(), TEST_HEX);
+        assert_eq!(from_param.as_prefixed(), prefixed);
+
+        let from_hex = Sha256Digest::from_hex(TEST_HEX).expect("valid hex digest");
+        assert_eq!(from_hex.as_hex(), TEST_HEX);
+        assert_eq!(from_hex.as_prefixed(), prefixed);
+    }
+
+    #[test]
+    fn sha256_digest_both_construction_forms_compare_equal() {
+        let from_param = Sha256Digest::parse_digest_param(&format!("sha256:{TEST_HEX}"))
+            .expect("valid prefixed digest");
+        let from_hex = Sha256Digest::from_hex(TEST_HEX).expect("valid hex digest");
+        assert_eq!(from_param, from_hex);
+    }
+
+    #[test]
+    fn sha256_digest_uppercase_hex_is_normalized_lowercase() {
+        let from_upper = Sha256Digest::from_hex(&TEST_HEX.to_ascii_uppercase())
+            .expect("uppercase hex is accepted");
+        assert_eq!(from_upper.as_hex(), TEST_HEX);
+        assert_eq!(from_upper, Sha256Digest::from_hex(TEST_HEX).unwrap());
+    }
+
+    #[test]
+    fn sha256_digest_rejects_missing_prefix() {
+        assert!(Sha256Digest::parse_digest_param(TEST_HEX).is_err());
+    }
+
+    #[test]
+    fn sha256_digest_rejects_wrong_algorithm() {
+        assert!(Sha256Digest::parse_digest_param(&format!("sha512:{TEST_HEX}")).is_err());
+    }
+
+    #[test]
+    fn sha256_digest_rejects_malformed_hex() {
+        // Too short.
+        assert!(Sha256Digest::from_hex("abc123").is_err());
+        // Correct length but non-hex characters.
+        let bad = "z".repeat(64);
+        assert!(Sha256Digest::from_hex(&bad).is_err());
+        // Too long.
+        let long = format!("{TEST_HEX}00");
+        assert!(Sha256Digest::from_hex(&long).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // UploadSessionState enum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upload_session_state_parse_as_str_round_trip() {
+        for state in [UploadSessionState::Open, UploadSessionState::Committing] {
+            assert_eq!(UploadSessionState::parse(state.as_str()).unwrap(), state);
+        }
+        assert_eq!(UploadSessionState::Open.as_str(), "open");
+        assert_eq!(UploadSessionState::Committing.as_str(), "committing");
+    }
+
+    #[test]
+    fn upload_session_state_rejects_unknown_string() {
+        assert!(UploadSessionState::parse("OPEN").is_err());
+        assert!(UploadSessionState::parse("done").is_err());
+        assert!(UploadSessionState::parse("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_upload_content_range / validate_patch_content_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_upload_content_range_accepts_bytes_prefix_and_whitespace() {
+        assert_eq!(parse_upload_content_range("bytes 0-9"), Some((0, 9)));
+        assert_eq!(parse_upload_content_range("  10-20 "), Some((10, 20)));
+        assert_eq!(parse_upload_content_range("0-0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn parse_upload_content_range_rejects_invalid() {
+        assert_eq!(parse_upload_content_range("not-a-range"), None);
+        assert_eq!(parse_upload_content_range("20-10"), None); // end < start
+        assert_eq!(parse_upload_content_range("5"), None); // no separator
+        assert_eq!(parse_upload_content_range(""), None);
+    }
+
+    fn content_range_headers(range: &str, content_length: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-range", HeaderValue::from_str(range).unwrap());
+        if let Some(len) = content_length {
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_str(len).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn validate_patch_content_range_accepts_matching_range() {
+        let headers = content_range_headers("0-9", Some("10"));
+        assert!(validate_patch_content_range(&headers, 0).is_none());
+    }
+
+    #[test]
+    fn validate_patch_content_range_without_header_is_ok() {
+        assert!(validate_patch_content_range(&HeaderMap::new(), 0).is_none());
+    }
+
+    #[test]
+    fn validate_patch_content_range_rejects_offset_mismatch() {
+        let headers = content_range_headers("5-9", Some("5"));
+        let resp = validate_patch_content_range(&headers, 0).expect("offset mismatch rejected");
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn validate_patch_content_range_rejects_length_mismatch() {
+        let headers = content_range_headers("0-9", Some("100"));
+        let resp = validate_patch_content_range(&headers, 0).expect("length mismatch rejected");
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn validate_patch_content_range_rejects_invalid_header() {
+        let headers = content_range_headers("garbage", None);
+        let resp = validate_patch_content_range(&headers, 0).expect("garbage range rejected");
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn validate_patch_content_range_does_not_overflow_on_i64_max_end() {
+        // Regression: `end - start + 1` overflowed i64 for a hostile range,
+        // panicking in debug builds. It must instead reject with 416 and never
+        // panic, even for `Content-Range: 0-9223372036854775807`.
+        let headers = content_range_headers(&format!("0-{}", i64::MAX), Some("10"));
+        let resp = validate_patch_content_range(&headers, 0)
+            .expect("overflowing range rejected without panic");
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn validate_patch_content_range_accepts_single_byte_span() {
+        // span of exactly 1 ("5-5" with Content-Length 1) at the expected offset.
+        let headers = content_range_headers("5-5", Some("1"));
+        assert!(validate_patch_content_range(&headers, 5).is_none());
+    }
+
+    #[test]
+    fn validate_patch_content_range_accepts_valid_range_without_content_length() {
+        // Offset is checked, but the span check is skipped when Content-Length
+        // is absent, so a well-formed range with no length header is accepted.
+        let headers = content_range_headers("0-41", None);
+        assert!(validate_patch_content_range(&headers, 0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // upload_session_body_limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upload_session_body_limit_zero_max_is_unlimited() {
+        assert_eq!(upload_session_body_limit(0, 0), usize::MAX);
+        assert_eq!(upload_session_body_limit(1_000_000, 0), usize::MAX);
+    }
+
+    #[test]
+    fn upload_session_body_limit_subtracts_existing_bytes() {
+        assert_eq!(upload_session_body_limit(0, 100), 100);
+        assert_eq!(upload_session_body_limit(40, 100), 60);
+    }
+
+    #[test]
+    fn upload_session_body_limit_saturates_to_zero_when_over_max() {
+        assert_eq!(upload_session_body_limit(100, 100), 0);
+        assert_eq!(upload_session_body_limit(150, 100), 0);
+    }
+
+    #[test]
+    fn upload_session_body_limit_negative_existing_bytes_is_zero() {
+        // existing_bytes can never legitimately be negative; a corrupt value
+        // must clamp the remaining allowance to 0, not yield a huge limit.
+        assert_eq!(upload_session_body_limit(-1, 100), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -5403,6 +7491,43 @@ mod tests {
         assert_eq!(upload_progress_range(1), "0-0");
         assert_eq!(upload_progress_range(2), "0-1");
         assert_eq!(upload_progress_range(4435), "0-4434");
+    }
+
+    #[tokio::test]
+    async fn test_collect_request_body_zero_limit_allows_non_empty_body() {
+        let body = Body::from(Bytes::from_static(b"unlimited"));
+
+        let bytes = match collect_request_body(body, 0).await {
+            Ok(bytes) => bytes,
+            Err(resp) => panic!(
+                "MAX_UPLOAD_SIZE=0 must disable the body limit, got {}",
+                resp.status()
+            ),
+        };
+
+        assert_eq!(bytes, Bytes::from_static(b"unlimited"));
+    }
+
+    #[tokio::test]
+    async fn test_collect_request_body_stream_error_returns_upload_unknown() {
+        let stream = futures::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client disconnected",
+            ))
+        });
+        let body = Body::from_stream(stream);
+
+        let resp = collect_request_body(body, 1024)
+            .await
+            .expect_err("stream read error should not be classified as oversize");
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("error response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(body["errors"][0]["code"], "BLOB_UPLOAD_UNKNOWN");
     }
 
     // -----------------------------------------------------------------------
@@ -7782,6 +9907,91 @@ mod token_claims_isactive_regression_tests {
     }
 }
 
+#[cfg(test)]
+mod blob_pull_streaming_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// GET blob (CAS hit) must STREAM the object from the storage backend with a
+    /// `Content-Length` sourced from `oci_blobs.size_bytes`, not buffer the
+    /// whole (potentially multi-GiB) layer in heap. (#1528)
+    #[tokio::test]
+    async fn get_blob_streams_from_backend_with_size_bytes_content_length() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // Public repo so an anonymous token can pull.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+
+        let body_bytes = b"a layer blob served by streaming from the storage backend".to_vec();
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let blob_key = format!("oci-blobs/{digest}");
+        storage
+            .put(&blob_key, bytes::Bytes::from(body_bytes.clone()))
+            .await
+            .expect("write blob object");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .bind(body_bytes.len() as i64)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        let app = fx.router_anon(router());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/myimage/blobs/{}", fx.repo_key, digest))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let got = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("collect streamed body");
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "CAS-hit GET blob must return 200");
+        assert_eq!(
+            content_length.as_deref(),
+            Some(body_bytes.len().to_string().as_str()),
+            "Content-Length must come from oci_blobs.size_bytes"
+        );
+        assert_eq!(
+            &got[..],
+            &body_bytes[..],
+            "streamed body must round-trip the stored blob bytes"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `docker login -p $API_TOKEN` regression: API-token-as-password must not
 // bump `failed_login_attempts`. DB-backed because the bug is observable only
@@ -8158,6 +10368,4443 @@ mod oci_manifest_refs_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming OCI blob upload coverage.
+//
+// The hot path for Docker/Podman push is:
+// POST /blobs/uploads/ -> PATCH body -> PUT ?digest=... with an empty body.
+// These DB-backed tests exercise that path through the router so the coverage
+// gate sees the handler branches that avoid reading the just-uploaded object
+// back into backend memory. DATABASE_URL is required so CI cannot report
+// vacuous success without exercising the DB-backed upload path.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod oci_blob_upload_streaming_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use crate::storage::{StorageBackend, StorageRegistry};
+    use async_trait::async_trait;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use std::collections::{HashMap, HashSet};
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    struct OciUploadFixture {
+        inner: tdh::Fixture,
+        authorization: String,
+    }
+
+    fn oci_streaming_tests_require_database_url() -> bool {
+        std::env::var_os("LLVM_PROFILE_FILE").is_some()
+            || std::env::var_os("CARGO_LLVM_COV").is_some()
+    }
+
+    impl OciUploadFixture {
+        async fn setup() -> Option<Self> {
+            if std::env::var("DATABASE_URL").is_err() {
+                if oci_streaming_tests_require_database_url() {
+                    panic!("DATABASE_URL must be set for OCI streaming upload tests");
+                }
+                eprintln!("skipping OCI streaming upload tests; DATABASE_URL not set");
+                return None;
+            }
+            let mut inner = None;
+            for _ in 0..30 {
+                inner = tdh::Fixture::setup("local", "docker").await;
+                if inner.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let inner = inner.expect("OCI streaming upload fixture setup failed");
+            let auth_service =
+                AuthService::new(inner.state.db.clone(), Arc::new(inner.state.config.clone()));
+            let user = sqlx::query_as::<_, crate::models::user::User>(
+                r#"
+                SELECT
+                    id, username, email, password_hash, display_name,
+                    auth_provider,
+                    external_id, is_admin, is_active, is_service_account, must_change_password,
+                    totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                    failed_login_attempts, locked_until, last_failed_login_at,
+                    password_changed_at, last_login_at, created_at, updated_at
+                FROM users
+                WHERE id = $1
+                "#,
+            )
+            .bind(inner.user_id)
+            .fetch_one(&inner.pool)
+            .await
+            .expect("fetch test user");
+            let tokens = auth_service
+                .generate_tokens(&user)
+                .expect("generate Bearer token");
+            let authorization = format!("Bearer {}", tokens.access_token);
+            Some(Self {
+                inner,
+                authorization,
+            })
+        }
+
+        fn app(&self) -> Router {
+            router().with_state(self.inner.state.clone())
+        }
+
+        fn app_with_max_upload_size(&self, max_upload_size_bytes: u64) -> Router {
+            let mut state = (*self.inner.state).clone();
+            state.config.max_upload_size_bytes = max_upload_size_bytes;
+            router().with_state(Arc::new(state))
+        }
+
+        fn storage(&self) -> Arc<dyn crate::storage::StorageBackend> {
+            self.inner
+                .state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend: "filesystem".to_string(),
+                    path: self.inner.storage_dir.to_string_lossy().into_owned(),
+                })
+                .expect("storage")
+        }
+
+        async fn teardown(&self) {
+            let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+                .bind(self.inner.repo_id)
+                .execute(&self.inner.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(self.inner.repo_id)
+                .execute(&self.inner.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(self.inner.repo_id)
+                .execute(&self.inner.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(self.inner.repo_id)
+                .execute(&self.inner.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+                .bind(self.inner.user_id)
+                .execute(&self.inner.pool)
+                .await;
+            self.inner.teardown().await;
+        }
+    }
+
+    fn request(method: Method, uri: String, authorization: &str, body: Bytes) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::from(body))
+            .expect("build OCI request")
+    }
+
+    fn request_with_body(
+        method: Method,
+        uri: String,
+        authorization: &str,
+        content_length: usize,
+        body: Body,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_LENGTH, content_length.to_string())
+            .body(body)
+            .expect("build OCI request")
+    }
+
+    fn counted_body(chunks_read: Arc<AtomicUsize>, chunks: Vec<Bytes>) -> Body {
+        let stream = futures::stream::iter(chunks.into_iter().map(move |chunk| {
+            chunks_read.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok::<Bytes, Infallible>(chunk)
+        }));
+        Body::from_stream(stream)
+    }
+
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, headers, body)
+    }
+
+    async fn oci_blob_count(f: &OciUploadFixture, digest: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count oci_blobs")
+    }
+
+    // RecordingStorage implements only put/get/exists/delete/copy and inherits
+    // the trait-default `put_stream` (which buffers then calls `put`). Tests that
+    // swap it in assert handler-level orchestration (which temp/part/blob objects
+    // are written/copied/deleted and the resulting session state), NOT streaming-
+    // backend internals — those are covered by the s3/azure/gcs/filesystem tests
+    // and the real filesystem-backed fixture tests.
+    #[derive(Default)]
+    struct RecordingStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        put_keys: Mutex<Vec<String>>,
+        copy_keys: Mutex<Vec<(String, String)>>,
+        delete_keys: Mutex<Vec<String>>,
+        get_errors: Mutex<HashSet<String>>,
+        delete_error_prefixes: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStorage {
+        fn keys(&self) -> Vec<String> {
+            self.objects.lock().unwrap().keys().cloned().collect()
+        }
+
+        fn put_keys(&self) -> Vec<String> {
+            self.put_keys.lock().unwrap().clone()
+        }
+
+        fn copy_keys(&self) -> Vec<(String, String)> {
+            self.copy_keys.lock().unwrap().clone()
+        }
+
+        fn delete_keys(&self) -> Vec<String> {
+            self.delete_keys.lock().unwrap().clone()
+        }
+
+        fn fail_get_for(&self, key: &str) {
+            self.get_errors.lock().unwrap().insert(key.to_string());
+        }
+
+        fn fail_delete_for_prefix(&self, prefix: &str) {
+            self.delete_error_prefixes
+                .lock()
+                .unwrap()
+                .push(prefix.to_string());
+        }
+
+        fn clear_delete_failures(&self) {
+            self.delete_error_prefixes.lock().unwrap().clear();
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for RecordingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.put_keys.lock().unwrap().push(key.to_string());
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            if self.get_errors.lock().unwrap().contains(key) {
+                return Err(AppError::Storage(format!("forced get failure: {}", key)));
+            }
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.delete_keys.lock().unwrap().push(key.to_string());
+            if self
+                .delete_error_prefixes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                return Err(AppError::Storage(format!("forced delete failure: {}", key)));
+            }
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            self.copy_keys
+                .lock()
+                .unwrap()
+                .push((source.to_string(), dest.to_string()));
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+            Ok(())
+        }
+    }
+
+    struct DeferredCommitFailureTrigger {
+        table: &'static str,
+        trigger_name: String,
+        function_name: String,
+    }
+
+    impl DeferredCommitFailureTrigger {
+        async fn install_for_upload_session_repo(pool: &PgPool, repository_id: Uuid) -> Self {
+            let trigger = Self::create(pool, "oci_upload_sessions").await;
+            let sql = format!(
+                "CREATE CONSTRAINT TRIGGER {trigger_name}
+                 AFTER INSERT ON oci_upload_sessions
+                 DEFERRABLE INITIALLY DEFERRED
+                 FOR EACH ROW
+                 WHEN (NEW.repository_id = '{repository_id}'::uuid)
+                 EXECUTE FUNCTION {function_name}()",
+                trigger_name = trigger.trigger_name,
+                function_name = trigger.function_name,
+            );
+            sqlx::query(&sql)
+                .execute(pool)
+                .await
+                .expect("create deferred upload-session trigger");
+            trigger
+        }
+
+        async fn install_for_upload_session_part(pool: &PgPool, session_id: Uuid) -> Self {
+            let trigger = Self::create(pool, "oci_upload_parts").await;
+            let sql = format!(
+                "CREATE CONSTRAINT TRIGGER {trigger_name}
+                 AFTER INSERT ON oci_upload_parts
+                 DEFERRABLE INITIALLY DEFERRED
+                 FOR EACH ROW
+                 WHEN (NEW.upload_session_id = '{session_id}'::uuid)
+                 EXECUTE FUNCTION {function_name}()",
+                trigger_name = trigger.trigger_name,
+                function_name = trigger.function_name,
+            );
+            sqlx::query(&sql)
+                .execute(pool)
+                .await
+                .expect("create deferred upload-part trigger");
+            trigger
+        }
+
+        async fn drop(self, pool: &PgPool) {
+            let drop_trigger = format!(
+                "DROP TRIGGER IF EXISTS {} ON {}",
+                self.trigger_name, self.table
+            );
+            let _ = sqlx::query(&drop_trigger).execute(pool).await;
+
+            let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
+            let _ = sqlx::query(&drop_function).execute(pool).await;
+        }
+
+        async fn create(pool: &PgPool, table: &'static str) -> Self {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let function_name = format!("ak_test_force_commit_failure_{}", suffix);
+            let trigger_name = format!("ak_test_force_commit_failure_{}", suffix);
+            let sql = format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     RAISE EXCEPTION 'forced deferred commit failure for OCI upload test';
+                 END;
+                 $$",
+                function_name = function_name,
+            );
+            sqlx::query(&sql)
+                .execute(pool)
+                .await
+                .expect("create deferred failure function");
+
+            Self {
+                table,
+                trigger_name,
+                function_name,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FirstPatchRaceStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        first_part_puts: AtomicUsize,
+        first_part_ready: tokio::sync::Notify,
+        delete_keys: Mutex<Vec<String>>,
+    }
+
+    impl FirstPatchRaceStorage {
+        fn delete_keys(&self) -> Vec<String> {
+            self.delete_keys.lock().unwrap().clone()
+        }
+
+        async fn wait_for_two_first_part_writes(&self, key: &str) {
+            if !key.contains(".part.00000000.") {
+                return;
+            }
+
+            self.first_part_puts.fetch_add(1, AtomicOrdering::SeqCst);
+            while self.first_part_puts.load(AtomicOrdering::SeqCst) < 2 {
+                self.first_part_ready.notified().await;
+            }
+            self.first_part_ready.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FirstPatchRaceStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.delete_keys.lock().unwrap().push(key.to_string());
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let content = self.get(source).await?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+            Ok(())
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            let mut hasher = Sha256::new();
+            let mut total = 0_u64;
+            let mut data = bytes::BytesMut::new();
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+                data.extend_from_slice(&chunk);
+            }
+
+            self.wait_for_two_first_part_writes(key).await;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.freeze());
+            Ok(crate::storage::PutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total,
+            })
+        }
+    }
+
+    struct BlockingCopyStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        copy_started: tokio::sync::Notify,
+        release_copy: tokio::sync::Notify,
+        should_block_copy: AtomicBool,
+    }
+
+    impl BlockingCopyStorage {
+        fn new() -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                copy_started: tokio::sync::Notify::new(),
+                release_copy: tokio::sync::Notify::new(),
+                should_block_copy: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for BlockingCopyStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            if self.should_block_copy.swap(false, AtomicOrdering::SeqCst) {
+                self.copy_started.notify_one();
+                self.release_copy.notified().await;
+            }
+
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+            Ok(())
+        }
+    }
+
+    struct LockProbeStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        pool: PgPool,
+        probe_put_stream: bool,
+        probe_copy: bool,
+        lock_observed: AtomicBool,
+    }
+
+    impl LockProbeStorage {
+        fn new(pool: PgPool, probe_put_stream: bool, probe_copy: bool) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                pool,
+                probe_put_stream,
+                probe_copy,
+                lock_observed: AtomicBool::new(false),
+            }
+        }
+
+        fn lock_observed(&self) -> bool {
+            self.lock_observed.load(AtomicOrdering::SeqCst)
+        }
+
+        async fn assert_session_row_unlocked(&self, key: &str) -> crate::error::Result<()> {
+            let Some(rest) = key.strip_prefix("oci-uploads/") else {
+                return Ok(());
+            };
+            let Some(uuid_part) = rest.split('.').next() else {
+                return Ok(());
+            };
+            let Ok(session_id) = Uuid::parse_str(uuid_part) else {
+                return Ok(());
+            };
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                let mut tx = self.pool.begin().await.map_err(AppError::from)?;
+                let lock_result = sqlx::query(
+                    "SELECT 1 FROM oci_upload_sessions WHERE id = $1 FOR UPDATE NOWAIT",
+                )
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await;
+
+                match lock_result {
+                    Ok(_) => {
+                        tx.commit().await.map_err(AppError::from)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        let error_message = e.to_string();
+                        if std::time::Instant::now() >= deadline {
+                            self.lock_observed.store(true, AtomicOrdering::SeqCst);
+                            return Err(AppError::Storage(format!(
+                                "upload session row stayed locked during storage I/O: {}",
+                                error_message
+                            )));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for LockProbeStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            if self.probe_copy {
+                self.assert_session_row_unlocked(source).await?;
+            }
+            let content = self.get(source).await?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+            Ok(())
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            if self.probe_put_stream {
+                self.assert_session_row_unlocked(key).await?;
+            }
+
+            let mut hasher = Sha256::new();
+            let mut total = 0_u64;
+            let mut data = bytes::BytesMut::new();
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+                data.extend_from_slice(&chunk);
+            }
+
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.freeze());
+            Ok(crate::storage::PutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total,
+            })
+        }
+    }
+
+    struct DeleteAfterSessionGoneStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        pool: PgPool,
+        session_id: Mutex<Option<Uuid>>,
+        early_delete_attempted: AtomicBool,
+    }
+
+    impl DeleteAfterSessionGoneStorage {
+        fn new(pool: PgPool) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                pool,
+                session_id: Mutex::new(None),
+                early_delete_attempted: AtomicBool::new(false),
+            }
+        }
+
+        fn track_session(&self, session_id: Uuid) {
+            *self.session_id.lock().unwrap() = Some(session_id);
+        }
+
+        fn early_delete_attempted(&self) -> bool {
+            self.early_delete_attempted.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for DeleteAfterSessionGoneStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            let tracked_session = *self.session_id.lock().unwrap();
+            if key.starts_with("oci-uploads/") {
+                if let Some(session_id) = tracked_session {
+                    let session_exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM oci_upload_sessions WHERE id = $1)",
+                    )
+                    .bind(session_id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(AppError::from)?;
+                    if session_exists {
+                        self.early_delete_attempted
+                            .store(true, AtomicOrdering::SeqCst);
+                        return Err(AppError::Storage(
+                            "temp object deleted before upload session commit".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+            Ok(())
+        }
+    }
+
+    struct DeleteRepoOnCopyStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        pool: PgPool,
+        repository_id: Uuid,
+    }
+
+    impl DeleteRepoOnCopyStorage {
+        fn new(pool: PgPool, repository_id: Uuid) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                pool,
+                repository_id,
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.objects.lock().unwrap().keys().cloned().collect()
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for DeleteRepoOnCopyStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(self.repository_id)
+                .execute(&self.pool)
+                .await
+                .map_err(AppError::from)?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn single_patch_upload_copies_streamed_temp_blob_on_completion() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"hello streamed blob");
+        let digest = compute_sha256(&content);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        assert_eq!(
+            headers
+                .get("Range")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "0-0"
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+        assert_eq!(
+            headers
+                .get("Range")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            upload_progress_range(content.len() as i64)
+        );
+
+        let session = sqlx::query(
+            "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let computed_digest: Option<String> = session.try_get("computed_digest").unwrap();
+        assert_eq!(bytes_received, content.len() as i64);
+        assert_eq!(computed_digest.as_deref(), Some(digest.as_str()));
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete upload failed: {:?}",
+            body
+        );
+
+        let remaining_sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        assert_eq!(remaining_sessions, 0);
+
+        let blob = sqlx::query(
+            "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch blob row");
+        let size_bytes: i64 = blob.try_get("size_bytes").unwrap();
+        let blob_key: String = blob.try_get("storage_key").unwrap();
+        assert_eq!(size_bytes, content.len() as i64);
+        assert_eq!(blob_key, blob_storage_key(&digest));
+
+        let storage = f
+            .inner
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: f.inner.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        assert_eq!(storage.get(&blob_key).await.unwrap(), content);
+        assert!(!storage
+            .exists(&upload_storage_key(&upload_uuid))
+            .await
+            .unwrap());
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_after_migration_backfills_existing_temp_object_as_first_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let upload_uuid = Uuid::new_v4();
+        let temp_key = upload_storage_key(&upload_uuid);
+        let initial = Bytes::from_static(b"legacy initial body");
+        let next = Bytes::from_static(b" plus next patch");
+        let mut combined = initial.to_vec();
+        combined.extend_from_slice(&next);
+        let digest = compute_sha256(&combined);
+        let initial_digest = compute_sha256(&initial);
+
+        f.storage().put(&temp_key, initial.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key, computed_digest) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(upload_uuid)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(initial.len() as i64)
+        .bind(&temp_key)
+        .bind(initial_digest.as_str())
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert legacy upload session without part rows");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                next.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch after migration failed: {:?}",
+            body
+        );
+        assert_eq!(
+            headers
+                .get("Range")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            upload_progress_range(combined.len() as i64)
+        );
+
+        let parts = sqlx::query(
+            "SELECT part_index, storage_key, size_bytes FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
+        )
+        .bind(upload_uuid)
+        .fetch_all(&f.inner.pool)
+        .await
+        .expect("fetch backfilled parts");
+        assert_eq!(parts.len(), 2);
+        let first_index: i32 = parts[0].try_get("part_index").unwrap();
+        let first_key: String = parts[0].try_get("storage_key").unwrap();
+        let first_size: i64 = parts[0].try_get("size_bytes").unwrap();
+        let second_index: i32 = parts[1].try_get("part_index").unwrap();
+        let second_size: i64 = parts[1].try_get("size_bytes").unwrap();
+        assert_eq!(first_index, 0);
+        assert_eq!(first_key, temp_key);
+        assert_eq!(first_size, initial.len() as i64);
+        assert_eq!(second_index, 1);
+        assert_eq!(second_size, next.len() as i64);
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete migrated upload failed: {:?}",
+            body
+        );
+        assert_eq!(
+            f.storage().get(&blob_storage_key(&digest)).await.unwrap(),
+            Bytes::from(combined)
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_with_content_range_header_disagreeing_with_session_offset_returns_416() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let upload_uuid = Uuid::new_v4();
+        let temp_key = upload_storage_key(&upload_uuid);
+        let initial = Bytes::from_static(b"already uploaded");
+        let next = Bytes::from_static(b"next");
+
+        f.storage().put(&temp_key, initial.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key, computed_digest) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(upload_uuid)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(initial.len() as i64)
+        .bind(&temp_key)
+        .bind(compute_sha256(&initial))
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert upload session");
+
+        let request = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!(
+                "/{}/image/blobs/uploads/{}",
+                f.inner.repo_key, upload_uuid
+            ))
+            .header(AUTHORIZATION, &f.authorization)
+            .header(CONTENT_LENGTH, next.len().to_string())
+            .header("Content-Range", "0-3")
+            .body(Body::from(next))
+            .expect("build patch request");
+        let (status, _headers, body) = send(app, request).await;
+
+        assert_eq!(
+            status,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "unexpected response body: {:?}",
+            body
+        );
+        let bytes_received: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("fetch bytes_received");
+        assert_eq!(bytes_received, initial.len() as i64);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_heartbeat_marks_lease_invalid_after_consecutive_db_errors() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgresql://127.0.0.1:1/unavailable")
+            .expect("lazy pool");
+        db.close().await;
+        let heartbeat = start_oci_upload_completion_heartbeat_for_tests(
+            db,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Duration::from_millis(1),
+            2,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while heartbeat.lease_is_valid() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("heartbeat should invalidate the lease after repeated DB errors");
+        assert!(!heartbeat.lease_is_valid());
+    }
+
+    #[tokio::test]
+    async fn completion_lease_loss_reopens_session_when_token_still_owned() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let state_token = Uuid::new_v4();
+        let temp_key = upload_storage_key(&session_id);
+
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key, state, state_token) VALUES ($1, $2, $3, 0, $4, 'committing', $5)",
+        )
+        .bind(session_id)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(&temp_key)
+        .bind(state_token)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committing upload session");
+
+        let response = completion_lease_lost_after_reset(
+            &f.inner.pool,
+            session_id,
+            f.inner.repo_id,
+            state_token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let row = sqlx::query("SELECT state, state_token FROM oci_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&f.inner.pool)
+            .await
+            .expect("fetch reset upload session");
+        let state: String = row.try_get("state").unwrap();
+        let state_token: Option<Uuid> = row.try_get("state_token").unwrap();
+        assert_eq!(state, "open");
+        assert!(state_token.is_none());
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_patch_does_not_delete_winning_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(FirstPatchRaceStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("first-patch-race".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'first-patch-race' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry =
+            Arc::new(StorageRegistry::new(backends, "first-patch-race".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let first = Bytes::from_static(b"first concurrent patch");
+        let second = Bytes::from_static(b"second racing body");
+        let first_request = request(
+            Method::PATCH,
+            format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+            &f.authorization,
+            first.clone(),
+        );
+        let second_request = request(
+            Method::PATCH,
+            format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+            &f.authorization,
+            second.clone(),
+        );
+
+        let ((first_status, _, first_body), (second_status, _, second_body)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    send(app.clone(), first_request),
+                    send(app.clone(), second_request)
+                )
+            })
+            .await
+            .expect("concurrent first PATCHes should not deadlock");
+
+        let mut status_codes = vec![first_status.as_u16(), second_status.as_u16()];
+        status_codes.sort_unstable();
+        assert_eq!(
+            status_codes,
+            vec![StatusCode::ACCEPTED.as_u16(), StatusCode::CONFLICT.as_u16()],
+            "expected one winning PATCH and one conflict, got {:?} / {:?}: {:?} / {:?}",
+            first_status,
+            second_status,
+            first_body,
+            second_body
+        );
+        let accepted_body = if first_status == StatusCode::ACCEPTED {
+            first
+        } else {
+            second
+        };
+
+        let part = sqlx::query(
+            "SELECT storage_key, size_bytes FROM oci_upload_parts WHERE upload_session_id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch winning upload part");
+        let part_key: String = part.try_get("storage_key").unwrap();
+        let part_size: i64 = part.try_get("size_bytes").unwrap();
+        assert_eq!(part_size, accepted_body.len() as i64);
+        assert_eq!(storage.get(&part_key).await.unwrap(), accepted_body);
+        assert!(
+            !storage.delete_keys().iter().any(|key| key == &part_key),
+            "losing PATCH must not delete the winning committed part"
+        );
+
+        let digest = compute_sha256(&accepted_body);
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete winning upload failed: {:?}",
+            body
+        );
+        assert_eq!(
+            storage.get(&blob_storage_key(&digest)).await.unwrap(),
+            accepted_body
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_does_not_hold_upload_session_row_lock_while_streaming_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(LockProbeStorage::new(f.inner.pool.clone(), true, false));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("lock-probe".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'lock-probe' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"no row lock while streaming"),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "PATCH should stream without holding SELECT FOR UPDATE: {:?}",
+            body
+        );
+        assert!(
+            !storage.lock_observed(),
+            "storage put_stream observed an upload-session row lock"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_does_not_hold_upload_session_row_lock_while_copying_blob() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(LockProbeStorage::new(f.inner.pool.clone(), false, true));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("lock-probe".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'lock-probe' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "lock-probe".into()));
+        let app = router().with_state(Arc::new(state));
+        let content = Bytes::from_static(b"copy without row lock");
+        let digest = compute_sha256(&content);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "final PUT should copy without holding SELECT FOR UPDATE: {:?}",
+            body
+        );
+        assert!(
+            !storage.lock_observed(),
+            "storage copy observed an upload-session row lock"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_returns_error_when_blob_record_insert_fails() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(DeleteRepoOnCopyStorage::new(
+            f.inner.pool.clone(),
+            f.inner.repo_id,
+        ));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("delete-repo-on-copy".to_string(), storage_backend);
+
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 'delete-repo-on-copy' WHERE id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry =
+            Arc::new(StorageRegistry::new(backends, "delete-repo-on-copy".into()));
+        let app = router().with_state(Arc::new(state));
+        let content = Bytes::from_static(b"monolithic db failure");
+        let digest = compute_sha256(&content);
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "monolithic upload must not return success if oci_blobs insert fails: {:?}",
+            body
+        );
+        let keys = storage.keys();
+        assert!(
+            keys.iter().all(|key| !key.starts_with("oci-uploads/")),
+            "temporary upload object should be cleaned up after DB insert failure: {:?}",
+            keys
+        );
+        assert!(
+            keys.iter().any(|key| key == &blob_storage_key(&digest)),
+            "digest-global blob object must not be deleted on DB failure because another same-digest upload may be committing it: {:?}",
+            keys
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn start_upload_keeps_temp_object_when_commit_result_is_ambiguous() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording-ambiguous-start".to_string(), storage_backend);
+
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 'recording-ambiguous-start' WHERE id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("update repository storage backend");
+
+        let trigger = DeferredCommitFailureTrigger::install_for_upload_session_repo(
+            &f.inner.pool,
+            f.inner.repo_id,
+        )
+        .await;
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(
+            backends,
+            "recording-ambiguous-start".into(),
+        ));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::from_static(b"body written before ambiguous commit"),
+            ),
+        )
+        .await;
+
+        trigger.drop(&f.inner.pool).await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "deferred commit failure should surface to client: {:?}",
+            body
+        );
+        let keys = storage.keys();
+        assert!(
+            keys.iter().any(|key| key.starts_with("oci-uploads/")),
+            "temp object must not be deleted after COMMIT was attempted; keys: {:?}, deletes: {:?}",
+            keys,
+            storage.delete_keys()
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_cleans_part_object_when_commit_recovery_confirms_rollback() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording-ambiguous-patch".to_string(), storage_backend);
+
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 'recording-ambiguous-patch' WHERE id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(
+            backends,
+            "recording-ambiguous-patch".into(),
+        ));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let trigger = DeferredCommitFailureTrigger::install_for_upload_session_part(
+            &f.inner.pool,
+            upload_uuid,
+        )
+        .await;
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"part written before ambiguous commit"),
+            ),
+        )
+        .await;
+
+        trigger.drop(&f.inner.pool).await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "deferred commit failure should surface to client: {:?}",
+            body
+        );
+        let keys = storage.keys();
+        assert!(
+            keys.iter()
+                .all(|key| !key.starts_with("oci-uploads/") || !key.contains(".part.00000000.")),
+            "part object should be deleted after recovery proves COMMIT rolled back; keys: {:?}, deletes: {:?}",
+            keys,
+            storage.delete_keys()
+        );
+        assert!(
+            storage
+                .delete_keys()
+                .iter()
+                .any(|key| key.contains(".part.00000000.")),
+            "part cleanup should be attempted after recovery proves COMMIT rolled back"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_commit_error_recovery_detects_committed_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let temp_key = upload_storage_key(&session_id);
+        let part_key = upload_part_storage_key(&temp_key, 0, &Uuid::new_v4());
+        let part_size = 37_i64;
+
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(session_id)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(part_size)
+        .bind(&temp_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committed upload session");
+
+        sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) VALUES ($1, 0, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(&part_key)
+        .bind(part_size)
+        .bind("abc123")
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committed part");
+
+        assert!(
+            recover_committed_patch_after_commit_error(
+                &f.inner.pool,
+                session_id,
+                f.inner.repo_id,
+                0,
+                &part_key,
+                part_size,
+                part_size,
+            )
+            .await
+            .expect("recover committed PATCH state"),
+            "committed session and part should be recognized after commit error"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_commit_error_recovery_rejects_mismatched_committed_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let temp_key = upload_storage_key(&session_id);
+        let part_key = upload_part_storage_key(&temp_key, 0, &Uuid::new_v4());
+        let part_size = 37_i64;
+
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(session_id)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(part_size + 1)
+        .bind(&temp_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert mismatched upload session");
+
+        sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) VALUES ($1, 0, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(&part_key)
+        .bind(part_size)
+        .bind("abc123")
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committed part");
+
+        let err = recover_committed_patch_after_commit_error(
+            &f.inner.pool,
+            session_id,
+            f.inner.repo_id,
+            0,
+            &part_key,
+            part_size,
+            part_size,
+        )
+        .await
+        .expect_err("mismatched recovered PATCH state must not be treated as rollback");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_commit_error_recovery_detects_committed_blob() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let blob = Bytes::from_static(b"completed before ambiguous commit");
+        let digest = compute_sha256(&blob);
+        let blob_key = blob_storage_key(&digest);
+
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .bind(blob.len() as i64)
+        .bind(&blob_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committed blob row");
+
+        assert!(
+            recover_committed_completion_after_commit_error(
+                &f.inner.pool,
+                session_id,
+                f.inner.repo_id,
+                &digest,
+                blob.len() as i64,
+                &blob_key,
+            )
+            .await
+            .expect("recover committed completion state"),
+            "deleted session plus matching blob row should be treated as committed"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_commit_error_recovery_keeps_rolled_back_session_retryable() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let temp_key = upload_storage_key(&session_id);
+        let digest = compute_sha256(b"not committed");
+        let blob_key = blob_storage_key(&digest);
+
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) VALUES ($1, $2, $3, 0, $4)",
+        )
+        .bind(session_id)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(&temp_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert rolled-back upload session");
+
+        assert!(
+            !recover_committed_completion_after_commit_error(
+                &f.inner.pool,
+                session_id,
+                f.inner.repo_id,
+                &digest,
+                0,
+                &blob_key,
+            )
+            .await
+            .expect("recover rolled-back completion state"),
+            "live upload session should remain retryable instead of being treated as committed"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_upload_uuid_from_different_repository_path() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let (other_repo_id, other_repo_key, _other_storage_dir) =
+            tdh::create_repo(&f.inner.pool, "local", "docker").await;
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", other_repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"wrong repo"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-repo PATCH must not attach to an upload session: {:?}",
+            body
+        );
+
+        let session = sqlx::query("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+            .bind(upload_uuid)
+            .fetch_one(&f.inner.pool)
+            .await
+            .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        assert_eq!(bytes_received, 0);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_repo_id)
+            .execute(&f.inner.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_upload_uuid_from_different_repository_path() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let (other_repo_id, other_repo_key, _other_storage_dir) =
+            tdh::create_repo(&f.inner.pool, "local", "docker").await;
+        let content = Bytes::from_static(b"repo-bound upload");
+        let digest = compute_sha256(&content);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    other_repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-repo completion must not use an upload session: {:?}",
+            body
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_repo_id)
+            .execute(&f.inner.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn final_put_deletes_temp_object_after_upload_session_commit() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(DeleteAfterSessionGoneStorage::new(f.inner.pool.clone()));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("session-aware".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'session-aware' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "session-aware".into()));
+        let app = router().with_state(Arc::new(state));
+        let content = Bytes::from_static(b"commit-before-cleanup");
+        let digest = compute_sha256(&content);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+        storage.track_session(upload_uuid);
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let temp_key = upload_storage_key(&upload_uuid);
+        assert!(storage.exists(&temp_key).await.unwrap());
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete upload failed: {:?}",
+            body
+        );
+        assert!(
+            !storage.early_delete_attempted(),
+            "handler attempted to delete temp object before upload session commit"
+        );
+        assert!(
+            !storage.exists(&temp_key).await.unwrap(),
+            "temp object should be removed after DB commit"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_stages_then_promotes_validated_blob_and_rejects_bad_digest() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"monolithic streamed blob");
+        let digest = compute_sha256(&content);
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "monolithic upload failed: {:?}",
+            body
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+
+        let storage = f
+            .inner
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: f.inner.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        assert_eq!(
+            storage.get(&blob_storage_key(&digest)).await.unwrap(),
+            content
+        );
+
+        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, bad_digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"different bytes"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, bad_digest).await, 0);
+        assert!(!storage.exists(&blob_storage_key(bad_digest)).await.unwrap());
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_bad_digest_does_not_delete_existing_blob() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let storage = f.storage();
+        let existing = Bytes::from_static(b"existing valid blob");
+        let digest = compute_sha256(&existing);
+        let blob_key = blob_storage_key(&digest);
+        storage.put(&blob_key, existing.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .bind(existing.len() as i64)
+        .bind(&blob_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert existing blob row");
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"corrupt bytes for that digest"),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+        assert_eq!(storage.get(&blob_key).await.unwrap(), existing);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_respects_configured_max_upload_size() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+        let storage = f.storage();
+        let content = Bytes::from_static(b"12345");
+        let digest = compute_sha256(&content);
+
+        let (status, _headers, _body) = send(
+            app,
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+        assert!(!storage.exists(&blob_storage_key(&digest)).await.unwrap());
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn start_upload_initial_body_respects_configured_max_upload_size() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+
+        let (status, _headers, _body) = send(
+            app,
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::from_static(b"12345"),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        assert_eq!(sessions, 0);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn first_patch_respects_configured_max_upload_size() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"12345"),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let session = sqlx::query(
+            "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let computed_digest: Option<String> = session.try_get("computed_digest").unwrap();
+        assert_eq!(bytes_received, 0);
+        assert!(computed_digest.is_none());
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn later_patch_respects_cumulative_max_upload_size() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"1234"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "first patch failed: {:?}",
+            body
+        );
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"5"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let session = sqlx::query(
+            "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let computed_digest: Option<String> = session.try_get("computed_digest").unwrap();
+        assert_eq!(bytes_received, 4);
+        assert_eq!(
+            computed_digest.as_deref(),
+            Some(compute_sha256(b"1234").as_str())
+        );
+        let part_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_upload_parts WHERE upload_session_id = $1 AND part_index = 0",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch first part key");
+        assert_eq!(
+            f.storage().get(&part_key).await.unwrap(),
+            Bytes::from_static(b"1234")
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn later_patch_rejects_oversized_content_length_before_reading_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"1234"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "first patch failed: {:?}",
+            body
+        );
+
+        let chunks_read = Arc::new(AtomicUsize::new(0));
+        let oversized_body = counted_body(Arc::clone(&chunks_read), vec![Bytes::from_static(b"5")]);
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request_with_body(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                1,
+                oversized_body,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            chunks_read.load(AtomicOrdering::SeqCst),
+            0,
+            "oversized PATCH should be rejected from Content-Length before polling body"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn later_patch_does_not_read_existing_temp_object() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'recording' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+        let upload_key = upload_storage_key(&upload_uuid);
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"123"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "first patch failed: {:?}",
+            body
+        );
+
+        storage.fail_get_for(&upload_key);
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"4"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "later PATCH should write an immutable part instead of reading the existing temp object"
+        );
+
+        let session = sqlx::query("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+            .bind(upload_uuid)
+            .fetch_one(&f.inner.pool)
+            .await
+            .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        assert_eq!(bytes_received, 4);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn final_put_rejects_later_patch_while_committing_without_db_row_lock() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(BlockingCopyStorage::new());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("blocking".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'blocking' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let content = Bytes::from_static(b"A");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "first patch failed: {:?}",
+            body
+        );
+
+        let final_app = app.clone();
+        let final_repo = f.inner.repo_key.clone();
+        let final_auth = f.authorization.clone();
+        let final_digest = digest.clone();
+        let mut final_task = tokio::spawn(async move {
+            send(
+                final_app,
+                request(
+                    Method::PUT,
+                    format!(
+                        "/{}/image/blobs/uploads/{}?digest={}",
+                        final_repo, upload_uuid, final_digest
+                    ),
+                    &final_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            storage.copy_started.notified(),
+        )
+        .await
+        .expect("final PUT should reach storage copy");
+
+        let patch_app = app.clone();
+        let patch_repo = f.inner.repo_key.clone();
+        let patch_auth = f.authorization.clone();
+        let mut patch_task = tokio::spawn(async move {
+            send(
+                patch_app,
+                request(
+                    Method::PATCH,
+                    format!("/{}/image/blobs/uploads/{}", patch_repo, upload_uuid),
+                    &patch_auth,
+                    Bytes::from_static(b"B"),
+                ),
+            )
+            .await
+        });
+
+        let patch_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut patch_task).await;
+        let (patch_status, _patch_headers, _patch_body) = patch_result
+            .expect("PATCH should be rejected promptly while final PUT is committing")
+            .expect("PATCH task should complete");
+        assert_eq!(patch_status, StatusCode::CONFLICT);
+
+        storage.release_copy.notify_one();
+
+        let (final_status, _final_headers, final_body) = (&mut final_task)
+            .await
+            .expect("final PUT task should complete");
+        assert_eq!(
+            final_status,
+            StatusCode::CREATED,
+            "final PUT failed: {:?}",
+            final_body
+        );
+
+        assert_eq!(storage.get(&blob_key).await.unwrap(), content);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn final_put_recovers_expired_committing_upload_session_lease() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"recover stale committing session");
+        let digest = compute_sha256(&content);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        sqlx::query(
+            "UPDATE oci_upload_sessions SET state = 'committing', state_token = $2, updated_at = NOW() - INTERVAL '6 hours 1 minute' WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .bind(Uuid::new_v4())
+        .execute(&f.inner.pool)
+        .await
+        .expect("mark upload session as expired committing lease");
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "stale committing completion should be recoverable: {:?}",
+            body
+        );
+        assert_eq!(
+            f.storage().get(&blob_storage_key(&digest)).await.unwrap(),
+            content
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_final_body_respects_cumulative_max_upload_size() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+        let digest = compute_sha256(b"12345");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"1234"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"5"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+        assert!(!f
+            .storage()
+            .exists(&blob_storage_key(&digest))
+            .await
+            .unwrap());
+
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        assert_eq!(sessions, 1);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_oversized_content_length_before_reading_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+        let digest = compute_sha256(b"12345");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"1234"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let chunks_read = Arc::new(AtomicUsize::new(0));
+        let oversized_body = counted_body(Arc::clone(&chunks_read), vec![Bytes::from_static(b"5")]);
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request_with_body(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                1,
+                oversized_body,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            chunks_read.load(AtomicOrdering::SeqCst),
+            0,
+            "oversized completion body should be rejected from Content-Length before polling body"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn rehash_completion_promotes_via_copy_not_direct_blob_put() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'recording' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
+        let app = router().with_state(Arc::new(state));
+        let digest = compute_sha256(b"hello world");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::from_static(b"hello "),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"world"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete upload failed: {:?}",
+            body
+        );
+
+        let blob_key = blob_storage_key(&digest);
+        assert!(
+            storage.copy_keys().iter().any(|(source, dest)| source
+                .starts_with(&format!("{}.complete.", upload_storage_key(&upload_uuid)))
+                && dest == &blob_key),
+            "multi-part rehash completion must promote a validated completion temp object via copy"
+        );
+        assert!(
+            !storage.put_keys().iter().any(|key| key == &blob_key),
+            "rehash completion must not write directly to digest-global blob key"
+        );
+        assert_eq!(
+            storage.get(&blob_key).await.unwrap(),
+            Bytes::from_static(b"hello world")
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_with_nonempty_final_put_body_concatenates_parts() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let digest = compute_sha256(b"hello world");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello "),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"world"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete upload with final body failed: {:?}",
+            body
+        );
+        assert_eq!(
+            f.storage()
+                .get(&blob_storage_key(&digest))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello world"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_upload_cancels_session_and_removes_temp_storage() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"cancel-me"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let storage_temp_key: String =
+            sqlx::query_scalar("SELECT storage_temp_key FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("fetch storage temp key");
+        let part_keys: Vec<String> = sqlx::query(
+            "SELECT storage_key FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
+        )
+        .bind(upload_uuid)
+        .fetch_all(&f.inner.pool)
+        .await
+        .expect("fetch upload part keys")
+        .into_iter()
+        .map(|row| row.try_get("storage_key").expect("storage_key"))
+        .collect();
+        assert!(
+            !part_keys.is_empty(),
+            "PATCH body must be recorded as an upload part"
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::DELETE,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "cancel upload failed: {:?}",
+            body
+        );
+
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        let part_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_parts WHERE upload_session_id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count upload parts");
+        assert_eq!(session_count, 0, "cancel must delete the upload session");
+        assert_eq!(part_count, 0, "cancel must cascade upload parts");
+        assert!(
+            !f.storage()
+                .exists(&storage_temp_key)
+                .await
+                .expect("temp exists check"),
+            "cancel must delete the upload temp object"
+        );
+        for part_key in part_keys {
+            assert!(
+                !f.storage()
+                    .exists(&part_key)
+                    .await
+                    .expect("part exists check"),
+                "cancel must delete upload part object {}",
+                part_key
+            );
+        }
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_malformed_digest_rejected_before_streaming_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+
+        // A syntactically invalid ?digest= must be rejected up front, before the
+        // body is streamed to storage or any cleanup-key row is registered, so a
+        // bad digest cannot cause a wasted (potentially multi-GiB) write.
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest=not-a-valid-sha256",
+                    f.inner.repo_key
+                ),
+                &f.authorization,
+                Bytes::from_static(b"body that must never reach storage"),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "malformed digest must be rejected: {:?}",
+            body
+        );
+        let cleanup_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE repository_id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup keys");
+        assert_eq!(
+            cleanup_keys, 0,
+            "a malformed digest must be rejected before any storage write is registered"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_partial_storage_delete_keeps_session_non_resumable() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        // RecordingStorage that fails every delete, simulating a transient storage
+        // error landing mid-cancel after some objects may already be gone.
+        let storage = Arc::new(RecordingStorage::default());
+        storage.fail_delete_for_prefix("");
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording-cancel-faildelete".to_string(), storage_backend);
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 'recording-cancel-faildelete' WHERE id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("update repository storage backend");
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(
+            backends,
+            "recording-cancel-faildelete".into(),
+        ));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::DELETE,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed storage delete during cancel must surface an error"
+        );
+
+        // The session must NOT be reset to `open` (which would make it resumable
+        // with missing parts). It stays `committing` until the GC sweep reaps it.
+        let state_value: String =
+            sqlx::query_scalar("SELECT state FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("session must still exist after a failed cancel");
+        assert_eq!(
+            state_value, "committing",
+            "a cancel that began deleting must leave the session non-resumable, not reset it to open"
+        );
+
+        // A resume attempt is rejected (not 202), proving the session is wedged
+        // rather than resumable with holes.
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"resume-bytes"),
+            ),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::ACCEPTED,
+            "a session left mid-cancel must not accept further PATCH appends"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn cached_single_part_completion_digest_mismatch_keeps_session_retryable() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let wrong_digest = compute_sha256(b"HELLO");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, wrong_digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &wrong_digest).await, 0);
+        assert!(
+            !f.storage()
+                .exists(&blob_storage_key(&wrong_digest))
+                .await
+                .expect("blob exists check"),
+            "digest mismatch must not promote a blob object"
+        );
+
+        let session = sqlx::query(
+            "SELECT state, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch retryable upload session");
+        let state: String = session.try_get("state").unwrap();
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let storage_temp_key: String = session.try_get("storage_temp_key").unwrap();
+        assert_eq!(state, "open");
+        assert_eq!(bytes_received, 5);
+        assert!(
+            f.storage()
+                .exists(&storage_temp_key)
+                .await
+                .expect("temp exists check"),
+            "the original uploaded part must remain so the client can retry completion"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn multi_patch_completion_rejects_digest_mismatch_and_keeps_session_open() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let wrong_digest = compute_sha256(b"GOODBYE");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        for chunk in [Bytes::from_static(b"hello "), Bytes::from_static(b"world")] {
+            let (status, _headers, body) = send(
+                app.clone(),
+                request(
+                    Method::PATCH,
+                    format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                    &f.authorization,
+                    chunk,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "patch upload failed: {:?}",
+                body
+            );
+        }
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, wrong_digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &wrong_digest).await, 0);
+        assert!(
+            !f.storage()
+                .exists(&blob_storage_key(&wrong_digest))
+                .await
+                .expect("blob exists check"),
+            "digest mismatch must not promote a blob object"
+        );
+
+        let session = sqlx::query(
+            "SELECT state, bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch retryable upload session");
+        let state: String = session.try_get("state").unwrap();
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let computed_digest: Option<String> = session.try_get("computed_digest").unwrap();
+        assert_eq!(state, "open");
+        assert_eq!(bytes_received, 11);
+        assert!(
+            computed_digest.is_none(),
+            "multi-PATCH completion must use the rehash path"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn rehash_completion_digest_mismatch_removes_final_and_complete_temp_objects() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'recording' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
+        let app = router().with_state(Arc::new(state));
+        let wrong_digest = compute_sha256(b"hello WORLD");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello "),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, wrong_digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"world"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(oci_blob_count(&f, &wrong_digest).await, 0);
+
+        let upload_key = upload_storage_key(&upload_uuid);
+        let deleted_keys = storage.delete_keys();
+        assert!(
+            deleted_keys
+                .iter()
+                .any(|key| key.starts_with(&format!("{}.complete.", upload_key))),
+            "digest mismatch must delete the concatenated completion temp object: {:?}",
+            deleted_keys
+        );
+        assert!(
+            deleted_keys
+                .iter()
+                .any(|key| key.starts_with(&format!("{}.part.2147483647.", upload_key))),
+            "digest mismatch must delete the streamed final PUT body object: {:?}",
+            deleted_keys
+        );
+        assert!(
+            !storage
+                .keys()
+                .iter()
+                .any(|key| key.starts_with(&format!("{}.complete.", upload_key))
+                    || key.starts_with(&format!("{}.part.2147483647.", upload_key))),
+            "temporary completion objects must not remain in storage"
+        );
+
+        let session =
+            sqlx::query("SELECT state, bytes_received FROM oci_upload_sessions WHERE id = $1")
+                .bind(upload_uuid)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("fetch retryable upload session");
+        let state: String = session.try_get("state").unwrap();
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        assert_eq!(state, "open");
+        assert_eq!(bytes_received, 6);
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(RecordingStorage::default());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("recording".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'recording' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry =
+            Arc::new(StorageRegistry::new(backends.clone(), "recording".into()));
+        let app = router().with_state(Arc::new(state));
+        let wrong_digest = compute_sha256(b"hello WORLD");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello "),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let upload_key = upload_storage_key(&upload_uuid);
+        storage.fail_delete_for_prefix(&format!("{}.part.2147483647.", upload_key));
+
+        let (status, _headers, _body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, wrong_digest
+                ),
+                &f.authorization,
+                Bytes::from_static(b"world"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let leaked_final_key = storage
+            .keys()
+            .into_iter()
+            .find(|key| key.starts_with(&format!("{}.part.2147483647.", upload_key)))
+            .expect("forced delete failure should leave the final PUT temp object");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&leaked_final_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup key rows");
+        assert_eq!(
+            cleanup_key_count, 1,
+            "failed best-effort delete must leave a durable cleanup-key row"
+        );
+
+        let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+
+        sqlx::query(
+            r#"
+            UPDATE oci_upload_cleanup_keys
+            SET created_at = NOW() - INTERVAL '25 hours',
+                storage_write_completed_at = NOW() - INTERVAL '25 hours'
+            WHERE storage_key = $1
+            "#,
+        )
+        .bind(&leaked_final_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("age cleanup key");
+        storage.clear_delete_failures();
+
+        let registry = Arc::new(StorageRegistry::new(backends, "recording".into()));
+        let gc = crate::services::storage_gc_service::StorageGcService::new(
+            f.inner.pool.clone(),
+            registry,
+        );
+        let gc_result = gc.run_gc(false).await.expect("storage gc succeeds");
+
+        let key_exists_after_gc = storage
+            .exists(&leaked_final_key)
+            .await
+            .expect("exists check after gc");
+        let cleanup_key_count_after_gc: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&leaked_final_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup key rows after gc");
+        assert!(
+            !key_exists_after_gc,
+            "storage GC must delete leaked final PUT temp object"
+        );
+        assert_eq!(
+            cleanup_key_count_after_gc, 0,
+            "storage GC must remove the durable cleanup-key row"
+        );
+        assert!(
+            gc_result.storage_keys_deleted >= 1,
+            "GC result should count the leaked final PUT temp key"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn multi_patch_upload_rehashes_when_digest_cache_is_cleared() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let first = Bytes::from_static(b"hello ");
+        let second = Bytes::from_static(b"world");
+        let digest = compute_sha256(b"hello world");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                first,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                second,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let session = sqlx::query(
+            "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("fetch upload session");
+        let bytes_received: i64 = session.try_get("bytes_received").unwrap();
+        let computed_digest: Option<String> = session.try_get("computed_digest").unwrap();
+        assert_eq!(bytes_received, 11);
+        assert!(
+            computed_digest.is_none(),
+            "multi-PATCH append path must clear stale computed_digest"
+        );
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete upload failed: {:?}",
+            body
+        );
+
+        let storage = f
+            .inner
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: f.inner.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        assert_eq!(
+            storage
+                .get(&blob_storage_key(&digest))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello world"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn three_part_upload_concatenates_parts_in_index_order() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let digest = compute_sha256(b"aaabbbccc");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        for (index, chunk) in [
+            Bytes::from_static(b"aaa"),
+            Bytes::from_static(b"bbb"),
+            Bytes::from_static(b"ccc"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, _headers, body) = send(
+                app.clone(),
+                request(
+                    Method::PATCH,
+                    format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                    &f.authorization,
+                    chunk,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "patch upload part {} failed: {:?}",
+                index,
+                body
+            );
+        }
+
+        let part_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_parts WHERE upload_session_id = $1",
+        )
+        .bind(upload_uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count upload parts");
+        assert_eq!(part_count, 3, "three PATCHes must record three parts");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete three-part upload failed: {:?}",
+            body
+        );
+
+        let blob_key = blob_storage_key(&digest);
+        assert_eq!(
+            f.storage().get(&blob_key).await.unwrap().as_ref(),
+            b"aaabbbccc",
+            "parts must concatenate in part_index order"
+        );
+        assert!(
+            f.storage().exists(&blob_key).await.unwrap(),
+            "stored blob object must exist"
+        );
+        assert_eq!(
+            oci_blob_count(&f, &digest).await,
+            1,
+            "exactly one blob row must be recorded"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_final_puts_commit_blob_exactly_once() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let storage = Arc::new(BlockingCopyStorage::new());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("blocking".to_string(), storage_backend);
+
+        sqlx::query("UPDATE repositories SET storage_backend = 'blocking' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let content = Bytes::from_static(b"A");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        let first_app = app.clone();
+        let first_repo = f.inner.repo_key.clone();
+        let first_auth = f.authorization.clone();
+        let first_digest = digest.clone();
+        let mut first_put = tokio::spawn(async move {
+            send(
+                first_app,
+                request(
+                    Method::PUT,
+                    format!(
+                        "/{}/image/blobs/uploads/{}?digest={}",
+                        first_repo, upload_uuid, first_digest
+                    ),
+                    &first_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await
+        });
+
+        // Wait for the first PUT to claim the session and reach the blocking copy.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            storage.copy_started.notified(),
+        )
+        .await
+        .expect("first final PUT should reach storage copy");
+
+        // Fire the second PUT while the first is mid-commit. It must lose the
+        // claim_oci_upload_session_for_completion race (state already 'committing').
+        let second_app = app.clone();
+        let second_repo = f.inner.repo_key.clone();
+        let second_auth = f.authorization.clone();
+        let second_digest = digest.clone();
+        let mut second_put = tokio::spawn(async move {
+            send(
+                second_app,
+                request(
+                    Method::PUT,
+                    format!(
+                        "/{}/image/blobs/uploads/{}?digest={}",
+                        second_repo, upload_uuid, second_digest
+                    ),
+                    &second_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await
+        });
+
+        let second_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut second_put).await;
+        let (second_status, _second_headers, _second_body) = second_result
+            .expect("second final PUT should be rejected promptly while first is committing")
+            .expect("second PUT task should complete");
+        assert_eq!(
+            second_status,
+            StatusCode::CONFLICT,
+            "second concurrent final PUT must lose the completion claim"
+        );
+
+        storage.release_copy.notify_one();
+
+        let (first_status, _first_headers, first_body) = (&mut first_put)
+            .await
+            .expect("first PUT task should complete");
+        assert_eq!(
+            first_status,
+            StatusCode::CREATED,
+            "first final PUT failed: {:?}",
+            first_body
+        );
+
+        assert_eq!(
+            storage.get(&blob_key).await.unwrap(),
+            content,
+            "blob must be stored exactly once with the correct bytes"
+        );
+        assert_eq!(
+            oci_blob_count(&f, &digest).await,
+            1,
+            "exactly one blob row must be recorded after concurrent PUTs"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_persists_canonical_lowercase_digest_for_uppercase_request() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let storage = f.storage();
+        let content = Bytes::from_static(b"upper-case digest request bytes");
+        let canonical = compute_sha256(&content); // sha256:<lowercase hex>
+        let upper_hex = canonical
+            .strip_prefix("sha256:")
+            .expect("prefixed digest")
+            .to_ascii_uppercase();
+        let upper_digest = format!("sha256:{}", upper_hex);
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, upper_digest
+                ),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "upper-case digest upload should succeed: {:?}",
+            body
+        );
+
+        // The blob must be persisted under the canonical lowercase digest, not
+        // the upper-case form the client sent, or a later canonical lookup would
+        // miss it. This is the regression guard for the digest-canonicalization
+        // fix in the monolithic POST path.
+        assert_eq!(
+            oci_blob_count(&f, &canonical).await,
+            1,
+            "blob row must use the canonical lowercase digest"
+        );
+        assert_eq!(
+            oci_blob_count(&f, &upper_digest).await,
+            0,
+            "no blob row may be stored under the raw upper-case digest"
+        );
+        assert_eq!(
+            storage.get(&blob_storage_key(&canonical)).await.unwrap(),
+            content,
+            "blob object must live under the canonical storage key"
+        );
+        assert!(
+            !storage
+                .exists(&blob_storage_key(&upper_digest))
+                .await
+                .unwrap(),
+            "no object may be stored under the upper-case storage key"
+        );
+        assert_eq!(
+            headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(canonical.as_str()),
+            "Docker-Content-Digest must echo the canonical lowercase digest"
+        );
+
+        // The READ side must canonicalize too: pulling by the upper-case digest
+        // must resolve the blob stored under its canonical lowercase digest,
+        // otherwise an upper-case push+pull round-trip would 404.
+        let (get_status, _get_headers, get_body) = send(
+            app.clone(),
+            request(
+                Method::GET,
+                format!("/{}/image/blobs/{}", f.inner.repo_key, upper_digest),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            get_status,
+            StatusCode::OK,
+            "upper-case GET must resolve the canonically-stored blob"
+        );
+        assert_eq!(get_body, content, "GET must return the stored bytes");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_empty_blob_upload_creates_zero_byte_blob() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let storage = f.storage();
+        // The empty blob (sha256 of zero bytes) is the config blob present in
+        // essentially every image manifest, so this path must work end to end.
+        let digest = compute_sha256(b"");
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "empty monolithic upload should succeed: {:?}",
+            body
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+        assert_eq!(
+            storage.get(&blob_storage_key(&digest)).await.unwrap().len(),
+            0,
+            "empty blob object must exist and be zero bytes"
+        );
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("blob size");
+        assert_eq!(size, 0, "empty blob row must record size_bytes = 0");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn session_empty_blob_completion_creates_zero_byte_blob() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let storage = f.storage();
+        let digest = compute_sha256(b"");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start empty upload session failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{}/image/blobs/uploads/{}?digest={}",
+                    f.inner.repo_key, upload_uuid, digest
+                ),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "complete empty upload failed: {:?}",
+            body
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+        assert_eq!(
+            storage.get(&blob_storage_key(&digest)).await.unwrap().len(),
+            0,
+            "empty blob object must exist and be zero bytes"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_heartbeat_marks_lease_invalid_when_token_changes_under_healthy_db() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let session_id = Uuid::new_v4();
+        let state_token = Uuid::new_v4();
+        let temp_key = upload_storage_key(&session_id);
+
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key, state, state_token) VALUES ($1, $2, $3, 0, $4, 'committing', $5)",
+        )
+        .bind(session_id)
+        .bind(f.inner.repo_id)
+        .bind(f.inner.user_id)
+        .bind(&temp_key)
+        .bind(state_token)
+        .execute(&f.inner.pool)
+        .await
+        .expect("insert committing upload session");
+
+        let heartbeat = start_oci_upload_completion_heartbeat_for_tests(
+            f.inner.pool.clone(),
+            session_id,
+            f.inner.repo_id,
+            state_token,
+            Duration::from_millis(20),
+            5,
+        );
+
+        // Steal the lease from another (healthy) connection by rotating the
+        // state_token. The next heartbeat UPDATE then matches 0 rows even though
+        // the DB is fully reachable, exercising the `Ok(_) if rows_affected != 1`
+        // branch that protects a live commit from a concurrent writer.
+        sqlx::query("UPDATE oci_upload_sessions SET state_token = $2 WHERE id = $1")
+            .bind(session_id)
+            .bind(Uuid::new_v4())
+            .execute(&f.inner.pool)
+            .await
+            .expect("rotate state_token");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while heartbeat.lease_is_valid() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("heartbeat must invalidate the lease when its token no longer owns the row");
+        assert!(!heartbeat.lease_is_valid());
+
+        f.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #1175: /v2/token `service` query parameter validation.
 //
 // The OCI Distribution token spec requires the server to validate that the
@@ -8249,280 +14896,6 @@ mod token_service_query_validation_tests {
             status,
             StatusCode::OK,
             "missing service param stays accepted (backward compat)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // OCI blob upload streaming (#1449)
-    //
-    // These tests mirror the #1512 ChunkRecordingBackend pattern: a fake
-    // StorageBackend that asserts (a) `put` is never called for large
-    // bodies, (b) `put_stream` is what the upload path actually uses, and
-    // (c) per-chunk memory stays bounded to STREAM_CHUNK_BUDGET. None of
-    // these tests touch the database; the helpers under test are pure
-    // tokio + tempfile operations.
-    // -----------------------------------------------------------------------
-
-    /// Streaming PATCH-append parity: writing a payload as one big chunk
-    /// versus many small chunks must produce the same on-disk bytes and
-    /// the same sha256, exactly the way the streaming PATCH path
-    /// (`stream_body_to_temp_file` with O_APPEND) must compose.
-    #[tokio::test]
-    async fn test_stream_body_to_temp_file_append_parity() {
-        // Deterministic 1 MiB + 17 bytes payload (off-by-one to catch
-        // boundary bugs).
-        let size = 1024 * 1024 + 17;
-        let mut payload = Vec::with_capacity(size);
-        let mut x: u32 = 0xCAFE_BABE;
-        for _ in 0..size {
-            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            payload.push((x >> 16) as u8);
-        }
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let one_shot_path = tmp.path().join("oneshot.bin");
-        let many_chunks_path = tmp.path().join("many.bin");
-
-        // 1) Single Body::from in one go.
-        let body = Body::from(payload.clone());
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        let max_upload: u64 = 0; // unlimited
-        stream_body_to_temp_file(body, &one_shot_path, &mut hasher, &mut total, max_upload)
-            .await
-            .expect("oneshot stream succeeds");
-        let digest_oneshot = format!("{:x}", hasher.finalize());
-
-        // 2) Same payload as many small chunks, appended via O_APPEND
-        //    across multiple calls -- this is the multi-PATCH shape.
-        let mut combined_hasher = Sha256::new();
-        let mut combined_total: u64 = 0;
-        for chunk in payload.chunks(13 * 1024 + 7) {
-            let body = Body::from(Bytes::copy_from_slice(chunk));
-            stream_body_to_temp_file(
-                body,
-                &many_chunks_path,
-                &mut combined_hasher,
-                &mut combined_total,
-                max_upload,
-            )
-            .await
-            .expect("multi-chunk append succeeds");
-        }
-        let digest_chunks = format!("{:x}", combined_hasher.finalize());
-
-        // Files should be byte-identical and same length.
-        let a = tokio::fs::read(&one_shot_path).await.unwrap();
-        let b = tokio::fs::read(&many_chunks_path).await.unwrap();
-        assert_eq!(a.len(), payload.len(), "oneshot file size matches payload");
-        assert_eq!(b.len(), payload.len(), "appended file size matches payload");
-        assert_eq!(a, b, "oneshot and appended file contents diverged");
-        assert_eq!(
-            digest_oneshot, digest_chunks,
-            "single-call vs append-multi sha256 must match"
-        );
-    }
-
-    /// MAX_UPLOAD_SIZE enforcement: a nonzero cap must reject a body
-    /// that overruns it BEFORE the offending bytes hit disk, and the
-    /// returned status must be 413 Payload Too Large.
-    #[tokio::test]
-    async fn test_stream_body_to_temp_file_enforces_nonzero_cap() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("capped.bin");
-        // 100 byte cap, 1 KiB body.
-        let payload = vec![0xA5u8; 1024];
-        let body = Body::from(payload);
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        let err = stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 100)
-            .await
-            .expect_err("must reject body over cap");
-        assert_eq!(
-            err.0,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "expected 413 on cap overrun, got {} ({})",
-            err.0,
-            err.1,
-        );
-    }
-
-    /// MAX_UPLOAD_SIZE = 0 must mean "unlimited", matching the
-    /// documented sentinel in `Config::max_upload_size_bytes`. A 0 cap
-    /// must NOT cause every chunk to overflow the cap.
-    #[tokio::test]
-    async fn test_stream_body_to_temp_file_zero_cap_is_unlimited() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("unlimited.bin");
-        // 4 MiB payload -- vastly larger than any conceivable check
-        // window; if `0` were treated as a literal cap this would 413.
-        let payload = vec![0x11u8; 4 * 1024 * 1024];
-        let body = Body::from(payload);
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        stream_body_to_temp_file(body, &path, &mut hasher, &mut total, 0)
-            .await
-            .expect("zero cap must permit any size");
-        assert_eq!(
-            total,
-            4 * 1024 * 1024,
-            "all bytes counted under unlimited cap"
-        );
-        let on_disk = tokio::fs::metadata(&path).await.unwrap().len();
-        assert_eq!(
-            on_disk,
-            4 * 1024 * 1024,
-            "all bytes written under unlimited cap"
-        );
-    }
-
-    /// `rehash_temp_file` must produce a sha256 that matches the
-    /// `compute_sha256` helper run on the same payload buffered in
-    /// memory. This is the digest-verification parity that
-    /// `handle_complete_upload` depends on: pre-#1449 the verification
-    /// hashed an in-memory buffer; post-#1449 it hashes the on-disk
-    /// temp file, and the two must agree byte-for-byte.
-    #[tokio::test]
-    async fn test_rehash_temp_file_matches_compute_sha256() {
-        let payload = b"hello OCI streaming push -- 1449".repeat(4096);
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("blob.bin");
-        tokio::fs::write(&path, &payload).await.unwrap();
-
-        let (digest_from_disk, size_from_disk) =
-            rehash_temp_file(&path).await.expect("rehash succeeds");
-        let digest_from_buf = compute_sha256(&payload);
-
-        assert_eq!(
-            digest_from_disk, digest_from_buf,
-            "on-disk rehash vs in-memory compute_sha256 must agree"
-        );
-        assert_eq!(size_from_disk as usize, payload.len());
-    }
-
-    /// Memory-bound put: when the upload temp file is fed to a
-    /// `StorageBackend` via `put_stream`, the backend must observe
-    /// multiple bounded chunks rather than a single Bytes containing
-    /// the whole payload. This is the #1449 invariant: a 10 GB layer
-    /// push must not buffer 10 GB in RAM at the storage interface.
-    ///
-    /// We use a `ChunkRecordingBackend` that captures chunk sizes from
-    /// the `put_stream` BoxStream and asserts:
-    ///   * `put` was never called (the legacy buffered path),
-    ///   * the chunk count is > 1 for a multi-MiB payload,
-    ///   * the largest single chunk is <= STREAM_CHUNK_BUDGET.
-    #[tokio::test]
-    async fn test_put_stream_is_chunked_not_buffered() {
-        use crate::storage::PutStreamResult;
-        use crate::storage::StorageBackend;
-        use async_trait::async_trait;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        struct ChunkRecordingBackend {
-            put_calls: Arc<AtomicUsize>,
-            chunk_sizes: Arc<Mutex<Vec<usize>>>,
-        }
-
-        #[async_trait]
-        impl StorageBackend for ChunkRecordingBackend {
-            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
-                self.put_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
-                Ok(Bytes::new())
-            }
-            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-                Ok(false)
-            }
-            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
-                Ok(())
-            }
-            async fn put_stream(
-                &self,
-                _key: &str,
-                stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
-            ) -> crate::error::Result<PutStreamResult> {
-                use futures::StreamExt;
-                let mut total: u64 = 0;
-                let mut hasher = Sha256::new();
-                tokio::pin!(stream);
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    self.chunk_sizes.lock().unwrap().push(chunk.len());
-                    hasher.update(&chunk);
-                    total += chunk.len() as u64;
-                }
-                Ok(PutStreamResult {
-                    checksum_sha256: format!("{:x}", hasher.finalize()),
-                    bytes_written: total,
-                })
-            }
-        }
-
-        // 4 MiB payload -- big enough to span > 1 STREAM_CHUNK_BUDGET
-        // window (256 KiB), so a non-chunked implementation would
-        // show up as a single Bytes of 4 MiB.
-        let payload = vec![0xCDu8; 4 * 1024 * 1024];
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("blob.bin");
-        tokio::fs::write(&path, &payload).await.unwrap();
-
-        let put_calls = Arc::new(AtomicUsize::new(0));
-        let chunk_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-        let backend = ChunkRecordingBackend {
-            put_calls: put_calls.clone(),
-            chunk_sizes: chunk_sizes.clone(),
-        };
-
-        let upload_stream = open_upload_temp_as_stream(&path)
-            .await
-            .expect("open temp as stream");
-        let result = backend
-            .put_stream("oci-blobs/sha256:test", upload_stream)
-            .await
-            .expect("put_stream succeeds");
-
-        assert_eq!(
-            put_calls.load(Ordering::SeqCst),
-            0,
-            "buffered `put` must NOT be called for a streaming upload"
-        );
-        let sizes = chunk_sizes.lock().unwrap().clone();
-        assert!(
-            sizes.len() > 1,
-            "expected multiple chunks for a 4 MiB payload, got {} chunks",
-            sizes.len()
-        );
-        let max_chunk = sizes.iter().copied().max().unwrap_or(0);
-        assert!(
-            max_chunk <= STREAM_CHUNK_BUDGET,
-            "max chunk {} bytes exceeds STREAM_CHUNK_BUDGET ({})",
-            max_chunk,
-            STREAM_CHUNK_BUDGET,
-        );
-        assert_eq!(result.bytes_written as usize, payload.len());
-    }
-
-    /// Sanity: `oci_upload_temp_path` produces a deterministic per-UUID
-    /// path under a configurable root, so concurrent uploads don't
-    /// collide and operators can pin uploads to a fast local volume.
-    #[test]
-    fn test_oci_upload_temp_path_is_per_uuid() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let pa = oci_upload_temp_path(&a);
-        let pb = oci_upload_temp_path(&b);
-        assert_ne!(pa, pb, "distinct uuids must produce distinct paths");
-        let again = oci_upload_temp_path(&a);
-        assert_eq!(pa, again, "same uuid must produce same path");
-        assert!(
-            pa.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with("ak-oci-upload-"))
-                .unwrap_or(false),
-            "filename must be prefixed with ak-oci-upload- for operator visibility"
         );
     }
 }
@@ -9529,10 +15902,11 @@ mod cross_repo_session_regression_tests {
         .await;
     }
 
-    /// PUT complete with a digest that does not match the bytes on disk
-    /// must reject with 400 DIGEST_INVALID, drop the session row, and
-    /// remove the temp file. This pins the rehash-and-compare branch of
-    /// `handle_complete_upload` plus the cleanup path (#1449 acceptance).
+    /// PUT complete with a digest that does not match the streamed bytes must
+    /// reject with 400 DIGEST_INVALID and write no blob row. Our streaming
+    /// design keeps the session `open` (retryable) on mismatch instead of
+    /// deleting it, so the client can re-PUT with the correct digest. This
+    /// pins the digest-verify branch of `handle_complete_upload`.
     #[tokio::test]
     async fn handle_complete_upload_digest_mismatch_rejected() {
         let Some(pool) = tdh::try_pool().await else {
@@ -9595,16 +15969,19 @@ mod cross_repo_session_regression_tests {
             "digest mismatch must reject with 400"
         );
 
-        // The session row should be gone (handler deletes it on mismatch).
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+        // The session is retained and reset to `open` so the client can retry
+        // the PUT with the correct digest (our streaming design keeps the
+        // session retryable on mismatch instead of forcing a full re-upload).
+        let session_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM oci_upload_sessions WHERE id = $1")
                 .bind(session_id)
-                .fetch_one(&pool)
+                .fetch_optional(&pool)
                 .await
                 .unwrap();
         assert_eq!(
-            remaining, 0,
-            "session row must be deleted on digest mismatch"
+            session_state.as_deref(),
+            Some("open"),
+            "session must be retained and reset to open (retryable) on digest mismatch"
         );
 
         // No blob row should have been recorded.

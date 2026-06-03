@@ -216,6 +216,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Cache invalidation for a specific path on a Remote (proxy) repository
+        // (#1539). POST keeps the action explicit; the underlying
+        // `ProxyService::invalidate_cache` is idempotent so a second call for
+        // an already-evicted path still returns 200.
+        .route("/:key/cache/invalidate", post(invalidate_cache))
         // Routing rules for path rewriting on remote repositories
         .route(
             "/:key/routing-rules",
@@ -649,6 +654,88 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct InvalidateCacheQuery {
+    /// Artifact path to evict from the proxy cache. Same shape as the path
+    /// segment of `GET /api/v1/repositories/{key}/artifacts/{path}`.
+    /// Path-traversal segments such as `..` are rejected by
+    /// `ProxyService::cache_storage_key` (covered by
+    /// `test_invalidate_cache_by_key_rejects_invalid_path`).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InvalidateCacheResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub invalidated: bool,
+}
+
+/// Invalidate a single cached artifact entry on a Remote (proxy) repository
+/// (#1539).
+///
+/// Mirrors the auth + repo-access pattern of `set_cache_ttl`. Idempotent:
+/// invalidating a path that was never cached (or was already evicted) still
+/// returns 200, matching the underlying `ProxyService::invalidate_cache`
+/// contract (which ignores delete-of-missing on the storage backend).
+#[utoipa::path(
+    post,
+    path = "/{key}/cache/invalidate",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        InvalidateCacheQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cache entry invalidated (or was already absent)", body = InvalidateCacheResponse),
+        (status = 400, description = "Validation error (e.g. non-remote repo or invalid path)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+        (status = 503, description = "Proxy service not configured on this deployment"),
+    )
+)]
+pub async fn invalidate_cache(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<InvalidateCacheQuery>,
+) -> Result<Json<InvalidateCacheResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Cache invalidation is meaningless on Local / Virtual / Staging repos --
+    // only Remote (proxy) repos own a cache. Reject up front before touching
+    // storage so the failure mode is a clear 400, not a silent no-op.
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "cache invalidation is only supported on remote (proxy) repositories".to_string(),
+        ));
+    }
+
+    // No proxy service => storage backend not configured on this deployment.
+    // Surface as 503 so operators can distinguish "feature off" from
+    // "server bug" (mirrors the `AppError::ServiceUnavailable` doc comment
+    // in `error.rs`). Avoids `unwrap()` on the optional field.
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("proxy service not configured".to_string()))?;
+
+    proxy.invalidate_cache(&repo, &query.path).await?;
+
+    Ok(Json(InvalidateCacheResponse {
+        repository_key: key,
+        path: query.path,
+        invalidated: true,
     }))
 }
 
@@ -1217,6 +1304,64 @@ pub async fn update_repository(
     Ok(Json(repo_to_response(repo, storage_used)))
 }
 
+/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
+/// objects from storage before the repository row is deleted.
+///
+/// `oci_upload_cleanup_keys`, `oci_upload_sessions`, and `oci_upload_parts` all
+/// `ON DELETE CASCADE` with `repositories`, so once the repo row is gone their
+/// storage objects lose their only discoverable owner and become permanent
+/// orphans that storage-GC can never reclaim. We delete them up front. Failures
+/// are logged but never block repository deletion.
+async fn purge_repo_oci_upload_temp_objects(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+) {
+    let storage = match state.storage_for_repo(location) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Could not resolve storage to purge OCI upload temp objects before repository delete"
+            );
+            return;
+        }
+    };
+    // The cleanup-key journal records every temp/part/completion storage key
+    // written for this repo's uploads; union in the session/part keys as
+    // belt-and-suspenders in case a write predated its journal row.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
+         UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
+         UNION SELECT p.storage_key FROM oci_upload_parts p \
+           JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
+          WHERE s.repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to list OCI upload temp keys to purge before repository delete"
+        );
+        Vec::new()
+    });
+    for key in keys {
+        match storage.delete(&key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => tracing::warn!(
+                repo_id = %repo_id,
+                storage_key = %key,
+                error = %e,
+                "Failed to purge OCI upload temp object before repository delete"
+            ),
+        }
+    }
+}
+
 /// Delete repository
 #[utoipa::path(
     delete,
@@ -1257,6 +1402,11 @@ pub async fn delete_repository(
             ));
         }
     }
+
+    // Purge this repo's in-flight / abandoned OCI upload temp objects from
+    // storage BEFORE the repository row is deleted (see the helper). Best-effort:
+    // never blocks the delete.
+    purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
 
     service.delete(repo.id).await?;
 
@@ -1309,6 +1459,19 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
+    /// When the proxy cache entry for this artifact was last written.
+    /// Only populated for Remote (proxy) repositories whose proxy service is
+    /// configured AND that have a cache-metadata blob for this path. None
+    /// for Local / Virtual / Staging repos and for Remote repos whose cache
+    /// hasn't been populated yet (e.g. an artifact that exists as a DB row
+    /// from a direct upload but has never been fetched through the proxy).
+    /// (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the proxy cache entry for this artifact will expire and be
+    /// re-validated against upstream. Same gating as `cache_cached_at`. (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1479,6 +1642,26 @@ pub async fn list_artifacts(
         .await;
     }
 
+    // Remote (proxy) repositories no longer record cached items in the
+    // `artifacts` table (#1278 / #1280): doing so reintroduced a doubled-prefix
+    // storage path bug on filesystem backends. The cached bodies and metadata
+    // sidecars still live in the storage backend under `proxy-cache/<key>/`, so
+    // the listing is reconstructed from there. Without this, packages pulled
+    // through a remote repo fill up storage but never appear in the UI, so they
+    // can't be browsed or scanned (#1548, web #424).
+    if repo.repo_type == RepositoryType::Remote {
+        return list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
+
     let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
         // Members are returned in priority order; local/hosted members are
@@ -1578,6 +1761,146 @@ pub async fn list_artifacts(
         components: None,
         docker_tags: None,
     }))
+}
+
+/// List the artifacts a remote (proxy) repository has cached.
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so they are
+/// reconstructed from the storage backend by [`ProxyService::list_cached_artifacts`].
+/// Each entry is mapped to an [`ArtifactResponse`]; entries carry no DB id,
+/// version, or download count, so those fields take their natural defaults
+/// (a deterministic synthetic id derived from `repo_key + path`, `None`
+/// version, zero downloads). Filtering and pagination happen in-process over
+/// the recovered set, since there is no DB query to push them into. See #1548
+/// and web #424.
+async fn list_remote_cached_artifacts(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    key: &str,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    let entries = match state.proxy_service.as_deref() {
+        Some(proxy) => proxy.list_cached_artifacts(&repo.key).await,
+        // No proxy service configured (e.g. proxying disabled): nothing cached.
+        None => Vec::new(),
+    };
+
+    let (page_entries, total) = filter_and_paginate_cached(entries, path_prefix, q, page, per_page);
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    let items = page_entries
+        .into_iter()
+        .map(|entry| build_cached_artifact_response(&entry, key))
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items,
+        pagination: Pagination {
+            page,
+            per_page,
+            total: total as i64,
+            total_pages,
+        },
+        components: None,
+        docker_tags: None,
+    }))
+}
+
+/// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
+/// cache entries, then return the slice for the requested page along with the
+/// total match count.
+///
+/// `path_prefix` matches against the start of the logical path; `q` is a
+/// case-insensitive substring match against the path. Pure so the
+/// filter/paginate logic is unit-testable without a storage backend.
+fn filter_and_paginate_cached(
+    entries: Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> (
+    Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    usize,
+) {
+    let q_lower = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let mut matched: Vec<_> = entries
+        .into_iter()
+        .filter(|e| match path_prefix {
+            Some(prefix) if !prefix.is_empty() => e.path.starts_with(prefix),
+            _ => true,
+        })
+        .filter(|e| match &q_lower {
+            Some(needle) => e.path.to_lowercase().contains(needle),
+            None => true,
+        })
+        .collect();
+
+    // Stable ordering for deterministic pagination across requests.
+    matched.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let total = matched.len();
+    let offset = ((page.saturating_sub(1)) as usize).saturating_mul(per_page as usize);
+    let page_items = matched
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+    (page_items, total)
+}
+
+/// Deterministic artifact id for a proxy-cached object.
+///
+/// The `uuid` crate is built with only the `v4` feature, so a UUIDv5 is not
+/// available. Instead the id is the first 16 bytes of a SHA-256 over the
+/// cache storage key `proxy-cache/<repo_key>/<path>`. This is stable across
+/// listing calls for a given object and effectively never collides with the
+/// random v4 ids the database assigns to hosted artifacts.
+fn cached_artifact_id(repo_key: &str, path: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("proxy-cache/{}/{}", repo_key, path).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Map a recovered proxy cache entry to the listing's [`ArtifactResponse`].
+///
+/// The id is deterministic over `<repo_key>/<path>` (see
+/// [`cached_artifact_id`]) so the same cached object always reports the same
+/// id across listing calls (useful for client-side keying) without colliding
+/// with the random v4 ids hosted artifacts get from the database.
+fn build_cached_artifact_response(
+    entry: &crate::services::proxy_service::CachedArtifactEntry,
+    repo_key: &str,
+) -> ArtifactResponse {
+    let id = cached_artifact_id(repo_key, &entry.path);
+    ArtifactResponse {
+        id,
+        repository_key: repo_key.to_string(),
+        path: entry.path.clone(),
+        name: entry.name.clone(),
+        version: None,
+        size_bytes: entry.size_bytes,
+        checksum_sha256: entry.checksum_sha256.clone(),
+        content_type: entry.content_type.clone(),
+        download_count: 0,
+        created_at: entry.cached_at,
+        metadata: None,
+        // This is a proxy-cache entry, so surface the cache timestamp.
+        // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
+        cache_cached_at: Some(entry.cached_at),
+        cache_expires_at: None,
+    }
 }
 
 /// Build the `ArtifactResponse` representing a single primary artifact row.
@@ -1693,6 +2016,12 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
+        // Cache metadata is surfaced only by the per-artifact metadata
+        // endpoint to avoid fanning out a storage GET per artifact in
+        // listings (#1541). Helpers used by listings leave these as None;
+        // get_artifact_metadata populates them after the fact.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }
 }
 
@@ -1737,6 +2066,8 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         });
     }
     out
@@ -2423,6 +2754,29 @@ pub async fn get_artifact_metadata(
         let downloads = artifact_service.get_download_stats(artifact.id).await?;
         let metadata = artifact_service.get_metadata(artifact.id).await?;
 
+        // #1541: surface proxy cache freshness on Remote repos so the UI
+        // can render "expires in 4 hours" / "expired" without a separate
+        // round-trip. Single storage GET, gated on `repo.repo_type ==
+        // Remote` AND `state.proxy_service.is_some()`. Tolerant of failure:
+        // a missing or unreadable metadata blob is a normal state for an
+        // artifact that has never been fetched through the proxy (e.g.
+        // direct-uploaded into a Remote repo, edge case but observed),
+        // so any error or `Ok(None)` collapses to None on both fields
+        // rather than failing the whole metadata response.
+        let cache_meta = if repo.repo_type == RepositoryType::Remote {
+            if let Some(proxy) = state.proxy_service.as_ref() {
+                proxy
+                    .get_cache_metadata(&key, &artifact.path)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         return Ok(Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
@@ -2435,6 +2789,8 @@ pub async fn get_artifact_metadata(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata.map(|m| m.metadata),
+            cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
+            cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
         })
         .into_response());
     }
@@ -2649,6 +3005,10 @@ pub async fn upload_artifact(
         download_count: downloads,
         created_at: artifact.created_at,
         metadata: metadata_json,
+        // Just-uploaded artifacts have no proxy cache state yet -- the
+        // cache is populated lazily on the first proxy fetch.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }))
 }
 
@@ -3849,6 +4209,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         delete_repository,
         set_cache_ttl,
         get_cache_ttl,
+        invalidate_cache,
         list_artifacts,
         get_artifact_metadata,
         upload_artifact,
@@ -3872,6 +4233,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryListResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        InvalidateCacheQuery,
+        InvalidateCacheResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -3966,6 +4329,94 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // Remote proxy-cache listing (#1548, web #424)
+    // -----------------------------------------------------------------------
+
+    fn make_cached_entry(path: &str) -> crate::services::proxy_service::CachedArtifactEntry {
+        crate::services::proxy_service::CachedArtifactEntry {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size_bytes: 1234,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            cached_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_returns_all_sorted() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, None, 1, 20);
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        // Sorted by path.
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[1].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_path_prefix() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, Some("lodash/"), None, 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_case_insensitive_query() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, Some("IS-ODD"), 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_paginates() {
+        let entries = vec![
+            make_cached_entry("a"),
+            make_cached_entry("b"),
+            make_cached_entry("c"),
+        ];
+        let (page2, total) = filter_and_paginate_cached(entries, None, None, 2, 2);
+        assert_eq!(total, 3);
+        // page size 2, page 2 -> just "c"
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].path, "c");
+    }
+
+    #[test]
+    fn test_build_cached_artifact_response_maps_fields_and_is_deterministic() {
+        let entry = make_cached_entry("express/-/express-4.18.2.tgz");
+        let resp = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.repository_key, "npm-remote");
+        assert_eq!(resp.path, "express/-/express-4.18.2.tgz");
+        assert_eq!(resp.name, "express-4.18.2.tgz");
+        assert_eq!(resp.size_bytes, 1234);
+        assert_eq!(resp.checksum_sha256, "deadbeef");
+        assert_eq!(resp.download_count, 0);
+        assert!(resp.version.is_none());
+        // Same repo_key + path always yields the same id.
+        let resp2 = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.id, resp2.id);
+        // Different path yields a different id.
+        let other = make_cached_entry("express/-/express-4.18.3.tgz");
+        assert_ne!(
+            resp.id,
+            build_cached_artifact_response(&other, "npm-remote").id
+        );
+    }
 
     // -----------------------------------------------------------------------
     // expand_maven_secondary_files & build_artifact_response (#1092)
@@ -5296,10 +5747,101 @@ mod tests {
             download_count: 42,
             created_at: chrono::Utc::now(),
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
+        // Cache fields are omitted when None so the wire shape stays the
+        // same for non-Remote repos and for Remote repos without cache
+        // metadata (#1541).
+        assert!(!json.contains("cache_cached_at"));
+        assert!(!json.contains("cache_expires_at"));
+    }
+
+    #[test]
+    fn test_artifact_response_serialization_with_cache_metadata() {
+        // (#1541) When populated -- which only happens for Remote repos
+        // whose proxy is configured AND have a cache-metadata blob for
+        // the path -- both timestamps appear as ISO-8601 strings so the
+        // web client can render relative time without parsing custom
+        // formats.
+        let cached = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expires = chrono::DateTime::parse_from_rfc3339("2026-06-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let resp = ArtifactResponse {
+            id: Uuid::new_v4(),
+            repository_key: "pypi-remote".to_string(),
+            path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
+            name: "requests-2.31.0-py3-none-any.whl".to_string(),
+            version: Some("2.31.0".to_string()),
+            size_bytes: 62500,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: cached,
+            metadata: None,
+            cache_cached_at: Some(cached),
+            cache_expires_at: Some(expires),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
+        assert!(json.contains("\"cache_expires_at\":\"2026-06-02T10:00:00Z\""));
+    }
+
+    #[test]
+    fn get_artifact_metadata_populates_cache_fields_only_for_remote() {
+        // (#1541) Structural assertion: the per-artifact metadata handler
+        // must (a) gate the cache-metadata read on `repo.repo_type ==
+        // RepositoryType::Remote`, (b) further guard on
+        // `state.proxy_service.as_ref()` so a non-proxy deployment doesn't
+        // panic, and (c) call the new public ProxyService method
+        // `get_cache_metadata`. Pinning the source string here keeps the
+        // cost-control invariant from quietly drifting if someone later
+        // refactors the handler -- e.g. moving the storage GET ahead of
+        // the type guard would silently fan out a per-list-item cost we
+        // explicitly chose to avoid.
+        //
+        // The pattern is intentionally tolerant of `cargo fmt` reformatting
+        // the chain across multiple lines, the way the proxy-service guard
+        // in `invalidate_cache` has to be (#1539). We assert on the pieces,
+        // not on a single multi-line string match.
+        let source = include_str!("repositories.rs");
+
+        // Find the body of the get_artifact_metadata handler (between its
+        // `pub async fn get_artifact_metadata(` opener and the next
+        // top-level `pub async fn` / `pub fn` / unindented `}` -- in
+        // practice the upload_artifact attribute that follows).
+        let start = source
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata handler not found");
+        let after = &source[start..];
+        let end_rel = after
+            .find("\n/// Upload artifact")
+            .expect("expected upload_artifact doc-comment to terminate the handler");
+        let body = &after[..end_rel];
+
+        assert!(
+            body.contains("RepositoryType::Remote"),
+            "handler must gate cache lookup on RepositoryType::Remote"
+        );
+        assert!(
+            body.contains("state.proxy_service.as_ref()"),
+            "handler must guard on state.proxy_service.as_ref() before calling the proxy"
+        );
+        assert!(
+            body.contains(".get_cache_metadata("),
+            "handler must call ProxyService::get_cache_metadata"
+        );
+        assert!(
+            body.contains("cache_cached_at:") && body.contains("cache_expires_at:"),
+            "handler must populate both cache_cached_at and cache_expires_at"
+        );
     }
 
     #[test]
@@ -6432,6 +6974,263 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // POST /repositories/:key/cache/invalidate (#1539)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalidate_cache_query_deserialization() {
+        // serde_urlencoded backs `Query<T>` in axum, but exercising the
+        // serde::Deserialize impl through serde_json is sufficient to pin
+        // the field name and required-ness. axum-side wiring is exercised
+        // by the structural test below.
+        let json = r#"{"path": "foo/bar-1.2.3.tgz"}"#;
+        let q: InvalidateCacheQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "foo/bar-1.2.3.tgz");
+    }
+
+    #[test]
+    fn test_invalidate_cache_query_rejects_missing_path() {
+        // `path` is required: an empty object must fail to deserialize so
+        // the handler never sees a default-empty path that would silently
+        // evict the wrong cache key.
+        let json = r#"{}"#;
+        let result: std::result::Result<InvalidateCacheQuery, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing `path` must fail deserialization, got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_invalidate_cache_response_serialization() {
+        let resp = InvalidateCacheResponse {
+            repository_key: "pypi-remote".to_string(),
+            path: "simple/requests/".to_string(),
+            invalidated: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repository_key\":\"pypi-remote\""));
+        assert!(json.contains("\"path\":\"simple/requests/\""));
+        assert!(json.contains("\"invalidated\":true"));
+    }
+
+    /// Structural regression test (#1539): the `invalidate_cache` handler
+    /// must guard on (a) `repo.repo_type != RepositoryType::Remote` (returns
+    /// 400) and (b) `state.proxy_service.as_ref()` (returns 503 when None),
+    /// and BOTH guards must run before the actual `proxy.invalidate_cache(`
+    /// call. Otherwise a Local/Virtual repo or a deployment without a
+    /// configured storage backend would either silently no-op (worse:
+    /// produce a misleading 200) or panic on `unwrap` of an
+    /// `Option<Arc<ProxyService>>`. Pins the contract this PR adds.
+    #[test]
+    fn invalidate_cache_handler_guards_repo_type_and_proxy_service() {
+        let source = include_str!("repositories.rs");
+
+        let signature = format!("pub async fn {}(", "invalidate_cache");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{}` in repositories.rs", signature));
+
+        // Bound the search at the closing `}` of the handler. The next
+        // top-level `pub` item gives a safe upper bound: the handler's body
+        // ends well before that.
+        let end = source[start + signature.len()..]
+            .find("\npub ")
+            .map(|offset| start + signature.len() + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        // Marker strings are built via format! so this test body itself does
+        // not satisfy the search.
+        let type_check = format!("{} != RepositoryType::Remote", "repo.repo_type");
+        // The 503 guard chain (`state.proxy_service.as_ref().ok_or_else(...)`)
+        // gets reformatted across multiple lines by rustfmt, so we anchor on
+        // the unique `ServiceUnavailable` error construction inside the
+        // `ok_or_else` closure -- that marker only exists when the guard is
+        // present.
+        let proxy_guard = format!(
+            "{}::ServiceUnavailable(\"proxy service not configured\"",
+            "AppError",
+        );
+        let evict_call = format!("{}.invalidate_cache(", "proxy");
+
+        let type_idx = body.find(&type_check).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must check `{}` to reject non-Remote repos (#1539)",
+                type_check,
+            )
+        });
+        let proxy_idx = body.find(&proxy_guard).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must guard `{}` to surface a 503 instead of unwrap-panic when no storage backend is configured (#1539)",
+                proxy_guard,
+            )
+        });
+        let evict_idx = body.find(&evict_call).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must call `{}` on the resolved proxy service (#1539)",
+                evict_call,
+            )
+        });
+
+        assert!(
+            type_idx < evict_idx,
+            "type-check `{}` must run BEFORE `{}` (#1539). type_idx={}, evict_idx={}",
+            type_check,
+            evict_call,
+            type_idx,
+            evict_idx,
+        );
+        assert!(
+            proxy_idx < evict_idx,
+            "proxy-service guard `{}` must run BEFORE `{}` (#1539). proxy_idx={}, evict_idx={}",
+            proxy_guard,
+            evict_call,
+            proxy_idx,
+            evict_idx,
+        );
+    }
+
+    /// Runtime regression (#1539): on a Remote repo with the proxy service
+    /// configured, `POST /:key/cache/invalidate?path=...` returns 200 with
+    /// `invalidated: true`. Idempotent: invalidating a path that was never
+    /// cached must still succeed (mirrors `ProxyService::invalidate_cache`,
+    /// which ignores delete-of-missing on the storage backend).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_200_for_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/cache/invalidate?path=foo%2Fbar-1.2.3.tgz",
+                fx.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Remote repo + proxy configured must return 200 (idempotent on \
+             never-cached paths); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("\"invalidated\":true"),
+            "response body must contain `invalidated: true` (#1539); got: {}",
+            body_str,
+        );
+        assert!(
+            body_str.contains("\"path\":\"foo/bar-1.2.3.tgz\""),
+            "response body must echo the URL-decoded `path` (#1539); got: {}",
+            body_str,
+        );
+    }
+
+    /// Runtime regression (#1539): on a Local (or Virtual / Staging) repo,
+    /// the handler MUST return 400 *before* touching the proxy service --
+    /// cache invalidation is meaningless on non-Remote repos. The proxy
+    /// service is wired up here on purpose so the test fails if the type
+    /// guard is removed (otherwise the call would no-op-success on a Local
+    /// repo and silently mask the contract).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_400_for_non_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Local repo MUST surface as 400 BadRequest, not silent 200 \
+             (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// Runtime regression (#1539): on a Remote repo *without* a proxy
+    /// service in `SharedState`, the handler MUST return 503 (not 500,
+    /// not panic on unwrap). Pins `AppError::ServiceUnavailable` as the
+    /// surfaced status so operators can distinguish "feature off" from
+    /// "server bug" -- see the doc comment on the guard.
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_503_when_proxy_service_missing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        // Plain `build_state` does NOT install a proxy_service, so the
+        // handler hits the `state.proxy_service.as_ref().ok_or_else(...)`
+        // arm.
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing proxy_service MUST surface as 503 ServiceUnavailable, \
+             not 500 / not unwrap-panic (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Virtual repository member list response
     // -----------------------------------------------------------------------
 
@@ -7488,6 +8287,127 @@ mod tests {
             upstream_body,
             "streamed body bytes must round-trip from wiremock through \
              proxy_fetch_streaming and back to the caller"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_repository_purges_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // An in-flight upload temp object, tracked only by the cleanup-key journal.
+        let temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &temp_key,
+                bytes::Bytes::from_static(b"in-flight upload bytes"),
+            )
+            .await
+            .expect("write temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+             VALUES ($1, $2, NOW())",
+        )
+        .bind(fx.repo_id)
+        .bind(&temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("register cleanup key");
+        // A session storage_temp_key object (second UNION branch).
+        let session_id = Uuid::new_v4();
+        let session_temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &session_temp_key,
+                bytes::Bytes::from_static(b"session temp"),
+            )
+            .await
+            .expect("write session temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, storage_temp_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .bind(&session_temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload session");
+
+        // A part storage_key object (third UNION branch).
+        let part_key = format!("{}.part.00000000.{}", session_temp_key, Uuid::new_v4());
+        storage
+            .put(&part_key, bytes::Bytes::from_static(b"part bytes"))
+            .await
+            .expect("write part object");
+        sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) \
+             VALUES ($1, 0, $2, $3, NULL)",
+        )
+        .bind(session_id)
+        .bind(&part_key)
+        .bind(10_i64)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload part");
+
+        // A COMMITTED blob — content-addressed, owned by oci_blobs, NOT an upload
+        // temp object. The purge must never touch it.
+        let blob_digest = format!("sha256:{}", "a".repeat(64));
+        let blob_key = format!("oci-blobs/{blob_digest}");
+        storage
+            .put(
+                &blob_key,
+                bytes::Bytes::from_static(b"committed blob bytes"),
+            )
+            .await
+            .expect("write committed blob");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(&blob_digest)
+        .bind(20_i64)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        for k in [&temp_key, &session_temp_key, &part_key, &blob_key] {
+            assert!(
+                storage.exists(k).await.expect("exists"),
+                "precondition: {k} exists"
+            );
+        }
+
+        // The repo-delete purge must remove the journaled temp/session/part
+        // objects up front (once the repo row is deleted their owner rows CASCADE
+        // away), but must leave the committed blob untouched.
+        purge_repo_oci_upload_temp_objects(&state, fx.repo_id, &location).await;
+
+        for k in [&temp_key, &session_temp_key, &part_key] {
+            assert!(
+                !storage.exists(k).await.expect("exists after purge"),
+                "purge must remove OCI upload temp object {k}"
+            );
+        }
+        assert!(
+            storage
+                .exists(&blob_key)
+                .await
+                .expect("blob exists after purge"),
+            "purge must NOT delete the committed content-addressed blob {blob_key}"
         );
 
         fx.teardown().await;

@@ -444,6 +444,32 @@ fn tee_upstream_to_cache(
     Box::pin(tee_stream)
 }
 
+/// A single proxy-cached artifact, reconstructed from the storage backend
+/// for the repository artifact-listing endpoint (#1548, web #424).
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so this is
+/// assembled from the on-disk `__content__` key and its `__cache_meta__.json`
+/// sidecar rather than from a database row. There is no DB id, version, or
+/// download count to report, so the listing handler synthesizes the parts of
+/// `ArtifactResponse` it can and leaves the rest at their natural defaults.
+#[derive(Debug, Clone)]
+pub struct CachedArtifactEntry {
+    /// Logical artifact path relative to the repository root, e.g.
+    /// `is-odd/-/is-odd-3.0.1.tgz`.
+    pub path: String,
+    /// Final path segment, used as the display name.
+    pub name: String,
+    /// Cached body size in bytes (from the sidecar).
+    pub size_bytes: i64,
+    /// SHA-256 of the cached body (from the sidecar).
+    pub checksum_sha256: String,
+    /// Content type recorded at cache-write time, defaulting to
+    /// `application/octet-stream` when upstream did not send one.
+    pub content_type: String,
+    /// When the entry was first cached (from the sidecar).
+    pub cached_at: DateTime<Utc>,
+}
+
 /// Cache metadata for a proxied artifact
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
@@ -1049,6 +1075,33 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
+    /// `upstream_etag`, `storage_etag`, `content_type`, `size_bytes`) for
+    /// a given path on a repository, without checking expiry.
+    ///
+    /// Returns `Ok(None)` when no metadata blob exists (e.g. a Remote-typed
+    /// artifact that was direct-uploaded and has never been fetched through
+    /// the proxy) or when the underlying storage rejects the path
+    /// (path-traversal segments are rejected by `cache_metadata_key`).
+    /// Errors from a transient storage failure on the GET propagate as
+    /// `Err(...)` so callers can choose between bubbling up and tolerating.
+    ///
+    /// Used by `get_artifact_metadata` (#1541) to surface cache freshness
+    /// alongside the static artifact metadata in a single round-trip,
+    /// without exposing the metadata-blob storage key derivation to
+    /// handlers.
+    pub async fn get_cache_metadata(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<CacheMetadata>> {
+        let metadata_key = match Self::cache_metadata_key(repo_key, path) {
+            Ok(k) => k,
+            Err(_) => return Ok(None),
+        };
+        self.load_cache_metadata(&metadata_key).await
+    }
+
     /// Fetch an artifact from upstream and report whether the content
     /// differs from what was previously cached.
     ///
@@ -1164,6 +1217,99 @@ impl ProxyService {
             names.insert(name.to_string());
         }
         names.into_iter().collect()
+    }
+
+    /// List the artifacts a remote repository has cached through the proxy.
+    ///
+    /// Proxy-cached items are not tracked in the `artifacts` table (#1278 /
+    /// #1280): caching them there reintroduced a doubled-prefix storage path
+    /// bug on filesystem backends. The body and a JSON metadata sidecar still
+    /// live on disk under `proxy-cache/<repo_key>/<path>/{__content__,
+    /// __cache_meta__.json}`, so this walks that prefix to recover the set of
+    /// objects the proxy has actually served. The repository artifact-listing
+    /// endpoint merges these into its response so remote-cached packages show
+    /// up in the UI and can be scanned (#1548, web #424).
+    ///
+    /// Returns an empty list when the storage backend cannot list the prefix.
+    /// Each entry's `size_bytes`, `checksum_sha256`, `content_type`, and
+    /// `cached_at` come from the sidecar; entries whose sidecar is missing or
+    /// unreadable are skipped (a half-written or legacy cache write).
+    pub async fn list_cached_artifacts(&self, repo_key: &str) -> Vec<CachedArtifactEntry> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = match self.storage.list(Some(&prefix)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    error = %e,
+                    "listing proxy cache for repository artifact listing failed; \
+                     returning no cached artifacts"
+                );
+                return Vec::new();
+            }
+        };
+
+        let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
+        let mut entries = Vec::with_capacity(logical_paths.len());
+        for path in logical_paths {
+            let Ok(metadata_key) = Self::cache_metadata_key(repo_key, &path) else {
+                continue;
+            };
+            let metadata = match self.load_cache_metadata(&metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        repo_key = %repo_key,
+                        path = %path,
+                        error = %e,
+                        "reading proxy cache sidecar failed; skipping entry"
+                    );
+                    continue;
+                }
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            entries.push(CachedArtifactEntry {
+                path,
+                name,
+                size_bytes: metadata.size_bytes,
+                checksum_sha256: metadata.checksum_sha256,
+                content_type: metadata
+                    .content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                cached_at: metadata.cached_at,
+            });
+        }
+        entries
+    }
+
+    /// Recover the distinct logical artifact paths from a set of proxy-cache
+    /// storage keys.
+    ///
+    /// Content lives at `proxy-cache/<repo_key>/<path>/__content__`; the
+    /// sibling `__cache_meta__.json` and any other leaf are ignored. Strips
+    /// the `proxy-cache/<repo_key>/` prefix and the `/__content__` suffix to
+    /// return `<path>`, deduped and sorted. Pure so the parsing can be
+    /// unit-tested without a storage backend.
+    fn cached_artifact_paths<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(path) = rest.strip_suffix("/__content__") else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            paths.insert(path.to_string());
+        }
+        paths.into_iter().collect()
     }
 
     /// Invalidate every cached file referenced from an APT Release file
@@ -4118,6 +4264,76 @@ SHA256:
         );
     }
 
+    // -----------------------------------------------------------------
+    // get_cache_metadata (#1541)
+    //
+    // The handler-side structural test (in repositories.rs) only pins the
+    // source-shape; these tests exercise the actual runtime path through
+    // the new pub method to make sure (a) the metadata key derivation
+    // hands the right key to the storage, (b) the deserialise path
+    // returns the populated struct, (c) a missing blob collapses cleanly
+    // to `Ok(None)`, and (d) a path the metadata-key validator rejects
+    // (e.g. `..` traversal) returns `Ok(None)` rather than bubbling --
+    // matching the handler's "cache fields just stay None on a bad
+    // input" tolerance.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_metadata_for_existing_path() {
+        let mock = Arc::new(CacheFreshMock::new(Some(fresh_metadata_bytes()), true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let meta = service
+            .get_cache_metadata("npm-proxy", "lodash")
+            .await
+            .expect("get_cache_metadata should not error on a present blob");
+
+        let meta = meta.expect("metadata should be Some when the blob exists");
+        // The fresh_metadata_bytes() helper pins these two fields; the
+        // others are exercised by the existing is_cache_fresh tests.
+        assert_eq!(meta.size_bytes, 42);
+        assert!(
+            meta.expires_at > Utc::now(),
+            "fresh metadata should not be already-expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_when_blob_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "never-fetched")
+            .await
+            .expect("missing blob must NOT bubble as Err");
+
+        assert!(
+            result.is_none(),
+            "missing metadata blob must collapse to Ok(None) so the \
+             handler can leave cache_expires_at / cache_cached_at unset \
+             rather than failing the whole metadata response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_for_path_traversal() {
+        // The metadata-key derivation rejects `..` segments before the
+        // storage is ever touched. The new pub wrapper translates that
+        // rejection into Ok(None) (rather than bubbling the Err) so the
+        // handler does not have to special-case it; the cache rows
+        // simply don't render for the request.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "../etc/passwd")
+            .await
+            .expect("path-traversal must NOT surface as Err on this path");
+
+        assert!(result.is_none(), "expected Ok(None) for invalid path");
+    }
+
     #[tokio::test]
     async fn test_invalidate_dist_packages_cache_evicts_each_path() {
         // Driven by the Release-file parser: every path under the
@@ -4949,6 +5165,219 @@ SHA256:
         ];
         let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
         assert_eq!(names, vec!["flask"]);
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_extracts_content_keys() {
+        let keys = vec![
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__content__",
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__cache_meta__.json",
+            "proxy-cache/npm-remote/lodash/__content__",
+            "proxy-cache/npm-remote/lodash/__cache_meta__.json",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        // Only content keys, sidecars dropped, prefix + suffix stripped, sorted.
+        assert_eq!(
+            paths,
+            vec![
+                "is-odd/-/is-odd-3.0.1.tgz".to_string(),
+                "lodash".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_skips_other_repos_and_empty() {
+        let keys = vec![
+            // different repo's cache — must not leak in
+            "proxy-cache/other-remote/express/__content__",
+            // non-content leaf — skipped
+            "proxy-cache/npm-remote/express/__cache_meta__.json",
+            // empty logical path (bare repo root) — skipped
+            "proxy-cache/npm-remote/__content__",
+            // a real entry — kept
+            "proxy-cache/npm-remote/express/__content__",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        assert_eq!(paths, vec!["express".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_cached_artifacts: storage-backed read path (#1548 / web #424).
+    // Exercises the full method against a mock backend: the prefix list, the
+    // sidecar read per logical path, the missing-sidecar skip, the
+    // content-type default, and the listing-error -> empty fallback. The
+    // pure key parsing is covered by the cached_artifact_paths tests above.
+    // -----------------------------------------------------------------------
+
+    /// Storage backend that returns a fixed key set from `list()` and serves
+    /// sidecar JSON from `get()` for keys present in `sidecars`. `list_fails`
+    /// drives the listing-error path.
+    struct CachedListingMock {
+        keys: Vec<String>,
+        sidecars: std::collections::HashMap<String, Bytes>,
+        list_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CachedListingMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            match self.sidecars.get(key) {
+                Some(b) => Ok(b.clone()),
+                None => Err(AppError::NotFound(key.to_string())),
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn sidecar_bytes(
+        size: i64,
+        checksum: &str,
+        content_type: Option<&str>,
+        cached_at: chrono::DateTime<chrono::Utc>,
+    ) -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at,
+            upstream_etag: None,
+            storage_etag: None,
+            expires_at: cached_at + chrono::Duration::hours(1),
+            content_type: content_type.map(|s| s.to_string()),
+            size_bytes: size,
+            checksum_sha256: checksum.to_string(),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn content_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__content__", repo, path)
+    }
+    fn meta_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__cache_meta__.json", repo, path)
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_returns_entries_from_sidecars() {
+        let repo = "npm-remote";
+        let pa = "is-odd/-/is-odd-3.0.1.tgz";
+        let pb = "lodash/-/lodash-4.17.21.tgz";
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, pa),
+            sidecar_bytes(123, &"a".repeat(64), Some("application/gzip"), now),
+        );
+        // pb sidecar has no content_type -> entry should default it.
+        sidecars.insert(
+            meta_key(repo, pb),
+            sidecar_bytes(456, &"b".repeat(64), None, now),
+        );
+        let keys = vec![
+            content_key(repo, pa),
+            meta_key(repo, pa),
+            content_key(repo, pb),
+            meta_key(repo, pb),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let mut entries = service.list_cached_artifacts(repo).await;
+        entries.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(entries.len(), 2);
+
+        let a = &entries[0];
+        assert_eq!(a.path, pa);
+        assert_eq!(a.name, "is-odd-3.0.1.tgz");
+        assert_eq!(a.size_bytes, 123);
+        assert_eq!(a.checksum_sha256, "a".repeat(64));
+        assert_eq!(a.content_type, "application/gzip");
+
+        let b = &entries[1];
+        assert_eq!(b.name, "lodash-4.17.21.tgz");
+        assert_eq!(
+            b.content_type, "application/octet-stream",
+            "missing content_type must default to application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_skips_entry_with_missing_sidecar() {
+        let repo = "npm-remote";
+        let good = "ok/-/ok-1.0.0.tgz";
+        let bad = "broken/-/broken-1.0.0.tgz"; // content listed, no sidecar
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, good),
+            sidecar_bytes(10, &"c".repeat(64), Some("application/octet-stream"), now),
+        );
+        let keys = vec![
+            content_key(repo, good),
+            meta_key(repo, good),
+            content_key(repo, bad),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let entries = service.list_cached_artifacts(repo).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an entry whose sidecar is missing must be skipped"
+        );
+        assert_eq!(entries[0].path, good);
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_empty_when_listing_fails() {
+        let mock = Arc::new(CachedListingMock {
+            keys: Vec::new(),
+            sidecars: std::collections::HashMap::new(),
+            list_fails: true,
+        });
+        let service = build_proxy_service_with_storage(mock);
+        assert!(
+            service.list_cached_artifacts("npm-remote").await.is_empty(),
+            "a storage listing error must yield no cached artifacts"
+        );
     }
 
     // -----------------------------------------------------------------------
