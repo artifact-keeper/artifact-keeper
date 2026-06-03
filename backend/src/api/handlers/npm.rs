@@ -563,16 +563,19 @@ fn derive_latest_version(versions: &[String]) -> Option<String> {
         .or_else(|| versions.last().cloned())
 }
 
-/// Fetch the stored npm dist-tags map for a package from the `packages` table.
-/// Best-effort: returns an empty map when the package has no row, no tags, or
-/// on any query error (the caller still derives a `latest` from the versions).
+/// Fetch the stored npm dist-tags map for a package from the `npm_dist_tags`
+/// table, which holds exactly one row per (repository_id, name). Best-effort:
+/// returns an empty map when there is no row, no tags, or on any query error
+/// (the caller still derives a `latest` from the versions).
 async fn fetch_npm_dist_tags(
     db: &PgPool,
     repository_id: uuid::Uuid,
     package_name: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
+    // PRIMARY KEY (repository_id, name) guarantees at most one row, so
+    // fetch_optional is safe here (unlike a per-version `packages` read).
     let stored: Option<serde_json::Value> = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT dist_tags FROM packages WHERE repository_id = $1 AND name = $2",
+        "SELECT tags FROM npm_dist_tags WHERE repository_id = $1 AND name = $2",
     )
     .bind(repository_id)
     .bind(package_name)
@@ -1582,18 +1585,28 @@ async fn publish_package(
         .await?;
     }
 
-    // Persist dist-tags from the publish body, merging into the existing map
-    // (jsonb `||` overwrites matching keys). The packages row was created by
-    // store_npm_version above (issue #1543).
-    if !parsed.dist_tags.is_empty() {
-        let tags_value = serde_json::Value::Object(parsed.dist_tags.clone());
+    // Persist custom dist-tags from the publish body into npm_dist_tags
+    // (one row per repository_id+name; jsonb `||` overwrites matching keys).
+    //
+    // We deliberately DROP `latest` here. A plain `npm publish` always sends
+    // {"latest": "<this version>"}, so persisting it verbatim would pin
+    // `latest` to the just-published version — including a prerelease published
+    // without `--tag` (e.g. `2.0.0-rc.1`), which is exactly the bug #1543
+    // targets. `latest` is computed by semver in build_npm_metadata_response
+    // (highest non-prerelease); an explicit `npm dist-tag add <pkg>@<v> latest`
+    // (dist_tags_put) still sets it deterministically.
+    let mut publish_tags = parsed.dist_tags.clone();
+    publish_tags.remove("latest");
+    if !publish_tags.is_empty() {
+        let tags_value = serde_json::Value::Object(publish_tags);
         let _ = sqlx::query(
-            "UPDATE packages SET dist_tags = dist_tags || $1::jsonb, updated_at = NOW() \
-             WHERE repository_id = $2 AND name = $3",
+            "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+             ON CONFLICT (repository_id, name) DO UPDATE \
+             SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
         )
-        .bind(&tags_value)
         .bind(repo.id)
         .bind(package_name)
+        .bind(&tags_value)
         .execute(&state.db)
         .await;
     }
@@ -1701,19 +1714,20 @@ async fn dist_tags_put(
     let mut patch = serde_json::Map::new();
     patch.insert(tag.clone(), serde_json::Value::String(version));
     let patch_value = serde_json::Value::Object(patch);
-    let result = sqlx::query(
-        "UPDATE packages SET dist_tags = dist_tags || $1::jsonb, updated_at = NOW() \
-         WHERE repository_id = $2 AND name = $3",
+    // Upsert the (repository_id, name) row — the version-existence check above
+    // already 404s a tag pointed at a nonexistent version, and the package's
+    // dist-tags row may not exist yet (first tag for the package).
+    sqlx::query(
+        "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+         ON CONFLICT (repository_id, name) DO UPDATE \
+         SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
     )
-    .bind(&patch_value)
     .bind(repo.id)
     .bind(&package)
+    .bind(&patch_value)
     .execute(&state.db)
     .await
     .map_err(map_db_err)?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!("Package {} not found", package)).into_response());
-    }
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -1744,7 +1758,7 @@ async fn dist_tags_delete(
     }
 
     let _ = sqlx::query(
-        "UPDATE packages SET dist_tags = dist_tags - $1, updated_at = NOW() \
+        "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
          WHERE repository_id = $2 AND name = $3",
     )
     .bind(&tag)
@@ -3610,18 +3624,17 @@ mod tests {
             .await;
         }
 
-        // Record a custom `next` tag as `npm publish --tag next` would.
-        sqlx::query(
-            "INSERT INTO packages (repository_id, name, version, dist_tags) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(fx.repo_id)
-        .bind("widget")
-        .bind("2.0.0-rc.1")
-        .bind(serde_json::json!({ "next": "2.0.0-rc.1" }))
-        .execute(&fx.pool)
-        .await
-        .expect("seed packages.dist_tags");
+        // Record a custom `next` tag as `npm publish --tag next` would, in the
+        // dedicated per-package table (PK repository_id, name). Note there are
+        // THREE versions seeded above: the per-(repo,name) row makes the read
+        // single-row regardless of version count.
+        sqlx::query("INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3)")
+            .bind(fx.repo_id)
+            .bind("widget")
+            .bind(serde_json::json!({ "next": "2.0.0-rc.1" }))
+            .execute(&fx.pool)
+            .await
+            .expect("seed npm_dist_tags");
 
         let result =
             super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
@@ -3643,6 +3656,88 @@ mod tests {
         assert_eq!(dist_tags["next"], "2.0.0-rc.1");
         // ...and `latest` is the highest STABLE version, not the prerelease.
         assert_eq!(dist_tags["latest"], "1.1.0");
+    }
+
+    /// #1543 finding-2: a plain `npm publish` of a PRERELEASE must not pin
+    /// `latest` to it. Every publish body carries `"dist-tags":{"latest":
+    /// "<this version>"}`; the publish path drops `latest` so it stays the
+    /// semver-derived highest stable. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_prerelease_does_not_clobber_latest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // A stable release already exists.
+        let path = "widget/1.1.0/widget-1.1.0.tgz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            "widget",
+            "1.1.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        // `npm publish` of a prerelease with NO explicit --tag: the client
+        // still sends `dist-tags: { latest: <this version> }`.
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "2.0.0-rc.1": { "name": "widget", "version": "2.0.0-rc.1" }
+            },
+            "_attachments": {
+                "widget-2.0.0-rc.1.tgz": { "data": tarball_b64 }
+            },
+            "dist-tags": { "latest": "2.0.0-rc.1" }
+        });
+        let publish = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+
+        // Read back the stored tags and the served packument.
+        let stored = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        let meta =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        fx.teardown().await;
+
+        assert!(
+            publish.is_ok(),
+            "prerelease publish should succeed: {:?}",
+            publish.err().map(|r| r.status())
+        );
+        // The publish-body `latest` was dropped, never persisted.
+        assert!(
+            !stored.contains_key("latest"),
+            "publish must not persist `latest` from the body; stored: {stored:?}"
+        );
+        let resp = meta.expect("packument");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse packument json");
+        // `latest` resolves to the highest STABLE (1.1.0), not the just-published
+        // prerelease — the whole point of #1543.
+        assert_eq!(
+            json["dist-tags"]["latest"], "1.1.0",
+            "latest must stay the highest stable, not the published prerelease"
+        );
     }
 
     #[test]
@@ -3696,14 +3791,9 @@ mod tests {
             )
             .await;
         }
-        // The handlers UPDATE the packages row, which seed_artifact does not create.
-        sqlx::query("INSERT INTO packages (repository_id, name, version) VALUES ($1, $2, $3)")
-            .bind(fx.repo_id)
-            .bind("widget")
-            .bind("1.0.0")
-            .execute(&fx.pool)
-            .await
-            .expect("seed packages row");
+        // No npm_dist_tags pre-seed: dist_tags_put UPSERTs the row itself, and
+        // its target-version check reads `artifacts` (seeded above), so the two
+        // real versions are all the setup the handlers need.
 
         // PUT next -> 2.0.0-rc.1 (a real version)
         let put_next = super::dist_tags_put(
