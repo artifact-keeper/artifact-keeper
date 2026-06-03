@@ -4,9 +4,9 @@ use axum::{
     body::Bytes,
     extract::{Extension, Multipart, Path, Query, State},
     http::{header, HeaderMap},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +16,12 @@ use uuid::Uuid;
 
 use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
 use crate::api::dto::Pagination;
+// Use the crate-local `Json` extractor so any deserialization failure on a
+// request body surfaces as HTTP 400 + `{code: "VALIDATION_ERROR"}` instead of
+// Axum's default 422 + plain-text body. See #1368 and the module docs in
+// `crate::api::extractors`. The wrapper also implements `IntoResponse` so it
+// is a drop-in replacement on response types too.
+use crate::api::extractors::Json;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -210,6 +216,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Cache invalidation for a specific path on a Remote (proxy) repository
+        // (#1539). POST keeps the action explicit; the underlying
+        // `ProxyService::invalidate_cache` is idempotent so a second call for
+        // an already-evicted path still returns 200.
+        .route("/:key/cache/invalidate", post(invalidate_cache))
         // Routing rules for path rewriting on remote repositories
         .route(
             "/:key/routing-rules",
@@ -479,13 +490,33 @@ fn validate_virtual_repo_member_count(
     if *repo_type != RepositoryType::Virtual {
         return Ok(());
     }
-    let count = member_repos.map_or(0, <[_]>::len);
-    if count == 0 {
+    // #1444 follow-up: distinguish "field omitted entirely" (None) from
+    // "explicit empty list" (Some(vec![])).
+    //
+    // * None  -> caller is following the deferred-population pattern: create
+    //            the virtual, then add members via `POST /repositories/{key}/members`.
+    //            This is the shape every E2E test helper uses. Rejecting it
+    //            at create time (the original PR #1279 / #1281 behaviour)
+    //            breaks the create-then-add flow and surfaces as the
+    //            "members router returns 404" symptom in #1444 because
+    //            the follow-up POSTs target a nonexistent repo. We
+    //            therefore accept None and leave the empty-virtual state
+    //            visible at fetch time (NOT_FOUND on download) -- it
+    //            self-resolves on the first add_member.
+    //
+    // * Some(vec![]) -> caller explicitly said "no members". This is the
+    //            silent-drop trap from #1279 (mis-typed field name
+    //            deserialised to None pre-fix; the explicit empty form is
+    //            also a clear operator mistake). Keep rejecting it so the
+    //            mistake surfaces at create-time with an actionable
+    //            message, as #1281 intended.
+    if let Some([]) = member_repos {
         return Err(AppError::Validation(format!(
-            "Virtual repository '{}' requires at least one member. Provide \
-             `member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]` \
-             in the request body. Use `PUT /api/v1/repositories/{}/members` \
-             after creation to update the member list. (#1279)",
+            "Virtual repository '{}' was created with an explicit empty \
+             `member_repos: []`. Provide one or more members \
+             (`member_repos: [{{\"repo_key\": \"<key>\", \"priority\": <int>}}, ...]`) \
+             at create time, or omit the field entirely and add members \
+             via `POST /api/v1/repositories/{}/members` afterwards. (#1279, #1444)",
             repo_key, repo_key
         )));
     }
@@ -623,6 +654,88 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct InvalidateCacheQuery {
+    /// Artifact path to evict from the proxy cache. Same shape as the path
+    /// segment of `GET /api/v1/repositories/{key}/artifacts/{path}`.
+    /// Path-traversal segments such as `..` are rejected by
+    /// `ProxyService::cache_storage_key` (covered by
+    /// `test_invalidate_cache_by_key_rejects_invalid_path`).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InvalidateCacheResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub invalidated: bool,
+}
+
+/// Invalidate a single cached artifact entry on a Remote (proxy) repository
+/// (#1539).
+///
+/// Mirrors the auth + repo-access pattern of `set_cache_ttl`. Idempotent:
+/// invalidating a path that was never cached (or was already evicted) still
+/// returns 200, matching the underlying `ProxyService::invalidate_cache`
+/// contract (which ignores delete-of-missing on the storage backend).
+#[utoipa::path(
+    post,
+    path = "/{key}/cache/invalidate",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        InvalidateCacheQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cache entry invalidated (or was already absent)", body = InvalidateCacheResponse),
+        (status = 400, description = "Validation error (e.g. non-remote repo or invalid path)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+        (status = 503, description = "Proxy service not configured on this deployment"),
+    )
+)]
+pub async fn invalidate_cache(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<InvalidateCacheQuery>,
+) -> Result<Json<InvalidateCacheResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Cache invalidation is meaningless on Local / Virtual / Staging repos --
+    // only Remote (proxy) repos own a cache. Reject up front before touching
+    // storage so the failure mode is a clear 400, not a silent no-op.
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "cache invalidation is only supported on remote (proxy) repositories".to_string(),
+        ));
+    }
+
+    // No proxy service => storage backend not configured on this deployment.
+    // Surface as 503 so operators can distinguish "feature off" from
+    // "server bug" (mirrors the `AppError::ServiceUnavailable` doc comment
+    // in `error.rs`). Avoids `unwrap()` on the optional field.
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("proxy service not configured".to_string()))?;
+
+    proxy.invalidate_cache(&repo, &query.path).await?;
+
+    Ok(Json(InvalidateCacheResponse {
+        repository_key: key,
+        path: query.path,
+        invalidated: true,
     }))
 }
 
@@ -810,10 +923,17 @@ pub async fn list_repositories(
 pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Json(payload): Json<CreateRepositoryRequest>,
+    body: Bytes,
 ) -> Result<Json<RepositoryResponse>> {
+    // #1438 (1b): authenticate BEFORE deserializing the body. The previous
+    // `Json<CreateRepositoryRequest>` extractor ran first and rejected
+    // unauth requests carrying a payload the schema didn't recognize with
+    // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    let payload: CreateRepositoryRequest =
+        serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Fine-grained permission check: non-admins need "admin" on the system sentinel.
     if !auth.is_admin {
@@ -835,11 +955,19 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
-    let format = parse_format(&payload.format)?;
+    // Resolve the format string via the service. The service owns both the
+    // built-in enum mapping and the `format_handlers` fallback for WASM
+    // plugin formats, so the handler keeps no business logic of its own here.
+    // For plugin formats, `plugin_format_key` carries the canonical handler
+    // name and `format` is reported as `Generic`.
+    let service = state.create_repository_service();
+    let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Validate up-front that virtual repos arrive with at least one member.
-    // See `validate_virtual_repo_member_count` for the rationale (#1279).
+    // Validate up-front that virtual repos do not arrive with an explicit
+    // empty `member_repos: []`. Omitted-field (deferred-population) is
+    // accepted so the create-then-add pattern works.
+    // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
     // Resolve storage backend: use the requested one or fall back to the default.
@@ -886,7 +1014,6 @@ pub async fn create_repository(
         );
     }
 
-    let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
             key: payload.key,
@@ -899,7 +1026,10 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
-            format_key: payload.format_key,
+            // Plugin format key takes precedence over any explicit format_key
+            // in the payload: when a WASM plugin format was resolved above,
+            // `plugin_format_key` carries the canonical handler name.
+            format_key: plugin_format_key.or(payload.format_key),
         })
         .await?;
 
@@ -907,31 +1037,36 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
-    // Add virtual repository members. The up-front validation above
-    // guarantees `member_repos` is `Some(non-empty)` whenever
-    // `repo_type == Virtual`, so the empty / None arms are unreachable.
+    // Add virtual repository members. Post-#1444, the validator accepts
+    // `member_repos == None` (deferred-population pattern: caller will
+    // POST /members later) and only rejects `Some(empty_vec)`. Treat the
+    // None arm as a clean no-op here; the Some(non-empty) arm is the
+    // create-with-members path and runs the original loop.
     if repo_type == RepositoryType::Virtual {
-        let member_inputs = payload
-            .member_repos
-            .as_deref()
-            .expect("member_repos non-empty validated above");
-        tracing::info!(
-            repo_key = %repo.key,
-            member_count = member_inputs.len(),
-            "Adding virtual repository members during creation"
-        );
-        for (idx, input) in member_inputs.iter().enumerate() {
-            let member_repo = service.get_by_key(&input.repo_key).await?;
-            let priority = resolve_member_priority(input.priority, idx);
-            tracing::debug!(
-                virtual_repo = %repo.key,
-                member_key = %input.repo_key,
-                priority = priority,
-                "Adding virtual member"
+        if let Some(member_inputs) = payload.member_repos.as_deref() {
+            tracing::info!(
+                repo_key = %repo.key,
+                member_count = member_inputs.len(),
+                "Adding virtual repository members during creation"
             );
-            service
-                .add_virtual_member(repo.id, member_repo.id, Some(priority))
-                .await?;
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = resolve_member_priority(input.priority, idx);
+                tracing::debug!(
+                    virtual_repo = %repo.key,
+                    member_key = %input.repo_key,
+                    priority = priority,
+                    "Adding virtual member"
+                );
+                service
+                    .add_virtual_member(repo.id, member_repo.id, Some(priority))
+                    .await?;
+            }
+        } else {
+            tracing::info!(
+                repo_key = %repo.key,
+                "Virtual repo created with no members; deferring to POST /members (#1444)"
+            );
         }
     }
 
@@ -1169,6 +1304,64 @@ pub async fn update_repository(
     Ok(Json(repo_to_response(repo, storage_used)))
 }
 
+/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
+/// objects from storage before the repository row is deleted.
+///
+/// `oci_upload_cleanup_keys`, `oci_upload_sessions`, and `oci_upload_parts` all
+/// `ON DELETE CASCADE` with `repositories`, so once the repo row is gone their
+/// storage objects lose their only discoverable owner and become permanent
+/// orphans that storage-GC can never reclaim. We delete them up front. Failures
+/// are logged but never block repository deletion.
+async fn purge_repo_oci_upload_temp_objects(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+) {
+    let storage = match state.storage_for_repo(location) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Could not resolve storage to purge OCI upload temp objects before repository delete"
+            );
+            return;
+        }
+    };
+    // The cleanup-key journal records every temp/part/completion storage key
+    // written for this repo's uploads; union in the session/part keys as
+    // belt-and-suspenders in case a write predated its journal row.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
+         UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
+         UNION SELECT p.storage_key FROM oci_upload_parts p \
+           JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
+          WHERE s.repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to list OCI upload temp keys to purge before repository delete"
+        );
+        Vec::new()
+    });
+    for key in keys {
+        match storage.delete(&key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => tracing::warn!(
+                repo_id = %repo_id,
+                storage_key = %key,
+                error = %e,
+                "Failed to purge OCI upload temp object before repository delete"
+            ),
+        }
+    }
+}
+
 /// Delete repository
 #[utoipa::path(
     delete,
@@ -1209,6 +1402,11 @@ pub async fn delete_repository(
             ));
         }
     }
+
+    // Purge this repo's in-flight / abandoned OCI upload temp objects from
+    // storage BEFORE the repository row is deleted (see the helper). Best-effort:
+    // never blocks the delete.
+    purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
 
     service.delete(repo.id).await?;
 
@@ -1261,6 +1459,19 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
+    /// When the proxy cache entry for this artifact was last written.
+    /// Only populated for Remote (proxy) repositories whose proxy service is
+    /// configured AND that have a cache-metadata blob for this path. None
+    /// for Local / Virtual / Staging repos and for Remote repos whose cache
+    /// hasn't been populated yet (e.g. an artifact that exists as a DB row
+    /// from a direct upload but has never been fetched through the proxy).
+    /// (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the proxy cache entry for this artifact will expire and be
+    /// re-validated against upstream. Same gating as `cache_cached_at`. (#1541)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1311,9 +1522,19 @@ pub struct DockerTagResponse {
     pub is_index: bool,
     /// Last push (or update) timestamp from the underlying `oci_tags` row.
     pub last_pushed_at: chrono::DateTime<chrono::Utc>,
-    /// Latest scan status (`pending`, `running`, `completed`, `failed`) from
-    /// `scan_results`, if the manifest has ever been scanned.  `None` when
-    /// the artifact has never been scanned.
+    /// Rolled-up scan status across all scanners configured for this
+    /// artifact. `None` when the artifact has never been scanned.
+    ///
+    /// Values surface the aggregate state, not a single scanner's row
+    /// (see #1497). One of:
+    ///
+    /// * `pending` / `running` -- at least one scanner is still in flight
+    /// * `completed` -- every per-scan-type latest row is `completed`
+    /// * `failed` -- every per-scan-type latest row is `failed`
+    /// * `partial` -- mixed: at least one `completed` AND at least one
+    ///   `failed`. A green generic scanner (e.g. grype) no longer hides
+    ///   a failed format-native scanner (e.g. incus) behind a
+    ///   `completed` label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_status: Option<String>,
 }
@@ -1421,6 +1642,26 @@ pub async fn list_artifacts(
         .await;
     }
 
+    // Remote (proxy) repositories no longer record cached items in the
+    // `artifacts` table (#1278 / #1280): doing so reintroduced a doubled-prefix
+    // storage path bug on filesystem backends. The cached bodies and metadata
+    // sidecars still live in the storage backend under `proxy-cache/<key>/`, so
+    // the listing is reconstructed from there. Without this, packages pulled
+    // through a remote repo fill up storage but never appear in the UI, so they
+    // can't be browsed or scanned (#1548, web #424).
+    if repo.repo_type == RepositoryType::Remote {
+        return list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
+
     let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
         // Members are returned in priority order; local/hosted members are
@@ -1482,11 +1723,27 @@ pub async fn list_artifacts(
             std::collections::HashMap::new()
         };
 
+    // For npm-family repos the artifact is stored under the
+    // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
+    // (see `api::handlers::npm::store_npm_version`), but npm clients and
+    // every external consumer reference tarballs by the download-URL
+    // shape `<name>/-/<name>-<version>.tgz`. Surface the URL shape in the
+    // listing's `path` so callers that resolve an artifact by the path
+    // npm published (the management UI, SDKs, the release-gate real-flow
+    // smoke test) match against the same string they downloaded from.
+    // Lookup-by-path already accepts both shapes via
+    // `normalize_lookup_path` (#1443); this keeps the listing consistent.
+    let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
+
     let mut items = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
-        items.push(build_artifact_response(&artifact, &key, download_count));
+        let mut item = build_artifact_response(&artifact, &key, download_count);
+        if rewrite_npm_tarball_paths {
+            apply_npm_tarball_url_path(&mut item);
+        }
+        items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
             items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
@@ -1506,11 +1763,242 @@ pub async fn list_artifacts(
     }))
 }
 
+/// List the artifacts a remote (proxy) repository has cached.
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so they are
+/// reconstructed from the storage backend by [`ProxyService::list_cached_artifacts`].
+/// Each entry is mapped to an [`ArtifactResponse`]; entries carry no DB id,
+/// version, or download count, so those fields take their natural defaults
+/// (a deterministic synthetic id derived from `repo_key + path`, `None`
+/// version, zero downloads). Filtering and pagination happen in-process over
+/// the recovered set, since there is no DB query to push them into. See #1548
+/// and web #424.
+async fn list_remote_cached_artifacts(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    key: &str,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    let entries = match state.proxy_service.as_deref() {
+        Some(proxy) => proxy.list_cached_artifacts(&repo.key).await,
+        // No proxy service configured (e.g. proxying disabled): nothing cached.
+        None => Vec::new(),
+    };
+
+    let (page_entries, total) = filter_and_paginate_cached(entries, path_prefix, q, page, per_page);
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    let items = page_entries
+        .into_iter()
+        .map(|entry| build_cached_artifact_response(&entry, key))
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items,
+        pagination: Pagination {
+            page,
+            per_page,
+            total: total as i64,
+            total_pages,
+        },
+        components: None,
+        docker_tags: None,
+    }))
+}
+
+/// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
+/// cache entries, then return the slice for the requested page along with the
+/// total match count.
+///
+/// `path_prefix` matches against the start of the logical path; `q` is a
+/// case-insensitive substring match against the path. Pure so the
+/// filter/paginate logic is unit-testable without a storage backend.
+fn filter_and_paginate_cached(
+    entries: Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> (
+    Vec<crate::services::proxy_service::CachedArtifactEntry>,
+    usize,
+) {
+    let q_lower = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let mut matched: Vec<_> = entries
+        .into_iter()
+        .filter(|e| match path_prefix {
+            Some(prefix) if !prefix.is_empty() => e.path.starts_with(prefix),
+            _ => true,
+        })
+        .filter(|e| match &q_lower {
+            Some(needle) => e.path.to_lowercase().contains(needle),
+            None => true,
+        })
+        .collect();
+
+    // Stable ordering for deterministic pagination across requests.
+    matched.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let total = matched.len();
+    let offset = ((page.saturating_sub(1)) as usize).saturating_mul(per_page as usize);
+    let page_items = matched
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+    (page_items, total)
+}
+
+/// Deterministic artifact id for a proxy-cached object.
+///
+/// The `uuid` crate is built with only the `v4` feature, so a UUIDv5 is not
+/// available. Instead the id is the first 16 bytes of a SHA-256 over the
+/// cache storage key `proxy-cache/<repo_key>/<path>`. This is stable across
+/// listing calls for a given object and effectively never collides with the
+/// random v4 ids the database assigns to hosted artifacts.
+fn cached_artifact_id(repo_key: &str, path: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("proxy-cache/{}/{}", repo_key, path).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Map a recovered proxy cache entry to the listing's [`ArtifactResponse`].
+///
+/// The id is deterministic over `<repo_key>/<path>` (see
+/// [`cached_artifact_id`]) so the same cached object always reports the same
+/// id across listing calls (useful for client-side keying) without colliding
+/// with the random v4 ids hosted artifacts get from the database.
+fn build_cached_artifact_response(
+    entry: &crate::services::proxy_service::CachedArtifactEntry,
+    repo_key: &str,
+) -> ArtifactResponse {
+    let id = cached_artifact_id(repo_key, &entry.path);
+    ArtifactResponse {
+        id,
+        repository_key: repo_key.to_string(),
+        path: entry.path.clone(),
+        name: entry.name.clone(),
+        version: None,
+        size_bytes: entry.size_bytes,
+        checksum_sha256: entry.checksum_sha256.clone(),
+        content_type: entry.content_type.clone(),
+        download_count: 0,
+        created_at: entry.cached_at,
+        metadata: None,
+        // This is a proxy-cache entry, so surface the cache timestamp.
+        // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
+        cache_cached_at: Some(entry.cached_at),
+        cache_expires_at: None,
+    }
+}
+
 /// Build the `ArtifactResponse` representing a single primary artifact row.
 ///
 /// Extracted from the inline listing loop so it can be unit-tested
 /// without a database. Pure transformation of `Artifact` fields plus
 /// the precomputed download count.
+/// Return the ordered list of paths to try when looking up an artifact
+/// by path under a repo of the given format.
+///
+/// The literal request path is always tried first so non-npm formats
+/// and already-stored paths keep working unchanged. For npm-family
+/// repos a second candidate is appended whenever the request path
+/// matches the canonical npm tarball URL shape
+/// (`<name>/-/<name>-<version>.tgz`); that second candidate is the
+/// version-segmented stored shape produced by `store_npm_version`. See
+/// #1443.
+///
+/// Returned without duplicates: if the literal path is already the
+/// stored shape (or `normalize_lookup_path` returns the same string),
+/// only one DB query runs.
+fn lookup_path_candidates(path: &str, format: &RepositoryFormat) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    if is_npm_family_format(format) {
+        if let Some(normalized) = crate::formats::npm::normalize_lookup_path(path) {
+            if normalized != path {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
+/// npm-family formats share the publish/download path conventions of
+/// the npm registry (`yarn`, `pnpm`, and `bower` all wrap the same
+/// upstream wire format). Keep this in sync with the `format` mapping
+/// in `parse_format` and with the publish handler in
+/// `api::handlers::npm`.
+fn is_npm_family_format(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Npm
+            | RepositoryFormat::Yarn
+            | RepositoryFormat::Bower
+            | RepositoryFormat::Pnpm
+    )
+}
+
+/// Try each candidate path in order, returning the first match. Skips
+/// soft-deleted rows. Used by `get_artifact_metadata` so the npm
+/// lookup-by-URL fallback only costs an extra DB roundtrip on a true
+/// cache miss.
+async fn lookup_artifact_by_paths(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    candidates: &[String],
+) -> Result<Option<crate::models::artifact::Artifact>> {
+    for candidate in candidates {
+        let found = sqlx::query_as!(
+            crate::models::artifact::Artifact,
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM artifacts
+            WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+            "#,
+            repository_id,
+            candidate
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+/// Rewrite an npm-family artifact listing row's `path` from the
+/// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
+/// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
+///
+/// No-op for any row whose path is not a stored npm tarball (metadata
+/// rows, raw uploads, paths already in URL form), so the listing keeps
+/// reporting those verbatim. See the real-flow-smoke follow-up to #1443:
+/// callers resolve a tarball by the URL path they downloaded from, which
+/// must match what the listing reports.
+fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
+    if let Some(url_path) = crate::formats::npm::tarball_url_path_from_stored(&item.path) {
+        item.path = url_path;
+    }
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -1528,6 +2016,12 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
+        // Cache metadata is surfaced only by the per-artifact metadata
+        // endpoint to avoid fanning out a storage GET per artifact in
+        // listings (#1541). Helpers used by listings leave these as None;
+        // get_artifact_metadata populates them after the fact.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }
 }
 
@@ -1572,6 +2066,8 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         });
     }
     out
@@ -1897,6 +2393,66 @@ async fn list_artifacts_grouped_by_docker_tag(
     }))
 }
 
+/// Collapse the set of per-scan-type latest statuses for an artifact into
+/// a single rollup label (#1497).
+///
+/// The scan pipeline writes one `scan_results` row per (artifact,
+/// scan_type) pair (grype, dependency-track, openscap, incus, ...).
+/// Surfacing only the most-recent row's status silently masks a failed
+/// format-native scanner whenever a generic scanner finishes after it,
+/// which is a security-scanning gap (the operator sees `completed` and
+/// concludes the artifact was fully scanned).
+///
+/// Precedence, applied in order:
+///
+/// 1. Empty input -> `None` (artifact has never been scanned).
+/// 2. Any `running` -> `running` (in-flight beats anything terminal).
+/// 3. Any `pending` -> `pending` (queued beats terminal).
+/// 4. All `completed` -> `completed` (every configured scanner is green).
+/// 5. All `failed` -> `failed` (every configured scanner errored out).
+/// 6. Mixed terminal (at least one `completed` AND at least one `failed`)
+///    -> `partial`. This is the case #1497 was filed for: a green grype
+///    plus a failed incus scan now surfaces as `partial`, not
+///    `completed`.
+///
+/// Unknown status strings are pessimistically treated as a failure for
+/// the all-completed check (they will not collapse to `completed`).
+pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+
+    let mut has_running = false;
+    let mut has_pending = false;
+    let mut has_completed = false;
+    let mut has_failed = false;
+    let mut has_unknown = false;
+
+    for s in statuses {
+        match s.as_str() {
+            "running" => has_running = true,
+            "pending" => has_pending = true,
+            "completed" => has_completed = true,
+            "failed" => has_failed = true,
+            _ => has_unknown = true,
+        }
+    }
+
+    if has_running {
+        return Some("running".to_string());
+    }
+    if has_pending {
+        return Some("pending".to_string());
+    }
+    if has_completed && !has_failed && !has_unknown {
+        return Some("completed".to_string());
+    }
+    if has_failed && !has_completed && !has_unknown {
+        return Some("failed".to_string());
+    }
+    Some("partial".to_string())
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` row. Returns at most `limit` rows.
 ///
@@ -1919,9 +2475,16 @@ async fn fetch_docker_tag_rows(
     // not carry a back-reference to the oci_tags row; the push handler
     // composes `v2/{image}/manifests/{tag}` deterministically.
     //
-    // LEFT JOIN scan_results on the latest row per artifact is filtered
-    // by NOT EXISTS so we don't carry historical scans; this matches the
-    // partial-index pattern from migration 101.
+    // Scan-status rollup (#1497): an artifact can have multiple scan_results
+    // rows, one per scan_type (grype, dependency-track, openscap, incus,
+    // ...). Previously this query returned only the most-recent row's
+    // status via `ORDER BY created_at DESC LIMIT 1`, which silently masked
+    // a failed format-native scanner whenever a generic scanner (e.g.
+    // grype) finished after it. We now project per-scan-type latest rows
+    // and aggregate their statuses with `array_agg(DISTINCT ...)`; the
+    // Rust-side `rollup_scan_status` helper collapses the set into a
+    // single label (`completed`, `partial`, `failed`, `running`,
+    // `pending`) honoring the precedence in its doc comment.
     let sql = if search_query.is_some() {
         r#"SELECT
                 a.id            AS artifact_id,
@@ -1931,18 +2494,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -1958,18 +2524,21 @@ async fn fetch_docker_tag_rows(
                 t.manifest_content_type AS manifest_content_type,
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
-                s.status        AS scan_status
+                s.statuses      AS scan_statuses
             FROM oci_tags t
             JOIN artifacts a
               ON a.repository_id = t.repository_id
              AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
              AND a.is_deleted = false
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM scan_results
-                WHERE artifact_id = a.id
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT array_agg(DISTINCT latest.status) AS statuses
+                FROM (
+                    SELECT DISTINCT ON (sr.scan_type)
+                        sr.status
+                    FROM scan_results sr
+                    WHERE sr.artifact_id = a.id
+                    ORDER BY sr.scan_type, sr.created_at DESC
+                ) latest
             ) s ON true
             WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0
@@ -2019,7 +2588,13 @@ async fn fetch_docker_tag_rows(
             last_pushed_at: r
                 .try_get("last_pushed_at")
                 .map_err(|e| AppError::Database(e.to_string()))?,
-            scan_status: r.try_get("scan_status").ok().flatten(),
+            scan_status: rollup_scan_status(
+                r.try_get::<Option<Vec<String>>, _>("scan_statuses")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .unwrap_or(&[]),
+            ),
         });
     }
     Ok(out)
@@ -2153,7 +2728,7 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
@@ -2161,42 +2736,130 @@ pub async fn get_artifact_metadata(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
-    let artifact = sqlx::query_as!(
-        crate::models::artifact::Artifact,
-        r#"
-        SELECT
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, is_deleted, uploaded_by,
-            quarantine_status, quarantine_until,
-            created_at, updated_at
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        "#,
-        repo.id,
-        path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    // #1443: npm publish stores tarballs under
+    // `<name>/<version>/<name>-<version>.tgz` (see
+    // `api::handlers::npm::store_npm_version`), but external callers
+    // (release-gate smoke test, JFrog/Artifactory-style consumers,
+    // webhook payloads) carry the canonical npm download-URL shape
+    // `<name>/-/<name>-<version>.tgz`. Without translating the request
+    // path, an exact-match lookup against `artifacts.path` never finds
+    // the row. Try the literal path first (so non-npm formats and
+    // already-stored npm paths still work), then fall back to the
+    // normalised stored shape for npm-family repos when the caller
+    // handed us the URL shape.
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    let direct = lookup_artifact_by_paths(&state.db, repo.id, &candidates).await?;
 
-    let downloads = artifact_service.get_download_stats(artifact.id).await?;
-    let metadata = artifact_service.get_metadata(artifact.id).await?;
+    if let Some(artifact) = direct {
+        let downloads = artifact_service.get_download_stats(artifact.id).await?;
+        let metadata = artifact_service.get_metadata(artifact.id).await?;
 
-    Ok(Json(ArtifactResponse {
-        id: artifact.id,
-        repository_key: key,
-        path: artifact.path,
-        name: artifact.name,
-        version: artifact.version,
-        size_bytes: artifact.size_bytes,
-        checksum_sha256: artifact.checksum_sha256,
-        content_type: artifact.content_type,
-        download_count: downloads,
-        created_at: artifact.created_at,
-        metadata: metadata.map(|m| m.metadata),
-    }))
+        // #1541: surface proxy cache freshness on Remote repos so the UI
+        // can render "expires in 4 hours" / "expired" without a separate
+        // round-trip. Single storage GET, gated on `repo.repo_type ==
+        // Remote` AND `state.proxy_service.is_some()`. Tolerant of failure:
+        // a missing or unreadable metadata blob is a normal state for an
+        // artifact that has never been fetched through the proxy (e.g.
+        // direct-uploaded into a Remote repo, edge case but observed),
+        // so any error or `Ok(None)` collapses to None on both fields
+        // rather than failing the whole metadata response.
+        let cache_meta = if repo.repo_type == RepositoryType::Remote {
+            if let Some(proxy) = state.proxy_service.as_ref() {
+                proxy
+                    .get_cache_metadata(&key, &artifact.path)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        return Ok(Json(ArtifactResponse {
+            id: artifact.id,
+            repository_key: key,
+            path: artifact.path,
+            name: artifact.name,
+            version: artifact.version,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256,
+            content_type: artifact.content_type,
+            download_count: downloads,
+            created_at: artifact.created_at,
+            metadata: metadata.map(|m| m.metadata),
+            cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
+            cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
+        })
+        .into_response());
+    }
+
+    // B9 / #1221 / #1217: a virtual repository owns no `artifacts` rows of
+    // its own -- its content lives in its member repositories. The generic
+    // GET /:key/artifacts/*path route is the format-agnostic artifact-fetch
+    // surface clients use to pull bytes through a virtual repo (the
+    // virtual-shadowing-guard E2E fetches L's trusted artifact this way).
+    // A virtual repo therefore has no direct row to describe, and returning
+    // 404 here would make the local member's artifact unreachable through
+    // the virtual. Resolve members in priority order and serve the winning
+    // member's BYTES, applying the same local-over-remote shadowing guard
+    // as `download_artifact`: if a non-Remote member owns the exact path,
+    // suppress the proxy so a Remote member cannot shadow the trusted
+    // local artifact.
+    if repo.repo_type == RepositoryType::Virtual {
+        let owns_locally = proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+            .await
+            .map_err(|_| AppError::Internal("virtual shadowing-guard query failed".to_string()))?;
+        let proxy_for_virtual = if owns_locally {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
+        let db = state.db.clone();
+        let path_clone = path.clone();
+        let state_clone = state.clone();
+        let (content, content_type) = proxy_helpers::resolve_virtual_download(
+            &state.db,
+            proxy_for_virtual,
+            repo.id,
+            &path,
+            move |member_id, location| {
+                let db = db.clone();
+                let state = state_clone.clone();
+                let p = path_clone.clone();
+                async move {
+                    proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &p).await
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            AppError::NotFound("Artifact not found in any member repository".to_string())
+        })?;
+
+        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        let filename = path.rsplit('/').next().unwrap_or(&path);
+
+        return Ok((
+            [
+                (header::CONTENT_TYPE, ct),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                ),
+                (header::CONTENT_LENGTH, content.len().to_string()),
+                (
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "virtual".to_string(),
+                ),
+            ],
+            content,
+        )
+            .into_response());
+    }
+
+    Err(AppError::NotFound("Artifact not found".to_string()))
 }
 
 /// Upload artifact
@@ -2342,6 +3005,10 @@ pub async fn upload_artifact(
         download_count: downloads,
         created_at: artifact.created_at,
         metadata: metadata_json,
+        // Just-uploaded artifacts have no proxy cache state yet -- the
+        // cache is populated lazily on the first proxy fetch.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }))
 }
 
@@ -2680,12 +3347,32 @@ pub async fn download_artifact(
             }
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Virtual => {
-            // Virtual repo: try each member in priority order
+            // Virtual repo: try each member in priority order.
+            //
+            // Shadowing guard (B9): the generic-format download keys on the
+            // exact stored path. If a non-Remote member of this virtual repo
+            // owns the path, suppress the proxy service so Remote members are
+            // Skip'd and cannot shadow the local artifact. Without this a
+            // Remote member earlier in priority order that returns a 200 for
+            // the same path (catch-all upstream, or a different object at
+            // that path) would win the first-`Ok` race and serve the wrong
+            // or empty bytes, while a guarded format handler would 404-refuse.
+            let owns_locally =
+                proxy_helpers::virtual_non_remote_owns_path(&state.db, repo.id, &path)
+                    .await
+                    .map_err(|_| {
+                        AppError::Internal("virtual shadowing-guard query failed".to_string())
+                    })?;
+            let proxy_for_virtual = if owns_locally {
+                None
+            } else {
+                state.proxy_service.as_deref()
+            };
             let db = state.db.clone();
             let path_clone = path.clone();
             let (content, content_type) = proxy_helpers::resolve_virtual_download(
                 &state.db,
-                state.proxy_service.as_deref(),
+                proxy_for_virtual,
                 repo.id,
                 &path,
                 |member_id, location| {
@@ -3007,14 +3694,16 @@ pub async fn remove_virtual_member(
     let member_repo = service.get_by_key(&member_key).await?;
     authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "remove")?;
 
-    sqlx::query(
-        "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
-    )
-    .bind(virtual_repo.id)
-    .bind(member_repo.id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Delegate to the service, which scopes the DELETE to the single
+    // (virtual_repo_id, member_repo_id) row and returns `AppError::NotFound`
+    // (HTTP 404) when no row matched. Routing through the service keeps a
+    // single source of truth for the delete predicate so this handler cannot
+    // drift back to a virtual-repo-id-only DELETE that would empty every
+    // member (B1), and gives the repeat-delete-of-an-already-removed-member
+    // path its 404 instead of a misleading 200 (B3).
+    service
+        .remove_virtual_member(virtual_repo.id, member_repo.id)
+        .await?;
 
     Ok(())
 }
@@ -3137,36 +3826,24 @@ pub async fn update_virtual_members(
 
     // Single-statement bulk update via UNNEST(uuid[], int4[]). This is atomic
     // by construction in Postgres: the entire statement either succeeds and
-    // updates every matching row, or fails and updates none. Removes the
-    // need for an explicit transaction, the per-row lock-ordering sort, and
-    // the rows_affected loop guard. Concurrent PUTs serialise at the row-
-    // lock layer of this single statement and produce a deterministic final
-    // state (one wins, the other overwrites it; never a row-level mix).
+    // updates every matching row, or fails and updates none.
+    //
+    // The service runs the UPDATE inside a transaction that first takes the
+    // process-wide member-graph advisory lock (B2). Without that lock, two
+    // concurrent PUTs over an overlapping member set acquire row locks in
+    // planner-scan order and can deadlock on the shared row, which Postgres
+    // only breaks after `deadlock_timeout`; under a race loop that surfaces
+    // as multi-second stalls that exhaust the client timeout. The lock
+    // serialises every member-graph mutation so the UPDATEs never contend.
     //
     // RETURNING gives us the set of member_repo_ids that actually matched
     // the (virtual_repo_id, member_repo_id) predicate. If that set is
     // smaller than the input set, some member row was deleted between the
     // resolve pass and the UPDATE (TOCTOU), and we surface a 404 listing
     // the missing keys so the caller can retry with a fresh resolution.
-    let updated: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        UPDATE virtual_repo_members
-           SET priority = c.priority
-          FROM (
-            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
-                     AS t(member_repo_id, priority)
-          ) AS c
-         WHERE virtual_repo_members.virtual_repo_id = $1
-           AND virtual_repo_members.member_repo_id = c.member_repo_id
-        RETURNING virtual_repo_members.member_repo_id
-        "#,
-    )
-    .bind(virtual_repo.id)
-    .bind(&resolved_member_ids)
-    .bind(&priorities)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let updated = service
+        .update_virtual_member_priorities(virtual_repo.id, &resolved_member_ids, &priorities)
+        .await?;
 
     detect_bulk_update_misses(
         &virtual_repo.key,
@@ -3532,6 +4209,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         delete_repository,
         set_cache_ttl,
         get_cache_ttl,
+        invalidate_cache,
         list_artifacts,
         get_artifact_metadata,
         upload_artifact,
@@ -3555,6 +4233,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryListResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        InvalidateCacheQuery,
+        InvalidateCacheResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -3651,6 +4331,94 @@ mod tests {
     use crate::error::AppError;
 
     // -----------------------------------------------------------------------
+    // Remote proxy-cache listing (#1548, web #424)
+    // -----------------------------------------------------------------------
+
+    fn make_cached_entry(path: &str) -> crate::services::proxy_service::CachedArtifactEntry {
+        crate::services::proxy_service::CachedArtifactEntry {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size_bytes: 1234,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            cached_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_returns_all_sorted() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, None, 1, 20);
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        // Sorted by path.
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[1].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_path_prefix() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, Some("lodash/"), None, 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_applies_case_insensitive_query() {
+        let entries = vec![
+            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
+            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
+        ];
+        let (page, total) = filter_and_paginate_cached(entries, None, Some("IS-ODD"), 1, 20);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_cached_paginates() {
+        let entries = vec![
+            make_cached_entry("a"),
+            make_cached_entry("b"),
+            make_cached_entry("c"),
+        ];
+        let (page2, total) = filter_and_paginate_cached(entries, None, None, 2, 2);
+        assert_eq!(total, 3);
+        // page size 2, page 2 -> just "c"
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].path, "c");
+    }
+
+    #[test]
+    fn test_build_cached_artifact_response_maps_fields_and_is_deterministic() {
+        let entry = make_cached_entry("express/-/express-4.18.2.tgz");
+        let resp = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.repository_key, "npm-remote");
+        assert_eq!(resp.path, "express/-/express-4.18.2.tgz");
+        assert_eq!(resp.name, "express-4.18.2.tgz");
+        assert_eq!(resp.size_bytes, 1234);
+        assert_eq!(resp.checksum_sha256, "deadbeef");
+        assert_eq!(resp.download_count, 0);
+        assert!(resp.version.is_none());
+        // Same repo_key + path always yields the same id.
+        let resp2 = build_cached_artifact_response(&entry, "npm-remote");
+        assert_eq!(resp.id, resp2.id);
+        // Different path yields a different id.
+        let other = make_cached_entry("express/-/express-4.18.3.tgz");
+        assert_ne!(
+            resp.id,
+            build_cached_artifact_response(&other, "npm-remote").id
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // expand_maven_secondary_files & build_artifact_response (#1092)
     // -----------------------------------------------------------------------
 
@@ -3686,6 +4454,57 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_npm_tarball_url_path: the listing rewrite that lets npm clients
+    // (and the release-gate real-flow smoke test) resolve a tarball by the
+    // `<name>/-/<file>.tgz` URL path they downloaded from, even though it is
+    // stored under `<name>/<version>/<file>.tgz`. Follow-up to #1443.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_stored_tarball() {
+        let a = make_artifact_for_test("rfs-pkg/1.0.5/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_rewrites_scoped_stored_tarball() {
+        let a = make_artifact_for_test("@angular/core/17.0.0/core-17.0.0.tgz");
+        let mut resp = build_artifact_response(&a, "npm-hosted", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "@angular/core/-/core-17.0.0.tgz");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_noop_for_metadata_row() {
+        // Non-tarball rows (a bare package metadata path) are left verbatim.
+        let a = make_artifact_for_test("rfs-pkg/package.json");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/package.json");
+    }
+
+    #[test]
+    fn test_apply_npm_tarball_url_path_idempotent_on_url_shape() {
+        // A path already in the `/-/` URL shape must not be rewritten again.
+        let a = make_artifact_for_test("rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        apply_npm_tarball_url_path(&mut resp);
+        assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
+    }
+
+    #[test]
+    fn test_is_npm_family_format_covers_npm_aliases() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
     }
 
     #[test]
@@ -4818,6 +5637,88 @@ mod tests {
         assert_eq!(resp.scan_status.as_deref(), Some("completed"));
     }
 
+    // -----------------------------------------------------------------------
+    // rollup_scan_status (#1497)
+    // -----------------------------------------------------------------------
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn test_rollup_scan_status_empty_returns_none() {
+        // Never scanned -> no rollup.
+        assert_eq!(rollup_scan_status(&[]), None);
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_completed_returns_completed() {
+        // Every configured scanner finished cleanly -> green rollup.
+        let statuses = vec![s("completed"), s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_all_failed_returns_failed() {
+        // Every configured scanner errored out -> hard failure.
+        let statuses = vec![s("failed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_completed_and_failed_returns_partial() {
+        // The #1497 regression case: incus (format-native) failed, grype
+        // completed. Pre-fix this surfaced as `completed` and the operator
+        // had no visible signal that the rootfs scan was skipped. Post-fix
+        // it must surface as `partial` so the UI/CLI/release-gate can flag
+        // the silent gap.
+        let statuses = vec![s("completed"), s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_mixed_with_running_returns_running() {
+        // An in-flight scan beats anything terminal so the UI does not
+        // prematurely call a still-running set `partial`.
+        let statuses = vec![s("completed"), s("failed"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_pending_beats_terminal_only() {
+        // pending beats completed/failed but loses to running (running ==
+        // already started, pending == not yet started).
+        let statuses = vec![s("completed"), s("pending")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("pending"));
+
+        let statuses = vec![s("pending"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_completed_stays_completed() {
+        // Only one scanner configured and it passed -> still `completed`.
+        // Guards against an overly-strict rollup that demanded N>=2.
+        let statuses = vec![s("completed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_single_failed_stays_failed() {
+        let statuses = vec![s("failed")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_unknown_status_collapses_to_partial() {
+        // Pessimistic: an unrecognized status should NOT be allowed to
+        // collapse the set to `completed`. Belt-and-braces against a
+        // future scanner that writes a status value the rollup does not
+        // yet know about.
+        let statuses = vec![s("completed"), s("weird-state")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
     #[test]
     fn test_build_docker_tag_response_saturating_add_handles_overflow() {
         // Pathological case: both sizes near i64::MAX should saturate
@@ -4846,10 +5747,101 @@ mod tests {
             download_count: 42,
             created_at: chrono::Utc::now(),
             metadata: None,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
+        // Cache fields are omitted when None so the wire shape stays the
+        // same for non-Remote repos and for Remote repos without cache
+        // metadata (#1541).
+        assert!(!json.contains("cache_cached_at"));
+        assert!(!json.contains("cache_expires_at"));
+    }
+
+    #[test]
+    fn test_artifact_response_serialization_with_cache_metadata() {
+        // (#1541) When populated -- which only happens for Remote repos
+        // whose proxy is configured AND have a cache-metadata blob for
+        // the path -- both timestamps appear as ISO-8601 strings so the
+        // web client can render relative time without parsing custom
+        // formats.
+        let cached = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expires = chrono::DateTime::parse_from_rfc3339("2026-06-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let resp = ArtifactResponse {
+            id: Uuid::new_v4(),
+            repository_key: "pypi-remote".to_string(),
+            path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
+            name: "requests-2.31.0-py3-none-any.whl".to_string(),
+            version: Some("2.31.0".to_string()),
+            size_bytes: 62500,
+            checksum_sha256: "deadbeef".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: cached,
+            metadata: None,
+            cache_cached_at: Some(cached),
+            cache_expires_at: Some(expires),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
+        assert!(json.contains("\"cache_expires_at\":\"2026-06-02T10:00:00Z\""));
+    }
+
+    #[test]
+    fn get_artifact_metadata_populates_cache_fields_only_for_remote() {
+        // (#1541) Structural assertion: the per-artifact metadata handler
+        // must (a) gate the cache-metadata read on `repo.repo_type ==
+        // RepositoryType::Remote`, (b) further guard on
+        // `state.proxy_service.as_ref()` so a non-proxy deployment doesn't
+        // panic, and (c) call the new public ProxyService method
+        // `get_cache_metadata`. Pinning the source string here keeps the
+        // cost-control invariant from quietly drifting if someone later
+        // refactors the handler -- e.g. moving the storage GET ahead of
+        // the type guard would silently fan out a per-list-item cost we
+        // explicitly chose to avoid.
+        //
+        // The pattern is intentionally tolerant of `cargo fmt` reformatting
+        // the chain across multiple lines, the way the proxy-service guard
+        // in `invalidate_cache` has to be (#1539). We assert on the pieces,
+        // not on a single multi-line string match.
+        let source = include_str!("repositories.rs");
+
+        // Find the body of the get_artifact_metadata handler (between its
+        // `pub async fn get_artifact_metadata(` opener and the next
+        // top-level `pub async fn` / `pub fn` / unindented `}` -- in
+        // practice the upload_artifact attribute that follows).
+        let start = source
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata handler not found");
+        let after = &source[start..];
+        let end_rel = after
+            .find("\n/// Upload artifact")
+            .expect("expected upload_artifact doc-comment to terminate the handler");
+        let body = &after[..end_rel];
+
+        assert!(
+            body.contains("RepositoryType::Remote"),
+            "handler must gate cache lookup on RepositoryType::Remote"
+        );
+        assert!(
+            body.contains("state.proxy_service.as_ref()"),
+            "handler must guard on state.proxy_service.as_ref() before calling the proxy"
+        );
+        assert!(
+            body.contains(".get_cache_metadata("),
+            "handler must call ProxyService::get_cache_metadata"
+        );
+        assert!(
+            body.contains("cache_cached_at:") && body.contains("cache_expires_at:"),
+            "handler must populate both cache_cached_at and cache_expires_at"
+        );
     }
 
     #[test]
@@ -5994,6 +6986,263 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // POST /repositories/:key/cache/invalidate (#1539)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalidate_cache_query_deserialization() {
+        // serde_urlencoded backs `Query<T>` in axum, but exercising the
+        // serde::Deserialize impl through serde_json is sufficient to pin
+        // the field name and required-ness. axum-side wiring is exercised
+        // by the structural test below.
+        let json = r#"{"path": "foo/bar-1.2.3.tgz"}"#;
+        let q: InvalidateCacheQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "foo/bar-1.2.3.tgz");
+    }
+
+    #[test]
+    fn test_invalidate_cache_query_rejects_missing_path() {
+        // `path` is required: an empty object must fail to deserialize so
+        // the handler never sees a default-empty path that would silently
+        // evict the wrong cache key.
+        let json = r#"{}"#;
+        let result: std::result::Result<InvalidateCacheQuery, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing `path` must fail deserialization, got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_invalidate_cache_response_serialization() {
+        let resp = InvalidateCacheResponse {
+            repository_key: "pypi-remote".to_string(),
+            path: "simple/requests/".to_string(),
+            invalidated: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repository_key\":\"pypi-remote\""));
+        assert!(json.contains("\"path\":\"simple/requests/\""));
+        assert!(json.contains("\"invalidated\":true"));
+    }
+
+    /// Structural regression test (#1539): the `invalidate_cache` handler
+    /// must guard on (a) `repo.repo_type != RepositoryType::Remote` (returns
+    /// 400) and (b) `state.proxy_service.as_ref()` (returns 503 when None),
+    /// and BOTH guards must run before the actual `proxy.invalidate_cache(`
+    /// call. Otherwise a Local/Virtual repo or a deployment without a
+    /// configured storage backend would either silently no-op (worse:
+    /// produce a misleading 200) or panic on `unwrap` of an
+    /// `Option<Arc<ProxyService>>`. Pins the contract this PR adds.
+    #[test]
+    fn invalidate_cache_handler_guards_repo_type_and_proxy_service() {
+        let source = include_str!("repositories.rs");
+
+        let signature = format!("pub async fn {}(", "invalidate_cache");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{}` in repositories.rs", signature));
+
+        // Bound the search at the closing `}` of the handler. The next
+        // top-level `pub` item gives a safe upper bound: the handler's body
+        // ends well before that.
+        let end = source[start + signature.len()..]
+            .find("\npub ")
+            .map(|offset| start + signature.len() + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        // Marker strings are built via format! so this test body itself does
+        // not satisfy the search.
+        let type_check = format!("{} != RepositoryType::Remote", "repo.repo_type");
+        // The 503 guard chain (`state.proxy_service.as_ref().ok_or_else(...)`)
+        // gets reformatted across multiple lines by rustfmt, so we anchor on
+        // the unique `ServiceUnavailable` error construction inside the
+        // `ok_or_else` closure -- that marker only exists when the guard is
+        // present.
+        let proxy_guard = format!(
+            "{}::ServiceUnavailable(\"proxy service not configured\"",
+            "AppError",
+        );
+        let evict_call = format!("{}.invalidate_cache(", "proxy");
+
+        let type_idx = body.find(&type_check).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must check `{}` to reject non-Remote repos (#1539)",
+                type_check,
+            )
+        });
+        let proxy_idx = body.find(&proxy_guard).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must guard `{}` to surface a 503 instead of unwrap-panic when no storage backend is configured (#1539)",
+                proxy_guard,
+            )
+        });
+        let evict_idx = body.find(&evict_call).unwrap_or_else(|| {
+            panic!(
+                "invalidate_cache must call `{}` on the resolved proxy service (#1539)",
+                evict_call,
+            )
+        });
+
+        assert!(
+            type_idx < evict_idx,
+            "type-check `{}` must run BEFORE `{}` (#1539). type_idx={}, evict_idx={}",
+            type_check,
+            evict_call,
+            type_idx,
+            evict_idx,
+        );
+        assert!(
+            proxy_idx < evict_idx,
+            "proxy-service guard `{}` must run BEFORE `{}` (#1539). proxy_idx={}, evict_idx={}",
+            proxy_guard,
+            evict_call,
+            proxy_idx,
+            evict_idx,
+        );
+    }
+
+    /// Runtime regression (#1539): on a Remote repo with the proxy service
+    /// configured, `POST /:key/cache/invalidate?path=...` returns 200 with
+    /// `invalidated: true`. Idempotent: invalidating a path that was never
+    /// cached must still succeed (mirrors `ProxyService::invalidate_cache`,
+    /// which ignores delete-of-missing on the storage backend).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_200_for_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/cache/invalidate?path=foo%2Fbar-1.2.3.tgz",
+                fx.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Remote repo + proxy configured must return 200 (idempotent on \
+             never-cached paths); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("\"invalidated\":true"),
+            "response body must contain `invalidated: true` (#1539); got: {}",
+            body_str,
+        );
+        assert!(
+            body_str.contains("\"path\":\"foo/bar-1.2.3.tgz\""),
+            "response body must echo the URL-decoded `path` (#1539); got: {}",
+            body_str,
+        );
+    }
+
+    /// Runtime regression (#1539): on a Local (or Virtual / Staging) repo,
+    /// the handler MUST return 400 *before* touching the proxy service --
+    /// cache invalidation is meaningless on non-Remote repos. The proxy
+    /// service is wired up here on purpose so the test fails if the type
+    /// guard is removed (otherwise the call would no-op-success on a Local
+    /// repo and silently mask the contract).
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_400_for_non_remote_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Local repo MUST surface as 400 BadRequest, not silent 200 \
+             (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// Runtime regression (#1539): on a Remote repo *without* a proxy
+    /// service in `SharedState`, the handler MUST return 503 (not 500,
+    /// not panic on unwrap). Pins `AppError::ServiceUnavailable` as the
+    /// surfaced status so operators can distinguish "feature off" from
+    /// "server bug" -- see the doc comment on the guard.
+    #[tokio::test]
+    async fn invalidate_cache_handler_returns_503_when_proxy_service_missing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        // Plain `build_state` does NOT install a proxy_service, so the
+        // handler hits the `state.proxy_service.as_ref().ok_or_else(...)`
+        // arm.
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing proxy_service MUST surface as 503 ServiceUnavailable, \
+             not 500 / not unwrap-panic (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Virtual repository member list response
     // -----------------------------------------------------------------------
 
@@ -6876,19 +8125,37 @@ mod tests {
         }
     }
 
-    /// A virtual repo with no `member_repos` field at all (the shape that
-    /// happens when an operator types `members: [...]` because the struct
-    /// uses `member_repos` and doesn't `deny_unknown_fields`) must 400 with
-    /// an actionable message.
+    /// A virtual repo with no `member_repos` field at all (the deferred-
+    /// population pattern used by every E2E test helper: create, then
+    /// `POST /members`) must be accepted. Pre-#1444 this 400'd, which
+    /// broke the create-then-add flow and surfaced as the "members router
+    /// 404" symptom because the follow-up POSTs targeted a nonexistent
+    /// repo. Empty-virtual state is now surfaced at fetch time instead of
+    /// create time, and self-heals on the first add_member.
     #[test]
-    fn test_validate_virtual_repo_member_count_rejects_none() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None)
-            .expect_err("None members must reject");
+    fn test_validate_virtual_repo_member_count_accepts_none_for_deferred_add() {
+        assert!(
+            validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, None).is_ok(),
+            "omitted member_repos must be accepted so the create-then-add \
+             flow works (regression of #1444)"
+        );
+    }
+
+    /// A virtual repo created with explicit `member_repos: []` is still a
+    /// clear operator mistake (caller has actively typed "zero members")
+    /// and must 400 with an actionable message. This preserves the #1279
+    /// discoverability win for the case where the operator's intent is
+    /// unambiguous, while the omitted-field case (above) flows through
+    /// to the deferred-add pattern.
+    #[test]
+    fn test_validate_virtual_repo_member_count_rejects_explicit_empty() {
+        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
+            .expect_err("explicit empty members must reject");
         match err {
             AppError::Validation(msg) => {
                 assert!(
-                    msg.contains("requires at least one member"),
-                    "message should explain the requirement; got: {}",
+                    msg.contains("explicit empty"),
+                    "message should call out the explicit-empty shape; got: {}",
                     msg
                 );
                 assert!(
@@ -6904,16 +8171,6 @@ mod tests {
             }
             other => panic!("expected AppError::Validation, got {:?}", other),
         }
-    }
-
-    /// A virtual repo created with `member_repos: []` is also unusable. The
-    /// validator must reject this with the same Validation error class as
-    /// the None case so the handler returns 400 (not 500) in both shapes.
-    #[test]
-    fn test_validate_virtual_repo_member_count_rejects_empty() {
-        let err = validate_virtual_repo_member_count("pypi", &RepositoryType::Virtual, Some(&[]))
-            .expect_err("empty members must reject");
-        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A virtual repo with one or more members passes validation. Pin both
@@ -7042,6 +8299,127 @@ mod tests {
             upstream_body,
             "streamed body bytes must round-trip from wiremock through \
              proxy_fetch_streaming and back to the caller"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_repository_purges_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // An in-flight upload temp object, tracked only by the cleanup-key journal.
+        let temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &temp_key,
+                bytes::Bytes::from_static(b"in-flight upload bytes"),
+            )
+            .await
+            .expect("write temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+             VALUES ($1, $2, NOW())",
+        )
+        .bind(fx.repo_id)
+        .bind(&temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("register cleanup key");
+        // A session storage_temp_key object (second UNION branch).
+        let session_id = Uuid::new_v4();
+        let session_temp_key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(
+                &session_temp_key,
+                bytes::Bytes::from_static(b"session temp"),
+            )
+            .await
+            .expect("write session temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, storage_temp_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(session_id)
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .bind(&session_temp_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload session");
+
+        // A part storage_key object (third UNION branch).
+        let part_key = format!("{}.part.00000000.{}", session_temp_key, Uuid::new_v4());
+        storage
+            .put(&part_key, bytes::Bytes::from_static(b"part bytes"))
+            .await
+            .expect("write part object");
+        sqlx::query(
+            "INSERT INTO oci_upload_parts (upload_session_id, part_index, storage_key, size_bytes, digest_sha256) \
+             VALUES ($1, 0, $2, $3, NULL)",
+        )
+        .bind(session_id)
+        .bind(&part_key)
+        .bind(10_i64)
+        .execute(&fx.pool)
+        .await
+        .expect("insert upload part");
+
+        // A COMMITTED blob — content-addressed, owned by oci_blobs, NOT an upload
+        // temp object. The purge must never touch it.
+        let blob_digest = format!("sha256:{}", "a".repeat(64));
+        let blob_key = format!("oci-blobs/{blob_digest}");
+        storage
+            .put(
+                &blob_key,
+                bytes::Bytes::from_static(b"committed blob bytes"),
+            )
+            .await
+            .expect("write committed blob");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(&blob_digest)
+        .bind(20_i64)
+        .bind(&blob_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        for k in [&temp_key, &session_temp_key, &part_key, &blob_key] {
+            assert!(
+                storage.exists(k).await.expect("exists"),
+                "precondition: {k} exists"
+            );
+        }
+
+        // The repo-delete purge must remove the journaled temp/session/part
+        // objects up front (once the repo row is deleted their owner rows CASCADE
+        // away), but must leave the committed blob untouched.
+        purge_repo_oci_upload_temp_objects(&state, fx.repo_id, &location).await;
+
+        for k in [&temp_key, &session_temp_key, &part_key] {
+            assert!(
+                !storage.exists(k).await.expect("exists after purge"),
+                "purge must remove OCI upload temp object {k}"
+            );
+        }
+        assert!(
+            storage
+                .exists(&blob_key)
+                .await
+                .expect("blob exists after purge"),
+            "purge must NOT delete the committed content-addressed blob {blob_key}"
         );
 
         fx.teardown().await;
@@ -7433,5 +8811,693 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual-repo /members + /cache-ttl sub-router registration (#1366)
+    // -----------------------------------------------------------------------
+    //
+    // Issue #1366 surfaced as 22 release-gate failures all reporting HTTP 404
+    // on `/api/v1/repositories/{key}/members` (and the sibling /cache-ttl
+    // route) for v1.2.0-rc.2. Investigation against the same commit
+    // (f81136eb) showed the routes are reachable end-to-end on a freshly
+    // built backend, so the source itself is not regressed -- the production
+    // failure was rooted elsewhere (likely a stale image / deploy artifact).
+    //
+    // These tests defend the router shape itself so a future refactor that
+    // accidentally drops one of the routes (the hypothesis the issue raised)
+    // would fail at `cargo test --workspace --lib` rather than slipping
+    // through to release-gate. The pattern matches the existing source-level
+    // regression for `/lxc` in `routes.rs::tests` (#1272): a runtime test
+    // would need a full DB + auth fixture which we already have elsewhere,
+    // but those tests cannot catch a route that was simply not registered
+    // (a missing route never reaches the handler under test). Source-level
+    // pins catch exactly that class of bug.
+    //
+    // Each assertion is built from `format!`d substrings so the test source
+    // itself does not satisfy the search if `include_str!` is replaced
+    // with a less specific lookup in a future refactor.
+    mod virtual_member_router_registration {
+        const SRC: &str = include_str!("repositories.rs");
+
+        fn router_fn_body() -> &'static str {
+            // Slice the `pub fn router()` body so route assertions do not
+            // accidentally match a route literal that appears inside a
+            // doc-comment or another function. The body starts at the
+            // signature and ends at the next top-level `pub` item.
+            let marker = "pub fn router() -> Router<SharedState> {";
+            let start = SRC
+                .find(marker)
+                .expect("repositories::router() definition must exist");
+            let after = &SRC[start..];
+            let end = after[1..]
+                .find("\npub ")
+                .map(|i| i + 1)
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+
+        #[test]
+        fn router_registers_members_get_post_put() {
+            // The combined route must include all three methods on a single
+            // `/:key/members` literal. Splitting them across multiple
+            // `.route()` calls is also valid axum, but the current shape is
+            // a single call -- if you change that, update this test in the
+            // same PR so the intent stays explicit.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            for method_handler in [
+                ("list_virtual_members", "get"),
+                ("add_virtual_member", "post"),
+                ("update_virtual_members", "put"),
+            ] {
+                let needle = format!("{}({})", method_handler.1, method_handler.0);
+                assert!(
+                    body.contains(&needle),
+                    "router() must bind {} via `{}` (regression of #1366)",
+                    method_handler.0,
+                    needle
+                );
+            }
+        }
+
+        #[test]
+        fn router_registers_members_delete_by_member_key() {
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}/:member_key\"", "members");
+            assert!(
+                body.contains(&path),
+                "router() must register the per-member delete route at {} (regression of #1366)",
+                path
+            );
+            let delete_handler = format!("delete({})", "remove_virtual_member");
+            assert!(
+                body.contains(&delete_handler),
+                "router() must bind remove_virtual_member via `{}` (regression of #1366)",
+                delete_handler
+            );
+        }
+
+        #[test]
+        fn router_registers_cache_ttl_put_and_get() {
+            // The release-gate failure for #1366 also flagged
+            // `PUT /repositories/{key}/cache-ttl` returning 404. cache-ttl is
+            // a sibling sub-resource of /members, so a regression that drops
+            // the virtual-member routes is likely to drop this one too. Pin
+            // both routes together so a single source-level read of
+            // `router()` covers the whole sub-router shape.
+            let body = router_fn_body();
+            let path = format!("\"/:key/{}\"", "cache-ttl");
+            assert!(
+                body.contains(&path),
+                "router() must register the {} sub-route (regression of #1366)",
+                path
+            );
+            let put_handler = format!("put({})", "set_cache_ttl");
+            let get_handler = format!("get({})", "get_cache_ttl");
+            assert!(
+                body.contains(&put_handler),
+                "router() must bind set_cache_ttl via `{}` (regression of #1366)",
+                put_handler
+            );
+            assert!(
+                body.contains(&get_handler),
+                "router() must bind get_cache_ttl via `{}` (regression of #1366)",
+                get_handler
+            );
+        }
+
+        #[test]
+        fn router_fn_marker_resolves_so_the_above_tests_are_not_vacuous() {
+            // Belt-and-suspenders: if a future refactor renames `router()`
+            // or changes its signature, `router_fn_body()` would panic and
+            // the three tests above would fail noisily rather than passing
+            // a `false.contains(...)` against an empty slice.
+            let body = router_fn_body();
+            assert!(
+                body.starts_with("pub fn router() -> Router<SharedState> {"),
+                "router_fn_body() did not anchor on the expected signature; \
+                 the route assertions above may be vacuously true. Refactor \
+                 hint: update the `marker` literal in router_fn_body() to \
+                 match the new signature."
+            );
+            // Sanity check that the body is non-trivial. A bare stub
+            // implementation (e.g. `Router::new()` only) would silently
+            // make every contains() assertion above fail with a
+            // not-found-substring message, which is the right outcome, but
+            // we also assert here so the failure mode is obvious.
+            assert!(
+                body.len() > 200,
+                "router() body is suspiciously short ({} bytes); the route \
+                 assertions above may be testing an empty router",
+                body.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WASM plugin format fallback in create_repository (regression tests)
+    //
+    // Format-string resolution lives in `RepositoryService::resolve_format`
+    // (see `services/repository_service.rs`). These end-to-end tests drive
+    // the HTTP handler so we verify both the resolve path and the wiring of
+    // the resolved `format_key` into the persisted row.
+    // -----------------------------------------------------------------------
+
+    /// Insert a `format_handlers` row for testing.  Returns the `format_key`
+    /// that was inserted.  The caller is responsible for deleting the row
+    /// after the test (use `cleanup_format_handler`).
+    async fn insert_format_handler(pool: &sqlx::PgPool, format_key: &str, is_enabled: bool) {
+        sqlx::query(
+            "INSERT INTO format_handlers \
+             (format_key, handler_type, display_name, is_enabled) \
+             VALUES ($1, 'wasm', $2, $3) \
+             ON CONFLICT (format_key) DO UPDATE \
+             SET is_enabled = EXCLUDED.is_enabled",
+        )
+        .bind(format_key)
+        .bind(format!("Test handler for {}", format_key))
+        .bind(is_enabled)
+        .execute(pool)
+        .await
+        .expect("insert format_handler");
+    }
+
+    async fn cleanup_format_handler(pool: &sqlx::PgPool, format_key: &str) {
+        sqlx::query("DELETE FROM format_handlers WHERE format_key = $1")
+            .bind(format_key)
+            .execute(pool)
+            .await
+            .expect("cleanup format_handler");
+    }
+
+    /// Helper: build an admin `AuthExtension` so the permission gate in
+    /// `create_repository` is bypassed without needing a database permission row.
+    fn admin_auth(user_id: Uuid, username: &str) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Build a `CreateRepositoryRequest` body as raw bytes from a minimal
+    /// JSON object, merging in `overrides` so individual tests only specify
+    /// the fields they care about. Returns bytes (matching the handler's
+    /// post-#1438 signature) so tests don't need to round-trip through the
+    /// `CreateRepositoryRequest` struct, which is `Deserialize`-only.
+    fn make_create_request(
+        key: &str,
+        name: &str,
+        format: &str,
+        overrides: serde_json::Value,
+    ) -> Bytes {
+        let mut base = serde_json::json!({
+            "key": key,
+            "name": name,
+            "format": format,
+            "repo_type": "local"
+        });
+        if let (serde_json::Value::Object(b), serde_json::Value::Object(o)) = (&mut base, overrides)
+        {
+            b.extend(o);
+        }
+        Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
+    }
+
+    /// When a format string is not a built-in variant but there IS an
+    /// **enabled** row in `format_handlers`, `create_repository` must succeed
+    /// and the resulting repository must have `format = Generic` and
+    /// `format_key = <the plugin key>`.
+    #[tokio::test]
+    async fn test_create_repository_with_enabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-wasm-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("wasm-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "WASM plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        let Json(resp) = result.expect("create_repository with enabled plugin format must succeed");
+        assert_eq!(
+            resp.format, "generic",
+            "plugin-backed repo must be stored as Generic format"
+        );
+
+        // Verify the format_key was persisted to the DB (RepositoryResponse does
+        // not expose format_key directly).
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT format_key FROM repositories WHERE key = $1")
+                .bind(&repo_key)
+                .fetch_optional(&pool)
+                .await
+                .expect("query format_key");
+
+        // Cleanup after reading so we don't delete the row before asserting.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(format_key.as_str()),
+            "plugin format key must be persisted to the repositories.format_key column"
+        );
+    }
+
+    /// When the format string maps to a **disabled** `format_handlers` row,
+    /// `create_repository` must return a `Validation` error whose message
+    /// mentions "disabled".
+    #[tokio::test]
+    async fn test_create_repository_with_disabled_plugin_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-disabled-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, false).await;
+
+        let payload = make_create_request(
+            &format!("disabled-repo-{}", Uuid::new_v4().simple()),
+            "Disabled plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("disabled plugin format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
+            "disabled plugin format must produce a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
+    /// When the format string is unknown and has **no** `format_handlers` row
+    /// at all, `create_repository` must return a `Validation` error.
+    #[tokio::test]
+    async fn test_create_repository_with_unknown_format() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let payload = make_create_request(
+            &format!("unknown-repo-{}", Uuid::new_v4().simple()),
+            "Unknown format repo",
+            // A format string that will never match any built-in or plugin.
+            "totally-unknown-zzz",
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("unknown format must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "unknown format must surface as Validation (400), got {err:?}",
+        );
+    }
+
+    /// Build a non-admin `AuthExtension`. Used to confirm that the same
+    /// admin/create-repo gate that protects built-in format creation also
+    /// guards the WASM-plugin codepath. Without this, a plugin-format string
+    /// could be a route around the gate.
+    fn non_admin_auth(
+        user_id: Uuid,
+        username: &str,
+    ) -> crate::api::middleware::auth::AuthExtension {
+        crate::api::middleware::auth::AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{}@test.local", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// A non-admin caller with no `system:admin` permission must receive an
+    /// `Authorization` error even when the requested format is a valid,
+    /// enabled WASM plugin format. The plugin codepath inherits the same
+    /// permission gate as built-in formats; there is no privileged shortcut.
+    #[tokio::test]
+    async fn test_create_repository_plugin_format_rejects_non_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let format_key = format!("test-noadmin-{}", Uuid::new_v4().simple());
+        insert_format_handler(&pool, &format_key, true).await;
+
+        let repo_key = format!("noadmin-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Non-admin plugin repo",
+            &format_key,
+            serde_json::json!({}),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(non_admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        // Cleanup: the request should NOT have created a repo row, but delete
+        // defensively in case the assertion below fails.
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_format_handler(&pool, &format_key).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err = result.expect_err("non-admin must be denied even for plugin formats");
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1443 regression: lookup_path_candidates + is_npm_family_format
+    //
+    // npm publish stores tarballs under the version-segmented shape, but
+    // external callers (release-gate smoke test, JFrog-compatible
+    // tooling) supply the canonical npm download-URL shape
+    // (`<name>/-/<name>-<version>.tgz`). `get_artifact_metadata` walks
+    // this list of candidates so the literal request always wins for
+    // formats that don't normalise, and npm-family repos quietly fall
+    // back to the stored path on the second probe.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_path_candidates_npm_url_shape_adds_stored_fallback() {
+        let candidates =
+            lookup_path_candidates("rfs-pkg/-/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "rfs-pkg/-/rfs-pkg-1.0.0.tgz".to_string(),
+                "rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_scoped_url_shape() {
+        let candidates =
+            lookup_path_candidates("@angular/core/-/core-17.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "@angular/core/-/core-17.0.0.tgz".to_string(),
+                "@angular/core/17.0.0/core-17.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_stored_shape_passthrough() {
+        // When the caller already supplies the stored shape,
+        // normalize_lookup_path returns None and we issue exactly one
+        // query against the literal path.
+        let candidates =
+            lookup_path_candidates("rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec!["rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_metadata_path_not_rewritten() {
+        // package.json / packument paths don't end in .tgz so
+        // normalize_lookup_path returns None and only the literal path
+        // is tried.
+        let candidates = lookup_path_candidates("lodash/package.json", &RepositoryFormat::Npm);
+        assert_eq!(candidates, vec!["lodash/package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_non_npm_format_unchanged() {
+        // Maven repos must never have their paths rewritten by the npm
+        // normaliser, even if a path coincidentally matches `/-/` (it
+        // doesn't here, but the guard fires before normalisation
+        // anyway).
+        let candidates =
+            lookup_path_candidates("com/example/lib/1.0/lib-1.0.jar", &RepositoryFormat::Maven);
+        assert_eq!(
+            candidates,
+            vec!["com/example/lib/1.0/lib-1.0.jar".to_string()]
+        );
+
+        // And even a path that looks npm-shaped is left alone outside
+        // npm-family repos.
+        let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &RepositoryFormat::Generic);
+        assert_eq!(candidates, vec!["foo/-/foo-1.0.0.tgz".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_yarn_pnpm_bower_apply_normalisation() {
+        // Yarn, pnpm, and bower all wrap the npm wire format. They
+        // share the publish/download layout so the same normalisation
+        // must fire for them.
+        for fmt in [
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+            RepositoryFormat::Bower,
+        ] {
+            let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &fmt);
+            assert_eq!(
+                candidates,
+                vec![
+                    "foo/-/foo-1.0.0.tgz".to_string(),
+                    "foo/1.0.0/foo-1.0.0.tgz".to_string(),
+                ],
+                "format {fmt:?} must inherit npm path normalisation",
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_npm_family_format_membership() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        // Negative cases: every format outside the npm wire-protocol
+        // family must NOT inherit npm path normalisation.
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Pypi));
+        assert!(!is_npm_family_format(&RepositoryFormat::Docker));
+        assert!(!is_npm_family_format(&RepositoryFormat::Generic));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
+    }
+
+    /// HTTP-level regression test for #1444: GET /:key/members against a
+    /// freshly-created virtual repo (no members yet) must return 2xx, not 404.
+    ///
+    /// This is the load-bearing assertion behind the user-reported "the
+    /// reproducer still fails" comment on #1444. Pre-fix, the chain was:
+    ///   1. test infra POSTs `/api/v1/repositories` for a virtual repo WITHOUT
+    ///      `member_repos` (the standard deferred-population shape).
+    ///   2. #1281's validator 400'd that request, so the virtual was never
+    ///      created.
+    ///   3. The follow-up POST `/repositories/{key}/members` then 404'd because
+    ///      the repo did not exist -- which the release-gate report classified
+    ///      as "the members sub-router is unmounted".
+    ///
+    /// Post-fix, step 1 succeeds with an empty-virtual repo. The /members
+    /// router has always been mounted; this test exercises it via the actual
+    /// axum `Router` (built from `router()`) so a future refactor that DOES
+    /// unmount the route fails this test in addition to the source-text pin
+    /// in `virtual_member_router_registration`.
+    #[tokio::test]
+    async fn test_members_route_returns_2xx_on_freshly_created_empty_virtual_1444() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::extract::{Extension, State};
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir =
+            std::env::temp_dir().join(format!("members-1444-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Step 1: create the virtual repo via the actual `create_repository`
+        // handler with `member_repos` OMITTED -- the deferred-population shape
+        // every E2E test helper uses.
+        let repo_key = format!("v-1444-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "Virtual 1444 regression",
+            "generic",
+            serde_json::json!({ "repo_type": "virtual" }),
+        );
+        // Post-#1438 `create_repository` takes `body: Bytes` so auth runs
+        // before body deserialisation. `make_create_request` already returns
+        // `Bytes`; pass it through directly (no `Json(...)` wrapper).
+        let create_result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        // The whole point of #1444 is that this NO LONGER returns 400.
+        let _created = create_result
+            .expect("create_repository must accept virtual repo with member_repos omitted (#1444)");
+
+        // Step 2: drive the actual /members route via axum::Router::oneshot.
+        // We mount `router()` as-is, wrap it in the auth-injection layer the
+        // production router applies, and hit GET /{key}/members.
+        let router = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            admin_auth(user_id, &username),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/members", repo_key))
+            .body(Body::empty())
+            .expect("build GET /members request");
+        let (status, body) = tdh::send(router, req).await;
+
+        // Cleanup before asserting so a panic does not leak DB state.
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id IN \
+                     (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET /:key/members on a freshly-created empty virtual must NOT return \
+             404 (regression of #1444 -- the symptom that the release-gate Full \
+             Suite classified as \"members sub-router unmounted\"); got body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            status.is_success(),
+            "GET /:key/members on a freshly-created empty virtual must return 2xx; \
+             got {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
     }
 }

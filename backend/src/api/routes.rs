@@ -145,12 +145,22 @@ pub fn create_router(state: SharedState) -> Router {
     // login/setup/health/OCI challenge). The guard performs its own token
     // resolution so it can run as a global outer layer regardless of which
     // inner auth middleware (if any) the matched route uses.
+    //
+    // Register this long-lived AuthService's token cache with the global
+    // invalidation registry so a deactivation (issue #931 / #1371) flushes
+    // its cached API-token validations immediately. Without this the guard
+    // would keep accepting a deactivated user's API token from its own cache
+    // even though the inner auth_service rejects it, because the guard runs
+    // FIRST and its `pass/fail` decision is what produces the 401 here when
+    // `guest_access_enabled=false`.
+    let guest_auth_service = Arc::new(AuthService::new(
+        state.db.clone(),
+        Arc::new(state.config.clone()),
+    ));
+    guest_auth_service.register_for_global_flush();
     let guest_access_state = GuestAccessState {
         guest_access_enabled: state.config.guest_access_enabled,
-        auth_service: Arc::new(AuthService::new(
-            state.db.clone(),
-            Arc::new(state.config.clone()),
-        )),
+        auth_service: guest_auth_service,
     };
     router = router.layer(middleware::from_fn_with_state(
         guest_access_state,
@@ -403,7 +413,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     optional_auth_middleware,
                 )),
         )
-        // Permission routes with auth middleware
+        // Permission routes with auth middleware.
+        //
+        // The permission handlers declare `Extension<Option<AuthExtension>>`
+        // and do their own authorization (require_auth + require_scope /
+        // require_admin). `auth_middleware` now injects BOTH the bare
+        // `AuthExtension` and an `Option<AuthExtension>` (see its body), so
+        // either extractor shape resolves. Before that fix the
+        // `Option<AuthExtension>` extractor failed during request extraction
+        // with HTTP 500 ("Missing request extension: Extension of type
+        // Option<AuthExtension>") before the in-handler scope check ran, so a
+        // read-scope service-account token got 500 instead of the canonical
+        // 403 on POST /api/v1/permissions. Hard auth (401 for anonymous) is
+        // preserved because auth_middleware still rejects unauthenticated
+        // requests up front. See #1438 (B10).
         .nest(
             "/permissions",
             handlers::permissions::router()

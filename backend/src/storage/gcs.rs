@@ -45,6 +45,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
 use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
@@ -54,7 +56,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::error::{AppError, Result};
-use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend, StoragePathFormat};
+use crate::storage::{
+    PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
+};
 
 /// GCP metadata server URL for fetching access tokens.
 const GCP_METADATA_TOKEN_URL: &str =
@@ -76,6 +80,90 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+/// Response from the GCS objects.rewrite endpoint.
+#[derive(serde::Deserialize)]
+struct RewriteResponse {
+    done: bool,
+    #[serde(rename = "rewriteToken")]
+    rewrite_token: Option<String>,
+}
+
+/// Chunk size for the resumable upload protocol. GCS requires every
+/// non-final chunk to be an exact multiple of 256 KiB. 32 MiB satisfies that
+/// (32 MiB = 128 * 256 KiB) and keeps the in-flight heap footprint bounded
+/// regardless of artifact size.
+const RESUMABLE_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Max attempts for a single resumable chunk PUT before giving up.
+const CHUNK_MAX_ATTEMPTS: u32 = 3;
+
+/// Build the `Content-Range` header value for a resumable chunk PUT.
+///
+/// `start` is the byte offset of the first byte in this chunk, `len` is the
+/// chunk's byte length, and `total` is `Some(total_size)` only for the final
+/// chunk (GCS finalizes the object once it learns the total) and `None` for
+/// intermediate chunks ("more to come").
+///
+/// Examples:
+/// - intermediate first chunk: `bytes 0-33554431/*`
+/// - final chunk of a 40 MiB object: `bytes 33554432-41943039/41943040`
+fn content_range(start: u64, len: u64, total: Option<u64>) -> String {
+    let total_str = match total {
+        Some(t) => t.to_string(),
+        None => "*".to_string(),
+    };
+    if len == 0 {
+        // No bytes in this request: used for the terminal "finalize" PUT when
+        // the upload ended exactly on a chunk boundary, or a zero-byte object.
+        format!("bytes */{}", total_str)
+    } else {
+        let end = start + len - 1;
+        format!("bytes {}-{}/{}", start, end, total_str)
+    }
+}
+
+/// Parse the `Range` header GCS returns on a 308 status-query response and
+/// return the next byte offset to send (the confirmed-last byte + 1).
+///
+/// GCS resumable uploads always start at byte 0, so a valid header is exactly
+/// `bytes=0-<n>` (case-insensitive `bytes=` prefix). Returns `None` for any
+/// other shape (missing `bytes=` prefix, a non-zero start, a non-numeric end,
+/// or trailing junk) so the caller can treat it as a hard error rather than
+/// silently resyncing to offset 0.
+fn parse_resumable_range_next(header: &str) -> Option<u64> {
+    let header = header.trim();
+    // Strip the "bytes=" prefix (case-insensitive on the literal "bytes").
+    let rest = header
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        .map(|_| &header[6..])?;
+    let (start, end) = rest.split_once('-')?;
+    // Resumable uploads always begin at byte 0.
+    if start.trim() != "0" {
+        return None;
+    }
+    let confirmed_last: u64 = end.trim().parse().ok()?;
+    confirmed_last.checked_add(1)
+}
+
+/// True if an upstream HTTP status is a transient failure worth retrying
+/// (429 Too Many Requests, or any 5xx).
+fn is_transient_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+/// Map a failed upstream status to the right `AppError`. Transient statuses
+/// (429/5xx) become `ServiceUnavailable` (HTTP 503, retryable by callers);
+/// everything else stays `Storage` (HTTP 500).
+fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
+    let msg = format!("{} (status {}): {}", context, status, body);
+    if is_transient_status(status) {
+        AppError::ServiceUnavailable(msg)
+    } else {
+        AppError::Storage(msg)
+    }
+}
+
 /// Check that an HTTP response indicates success; return an error with context otherwise.
 async fn require_success(
     response: reqwest::Response,
@@ -84,12 +172,9 @@ async fn require_success(
     if response.status().is_success() {
         return Ok(response);
     }
-    let status = response.status();
+    let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
-    Err(AppError::Storage(format!(
-        "{} (status {}): {}",
-        context, status, body
-    )))
+    Err(map_status_error(status, context, &body))
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +458,14 @@ impl GcsConfig {
 /// Google Cloud Storage backend.
 pub struct GcsBackend {
     config: GcsConfig,
+    /// Control-plane client (get/put/exists/delete/metadata/list, token
+    /// acquisition). Short 30 s timeout so a stuck control op fails fast.
     client: reqwest::Client,
+    /// Long-timeout client used only for the streaming GET (`get_stream`) and
+    /// the resumable PUT chunks in `put_stream`. A multi-GiB resumable upload's
+    /// total can run for many minutes; bounding it at 30 min keeps a cliff in
+    /// place without leaking that long timeout onto fast control-plane calls.
+    stream_client: reqwest::Client,
     auth: GcsAuthMode,
     path_format: StoragePathFormat,
     /// API base URL (overridable in tests via `with_base_url`).
@@ -383,10 +475,24 @@ pub struct GcsBackend {
 impl GcsBackend {
     /// Create a new GCS backend.
     pub async fn new(config: GcsConfig) -> Result<Self> {
+        // Control-plane client: 30 s is plenty for metadata, list, delete, and
+        // single-shot puts of single-MB OCI layers. Token acquisition rides
+        // this client too.
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+
+        // Streaming client: a multi-GiB resumable upload's total can run for
+        // many minutes; bound the cliff at 30 min. Per-chunk PUTs stay well
+        // under this on intra-GCP networking, but the streaming GET of a large
+        // object can legitimately run long.
+        let stream_client = crate::services::http_client::base_client_builder()
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .map_err(|e| {
+                AppError::Storage(format!("Failed to create streaming HTTP client: {}", e))
+            })?;
 
         let auth = if let Some(ref key_pem) = config.private_key {
             let key_pem = key_pem.replace("\\n", "\n");
@@ -427,6 +533,7 @@ impl GcsBackend {
         Ok(Self {
             config,
             client,
+            stream_client,
             auth,
             path_format,
             base_url: GCS_BASE_URL.to_string(),
@@ -501,7 +608,7 @@ impl GcsBackend {
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/octet-stream")
-            .body(content.to_vec())
+            .body(content)
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))
@@ -512,6 +619,20 @@ impl GcsBackend {
         let token = self.get_bearer_token().await?;
 
         self.client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+    }
+
+    /// GET request on the long-timeout streaming client. Used only by
+    /// `get_stream`, where pulling a multi-GiB body can legitimately run far
+    /// past the 30 s control-plane budget.
+    async fn authorized_get_stream(&self, url: &str) -> Result<reqwest::Response> {
+        let token = self.get_bearer_token().await?;
+
+        self.stream_client
             .get(url)
             .header("Authorization", format!("Bearer {}", token))
             .send()
@@ -666,26 +787,67 @@ impl GcsBackend {
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let token = self.get_bearer_token().await?;
         let bucket_enc = urlencoding::encode(&self.config.bucket);
-        let url = format!(
-            "{}/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
+        let base_url = format!(
+            "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
             self.base_url,
             bucket_enc,
             urlencoding::encode(source),
             bucket_enc,
             urlencoding::encode(dest),
         );
+        let mut rewrite_token: Option<String> = None;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS copy failed: {}", e)))?;
+        // GCS server-side rewrite is paginated: each continuation copies as much
+        // as GCS chooses (we set no `maxBytesRewrittenPerCall`) and is a fast
+        // sub-second metadata op, so even a 5 TiB object (GCS's max) completes in
+        // far fewer than this cap, reusing the single bearer token fetched above
+        // well within its lifetime. The cap is purely a defensive backstop
+        // against a non-conformant endpoint that never reports `done` (or rotates
+        // a token without progressing), matching the explicit limits on the S3
+        // part / Azure block loops.
+        const MAX_REWRITE_ITERATIONS: usize = 100_000;
 
-        require_success(response, "GCS copy failed").await?;
-        Ok(())
+        for _ in 0..MAX_REWRITE_ITERATIONS {
+            let url = match rewrite_token.as_deref() {
+                Some(token) => format!("{}?rewriteToken={}", base_url, urlencoding::encode(token)),
+                None => base_url.clone(),
+            };
+
+            let response = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Length", "0")
+                .send()
+                .await
+                .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))?;
+
+            let response = require_success(response, "GCS rewrite failed").await?;
+            let rewrite: RewriteResponse = response.json().await.map_err(|e| {
+                AppError::Storage(format!("Failed to parse GCS rewrite response: {}", e))
+            })?;
+
+            if rewrite.done {
+                return Ok(());
+            }
+
+            rewrite_token = rewrite.rewrite_token;
+            if rewrite_token.is_none() {
+                tracing::warn!(
+                    source = %source,
+                    dest = %dest,
+                    "GCS rewrite response was incomplete and did not include rewriteToken"
+                );
+                return Err(AppError::Storage(
+                    "GCS rewrite response missing rewriteToken".to_string(),
+                ));
+            }
+        }
+
+        Err(AppError::Storage(format!(
+            "GCS rewrite of '{}' -> '{}' did not complete within {} iterations",
+            source, dest, MAX_REWRITE_ITERATIONS
+        )))
     }
 
     /// Get the size of an object in bytes.
@@ -806,6 +968,378 @@ impl GcsBackend {
 
         Ok(signed_url)
     }
+
+    // ---- Resumable upload helpers ----
+
+    /// Initiate a resumable upload session. Returns the session URL from the
+    /// `Location` header.
+    async fn initiate_resumable_session(&self, key: &str) -> Result<String> {
+        let token = self.get_bearer_token().await?;
+        let initiate_url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=resumable&name={}",
+            self.base_url,
+            urlencoding::encode(&self.config.bucket),
+            urlencoding::encode(key),
+        );
+
+        let init_response = self
+            .stream_client
+            .post(&initiate_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", "0")
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS resumable initiate failed: {}", e)))?;
+
+        if !init_response.status().is_success() {
+            let status = init_response.status().as_u16();
+            let body = init_response.text().await.unwrap_or_default();
+            return Err(map_status_error(
+                status,
+                "GCS resumable initiate failed",
+                &body,
+            ));
+        }
+
+        init_response
+            .headers()
+            .get("Location")
+            .ok_or_else(|| {
+                AppError::Storage("GCS resumable initiate returned no Location header".to_string())
+            })?
+            .to_str()
+            .map_err(|e| AppError::Storage(format!("GCS Location header not valid UTF-8: {}", e)))
+            .map(|s| s.to_string())
+    }
+
+    /// Best-effort abort of a resumable session so a failed upload does not
+    /// leave an orphaned, billable session behind. Errors are logged and
+    /// swallowed: the caller is already returning the original failure.
+    async fn abort_resumable_session(&self, session_url: &str) {
+        match self.stream_client.delete(session_url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                // GCS returns 499 / 4xx for an aborted session; any non-error
+                // outcome means the session is gone.
+                if !(status.is_success() || status.as_u16() == 499) {
+                    tracing::warn!(
+                        status = %status,
+                        "GCS resumable session abort returned unexpected status"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "GCS resumable session abort request failed");
+            }
+        }
+    }
+
+    /// Query the confirmed offset of a resumable session. GCS replies 308 with
+    /// a `Range: bytes=0-N` header indicating bytes it has durably received
+    /// (so the next byte to send is N+1). No `Range` header means zero bytes
+    /// confirmed. A 2xx means the object is already finalized.
+    ///
+    /// Returns `Some(next_offset)` for an in-progress session, `None` if the
+    /// session is already complete.
+    async fn query_resumable_offset(
+        &self,
+        session_url: &str,
+        total: Option<u64>,
+    ) -> Result<Option<u64>> {
+        let resp = self
+            .stream_client
+            .put(session_url)
+            .header("Content-Length", "0")
+            .header("Content-Range", content_range(0, 0, total))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS resumable status query failed: {}", e)))?;
+
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            // Already finalized.
+            return Ok(None);
+        }
+        if status != 308 {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status_error(
+                status,
+                "GCS resumable status query failed",
+                &body,
+            ));
+        }
+
+        // No Range header on a 308 means GCS has durably received zero bytes,
+        // so the next byte to send is offset 0.
+        let range_header = match resp.headers().get("Range") {
+            None => return Ok(Some(0)),
+            Some(v) => v,
+        };
+
+        // A present Range header must be exactly "bytes=0-N" (resumable uploads
+        // always start at byte 0). Anything else is malformed: rather than
+        // silently resyncing to offset 0 (which would re-PUT already-accepted
+        // bytes and can leave the session in a mismatched state), fail the chunk
+        // so the upload aborts cleanly.
+        let parsed = range_header
+            .to_str()
+            .ok()
+            .and_then(parse_resumable_range_next)
+            .ok_or_else(|| {
+                let raw = range_header.to_str().unwrap_or("<non-utf8>").to_string();
+                AppError::Storage(format!(
+                    "GCS resumable status query returned malformed Range header: {:?}",
+                    raw
+                ))
+            })?;
+        Ok(Some(parsed))
+    }
+
+    /// Issue an explicit terminal finalize PUT (`Content-Range: bytes */<total>`,
+    /// zero-length body) and require a 2xx response.
+    ///
+    /// A 308-confirmed offset from `query_resumable_offset` only means GCS has
+    /// durably *received* every byte; it does NOT mean the object is finalized.
+    /// GCS only finalizes when a PUT declares the total size and it answers
+    /// 200/201. On a resumed final chunk the total may only have been declared
+    /// on the PUT that failed, so the session can still be open even though all
+    /// bytes landed. This terminal PUT closes that gap: we treat the upload as
+    /// done only once GCS confirms finalization with a 2xx. A non-2xx (other
+    /// than a transient that the caller may retry) is surfaced as an error.
+    async fn finalize_resumable(&self, session_url: &str, total: u64) -> Result<()> {
+        let range = content_range(0, 0, Some(total));
+        let resp = self
+            .stream_client
+            .put(session_url)
+            .header("Content-Length", "0")
+            .header("Content-Range", &range)
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "GCS resumable finalize (range {}) network error: {}",
+                    range, e
+                ))
+            })?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(map_status_error(
+            status,
+            &format!("GCS resumable finalize (range {}) not confirmed", range),
+            &body,
+        ))
+    }
+
+    /// PUT one resumable chunk with bounded retry on transient failures.
+    ///
+    /// `start` is the absolute offset of the first byte; `final_total` is
+    /// `Some(total)` for the terminal chunk, `None` otherwise. On a transient
+    /// status (429/5xx) or a network error the chunk is retried after a short
+    /// backoff; before each retry we query the confirmed offset and slice the
+    /// already-accepted prefix off the chunk so we resume cleanly rather than
+    /// re-sending bytes GCS already has.
+    ///
+    /// Returns the new absolute offset after the chunk is accepted.
+    async fn put_chunk_with_retry(
+        &self,
+        session_url: &str,
+        start: u64,
+        chunk: Vec<u8>,
+        final_total: Option<u64>,
+    ) -> Result<u64> {
+        let mut offset = start;
+        let mut body = chunk;
+        let chunk_end_exclusive = start + body.len() as u64;
+        let mut last_err: Option<AppError> = None;
+
+        for attempt in 1..=CHUNK_MAX_ATTEMPTS {
+            let len = body.len() as u64;
+            let range = content_range(offset, len, final_total);
+
+            let send_result = self
+                .stream_client
+                .put(session_url)
+                .header("Content-Length", len.to_string())
+                .header("Content-Range", &range)
+                .body(body.clone())
+                .send()
+                .await;
+
+            match send_result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let ok = if final_total.is_some() {
+                        // Final chunk: GCS finalizes with 200/201.
+                        resp.status().is_success()
+                    } else {
+                        // Intermediate chunk: 308 Resume Incomplete.
+                        status == 308
+                    };
+                    if ok {
+                        return Ok(chunk_end_exclusive);
+                    }
+
+                    if is_transient_status(status) && attempt < CHUNK_MAX_ATTEMPTS {
+                        last_err = Some(map_status_error(
+                            status,
+                            &format!("GCS resumable PUT (range {})", range),
+                            "",
+                        ));
+                    } else {
+                        let resp_body = resp.text().await.unwrap_or_default();
+                        return Err(map_status_error(
+                            status,
+                            &format!("GCS resumable PUT (range {}) returned {}", range, status),
+                            &resp_body,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if attempt < CHUNK_MAX_ATTEMPTS {
+                        last_err = Some(AppError::ServiceUnavailable(format!(
+                            "GCS resumable PUT (range {}) network error: {}",
+                            range, e
+                        )));
+                    } else {
+                        return Err(AppError::ServiceUnavailable(format!(
+                            "GCS resumable PUT (range {}) network error: {}",
+                            range, e
+                        )));
+                    }
+                }
+            }
+
+            // Backoff, then resync against the confirmed offset so we don't
+            // resend bytes GCS already durably accepted.
+            tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+            match self.query_resumable_offset(session_url, final_total).await {
+                Ok(None) => {
+                    // The status query saw a 2xx: the object is already
+                    // finalized. This is the only signal that confirms
+                    // finalization, so it is safe to report success.
+                    return Ok(chunk_end_exclusive);
+                }
+                Ok(Some(confirmed_next)) => {
+                    if confirmed_next >= chunk_end_exclusive {
+                        // Every byte of this chunk landed during the failed
+                        // attempt, but a 308 only confirms bytes RECEIVED, not
+                        // a finalized object. For the terminal chunk we must
+                        // still send an explicit finalize PUT and require a 2xx
+                        // before reporting success, otherwise we would return Ok
+                        // on a session GCS never closed.
+                        if let Some(total) = final_total {
+                            self.finalize_resumable(session_url, total).await?;
+                        }
+                        return Ok(chunk_end_exclusive);
+                    }
+                    if confirmed_next > offset {
+                        let drop = (confirmed_next - offset) as usize;
+                        body.drain(0..drop.min(body.len()));
+                        offset = confirmed_next;
+                    }
+                }
+                Err(e) => {
+                    // A status query that itself fails (e.g. malformed Range,
+                    // see parse_resumable_range_next) is not recoverable: abort
+                    // the chunk rather than blindly resending from a guessed
+                    // offset.
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            AppError::ServiceUnavailable("GCS resumable PUT exhausted retries".to_string())
+        }))
+    }
+
+    /// Drive the resumable upload loop after the session is initiated.
+    ///
+    /// `initial` is the first buffer already read by `put_stream` (guaranteed
+    /// to be at least one full chunk when this is called). `stream_done`
+    /// indicates whether `initial` is the entire remaining input. The hasher is
+    /// updated by the caller as bytes are read, so this method does not hash.
+    ///
+    /// Intermediate PUTs send exactly `RESUMABLE_CHUNK_SIZE` bytes (256-KiB
+    /// aligned); the remainder is carried forward. The final PUT carries the
+    /// known total so GCS finalizes the object. An upload that ends exactly on
+    /// a chunk boundary still sends a terminal zero-length `PUT bytes */<total>`
+    /// to finalize.
+    ///
+    /// Returns the total number of bytes written.
+    async fn stream_resumable_chunks(
+        &self,
+        session_url: &str,
+        hasher: &mut sha2::Sha256,
+        initial: Vec<u8>,
+        stream: &mut BoxStream<'static, Result<Bytes>>,
+        mut stream_done: bool,
+    ) -> Result<u64> {
+        let mut buffer = initial;
+        let mut total_bytes: u64 = 0;
+
+        loop {
+            // Top up the buffer to at least one chunk (unless the stream ended).
+            while buffer.len() < RESUMABLE_CHUNK_SIZE && !stream_done {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        hasher.update(&bytes);
+                        buffer.extend_from_slice(&bytes);
+                    }
+                    Some(Err(e)) => {
+                        return Err(AppError::Storage(format!(
+                            "stream read error during GCS upload: {}",
+                            e
+                        )));
+                    }
+                    None => stream_done = true,
+                }
+            }
+
+            if stream_done {
+                // Final flush: send everything left as the terminal chunk with
+                // the known total so GCS finalizes the object.
+                let final_total = total_bytes + buffer.len() as u64;
+
+                if buffer.is_empty() {
+                    // Upload ended exactly on a chunk boundary. Send a terminal
+                    // zero-length PUT so GCS finalizes (it has all bytes but has
+                    // not been told the total yet).
+                    let _ = self
+                        .put_chunk_with_retry(
+                            session_url,
+                            total_bytes,
+                            Vec::new(),
+                            Some(final_total),
+                        )
+                        .await?;
+                } else {
+                    let chunk = std::mem::take(&mut buffer);
+                    total_bytes = self
+                        .put_chunk_with_retry(session_url, total_bytes, chunk, Some(final_total))
+                        .await?;
+                }
+                return Ok(total_bytes);
+            }
+
+            // Intermediate flush: send exactly one 256-KiB-aligned chunk and
+            // carry the overshoot into the next iteration.
+            debug_assert!(buffer.len() >= RESUMABLE_CHUNK_SIZE);
+            let remainder = buffer.split_off(RESUMABLE_CHUNK_SIZE);
+            let chunk = std::mem::replace(&mut buffer, remainder);
+            total_bytes = self
+                .put_chunk_with_retry(session_url, total_bytes, chunk, None)
+                .await?;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1352,93 @@ impl StorageBackend for GcsBackend {
         let response = self.authorized_put(key, content).await?;
         require_success(response, "GCS upload failed").await?;
         Ok(())
+    }
+
+    /// Streaming upload to GCS via the JSON API's resumable-upload protocol.
+    /// Splits the input stream into 32 MiB chunks; each chunk is a short PUT to
+    /// the session URL. The final chunk sends the known total size; intermediate
+    /// chunks use `*` ("more to come") per the GCS spec.
+    ///
+    /// Why not a single `reqwest::Body::wrap_stream` PUT? That dies on the
+    /// gateway timeout for multi-GiB artifacts — Envoy / GCP's HTTPS LB caps an
+    /// individual request at ~3 min, which a 3.4 GiB single-shot upload exceeds.
+    /// Resumable upload moves the work into many short requests (each chunk PUT
+    /// completes in ~1 s on intra-GCP networking), so the per-request budget is
+    /// never the bottleneck; total time tracks GCS throughput, not a timeout.
+    ///
+    /// Chunk alignment: GCS requires every non-final chunk to be an exact
+    /// multiple of 256 KiB or it rejects the intermediate `Content-Range` with
+    /// HTTP 400. We therefore flush exactly `RESUMABLE_CHUNK_SIZE` bytes per
+    /// intermediate PUT (32 MiB is 256-KiB-aligned) and carry the remainder
+    /// into the next iteration, never letting an incoming `Bytes` chunk that
+    /// straddles the boundary push the request size off the alignment.
+    ///
+    /// Small objects (the whole stream fits in the first sub-chunk buffer) skip
+    /// the resumable handshake entirely and go through a single-shot `put()`,
+    /// avoiding two extra round-trips for tiny artifacts the proxy cache writes.
+    ///
+    /// On any error after the session is initiated the session is aborted with
+    /// a best-effort DELETE so GCS does not retain an orphaned upload session.
+    async fn put_stream(
+        &self,
+        key: &str,
+        mut stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use sha2::Sha256 as Sha256Inner;
+
+        let mut hasher = Sha256Inner::new();
+        // Accumulate enough to decide whether this is a small object. We buffer
+        // up to one full chunk before initiating the session.
+        let mut buffer: Vec<u8> = Vec::with_capacity(RESUMABLE_CHUNK_SIZE);
+        let mut stream_done = false;
+
+        while buffer.len() < RESUMABLE_CHUNK_SIZE && !stream_done {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    hasher.update(&bytes);
+                    buffer.extend_from_slice(&bytes);
+                }
+                Some(Err(e)) => {
+                    return Err(AppError::Storage(format!(
+                        "stream read error before GCS upload: {}",
+                        e
+                    )));
+                }
+                None => stream_done = true,
+            }
+        }
+
+        // Small-object fast path: the entire stream fit in the first buffer
+        // (strictly less than one chunk). Skip the resumable handshake and do a
+        // single-shot upload. Covers zero-byte objects too.
+        if stream_done && buffer.len() < RESUMABLE_CHUNK_SIZE {
+            let bytes_written = buffer.len() as u64;
+            let response = self.authorized_put(key, Bytes::from(buffer)).await?;
+            require_success(response, "GCS upload failed").await?;
+            return Ok(PutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written,
+            });
+        }
+
+        // Large object: run the resumable protocol. Initiate the session first.
+        let session_url = self.initiate_resumable_session(key).await?;
+
+        // From here on, any error must abort the session to avoid leaking it.
+        let result = self
+            .stream_resumable_chunks(&session_url, &mut hasher, buffer, &mut stream, stream_done)
+            .await;
+
+        match result {
+            Ok(total_bytes) => Ok(PutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total_bytes,
+            }),
+            Err(e) => {
+                self.abort_resumable_session(&session_url).await;
+                Err(e)
+            }
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
@@ -839,6 +1460,38 @@ impl StorageBackend for GcsBackend {
         }
 
         // Propagate the error via require_success (always fails for non-2xx)
+        require_success(response, "GCS download failed").await?;
+        unreachable!()
+    }
+
+    /// Stream the object body without buffering it in a single `Bytes`. The
+    /// default trait impl wraps `get()` in a one-item stream, which forces the
+    /// entire object onto the heap before the consumer can write it to disk —
+    /// for a 3+ GiB scan input that alone can exceed node-allocatable on small
+    /// pools and OOM-kill the pod. `bytes_stream()` pulls chunks straight from
+    /// the HTTPS connection, keeping the in-flight footprint at reqwest's TCP
+    /// read buffer (~64 KiB) instead of object-size.
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let url = self.object_download_url(key);
+        let response = self.authorized_get_stream(&url).await?;
+
+        if response.status().is_success() {
+            let stream = response.bytes_stream().map(|r| {
+                r.map_err(|e| AppError::Storage(format!("GCS stream chunk read failed: {}", e)))
+            });
+            return Ok(Box::pin(stream));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // The migration-mode Artifactory fallback still buffers
+            // (try_fallback_get returns Bytes); wrap it in a single-item stream
+            // so the caller's interface stays uniform.
+            if let Some(bytes) = self.try_fallback_get(key).await? {
+                return Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })));
+            }
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+
         require_success(response, "GCS download failed").await?;
         unreachable!()
     }
@@ -868,6 +1521,10 @@ impl StorageBackend for GcsBackend {
         }
         require_success(response, "GCS delete failed").await?;
         Ok(())
+    }
+
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        GcsBackend::copy(self, source, dest).await
     }
 
     /// Fetch the GCS object's `etag` field via the JSON metadata endpoint
@@ -984,6 +1641,175 @@ mod tests {
 
     async fn create_test_backend() -> GcsBackend {
         GcsBackend::new(create_test_config()).await.unwrap()
+    }
+
+    // ---- content_range pure helper (off-by-one lives here) ----
+
+    #[test]
+    fn test_content_range_intermediate_chunk() {
+        // First 32 MiB chunk, more to come: bytes 0-33554431/*
+        assert_eq!(
+            content_range(0, RESUMABLE_CHUNK_SIZE as u64, None),
+            "bytes 0-33554431/*"
+        );
+        // Second 32 MiB chunk, more to come.
+        assert_eq!(
+            content_range(
+                RESUMABLE_CHUNK_SIZE as u64,
+                RESUMABLE_CHUNK_SIZE as u64,
+                None
+            ),
+            "bytes 33554432-67108863/*"
+        );
+    }
+
+    #[test]
+    fn test_content_range_final_chunk() {
+        // A 40 MiB object: final 8 MiB chunk starting at 32 MiB, total known.
+        let total = RESUMABLE_CHUNK_SIZE as u64 + 8 * 1024 * 1024;
+        assert_eq!(
+            content_range(RESUMABLE_CHUNK_SIZE as u64, 8 * 1024 * 1024, Some(total)),
+            "bytes 33554432-41943039/41943040"
+        );
+    }
+
+    #[test]
+    fn test_content_range_single_small_object() {
+        // 5-byte object as a final chunk from offset 0.
+        assert_eq!(content_range(0, 5, Some(5)), "bytes 0-4/5");
+    }
+
+    #[test]
+    fn test_content_range_zero_length_finalize_on_boundary() {
+        // Terminal zero-length PUT when the upload ended on a chunk boundary:
+        // GCS already has all bytes, we only need to tell it the total.
+        assert_eq!(
+            content_range(
+                RESUMABLE_CHUNK_SIZE as u64,
+                0,
+                Some(RESUMABLE_CHUNK_SIZE as u64)
+            ),
+            "bytes */33554432"
+        );
+    }
+
+    #[test]
+    fn test_content_range_zero_byte_object() {
+        assert_eq!(content_range(0, 0, Some(0)), "bytes */0");
+    }
+
+    // ---- parse_resumable_range_next pure helper ----
+
+    #[test]
+    fn test_parse_resumable_range_next_valid() {
+        // bytes=0-N → next offset is N+1.
+        assert_eq!(parse_resumable_range_next("bytes=0-0"), Some(1));
+        assert_eq!(
+            parse_resumable_range_next("bytes=0-16777215"),
+            Some(16777216)
+        );
+        // Case-insensitive on the "bytes=" literal, tolerant of surrounding ws.
+        assert_eq!(parse_resumable_range_next("  Bytes=0-9  "), Some(10));
+    }
+
+    #[test]
+    fn test_parse_resumable_range_next_rejects_malformed() {
+        // Non-zero start (resumable uploads always begin at 0).
+        assert_eq!(parse_resumable_range_next("bytes=5-10"), None);
+        // Missing the "bytes=" prefix.
+        assert_eq!(parse_resumable_range_next("0-10"), None);
+        assert_eq!(parse_resumable_range_next("0-10/100"), None);
+        // No dash separator.
+        assert_eq!(parse_resumable_range_next("bytes=0"), None);
+        // Non-numeric end.
+        assert_eq!(parse_resumable_range_next("bytes=0-abc"), None);
+        // Empty / garbage.
+        assert_eq!(parse_resumable_range_next(""), None);
+        assert_eq!(parse_resumable_range_next("nonsense"), None);
+    }
+
+    #[test]
+    fn test_content_range_status_query() {
+        // Status query uses len 0 with unknown total.
+        assert_eq!(content_range(0, 0, None), "bytes */*");
+    }
+
+    #[test]
+    fn test_is_transient_status() {
+        assert!(is_transient_status(429));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(503));
+        assert!(is_transient_status(599));
+        assert!(!is_transient_status(200));
+        assert!(!is_transient_status(308));
+        assert!(!is_transient_status(400));
+        assert!(!is_transient_status(404));
+    }
+
+    #[test]
+    fn test_map_status_error_transient_is_service_unavailable() {
+        assert!(matches!(
+            map_status_error(503, "ctx", "body"),
+            AppError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            map_status_error(429, "ctx", "body"),
+            AppError::ServiceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn test_map_status_error_permanent_is_storage() {
+        assert!(matches!(
+            map_status_error(400, "ctx", "body"),
+            AppError::Storage(_)
+        ));
+        assert!(matches!(
+            map_status_error(403, "ctx", "body"),
+            AppError::Storage(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_success() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"streamed body contents".to_vec();
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let mut stream = backend.get_stream("test/file.txt").await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, body);
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_not_found() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        match backend.get_stream("missing.txt").await {
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => panic!("Expected NotFound, got {:?}", e),
+            Ok(_) => panic!("Expected NotFound, got Ok stream"),
+        }
     }
 
     // ---- Backend creation ----
@@ -1566,6 +2392,7 @@ mod tests {
 
         GcsBackend {
             config,
+            stream_client: client.clone(),
             client,
             auth: GcsAuthMode::Adc { provider },
             path_format: StoragePathFormat::Native,
@@ -1606,6 +2433,560 @@ mod tests {
         let result = backend.put("test/file.txt", Bytes::from("hello")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("500"));
+    }
+
+    // ---- put_stream (resumable upload) tests ----
+
+    /// Build a stream from a list of byte chunks for put_stream input.
+    fn stream_of(chunks: Vec<Vec<u8>>) -> BoxStream<'static, Result<Bytes>> {
+        let items: Vec<Result<Bytes>> = chunks.into_iter().map(|c| Ok(Bytes::from(c))).collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_small_object_single_shot() {
+        // A sub-chunk object must take the single-shot put() fast path: a POST
+        // to the simple upload endpoint, never a resumable initiate.
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Simple upload (uploadType=media) — the fast path.
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let data = b"a small artifact".to_vec();
+        let result = backend
+            .put_stream("repos/small.txt", stream_of(vec![data.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, data.len() as u64);
+        // sha256 of the payload must match.
+        let expected = {
+            let mut h = sha2::Sha256::new();
+            h.update(&data);
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(result.checksum_sha256, expected);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_zero_byte_single_shot() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let result = backend
+            .put_stream("repos/empty.txt", stream_of(vec![]))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, 0);
+        // sha256 of empty input.
+        assert_eq!(
+            result.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_multi_chunk_alignment_and_finalize() {
+        // Feed > 32 MiB so the resumable protocol runs with an intermediate
+        // 256-KiB-aligned chunk followed by a final chunk carrying the total.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/abc123";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        // Initiate resumable session.
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Intermediate chunk: exactly 32 MiB, range bytes 0-33554431/* → 308.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Final chunk: remaining 9 MiB, range bytes 33554432-.../41943040 → 200.
+        let total = RESUMABLE_CHUNK_SIZE + 9 * 1024 * 1024;
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        // Feed in oddly-sized chunks that straddle the 32 MiB boundary to prove
+        // the buffer re-alignment: 20 MiB + 20 MiB + 1 MiB = 41 MiB total. The
+        // first 32 MiB must be sent as one aligned intermediate chunk and the
+        // remaining 9 MiB as the final chunk, regardless of the input framing.
+        let part = 20 * 1024 * 1024;
+        let chunks = vec![
+            vec![0xABu8; part],
+            vec![0xCDu8; part],
+            vec![0xEFu8; total - 2 * part],
+        ];
+        let result = backend
+            .put_stream("repos/big.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_finalize_on_exact_boundary() {
+        // Upload ends exactly on a 32 MiB boundary → one intermediate 308 PUT
+        // plus a terminal zero-length PUT (bytes */<total>) to finalize.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/boundary";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Intermediate chunk → 308.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Terminal zero-length finalize PUT.
+        let finalize_range = format!("bytes */{}", RESUMABLE_CHUNK_SIZE);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let result = backend
+            .put_stream(
+                "repos/exact.bin",
+                stream_of(vec![vec![0x11u8; RESUMABLE_CHUNK_SIZE]]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, RESUMABLE_CHUNK_SIZE as u64);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_initiate_missing_location_header() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Initiate succeeds but omits Location → must error.
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        // > 32 MiB so we go through the resumable path (not the small fast path).
+        let big = vec![0x22u8; RESUMABLE_CHUNK_SIZE + 1];
+        let err = backend
+            .put_stream("repos/x.bin", stream_of(vec![big]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Location"),
+            "error should mention missing Location header: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_mid_stream_error_aborts_session() {
+        // A stream error after the session is initiated must trigger a
+        // best-effort DELETE on the session URL and return Err.
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/aborted";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // The abort DELETE on the session URL. Assert it is called exactly once.
+        Mock::given(method("DELETE"))
+            .and(path_regex(session_path))
+            .respond_with(ResponseTemplate::new(499))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Also accept any chunk PUTs that happen before the error (308).
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .respond_with(ResponseTemplate::new(308))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        // First a full chunk (forces resumable + at least one PUT), then an Err.
+        let good = vec![0x33u8; RESUMABLE_CHUNK_SIZE];
+        let items: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from(good)),
+            Ok(Bytes::from(vec![0x44u8; 16])),
+            Err(AppError::Storage("simulated upstream read failure".into())),
+        ];
+        let stream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(items));
+        let err = backend.put_stream("repos/fail.bin", stream).await;
+        assert!(err.is_err(), "stream error must propagate");
+        // Mock .expect(1) on DELETE is verified on server drop.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_retries_on_transient_503() {
+        // A chunk PUT that returns 503 once then succeeds must be retried and
+        // ultimately succeed without surfacing an error.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/retry";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // First intermediate PUT attempt returns 503 (transient).
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("slow down"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query after the failed attempt: 308 with no Range (0 confirmed).
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes */*"))
+            .respond_with(ResponseTemplate::new(308))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        // Retry of the intermediate chunk succeeds with 308.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .with_priority(3)
+            .mount(&server)
+            .await;
+
+        // Final chunk succeeds.
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .with_priority(3)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0x55u8; RESUMABLE_CHUNK_SIZE], vec![0x66u8; 8]];
+        let result = backend
+            .put_stream("repos/retry.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_resume_from_nonzero_offset() {
+        // An intermediate chunk PUT fails transiently, and the status query
+        // reports that GCS already durably accepted the first 16 MiB of the
+        // 32 MiB chunk (Range: bytes=0-16777215). The retry must resume from
+        // byte 16777216 with exactly the remaining 16 MiB body, not resend from
+        // 0. This exercises the body.drain / offset = confirmed_next slicing.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/resume-nonzero";
+        let location = format!("{}{}", server.uri(), session_path);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // First full-chunk PUT (bytes 0-33554431/*) fails once with 503.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query (bytes */*): 308 with Range showing 16 MiB confirmed, so
+        // confirmed_next == 16777216.
+        let half = 16 * 1024 * 1024u64;
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes */*"))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", half - 1).as_str()),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        // Retry must resume from byte 16777216 carrying exactly the remaining
+        // 16 MiB. Assert both the start offset (Content-Range) and the remaining
+        // body length (Content-Length).
+        let resume_range = format!("bytes {}-{}/*", half, RESUMABLE_CHUNK_SIZE - 1);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", resume_range.as_str()))
+            .and(header("Content-Length", half.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(308))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Final chunk carrying the total → 200.
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0x77u8; RESUMABLE_CHUNK_SIZE], vec![0x88u8; 8]];
+        let result = backend
+            .put_stream("repos/resume.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+        // The .expect(1) on the resume PUT is verified on server drop.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_finalize_after_resume() {
+        // The FINAL chunk PUT fails transiently, the status query then reports
+        // every byte received (308, Range covering the whole object). A 308 only
+        // confirms bytes received, NOT a finalized object, so the code must send
+        // an explicit terminal finalize PUT (bytes */<total>) and require a 2xx
+        // before reporting success.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/finalize-resume";
+        let location = format!("{}{}", server.uri(), session_path);
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let finalize_range = format!("bytes */{}", total);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // Intermediate chunk → 308.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .mount(&server)
+            .await;
+
+        // Final chunk PUT fails once with 503 (transient).
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query (bytes */<total>): first call returns 308 with a Range
+        // showing the whole object is durably received.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", total - 1).as_str()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Terminal finalize PUT (same bytes */<total> shape) must fire and is
+        // answered with 200. Assert it is called exactly once.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0x99u8; RESUMABLE_CHUNK_SIZE], vec![0xAAu8; 8]];
+        let result = backend
+            .put_stream("repos/finalize.bin", stream_of(chunks))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes_written, total as u64);
+        // The .expect(1) on the finalize PUT is verified on server drop.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_finalize_after_resume_non_2xx_errors() {
+        // Same resumed-final-chunk path as above, but the terminal finalize PUT
+        // comes back non-2xx (the session never closed). The upload must NOT be
+        // reported as successful: the error is surfaced to the caller.
+        use wiremock::matchers::{header, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_path = "/resumable-session/finalize-fail";
+        let location = format!("{}{}", server.uri(), session_path);
+        let total = RESUMABLE_CHUNK_SIZE + 8;
+        let finalize_range = format!("bytes */{}", total);
+
+        Mock::given(method("POST"))
+            .and(path_regex("/upload/storage/v1/b/.*/o"))
+            .and(query_param("uploadType", "resumable"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+
+        // The abort DELETE that put_stream issues on failure.
+        Mock::given(method("DELETE"))
+            .and(path_regex(session_path))
+            .respond_with(ResponseTemplate::new(499))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", "bytes 0-33554431/*"))
+            .respond_with(ResponseTemplate::new(308))
+            .mount(&server)
+            .await;
+
+        // Final chunk PUT fails once with 503.
+        let final_range = format!("bytes 33554432-{}/{}", total - 1, total);
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", final_range.as_str()))
+            .respond_with(ResponseTemplate::new(503).set_body_string("transient"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Status query: 308, whole object received.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(
+                ResponseTemplate::new(308)
+                    .insert_header("Range", format!("bytes=0-{}", total - 1).as_str()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Terminal finalize PUT returns 500: the object is not finalized.
+        Mock::given(method("PUT"))
+            .and(path_regex(session_path))
+            .and(header("Content-Range", finalize_range.as_str()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("finalize failed"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let chunks = vec![vec![0xBBu8; RESUMABLE_CHUNK_SIZE], vec![0xCCu8; 8]];
+        let err = backend
+            .put_stream("repos/finalize-fail.bin", stream_of(chunks))
+            .await;
+        assert!(
+            err.is_err(),
+            "a non-2xx finalize after resume must be surfaced as an error, got: {:?}",
+            err.map(|r| r.bytes_written)
+        );
     }
 
     #[tokio::test]
@@ -1794,15 +3175,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_success() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex("/storage/v1/b/.*/o/.*/copyTo/b/.*/o/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"name": "dest.txt"})),
-            )
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param_is_missing("rewriteToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "continue-copy",
+                "totalBytesRewritten": "1048576",
+                "objectSize": "2097152"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param("rewriteToken", "continue-copy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1817,13 +3213,97 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex("/storage/v1/b/.*/o/.*/copyTo/b/.*/o/.*"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
             .respond_with(ResponseTemplate::new(404).set_body_string("source not found"))
             .mount(&server)
             .await;
 
         let backend = mock_backend(&server.uri()).await;
         assert!(backend.copy("missing.txt", "dest.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_copy_rejects_rewrite_without_continuation_token() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let err = backend
+            .copy("src.txt", "dest.txt")
+            .await
+            .expect_err("incomplete rewrite without token must fail");
+        assert!(
+            err.to_string().contains("rewriteToken"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_forwards_rewrite_token_on_continuation() {
+        use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // First rewrite POST has no rewriteToken and is incomplete.
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param_is_missing("rewriteToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "t1",
+                "totalBytesRewritten": "1048576",
+                "objectSize": "2097152"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Continuation POST must carry the token returned above.
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param("rewriteToken", "t1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        assert!(backend.copy("src.txt", "dest.txt").await.is_ok());
+
+        // Exactly two POSTs: the initial rewrite and one continuation that
+        // forwards the rewriteToken on the query string.
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(requests.len(), 2, "expected two rewrite POSTs");
+        assert!(
+            !requests[0]
+                .url
+                .query_pairs()
+                .any(|(k, _)| k == "rewriteToken"),
+            "first request must not carry a rewriteToken"
+        );
+        assert!(
+            requests[1]
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "rewriteToken" && v == "t1"),
+            "continuation request must forward rewriteToken=t1, got {}",
+            requests[1].url
+        );
     }
 
     #[tokio::test]

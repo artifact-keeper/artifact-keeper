@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -202,8 +203,16 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
 
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
-/// * Other non-2xx → `AppError::Storage` (transient/upstream-misconfig
-///   error; bubbles to the client as 500/5xx)
+/// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
+///   bubbles to the client as 503). Closes the 502-leak path in #1445:
+///   a flaky upstream returning 502/503/504 should NOT propagate the raw
+///   status to the client. Surfacing 503 lets clients (and our own retry
+///   guard / single-flight followers) treat the failure as "try again in
+///   a moment" instead of misclassifying it as a permanent gateway error.
+/// * Other 4xx (401, 403, etc.) → `AppError::BadGateway` (upstream-config /
+///   auth misconfig; bubbles to the client as 502). 4xx is genuinely a
+///   gateway-side problem (the upstream told us we are not allowed) so
+///   503 would be misleading.
 /// * 2xx → `Ok(())`
 fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     if status == StatusCode::NOT_FOUND {
@@ -212,8 +221,14 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
             url
         )));
     }
+    if status.is_server_error() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "Upstream returned error status {}: {}",
+            status, url
+        )));
+    }
     if !status.is_success() {
-        return Err(AppError::Storage(format!(
+        return Err(AppError::BadGateway(format!(
             "Upstream returned error status {}: {}",
             status, url
         )));
@@ -300,6 +315,33 @@ fn tee_upstream_to_cache(
             .await;
 
         match put_result {
+            Ok(result) if result.bytes_written == 0 => {
+                // #1365: never cache a zero-byte body. A Maven client
+                // resolving dependencies can drive an upstream response
+                // with no body (a 204, a 200 with `Content-Length: 0`, or
+                // a HEAD-style probe that reaches the streaming download
+                // path), and the upstream POM/JAR is non-empty. Writing the
+                // metadata sidecar here would mark the empty object as a
+                // fresh, non-expired cache hit; the next GET would then
+                // serve `Content-Length: 0`, and Gradle fails parsing the
+                // POM with "Content is not allowed in prolog." Skip the
+                // sidecar so the entry is treated as a miss, and delete the
+                // empty object we just wrote so a later GET re-fetches the
+                // real body from upstream (self-heal).
+                tracing::warn!(
+                    cache_key = %cache_key_for_writer,
+                    "proxy upstream returned an empty body; not caching the zero-byte \
+                     object (no metadata sidecar) so the next request refetches upstream"
+                );
+                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                    tracing::debug!(
+                        cache_key = %cache_key_for_writer,
+                        error = %e,
+                        "best-effort delete of empty proxy-cache object failed; \
+                         the missing metadata sidecar still forces a refetch"
+                    );
+                }
+            }
             Ok(result) => {
                 let now = Utc::now();
                 // Pin the storage backend's ETag at write time so the
@@ -400,6 +442,32 @@ fn tee_upstream_to_cache(
         drop(tx);
     };
     Box::pin(tee_stream)
+}
+
+/// A single proxy-cached artifact, reconstructed from the storage backend
+/// for the repository artifact-listing endpoint (#1548, web #424).
+///
+/// Proxy-cached items are not in the `artifacts` table (#1280), so this is
+/// assembled from the on-disk `__content__` key and its `__cache_meta__.json`
+/// sidecar rather than from a database row. There is no DB id, version, or
+/// download count to report, so the listing handler synthesizes the parts of
+/// `ArtifactResponse` it can and leaves the rest at their natural defaults.
+#[derive(Debug, Clone)]
+pub struct CachedArtifactEntry {
+    /// Logical artifact path relative to the repository root, e.g.
+    /// `is-odd/-/is-odd-3.0.1.tgz`.
+    pub path: String,
+    /// Final path segment, used as the display name.
+    pub name: String,
+    /// Cached body size in bytes (from the sidecar).
+    pub size_bytes: i64,
+    /// SHA-256 of the cached body (from the sidecar).
+    pub checksum_sha256: String,
+    /// Content type recorded at cache-write time, defaulting to
+    /// `application/octet-stream` when upstream did not send one.
+    pub content_type: String,
+    /// When the entry was first cached (from the sidecar).
+    pub cached_at: DateTime<Utc>,
 }
 
 /// Cache metadata for a proxied artifact
@@ -716,45 +784,81 @@ impl ProxyService {
             return Ok((content, content_type));
         }
 
-        // Fetch from upstream using the real fetch_path
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
-        let upstream_result = self
-            .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
-            .await;
+        let hydration_lease_key = format!("proxy-cache:{}", cache_key);
+        coordinate_proxy_hydration(
+            &hydration_lease_key,
+            || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
+            || async {
+                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+                let upstream_result = self
+                    .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
+                    .await;
 
-        match upstream_result {
-            Ok(resp) => {
-                let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-                self.cache_artifact(
-                    &cache_key,
-                    &metadata_key,
-                    &resp.content,
-                    resp.content_type.clone(),
-                    resp.etag,
-                    cache_ttl,
-                    repo.id,
-                    cache_path,
-                )
-                .await?;
+                match upstream_result {
+                    Ok(resp) => {
+                        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                        // B6 (coalescing 502 leak, remaining path): the upstream fetch
+                        // already SUCCEEDED -- `resp.content` is in hand. A failure to
+                        // persist the cache entry must NOT fail the client request.
+                        // Under a cold-cache stampede, N concurrent waiters all miss
+                        // the cache and all race to write the SAME cache file; one of
+                        // those writes can transiently fail (e.g. ENOENT from a
+                        // create_dir_all/File::create race against a sibling writer, a
+                        // half-renamed temp file, or a poisoned entry). Propagating
+                        // that write error via `?` surfaced as `AppError::Io` ->
+                        // `map_proxy_error` -> raw 502, which is exactly the leak the
+                        // stampede gate rejects (`200 502 200 ...`). Treat the cache
+                        // write as best-effort: log at warn and still serve the bytes
+                        // we fetched. The cache self-heals on the next request (the
+                        // streaming path already documents this self-healing).
+                        if let Err(cache_err) = self
+                            .cache_artifact(
+                                &cache_key,
+                                &metadata_key,
+                                &resp.content,
+                                resp.content_type.clone(),
+                                resp.etag,
+                                cache_ttl,
+                                repo.id,
+                                cache_path,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                cache_key = %cache_key,
+                                error = %cache_err,
+                                "proxy cache write failed after successful upstream fetch; \
+                                 serving fetched bytes and leaving cache to self-heal on next request"
+                            );
+                        }
 
-                Ok((resp.content, resp.content_type))
-            }
-            Err(upstream_err) => {
-                if let Ok(Some((stale_content, stale_content_type))) = self
-                    .get_stale_cached_artifact(&cache_key, &metadata_key)
-                    .await
-                {
-                    tracing::warn!(
-                        "Upstream fetch failed for {}; serving stale cached copy: {}",
-                        full_url,
-                        upstream_err
-                    );
-                    Ok((stale_content, stale_content_type))
-                } else {
-                    Err(upstream_err)
+                        Ok((resp.content, resp.content_type))
+                    }
+                    Err(upstream_err) => {
+                        if let Ok(Some((stale_content, stale_content_type))) = self
+                            .get_stale_cached_artifact(&cache_key, &metadata_key)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Upstream fetch failed for {}; serving stale cached copy: {}",
+                                full_url,
+                                upstream_err
+                            );
+                            Ok((stale_content, stale_content_type))
+                        } else {
+                            Err(upstream_err)
+                        }
+                    }
                 }
-            }
-        }
+            },
+            || {
+                AppError::Storage(format!(
+                    "Timed out waiting for proxy cache hydration: {}",
+                    cache_key
+                ))
+            },
+        )
+        .await
     }
 
     /// Streaming sibling of [`Self::fetch_artifact`] that does NOT buffer
@@ -971,6 +1075,33 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
+    /// `upstream_etag`, `storage_etag`, `content_type`, `size_bytes`) for
+    /// a given path on a repository, without checking expiry.
+    ///
+    /// Returns `Ok(None)` when no metadata blob exists (e.g. a Remote-typed
+    /// artifact that was direct-uploaded and has never been fetched through
+    /// the proxy) or when the underlying storage rejects the path
+    /// (path-traversal segments are rejected by `cache_metadata_key`).
+    /// Errors from a transient storage failure on the GET propagate as
+    /// `Err(...)` so callers can choose between bubbling up and tolerating.
+    ///
+    /// Used by `get_artifact_metadata` (#1541) to surface cache freshness
+    /// alongside the static artifact metadata in a single round-trip,
+    /// without exposing the metadata-blob storage key derivation to
+    /// handlers.
+    pub async fn get_cache_metadata(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<CacheMetadata>> {
+        let metadata_key = match Self::cache_metadata_key(repo_key, path) {
+            Ok(k) => k,
+            Err(_) => return Ok(None),
+        };
+        self.load_cache_metadata(&metadata_key).await
+    }
+
     /// Fetch an artifact from upstream and report whether the content
     /// differs from what was previously cached.
     ///
@@ -1022,6 +1153,163 @@ impl ProxyService {
             None => true,
         };
         Ok((content, content_type, changed))
+    }
+
+    /// List the PyPI project names that already have a cached `simple/<name>/`
+    /// index in this repository's proxy cache.
+    ///
+    /// PyPI clients fetch a per-project simple index (`simple/<name>/`) before
+    /// downloading any distribution. That index is proxy-cached at
+    /// `proxy-cache/<repo_key>/simple/<name>/__content__`. For a Remote repo,
+    /// proxy-cached artifacts are intentionally NOT recorded in the `artifacts`
+    /// table (#1278), so the root simple index (`simple/`) has no DB rows to
+    /// list and can come back empty even after clients have pulled packages
+    /// through the proxy. Walking the proxy-cache prefix recovers the set of
+    /// projects the proxy has actually served, so the root index lists them
+    /// (B8). Falls back to an empty list when the storage backend cannot list
+    /// the prefix.
+    pub async fn list_cached_pypi_packages(&self, repo_key: &str) -> Vec<String> {
+        let prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let keys = match self.storage.list(Some(&prefix)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    error = %e,
+                    "listing proxy cache for pypi simple-root packages failed; \
+                     returning no cached packages"
+                );
+                return Vec::new();
+            }
+        };
+        Self::pypi_package_names_from_cache_keys(repo_key, keys.iter().map(String::as_str))
+    }
+
+    /// Extract the distinct PyPI project names from a set of proxy-cache
+    /// storage keys.
+    ///
+    /// Keys look like
+    /// `proxy-cache/<repo_key>/simple/<name>/__content__` (and a sibling
+    /// `__cache_meta__.json`). We keep only entries that carry a package
+    /// segment (`simple/<name>/...`), pull the `<name>` segment out, and
+    /// dedupe. Pure so the parsing can be unit-tested without a storage
+    /// backend.
+    fn pypi_package_names_from_cache_keys<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let simple_prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(&simple_prefix) else {
+                continue;
+            };
+            // `rest` is `<name>/<more>...`; the first segment is the project.
+            // The bare `simple/` root index caches under `simple//__content__`
+            // (empty first segment) which we skip, and a `__content__` sitting
+            // directly under `simple/` has no project segment either.
+            let Some((name, tail)) = rest.split_once('/') else {
+                continue;
+            };
+            if name.is_empty() || tail.is_empty() {
+                continue;
+            }
+            names.insert(name.to_string());
+        }
+        names.into_iter().collect()
+    }
+
+    /// List the artifacts a remote repository has cached through the proxy.
+    ///
+    /// Proxy-cached items are not tracked in the `artifacts` table (#1278 /
+    /// #1280): caching them there reintroduced a doubled-prefix storage path
+    /// bug on filesystem backends. The body and a JSON metadata sidecar still
+    /// live on disk under `proxy-cache/<repo_key>/<path>/{__content__,
+    /// __cache_meta__.json}`, so this walks that prefix to recover the set of
+    /// objects the proxy has actually served. The repository artifact-listing
+    /// endpoint merges these into its response so remote-cached packages show
+    /// up in the UI and can be scanned (#1548, web #424).
+    ///
+    /// Returns an empty list when the storage backend cannot list the prefix.
+    /// Each entry's `size_bytes`, `checksum_sha256`, `content_type`, and
+    /// `cached_at` come from the sidecar; entries whose sidecar is missing or
+    /// unreadable are skipped (a half-written or legacy cache write).
+    pub async fn list_cached_artifacts(&self, repo_key: &str) -> Vec<CachedArtifactEntry> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = match self.storage.list(Some(&prefix)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    error = %e,
+                    "listing proxy cache for repository artifact listing failed; \
+                     returning no cached artifacts"
+                );
+                return Vec::new();
+            }
+        };
+
+        let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
+        let mut entries = Vec::with_capacity(logical_paths.len());
+        for path in logical_paths {
+            let Ok(metadata_key) = Self::cache_metadata_key(repo_key, &path) else {
+                continue;
+            };
+            let metadata = match self.load_cache_metadata(&metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        repo_key = %repo_key,
+                        path = %path,
+                        error = %e,
+                        "reading proxy cache sidecar failed; skipping entry"
+                    );
+                    continue;
+                }
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            entries.push(CachedArtifactEntry {
+                path,
+                name,
+                size_bytes: metadata.size_bytes,
+                checksum_sha256: metadata.checksum_sha256,
+                content_type: metadata
+                    .content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                cached_at: metadata.cached_at,
+            });
+        }
+        entries
+    }
+
+    /// Recover the distinct logical artifact paths from a set of proxy-cache
+    /// storage keys.
+    ///
+    /// Content lives at `proxy-cache/<repo_key>/<path>/__content__`; the
+    /// sibling `__cache_meta__.json` and any other leaf are ignored. Strips
+    /// the `proxy-cache/<repo_key>/` prefix and the `/__content__` suffix to
+    /// return `<path>`, deduped and sorted. Pure so the parsing can be
+    /// unit-tested without a storage backend.
+    fn cached_artifact_paths<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(path) = rest.strip_suffix("/__content__") else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            paths.insert(path.to_string());
+        }
+        paths.into_iter().collect()
     }
 
     /// Invalidate every cached file referenced from an APT Release file
@@ -1224,10 +1512,22 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Check if metadata exists
-        let metadata = match self.load_cache_metadata(metadata_key).await? {
-            Some(m) => m,
-            None => return Ok(None),
+        // Check if metadata exists. A read/parse error on the sidecar (e.g. a
+        // waiter racing the single-flight leader's metadata write, or a
+        // half-written JSON) is treated as a cache miss rather than bubbling
+        // out as a 502 (B6): the caller re-fetches upstream and gets a clean
+        // 2xx or a 503, never a raw storage 502.
+        let metadata = match self.load_cache_metadata(metadata_key).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    metadata_key = %metadata_key,
+                    error = %e,
+                    "proxy cache metadata read failed; treating as miss and refetching upstream"
+                );
+                return Ok(None);
+            }
         };
 
         // Check if cache has expired
@@ -1255,7 +1555,24 @@ impl ProxyService {
                 Ok(Some((content, metadata.content_type)))
             }
             Err(AppError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            // B6 (coalescing 502 leak): a transient storage read error here
+            // (e.g. a waiter reading the cache body while the single-flight
+            // leader is mid-write, or a partially-written / poisoned entry)
+            // must NOT bubble out as a raw 502 to every concurrent waiter.
+            // Treat it as a cache miss so the caller re-fetches upstream; the
+            // upstream path then surfaces a clean 2xx (cache repopulated) or a
+            // 503 via `validate_upstream_status` when upstream itself is the
+            // one failing. Surfacing the read error as `Err(e)` made it
+            // `map_proxy_error` -> 502, which is exactly the raw status the
+            // stampede gate rejects.
+            Err(e) => {
+                tracing::warn!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "proxy cache read failed; treating as miss and refetching upstream"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -1387,19 +1704,12 @@ impl ProxyService {
         let status = response.status();
         let effective_url = response.url().to_string();
 
-        if status == StatusCode::NOT_FOUND {
-            return Err(AppError::NotFound(format!(
-                "Artifact not found at upstream: {}",
-                url
-            )));
-        }
-
-        if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
+        // Centralise the 404/4xx/5xx classification through
+        // `validate_upstream_status` (#1445) so the buffered fetch path
+        // gets the same 5xx -> ServiceUnavailable mapping the streaming
+        // path does. Previously this inlined a "non-2xx -> Storage" rule
+        // that surfaced raw upstream 502/503/504 to clients as 502.
+        validate_upstream_status(status, url)?;
 
         let content_type = response
             .headers()
@@ -1690,6 +2000,22 @@ impl ProxyService {
         repository_id: Uuid,
         artifact_path: &str,
     ) -> Result<()> {
+        // #1365: never cache a zero-byte body on the buffered path either.
+        // An empty upstream response (204 / empty 200) must not become a
+        // fresh cache entry that a later request serves as
+        // `Content-Length: 0`. Skip the write entirely so the next request
+        // refetches from upstream; the caller treats a cache miss as the
+        // normal path. The streaming sibling `tee_upstream_to_cache` applies
+        // the same guard after `put_stream`.
+        if content.is_empty() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "proxy upstream returned an empty body; not caching the zero-byte \
+                 object so the next request refetches upstream"
+            );
+            return Ok(());
+        }
+
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
 
@@ -2152,6 +2478,52 @@ mod tests {
         assert_eq!(
             ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz").unwrap(),
             "proxy-cache/npm-proxy/@types/node/-/node-18.0.0.tgz/__content__"
+        );
+    }
+
+    /// #1445 (C): scoped npm tarball remote-proxy round-trip.
+    ///
+    /// The npm handler builds the upstream path as
+    /// `@scope%2Fpkg/-/{filename}` (with the scope separator percent-
+    /// encoded) and passes the SAME string as both the upstream fetch
+    /// path AND the proxy-cache path. The cache key derived from that
+    /// path MUST be byte-identical between write and read, otherwise a
+    /// cached tarball is invisible to the next request and every fetch
+    /// re-hits upstream, exactly the "scoped tarball through remote
+    /// proxy fails" symptom in #1445(C).
+    ///
+    /// This test pins the key formula so a future "normalize the cache
+    /// path before storing" refactor cannot silently regress.
+    #[test]
+    fn test_cache_storage_key_scoped_npm_encoded_path_round_trip() {
+        // Path as the npm handler constructs it (encode_package_name_for_upstream).
+        let encoded_path = "@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz";
+
+        let write_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a cache key");
+        let read_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a cache key on read");
+
+        assert_eq!(
+            write_key, read_key,
+            "scoped npm cache key MUST be deterministic so cached \
+             tarballs survive the next request (#1445C)"
+        );
+        assert_eq!(
+            write_key, "proxy-cache/npm-proxy/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz/__content__",
+            "scoped npm cache key MUST preserve the %2F-encoded scope \
+             separator verbatim. The upstream fetch path uses the same \
+             string, and any normalisation here would desync the two."
+        );
+
+        // The matching metadata key must round-trip too, otherwise the
+        // freshness probe and the content lookup land in different
+        // storage namespaces.
+        let meta_key = ProxyService::cache_metadata_key("npm-proxy", encoded_path)
+            .expect("encoded scoped path must derive a metadata key");
+        assert_eq!(
+            meta_key,
+            "proxy-cache/npm-proxy/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz/__cache_meta__.json"
         );
     }
 
@@ -3892,6 +4264,76 @@ SHA256:
         );
     }
 
+    // -----------------------------------------------------------------
+    // get_cache_metadata (#1541)
+    //
+    // The handler-side structural test (in repositories.rs) only pins the
+    // source-shape; these tests exercise the actual runtime path through
+    // the new pub method to make sure (a) the metadata key derivation
+    // hands the right key to the storage, (b) the deserialise path
+    // returns the populated struct, (c) a missing blob collapses cleanly
+    // to `Ok(None)`, and (d) a path the metadata-key validator rejects
+    // (e.g. `..` traversal) returns `Ok(None)` rather than bubbling --
+    // matching the handler's "cache fields just stay None on a bad
+    // input" tolerance.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_metadata_for_existing_path() {
+        let mock = Arc::new(CacheFreshMock::new(Some(fresh_metadata_bytes()), true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let meta = service
+            .get_cache_metadata("npm-proxy", "lodash")
+            .await
+            .expect("get_cache_metadata should not error on a present blob");
+
+        let meta = meta.expect("metadata should be Some when the blob exists");
+        // The fresh_metadata_bytes() helper pins these two fields; the
+        // others are exercised by the existing is_cache_fresh tests.
+        assert_eq!(meta.size_bytes, 42);
+        assert!(
+            meta.expires_at > Utc::now(),
+            "fresh metadata should not be already-expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_when_blob_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "never-fetched")
+            .await
+            .expect("missing blob must NOT bubble as Err");
+
+        assert!(
+            result.is_none(),
+            "missing metadata blob must collapse to Ok(None) so the \
+             handler can leave cache_expires_at / cache_cached_at unset \
+             rather than failing the whole metadata response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_metadata_returns_none_for_path_traversal() {
+        // The metadata-key derivation rejects `..` segments before the
+        // storage is ever touched. The new pub wrapper translates that
+        // rejection into Ok(None) (rather than bubbling the Err) so the
+        // handler does not have to special-case it; the cache rows
+        // simply don't render for the request.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service
+            .get_cache_metadata("npm-proxy", "../etc/passwd")
+            .await
+            .expect("path-traversal must NOT surface as Err on this path");
+
+        assert!(result.is_none(), "expected Ok(None) for invalid path");
+    }
+
     #[tokio::test]
     async fn test_invalidate_dist_packages_cache_evicts_each_path() {
         // Driven by the Release-file parser: every path under the
@@ -4018,6 +4460,7 @@ SHA256:
     struct TeeRecordingBackend {
         put_stream_chunks: tokio::sync::Mutex<Vec<Bytes>>,
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
     }
 
@@ -4026,6 +4469,7 @@ SHA256:
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
             })
         }
@@ -4033,6 +4477,7 @@ SHA256:
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
             })
         }
@@ -4055,7 +4500,8 @@ SHA256:
         async fn exists(&self, _key: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn delete(&self, _key: &str) -> Result<()> {
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
             Ok(())
         }
         async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
@@ -4191,10 +4637,17 @@ SHA256:
         );
     }
 
-    /// Empty upstream (e.g. a 0-byte upstream object) round-trips
-    /// cleanly. Edge case for the channel-drop-on-EOF sequence.
+    /// #1365 regression: an empty upstream body (a 204, an empty 200, or a
+    /// HEAD-style probe that reaches the streaming download path) must NOT
+    /// be cached. The client still receives the empty body for this
+    /// request, but the writer must (a) skip the metadata sidecar so a
+    /// later GET is a cache miss, and (b) delete the zero-byte object it
+    /// wrote so the next request refetches the real body from upstream.
+    /// Before the fix the writer persisted a `size_bytes: 0` sidecar,
+    /// which a subsequent GET served as `Content-Length: 0`, breaking
+    /// Gradle POM parsing ("Content is not allowed in prolog.").
     #[tokio::test]
-    async fn test_tee_empty_upstream_yields_empty_body_and_writes_metadata() {
+    async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
@@ -4211,17 +4664,18 @@ SHA256:
         while let Some(chunk) = client.next().await {
             total += chunk.unwrap().len();
         }
-        assert_eq!(total, 0);
+        assert_eq!(total, 0, "client receives the empty body for this request");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let writes = backend.metadata_writes.lock().await;
-        assert_eq!(writes.len(), 1, "empty-body cache still gets metadata");
-        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
-        assert_eq!(metadata.size_bytes, 0);
-        // SHA-256 of empty input:
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "zero-byte upstream body MUST NOT write a metadata sidecar; \
+             otherwise the next GET serves a Content-Length: 0 cache hit (#1365)"
+        );
         assert_eq!(
-            metadata.checksum_sha256,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "the empty cache object must be deleted so the next request refetches"
         );
     }
 
@@ -4485,29 +4939,445 @@ SHA256:
     }
 
     #[test]
-    fn test_validate_upstream_status_5xx_is_storage_error() {
+    fn test_validate_upstream_status_5xx_is_service_unavailable() {
+        // #1445: upstream 5xx (502/503/504/etc.) MUST map to
+        // ServiceUnavailable so the client sees a 503 (a transient,
+        // "retry in a moment" signal) instead of a raw 502 leaking from
+        // upstream. The previous mapping (Storage -> 502) made every
+        // flaky-upstream incident look like a permanent gateway failure
+        // to clients and broke the contract that the proxy returns
+        // either 2xx or 503 under load.
         match validate_upstream_status(StatusCode::INTERNAL_SERVER_ERROR, "http://up/x") {
-            Err(AppError::Storage(msg)) => {
+            Err(AppError::ServiceUnavailable(msg)) => {
                 assert!(msg.contains("500"));
                 assert!(msg.contains("http://up/x"));
             }
-            other => panic!("500 must map to AppError::Storage; got {:?}", other),
+            other => panic!(
+                "500 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
         }
         match validate_upstream_status(StatusCode::BAD_GATEWAY, "http://up/x") {
-            Err(AppError::Storage(_)) => {}
-            other => panic!("502 must map to AppError::Storage; got {:?}", other),
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "502 must map to AppError::ServiceUnavailable so the proxy \
+                 returns 503 instead of leaking the raw upstream 502 \
+                 (closes #1445); got {:?}",
+                other
+            ),
+        }
+        match validate_upstream_status(StatusCode::SERVICE_UNAVAILABLE, "http://up/x") {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "503 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
+        }
+        match validate_upstream_status(StatusCode::GATEWAY_TIMEOUT, "http://up/x") {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!(
+                "504 must map to AppError::ServiceUnavailable; got {:?}",
+                other
+            ),
         }
     }
 
     #[test]
-    fn test_validate_upstream_status_4xx_other_is_storage_error() {
+    fn test_validate_upstream_status_4xx_other_is_bad_gateway() {
         // Non-404 4xx (e.g. 401 if it slipped past the retry path, or
-        // 403 from a misconfigured private mirror) must NOT be mistaken
-        // for a cache miss. Falls through to Storage class.
+        // 403 from a misconfigured private mirror) is genuinely a
+        // gateway-side / auth-misconfig problem and stays mapped to
+        // BadGateway (502). A 503 would mislead clients into retrying
+        // an auth failure that needs a config fix.
         match validate_upstream_status(StatusCode::FORBIDDEN, "http://up/x") {
-            Err(AppError::Storage(_)) => {}
-            other => panic!("403 must map to AppError::Storage; got {:?}", other),
+            Err(AppError::BadGateway(_)) => {}
+            other => panic!("403 must map to AppError::BadGateway; got {:?}", other),
         }
+        match validate_upstream_status(StatusCode::UNAUTHORIZED, "http://up/x") {
+            Err(AppError::BadGateway(_)) => {}
+            other => panic!("401 must map to AppError::BadGateway; got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B6: coalescing-waiter 502 leak. Under a cache stampede, every
+    // concurrent waiter consults the proxy cache before re-fetching. If the
+    // single-flight leader's upstream fetch failed and left a transiently
+    // unreadable cache entry (mid-write, half-written sidecar, or a poisoned
+    // partial), reading that entry must NOT surface as a raw 502 to the
+    // waiter. `get_cached_artifact` must treat a non-NotFound storage error
+    // as a cache MISS (`Ok(None)`) so the waiter re-fetches upstream and
+    // gets a clean 2xx or a 503 (via `validate_upstream_status`) — never the
+    // raw upstream 502 the stampede gate rejects.
+    // -----------------------------------------------------------------------
+
+    /// Mock backend that serves valid, fresh metadata but fails the body
+    /// read with a transient `Storage` error (models a waiter racing the
+    /// leader's cache write, or a poisoned partial body).
+    struct PoisonedCacheBodyMock {
+        metadata: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PoisonedCacheBodyMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            if key.ends_with("__cache_meta__.json") {
+                Ok(self.metadata.clone())
+            } else {
+                // The body read fails transiently (NOT NotFound).
+                Err(AppError::Storage(
+                    "transient backend read error".to_string(),
+                ))
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_waiter_treats_unreadable_cache_body_as_miss_not_502() {
+        let mock = Arc::new(PoisonedCacheBodyMock {
+            metadata: fresh_metadata_bytes(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let result = service
+            .get_cached_artifact(
+                "proxy-cache/npm-proxy/lodash/__content__",
+                "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+            )
+            .await;
+
+        // Must be Ok(None) (treated as miss -> caller refetches upstream),
+        // NOT Err(_) which would map to a raw 502 for every concurrent waiter.
+        match result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!(
+                "a body read error must not be promoted to a cache hit; \
+                 got Ok(Some(_))"
+            ),
+            Err(e) => panic!(
+                "coalescing waiter saw a raw cache read error (would surface \
+                 as 502); it must be treated as a miss instead. got Err({:?})",
+                e
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_waiter_treats_unreadable_metadata_as_miss_not_502() {
+        /// Backend whose metadata sidecar read fails transiently.
+        struct PoisonedMetadataMock;
+        #[async_trait::async_trait]
+        impl crate::services::storage_service::StorageBackend for PoisonedMetadataMock {
+            async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> Result<Bytes> {
+                Err(AppError::Storage(
+                    "transient metadata read error".to_string(),
+                ))
+            }
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn size(&self, _key: &str) -> Result<u64> {
+                Ok(0)
+            }
+        }
+
+        let service = build_proxy_service_with_storage(Arc::new(PoisonedMetadataMock));
+
+        let result = service
+            .get_cached_artifact(
+                "proxy-cache/npm-proxy/lodash/__content__",
+                "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+            )
+            .await;
+
+        match result {
+            Ok(None) => {}
+            other => panic!(
+                "a metadata read error must be treated as a cache miss (Ok(None)), \
+                 not a raw 502; got {:?}",
+                other.map(|o| o.is_some())
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B8: pypi simple-root recovers cached project names from the proxy
+    // cache so a Remote repo's root index lists packages even though
+    // proxy-cached artifacts no longer land in the `artifacts` table (#1278).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_extracts_projects() {
+        let keys = vec![
+            "proxy-cache/pypi-remote/simple/flask/__content__",
+            "proxy-cache/pypi-remote/simple/flask/__cache_meta__.json",
+            "proxy-cache/pypi-remote/simple/requests/__content__",
+            "proxy-cache/pypi-remote/simple/numpy/__content__",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        // Deduped (flask appears twice across content + metadata) and sorted.
+        assert_eq!(names, vec!["flask", "numpy", "requests"]);
+    }
+
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_skips_root_and_other_repos() {
+        let keys = vec![
+            // bare simple root index (empty project segment) — must be skipped
+            "proxy-cache/pypi-remote/simple//__content__",
+            // a __content__ directly under simple/ with no project — skipped
+            "proxy-cache/pypi-remote/simple/__content__",
+            // a different repo's cache — must not leak in
+            "proxy-cache/other-repo/simple/django/__content__",
+            // an unrelated (non-simple) cache entry — skipped
+            "proxy-cache/pypi-remote/packages/foo.whl/__content__",
+            // a real project — kept
+            "proxy-cache/pypi-remote/simple/flask/__content__",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        assert_eq!(names, vec!["flask"]);
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_extracts_content_keys() {
+        let keys = vec![
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__content__",
+            "proxy-cache/npm-remote/is-odd/-/is-odd-3.0.1.tgz/__cache_meta__.json",
+            "proxy-cache/npm-remote/lodash/__content__",
+            "proxy-cache/npm-remote/lodash/__cache_meta__.json",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        // Only content keys, sidecars dropped, prefix + suffix stripped, sorted.
+        assert_eq!(
+            paths,
+            vec![
+                "is-odd/-/is-odd-3.0.1.tgz".to_string(),
+                "lodash".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cached_artifact_paths_skips_other_repos_and_empty() {
+        let keys = vec![
+            // different repo's cache — must not leak in
+            "proxy-cache/other-remote/express/__content__",
+            // non-content leaf — skipped
+            "proxy-cache/npm-remote/express/__cache_meta__.json",
+            // empty logical path (bare repo root) — skipped
+            "proxy-cache/npm-remote/__content__",
+            // a real entry — kept
+            "proxy-cache/npm-remote/express/__content__",
+        ];
+        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        assert_eq!(paths, vec!["express".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_cached_artifacts: storage-backed read path (#1548 / web #424).
+    // Exercises the full method against a mock backend: the prefix list, the
+    // sidecar read per logical path, the missing-sidecar skip, the
+    // content-type default, and the listing-error -> empty fallback. The
+    // pure key parsing is covered by the cached_artifact_paths tests above.
+    // -----------------------------------------------------------------------
+
+    /// Storage backend that returns a fixed key set from `list()` and serves
+    /// sidecar JSON from `get()` for keys present in `sidecars`. `list_fails`
+    /// drives the listing-error path.
+    struct CachedListingMock {
+        keys: Vec<String>,
+        sidecars: std::collections::HashMap<String, Bytes>,
+        list_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CachedListingMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            match self.sidecars.get(key) {
+                Some(b) => Ok(b.clone()),
+                None => Err(AppError::NotFound(key.to_string())),
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn sidecar_bytes(
+        size: i64,
+        checksum: &str,
+        content_type: Option<&str>,
+        cached_at: chrono::DateTime<chrono::Utc>,
+    ) -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at,
+            upstream_etag: None,
+            storage_etag: None,
+            expires_at: cached_at + chrono::Duration::hours(1),
+            content_type: content_type.map(|s| s.to_string()),
+            size_bytes: size,
+            checksum_sha256: checksum.to_string(),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn content_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__content__", repo, path)
+    }
+    fn meta_key(repo: &str, path: &str) -> String {
+        format!("proxy-cache/{}/{}/__cache_meta__.json", repo, path)
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_returns_entries_from_sidecars() {
+        let repo = "npm-remote";
+        let pa = "is-odd/-/is-odd-3.0.1.tgz";
+        let pb = "lodash/-/lodash-4.17.21.tgz";
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, pa),
+            sidecar_bytes(123, &"a".repeat(64), Some("application/gzip"), now),
+        );
+        // pb sidecar has no content_type -> entry should default it.
+        sidecars.insert(
+            meta_key(repo, pb),
+            sidecar_bytes(456, &"b".repeat(64), None, now),
+        );
+        let keys = vec![
+            content_key(repo, pa),
+            meta_key(repo, pa),
+            content_key(repo, pb),
+            meta_key(repo, pb),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let mut entries = service.list_cached_artifacts(repo).await;
+        entries.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(entries.len(), 2);
+
+        let a = &entries[0];
+        assert_eq!(a.path, pa);
+        assert_eq!(a.name, "is-odd-3.0.1.tgz");
+        assert_eq!(a.size_bytes, 123);
+        assert_eq!(a.checksum_sha256, "a".repeat(64));
+        assert_eq!(a.content_type, "application/gzip");
+
+        let b = &entries[1];
+        assert_eq!(b.name, "lodash-4.17.21.tgz");
+        assert_eq!(
+            b.content_type, "application/octet-stream",
+            "missing content_type must default to application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_skips_entry_with_missing_sidecar() {
+        let repo = "npm-remote";
+        let good = "ok/-/ok-1.0.0.tgz";
+        let bad = "broken/-/broken-1.0.0.tgz"; // content listed, no sidecar
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, good),
+            sidecar_bytes(10, &"c".repeat(64), Some("application/octet-stream"), now),
+        );
+        let keys = vec![
+            content_key(repo, good),
+            meta_key(repo, good),
+            content_key(repo, bad),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let entries = service.list_cached_artifacts(repo).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an entry whose sidecar is missing must be skipped"
+        );
+        assert_eq!(entries[0].path, good);
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_empty_when_listing_fails() {
+        let mock = Arc::new(CachedListingMock {
+            keys: Vec::new(),
+            sidecars: std::collections::HashMap::new(),
+            list_fails: true,
+        });
+        let service = build_proxy_service_with_storage(mock);
+        assert!(
+            service.list_cached_artifacts("npm-remote").await.is_empty(),
+            "a storage listing error must yield no cached artifacts"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5035,6 +5905,482 @@ SHA256:
 
         let (body, _) = result.expect("blob fetch with accept=None must succeed");
         assert_eq!(&body[..], b"blob-bytes");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1360: ghcr.io manifest pull. GitHub Container Registry returns 404
+    // when the request's `Accept` header does not list a media type that
+    // matches the stored manifest. The OCI handler's
+    // `manifest_accept_for_upstream` helper supplements the client's
+    // Accept with the canonical OCI/Docker manifest media-type set so
+    // these strict upstreams still serve the request. This test pins the
+    // wire-level contract: a wiremock upstream that only responds 200
+    // when the request's Accept contains the OCI image-index media type
+    // must succeed when the proxy is given the supplemented Accept value.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_manifest_with_canonical_accept_succeeds_against_strict_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        // Strict ghcr-shaped upstream: respond 200 only when the request
+        // carries the OCI image-index media type in Accept; otherwise the
+        // wiremock default (404) fires, matching the user's reproducer
+        // for `gurucomputing/headscale-ui:2026.03.17`.
+        let manifest_body =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        Mock::given(method("GET"))
+            .and(path("/v2/gurucomputing/headscale-ui/manifests/2026.03.17"))
+            .and(AcceptHeaderContains {
+                expected_substring: "application/vnd.oci.image.index.v1+json",
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.index.v1+json")
+                    .set_body_bytes(manifest_body.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ghcr-1360-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "remote-container-ghcr".to_string(),
+            name: "remote-container-ghcr".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // The canonical Accept value that the OCI manifest handler now
+        // always sends. Contains the OCI image-index media type that the
+        // strict upstream requires; older docker engines that only sent
+        // the Docker manifest types would fail this match before #1360.
+        let canonical_accept = "application/vnd.docker.distribution.manifest.v2+json, \
+                                application/vnd.docker.distribution.manifest.list.v2+json, \
+                                application/vnd.oci.image.index.v1+json, \
+                                application/vnd.oci.image.manifest.v1+json";
+
+        let result = proxy
+            .fetch_artifact_with_accept(
+                &repo,
+                "v2/gurucomputing/headscale-ui/manifests/2026.03.17",
+                Some(canonical_accept),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (body, ct) = result.expect(
+            "ghcr-shaped upstream must succeed when proxy advertises the \
+             canonical OCI Accept header set on manifest fetches (#1360)",
+        );
+        assert_eq!(&body[..], manifest_body.as_ref());
+        assert_eq!(
+            ct.as_deref(),
+            Some("application/vnd.oci.image.index.v1+json"),
+        );
+    }
+
+    /// Companion: the same strict upstream MUST 404 when the proxy sends
+    /// only the Docker manifest media types (the pre-#1360 behaviour for
+    /// older Docker clients). This pins the test fixture itself: if a
+    /// future change makes the wiremock match too lax (e.g. matches on
+    /// the absence of Accept) the regression value of the test above
+    /// collapses.
+    #[tokio::test]
+    async fn test_strict_upstream_rejects_sparse_accept_header() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/gurucomputing/headscale-ui/manifests/2026.03.17"))
+            .and(AcceptHeaderContains {
+                expected_substring: "application/vnd.oci.image.index.v1+json",
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ghcr-1360-neg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "remote-container-ghcr".to_string(),
+            name: "remote-container-ghcr".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Sparse pre-#1360 Accept: only docker media types, no OCI ones.
+        let sparse = "application/vnd.docker.distribution.manifest.v2+json";
+
+        let result = proxy
+            .fetch_artifact_with_accept(
+                &repo,
+                "v2/gurucomputing/headscale-ui/manifests/2026.03.17",
+                Some(sparse),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // The strict upstream must reject this request (default 404), so
+        // the proxy surfaces NotFound. This confirms the wiremock fixture
+        // actually discriminates on the OCI Accept content.
+        match result {
+            Err(crate::error::AppError::NotFound(_)) => {}
+            other => panic!(
+                "expected NotFound from strict upstream when proxy sends \
+                 only Docker manifest media types in Accept, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// #1445 (A): the buffered proxy fetch path MUST persist the
+    /// upstream bytes AND make them visible to the next request through
+    /// the same proxy_service. The reproducer "cached artifacts should
+    /// contain `abbrev` after npm upstream fetch -- not present" asserts
+    /// this round-trip end-to-end against the live `/artifacts` listing
+    /// endpoint, which depends on the on-disk cache being readable via
+    /// `get_cached_artifact_by_path` on the next call.
+    ///
+    /// This test does NOT need a real upstream: the buffered path calls
+    /// `cache_artifact` synchronously (`.await`s the storage put) before
+    /// returning, so we can drive `cache_artifact` directly and then
+    /// assert that `get_cached_artifact_by_path` returns the same bytes.
+    /// A regression in this contract (for example, dropping the
+    /// metadata-sidecar write or moving it onto a fire-and-forget task)
+    /// would break the listing reproducer in the same way #1445(A)
+    /// reports.
+    ///
+    /// The wider "/artifacts listing also shows proxy-cached items"
+    /// behaviour requires the storage-routing redesign described on
+    /// `test_cache_artifact_does_not_insert_into_artifacts_table` and
+    /// is intentionally out of scope for this fix. This test pins the
+    /// half of the contract that lives inside ProxyService and is the
+    /// foundation any future listing-merge work will rely on.
+    #[tokio::test]
+    async fn test_cache_artifact_persists_bytes_for_next_request() {
+        use crate::services::storage_service::{FilesystemBackend, StorageService};
+
+        // Use a real filesystem-backed storage so the same put/get
+        // round-trip the production code does is exercised, including
+        // the metadata sidecar write.
+        let tmp = std::env::temp_dir().join(format!("ak-1445a-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+
+        let backend = Arc::new(FilesystemBackend::new(tmp.clone()));
+        let storage = Arc::new(StorageService::new(backend));
+
+        // Build the service with a `lazy` PgPool: we never call any
+        // code path that touches the DB on this test.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let proxy = ProxyService::new(pool, storage);
+
+        let repo_key = "npm-proxy";
+        let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
+        let content = Bytes::from_static(b"mock-tarball-bytes-for-abbrev-1.1.1");
+
+        // Drive cache_artifact directly with the same keys
+        // `fetch_artifact_with_cache_path` derives.
+        let cache_key = ProxyService::cache_storage_key(repo_key, cache_path).unwrap();
+        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path).unwrap();
+        proxy
+            .cache_artifact(
+                &cache_key,
+                &metadata_key,
+                &content,
+                Some("application/gzip".to_string()),
+                None,
+                DEFAULT_CACHE_TTL_SECS,
+                Uuid::new_v4(),
+                cache_path,
+            )
+            .await
+            .expect("cache_artifact must succeed on a healthy filesystem backend");
+
+        // The next request MUST find the cached bytes via the public
+        // lookup helper used by handlers (`proxy_check_cache` is built
+        // on top of this). A regression that lost the metadata sidecar
+        // or wrote it under the wrong key would surface here as None.
+        let lookup = proxy
+            .get_cached_artifact_by_path(repo_key, cache_path)
+            .await
+            .expect("cache lookup must not error on a fresh entry");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (got, got_ct) = lookup.expect(
+            "cache_artifact MUST persist bytes that the very next call to \
+             get_cached_artifact_by_path can read back. The reproducer in \
+             #1445(A) (`cached artifacts should contain abbrev after npm \
+             upstream fetch -- not present`) trips when this round-trip \
+             fails: bytes are returned to the client but the cache is \
+             empty next time.",
+        );
+        assert_eq!(&got[..], content.as_ref());
+        assert_eq!(got_ct.as_deref(), Some("application/gzip"));
+    }
+
+    /// Build a minimal Remote `Repository` pointing at `upstream_url` for
+    /// the streaming proxy tests below. The storage path is unused by the
+    /// streaming cache (which writes through `self.storage`), but the field
+    /// is required by the struct.
+    fn remote_repo_for(key: &str, upstream_url: &str, storage_path: &str) -> Repository {
+        Repository {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: storage_path.to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// #1365 end-to-end regression: a non-empty upstream Maven POM proxied
+    /// through `fetch_artifact_streaming` must be cached at the full
+    /// upstream byte length, and the second request must serve that same
+    /// non-zero body from the cache (never `Content-Length: 0`).
+    ///
+    /// Drives the real streaming path (tee + filesystem `put_stream` +
+    /// metadata sidecar) against a wiremock upstream, so it exercises the
+    /// exact code that produced the zero-byte cache hit in the incident.
+    #[tokio::test]
+    async fn test_streaming_proxy_caches_full_length_pom() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The streaming fetch loads per-repo upstream auth from the DB, so
+        // this end-to-end test needs a real database. Skip gracefully when
+        // DATABASE_URL is unset/unreachable (matches the other wiremock
+        // proxy tests). The deterministic unit-level guard for #1365 lives
+        // in `test_tee_empty_upstream_is_not_cached`, which needs no DB.
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let pom = br#"<?xml version="1.0" encoding="UTF-8"?>
+<project><modelVersion>4.0.0</modelVersion>
+<groupId>io.sentry</groupId><artifactId>sentry</artifactId><version>8.42.0</version></project>"#;
+        let pom_path = "io/sentry/sentry/8.42.0/sentry-8.42.0.pom";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(pom.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-1365-ok-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+
+        // First request: cache miss, streamed from upstream and tee'd to cache.
+        let first = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("streaming fetch must succeed on a 200 upstream");
+        let body = drain_stream(first.body).await;
+        assert_eq!(
+            body.len(),
+            pom.len(),
+            "first (miss) response must carry the full upstream POM length"
+        );
+        assert_eq!(&body[..], pom.as_ref());
+
+        // Give the background cache writer time to flush the sidecar.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The cache must now be fresh with the correct length.
+        assert!(
+            proxy.is_cache_fresh("maven-central", pom_path).await,
+            "a non-empty POM must produce a fresh cache entry"
+        );
+
+        // Second request: served from cache. Must be non-zero and full length.
+        let second = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("cached streaming fetch must succeed");
+        assert_eq!(
+            second.content_length,
+            Some(pom.len() as u64),
+            "cache hit must report the full POM length, never 0 (#1365)"
+        );
+        let cached_body = drain_stream(second.body).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            &cached_body[..],
+            pom.as_ref(),
+            "cache hit must serve the full POM body, never an empty body (#1365)"
+        );
+    }
+
+    /// #1365 end-to-end regression: an empty upstream body (a 204, an empty
+    /// 200, or a HEAD-style probe reaching the streaming download path)
+    /// must NOT poison the cache. After draining the empty first response,
+    /// the entry must not be fresh, and once the upstream serves the real
+    /// POM the next request must return the full non-empty body.
+    #[tokio::test]
+    async fn test_streaming_proxy_does_not_cache_empty_upstream_then_self_heals() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let pom = br#"<?xml version="1.0"?><project><artifactId>sentry</artifactId></project>"#;
+        let pom_path = "io/sentry/sentry/8.42.0/sentry-8.42.0.pom";
+
+        let server = MockServer::start().await;
+        // First response: a valid 200 status but an empty body (the bug
+        // trigger). `up_to_n_times(1)` so the second request gets the
+        // real POM, proving the bad entry self-heals rather than sticking.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(b"".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{pom_path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_bytes(pom.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-1365-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+
+        // First request: empty upstream body. Client gets the empty body
+        // for THIS request, but nothing must be cached.
+        let first = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("streaming fetch must succeed even on an empty 200");
+        let body = drain_stream(first.body).await;
+        assert_eq!(
+            body.len(),
+            0,
+            "first response mirrors the empty upstream body"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !proxy.is_cache_fresh("maven-central", pom_path).await,
+            "an empty upstream body MUST NOT create a fresh cache entry (#1365)"
+        );
+
+        // Second request: upstream now serves the real POM. The proxy must
+        // refetch (the empty entry was not cached) and return the full body.
+        let second = proxy
+            .fetch_artifact_streaming(&repo, pom_path)
+            .await
+            .expect("refetch after empty upstream must succeed");
+        let healed = drain_stream(second.body).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            &healed[..],
+            pom.as_ref(),
+            "after the empty body was rejected, the next request must serve \
+             the full upstream POM (self-heal), never a zero-byte cache hit (#1365)"
+        );
+    }
+
+    /// Drain a streaming proxy body into a single `Vec<u8>`.
+    async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
+        let mut body = body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        out
     }
 
     /// Source-level pin for #1278: `cache_artifact` must NOT insert into

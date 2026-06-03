@@ -116,11 +116,19 @@ impl MavenHandler {
         };
 
         // Check for classifier: -classifier.ext
+        //
+        // Edge case: `artifact-version-.ext` has an empty classifier and is
+        // not a valid Maven coordinate. Reject it via the trailing
+        // `Err` branch below so callers (e.g. `is_maven_secondary_path` in
+        // the virtual-repo fallback) don't treat it as a classifier
+        // artifact and route it around its own SQL row. See #1399.
         if let Some(rest) = remainder.strip_prefix('-') {
             if let Some(dot_pos) = rest.rfind('.') {
                 let classifier = &rest[..dot_pos];
                 let extension = &rest[dot_pos + 1..];
-                return Ok((Some(classifier.to_string()), extension.to_string()));
+                if !classifier.is_empty() {
+                    return Ok((Some(classifier.to_string()), extension.to_string()));
+                }
             }
         }
 
@@ -301,7 +309,13 @@ pub struct PomProject {
     pub url: Option<String>,
     pub parent: Option<PomParent>,
     pub dependencies: Option<PomDependencies>,
-    pub properties: Option<PomProperties>,
+    /// Maven `<properties>` as a flat `name -> value` map. Deserialized
+    /// directly into a map: quick-xml treats the arbitrary-named child
+    /// elements of `<properties>` as map entries. (A `#[serde(flatten)]`
+    /// wrapper struct fails here with "invalid type: map, expected a
+    /// string", which previously made any POM declaring `<properties>`
+    /// unparseable.)
+    pub properties: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,12 +343,6 @@ pub struct PomDependency {
     pub dep_type: Option<String>,
     pub classifier: Option<String>,
     pub optional: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PomProperties {
-    #[serde(flatten)]
-    pub properties: std::collections::HashMap<String, String>,
 }
 
 /// Generate maven-metadata.xml content
@@ -451,6 +459,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pom_with_properties_and_dependencies() {
+        // Regression: a POM declaring <properties> previously failed to parse
+        // entirely ("invalid type: map, expected a string"), which made
+        // validate() reject such uploads and left the SBOM without declared
+        // dependencies (#870). Real-world POMs almost always declare
+        // properties, so this must parse.
+        let pom = b"<project>\
+            <groupId>com.example</groupId><artifactId>app</artifactId><version>1.0.0</version>\
+            <properties>\
+                <java.version>17</java.version>\
+                <guava.version>32.1.3-jre</guava.version>\
+            </properties>\
+            <dependencies>\
+                <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>${guava.version}</version></dependency>\
+            </dependencies>\
+        </project>";
+        let parsed = MavenHandler::parse_pom(pom).expect("POM with <properties> must parse");
+        let props = parsed.properties.expect("properties present");
+        assert_eq!(props.get("java.version").map(|s| s.as_str()), Some("17"));
+        assert_eq!(
+            props.get("guava.version").map(|s| s.as_str()),
+            Some("32.1.3-jre")
+        );
+        let deps = parsed.dependencies.expect("dependencies present");
+        assert_eq!(deps.dependency.len(), 1);
+        assert_eq!(deps.dependency[0].artifact_id, "guava");
+    }
+
+    #[test]
     fn test_coordinates_to_path() {
         let coords = MavenCoordinates {
             group_id: "com.example".to_string(),
@@ -538,6 +575,20 @@ mod tests {
         assert_eq!(coords.artifact_id, "test");
         assert_eq!(coords.version, "1.0.0-SNAPSHOT");
         assert_eq!(coords.extension, "pom");
+    }
+
+    #[test]
+    fn test_parse_coordinates_rejects_empty_classifier() {
+        // `artifact-version-.ext` has a dangling hyphen and an empty
+        // classifier. It is not a valid Maven coordinate; the parser
+        // must reject it rather than returning `Some("")`. The Maven
+        // virtual-repo fallback (#1399) relies on this to refuse routing
+        // empty-classifier paths around their SQL row.
+        let result = MavenHandler::parse_coordinates("g/a/1.0/a-1.0-.jar");
+        assert!(
+            result.is_err(),
+            "empty-classifier coordinate must not parse as a valid Maven path"
+        );
     }
 
     #[test]

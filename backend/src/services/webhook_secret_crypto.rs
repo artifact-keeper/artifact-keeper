@@ -16,7 +16,13 @@
 //! This module is deliberately scoped to webhook secrets so that the key
 //! can be rotated independently from the SSO credential key.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64_URL,
+        URL_SAFE_NO_PAD as B64_URL_NO_PAD,
+    },
+    Engine as _,
+};
 use rand::RngCore;
 use thiserror::Error;
 
@@ -56,13 +62,50 @@ pub enum WebhookSecretError {
 /// Result type for webhook crypto operations.
 pub type Result<T> = std::result::Result<T, WebhookSecretError>;
 
-/// Load the 32-byte key from the environment, decoding base64.
+/// Decode an `AK_WEBHOOK_SECRET_KEY` value, accepting any of the common
+/// base64 alphabets: standard, standard-no-pad, URL-safe (base64url), and
+/// URL-safe-no-pad. Operators frequently generate these keys with tools that
+/// emit base64url (e.g. `openssl rand -base64 32 | tr '+/' '-_'`, `head -c
+/// 32 /dev/urandom | base64 -w0` on systems whose `base64` defaults to URL
+/// alphabet, or Kubernetes secret tooling). Refusing such values broke
+/// release-gate deploys when the generated key happened to contain `-` or
+/// `_` (see #1350, #1367), so we try every alphabet before giving up.
+fn decode_key_material(input: &str) -> std::result::Result<Vec<u8>, String> {
+    // The order matters only for the error message we propagate when every
+    // attempt fails: we want the most informative one. Standard base64 is
+    // tried first because it is the documented format.
+    let mut last_err: Option<String> = None;
+    for engine in [
+        &B64 as &dyn _Decoder,
+        &B64_NO_PAD,
+        &B64_URL,
+        &B64_URL_NO_PAD,
+    ] {
+        match engine.decode(input) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no base64 alphabet matched".to_string()))
+}
+
+/// Erased decoder trait so the four `general_purpose::*` constants (which
+/// have distinct concrete types) can live in the same array.
+trait _Decoder {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String>;
+}
+
+impl<E: base64::Engine> _Decoder for E {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String> {
+        base64::Engine::decode(self, input).map_err(|e| e.to_string())
+    }
+}
+
+/// Load the 32-byte key from the environment, decoding base64 or base64url.
 fn load_key() -> Result<[u8; 32]> {
     let raw = std::env::var(ENV_KEY).map_err(|_| WebhookSecretError::KeyMissing)?;
     let trimmed = raw.trim();
-    let bytes = B64
-        .decode(trimmed)
-        .map_err(|e| WebhookSecretError::KeyNotBase64(e.to_string()))?;
+    let bytes = decode_key_material(trimmed).map_err(WebhookSecretError::KeyNotBase64)?;
     if bytes.len() != 32 {
         return Err(WebhookSecretError::KeyWrongLength(bytes.len()));
     }
@@ -349,6 +392,63 @@ mod tests {
     }
 
     #[test]
+    fn test_url_safe_base64_key_accepted() {
+        // Regression for #1367: backend refused to start when
+        // AK_WEBHOOK_SECRET_KEY was base64url-encoded (contains `-` or `_`).
+        // A 32-byte key whose URL-safe encoding contains `_`:
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        // Pick bytes whose standard-base64 form contains `/` and `+`, so
+        // the URL-safe form contains `_` and `-`. Byte values 0xFB and 0xFE
+        // map to alphabet chars `+` and `/`. Cycling 0xFB/0xFE produces an
+        // encoding rich in both `+/`, ensuring the URL-safe variant differs.
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe = base64::engine::general_purpose::URL_SAFE.encode(bytes);
+        assert!(
+            url_safe.contains('_') || url_safe.contains('-'),
+            "test fixture should exercise base64url alphabet, got {}",
+            url_safe
+        );
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe);
+        }
+        assert!(
+            ensure_configured().is_ok(),
+            "base64url-encoded key must be accepted; got error for input {}",
+            url_safe
+        );
+    }
+
+    #[test]
+    fn test_url_safe_no_pad_base64_key_accepted() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe_no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe_no_pad);
+        }
+        assert!(ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn test_garbage_key_still_rejected_as_invalid_base64() {
+        // A key with characters that are neither in the standard nor the
+        // URL-safe alphabet must still be rejected with KeyNotBase64 so
+        // the operator gets a clear diagnostic.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, "!!! definitely not base64 !!!");
+        }
+        let res = ensure_configured();
+        assert!(matches!(res, Err(WebhookSecretError::KeyNotBase64(_))));
+    }
+
+    #[test]
     fn test_ensure_configured_wrong_length() {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -358,5 +458,113 @@ mod tests {
             ensure_configured(),
             Err(WebhookSecretError::KeyWrongLength(16))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_key_material: pure decoder used by load_key. Direct tests so
+    // we can pin every alphabet without paying the env-mutation cost the
+    // ensure_configured tests serialize on.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_key_material_standard_base64_padded() {
+        // Standard alphabet, padded — the documented format.
+        let raw = [0xAAu8; 32];
+        let encoded = B64.encode(raw);
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_standard_base64_unpadded() {
+        // The padding-tolerant engine must accept a payload whose length
+        // is a multiple of 4 but with the `=` characters stripped.
+        let raw = [0xCCu8; 32];
+        let encoded = B64.encode(raw).trim_end_matches('=').to_string();
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_padded() {
+        // URL-safe alphabet (`-`/`_`) must round-trip even when the input
+        // could not have come out of the standard engine.
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(raw);
+        assert!(encoded.contains('_') || encoded.contains('-'));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_unpadded() {
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        assert!(!encoded.ends_with('='));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_rejects_garbage() {
+        // Characters outside both alphabets must surface as an error.
+        let result = decode_key_material("!!! not base64 at all !!!");
+        assert!(result.is_err());
+        // And the error string is non-empty so operators see why.
+        assert!(!result.unwrap_err().is_empty());
+    }
+
+    #[test]
+    fn test_decode_key_material_empty_input_decodes_to_empty() {
+        // Empty input is a degenerate-but-valid base64 string. The decoder
+        // must succeed (returning empty bytes) so the caller's length check
+        // is what surfaces the diagnostic, not a generic base64 error.
+        assert_eq!(decode_key_material("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decode_key_material_passes_shortest_informative_error() {
+        // When every alphabet fails, the last attempt's error message is
+        // propagated. We can't pin a specific message (engine-internal),
+        // but the result must be Err with a non-empty string so callers
+        // can render it.
+        let err = decode_key_material("@@@@@@").unwrap_err();
+        assert!(!err.is_empty(), "error message must not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // digest_for_display: pure helper. Extra edge cases on top of the
+    // existing prefix/short-secret tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_for_display_no_prefix_uses_first4_dots_last4() {
+        // A secret without the standard `whsec_` prefix falls back to the
+        // generic `<first4>...<last4>` formatting.
+        let secret = "ABCD12345678WXYZ";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("ABCD"));
+        assert!(digest.ends_with("WXYZ"));
+        assert!(digest.contains("..."));
+        assert!(!digest.starts_with(SECRET_PREFIX));
+    }
+
+    #[test]
+    fn test_digest_for_display_prefix_with_short_body_returns_full_secret() {
+        // `whsec_` + a body shorter than 4 chars must surface verbatim so
+        // operators don't get a misleading `whsec_...xxx` rendering for a
+        // secret whose last4 *is* the entire body.
+        // 8+ chars total so the early "short secret" branch doesn't trip.
+        let secret = "whsec_xy"; // 8 chars total, 2-char body
+        let digest = digest_for_display(secret);
+        assert_eq!(digest, secret);
+    }
+
+    #[test]
+    fn test_digest_for_display_redaction_excludes_middle_bytes() {
+        // Anti-leak property: a `whsec_<body>` digest exposes only the
+        // first 6 characters (the prefix) and the last 4 of the body. The
+        // middle bytes must not appear in the rendered string.
+        let secret = "whsec_MIDDLE_SHOULD_NEVER_LEAKtail";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("whsec_"));
+        assert!(digest.ends_with("tail"));
+        assert!(!digest.contains("MIDDLE_SHOULD_NEVER_LEAK"));
     }
 }

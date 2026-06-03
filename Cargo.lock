@@ -195,10 +195,12 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "http-body-util",
  "jsonwebtoken",
  "ldap3",
  "lettre",
  "md-5",
+ "memmap2",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
@@ -263,6 +265,7 @@ dependencies = [
  "windows-service",
  "wiremock",
  "xz2",
+ "zeroize",
  "zip 8.5.1",
  "zstd",
  "zxcvbn",
@@ -3520,6 +3523,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
@@ -16,6 +16,53 @@ use crate::error::{AppError, Result};
 
 /// Chunk size for streaming reads (256 KB).
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to open parent directory {} for sync: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        dir.sync_all().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to sync parent directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn temp_path_for_dest(dest: &Path, id: Uuid) -> Result<PathBuf> {
+    let parent = dest.parent().ok_or_else(|| {
+        AppError::Storage(format!(
+            "Destination path {} has no parent directory",
+            dest.display()
+        ))
+    })?;
+    Ok(parent.join(format!(".tmp.{id}")))
+}
+
+async fn remove_temp_file_best_effort(path: &Path, context: &'static str) {
+    if let Err(e) = fs::remove_file(path).await {
+        tracing::warn!(
+            path = %path.display(),
+            context,
+            error = %e,
+            "Failed to remove filesystem storage temp file"
+        );
+    }
+}
 
 /// Filesystem-based storage backend
 pub struct FilesystemStorage {
@@ -80,10 +127,38 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write content
-        let mut file = fs::File::create(&path).await?;
-        file.write_all(&content).await?;
-        file.sync_all().await?;
+        // Write to a unique temp file in the same directory, then atomically
+        // rename into place (same filesystem => atomic rename on POSIX). The
+        // previous implementation wrote directly to `path` via
+        // `File::create` + `write_all`, which is NOT atomic: under a
+        // cold-cache proxy stampede, N concurrent writers target the SAME
+        // cache file and race on truncate/write, and a reader interleaving
+        // with a sibling writer's truncate can observe a torn or
+        // transiently-missing file. Writing to a per-writer temp path and
+        // renaming gives each writer an isolated file and makes the visible
+        // `path` flip atomically from old bytes to new bytes, never to a
+        // partial/empty state. This closes the B6 stampede 502 leak at the
+        // storage layer (the proxy-service call site additionally treats a
+        // cache-write failure as best-effort).
+        let mut temp_name = path.as_os_str().to_os_string();
+        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
+        let temp_path = PathBuf::from(temp_name);
+
+        let mut file = fs::File::create(&temp_path).await?;
+        if let Err(e) = file.write_all(&content).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
 
         Ok(())
     }
@@ -128,6 +203,53 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let source_path = self.key_to_path(source);
+        let dest_path = self.key_to_path(dest);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temp_path = temp_path_for_dest(&dest_path, Uuid::new_v4())?;
+
+        if let Err(e) = fs::copy(&source_path, &temp_path).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy failed").await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", source))
+            } else {
+                AppError::Storage(format!("Failed to copy {} to {}: {}", source, dest, e))
+            });
+        }
+
+        let file = match fs::OpenOptions::new().read(true).open(&temp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                remove_temp_file_best_effort(&temp_path, "filesystem copy temp open failed").await;
+                return Err(AppError::Storage(format!(
+                    "Failed to open copied temp file for {}: {}",
+                    dest, e
+                )));
+            }
+        };
+        if let Err(e) = file.sync_all().await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy temp sync failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to sync copied temp file for {}: {}",
+                dest, e
+            )));
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &dest_path).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy temp promote failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to promote copied temp file to {}: {}",
+                dest, e
+            )));
+        }
+        sync_parent_directory(&dest_path).await?;
+        Ok(())
+    }
+
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
@@ -167,9 +289,7 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let mut temp_name = dest.as_os_str().to_os_string();
-        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
-        let temp_path = PathBuf::from(temp_name);
+        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
         let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
@@ -184,12 +304,13 @@ impl StorageBackend for FilesystemStorage {
                     hasher.update(&data);
                     total += data.len() as u64;
                     if let Err(e) = file.write_all(&data).await {
-                        let _ = fs::remove_file(&temp_path).await;
+                        remove_temp_file_best_effort(&temp_path, "filesystem stream write failed")
+                            .await;
                         return Err(AppError::Storage(format!("Write error: {}", e)));
                     }
                 }
                 Err(e) => {
-                    let _ = fs::remove_file(&temp_path).await;
+                    remove_temp_file_best_effort(&temp_path, "filesystem stream read failed").await;
                     return Err(e);
                 }
             }
@@ -197,17 +318,17 @@ impl StorageBackend for FilesystemStorage {
 
         // Flush and sync to disk before renaming
         if let Err(e) = file.sync_all().await {
-            let _ = fs::remove_file(&temp_path).await;
+            remove_temp_file_best_effort(&temp_path, "filesystem stream sync failed").await;
             return Err(AppError::Storage(format!("Sync error: {}", e)));
         }
         drop(file);
 
         // Atomic rename
         if let Err(e) = fs::rename(&temp_path, &dest).await {
-            // Best-effort cleanup; the temp file may already be gone
-            let _ = fs::remove_file(&temp_path).await;
+            remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
             return Err(AppError::Storage(format!("Rename error: {}", e)));
         }
+        sync_parent_directory(&dest).await?;
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -255,6 +376,20 @@ mod tests {
         // Key shorter than 2 chars: uses entire key as prefix
         let path = storage.key_to_path("a");
         assert_eq!(path, PathBuf::from("/data/a/a"));
+    }
+
+    #[test]
+    fn test_temp_path_for_dest_uses_short_sibling_name() {
+        let dest = PathBuf::from(format!("/data/aa/{}", "a".repeat(240)));
+        let temp = temp_path_for_dest(&dest, Uuid::nil()).expect("temp path");
+
+        assert_eq!(temp.parent(), dest.parent());
+        let file_name = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp file name");
+        assert_eq!(file_name, ".tmp.00000000-0000-0000-0000-000000000000");
+        assert!(file_name.len() < 64);
     }
 
     #[test]
@@ -385,6 +520,52 @@ mod tests {
         assert_eq!(retrieved, content);
     }
 
+    /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +
+    /// atomic rename so concurrent writers to the SAME key never observe a
+    /// torn / transiently-missing file. Before the fix, `put` did
+    /// `File::create(&dest) + write_all`, which truncated `dest` in place and
+    /// let a reader interleave with a sibling writer's truncate. This test
+    /// fires many concurrent writers + readers at one key and asserts every
+    /// `put` succeeds, no `.tmp.` files leak, and the final read returns a
+    /// complete (non-empty) body.
+    #[tokio::test]
+    async fn test_concurrent_put_same_key_is_atomic() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FilesystemStorage::new(temp_dir.path()));
+        let key = "proxy-cache/stampede-repo/simple/pkg/__content__";
+        let content = Bytes::from(vec![b'x'; 4096]);
+
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let s = storage.clone();
+            let c = content.clone();
+            handles.push(tokio::spawn(async move {
+                // Each writer writes the same body; the read may race a
+                // concurrent rename but must never see a partial file.
+                s.put(key, c).await
+            }));
+        }
+        for h in handles {
+            // Every put must succeed (no ENOENT from the create_dir_all /
+            // File::create race the old non-atomic path exhibited).
+            h.await.unwrap().expect("concurrent put must not fail");
+        }
+
+        let got = storage.get(key).await.expect("final read must succeed");
+        assert_eq!(got.len(), content.len(), "body must be complete, not torn");
+
+        // No leftover temp files.
+        let mut leftovers = Vec::new();
+        let mut entries = fs::read_dir(temp_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            collect_tmp_files(entry.path(), &mut leftovers).await;
+        }
+        assert!(
+            leftovers.is_empty(),
+            "atomic put must not leave .tmp. files: {leftovers:?}"
+        );
+    }
+
     // #1073 regression: a proxy-cache key written by the un-sharded writer
     // (`services::storage_service::FilesystemBackend`) must be readable by
     // this backend's `get`. Before the fix, this backend sharded the key
@@ -463,6 +644,63 @@ mod tests {
 
         storage.delete(key).await.unwrap();
         assert!(!storage.exists(key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_copy_copies_content_to_destination_key() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        storage
+            .put("source/object", Bytes::from_static(b"copy me"))
+            .await
+            .unwrap();
+
+        storage
+            .copy("source/object", "dest/nested/object")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get("source/object").await.unwrap(),
+            Bytes::from_static(b"copy me")
+        );
+        assert_eq!(
+            storage.get("dest/nested/object").await.unwrap(),
+            Bytes::from_static(b"copy me")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_copy_replaces_existing_destination_by_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        storage
+            .put("source/object", Bytes::from_static(b"new content"))
+            .await
+            .unwrap();
+        storage
+            .put("dest/object", Bytes::from_static(b"old content"))
+            .await
+            .unwrap();
+        let dest_path = storage.key_to_path("dest/object");
+        let before_ino = tokio::fs::metadata(&dest_path).await.unwrap().ino();
+
+        storage.copy("source/object", "dest/object").await.unwrap();
+
+        let after_ino = tokio::fs::metadata(&dest_path).await.unwrap().ino();
+        assert_ne!(
+	            before_ino, after_ino,
+	            "copy should replace the destination with a temp-file rename instead of rewriting it in place"
+	        );
+        assert_eq!(
+            storage.get("dest/object").await.unwrap(),
+            Bytes::from_static(b"new content")
+        );
     }
 
     #[tokio::test]

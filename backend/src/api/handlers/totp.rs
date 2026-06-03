@@ -8,15 +8,18 @@ use axum::{
     routing::post,
     Extension, Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::handlers::auth::set_auth_cookies;
-use crate::api::middleware::auth::AuthExtension;
+use crate::api::middleware::auth::{AuthExtension, TokenIat};
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::auth_service::{invalidate_user_tokens, AuthService};
+use crate::services::auth_service::{
+    invalidate_user_tokens, invalidate_user_tokens_except_caller, AuthService,
+};
 
 /// Build a TOTP instance from raw secret bytes and a username label.
 fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
@@ -136,6 +139,7 @@ pub struct TotpEnableResponse {
 pub async fn enable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
+    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<TotpEnableResponse>> {
     // Fetch stored secret
@@ -194,23 +198,67 @@ pub async fn enable_totp(
     let hashed_json = serde_json::to_string(&hashed_codes)
         .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
 
-    // Enable TOTP
+    // Enable TOTP. We bump `totp_verified_at` to a value that invalidates
+    // every JWT issued strictly before the calling session's `iat` while
+    // letting the calling token itself survive (#1370). The DB-backed check
+    // at `is_token_invalidated_replica_safe` uses strict `<` so a token
+    // whose `iat` equals the watermark passes; pre-fix this UPDATE used
+    // `NOW()`, which on a fast test path always exceeded the caller's `iat`
+    // and locked the caller out of their own session right after enable.
+    //
+    // When the caller didn't use a JWT (no `iat`), fall back to `NOW()` so
+    // the original #1146 semantic still holds for any other JWT sessions
+    // this user has.
+    let caller_iat = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    let verified_ts: DateTime<Utc> = match caller_iat {
+        Some(iat) => DateTime::<Utc>::from_timestamp(iat, 0).ok_or_else(|| {
+            AppError::Internal(format!("Invalid caller iat for totp_verified_at: {iat}"))
+        })?,
+        None => Utc::now(),
+    };
     sqlx::query!(
-        "UPDATE users SET totp_enabled = true, totp_backup_codes = $2, totp_verified_at = NOW() WHERE id = $1",
+        "UPDATE users SET totp_enabled = true, totp_backup_codes = $2, totp_verified_at = $3 WHERE id = $1",
         auth.user_id,
-        hashed_json
+        hashed_json,
+        verified_ts
     )
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Enabling 2FA is a credential change: invalidate every JWT/refresh token
-    // issued before this point so existing sessions cannot keep operating
-    // under the old (TOTP-not-required) policy. Without this, a refresh token
-    // issued before TOTP was enabled stays valid until natural expiry, and
-    // the holder can swap it for a fresh access token via the refresh-grant
-    // path — bypassing the new factor.
-    invalidate_user_tokens(auth.user_id);
+    // Enabling 2FA is a credential change: invalidate every JWT issued before
+    // this point so existing sessions cannot keep operating under the old
+    // (TOTP-not-required) policy. The calling session is exempted so the
+    // user is not signed out by their own action (#1370); every other
+    // session is still killed.
+    //
+    // Refresh tokens are revoked via the DB on every replica below so the
+    // OAuth refresh-grant cannot mint a fresh access token from a stale
+    // refresh JWT — that's the original #1146 threat.
+    match caller_iat {
+        Some(iat) => invalidate_user_tokens_except_caller(auth.user_id, iat),
+        None => invalidate_user_tokens(auth.user_id),
+    }
+
+    // Refresh-token family revocation (#1146 / #1370): a refresh JWT issued
+    // before TOTP was enabled stays valid until natural expiry. Mark every
+    // active row in `refresh_token_jti` for this user as revoked so the
+    // DB-backed replay check rejects them on every replica.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service
+        .revoke_all_refresh_token_families(auth.user_id)
+        .await
+    {
+        // Best-effort: a failure here is logged but does not block enable.
+        // The in-memory watermark and DB `totp_verified_at` already block
+        // refresh-grant on this replica; the explicit family revocation
+        // covers the cross-replica fan-out window.
+        tracing::warn!(
+            user_id = %auth.user_id,
+            error = %e,
+            "Failed to revoke refresh-token families after TOTP enable",
+        );
+    }
 
     Ok(Json(TotpEnableResponse { backup_codes }))
 }
@@ -380,6 +428,7 @@ pub struct TotpDisableRequest {
 pub async fn disable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
+    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpDisableRequest>,
 ) -> Result<()> {
     // Verify password
@@ -419,7 +468,11 @@ pub async fn disable_totp(
         return Err(AppError::Authentication("Invalid TOTP code".to_string()));
     }
 
-    // Disable TOTP
+    // Disable TOTP. `totp_verified_at` is cleared (NULL) so the DB-backed
+    // credential-change watermark falls back to `password_changed_at` which
+    // doesn't change here. To still invalidate other JWT sessions that were
+    // issued under the TOTP-required policy, we set the in-memory watermark
+    // explicitly via `invalidate_user_tokens_except_caller` below (#1370).
     sqlx::query!(
         "UPDATE users SET totp_secret = NULL, totp_enabled = false, totp_backup_codes = NULL, totp_verified_at = NULL WHERE id = $1",
         auth.user_id
@@ -430,9 +483,29 @@ pub async fn disable_totp(
 
     // Symmetric with `enable_totp`: removing 2FA is a credential change too.
     // Invalidate prior tokens issued under the stricter (TOTP-required)
-    // policy so the user re-authenticates and existing sessions don't keep
-    // operating with elevated trust they no longer satisfy.
-    invalidate_user_tokens(auth.user_id);
+    // policy while exempting the calling session so the user is not signed
+    // out by their own disable action (#1370).
+    let caller_iat = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    match caller_iat {
+        Some(iat) => invalidate_user_tokens_except_caller(auth.user_id, iat),
+        None => invalidate_user_tokens(auth.user_id),
+    }
+
+    // Refresh-token family revocation (#1146 / #1370): kill every refresh
+    // JWT for this user across replicas so the OAuth refresh-grant cannot
+    // mint a new access token from a stale refresh JWT minted under the
+    // TOTP-required policy. Best-effort; logged on failure.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service
+        .revoke_all_refresh_token_families(auth.user_id)
+        .await
+    {
+        tracing::warn!(
+            user_id = %auth.user_id,
+            error = %e,
+            "Failed to revoke refresh-token families after TOTP disable",
+        );
+    }
 
     Ok(())
 }
@@ -785,9 +858,13 @@ mod totp_token_invalidation_regression_tests {
             "fresh user must not be pre-invalidated"
         );
 
+        // Simulate a non-JWT auth path (no TokenIat extension) so the handler
+        // falls back to the "invalidate everything" semantic. This pins the
+        // legacy #1146 behaviour for API-token / basic-auth callers.
         let result = enable_totp(
             State(state),
             Extension(auth),
+            None,
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -807,6 +884,83 @@ mod totp_token_invalidation_regression_tests {
         assert!(
             is_token_invalidated(user_id, pre_change_iat),
             "enable_totp must invalidate tokens issued before this point"
+        );
+    }
+
+    /// Companion regression for the #1370 carve-out: when `enable_totp` is
+    /// called with a `TokenIat` matching a recent token, the calling token
+    /// itself must NOT be invalidated, while older tokens still are.
+    ///
+    /// Pre-#1370 the handler unconditionally bumped the in-memory watermark
+    /// to `NOW()` and `totp_verified_at` to `NOW()`, so a release-gate run
+    /// that re-used the just-issued login token to disable TOTP saw a 401
+    /// on every subsequent request.
+    #[tokio::test]
+    async fn enable_totp_exempts_caller_iat_from_invalidation() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+
+        let secret = totp_rs::Secret::generate_secret();
+        let secret_b32 = secret.to_encoded().to_string();
+        let secret_bytes = secret.to_bytes().expect("secret bytes");
+        sqlx::query("UPDATE users SET totp_secret = $1 WHERE id = $2")
+            .bind(&secret_b32)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("set totp_secret");
+
+        let storage_dir =
+            std::env::temp_dir().join(format!("totp-exempt-enable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
+        let code = totp.generate_current().expect("generate code");
+
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        // The caller's token was issued "now"; tokens issued before now must
+        // be killed; the caller's own token must survive.
+        let caller_iat = Utc::now().timestamp();
+        let pre_caller_iat = caller_iat - 60;
+
+        let result = enable_totp(
+            State(state),
+            Extension(auth),
+            Some(Extension(TokenIat(caller_iat))),
+            Json(TotpCodeRequest { code }),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_ok(),
+            "enable_totp must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !is_token_invalidated(user_id, caller_iat),
+            "calling token (iat == watermark anchor) must NOT be invalidated"
+        );
+        assert!(
+            is_token_invalidated(user_id, pre_caller_iat),
+            "tokens issued strictly before the caller's iat must be invalidated"
         );
     }
 
@@ -862,9 +1016,12 @@ mod totp_token_invalidation_regression_tests {
         // user_id has never been invalidated before.
         assert!(!is_token_invalidated(user_id, pre_change_iat));
 
+        // Legacy non-JWT path (no TokenIat) — must still invalidate all
+        // sessions for this user, as in #1146.
         let result = disable_totp(
             State(state),
             Extension(auth),
+            None,
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,
@@ -886,6 +1043,103 @@ mod totp_token_invalidation_regression_tests {
         assert!(
             is_token_invalidated(user_id, pre_change_iat),
             "disable_totp must invalidate tokens issued before this point"
+        );
+    }
+
+    /// #1370 regression: `disable_totp` called with the calling session's
+    /// `TokenIat` must return 2xx, exempt the caller from invalidation, and
+    /// leave `users.totp_enabled = false` so a subsequent `/auth/me` call
+    /// reports the correct state.
+    ///
+    /// This is the unit-level companion of the release-gate assertion
+    /// `auth-totp-disable / Disable succeeds with correct password and TOTP
+    /// code` + `User profile shows totp_enabled = false after disable`.
+    #[tokio::test]
+    async fn disable_totp_returns_ok_and_clears_totp_enabled_for_caller() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let secret = totp_rs::Secret::generate_secret();
+        let secret_b32 = secret.to_encoded().to_string();
+        let secret_bytes = secret.to_bytes().expect("secret bytes");
+        sqlx::query(
+            "UPDATE users SET totp_secret = $1, totp_enabled = true, password_hash = $2 \
+             WHERE id = $3",
+        )
+        .bind(&secret_b32)
+        .bind(&pwd_hash)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("set totp+password");
+
+        let storage_dir =
+            std::env::temp_dir().join(format!("totp-exempt-disable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
+        let code = totp.generate_current().expect("generate code");
+
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        let caller_iat = Utc::now().timestamp();
+        let pre_caller_iat = caller_iat - 60;
+
+        let result = disable_totp(
+            State(state),
+            Extension(auth),
+            Some(Extension(TokenIat(caller_iat))),
+            Json(TotpDisableRequest {
+                password: "real-test-password".to_string(),
+                code,
+            }),
+        )
+        .await;
+
+        // Read post-disable state BEFORE cleanup so the assertion can
+        // exercise what `/auth/me` would observe.
+        let totp_enabled_after: Option<bool> =
+            sqlx::query_scalar("SELECT totp_enabled FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .ok();
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_ok(),
+            "disable_totp must return Ok with correct creds + caller iat: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            totp_enabled_after,
+            Some(false),
+            "users.totp_enabled must be false after disable (drives /auth/me response)"
+        );
+        assert!(
+            !is_token_invalidated(user_id, caller_iat),
+            "calling token must survive its own disable (#1370)"
+        );
+        assert!(
+            is_token_invalidated(user_id, pre_caller_iat),
+            "older tokens must still be invalidated by disable"
         );
     }
 }

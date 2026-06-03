@@ -32,6 +32,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
+use crate::services::curation_service::version_compare;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -164,6 +165,12 @@ struct SearchQuery {
     prerelease: Option<bool>,
 }
 
+#[derive(sqlx::FromRow)]
+struct SearchPackageRow {
+    name: String,
+    versions: Vec<String>,
+}
+
 async fn search_packages(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
@@ -187,11 +194,10 @@ async fn search_packages(
     // Search distinct package names matching the query term.
     let search_pattern = format!("%{}%", query_term.to_lowercase());
 
-    let packages = sqlx::query!(
+    let packages: Vec<SearchPackageRow> = sqlx::query_as(
         r#"
-        SELECT LOWER(name) as "name!", MAX(version) as "latest_version?",
-               COUNT(DISTINCT version)::bigint as "version_count!",
-               SUM(size_bytes)::bigint as "total_size?"
+        SELECT LOWER(name) AS name,
+               ARRAY_AGG(DISTINCT version) FILTER (WHERE version IS NOT NULL) AS versions
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -200,11 +206,11 @@ async fn search_packages(
         ORDER BY LOWER(name)
         LIMIT $3 OFFSET $4
         "#,
-        repo.id,
-        search_pattern,
-        take,
-        skip
     )
+    .bind(repo.id)
+    .bind(&search_pattern)
+    .bind(take)
+    .bind(skip)
     .fetch_all(&state.db)
     .await
     .map_err(|e| {
@@ -241,7 +247,12 @@ async fn search_packages(
         .iter()
         .map(|p| {
             let id = &p.name;
-            let latest = p.latest_version.as_deref().unwrap_or("0.0.0");
+            let latest = p
+                .versions
+                .iter()
+                .max_by(|a, b| version_compare(a, b).cmp(&0))
+                .map(String::as_str)
+                .unwrap_or("0.0.0");
 
             // Build version list entry for the latest version.
             let versions = vec![serde_json::json!({
@@ -401,19 +412,18 @@ async fn flatcontainer_versions(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
-    let versions: Vec<String> = sqlx::query_scalar!(
+    let mut versions: Vec<String> = sqlx::query_scalar(
         r#"
-        SELECT DISTINCT version as "version!"
+        SELECT DISTINCT version
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
           AND LOWER(name) = $2
           AND version IS NOT NULL
-        ORDER BY version
         "#,
-        repo.id,
-        package_id_lower
     )
+    .bind(repo.id)
+    .bind(&package_id_lower)
     .fetch_all(&state.db)
     .await
     .map_err(|e| {
@@ -423,6 +433,12 @@ async fn flatcontainer_versions(
         )
             .into_response()
     })?;
+
+    versions.sort_by(|a, b| match version_compare(a, b) {
+        n if n < 0 => std::cmp::Ordering::Less,
+        n if n > 0 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
 
     if versions.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
@@ -561,13 +577,60 @@ async fn flatcontainer_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let package_id_lower = package_id_lower.clone();
+            let version = version.clone();
+            let filename = filename.clone();
+            let repo_key = repo_key.clone();
+            proxy_helpers::get_cached_or_refetch(
+                &state.db,
+                artifact.id,
+                storage.as_ref(),
+                &artifact.storage_key,
+                || {
+                    let package_id_lower = package_id_lower.clone();
+                    let version = version.clone();
+                    let filename = filename.clone();
+                    let repo_key = repo_key.clone();
+                    async move {
+                        let upstream_path = format!(
+                            "v3/flatcontainer/{}/{}/{}",
+                            package_id_lower, version, filename
+                        );
+                        let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &upstream_path,
+                        )
+                        .await?;
+                        Ok(bytes)
+                    }
+                },
+            )
+            .await?
+        } else {
+            storage.get(&artifact.storage_key).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Storage error: {}", e),
+                )
+                    .into_response()
+            })?
+        }
+    } else {
+        storage.get(&artifact.storage_key).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     // Record download.
     let _ = sqlx::query!(
@@ -938,6 +1001,9 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use bytes::Bytes;
+
     use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
@@ -1688,6 +1754,116 @@ mod tests {
             "%newtonsoft.json%"
         );
     }
+
+    #[tokio::test]
+    async fn test_flatcontainer_download_remote_arm_routes_through_cached_or_refetch_helper() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+
+        let nupkg_bytes: &[u8] = b"cached-nupkg-from-disk";
+        let package_id = "newtonsoft.json";
+        let package_id_lower = package_id.to_lowercase();
+        let version = "13.0.1";
+        let filename = format!("{}.{}.nupkg", package_id_lower, version);
+
+        // Upstream URL only needs to parse; no network I/O is performed here.
+        let upstream = "https://upstream.example.test".to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let repo_info = fx.repo_info("remote", Some(&upstream));
+
+        // Seed storage and DB row. The handler looks up by name (lowercased)
+        // and version, so the exact `path` inserted is unimportant here.
+        let storage_key = format!("nuget/{}/{}/{}", package_id_lower, version, filename);
+        let artifact_path = format!(
+            "v3/flatcontainer/{}/{}/{}",
+            package_id_lower, version, filename
+        );
+
+        tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &repo_info,
+            &storage_key,
+            &artifact_path,
+            &package_id_lower,
+            version,
+            "application/octet-stream",
+            Bytes::from_static(nupkg_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Call the handler directly via extractors.
+        let result = super::flatcontainer_download(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                package_id_lower.clone(),
+                version.to_string(),
+                filename.clone(),
+            )),
+        )
+        .await;
+
+        // Cleanup first so a panic does not leave DB state behind.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!("flatcontainer_download Remote arm must serve cached payload, got {status}");
+            }
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("Content-Type")
+                .to_str()
+                .unwrap(),
+            "application/octet-stream",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("Content-Length")
+                .to_str()
+                .unwrap(),
+            nupkg_bytes.len().to_string(),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Disposition")
+                .expect("Content-Disposition")
+                .to_str()
+                .unwrap(),
+            format!("attachment; filename=\"{}\"", filename),
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(&body_bytes[..], nupkg_bytes);
+
+        cleanup().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,19 +2025,20 @@ mod push_db_tests {
         // packages row is keyed by the original casing. (The artifacts row
         // uses the lowercased name from the duplicate-check path; the two
         // tables intentionally diverge for legacy reasons.)
-        let row: Option<(String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT name, description, metadata FROM packages \
-             WHERE repository_id = $1 AND name = $2 AND version = $3",
-        )
-        .bind(f.repo_id)
-        .bind("IndexedPkg")
-        .bind("3.1.4")
-        .fetch_optional(&f.pool)
-        .await
-        .expect("query packages");
+        let row: Option<(String, String, Option<String>, Option<serde_json::Value>)> =
+            sqlx::query_as(
+                "SELECT name, version, description, metadata FROM packages \
+                 WHERE repository_id = $1 AND name = $2",
+            )
+            .bind(f.repo_id)
+            .bind("IndexedPkg")
+            .fetch_optional(&f.pool)
+            .await
+            .expect("query packages");
 
-        let (name, desc, meta) = row.expect("packages row must exist after push");
+        let (name, version, desc, meta) = row.expect("packages row must exist after push");
         assert_eq!(name, "IndexedPkg");
+        assert_eq!(version, "3.1.4");
         assert_eq!(
             desc.as_deref(),
             Some("an indexed package"),
@@ -1887,6 +2064,68 @@ mod push_db_tests {
             version_count.0, 1,
             "exactly one package_versions row expected after a single push"
         );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn push_multiple_versions_collapses_into_one_package_row() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+
+        let first = build_nupkg("MultiVersionPkg", "9.0.0", "first");
+        let first_req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), first).await;
+        let (first_status, _) = tdh::send(app.clone(), first_req).await;
+        assert!(
+            first_status.is_success(),
+            "first push failed: {}",
+            first_status
+        );
+
+        let second = build_nupkg("MultiVersionPkg", "10.0.0", "second");
+        let second_req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), second).await;
+        let (second_status, _) = tdh::send(app, second_req).await;
+        assert!(
+            second_status.is_success(),
+            "second push failed: {}",
+            second_status
+        );
+
+        let package_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("MultiVersionPkg")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query packages");
+        assert_eq!(
+            package_rows.0, 1,
+            "multiple versions should collapse into a single packages row"
+        );
+
+        let package: (String,) =
+            sqlx::query_as("SELECT version FROM packages WHERE repository_id = $1 AND name = $2")
+                .bind(f.repo_id)
+                .bind("MultiVersionPkg")
+                .fetch_one(&f.pool)
+                .await
+                .expect("query package version");
+        assert_eq!(package.0, "10.0.0");
+
+        let version_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("MultiVersionPkg")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(version_rows.0, 2, "both versions should remain addressable");
 
         f.teardown().await;
     }

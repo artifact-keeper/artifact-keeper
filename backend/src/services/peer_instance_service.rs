@@ -360,7 +360,14 @@ impl PeerInstanceService {
         Ok(())
     }
 
-    /// Assign repository to peer instance (subscribe)
+    /// Assign repository to peer instance (subscribe).
+    ///
+    /// Persists per-subscription `replication_mode`, `replication_schedule`
+    /// (cron), and `replication_filter` (JSON: `{"include_patterns": [...],
+    /// "exclude_patterns": [...]}`). The filter is read by the sync worker
+    /// when dispatching tasks (see `matches_replication_filter`); leaving
+    /// it unset means "replicate everything".
+    #[allow(clippy::too_many_arguments)]
     pub async fn assign_repository(
         &self,
         peer_instance_id: Uuid,
@@ -368,28 +375,112 @@ impl PeerInstanceService {
         sync_enabled: bool,
         replication_mode: Option<ReplicationMode>,
         replication_schedule: Option<String>,
+        replication_filter: Option<serde_json::Value>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
             INSERT INTO peer_repo_subscriptions
-                (peer_instance_id, repository_id, sync_enabled, replication_mode, replication_schedule)
-            VALUES ($1, $2, $3, $4, $5)
+                (peer_instance_id, repository_id, sync_enabled, replication_mode, replication_schedule, replication_filter)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (peer_instance_id, repository_id) DO UPDATE SET
                 sync_enabled = $3,
                 replication_mode = $4,
-                replication_schedule = $5
+                replication_schedule = $5,
+                replication_filter = $6
             "#,
             peer_instance_id,
             repository_id,
             sync_enabled,
             replication_mode as Option<ReplicationMode>,
-            replication_schedule
+            replication_schedule,
+            replication_filter
         )
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Get full subscription details (mode, schedule, filter) for a single
+    /// (peer, repo) pair. Returns `NotFound` if no subscription exists.
+    pub async fn get_subscription(
+        &self,
+        peer_instance_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<crate::models::peer_instance::PeerRepoSubscription> {
+        let sub = sqlx::query_as!(
+            crate::models::peer_instance::PeerRepoSubscription,
+            r#"
+            SELECT
+                id, peer_instance_id, repository_id, sync_enabled,
+                replication_mode::text as replication_mode,
+                replication_schedule,
+                replication_filter,
+                last_replicated_at,
+                created_at
+            FROM peer_repo_subscriptions
+            WHERE peer_instance_id = $1 AND repository_id = $2
+            "#,
+            peer_instance_id,
+            repository_id,
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Subscription not found".to_string()))?;
+
+        Ok(sub)
+    }
+
+    /// Queue sync tasks for every artifact in a subscribed repository.
+    /// Used by the "run now" endpoint to bypass the polled schedule and
+    /// kick a sync immediately. Returns the number of tasks queued.
+    pub async fn run_subscription_now(
+        &self,
+        peer_instance_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<i64> {
+        // Confirm the subscription exists first so we return 404 cleanly.
+        let _ = self
+            .get_subscription(peer_instance_id, repository_id)
+            .await?;
+
+        // INSERT one sync_task per artifact in the repo. The unique constraint
+        // (peer_instance_id, artifact_id, task_type) ensures we don't duplicate
+        // pending tasks already queued for the same artifact.
+        let inserted: i64 = sqlx::query_scalar(
+            r#"
+            WITH inserted AS (
+                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
+                SELECT $1, a.id, 100
+                FROM artifacts a
+                WHERE a.repository_id = $2
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                RETURNING id
+            )
+            SELECT COUNT(*)::bigint FROM inserted
+            "#,
+        )
+        .bind(peer_instance_id)
+        .bind(repository_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Reset last_replicated_at so the mirror scheduler doesn't think this
+        // run satisfies the cron schedule; we still want the next cron tick to
+        // re-evaluate.
+        let _ = sqlx::query!(
+            "UPDATE peer_repo_subscriptions SET last_replicated_at = NOW() WHERE peer_instance_id = $1 AND repository_id = $2",
+            peer_instance_id,
+            repository_id,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(inserted)
     }
 
     /// Remove repository subscription from peer instance
@@ -707,6 +798,92 @@ pub struct SyncTask {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    /// DB-backed: a queued sync task must surface a populated `created_at`
+    /// through `get_pending_sync_tasks`, so callers can tell a freshly
+    /// scheduled task from a stale queue entry. (Backs the replication-schedule
+    /// e2e check, which keys on task timestamp recency.)
+    ///
+    /// Requires a migrated PostgreSQL at `DATABASE_URL`. Run with:
+    ///   DATABASE_URL=postgres://... cargo test --lib \
+    ///     services::peer_instance_service::tests::pending_task_exposes_created_at -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn pending_task_exposes_created_at() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let db = sqlx::PgPool::connect(&url).await.unwrap();
+
+        let suffix = Uuid::new_v4();
+        // Minimal repo.
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', $1) RETURNING id",
+        )
+        .bind(format!("ptask-repo-{suffix}"))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        // Minimal artifact in that repo.
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, name, path, storage_key, size_bytes, \
+             content_type, checksum_sha256) \
+             VALUES ($1, 'marker.txt', 'sched/marker.txt', $2, 12, 'text/plain', $3) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("storage/{suffix}"))
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        // Non-local online peer.
+        let svc = PeerInstanceService::new(db.clone());
+        let peer = svc
+            .register(RegisterPeerInstanceRequest {
+                name: format!("ptask-peer-{suffix}"),
+                endpoint_url: "http://127.0.0.1:65535".to_string(),
+                region: None,
+                cache_size_bytes: 0,
+                sync_filter: None,
+                api_key: "k".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+        svc.queue_sync_task(peer.id, artifact_id, 0).await.unwrap();
+
+        let tasks = svc.get_pending_sync_tasks(peer.id, 50).await.unwrap();
+        assert_eq!(tasks.len(), 1, "queued task must be listed");
+        assert!(
+            tasks[0].created_at >= before,
+            "created_at must be populated and recent (got {})",
+            tasks[0].created_at
+        );
+
+        // Cleanup (FK cascade order).
+        sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = $1")
+            .bind(peer.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)

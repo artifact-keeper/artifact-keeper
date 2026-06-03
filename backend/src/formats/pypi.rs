@@ -354,6 +354,47 @@ impl PypiHandler {
             _ => {}
         }
     }
+
+    /// Render the PEP 503 root simple index (`simple/`) as HTML: one
+    /// `<a href="/pypi/<repo_key>/simple/<name>/">name</a>` link per known
+    /// project. `repo_key` and every `package` name are HTML-escaped before
+    /// interpolation (defense-in-depth; `package` names are already PEP 503
+    /// normalised at the call site, but the escape keeps a future regression
+    /// from introducing stored XSS).
+    ///
+    /// Kept pure (returns the body string) so the anchor-rendering rules are
+    /// unit-testable without standing up an HTTP handler, a DB, or a storage
+    /// backend. The HTTP handler wraps the returned body with the PEP 503
+    /// response headers (Content-Type, CSP, nosniff).
+    pub fn render_simple_root_html(repo_key: &str, packages: &[String]) -> String {
+        let escaped_repo_key = html_escape_pep503(repo_key);
+        let mut html = String::from(
+            "<!DOCTYPE html>\n<html>\n<head><meta name=\"pypi:repository-version\" \
+             content=\"1.0\"/><title>Simple Index</title></head>\n<body>\n\
+             <h1>Simple Index</h1>\n",
+        );
+        for package in packages {
+            let escaped = html_escape_pep503(package);
+            html.push_str(&format!(
+                "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
+                escaped_repo_key, escaped, escaped
+            ));
+        }
+        html.push_str("</body>\n</html>\n");
+        html
+    }
+}
+
+/// Minimal HTML escaper for the PEP 503 simple-index renderer. Escapes the
+/// five characters that are unsafe to interpolate into element text or a
+/// double-quoted attribute value.
+fn html_escape_pep503(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 impl Default for PypiHandler {
@@ -545,6 +586,47 @@ pub fn generate_simple_package_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // render_simple_root_html tests (B8): the PEP 503 root index must emit
+    // one `<a>` anchor per known project. The regression was a Remote repo
+    // returning a non-empty page with ZERO anchors because the package list
+    // was empty; here we assert anchors are present for known packages.
+    // ========================================================================
+
+    #[test]
+    fn test_render_simple_root_html_lists_anchors_for_known_packages() {
+        let packages = vec![
+            "flask".to_string(),
+            "numpy".to_string(),
+            "requests".to_string(),
+        ];
+        let html = PypiHandler::render_simple_root_html("pypi-remote", &packages);
+
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        // One anchor per project, pointing at the per-project simple index.
+        assert_eq!(html.matches("<a href=").count(), 3);
+        assert!(html.contains("<a href=\"/pypi/pypi-remote/simple/flask/\">flask</a>"));
+        assert!(html.contains("<a href=\"/pypi/pypi-remote/simple/numpy/\">numpy</a>"));
+        assert!(html.contains("<a href=\"/pypi/pypi-remote/simple/requests/\">requests</a>"));
+    }
+
+    #[test]
+    fn test_render_simple_root_html_empty_has_no_anchors() {
+        let html = PypiHandler::render_simple_root_html("pypi-local", &[]);
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        assert!(!html.contains("<a href="));
+    }
+
+    #[test]
+    fn test_render_simple_root_html_escapes_inputs() {
+        // Defense-in-depth: a stray `<` in either field must be escaped.
+        let packages = vec!["a<b".to_string()];
+        let html = PypiHandler::render_simple_root_html("re\"po", &packages);
+        assert!(!html.contains("a<b"));
+        assert!(html.contains("a&lt;b"));
+        assert!(html.contains("re&quot;po"));
+    }
 
     // ========================================================================
     // normalize_name tests

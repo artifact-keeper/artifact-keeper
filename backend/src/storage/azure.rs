@@ -37,16 +37,21 @@
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{Duration as ChronoDuration, Utc};
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend, StoragePathFormat};
+use crate::storage::{
+    PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -177,6 +182,12 @@ const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
 
 /// Refresh tokens 5 minutes before expiry.
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 300;
+
+const AZURE_BLOCK_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const AZURE_MAX_BLOCKS: usize = 50_000;
+const AZURE_BLOCK_WARNING_THRESHOLD: usize = 40_000;
+const AZURE_PUT_BLOB_FROM_URL_MAX_SIZE: u64 = 5_000 * 1024 * 1024;
+const AZURE_COPY_SOURCE_URL_MAX_LEN: usize = 2 * 1024;
 
 impl TokenCredentialProvider {
     /// Build a provider from environment variables.
@@ -422,7 +433,10 @@ impl AzureBackend {
         // so the HTTP client must allow non-TLS when RBAC mode might use managed identity.
         let needs_http = allow_http || config.access_key.is_none();
 
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::large_object_client_builder(needs_http)
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        let token_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
             .https_only(!needs_http)
             .build()
@@ -440,7 +454,7 @@ impl AzureBackend {
                 AzureAuthMode::SharedKey { decoded_key }
             }
             None => {
-                let provider = TokenCredentialProvider::from_env(&client)?;
+                let provider = TokenCredentialProvider::from_env(&token_client)?;
                 AzureAuthMode::TokenCredential {
                     provider: Arc::new(provider),
                 }
@@ -499,6 +513,38 @@ impl AzureBackend {
         format!("{}/{}/{}", self.base_url(), self.config.container_name, key)
     }
 
+    fn append_query(mut url: String, query: &str) -> String {
+        if url.contains('?') {
+            url.push('&');
+        } else {
+            url.push('?');
+        }
+        url.push_str(query);
+        url
+    }
+
+    fn write_url(&self, key: &str) -> Result<String> {
+        match &self.auth {
+            AzureAuthMode::SharedKey { .. } => {
+                self.generate_sas_url_with_permissions(key, Duration::from_secs(300), "cw")
+            }
+            AzureAuthMode::TokenCredential { .. } => Ok(self.blob_url(key)),
+        }
+    }
+
+    fn block_url(&self, key: &str, block_id: &str) -> Result<String> {
+        let url = self.write_url(key)?;
+        Ok(Self::append_query(
+            url,
+            &format!("comp=block&blockid={}", urlencoding::encode(block_id)),
+        ))
+    }
+
+    fn block_list_url(&self, key: &str) -> Result<String> {
+        let url = self.write_url(key)?;
+        Ok(Self::append_query(url, "comp=blocklist"))
+    }
+
     /// Generate a Shared Key authorization header for a request.
     fn shared_key_auth(
         decoded_key: &[u8],
@@ -543,7 +589,7 @@ impl AzureBackend {
                     .header("x-ms-blob-type", "BlockBlob")
                     .header("Content-Type", "application/octet-stream")
                     .header("Content-Length", content.len())
-                    .body(content.to_vec())
+                    .body(content.clone())
                     .send()
                     .await
                     .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
@@ -559,12 +605,91 @@ impl AzureBackend {
                     .header("x-ms-blob-type", "BlockBlob")
                     .header("Content-Type", "application/octet-stream")
                     .header("Content-Length", content.len())
-                    .body(content.to_vec())
+                    .body(content.clone())
                     .send()
                     .await
                     .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
             }
         }
+    }
+
+    async fn authorized_put_block(&self, url: &str, content: Bytes) -> Result<reqwest::Response> {
+        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let content_length = content.len();
+        let mut request = self
+            .client
+            .put(url)
+            .header("x-ms-date", &date_str)
+            .header("x-ms-version", "2021-06-08")
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", content_length)
+            .body(content);
+
+        if let AzureAuthMode::TokenCredential { provider } = &self.auth {
+            let token = provider.get_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Azure Put Block failed: {}", e)))
+    }
+
+    async fn authorized_put_block_list(
+        &self,
+        url: &str,
+        content: Bytes,
+    ) -> Result<reqwest::Response> {
+        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let content_length = content.len();
+        let mut request = self
+            .client
+            .put(url)
+            .header("x-ms-date", &date_str)
+            .header("x-ms-version", "2021-06-08")
+            .header("Content-Type", "application/xml")
+            .header("Content-Length", content_length)
+            .body(content);
+
+        if let AzureAuthMode::TokenCredential { provider } = &self.auth {
+            let token = provider.get_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Azure Put Block List failed: {}", e)))
+    }
+
+    async fn authorized_put_blob_from_url(
+        &self,
+        dest_url: &str,
+        source_url: &str,
+    ) -> Result<reqwest::Response> {
+        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let mut request = self
+            .client
+            .put(dest_url)
+            .header("x-ms-date", &date_str)
+            .header("x-ms-version", "2021-06-08")
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-copy-source", source_url)
+            .header("Content-Length", "0");
+
+        if let AzureAuthMode::TokenCredential { provider } = &self.auth {
+            let token = provider.get_token().await?;
+            let bearer = format!("Bearer {}", token);
+            request = request
+                .header("Authorization", bearer.clone())
+                .header("x-ms-copy-source-authorization", bearer);
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Azure Put Blob From URL failed: {}", e)))
     }
 
     /// Build an authorized GET request.
@@ -670,6 +795,15 @@ impl AzureBackend {
     ///
     /// Uses Service SAS with blob resource type.
     fn generate_sas_token(&self, key: &str, expires_in: Duration) -> Result<String> {
+        self.generate_sas_token_with_permissions(key, expires_in, "r")
+    }
+
+    fn generate_sas_token_with_permissions(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        signed_permissions: &str,
+    ) -> Result<String> {
         let decoded_key = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => decoded_key,
             AzureAuthMode::TokenCredential { .. } => {
@@ -685,7 +819,6 @@ impl AzureBackend {
 
         let signed_version = "2021-06-08";
         let signed_resource = "b";
-        let signed_permissions = "r";
         let signed_start = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_expiry = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_protocol = "https";
@@ -737,6 +870,160 @@ impl AzureBackend {
     pub fn generate_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
         let sas_token = self.generate_sas_token(key, expires_in)?;
         Ok(format!("{}?{}", self.blob_url(key), sas_token))
+    }
+
+    fn generate_sas_url_with_permissions(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        signed_permissions: &str,
+    ) -> Result<String> {
+        let sas_token =
+            self.generate_sas_token_with_permissions(key, expires_in, signed_permissions)?;
+        Ok(format!("{}?{}", self.blob_url(key), sas_token))
+    }
+
+    async fn put_stream_block(
+        &self,
+        key: &str,
+        upload_nonce: &str,
+        block_ids: &mut Vec<String>,
+        content: Bytes,
+    ) -> Result<()> {
+        if block_ids.len() >= AZURE_MAX_BLOCKS {
+            return Err(AppError::Storage(format!(
+                "Azure block blob limit exceeded for '{}': {} blocks staged; maximum is {}",
+                key,
+                block_ids.len(),
+                AZURE_MAX_BLOCKS
+            )));
+        }
+        if block_ids.len() == AZURE_BLOCK_WARNING_THRESHOLD {
+            tracing::warn!(
+                key = %key,
+                staged_blocks = block_ids.len(),
+                max_blocks = AZURE_MAX_BLOCKS,
+                "Azure streaming upload is approaching the block blob limit"
+            );
+        }
+        // The block ID embeds a per-upload nonce so two concurrent streaming
+        // writes to the same key stage into disjoint uncommitted block lists.
+        // Without it, both would use block IDs derived from the index alone
+        // (0, 1, …) and overwrite each other's uncommitted blocks, letting one
+        // Put Block List assemble the other request's bytes under this key.
+        // The pre-base64 string (32-hex nonce + 16-digit index = 48 bytes) is
+        // a fixed length for every block, satisfying Azure's same-size-per-blob
+        // and <=64-byte block-ID rules.
+        let block_id = BASE64.encode(format!("{upload_nonce}{:016}", block_ids.len()));
+        let url = self.block_url(key, &block_id)?;
+        let response = self.authorized_put_block(&url, content).await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure Put Block for '{}' failed with status {}: {}",
+                key, status, body
+            )));
+        }
+
+        block_ids.push(block_id);
+        Ok(())
+    }
+
+    async fn commit_stream_blocks(&self, key: &str, block_ids: &[String]) -> Result<()> {
+        let mut block_list = String::from(r#"<?xml version="1.0" encoding="utf-8"?><BlockList>"#);
+        for block_id in block_ids {
+            block_list.push_str("<Latest>");
+            block_list.push_str(block_id);
+            block_list.push_str("</Latest>");
+        }
+        block_list.push_str("</BlockList>");
+
+        let url = self.block_list_url(key)?;
+        let response = self
+            .authorized_put_block_list(&url, Bytes::from(block_list))
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure Put Block List for '{}' failed with status {}: {}",
+                key, status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Handle uncommitted blocks left behind by a failed streaming upload.
+    ///
+    /// We deliberately do NOT mutate the destination blob to "clean up" the
+    /// staged blocks. A concurrent writer may have committed this same key
+    /// between any pre-flight check and now — two clients pushing the same
+    /// digest-addressed OCI blob is a real scenario — and overwriting or
+    /// deleting the blob here would destroy their committed data. The staged
+    /// blocks are private to this upload (their block IDs carry a per-upload
+    /// nonce, so they can never be assembled into another writer's Put Block
+    /// List) and Azure garbage-collects uncommitted blocks automatically
+    /// (~7 days). So we only log.
+    async fn report_uncommitted_stream_blocks(&self, key: &str, block_ids: &[String]) {
+        if block_ids.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            key = %key,
+            staged_blocks = block_ids.len(),
+            "Azure streaming upload failed after staging blocks; leaving them for Azure to garbage-collect (not mutating the destination blob to avoid clobbering a concurrent writer)"
+        );
+    }
+
+    fn content_length_from_head(response: &reqwest::Response, key: &str) -> Result<u64> {
+        let value = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "Azure HEAD for '{}' did not return Content-Length",
+                    key
+                ))
+            })?;
+        let text = value.to_str().map_err(|e| {
+            AppError::Storage(format!(
+                "Azure HEAD for '{}' returned invalid Content-Length: {}",
+                key, e
+            ))
+        })?;
+        text.parse::<u64>().map_err(|e| {
+            AppError::Storage(format!(
+                "Azure HEAD for '{}' returned non-numeric Content-Length '{}': {}",
+                key, text, e
+            ))
+        })
+    }
+
+    async fn size(&self, key: &str) -> Result<u64> {
+        let url = self.read_url(key, Duration::from_secs(60))?;
+        let response = self.authorized_head(&url).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::NotFound(format!("Blob not found: {}", key)));
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure HEAD for '{}' failed with status {}: {}",
+                key, status, body
+            )));
+        }
+        Self::content_length_from_head(&response, key)
+    }
+
+    async fn copy_via_stream(&self, source: &str, dest: &str) -> Result<()> {
+        let stream = self.get_stream(source).await?;
+        self.put_stream(dest, stream).await?;
+        Ok(())
     }
 
     /// Whether this backend is using RBAC (token credential) auth.
@@ -810,6 +1097,170 @@ impl StorageBackend for AzureBackend {
             .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
 
         Ok(bytes)
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let url = self.read_url(key, Duration::from_secs(300))?;
+        let mut response = self.authorized_get(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if self.path_format.has_fallback() {
+                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                        tracing::debug!(
+                            original = %key,
+                            fallback = %fallback_key,
+                            "Trying Artifactory fallback path for stream"
+                        );
+                        let fallback_url =
+                            self.read_url(&fallback_key, Duration::from_secs(300))?;
+                        response = self.authorized_get(&fallback_url).await?;
+
+                        if !response.status().is_success() {
+                            return Err(AppError::NotFound(format!("Blob not found: {}", key)));
+                        }
+                    } else {
+                        return Err(AppError::NotFound(format!("Blob not found: {}", key)));
+                    }
+                } else {
+                    return Err(AppError::NotFound(format!("Blob not found: {}", key)));
+                }
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                return Err(AppError::Storage(format!(
+                    "Azure download failed with status {}: {}",
+                    status, body
+                )));
+            }
+        }
+
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut buffer = BytesMut::with_capacity(AZURE_BLOCK_CHUNK_SIZE);
+        let mut block_ids = Vec::new();
+        // Per-upload nonce woven into every block ID (see put_stream_block) so
+        // concurrent streaming writes to the same key cannot collide on block
+        // IDs. With that guarantee a failed upload's staged blocks are private
+        // and Azure auto-GCs them, so we neither probe existence up front nor
+        // mutate the destination blob on failure.
+        let upload_nonce = Uuid::new_v4().simple().to_string();
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let mut chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    self.report_uncommitted_stream_blocks(key, &block_ids).await;
+                    return Err(e);
+                }
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+
+            while !chunk.is_empty() {
+                let remaining = AZURE_BLOCK_CHUNK_SIZE - buffer.len();
+                let take = remaining.min(chunk.len());
+                let piece = chunk.split_to(take);
+                buffer.extend_from_slice(&piece);
+
+                if buffer.len() == AZURE_BLOCK_CHUNK_SIZE {
+                    let block = buffer.split().freeze();
+                    if let Err(e) = self
+                        .put_stream_block(key, &upload_nonce, &mut block_ids, block)
+                        .await
+                    {
+                        self.report_uncommitted_stream_blocks(key, &block_ids).await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            let block = buffer.split().freeze();
+            if let Err(e) = self
+                .put_stream_block(key, &upload_nonce, &mut block_ids, block)
+                .await
+            {
+                self.report_uncommitted_stream_blocks(key, &block_ids).await;
+                return Err(e);
+            }
+        }
+
+        if block_ids.is_empty() {
+            self.put(key, Bytes::new()).await?;
+        } else {
+            if let Err(e) = self.commit_stream_blocks(key, &block_ids).await {
+                self.report_uncommitted_stream_blocks(key, &block_ids).await;
+                return Err(e);
+            }
+        }
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
+    }
+
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let size = match self.size(source).await {
+            Ok(size) => size,
+            Err(AppError::NotFound(_)) if self.path_format.has_fallback() => {
+                return self.copy_via_stream(source, dest).await;
+            }
+            Err(e) => return Err(e),
+        };
+        if size > AZURE_PUT_BLOB_FROM_URL_MAX_SIZE {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                size,
+                "Azure source is too large for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        let source_url = self.read_url(source, Duration::from_secs(300))?;
+        if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                source_url_len = source_url.len(),
+                "Azure source URL is too long for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        let dest_url = self.write_url(dest)?;
+        let response = self
+            .authorized_put_blob_from_url(&dest_url, &source_url)
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
+                source, dest, status, body
+            )));
+        }
+
+        Ok(())
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
@@ -913,6 +1364,92 @@ impl StorageBackend for AzureBackend {
         }))
     }
 
+    /// Stream a file on disk into Azure Blob Storage as a single BlockBlob
+    /// without buffering the whole body in memory.
+    ///
+    /// The default trait implementation opens the file as a `ReaderStream`
+    /// and delegates to `put_stream`, but Azure has no streaming
+    /// `put_stream` override (single-PUT requires Content-Length, and a
+    /// staged-block implementation is non-trivial). For migration (#1422)
+    /// we know the file size from `fs::metadata`, so we can sign a single
+    /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
+    /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
+    /// not O(file_size).
+    async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        use futures::StreamExt;
+        use tokio::io::BufReader;
+        use tokio_util::io::ReaderStream;
+
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to stat file for Azure upload: {}", e))
+        })?;
+        let content_length = metadata.len();
+
+        let file = tokio::fs::File::open(path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to open file for Azure upload: {}", e))
+        })?;
+        let reader = BufReader::with_capacity(256 * 1024, file);
+        let stream = ReaderStream::with_capacity(reader, 256 * 1024)
+            .map(|r| r.map_err(|e| std::io::Error::other(format!("Read error: {}", e))));
+
+        let url = self.blob_url(key);
+        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        let response = match &self.auth {
+            AzureAuthMode::SharedKey { decoded_key } => {
+                let string_to_sign = format!(
+                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
+                    content_length,
+                    date_str,
+                    self.config.account_name,
+                    self.config.container_name,
+                    key
+                );
+                let auth_header =
+                    Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
+
+                self.client
+                    .put(&url)
+                    .header("Authorization", auth_header)
+                    .header("x-ms-date", &date_str)
+                    .header("x-ms-version", "2021-06-08")
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", content_length)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+            }
+            AzureAuthMode::TokenCredential { provider } => {
+                let token = provider.get_token().await?;
+                self.client
+                    .put(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-ms-date", &date_str)
+                    .header("x-ms-version", "2021-06-08")
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", content_length)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure upload failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
@@ -989,6 +1526,28 @@ mod tests {
         };
         AzureBackend {
             config: create_rbac_config(),
+            client,
+            auth: AzureAuthMode::TokenCredential {
+                provider: Arc::new(provider),
+            },
+            path_format: StoragePathFormat::Native,
+        }
+    }
+
+    fn create_cached_rbac_backend_with_endpoint(endpoint: String) -> AzureBackend {
+        let client = reqwest::Client::new();
+        let provider = TokenCredentialProvider {
+            client: client.clone(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(Some(CachedToken {
+                access_token: "cached-test-token".to_string(),
+                expires_at: Utc::now() + ChronoDuration::hours(1),
+            })),
+        };
+        let mut config = create_rbac_config();
+        config.endpoint = Some(endpoint);
+        AzureBackend {
+            config,
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -1205,6 +1764,345 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(presigned.expires_in, expires);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_uses_block_upload_instead_of_buffered_put_blob() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let stream = stream::iter([
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"stream")),
+        ]);
+
+        let result =
+            StorageBackendTrait::put_stream(&backend, "streamed/blob.txt", Box::pin(stream))
+                .await
+                .expect("stream upload should succeed");
+        assert_eq!(result.bytes_written, 12);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "comp" && value == "block")),
+            "Azure put_stream should stage data with Put Block requests"
+        );
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "comp" && value == "blocklist")),
+            "Azure put_stream should commit staged blocks with Put Block List"
+        );
+        assert!(
+            !requests.iter().any(|request| request
+                .headers
+                .get("x-ms-blob-type")
+                .is_some_and(|value| value == "BlockBlob")),
+            "Azure put_stream must not fall back to a single buffered Put Blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_does_not_delete_destination_when_block_commit_fails() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("server busy"))
+            .mount(&server)
+            .await;
+        // A failed commit must NOT delete or overwrite the destination key: a
+        // concurrent writer may have committed the same digest-addressed blob
+        // after this upload started, and clearing "our" uncommitted blocks by
+        // mutating the blob would destroy their committed data. Azure GCs
+        // uncommitted blocks on its own.
+        let delete_guard = Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let stream = stream::iter([Ok(Bytes::from_static(b"staged block"))]);
+
+        let result =
+            StorageBackendTrait::put_stream(&backend, "streamed/blob.txt", Box::pin(stream)).await;
+
+        assert!(result.is_err(), "commit failure must surface to caller");
+        assert_eq!(
+            delete_guard.received_requests().await.len(),
+            0,
+            "failed upload must not delete the destination blob (a concurrent writer may own it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_uses_unique_block_ids_across_uploads_to_same_key() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Capture every Put Block so we can compare the block IDs that two
+        // separate uploads to the SAME key use.
+        let block_guard = Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        for _ in 0..2 {
+            let stream = stream::iter([Ok(Bytes::from_static(b"same-key block"))]);
+            StorageBackendTrait::put_stream(&backend, "streamed/blob.txt", Box::pin(stream))
+                .await
+                .expect("streaming upload should succeed");
+        }
+
+        let block_requests = block_guard.received_requests().await;
+        assert_eq!(
+            block_requests.len(),
+            2,
+            "each upload stages exactly one block"
+        );
+        let block_ids: Vec<String> = block_requests
+            .iter()
+            .map(|req| {
+                req.url
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "blockid").then(|| v.into_owned()))
+                    .expect("Put Block request must carry a blockid")
+            })
+            .collect();
+        assert_ne!(
+            block_ids[0], block_ids[1],
+            "two streaming uploads to the same key must use distinct block IDs so a concurrent writer's uncommitted blocks can never be assembled under this key"
+        );
+    }
+
+    #[test]
+    fn test_azure_block_id_stays_within_64_byte_limit() {
+        // Azure requires each base64-encoded block ID to be <= 64 bytes and all
+        // block IDs for a blob to be the same length. Our ID is a 32-hex UUID
+        // nonce + a 16-digit zero-padded index = 48 raw bytes -> exactly 64
+        // base64 chars. Pin this so a future change to the nonce/index width (or
+        // switching to a hyphenated 36-char UUID) cannot silently push the
+        // encoded ID past the limit — that would fail only on real Azure, which
+        // the wiremock tests do not enforce.
+        let nonce = Uuid::new_v4().simple().to_string();
+        assert_eq!(nonce.len(), 32, "simple UUID nonce must be 32 hex chars");
+        for idx in [0usize, 1, 49_999, usize::from(u16::MAX)] {
+            let block_id = BASE64.encode(format!("{nonce}{idx:016}"));
+            assert_eq!(
+                block_id.len(),
+                64,
+                "Azure block ID for idx {idx} must be a fixed 64 base64 bytes (<= Azure's 64-byte limit), got {}",
+                block_id.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_uses_put_blob_from_url_for_small_source() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let source_path = "/testcontainer/source/blob.txt";
+        let dest_path = "/testcontainer/dest/blob.txt";
+        Mock::given(method("HEAD"))
+            .and(path(source_path))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "1024"))
+            .mount(&server)
+            .await;
+        let copy_guard = Mock::given(method("PUT"))
+            .and(path(dest_path))
+            .respond_with(ResponseTemplate::new(201))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        StorageBackendTrait::copy(&backend, "source/blob.txt", "dest/blob.txt")
+            .await
+            .expect("small copy should use Azure Put Blob From URL");
+
+        assert_eq!(
+            copy_guard.received_requests().await.len(),
+            1,
+            "copy should issue one destination PUT"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let copy_request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PUT" && request.url.path() == dest_path)
+            .expect("destination copy request should be recorded");
+        assert_eq!(
+            copy_request.headers.get("x-ms-blob-type").unwrap(),
+            "BlockBlob"
+        );
+        assert_eq!(
+            copy_request.headers.get("Content-Length").unwrap(),
+            "0",
+            "Put Blob From URL must send an empty body"
+        );
+        assert_eq!(copy_request.body.len(), 0);
+
+        let copy_source = copy_request
+            .headers
+            .get("x-ms-copy-source")
+            .expect("copy request should include source URL")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            copy_source,
+            format!("{}/testcontainer/source/blob.txt", server.uri())
+        );
+        assert_eq!(
+            copy_request
+                .headers
+                .get("x-ms-copy-source-authorization")
+                .unwrap(),
+            "Bearer cached-test-token"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method.as_str() == "GET"),
+            "server-side copy must not download the source through the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_streams_large_source_instead_of_put_blob_from_url() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let source_path = "/testcontainer/source/blob.txt";
+        // Advertise a source larger than Put Blob From URL can handle so copy
+        // is forced down the block-streaming path instead of the single-shot
+        // server-side copy.
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                "Content-Length",
+                (AZURE_PUT_BLOB_FROM_URL_MAX_SIZE + 1).to_string(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(source_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"large-copy"[..])))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        StorageBackendTrait::copy(&backend, "source/blob.txt", "dest/blob.txt")
+            .await
+            .expect("large copy should stream through block upload");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.iter().any(
+                |request| request.method.as_str() == "GET" && request.url.path() == source_path
+            ),
+            "large copy should read the source as a stream"
+        );
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "comp" && value == "block")),
+            "large copy should stage the destination with Put Block requests"
+        );
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "comp" && value == "blocklist")),
+            "large copy should commit the destination with Put Block List"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.headers.contains_key("x-ms-copy-source")),
+            "large copy must not use single-shot Azure Put Blob From URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_block_rejects_azure_block_limit_before_http_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let put_guard = Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount_as_scoped(&server)
+            .await;
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let mut block_ids = (0..50_000)
+            .map(|i| format!("block-{i}"))
+            .collect::<Vec<_>>();
+
+        let result = backend
+            .put_stream_block(
+                "streamed/blob.txt",
+                "0123456789abcdef0123456789abcdef",
+                &mut block_ids,
+                Bytes::from_static(b"x"),
+            )
+            .await;
+
+        let error = result.expect_err("50,000 staged blocks must fail locally");
+        assert!(
+            error.to_string().contains("Azure block blob limit"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            put_guard.received_requests().await.len(),
+            0,
+            "block-limit failure must not send another Put Block request"
+        );
     }
 
     // ── URL construction ─────────────────────────────────────────────────

@@ -5,12 +5,698 @@ use crate::models::sbom::{
     CveHistoryEntry, CveStatus, CveTimelineEntry, CveTrends, LicensePolicy, SbomComponent,
     SbomDocument, SbomFormat, SbomSummary,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;
+
+/// Row aggregating scan_findings into a single CVE detection record per
+/// (artifact_id, cve_id). Used by the scan-derived CVE history projection
+/// added for #1375.
+#[derive(sqlx::FromRow)]
+struct ScanFindingCveRow {
+    artifact_id: Uuid,
+    cve_id: Option<String>,
+    severity: Option<String>,
+    affected_component: Option<String>,
+    affected_version: Option<String>,
+    fixed_version: Option<String>,
+    first_detected_at: DateTime<Utc>,
+    last_detected_at: DateTime<Utc>,
+    all_acknowledged: bool,
+}
+
+/// Build a deterministic synthetic UUID for a (artifact, cve) pair.
+///
+/// Used so scan-derived `CveHistoryEntry` rows have a stable `id` across
+/// re-reads. Hashing instead of `Uuid::new_v4` means clients can dedupe by
+/// id even when the row is synthesized at read time. The first 16 bytes of
+/// SHA-256(artifact_id || cve_id) become the UUID.
+///
+/// # Synthetic ID semantics
+///
+/// Synth ids carry **no foreign-key meaning** -- they are not present in
+/// the `cve_history` table. Consequences for callers:
+///
+/// - `POST /sbom/cve/status/{id}` against a synth id returns 404. This is
+///   expected: only curated rows (written via the rare promotion-policy
+///   admin paths) can have their status mutated. Clients receiving a
+///   `CveHistoryEntry` whose `sbom_id`/`component_id`/`scan_result_id` are
+///   all `null` are looking at a synth row and must not offer
+///   "acknowledge" / "mark fixed" UI on it.
+/// - Synth ids are stable across re-reads for the same (artifact, cve)
+///   pair, so client-side dedupe by `id` works.
+/// - Synth ids are derived from a hash, not generated, so they will
+///   collide with a `cve_history.id` only with negligible probability
+///   (2^-128). If a collision ever did surface, the curated row wins via
+///   the dedupe filter in `build_known_cve_set`.
+pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(artifact_id.as_bytes());
+    hasher.update([0u8]); // separator so concatenation collisions are impossible
+    hasher.update(cve_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Collect a case-insensitive (upper-cased) set of CVE identifiers from a
+/// slice of curated `CveHistoryEntry` rows.
+///
+/// Pulled out of the read paths so the dedupe-by-cve normalization is
+/// covered by unit tests without needing a database. The CVE-history
+/// pipeline calls this once per query to build the `known` set passed to
+/// `build_cve_entries_from_scan_findings`.
+pub(crate) fn build_known_cve_set(entries: &[CveHistoryEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .map(|e| e.cve_id.to_ascii_uppercase())
+        .collect()
+}
+
+/// Decide whether a `scan_findings`-derived row should pass the dedupe
+/// filter. A row passes only when it has a `cve_id` and that id (compared
+/// case-insensitively) is not already in the curated `known` set.
+///
+/// Extracted so the case-insensitivity contract is unit-testable. See
+/// #1375 -- without this normalization the scan-derived path would
+/// duplicate any CVE whose case differs between `cve_history` and
+/// `scan_findings`.
+pub(crate) fn scan_row_passes_known_filter(
+    row_cve_id: Option<&str>,
+    known: &HashSet<String>,
+) -> bool {
+    row_cve_id
+        .map(|c| !known.contains(&c.to_ascii_uppercase()))
+        .unwrap_or(false)
+}
+
+/// Rank a CVSS severity string by its operational priority. Higher rank
+/// means more severe.
+///
+/// `critical` > `high` > `medium` > `low` > anything else (unknown / NULL
+/// rendered as the empty string). The DB-side aggregates in
+/// `get_cve_trends` use the inverse mapping via SQL `CASE` so that
+/// `MAX(rank)` returns the right "worst seen" severity for an (artifact,
+/// cve_id) pair across multiple scanner outputs. Without this ranking we
+/// fall through to lexicographic ordering -- "medium" > "low" > "high" >
+/// "critical" -- which silently misreports a vulnerability that one
+/// scanner labels `high` and another labels `medium` as `medium`.
+///
+/// This helper lives in Rust so the contract is unit-testable; the SQL
+/// queries inline an equivalent `CASE` because Postgres can't call Rust.
+/// If you edit the ranks here, also update the four `CASE severity ...`
+/// expressions in `get_cve_trends`. The unit tests in this module assert
+/// the two stay in sync. (#1375 round-2)
+#[allow(dead_code)] // Mirror of an SQL CASE; only used from tests today.
+pub(crate) fn severity_rank(severity: &str) -> i32 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Inverse of `severity_rank`: map a rank produced by the SQL `MAX(CASE ...)`
+/// expression back to its canonical lower-case string. Ranks outside
+/// 1..=4 map to `None` (caller decides whether to default to `"unknown"`
+/// or skip the row).
+#[allow(dead_code)] // Mirror of an SQL CASE; only used from tests today.
+pub(crate) fn severity_from_rank(rank: i32) -> Option<&'static str> {
+    match rank {
+        4 => Some("critical"),
+        3 => Some("high"),
+        2 => Some("medium"),
+        1 => Some("low"),
+        _ => None,
+    }
+}
+
+/// Map the `all_acknowledged` flag aggregated from `scan_findings` to the
+/// `CveHistoryEntry.status` string (`"acknowledged"` vs `"open"`). The
+/// scanner has no notion of `fixed` or `false_positive`, those statuses
+/// only exist on curated rows.
+pub(crate) fn status_string_from_acknowledged(all_acknowledged: bool) -> &'static str {
+    if all_acknowledged {
+        "acknowledged"
+    } else {
+        "open"
+    }
+}
+
+/// Project a `CveStatus` request onto the boolean `scan_findings.is_acknowledged`
+/// column the Security tab acknowledge path actually writes to.
+///
+/// Returns:
+///   - `Ok(Some(true))`  for `Acknowledged` and `FalsePositive` (the
+///     boolean column collapses both; the reason field carries the
+///     audit distinction).
+///   - `Ok(Some(false))` for `Open` (revoke an existing acknowledgement).
+///   - `Ok(None)`        for `Fixed`, signalling the caller that no
+///     `scan_findings` mutation is possible -- "fixed" is a curated-only
+///     lifecycle state. The handler turns this into a 400 with a clear
+///     message rather than silently coercing.
+///
+/// Pulled out of `update_cve_status_by_artifact_cve` so the mapping is
+/// unit-testable without a Postgres pool. (#1426)
+pub(crate) fn cve_status_to_acknowledge_flag(status: CveStatus) -> Option<bool> {
+    match status {
+        CveStatus::Acknowledged | CveStatus::FalsePositive => Some(true),
+        CveStatus::Open => Some(false),
+        CveStatus::Fixed => None,
+    }
+}
+
+/// Map the `all_acknowledged` flag to a typed `CveStatus` for the timeline
+/// projection in `get_cve_trends`. Mirrors `status_string_from_acknowledged`
+/// but returns the enum directly because the timeline DTO is typed.
+pub(crate) fn status_enum_from_acknowledged(all_acknowledged: bool) -> CveStatus {
+    if all_acknowledged {
+        CveStatus::Acknowledged
+    } else {
+        CveStatus::Open
+    }
+}
+
+/// Convert a `ScanFindingCveRow` aggregate into a synthetic
+/// `CveHistoryEntry`. Pure mapping, no DB access -- factored out so the
+/// field-by-field projection is covered by unit tests.
+///
+/// Synth entries carry:
+///   - `id` = `synth_cve_id(artifact_id, cve_id)` (deterministic)
+///   - `sbom_id` / `component_id` / `scan_result_id` = `None` (no FK)
+///   - `cve_id` = empty string when the row's `cve_id` is `None`
+///     (callers filter these out via `scan_row_passes_known_filter` before
+///     mapping, but the defensive default keeps the mapping total).
+///   - `status` from `all_acknowledged`
+///   - `created_at` / `updated_at` aligned to first/last detection
+fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
+    let cve_id = row.cve_id.unwrap_or_default();
+    let id = synth_cve_id(row.artifact_id, &cve_id);
+    CveHistoryEntry {
+        id,
+        artifact_id: row.artifact_id,
+        sbom_id: None,
+        component_id: None,
+        scan_result_id: None,
+        cve_id,
+        affected_component: row.affected_component,
+        affected_version: row.affected_version,
+        fixed_version: row.fixed_version,
+        severity: row.severity,
+        cvss_score: None,
+        cve_published_at: None,
+        first_detected_at: row.first_detected_at,
+        last_detected_at: row.last_detected_at,
+        status: status_string_from_acknowledged(row.all_acknowledged).to_string(),
+        acknowledged_by: None,
+        acknowledged_at: None,
+        acknowledged_reason: None,
+        created_at: row.first_detected_at,
+        updated_at: row.last_detected_at,
+    }
+}
+
+/// Convert a `ScanFindingCveRow` aggregate into a `CveTimelineEntry` for
+/// the trends timeline. `now` is injected so tests can pin `days_exposed`
+/// without `Utc::now()` racing the assertion.
+fn scan_finding_to_timeline_entry(row: &ScanFindingCveRow, now: DateTime<Utc>) -> CveTimelineEntry {
+    let days_exposed = (now - row.first_detected_at).num_days();
+    CveTimelineEntry {
+        cve_id: row.cve_id.clone().unwrap_or_default(),
+        severity: row.severity.clone().unwrap_or_default(),
+        affected_component: row.affected_component.clone().unwrap_or_default(),
+        cve_published_at: None,
+        first_detected_at: row.first_detected_at,
+        status: status_enum_from_acknowledged(row.all_acknowledged),
+        days_exposed,
+    }
+}
+
+/// Drop entries whose owning artifact's repo is not in `allowed_repos`.
+///
+/// Pulled out of `filter_entries_by_repo` so the filter logic itself
+/// (independent of the DB lookup that builds `repo_by_artifact`) is
+/// unit-testable. The DB call still lives in the async method; this
+/// helper handles the in-memory partition once that map is available.
+pub(crate) fn filter_entries_by_repo_map(
+    entries: Vec<CveHistoryEntry>,
+    repo_by_artifact: &std::collections::HashMap<Uuid, Uuid>,
+    allowed_repos: &HashSet<Uuid>,
+) -> Vec<CveHistoryEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            repo_by_artifact
+                .get(&e.artifact_id)
+                .map(|r| allowed_repos.contains(r))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Sort `CveHistoryEntry` rows by `first_detected_at` descending (newest
+/// first). The read paths concatenate curated + scan-derived rows then
+/// re-sort so the response is monotonic; extracted so the sort key is
+/// guaranteed by a unit test and won't drift if the type changes.
+pub(crate) fn sort_entries_by_first_detected_desc(entries: &mut [CveHistoryEntry]) {
+    entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
+}
+
+/// Build a `CveTrends` response from the seven count aggregates, the fixed-
+/// CVEs count, and the timeline slice. Extracted from `get_cve_trends` so
+/// the projection is exercised by unit tests without spinning up Postgres.
+///
+/// `avg_days_to_fix` is always `None` on this path because `scan_findings`
+/// has no fixed-at timestamp (#1375). Curated rows that *do* carry one
+/// flow through a different path (the legacy `cve_history` admin write).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cve_trends_from_aggregates(
+    total: i64,
+    open: i64,
+    acknowledged: i64,
+    critical: i64,
+    high: i64,
+    medium: i64,
+    low: i64,
+    fixed_cves: i64,
+    timeline: Vec<CveTimelineEntry>,
+) -> CveTrends {
+    CveTrends {
+        total_cves: total,
+        open_cves: open,
+        fixed_cves,
+        acknowledged_cves: acknowledged,
+        critical_count: critical,
+        high_count: high,
+        medium_count: medium,
+        low_count: low,
+        avg_days_to_fix: None,
+        timeline,
+        // #1446: mirror the count fields under the bare aliases so the
+        // security-tests trends-shape probe (which checks for `total`,
+        // `critical`, `high`, ...) sees a recognized aggregate shape.
+        total,
+        critical,
+        high,
+        medium,
+        low,
+    }
+}
+
+/// Build the timeline-row projection: synthesize one `CveTimelineEntry` per
+/// scan row using `scan_finding_to_timeline_entry` with a shared `now`
+/// reference. Pulled out of `get_cve_trends` so the projection step itself
+/// is unit-testable without Postgres.
+fn project_timeline_rows(rows: &[ScanFindingCveRow], now: DateTime<Utc>) -> Vec<CveTimelineEntry> {
+    rows.iter()
+        .map(|r| scan_finding_to_timeline_entry(r, now))
+        .collect()
+}
+
+/// Apply the curated-vs-scan dedupe and projection pipeline to a slice of
+/// scan rows, given the set of CVE ids already returned by the curated
+/// path. Pure: no DB, no clock, no I/O. The `get_cve_history` read path
+/// invokes this after pulling rows from `scan_findings`.
+fn project_scan_rows_to_entries(
+    rows: Vec<ScanFindingCveRow>,
+    known: &HashSet<String>,
+) -> Vec<CveHistoryEntry> {
+    rows.into_iter()
+        .filter(|r| scan_row_passes_known_filter(r.cve_id.as_deref(), known))
+        .map(scan_finding_to_history_entry)
+        .collect()
+}
+
+// === SQL query constants =================================================
+//
+// The CVE-history read paths share a small set of large SQL strings. Hoisting
+// them to module-level `const`s lets unit tests assert key clauses (the
+// ranked CASE table, the `cve_id IS NOT NULL` guard, the artifact-deletion
+// filter) without standing up Postgres. The `async fn` callers still own
+// the parameter binds; only the query text moved out.
+
+/// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
+/// single artifact. Mirrors the inline query in
+/// `build_cve_entries_from_scan_findings` (#1375).
+pub(crate) const SCAN_FINDINGS_BY_ARTIFACT_SQL: &str = r#"
+SELECT
+    artifact_id,
+    cve_id,
+    CASE severity_rank
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE NULL
+    END AS severity,
+    affected_component,
+    affected_version,
+    fixed_version,
+    first_detected_at,
+    last_detected_at,
+    all_acknowledged
+FROM (
+    SELECT
+        artifact_id,
+        cve_id,
+        MAX(
+            CASE LOWER(severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        MAX(affected_component) AS affected_component,
+        MAX(affected_version) AS affected_version,
+        MAX(fixed_version) AS fixed_version,
+        MIN(created_at) AS first_detected_at,
+        MAX(created_at) AS last_detected_at,
+        BOOL_AND(is_acknowledged) AS all_acknowledged
+    FROM scan_findings
+    WHERE artifact_id = $1
+      AND cve_id IS NOT NULL
+    GROUP BY artifact_id, cve_id
+    ORDER BY MIN(created_at) DESC
+) inner_ranked
+"#;
+
+/// CVE-history counts CTE, scoped to one repository. The outer projection
+/// must keep the column order in lockstep with the `(i64, i64, i64, i64,
+/// i64, i64, i64)` tuple destructured in `get_cve_trends`. (#1375)
+pub(crate) const CVE_TRENDS_COUNTS_REPO_SQL: &str = r#"
+WITH per_cve AS (
+    SELECT
+        sf.artifact_id,
+        sf.cve_id,
+        MAX(
+            CASE LOWER(sf.severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        BOOL_AND(sf.is_acknowledged) AS all_ack
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND a.repository_id = $1
+      AND NOT a.is_deleted
+    GROUP BY sf.artifact_id, sf.cve_id
+)
+SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
+    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
+    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
+    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
+    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
+    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
+FROM per_cve
+"#;
+
+/// CVE-history counts CTE, all-repos variant. Must stay byte-aligned with
+/// the repo-scoped variant above (same severity CASE, same projection).
+pub(crate) const CVE_TRENDS_COUNTS_ALL_SQL: &str = r#"
+WITH per_cve AS (
+    SELECT
+        sf.artifact_id,
+        sf.cve_id,
+        MAX(
+            CASE LOWER(sf.severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        BOOL_AND(sf.is_acknowledged) AS all_ack
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND NOT a.is_deleted
+    GROUP BY sf.artifact_id, sf.cve_id
+)
+SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
+    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
+    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
+    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
+    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
+    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
+FROM per_cve
+"#;
+
+/// CVE-history timeline projection (most recent 100 within 30 days), scoped
+/// to one repository. The severity CASE table must stay aligned with the
+/// counts CTE above. (#1375)
+pub(crate) const CVE_TRENDS_TIMELINE_REPO_SQL: &str = r#"
+SELECT
+    artifact_id,
+    cve_id,
+    CASE severity_rank
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE NULL
+    END AS severity,
+    affected_component,
+    affected_version,
+    fixed_version,
+    first_detected_at,
+    last_detected_at,
+    all_acknowledged
+FROM (
+    SELECT
+        sf.artifact_id,
+        sf.cve_id,
+        MAX(
+            CASE LOWER(sf.severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        MAX(sf.affected_component) AS affected_component,
+        MAX(sf.affected_version) AS affected_version,
+        MAX(sf.fixed_version) AS fixed_version,
+        MIN(sf.created_at) AS first_detected_at,
+        MAX(sf.created_at) AS last_detected_at,
+        BOOL_AND(sf.is_acknowledged) AS all_acknowledged
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND a.repository_id = $1
+      AND NOT a.is_deleted
+      AND sf.created_at > NOW() - INTERVAL '30 days'
+    GROUP BY sf.artifact_id, sf.cve_id
+    ORDER BY MIN(sf.created_at) DESC
+    LIMIT 100
+) inner_ranked
+"#;
+
+/// CVE-history timeline projection, all-repos variant.
+pub(crate) const CVE_TRENDS_TIMELINE_ALL_SQL: &str = r#"
+SELECT
+    artifact_id,
+    cve_id,
+    CASE severity_rank
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE NULL
+    END AS severity,
+    affected_component,
+    affected_version,
+    fixed_version,
+    first_detected_at,
+    last_detected_at,
+    all_acknowledged
+FROM (
+    SELECT
+        sf.artifact_id,
+        sf.cve_id,
+        MAX(
+            CASE LOWER(sf.severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        MAX(sf.affected_component) AS affected_component,
+        MAX(sf.affected_version) AS affected_version,
+        MAX(sf.fixed_version) AS fixed_version,
+        MIN(sf.created_at) AS first_detected_at,
+        MAX(sf.created_at) AS last_detected_at,
+        BOOL_AND(sf.is_acknowledged) AS all_acknowledged
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND NOT a.is_deleted
+      AND sf.created_at > NOW() - INTERVAL '30 days'
+    GROUP BY sf.artifact_id, sf.cve_id
+    ORDER BY MIN(sf.created_at) DESC
+    LIMIT 100
+) inner_ranked
+"#;
+
+/// `fixed_cves` count: union of curated `cve_history` rows with status='fixed'
+/// and "fell off on rescan" CVEs, deduped by (artifact_id, cve_id). Repo-
+/// scoped variant. (#1375)
+pub(crate) const FIXED_CVES_COUNT_REPO_SQL: &str = r#"
+WITH curated_fixed AS (
+    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
+    FROM cve_history ch
+    JOIN artifacts a ON ch.artifact_id = a.id
+    WHERE ch.status = 'fixed'
+      AND ch.cve_id IS NOT NULL
+      AND a.repository_id = $1
+      AND NOT a.is_deleted
+),
+latest_scans AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+        sr.id, sr.artifact_id, sr.scan_type
+    FROM scan_results sr
+    JOIN artifacts a ON sr.artifact_id = a.id
+    WHERE sr.status = 'completed'
+      AND a.repository_id = $1
+      AND NOT a.is_deleted
+    ORDER BY sr.artifact_id, sr.scan_type, sr.created_at DESC
+),
+ever_seen AS (
+    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND a.repository_id = $1
+      AND NOT a.is_deleted
+),
+still_present AS (
+    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+    FROM scan_findings sf
+    JOIN latest_scans ls ON sf.scan_result_id = ls.id
+    WHERE sf.cve_id IS NOT NULL
+),
+disappeared AS (
+    SELECT e.artifact_id, e.cve_id FROM ever_seen e
+    EXCEPT
+    SELECT s.artifact_id, s.cve_id FROM still_present s
+),
+unioned AS (
+    SELECT artifact_id, cve_id FROM curated_fixed
+    UNION
+    SELECT artifact_id, cve_id FROM disappeared
+)
+SELECT COUNT(*) FROM unioned
+"#;
+
+/// `fixed_cves` count, all-repos variant.
+pub(crate) const FIXED_CVES_COUNT_ALL_SQL: &str = r#"
+WITH curated_fixed AS (
+    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
+    FROM cve_history ch
+    JOIN artifacts a ON ch.artifact_id = a.id
+    WHERE ch.status = 'fixed'
+      AND ch.cve_id IS NOT NULL
+      AND NOT a.is_deleted
+),
+latest_scans AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+        sr.id, sr.artifact_id, sr.scan_type
+    FROM scan_results sr
+    JOIN artifacts a ON sr.artifact_id = a.id
+    WHERE sr.status = 'completed'
+      AND NOT a.is_deleted
+    ORDER BY sr.artifact_id, sr.scan_type, sr.created_at DESC
+),
+ever_seen AS (
+    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+    FROM scan_findings sf
+    JOIN artifacts a ON sf.artifact_id = a.id
+    WHERE sf.cve_id IS NOT NULL
+      AND NOT a.is_deleted
+),
+still_present AS (
+    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+    FROM scan_findings sf
+    JOIN latest_scans ls ON sf.scan_result_id = ls.id
+    WHERE sf.cve_id IS NOT NULL
+),
+disappeared AS (
+    SELECT e.artifact_id, e.cve_id FROM ever_seen e
+    EXCEPT
+    SELECT s.artifact_id, s.cve_id FROM still_present s
+),
+unioned AS (
+    SELECT artifact_id, cve_id FROM curated_fixed
+    UNION
+    SELECT artifact_id, cve_id FROM disappeared
+)
+SELECT COUNT(*) FROM unioned
+"#;
+
+/// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
+/// case-insensitive CVE id match. Mirrors the inline query in
+/// `build_cve_entries_from_scan_findings` (#1375).
+pub(crate) const SCAN_FINDINGS_BY_CVE_SQL: &str = r#"
+SELECT
+    artifact_id,
+    cve_id,
+    CASE severity_rank
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE NULL
+    END AS severity,
+    affected_component,
+    affected_version,
+    fixed_version,
+    first_detected_at,
+    last_detected_at,
+    all_acknowledged
+FROM (
+    SELECT
+        artifact_id,
+        cve_id,
+        MAX(
+            CASE LOWER(severity)
+                WHEN 'critical' THEN 4
+                WHEN 'high' THEN 3
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 1
+                ELSE 0
+            END
+        ) AS severity_rank,
+        MAX(affected_component) AS affected_component,
+        MAX(affected_version) AS affected_version,
+        MAX(fixed_version) AS fixed_version,
+        MIN(created_at) AS first_detected_at,
+        MAX(created_at) AS last_detected_at,
+        BOOL_AND(is_acknowledged) AS all_acknowledged
+    FROM scan_findings
+    WHERE LOWER(cve_id) = LOWER($1)
+    GROUP BY artifact_id, cve_id
+    ORDER BY MIN(created_at) DESC
+) inner_ranked
+"#;
 
 /// SBOM service for generating and managing SBOMs.
 #[derive(Clone)]
@@ -321,7 +1007,8 @@ impl SbomService {
 
     /// Get CVE history for an artifact.
     pub async fn get_cve_history(&self, artifact_id: Uuid) -> Result<Vec<CveHistoryEntry>> {
-        let entries = sqlx::query_as::<_, CveHistoryEntry>(
+        // Primary source: legacy `cve_history` table (manual / promoted entries).
+        let mut entries = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
             SELECT * FROM cve_history
             WHERE artifact_id = $1
@@ -332,7 +1019,198 @@ impl SbomService {
         .fetch_all(&self.db)
         .await?;
 
+        // Fallback / supplement: derive CVE-shaped entries from `scan_findings`
+        // for findings the scanner produced but never wrote into `cve_history`
+        // (see #1375: `record_cve` is presently dead code, so the scan-derived
+        // path is the only source of real CVE data). De-dupe by `cve_id` so a
+        // CVE that exists in both tables surfaces once with the curated row.
+        // Normalize to upper-case so the dedupe is case-insensitive (schema
+        // does not constrain `cve_id` case in either table).
+        let known = build_known_cve_set(&entries);
+        let scan_entries = self
+            .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
+            .await?;
+        entries.extend(scan_entries);
+        sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
+    }
+
+    /// Get CVE history for a single CVE identifier across artifacts.
+    ///
+    /// Reads from both `cve_history` (curated rows) and `scan_findings` (live
+    /// scanner output) so that callers see the full set of artifacts where
+    /// this CVE has ever been detected.
+    ///
+    /// # `allowed_repo_ids` contract (ADMIN-ONLY when `None`)
+    ///
+    /// The `allowed_repo_ids` argument scopes the lookup to repositories the
+    /// caller can access (mirrors `AuthExtension::can_access_repo`).
+    ///
+    /// - `Some(&[...])` -- limit results to the listed repositories. An empty
+    ///   slice returns zero rows (caller has access to nothing).
+    /// - `None` -- **NO REPOSITORY SCOPE; FULL CROSS-REPO READ**. Only pass
+    ///   `None` when the caller has admin-tier access. The convention here
+    ///   mirrors `AuthExtension::allowed_repo_ids` where `None` means "no
+    ///   restriction applied by auth middleware" (admin/root tokens, system
+    ///   workers). Calling this with `None` for an end-user token is a data
+    ///   leak. The HTTP handler enforces this by always passing
+    ///   `auth.allowed_repo_ids.as_deref()` through unchanged: if auth said
+    ///   "no restriction", the service trusts that decision.
+    ///
+    /// This is a footgun-prone shape. Tracked for refactor to an explicit
+    /// `enum AccessScope { Admin, Restricted(Vec<Uuid>) }` post v1.2.0 (see
+    /// #1390 follow-up). Until then, treat `None` as a load-bearing comment
+    /// that must read "admin-only".
+    ///
+    /// Returns an empty vec when the CVE is not present (200 OK, [] body); a
+    /// missing CVE is not a 404 in this contract.
+    ///
+    /// #1375: this is the cross-artifact lookup path that the broken
+    /// `Path<Uuid>` extractor used to make impossible.
+    pub async fn get_cve_history_by_cve_id(
+        &self,
+        cve_id: &str,
+        allowed_repo_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<CveHistoryEntry>> {
+        // Normalize: NVD shape is upper-case; lower-case is a common typo.
+        // Schema does not constrain `cve_id` case in either `cve_history` or
+        // `scan_findings`, so we compare case-insensitively and only use the
+        // upper-cased form for display/known-set dedupe below.
+        let cve_id_upper = cve_id.to_ascii_uppercase();
+
+        // 1. Curated rows from cve_history. We join through artifacts so we
+        //    can filter by allowed_repo_ids without a second round-trip.
+        //    LOWER(...)=LOWER(...) so a scanner that wrote lower-case still
+        //    matches an upper-case query (and vice versa).
+        let mut entries: Vec<CveHistoryEntry> = if let Some(repo_ids) = allowed_repo_ids {
+            sqlx::query_as::<_, CveHistoryEntry>(
+                r#"
+                SELECT ch.*
+                FROM cve_history ch
+                JOIN artifacts a ON ch.artifact_id = a.id
+                WHERE LOWER(ch.cve_id) = LOWER($1)
+                  AND a.repository_id = ANY($2)
+                  AND NOT a.is_deleted
+                ORDER BY ch.first_detected_at DESC
+                "#,
+            )
+            .bind(&cve_id_upper)
+            .bind(repo_ids)
+            .fetch_all(&self.db)
+            .await?
+        } else {
+            sqlx::query_as::<_, CveHistoryEntry>(
+                r#"
+                SELECT ch.*
+                FROM cve_history ch
+                JOIN artifacts a ON ch.artifact_id = a.id
+                WHERE LOWER(ch.cve_id) = LOWER($1)
+                  AND NOT a.is_deleted
+                ORDER BY ch.first_detected_at DESC
+                "#,
+            )
+            .bind(&cve_id_upper)
+            .fetch_all(&self.db)
+            .await?
+        };
+
+        // 2. Live findings from scan_findings, skipping cve_ids we already
+        //    surfaced via the curated path. `known` is normalized so the
+        //    dedupe is case-insensitive too.
+        let known = build_known_cve_set(&entries);
+        let scan_entries = self
+            .build_cve_entries_from_scan_findings(None, Some(&cve_id_upper), &known)
+            .await?;
+        // For scan-derived entries we additionally enforce the repo filter
+        // (artifact-level lookup already enforced it inside the helper, so
+        // here we only need to re-scope by allowed_repo_ids).
+        let scan_entries = match allowed_repo_ids {
+            None => scan_entries,
+            Some(repo_ids) => {
+                let allowed: HashSet<Uuid> = repo_ids.iter().copied().collect();
+                self.filter_entries_by_repo(scan_entries, &allowed).await?
+            }
+        };
+        entries.extend(scan_entries);
+        sort_entries_by_first_detected_desc(&mut entries);
+        Ok(entries)
+    }
+
+    /// Drop entries whose owning artifact is not in `allowed_repos`.
+    ///
+    /// Used by the CVE-id read path to apply the auth `allowed_repo_ids`
+    /// filter to scan-derived entries (where we synthesize `CveHistoryEntry`
+    /// rows on the fly and so cannot enforce the filter inside the original
+    /// SQL `WHERE` clause).
+    async fn filter_entries_by_repo(
+        &self,
+        entries: Vec<CveHistoryEntry>,
+        allowed_repos: &HashSet<Uuid>,
+    ) -> Result<Vec<CveHistoryEntry>> {
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+        let artifact_ids: Vec<Uuid> = entries.iter().map(|e| e.artifact_id).collect();
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            r#"
+            SELECT id, repository_id FROM artifacts
+            WHERE id = ANY($1) AND NOT is_deleted
+            "#,
+        )
+        .bind(&artifact_ids)
+        .fetch_all(&self.db)
+        .await?;
+        let repo_by_artifact: std::collections::HashMap<Uuid, Uuid> = rows.into_iter().collect();
+        Ok(filter_entries_by_repo_map(
+            entries,
+            &repo_by_artifact,
+            allowed_repos,
+        ))
+    }
+
+    /// Build synthetic `CveHistoryEntry` rows from `scan_findings`.
+    ///
+    /// Why this exists: the scanner pipeline writes findings to
+    /// `scan_findings` but never invokes `SbomService::record_cve`, so the
+    /// `cve_history` table is structurally empty in production. To make the
+    /// CVE history / trends endpoints return real data we synthesize entries
+    /// from scan findings. This is a read-time projection; nothing is
+    /// persisted. (#1375)
+    ///
+    /// `artifact_filter` and `cve_filter` are mutually exclusive scopes —
+    /// pass `Some` for at most one. `known` is a set of CVE ids that should
+    /// be excluded (because the curated `cve_history` path already returned
+    /// them).
+    async fn build_cve_entries_from_scan_findings(
+        &self,
+        artifact_filter: Option<Uuid>,
+        cve_filter: Option<&str>,
+        known: &HashSet<String>,
+    ) -> Result<Vec<CveHistoryEntry>> {
+        // Each row collapses to one synthetic CVE-history entry per
+        // (artifact_id, cve_id). MIN(created_at) approximates
+        // first_detected_at; MAX(created_at) approximates last_detected_at.
+        // Severity is aggregated via a ranked CASE (see `severity_rank`) so
+        // that a CVE reported `high` by one scanner and `medium` by another
+        // shows up as `high` rather than the lexicographically-larger but
+        // operationally-lower `medium`. Same fix as `get_cve_trends`. (#1375)
+        let rows: Vec<ScanFindingCveRow> = if let Some(artifact_id) = artifact_filter {
+            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_ARTIFACT_SQL)
+                .bind(artifact_id)
+                .fetch_all(&self.db)
+                .await?
+        } else if let Some(cve_id) = cve_filter {
+            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_CVE_SQL)
+                .bind(cve_id)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            // Unfiltered scope is a misuse (would return every CVE in the
+            // system). Refuse rather than DoS the DB.
+            return Ok(Vec::new());
+        };
+
+        Ok(project_scan_rows_to_entries(rows, known))
     }
 
     /// Update CVE status.
@@ -365,11 +1243,153 @@ impl SbomService {
         Ok(entry)
     }
 
+    /// Update CVE status for an (artifact, cve) pair by mutating the
+    /// underlying `scan_findings` rows.
+    ///
+    /// Why this exists (#1426): the Security tab read path projects
+    /// `scan_findings` rows into synthetic `CveHistoryEntry` values whose
+    /// `id` is a hash-derived UUID with no corresponding row in
+    /// `cve_history`. The legacy acknowledge endpoint
+    /// `POST /sbom/cve/status/{id}` writes to `cve_history` only, so an
+    /// "acknowledge" click on a scan-derived row returned 404 -- the second,
+    /// unwired acknowledge path called out in the issue. This method gives
+    /// the Security tab a working acknowledge path by updating the source
+    /// table (`scan_findings`) directly, keyed on (artifact_id, cve_id)
+    /// because that is the only stable identity a synth row carries.
+    ///
+    /// `status` mapping (the four-state `cve_history.status` does not exist
+    /// on `scan_findings`; the only acknowledge column there is the
+    /// boolean `is_acknowledged`):
+    ///
+    /// - `Acknowledged` / `FalsePositive` -- set `is_acknowledged = true`,
+    ///   record `acknowledged_by` / `acknowledged_at` / `acknowledged_reason`.
+    ///   `false_positive` collapses to `acknowledged` on `scan_findings` since
+    ///   the table has no separate column; the reason field carries the
+    ///   distinction for audit.
+    /// - `Open` -- clear acknowledgement (mirror of the `revoke` endpoint).
+    /// - `Fixed` -- not supported by `scan_findings`; returns `Validation`.
+    ///   "Fixed" is only meaningful on curated `cve_history` rows.
+    ///
+    /// Returns a synthetic `CveHistoryEntry` reflecting the post-update
+    /// aggregate state (same shape the read path returns). Returns
+    /// `AppError::NotFound` when no matching `scan_findings` rows exist;
+    /// the caller turns that into 404.
+    pub async fn update_cve_status_by_artifact_cve(
+        &self,
+        artifact_id: Uuid,
+        cve_id: &str,
+        status: CveStatus,
+        user_id: Option<Uuid>,
+        reason: Option<&str>,
+    ) -> Result<CveHistoryEntry> {
+        // `scan_findings` only models a binary acknowledge state. `fixed`
+        // has no representation; refuse rather than silently coerce.
+        let acknowledge = cve_status_to_acknowledge_flag(status).ok_or_else(|| {
+            AppError::Validation(
+                "Status 'fixed' is not supported on scan-derived CVE entries; \
+                 only 'open', 'acknowledged', and 'false_positive' map to scan_findings"
+                    .to_string(),
+            )
+        })?;
+
+        // Compare CVE id case-insensitively. The schema does not constrain
+        // case on `scan_findings.cve_id`, and the synth ids the read path
+        // emits are upper-case, so we LOWER both sides.
+        let affected = if acknowledge {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = TRUE,
+                    acknowledged_by = $3,
+                    acknowledged_reason = $4,
+                    acknowledged_at = NOW()
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .bind(user_id)
+            .bind(reason)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = FALSE,
+                    acknowledged_by = NULL,
+                    acknowledged_reason = NULL,
+                    acknowledged_at = NULL
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        };
+
+        if affected == 0 {
+            return Err(AppError::NotFound(format!(
+                "No scan_findings rows for artifact {} and CVE {}",
+                artifact_id, cve_id
+            )));
+        }
+
+        // Re-read the (now-mutated) aggregate so the response carries the
+        // same shape as the read path: synth id, aggregated severity, MIN/MAX
+        // detection timestamps, and an `all_acknowledged` flag that now
+        // reflects the just-written state.
+        let known: HashSet<String> = HashSet::new();
+        let entries = self
+            .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
+            .await?;
+        let cve_upper = cve_id.to_ascii_uppercase();
+        entries
+            .into_iter()
+            .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Updated scan_findings rows but could not re-read aggregate \
+                     for artifact {} and CVE {}",
+                    artifact_id, cve_id
+                ))
+            })
+    }
+
     /// Get CVE trends for a repository.
+    ///
+    /// #1375: trends previously read only from `cve_history`, which is never
+    /// populated by the scanner pipeline (no caller invokes
+    /// `SbomService::record_cve`). The result was an all-zeros response for
+    /// every fresh deployment, which the release-gate test flagged. We now
+    /// derive the aggregates from `scan_findings`, the table the scanner
+    /// actually writes to, so trends reflect live CVE state.
+    ///
+    /// `cve_history.status` (open/fixed/acknowledged/false_positive) has no
+    /// direct equivalent in `scan_findings`. We approximate:
+    ///   - open: findings where `NOT is_acknowledged`
+    ///   - acknowledged: findings where `is_acknowledged`
+    ///   - fixed: union of two sources, deduped by (artifact_id, cve_id):
+    ///     (a) curated `cve_history` rows with `status='fixed'` (preserves
+    ///     the legacy admin/promotion-policy semantic for the rare callers
+    ///     that write to that table); plus
+    ///     (b) CVEs that appeared in an earlier `scan_findings` row for an
+    ///     artifact but are absent from that artifact's most recent
+    ///     `scan_results` (per `scan_type`). "Disappeared on rescan" is the
+    ///     closest signal we have to a fixed CVE without a real fixed-at
+    ///     timestamp.
+    ///
+    /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
+    /// double-count a single vulnerability.
     pub async fn get_cve_trends(&self, repository_id: Option<Uuid>) -> Result<CveTrends> {
-        // Get aggregate counts
-        let (total, open, fixed, acknowledged, critical, high, medium, low): (
-            i64,
+        let (total, open, acknowledged, critical, high, medium, low): (
             i64,
             i64,
             i64,
@@ -378,84 +1398,65 @@ impl SbomService {
             i64,
             i64,
         ) = if let Some(repo_id) = repository_id {
-            sqlx::query_as(
-                r#"
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'open') as open,
-                    COUNT(*) FILTER (WHERE status = 'fixed') as fixed,
-                    COUNT(*) FILTER (WHERE status = 'acknowledged') as acknowledged,
-                    COUNT(*) FILTER (WHERE severity = 'critical') as critical,
-                    COUNT(*) FILTER (WHERE severity = 'high') as high,
-                    COUNT(*) FILTER (WHERE severity = 'medium') as medium,
-                    COUNT(*) FILTER (WHERE severity = 'low') as low
-                FROM cve_history ch
-                JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE a.repository_id = $1
-                "#,
-            )
-            .bind(repo_id)
-            .fetch_one(&self.db)
-            .await?
+            sqlx::query_as(CVE_TRENDS_COUNTS_REPO_SQL)
+                .bind(repo_id)
+                .fetch_one(&self.db)
+                .await?
         } else {
-            sqlx::query_as(
-                r#"
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'open') as open,
-                    COUNT(*) FILTER (WHERE status = 'fixed') as fixed,
-                    COUNT(*) FILTER (WHERE status = 'acknowledged') as acknowledged,
-                    COUNT(*) FILTER (WHERE severity = 'critical') as critical,
-                    COUNT(*) FILTER (WHERE severity = 'high') as high,
-                    COUNT(*) FILTER (WHERE severity = 'medium') as medium,
-                    COUNT(*) FILTER (WHERE severity = 'low') as low
-                FROM cve_history
-                "#,
-            )
-            .fetch_one(&self.db)
-            .await?
+            sqlx::query_as(CVE_TRENDS_COUNTS_ALL_SQL)
+                .fetch_one(&self.db)
+                .await?
         };
 
-        // Get timeline (last 30 days)
-        let timeline_entries = sqlx::query_as::<_, CveHistoryEntry>(
-            r#"
-            SELECT * FROM cve_history
-            WHERE first_detected_at > NOW() - INTERVAL '30 days'
-            ORDER BY first_detected_at DESC
-            LIMIT 100
-            "#,
-        )
-        .fetch_all(&self.db)
-        .await?;
+        // Timeline (most recent 100 newly-detected CVEs in the last 30 days)
+        // derived from scan_findings.
+        //
+        // Round-2 fix (#1375): severity is projected through the same
+        // ranked CASE as the counts above, then mapped back to a text
+        // label, so multi-scanner overlap doesn't flatten a `high`
+        // finding to `medium` via lexicographic MAX.
+        let timeline_rows: Vec<ScanFindingCveRow> = if let Some(repo_id) = repository_id {
+            sqlx::query_as::<_, ScanFindingCveRow>(CVE_TRENDS_TIMELINE_REPO_SQL)
+                .bind(repo_id)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            sqlx::query_as::<_, ScanFindingCveRow>(CVE_TRENDS_TIMELINE_ALL_SQL)
+                .fetch_all(&self.db)
+                .await?
+        };
 
-        let timeline: Vec<CveTimelineEntry> = timeline_entries
-            .into_iter()
-            .map(|e| {
-                let days_exposed = (Utc::now() - e.first_detected_at).num_days();
-                CveTimelineEntry {
-                    cve_id: e.cve_id,
-                    severity: e.severity.unwrap_or_default(),
-                    affected_component: e.affected_component.unwrap_or_default(),
-                    cve_published_at: e.cve_published_at,
-                    first_detected_at: e.first_detected_at,
-                    status: CveStatus::parse(&e.status).unwrap_or(CveStatus::Open),
-                    days_exposed,
-                }
-            })
-            .collect();
+        let timeline = project_timeline_rows(&timeline_rows, Utc::now());
 
-        Ok(CveTrends {
-            total_cves: total,
-            open_cves: open,
-            fixed_cves: fixed,
-            acknowledged_cves: acknowledged,
-            critical_count: critical,
-            high_count: high,
-            medium_count: medium,
-            low_count: low,
-            avg_days_to_fix: None, // TODO: calculate from fixed CVEs
+        // fixed_cves: union of two definitions, deduped by (artifact_id, cve_id):
+        //   (a) curated `cve_history` rows with status='fixed'
+        //   (b) CVEs present in an earlier scan_findings row for an artifact
+        //       but absent from that artifact's most recent scan_result per
+        //       scan_type (i.e. they "fell off" on rescan)
+        // This avoids the silent-zero regression while still being correct
+        // when no curated rows exist.
+        let fixed_cves: i64 = if let Some(repo_id) = repository_id {
+            sqlx::query_scalar(FIXED_CVES_COUNT_REPO_SQL)
+                .bind(repo_id)
+                .fetch_one(&self.db)
+                .await?
+        } else {
+            sqlx::query_scalar(FIXED_CVES_COUNT_ALL_SQL)
+                .fetch_one(&self.db)
+                .await?
+        };
+
+        Ok(cve_trends_from_aggregates(
+            total,
+            open,
+            acknowledged,
+            critical,
+            high,
+            medium,
+            low,
+            fixed_cves,
             timeline,
-        })
+        ))
     }
 
     // === License Policies ===
@@ -560,6 +1561,55 @@ impl SbomService {
         }
     }
 
+    /// Conservative set of ubiquitous, long-stable SPDX identifiers that are
+    /// guaranteed to be present in any modern SPDX license list (and thus
+    /// accepted in a CycloneDX `license.id`). Kept intentionally small: a
+    /// miss here only downgrades a recognized license to the free-form
+    /// `name` field, whereas a *wrong* entry would re-introduce the
+    /// whole-BOM rejection this guards against.
+    const SPDX_COMMON_IDS: &'static [&'static str] = &[
+        "0BSD",
+        "Apache-2.0",
+        "Artistic-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "BSL-1.0",
+        "CC0-1.0",
+        "EPL-2.0",
+        "GPL-2.0-only",
+        "GPL-2.0-or-later",
+        "GPL-3.0-only",
+        "GPL-3.0-or-later",
+        "ISC",
+        "LGPL-2.1-only",
+        "LGPL-2.1-or-later",
+        "LGPL-3.0-only",
+        "LGPL-3.0-or-later",
+        "AGPL-3.0-only",
+        "AGPL-3.0-or-later",
+        "MIT",
+        "MPL-2.0",
+        "Unlicense",
+        "Zlib",
+    ];
+
+    /// Build a CycloneDX `licenses[]` entry for a single license string.
+    ///
+    /// CycloneDX requires `license.id` to be a member of the SPDX license
+    /// enumeration; Dependency-Track rejects the *entire* BOM with HTTP 400
+    /// ("Schema validation failed") if any component carries an `id` outside
+    /// that set. Package license metadata is frequently not a bare SPDX id
+    /// (free-form names, SPDX expressions, "UNKNOWN"), so emit `id` only for
+    /// recognized identifiers and fall back to the free-form `name` field —
+    /// which DT accepts unconditionally — for everything else.
+    fn cyclonedx_license_entry(license: &str) -> serde_json::Value {
+        if Self::SPDX_COMMON_IDS.contains(&license) {
+            serde_json::json!({"license": {"id": license}})
+        } else {
+            serde_json::json!({"license": {"name": license}})
+        }
+    }
+
     fn generate_cyclonedx_inner(
         &self,
         dependencies: &[DependencyInfo],
@@ -592,7 +1642,7 @@ impl SbomService {
                 cdx_comp["purl"] = serde_json::json!(p);
             }
             if let Some(l) = &dep.license {
-                cdx_comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+                cdx_comp["licenses"] = serde_json::json!([Self::cyclonedx_license_entry(l)]);
             }
             if let Some(h) = &dep.sha256 {
                 cdx_comp["hashes"] = serde_json::json!([{"alg": "SHA-256", "content": h}]);
@@ -780,7 +1830,7 @@ mod tests {
             comp["purl"] = serde_json::json!(p);
         }
         if let Some(l) = &dep.license {
-            comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+            comp["licenses"] = serde_json::json!([SbomService::cyclonedx_license_entry(l)]);
         }
         if let Some(h) = &dep.sha256 {
             comp["hashes"] = serde_json::json!([{"alg": "SHA-256", "content": h}]);
@@ -902,6 +1952,50 @@ mod tests {
     #[test]
     fn test_format_version_spdx() {
         assert_eq!(format_version(SbomFormat::SPDX), "2.3");
+    }
+
+    // ===================================================================
+    // cyclonedx_license_entry — SPDX id vs free-form name
+    // ===================================================================
+
+    #[test]
+    fn test_cyclonedx_license_entry_known_spdx_uses_id() {
+        let entry = SbomService::cyclonedx_license_entry("Apache-2.0");
+        assert_eq!(entry["license"]["id"], "Apache-2.0");
+        assert!(entry["license"].get("name").is_none());
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_non_spdx_uses_name() {
+        // A free-form / non-SPDX license must NOT land in `id` — that makes
+        // Dependency-Track reject the entire BOM with HTTP 400. It belongs in
+        // the free-form `name` field.
+        let entry = SbomService::cyclonedx_license_entry("Public Domain");
+        assert_eq!(entry["license"]["name"], "Public Domain");
+        assert!(entry["license"].get("id").is_none());
+    }
+
+    #[test]
+    fn test_cyclonedx_license_entry_spdx_expression_uses_name() {
+        // SPDX expressions are not bare ids and fail `license.id` enum
+        // validation; they must fall back to `name`.
+        let entry = SbomService::cyclonedx_license_entry("MIT OR Apache-2.0");
+        assert_eq!(entry["license"]["name"], "MIT OR Apache-2.0");
+        assert!(entry["license"].get("id").is_none());
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_non_spdx_license_not_in_id() {
+        let dep = DependencyInfo {
+            name: "weird-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            purl: None,
+            license: Some("UNKNOWN".to_string()),
+            sha256: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(comp["licenses"][0]["license"]["name"], "UNKNOWN");
+        assert!(comp["licenses"][0]["license"].get("id").is_none());
     }
 
     // ===================================================================
@@ -1935,5 +3029,1627 @@ mod tests {
         assert_eq!(CveStatus::Fixed.as_str(), "fixed");
         assert_eq!(CveStatus::Acknowledged.as_str(), "acknowledged");
         assert_eq!(CveStatus::FalsePositive.as_str(), "false_positive");
+    }
+
+    // -----------------------------------------------------------------------
+    // synth_cve_id: regression coverage for #1375. The CVE history endpoint
+    // synthesizes `CveHistoryEntry` rows on the fly from `scan_findings`
+    // because `cve_history` is never written to in production. Synth ids
+    // must be deterministic so re-reads return stable identifiers and
+    // distinct for distinct (artifact, cve) pairs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_synth_cve_id_is_deterministic() {
+        let artifact = Uuid::new_v4();
+        let cve = "CVE-2019-10744";
+        let a = synth_cve_id(artifact, cve);
+        let b = synth_cve_id(artifact, cve);
+        assert_eq!(
+            a, b,
+            "synth_cve_id must be deterministic so client-side dedup by id works"
+        );
+    }
+
+    #[test]
+    fn test_synth_cve_id_distinct_pairs_produce_distinct_ids() {
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let cve = "CVE-2019-10744";
+        let x = synth_cve_id(a1, cve);
+        let y = synth_cve_id(a2, cve);
+        let z = synth_cve_id(a1, "CVE-2024-12345");
+        assert_ne!(x, y, "different artifacts must yield different ids");
+        assert_ne!(x, z, "different CVEs must yield different ids");
+        assert_ne!(y, z);
+    }
+
+    #[test]
+    fn test_synth_cve_id_separator_prevents_concat_collisions() {
+        // Without the explicit separator byte, (artifact="00...01", cve="234")
+        // would hash the same as (artifact="00...0", cve="1234"). Use a pair
+        // that exercises adjacent boundaries: encode the boundary by varying
+        // the cve suffix length while keeping the same combined string.
+        let artifact = Uuid::nil();
+        let a = synth_cve_id(artifact, "AB");
+        let b = synth_cve_id(artifact, "ABC");
+        assert_ne!(
+            a, b,
+            "synth_cve_id must separate fields so concatenation collisions \
+             do not yield the same UUID for different inputs"
+        );
+    }
+
+    #[test]
+    fn test_synth_cve_id_empty_cve_id() {
+        // Defensive: the mapping in `scan_finding_to_history_entry` passes
+        // an empty cve_id when the row has `None`. The hash must still be
+        // total (not panic) and remain stable.
+        let artifact = Uuid::nil();
+        let a = synth_cve_id(artifact, "");
+        let b = synth_cve_id(artifact, "");
+        assert_eq!(a, b);
+        // And distinct from a non-empty cve_id under the same artifact.
+        let c = synth_cve_id(artifact, "CVE-2019-10744");
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure-logic helpers extracted from the DB-coupled CVE history paths.
+    // These are the cases the inline coverage gate counts; the SQL queries
+    // they wrap are unreachable without a live PostgreSQL, so we exercise
+    // the surrounding projection / dedupe / sort logic here. (#1375)
+    // -----------------------------------------------------------------------
+
+    fn make_history_entry(cve_id: &str, first_detected_at: DateTime<Utc>) -> CveHistoryEntry {
+        CveHistoryEntry {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            sbom_id: None,
+            component_id: None,
+            scan_result_id: None,
+            cve_id: cve_id.to_string(),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            severity: None,
+            cvss_score: None,
+            cve_published_at: None,
+            first_detected_at,
+            last_detected_at: first_detected_at,
+            status: "open".to_string(),
+            acknowledged_by: None,
+            acknowledged_at: None,
+            acknowledged_reason: None,
+            created_at: first_detected_at,
+            updated_at: first_detected_at,
+        }
+    }
+
+    fn make_scan_row(
+        artifact_id: Uuid,
+        cve_id: Option<&str>,
+        first_detected_at: DateTime<Utc>,
+        all_acknowledged: bool,
+    ) -> ScanFindingCveRow {
+        ScanFindingCveRow {
+            artifact_id,
+            cve_id: cve_id.map(|s| s.to_string()),
+            severity: Some("high".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.4".to_string()),
+            fixed_version: Some("4.17.21".to_string()),
+            first_detected_at,
+            last_detected_at: first_detected_at,
+            all_acknowledged,
+        }
+    }
+
+    // --- build_known_cve_set -----------------------------------------------
+
+    #[test]
+    fn test_build_known_cve_set_uppercases() {
+        let entries = vec![
+            make_history_entry("cve-2019-10744", Utc::now()),
+            make_history_entry("CVE-2024-12345", Utc::now()),
+        ];
+        let set = build_known_cve_set(&entries);
+        assert!(set.contains("CVE-2019-10744"));
+        assert!(set.contains("CVE-2024-12345"));
+        // Lower-case form must not appear -- the helper exists *because* we
+        // need a case-insensitive compare downstream.
+        assert!(!set.contains("cve-2019-10744"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_build_known_cve_set_empty_input() {
+        let set = build_known_cve_set(&[]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_build_known_cve_set_dedupes_case_variants() {
+        // Two curated rows for the same CVE in mixed case must collapse
+        // to one entry in the known set, otherwise the dedupe-by-known
+        // filter on the scan-findings path would behave inconsistently
+        // depending on which case the scanner happened to write.
+        let entries = vec![
+            make_history_entry("cve-2019-10744", Utc::now()),
+            make_history_entry("CVE-2019-10744", Utc::now()),
+        ];
+        let set = build_known_cve_set(&entries);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("CVE-2019-10744"));
+    }
+
+    // --- scan_row_passes_known_filter --------------------------------------
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_known_uppercase_match() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        // Row matches by upper-case: filtered out.
+        assert!(!scan_row_passes_known_filter(
+            Some("CVE-2019-10744"),
+            &known
+        ));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_known_lowercase_match() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        // Row in lower-case still matches: case-insensitive dedupe.
+        assert!(!scan_row_passes_known_filter(
+            Some("cve-2019-10744"),
+            &known
+        ));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_keeps_novel_cve() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        assert!(scan_row_passes_known_filter(Some("CVE-2024-12345"), &known));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_none_cve_id() {
+        // Rows with NULL cve_id should be filtered out -- they cannot be
+        // meaningful CVE history entries.
+        let known: HashSet<String> = HashSet::new();
+        assert!(!scan_row_passes_known_filter(None, &known));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_keeps_when_known_empty() {
+        let known: HashSet<String> = HashSet::new();
+        assert!(scan_row_passes_known_filter(Some("CVE-2019-10744"), &known));
+    }
+
+    // --- cve_status_to_acknowledge_flag (#1426) ----------------------------
+    //
+    // The Security tab read path projects `scan_findings` into synth
+    // `CveHistoryEntry` rows; `update_cve_status_by_artifact_cve` writes the
+    // same table back. `scan_findings` only models a binary acknowledge
+    // state, so the four-state `CveStatus` enum has to collapse onto a
+    // `bool`. These tests pin the mapping rules so a future enum-variant
+    // addition doesn't silently coerce.
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_acknowledged_is_true() {
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::Acknowledged),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_false_positive_collapses_to_true() {
+        // `scan_findings` has no separate "false positive" column. The
+        // boolean column models "the user told us to hide this"; the reason
+        // field carries the audit distinction.
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::FalsePositive),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_open_is_false() {
+        // `Open` is the revoke-acknowledgement path on the Security tab.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Open), Some(false));
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_fixed_is_none() {
+        // "Fixed" has no representation on `scan_findings`. The handler
+        // must surface a 400, not silently set is_acknowledged = true.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Fixed), None);
+    }
+
+    // --- severity_rank / severity_from_rank --------------------------------
+    //
+    // Round-2 regression coverage for the lexicographic-MAX bug (#1375). The
+    // pre-fix SQL used `MAX(severity)` against a TEXT column, which orders
+    // alphabetically: "medium" > "low" > "high" > "critical". So a CVE
+    // reported as `high` by one scanner and `medium` by another surfaced as
+    // `medium` in the trends counts and timeline, silently undercounting
+    // high/critical findings. The ranked CASE in `get_cve_trends` and
+    // `build_cve_entries_from_scan_findings` fixes this; these tests pin
+    // the Rust side of the contract so the SQL and Rust stay in lockstep.
+
+    #[test]
+    fn test_severity_rank_strict_ordering() {
+        // Operational severity ranking, NOT lex order. This is the load-
+        // bearing contract that motivated the round-2 SQL rewrite.
+        assert!(severity_rank("critical") > severity_rank("high"));
+        assert!(severity_rank("high") > severity_rank("medium"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+        assert!(severity_rank("low") > severity_rank("unknown"));
+    }
+
+    #[test]
+    fn test_severity_rank_case_insensitive() {
+        // The DB column has no case constraint and different scanners write
+        // different cases (Trivy: "HIGH", Grype: "High", OSV: "high"). The
+        // ranking must collapse all of these to the same value or the
+        // multi-scanner dedupe in `get_cve_trends` would split a single
+        // CVE into separate rows by case.
+        assert_eq!(severity_rank("CRITICAL"), severity_rank("critical"));
+        assert_eq!(severity_rank("High"), severity_rank("high"));
+        assert_eq!(severity_rank("Medium"), severity_rank("medium"));
+        assert_eq!(severity_rank("LOW"), severity_rank("low"));
+    }
+
+    #[test]
+    fn test_severity_rank_unknown_is_zero() {
+        // Anything outside the four canonical labels (NULL severity, future
+        // labels like "info" / "negligible", junk data) must rank 0 so it
+        // never outranks a real severity.
+        assert_eq!(severity_rank(""), 0);
+        assert_eq!(severity_rank("unknown"), 0);
+        assert_eq!(severity_rank("info"), 0);
+        assert_eq!(severity_rank("negligible"), 0);
+        assert!(severity_rank("low") > severity_rank("info"));
+    }
+
+    #[test]
+    fn test_severity_from_rank_round_trip() {
+        // Round-trip every canonical label so a refactor of the rank
+        // constants can't silently break the inverse mapping.
+        for label in ["critical", "high", "medium", "low"] {
+            let r = severity_rank(label);
+            assert_eq!(
+                severity_from_rank(r),
+                Some(label),
+                "rank/label round-trip must hold for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_severity_from_rank_unknown_ranks() {
+        assert_eq!(severity_from_rank(0), None);
+        assert_eq!(severity_from_rank(5), None);
+        assert_eq!(severity_from_rank(-1), None);
+    }
+
+    // The headline #1375 round-2 regression: aggregating `['low', 'high',
+    // 'medium']` must yield `'high'`, not `'medium'` (which is what the
+    // pre-fix lexicographic MAX returned).
+    #[test]
+    fn test_severity_rank_aggregates_high_over_medium_for_low_high_medium_input() {
+        let severities = ["low", "high", "medium"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(
+            severity_from_rank(max_rank),
+            Some("high"),
+            "['low','high','medium'] must aggregate to 'high', not the \
+             lex-largest 'medium' that the pre-fix MAX(severity) returned"
+        );
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_critical_over_high() {
+        // The other half of the lex-sort bug: "critical" sorts BEFORE
+        // "high" alphabetically, so the pre-fix MAX returned "high" for
+        // a (high, critical) pair. The rank picks "critical" correctly.
+        let severities = ["high", "critical"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("critical"));
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_mixed_case_input() {
+        // Multi-scanner overlap with inconsistent casing must still pick
+        // the operationally-worst severity.
+        let severities = ["MEDIUM", "High", "low"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("high"));
+    }
+
+    #[test]
+    fn test_severity_rank_aggregates_skips_unknown() {
+        // An unknown rank-0 row in the mix must not knock a real severity
+        // out of the aggregate (a regression worth pinning because a
+        // future scanner could write `"info"` or `""`).
+        let severities = ["unknown", "low", "info", "high", "negligible"];
+        let max_rank = severities.iter().map(|s| severity_rank(s)).max().unwrap();
+        assert_eq!(severity_from_rank(max_rank), Some("high"));
+    }
+
+    // --- status mapping helpers --------------------------------------------
+
+    #[test]
+    fn test_status_string_from_acknowledged() {
+        assert_eq!(status_string_from_acknowledged(true), "acknowledged");
+        assert_eq!(status_string_from_acknowledged(false), "open");
+    }
+
+    #[test]
+    fn test_status_enum_from_acknowledged() {
+        assert_eq!(status_enum_from_acknowledged(true), CveStatus::Acknowledged);
+        assert_eq!(status_enum_from_acknowledged(false), CveStatus::Open);
+    }
+
+    #[test]
+    fn test_status_mappings_are_consistent() {
+        // Whatever the string variant says, the enum variant must match
+        // (else trends timeline and history list would disagree on the
+        // same scan_findings row).
+        assert_eq!(
+            status_string_from_acknowledged(true),
+            status_enum_from_acknowledged(true).as_str()
+        );
+        assert_eq!(
+            status_string_from_acknowledged(false),
+            status_enum_from_acknowledged(false).as_str()
+        );
+    }
+
+    // --- scan_finding_to_history_entry -------------------------------------
+
+    #[test]
+    fn test_scan_finding_to_history_entry_basic_mapping() {
+        let when = Utc::now();
+        let artifact = Uuid::new_v4();
+        let row = make_scan_row(artifact, Some("CVE-2019-10744"), when, false);
+        let entry = scan_finding_to_history_entry(row);
+
+        assert_eq!(entry.artifact_id, artifact);
+        assert_eq!(entry.cve_id, "CVE-2019-10744");
+        assert_eq!(entry.severity.as_deref(), Some("high"));
+        assert_eq!(entry.affected_component.as_deref(), Some("lodash"));
+        assert_eq!(entry.affected_version.as_deref(), Some("4.17.4"));
+        assert_eq!(entry.fixed_version.as_deref(), Some("4.17.21"));
+        assert_eq!(entry.first_detected_at, when);
+        assert_eq!(entry.last_detected_at, when);
+        assert_eq!(entry.status, "open");
+        assert_eq!(entry.created_at, when);
+        assert_eq!(entry.updated_at, when);
+        // Synthetic rows carry no FK references.
+        assert!(entry.sbom_id.is_none());
+        assert!(entry.component_id.is_none());
+        assert!(entry.scan_result_id.is_none());
+        assert!(entry.acknowledged_by.is_none());
+        assert!(entry.acknowledged_at.is_none());
+        assert!(entry.acknowledged_reason.is_none());
+        assert!(entry.cvss_score.is_none());
+        assert!(entry.cve_published_at.is_none());
+        // The id must equal synth_cve_id for the same inputs (stable across re-reads).
+        assert_eq!(entry.id, synth_cve_id(artifact, "CVE-2019-10744"));
+    }
+
+    #[test]
+    fn test_scan_finding_to_history_entry_acknowledged_status() {
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2024-12345"), Utc::now(), true);
+        let entry = scan_finding_to_history_entry(row);
+        assert_eq!(entry.status, "acknowledged");
+    }
+
+    #[test]
+    fn test_scan_finding_to_history_entry_none_cve_id_defaults_to_empty() {
+        // Defensive: the upstream filter should drop rows with NULL cve_id,
+        // but if anything slips through the mapping must remain total and
+        // produce a usable (if empty-id) row rather than panicking.
+        let row = make_scan_row(Uuid::new_v4(), None, Utc::now(), false);
+        let entry = scan_finding_to_history_entry(row);
+        assert_eq!(entry.cve_id, "");
+    }
+
+    // --- scan_finding_to_timeline_entry ------------------------------------
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_days_exposed() {
+        let now = Utc::now();
+        // 10 days ago
+        let first = now - chrono::Duration::days(10);
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2019-10744"), first, false);
+        let t = scan_finding_to_timeline_entry(&row, now);
+        assert_eq!(t.days_exposed, 10);
+        assert_eq!(t.cve_id, "CVE-2019-10744");
+        assert_eq!(t.severity, "high");
+        assert_eq!(t.affected_component, "lodash");
+        assert_eq!(t.status, CveStatus::Open);
+        assert_eq!(t.first_detected_at, first);
+        assert!(t.cve_published_at.is_none());
+    }
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_acknowledged_status() {
+        let now = Utc::now();
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2024-12345"), now, true);
+        let t = scan_finding_to_timeline_entry(&row, now);
+        assert_eq!(t.status, CveStatus::Acknowledged);
+        assert_eq!(t.days_exposed, 0);
+    }
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_handles_none_fields() {
+        let now = Utc::now();
+        let row = ScanFindingCveRow {
+            artifact_id: Uuid::new_v4(),
+            cve_id: None,
+            severity: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            first_detected_at: now,
+            last_detected_at: now,
+            all_acknowledged: false,
+        };
+        let t = scan_finding_to_timeline_entry(&row, now);
+        // None fields default to empty strings in the DTO.
+        assert_eq!(t.cve_id, "");
+        assert_eq!(t.severity, "");
+        assert_eq!(t.affected_component, "");
+    }
+
+    // --- filter_entries_by_repo_map ----------------------------------------
+
+    #[test]
+    fn test_filter_entries_by_repo_map_keeps_only_allowed() {
+        let artifact_a = Uuid::new_v4();
+        let artifact_b = Uuid::new_v4();
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let mut e2 = make_history_entry("CVE-2", Utc::now());
+        e2.artifact_id = artifact_b;
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(artifact_a, repo_a);
+        map.insert(artifact_b, repo_b);
+
+        let allowed: HashSet<Uuid> = [repo_a].into_iter().collect();
+        let filtered = filter_entries_by_repo_map(vec![e1, e2], &map, &allowed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].cve_id, "CVE-1");
+        assert_eq!(filtered[0].artifact_id, artifact_a);
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_drops_entry_with_unknown_artifact() {
+        // Defensive: if the DB lookup is partial (e.g. artifact was deleted
+        // mid-request, so `is_deleted` filter excluded it), the entry must
+        // be dropped rather than leaked to the caller.
+        let artifact_a = Uuid::new_v4();
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let map = std::collections::HashMap::new(); // empty: artifact not present
+        let allowed: HashSet<Uuid> = [Uuid::new_v4()].into_iter().collect();
+        let filtered = filter_entries_by_repo_map(vec![e1], &map, &allowed);
+        assert!(
+            filtered.is_empty(),
+            "entries with unknown repo must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_empty_input() {
+        let map = std::collections::HashMap::new();
+        let allowed: HashSet<Uuid> = HashSet::new();
+        let filtered = filter_entries_by_repo_map(vec![], &map, &allowed);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_empty_allowed_set_drops_all() {
+        // An empty allowed set must drop everything (the caller passed an
+        // explicit empty allowlist, not None -- different contract).
+        let artifact_a = Uuid::new_v4();
+        let repo_a = Uuid::new_v4();
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let mut map = std::collections::HashMap::new();
+        map.insert(artifact_a, repo_a);
+        let allowed: HashSet<Uuid> = HashSet::new();
+        let filtered = filter_entries_by_repo_map(vec![e1], &map, &allowed);
+        assert!(filtered.is_empty());
+    }
+
+    // --- sort_entries_by_first_detected_desc -------------------------------
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_newest_first() {
+        let now = Utc::now();
+        let old = make_history_entry("CVE-OLD", now - chrono::Duration::days(30));
+        let mid = make_history_entry("CVE-MID", now - chrono::Duration::days(10));
+        let new = make_history_entry("CVE-NEW", now);
+        // Deliberately scrambled.
+        let mut entries = vec![old, new, mid];
+        sort_entries_by_first_detected_desc(&mut entries);
+        assert_eq!(entries[0].cve_id, "CVE-NEW");
+        assert_eq!(entries[1].cve_id, "CVE-MID");
+        assert_eq!(entries[2].cve_id, "CVE-OLD");
+    }
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_empty_input() {
+        let mut entries: Vec<CveHistoryEntry> = vec![];
+        sort_entries_by_first_detected_desc(&mut entries);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_stable_for_equal_timestamps() {
+        let when = Utc::now();
+        let a = make_history_entry("CVE-A", when);
+        let b = make_history_entry("CVE-B", when);
+        let mut entries = vec![a.clone(), b.clone()];
+        sort_entries_by_first_detected_desc(&mut entries);
+        // Both have the same first_detected_at -- the sort is total but the
+        // relative order of equals is preserved by sort_by_key (Rust's slice
+        // sort is stable). Don't rely on which comes first; rely on both
+        // still being present.
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.cve_id == "CVE-A"));
+        assert!(entries.iter().any(|e| e.cve_id == "CVE-B"));
+    }
+
+    // --- end-to-end pipeline check (pure, no DB) ---------------------------
+
+    #[test]
+    fn test_scan_finding_dedupe_then_merge_then_sort() {
+        // Simulate the full read pipeline in `get_cve_history` against an
+        // in-memory dataset: curated rows + scan rows, dedupe by cve_id,
+        // sort newest-first.
+        let now = Utc::now();
+        let artifact = Uuid::new_v4();
+
+        // Curated row (older, "CVE-2019-10744" upper-case).
+        let curated = make_history_entry("CVE-2019-10744", now - chrono::Duration::days(20));
+
+        // Scan rows: one is a case-variant duplicate of the curated CVE
+        // (must be dropped), one is novel (must survive).
+        let dup_row = make_scan_row(
+            artifact,
+            Some("cve-2019-10744"), // lower-case duplicate
+            now - chrono::Duration::days(5),
+            false,
+        );
+        let novel_row = make_scan_row(
+            artifact,
+            Some("CVE-2024-12345"),
+            now - chrono::Duration::days(1),
+            false,
+        );
+
+        // Step 1: known set from curated rows.
+        let known = build_known_cve_set(std::slice::from_ref(&curated));
+        assert_eq!(known.len(), 1);
+
+        // Step 2: apply dedupe filter to scan rows.
+        let scan_rows = vec![dup_row, novel_row];
+        let kept: Vec<_> = scan_rows
+            .into_iter()
+            .filter(|r| scan_row_passes_known_filter(r.cve_id.as_deref(), &known))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "case-insensitive dedupe must drop the lower-case duplicate"
+        );
+        assert_eq!(kept[0].cve_id.as_deref(), Some("CVE-2024-12345"));
+
+        // Step 3: project scan rows to CveHistoryEntry.
+        let mut combined: Vec<CveHistoryEntry> = vec![curated];
+        combined.extend(kept.into_iter().map(scan_finding_to_history_entry));
+
+        // Step 4: sort newest-first.
+        sort_entries_by_first_detected_desc(&mut combined);
+
+        // The novel scan row was detected 1 day ago, the curated row 20
+        // days ago, so the scan row sorts first.
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].cve_id, "CVE-2024-12345");
+        assert_eq!(combined[1].cve_id, "CVE-2019-10744");
+    }
+
+    // -----------------------------------------------------------------------
+    // cve_trends_from_aggregates: pure projection from the count tuple to
+    // the typed `CveTrends` DTO. Round-2 (#1375) extracted this so the
+    // field-by-field mapping is exercised without spinning up Postgres.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cve_trends_from_aggregates_field_mapping() {
+        // Every tuple slot must land in its named DTO field. A swap (e.g.
+        // critical and high crossed) would silently misreport severity
+        // counts on the trends dashboard; pin the mapping explicitly.
+        let trends = cve_trends_from_aggregates(100, 60, 25, 5, 10, 20, 30, 15, vec![]);
+        assert_eq!(trends.total_cves, 100);
+        assert_eq!(trends.open_cves, 60);
+        assert_eq!(trends.acknowledged_cves, 25);
+        assert_eq!(trends.critical_count, 5);
+        assert_eq!(trends.high_count, 10);
+        assert_eq!(trends.medium_count, 20);
+        assert_eq!(trends.low_count, 30);
+        assert_eq!(trends.fixed_cves, 15);
+        // avg_days_to_fix is always None on the scan-findings path.
+        assert!(trends.avg_days_to_fix.is_none());
+        assert!(trends.timeline.is_empty());
+        // #1446: alias fields must mirror their *_count / *_cves counterparts
+        // so the security-tests `cve-history` trends-shape probe sees a
+        // recognized aggregate (`.total`, `.critical`, `.high`, ...).
+        assert_eq!(trends.total, 100);
+        assert_eq!(trends.critical, 5);
+        assert_eq!(trends.high, 10);
+        assert_eq!(trends.medium, 20);
+        assert_eq!(trends.low, 30);
+    }
+
+    #[test]
+    fn test_cve_trends_serializes_alias_fields() {
+        // #1446: the JSON body must surface `total`, `critical`, `high`,
+        // `medium`, `low` alongside the original `total_cves`,
+        // `critical_count`, ... keys. The security-tests probe accepts ANY
+        // of `.total // .count // .critical // .high` as a recognized
+        // aggregate; we pin both shapes so future refactors can't break it.
+        let trends = cve_trends_from_aggregates(7, 3, 1, 2, 3, 1, 0, 4, vec![]);
+        let json = serde_json::to_value(&trends).expect("serialize CveTrends");
+        // Original keys retained.
+        assert_eq!(json["total_cves"], 7);
+        assert_eq!(json["critical_count"], 2);
+        assert_eq!(json["high_count"], 3);
+        // Alias keys added.
+        assert_eq!(json["total"], 7);
+        assert_eq!(json["critical"], 2);
+        assert_eq!(json["high"], 3);
+        assert_eq!(json["medium"], 1);
+        assert_eq!(json["low"], 0);
+    }
+
+    #[test]
+    fn test_cve_trends_from_aggregates_avg_days_to_fix_always_none() {
+        // scan_findings has no fixed-at timestamp; the contract is that
+        // this field stays None regardless of how many fixed CVEs there
+        // are. Pin it so a future refactor cannot silently start filling
+        // it with bogus zeros.
+        let trends = cve_trends_from_aggregates(10, 5, 2, 1, 1, 1, 1, 3, vec![]);
+        assert!(trends.avg_days_to_fix.is_none(), "must be None always");
+    }
+
+    #[test]
+    fn test_cve_trends_from_aggregates_timeline_passes_through() {
+        // Timeline is moved through unchanged; ensure the projection does
+        // not reorder or drop entries.
+        let now = Utc::now();
+        let t1 = CveTimelineEntry {
+            cve_id: "CVE-2024-1".to_string(),
+            severity: "high".to_string(),
+            affected_component: "lodash".to_string(),
+            cve_published_at: None,
+            first_detected_at: now,
+            status: CveStatus::Open,
+            days_exposed: 7,
+        };
+        let t2 = CveTimelineEntry {
+            cve_id: "CVE-2024-2".to_string(),
+            severity: "critical".to_string(),
+            affected_component: "express".to_string(),
+            cve_published_at: None,
+            first_detected_at: now,
+            status: CveStatus::Acknowledged,
+            days_exposed: 1,
+        };
+        let trends = cve_trends_from_aggregates(2, 1, 1, 1, 1, 0, 0, 0, vec![t1, t2]);
+        assert_eq!(trends.timeline.len(), 2);
+        assert_eq!(trends.timeline[0].cve_id, "CVE-2024-1");
+        assert_eq!(trends.timeline[1].cve_id, "CVE-2024-2");
+    }
+
+    #[test]
+    fn test_cve_trends_from_aggregates_all_zero_input() {
+        // Pre-#1375 every fresh deployment returned all-zero counts
+        // because `cve_history` was empty. Now that the read paths derive
+        // from `scan_findings`, the zero-zero case still has to project
+        // cleanly when nothing has been scanned yet.
+        let trends = cve_trends_from_aggregates(0, 0, 0, 0, 0, 0, 0, 0, vec![]);
+        assert_eq!(trends.total_cves, 0);
+        assert_eq!(trends.open_cves, 0);
+        assert_eq!(trends.critical_count, 0);
+        assert!(trends.timeline.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // project_timeline_rows: read-side helper that maps scan rows to typed
+    // `CveTimelineEntry` DTOs. Pure (no DB, no clock side-effect — `now`
+    // is injected).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_project_timeline_rows_empty_input() {
+        let now = Utc::now();
+        let result = project_timeline_rows(&[], now);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_project_timeline_rows_preserves_order() {
+        let now = Utc::now();
+        let r1 = make_scan_row(
+            Uuid::new_v4(),
+            Some("CVE-2024-1"),
+            now - chrono::Duration::days(2),
+            false,
+        );
+        let r2 = make_scan_row(
+            Uuid::new_v4(),
+            Some("CVE-2024-2"),
+            now - chrono::Duration::days(5),
+            false,
+        );
+        let result = project_timeline_rows(&[r1, r2], now);
+        assert_eq!(result.len(), 2);
+        // Order is preserved (the SQL already orders DESC by detection
+        // date; the projection must not re-sort or it would shuffle the
+        // dashboard).
+        assert_eq!(result[0].cve_id, "CVE-2024-1");
+        assert_eq!(result[1].cve_id, "CVE-2024-2");
+        assert_eq!(result[0].days_exposed, 2);
+        assert_eq!(result[1].days_exposed, 5);
+    }
+
+    #[test]
+    fn test_project_timeline_rows_acknowledged_flag_propagates() {
+        // The acknowledged status must come through unchanged so the
+        // dashboard can colour-code acknowledged-vs-open differently.
+        let now = Utc::now();
+        let ack_row = make_scan_row(Uuid::new_v4(), Some("CVE-A"), now, true);
+        let open_row = make_scan_row(Uuid::new_v4(), Some("CVE-B"), now, false);
+        let result = project_timeline_rows(&[ack_row, open_row], now);
+        assert_eq!(result[0].status, CveStatus::Acknowledged);
+        assert_eq!(result[1].status, CveStatus::Open);
+    }
+
+    // -----------------------------------------------------------------------
+    // project_scan_rows_to_entries: combined filter + map pipeline that
+    // backs `build_cve_entries_from_scan_findings`. The async wrapper just
+    // runs the SQL and delegates here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_project_scan_rows_to_entries_drops_known_uppercase() {
+        let when = Utc::now();
+        let artifact = Uuid::new_v4();
+        let dup = make_scan_row(artifact, Some("CVE-2019-10744"), when, false);
+        let novel = make_scan_row(artifact, Some("CVE-2024-12345"), when, false);
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        let entries = project_scan_rows_to_entries(vec![dup, novel], &known);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cve_id, "CVE-2024-12345");
+    }
+
+    #[test]
+    fn test_project_scan_rows_to_entries_drops_known_case_insensitive() {
+        // The scanner could write `cve-2019-10744` (lower) while the
+        // curated row is upper-case; the dedupe must still hide the
+        // duplicate.
+        let when = Utc::now();
+        let dup = make_scan_row(Uuid::new_v4(), Some("cve-2019-10744"), when, false);
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        let entries = project_scan_rows_to_entries(vec![dup], &known);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_project_scan_rows_to_entries_drops_null_cve_id() {
+        // Defensive: scanner row with NULL cve_id must not become a
+        // synthetic entry with empty id (the upstream WHERE clause should
+        // also reject it, but pin the second-line check here).
+        let when = Utc::now();
+        let row = make_scan_row(Uuid::new_v4(), None, when, false);
+        let known: HashSet<String> = HashSet::new();
+        let entries = project_scan_rows_to_entries(vec![row], &known);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_project_scan_rows_to_entries_keeps_novel_when_known_empty() {
+        // No curated rows means no dedupe; everything passes through.
+        let when = Utc::now();
+        let r1 = make_scan_row(Uuid::new_v4(), Some("CVE-2024-1"), when, false);
+        let r2 = make_scan_row(Uuid::new_v4(), Some("CVE-2024-2"), when, false);
+        let known: HashSet<String> = HashSet::new();
+        let entries = project_scan_rows_to_entries(vec![r1, r2], &known);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_project_scan_rows_to_entries_synthesizes_ids() {
+        // Synthetic id derives from (artifact_id, cve_id) -- two scans on
+        // the same pair must produce the same id so client-side dedupe
+        // works.
+        let when = Utc::now();
+        let artifact = Uuid::new_v4();
+        let r1 = make_scan_row(artifact, Some("CVE-2024-99"), when, false);
+        let r2 = make_scan_row(artifact, Some("CVE-2024-99"), when, false);
+        let entries_first = project_scan_rows_to_entries(vec![r1], &HashSet::new());
+        let entries_second = project_scan_rows_to_entries(vec![r2], &HashSet::new());
+        assert_eq!(entries_first[0].id, entries_second[0].id);
+        assert_eq!(entries_first[0].id, synth_cve_id(artifact, "CVE-2024-99"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SQL constants: lexical assertions over the query text. These pin the
+    // ranked-CASE table to the values that `severity_rank` /
+    // `severity_from_rank` translate, and pin the WHERE clauses that
+    // enforce the multi-scanner / soft-delete / null-cve invariants. If
+    // the SQL drifts the lex bug (#1375) reopens silently because the
+    // shape would still typecheck.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_findings_by_artifact_sql_uses_ranked_case() {
+        // The ranked CASE must list all four labels in the order Rust's
+        // `severity_rank` expects (critical=4, high=3, medium=2, low=1).
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("WHEN 'critical' THEN 4"));
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("WHEN 'high' THEN 3"));
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("WHEN 'medium' THEN 2"));
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("WHEN 'low' THEN 1"));
+        // ELSE 0 catches NULL / "info" / "unknown" so they never outrank a
+        // real severity.
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("ELSE 0"));
+    }
+
+    #[test]
+    fn test_scan_findings_by_artifact_sql_uses_lower_severity() {
+        // Scanner output is case-inconsistent (Trivy: HIGH, Grype: High,
+        // OSV: high). The SQL must LOWER the column before matching the
+        // CASE labels.
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("CASE LOWER(severity)"));
+    }
+
+    #[test]
+    fn test_scan_findings_by_artifact_sql_groups_by_artifact_and_cve() {
+        // The aggregate key must be (artifact_id, cve_id) -- grouping by
+        // just one of them would either collapse distinct CVEs together
+        // or split a single CVE across rows.
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("GROUP BY artifact_id, cve_id"));
+    }
+
+    #[test]
+    fn test_scan_findings_by_artifact_sql_filters_null_cve_ids() {
+        // NULL cve_id rows are non-CVE findings (license violations,
+        // policy hits) and must not be projected into the CVE history.
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("cve_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn test_scan_findings_by_cve_sql_case_insensitive_match() {
+        // Caller may pass either case; the WHERE clause normalizes both
+        // sides via LOWER() so the schema's lack of case constraint never
+        // surfaces as a missed lookup.
+        assert!(SCAN_FINDINGS_BY_CVE_SQL.contains("LOWER(cve_id) = LOWER($1)"));
+    }
+
+    #[test]
+    fn test_scan_findings_sql_severity_ranks_match_rust() {
+        // The four rank constants in the SQL CASE must match the integer
+        // ranks the Rust `severity_rank` function returns; if they ever
+        // drift the lex-MAX regression reopens.
+        for (label, rank) in [("critical", 4), ("high", 3), ("medium", 2), ("low", 1)] {
+            assert_eq!(severity_rank(label), rank);
+            assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains(&format!("WHEN '{label}' THEN {rank}")));
+            assert!(SCAN_FINDINGS_BY_CVE_SQL.contains(&format!("WHEN '{label}' THEN {rank}")));
+            assert_eq!(severity_from_rank(rank), Some(label));
+        }
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_sql_uses_per_cve_cte() {
+        // Counts must come from a per-CVE CTE so multi-scanner overlap
+        // does not double-count.
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("WITH per_cve AS"));
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("GROUP BY sf.artifact_id, sf.cve_id"));
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_sql_filters_deleted_artifacts() {
+        // A soft-deleted artifact must not contribute to the open count.
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("NOT a.is_deleted"));
+        assert!(CVE_TRENDS_COUNTS_ALL_SQL.contains("NOT a.is_deleted"));
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_sql_emits_named_columns_in_tuple_order() {
+        // The outer SELECT in the counts CTE projects exactly seven
+        // columns in this order: total, open, acknowledged, critical,
+        // high, medium, low. The async caller destructures into a 7-i64
+        // tuple, so any column reorder here would silently swap the
+        // counts on the trends dashboard.
+        let columns = [
+            "AS total",
+            "AS open",
+            "AS acknowledged",
+            "AS critical",
+            "AS high",
+            "AS medium",
+            "AS low",
+        ];
+        for c in columns {
+            assert!(
+                CVE_TRENDS_COUNTS_REPO_SQL.contains(c),
+                "counts SQL missing column alias: {c}"
+            );
+            assert!(
+                CVE_TRENDS_COUNTS_ALL_SQL.contains(c),
+                "counts SQL missing column alias: {c}"
+            );
+        }
+        // Order: total appears before open before acknowledged.
+        let p_total = CVE_TRENDS_COUNTS_REPO_SQL.find("AS total").unwrap();
+        let p_open = CVE_TRENDS_COUNTS_REPO_SQL.find("AS open").unwrap();
+        let p_ack = CVE_TRENDS_COUNTS_REPO_SQL.find("AS acknowledged").unwrap();
+        let p_crit = CVE_TRENDS_COUNTS_REPO_SQL.find("AS critical").unwrap();
+        let p_low = CVE_TRENDS_COUNTS_REPO_SQL.find("AS low").unwrap();
+        assert!(p_total < p_open);
+        assert!(p_open < p_ack);
+        assert!(p_ack < p_crit);
+        assert!(p_crit < p_low);
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_uses_filter_clauses() {
+        // Each severity count is gated by a FILTER (WHERE severity_rank
+        // = N) -- losing the FILTER would turn each count into the total.
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 4)"));
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 3)"));
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 2)"));
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 1)"));
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_uses_bool_and_for_ack() {
+        // `acknowledged` only counts when EVERY scan_findings row for the
+        // (artifact, cve) pair is acknowledged -- otherwise a single
+        // unacknowledged scanner would silently mark it acked.
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("BOOL_AND(sf.is_acknowledged)"));
+    }
+
+    #[test]
+    fn test_cve_trends_counts_repo_scopes_by_repository_id() {
+        // The repo-scoped variant must bind $1 to a.repository_id; the
+        // all-repos variant must omit it. Pin both halves so a copy-paste
+        // could not collapse them.
+        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("a.repository_id = $1"));
+        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.contains("a.repository_id ="));
+    }
+
+    #[test]
+    fn test_cve_trends_timeline_repo_sql_30_day_window() {
+        // The timeline is "newly-detected in the last 30 days"; the
+        // INTERVAL must be present in both variants or the dashboard
+        // grows unbounded over time.
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("INTERVAL '30 days'"));
+        assert!(CVE_TRENDS_TIMELINE_ALL_SQL.contains("INTERVAL '30 days'"));
+    }
+
+    #[test]
+    fn test_cve_trends_timeline_repo_sql_limit_100() {
+        // The timeline is capped at 100 newly-detected CVEs so a
+        // pathological recent scan does not blow up the JSON response.
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("LIMIT 100"));
+        assert!(CVE_TRENDS_TIMELINE_ALL_SQL.contains("LIMIT 100"));
+    }
+
+    #[test]
+    fn test_cve_trends_timeline_repo_sql_orders_by_min_created_at_desc() {
+        // Newest detection first; matching the in-memory
+        // `sort_entries_by_first_detected_desc` semantics.
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("ORDER BY MIN(sf.created_at) DESC"));
+        assert!(CVE_TRENDS_TIMELINE_ALL_SQL.contains("ORDER BY MIN(sf.created_at) DESC"));
+    }
+
+    #[test]
+    fn test_cve_trends_timeline_repo_sql_inverse_case_to_label() {
+        // The outer SELECT translates `severity_rank` back to the string
+        // label so the timeline DTO carries text severity, not a numeric
+        // rank. Inverse of the inner ranked CASE.
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("WHEN 4 THEN 'critical'"));
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("WHEN 3 THEN 'high'"));
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("WHEN 2 THEN 'medium'"));
+        assert!(CVE_TRENDS_TIMELINE_REPO_SQL.contains("WHEN 1 THEN 'low'"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_unions_curated_and_disappeared() {
+        // fixed = curated_fixed UNION disappeared (dedup by artifact_id +
+        // cve_id). Losing either CTE would silently zero one of the two
+        // signals.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("WITH curated_fixed AS"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("latest_scans AS"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ever_seen AS"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("still_present AS"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("disappeared AS"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM curated_fixed"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("UNION"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM disappeared"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_uses_except_for_disappeared() {
+        // disappeared = ever_seen EXCEPT still_present. Replacing EXCEPT
+        // with MINUS or NOT IN would change the semantics on edge cases.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("EXCEPT"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("EXCEPT"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_uses_distinct_on_latest_scans() {
+        // The latest_scans CTE is keyed (artifact_id, scan_type); without
+        // DISTINCT ON the join would multiply rows when an artifact had
+        // multiple completed scans.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("DISTINCT ON (sr.artifact_id, sr.scan_type)"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("DISTINCT ON (sr.artifact_id, sr.scan_type)"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_completed_scans_only() {
+        // A failed / cancelled / running scan must not count as evidence
+        // that a CVE disappeared.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("sr.status = 'completed'"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("sr.status = 'completed'"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_curated_fixed_uses_status_fixed() {
+        // Curated fixed rows must filter by status='fixed', not by the
+        // acknowledged column (a different semantic).
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ch.status = 'fixed'"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("ch.status = 'fixed'"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_all_drops_repository_filter() {
+        // All-repos variant must NOT scope by repository_id; otherwise
+        // admin callers would silently get a partial count.
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.contains("a.repository_id"));
+    }
+
+    #[test]
+    fn test_fixed_cves_count_repo_sql_lowercases_cve_id() {
+        // The dedupe is on LOWER(cve_id) so the curated and scan paths
+        // collide regardless of how each side cased the id.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(ch.cve_id)"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(sf.cve_id)"));
+    }
+
+    #[test]
+    fn test_all_sql_constants_are_nonempty() {
+        // Defensive sanity check: a refactor that accidentally blanked a
+        // const would still typecheck and the async caller would issue
+        // an empty query against Postgres.
+        assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.trim().is_empty());
+        assert!(!SCAN_FINDINGS_BY_CVE_SQL.trim().is_empty());
+        assert!(!CVE_TRENDS_COUNTS_REPO_SQL.trim().is_empty());
+        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.trim().is_empty());
+        assert!(!CVE_TRENDS_TIMELINE_REPO_SQL.trim().is_empty());
+        assert!(!CVE_TRENDS_TIMELINE_ALL_SQL.trim().is_empty());
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.trim().is_empty());
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.trim().is_empty());
+    }
+
+    #[test]
+    fn test_scan_findings_sql_variants_differ_only_by_where_clause() {
+        // The two scan_findings variants share the same outer projection
+        // and the same ranked CASE; the only difference is the WHERE
+        // clause. Pin this so a future copy-paste cannot accidentally
+        // diverge the severity ranks on one branch.
+        assert!(SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("WHERE artifact_id = $1"));
+        assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("LOWER(cve_id) = LOWER($1)"));
+        assert!(SCAN_FINDINGS_BY_CVE_SQL.contains("LOWER(cve_id) = LOWER($1)"));
+        assert!(!SCAN_FINDINGS_BY_CVE_SQL.contains("WHERE artifact_id = $1"));
+    }
+
+    #[test]
+    fn test_cve_trends_repo_and_all_sql_severity_ranks_align() {
+        // Both variants of the counts CTE must use the same ranked CASE;
+        // a drift would silently misreport severities on the all-repos
+        // dashboard vs the per-repo one.
+        for label_then in [
+            "WHEN 'critical' THEN 4",
+            "WHEN 'high' THEN 3",
+            "WHEN 'medium' THEN 2",
+            "WHEN 'low' THEN 1",
+        ] {
+            assert!(
+                CVE_TRENDS_COUNTS_REPO_SQL.contains(label_then),
+                "repo SQL missing rank clause: {label_then}"
+            );
+            assert!(
+                CVE_TRENDS_COUNTS_ALL_SQL.contains(label_then),
+                "all-repos SQL missing rank clause: {label_then}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // update_cve_status_by_artifact_cve (#1426)
+    //
+    // DB-backed coverage for the synth-id acknowledge path. These tests
+    // require a live `DATABASE_URL` (provided by CI's coverage job, which
+    // seeds Postgres + applies migrations before `cargo llvm-cov --lib`).
+    // Locally they no-op when `DATABASE_URL` is unset, so `cargo test --lib`
+    // stays green without Postgres.
+    //
+    // What we cover:
+    //   * Happy path Acknowledged: writes `is_acknowledged = true`,
+    //     populates the audit fields, and re-reads the synth aggregate.
+    //   * Happy path FalsePositive: collapses to `true` on `scan_findings`
+    //     (the table has no separate column), reason field carries the
+    //     audit distinction.
+    //   * Happy path Open: clears acknowledgement back to false and nulls
+    //     the audit fields (mirror of the revoke endpoint).
+    //   * Validation: `Fixed` is unrepresentable on `scan_findings`, so the
+    //     service surfaces `AppError::Validation` rather than silently
+    //     coercing.
+    //   * Not-found: no matching `scan_findings` rows for (artifact, cve)
+    //     produces `AppError::NotFound` (handler maps that to 404).
+    //   * Case-insensitive CVE match: lower/upper-case CVE strings on
+    //     either side of the comparison must still find the row.
+    //   * Multi-row aggregate: when two findings share (artifact, cve), the
+    //     update touches both, the post-write aggregate uses MIN/MAX of
+    //     detection timestamps, and `all_acknowledged` reflects both rows.
+    // -----------------------------------------------------------------------
+
+    /// Connect to the test database when `DATABASE_URL` is set; otherwise
+    /// return `None` so the test skips cleanly.
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    /// Seed a repository row with a unique key/storage path.
+    async fn seed_repo(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("sbom-cve-test-{}", id);
+        let storage = format!("/tmp/sbom-cve-test/{}", id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local', 'generic')",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(&storage)
+        .execute(pool)
+        .await
+        .expect("seed repository");
+        id
+    }
+
+    /// Seed an artifact row. `name` is uniquified to avoid (repository_id,
+    /// path) collisions across parallel test runs.
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{}/{}", repo_id, id);
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, repository_id, name, path, version,
+                                   size_bytes, checksum_sha256, content_type,
+                                   storage_key, is_deleted)
+            VALUES ($1, $2, $3, $4, '1.0.0', 1024, $5,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("a-{}", id))
+        .bind(&path)
+        .bind(format!("sha256-{}", id))
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+        id
+    }
+
+    /// Seed a completed scan_results row tied to (artifact, repo). Returns
+    /// the scan_result id so the caller can attach scan_findings to it.
+    async fn seed_scan_result(pool: &PgPool, artifact_id: Uuid, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (id, artifact_id, repository_id, scan_type,
+                                      status, findings_count, started_at,
+                                      completed_at)
+            VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW())
+            "#,
+        )
+        .bind(id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_result");
+        id
+    }
+
+    /// Seed an unacknowledged scan_findings row carrying the given CVE id.
+    async fn seed_finding(
+        pool: &PgPool,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        cve_id: &str,
+        severity: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_findings (id, scan_result_id, artifact_id, severity,
+                                       title, cve_id, source, is_acknowledged)
+            VALUES ($1, $2, $3, $4, $5, $6, 'trivy', false)
+            "#,
+        )
+        .bind(id)
+        .bind(scan_result_id)
+        .bind(artifact_id)
+        .bind(severity)
+        .bind(format!("Test finding for {}", cve_id))
+        .bind(cve_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_finding");
+        id
+    }
+
+    /// Drop everything owned by the given repo so tests don't leak state.
+    async fn teardown(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Read back is_acknowledged + audit fields for one (artifact, cve)
+    /// scan_findings row. Returns `None` when no row matches.
+    async fn read_ack(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        cve_id: &str,
+    ) -> Option<(bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)> {
+        sqlx::query_as::<_, (bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at \
+             FROM scan_findings \
+             WHERE artifact_id = $1 AND LOWER(cve_id) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(artifact_id)
+        .bind(cve_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read_ack")
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_acknowledged_sets_flag_and_audit_fields() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        let _finding = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-1111", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-1111",
+                CveStatus::Acknowledged,
+                None,
+                Some("triaged: not exploitable"),
+            )
+            .await
+            .expect("acknowledge happy path");
+
+        // The response carries the synth aggregate shape: the cve_id is
+        // surfaced upper-case (the read path normalizes) and the
+        // post-write `status` reflects all_acknowledged = true.
+        assert_eq!(entry.cve_id.to_ascii_uppercase(), "CVE-2024-1111");
+        assert_eq!(entry.status, "acknowledged");
+        assert_eq!(entry.artifact_id, artifact_id);
+
+        // The underlying scan_findings row must carry the flag + audit
+        // payload the handler wrote.
+        let (ack, _by, reason, at) = read_ack(&pool, artifact_id, "CVE-2024-1111")
+            .await
+            .expect("finding row still present");
+        assert!(ack, "is_acknowledged must be true after Acknowledged");
+        assert_eq!(reason.as_deref(), Some("triaged: not exploitable"));
+        assert!(at.is_some(), "acknowledged_at must be set");
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_false_positive_collapses_to_acknowledged() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-2222", "medium").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-2222",
+                CveStatus::FalsePositive,
+                None,
+                Some("false positive: code path not reachable"),
+            )
+            .await
+            .expect("false_positive happy path");
+
+        // scan_findings has no separate FP column, so the synth row's
+        // status collapses to "acknowledged"; the reason field carries
+        // the audit distinction.
+        assert_eq!(entry.status, "acknowledged");
+
+        let (ack, _by, reason, _at) = read_ack(&pool, artifact_id, "CVE-2024-2222")
+            .await
+            .expect("finding row still present");
+        assert!(ack);
+        assert_eq!(
+            reason.as_deref(),
+            Some("false positive: code path not reachable")
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_open_revokes_acknowledgement() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        let finding_id = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-3333", "low").await;
+
+        // Pre-acknowledge so we can verify Open clears the state.
+        sqlx::query(
+            "UPDATE scan_findings SET is_acknowledged = true, \
+             acknowledged_reason = 'pre-ack', acknowledged_at = NOW() WHERE id = $1",
+        )
+        .bind(finding_id)
+        .execute(&pool)
+        .await
+        .expect("pre-acknowledge");
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-3333",
+                CveStatus::Open,
+                None,
+                None,
+            )
+            .await
+            .expect("open happy path");
+
+        assert_eq!(entry.status, "open");
+
+        let (ack, by, reason, at) = read_ack(&pool, artifact_id, "CVE-2024-3333")
+            .await
+            .expect("finding row still present");
+        assert!(!ack, "is_acknowledged must be false after Open");
+        assert!(
+            by.is_none() && reason.is_none() && at.is_none(),
+            "audit fields must be cleared after Open"
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_fixed_returns_validation_error() {
+        // `Fixed` has no representation on scan_findings. The service must
+        // surface AppError::Validation rather than silently coerce
+        // is_acknowledged = true (which would hide the finding from the
+        // Security tab and mislead operators).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-4444", "critical").await;
+
+        let service = SbomService::new(pool.clone());
+        let err = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-4444",
+                CveStatus::Fixed,
+                None,
+                None,
+            )
+            .await
+            .expect_err("fixed must be rejected");
+
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("fixed"),
+                    "validation message must mention 'fixed': {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+
+        // And the row must remain untouched (no silent coercion).
+        let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-4444")
+            .await
+            .expect("finding row still present");
+        assert!(
+            !ack,
+            "scan_findings.is_acknowledged must NOT change on Fixed rejection"
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_no_matching_rows_returns_not_found() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        // Seed a finding for a DIFFERENT CVE so the artifact has scans but
+        // the (artifact, cve) pair the caller asks about has no rows.
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-5555", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let err = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-9999",
+                CveStatus::Acknowledged,
+                None,
+                Some("won't match"),
+            )
+            .await
+            .expect_err("no matching rows must 404");
+
+        match err {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("CVE-2024-9999"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_match_is_case_insensitive() {
+        // Synth ids returned by the read path are upper-case but scanners
+        // sometimes emit mixed case. The UPDATE must lower-case both sides
+        // so a click on the Security tab still lands on the right row.
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "cve-2024-6666", "medium").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-6666",
+                CveStatus::Acknowledged,
+                None,
+                Some("case-insensitive match"),
+            )
+            .await
+            .expect("case-insensitive match must succeed");
+
+        assert_eq!(entry.status, "acknowledged");
+
+        let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-6666")
+            .await
+            .expect("finding row still present");
+        assert!(ack);
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_by_artifact_cve_updates_all_matching_findings() {
+        // Two scan_findings rows can share (artifact, cve) when the same
+        // CVE surfaces from multiple scans or multiple components. The
+        // UPDATE has no LIMIT, so both rows must flip and the synth
+        // aggregate's `all_acknowledged` flag must reflect that.
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-7777", "critical").await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-7777", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let entry = service
+            .update_cve_status_by_artifact_cve(
+                artifact_id,
+                "CVE-2024-7777",
+                CveStatus::Acknowledged,
+                None,
+                Some("ack both rows"),
+            )
+            .await
+            .expect("multi-row acknowledge");
+
+        // The aggregate must collapse to "acknowledged" only if BOTH rows
+        // are acknowledged (BOOL_AND semantics). The service uses an
+        // unbounded UPDATE, so this is the regression assertion.
+        assert_eq!(entry.status, "acknowledged");
+
+        // Direct count verification: both rows must be ack'd.
+        let acked: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scan_findings \
+             WHERE artifact_id = $1 AND cve_id = $2 AND is_acknowledged = true",
+        )
+        .bind(artifact_id)
+        .bind("CVE-2024-7777")
+        .fetch_one(&pool)
+        .await
+        .expect("count acked rows");
+        assert_eq!(acked.0, 2, "both scan_findings rows must be acknowledged");
+
+        teardown(&pool, repo_id).await;
     }
 }

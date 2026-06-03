@@ -90,6 +90,27 @@ pub struct ScoreResponse {
 pub struct TriggerScanRequest {
     pub artifact_id: Option<Uuid>,
     pub repository_id: Option<Uuid>,
+    /// Skip the hash-based scan dedup short-circuit when running this scan.
+    ///
+    /// Defaults to `false`. Normal trigger calls dedup against prior
+    /// completed scans for the same checksum + scan_type so a freshly
+    /// uploaded byte-identical artifact reuses the existing result instead
+    /// of re-running the scanner. When `true`, that dedup is skipped: the
+    /// scanner runs against the bytes again and writes a fresh
+    /// `scan_results` row. Use this to recover from a silently-broken
+    /// prior scan (e.g. an extraction bug producing a completed,
+    /// zero-finding row that masks the real findings until the dedup TTL
+    /// expires; see #1469). Costs an extra scan run, so leave it unset
+    /// for routine trigger calls.
+    ///
+    /// **Admin only.** Setting this to `true` bypasses the dedup short-
+    /// circuit and fans out unbounded scanner work per artifact. The
+    /// `trigger_scan` handler rejects this field with 403 for non-admin
+    /// callers, since a non-admin force-rescan path would be a DoS
+    /// amplifier (the pre-existing `force=true` was naturally rate-limited
+    /// by dedup; `bypass_dedup` removes that safety).
+    #[serde(default)]
+    pub bypass_dedup: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -165,8 +186,22 @@ impl ScanResponse {
         artifact_name: Option<String>,
         artifact_version: Option<String>,
     ) -> Self {
+        // #1373 / B13: a reused row (cross-artifact dedup) is a thin pointer at
+        // a source scan that holds the real findings. Report the SOURCE scan id
+        // as this row's `id` so that two byte-identical artifacts surface the
+        // SAME logical scan_id to clients. The release-gate `scan-dedup-checksum`
+        // suite asserts exactly this: triggering a scan on a byte-identical
+        // second artifact must resolve to the same scan_id as the first. The
+        // row's own (placeholder) id is internal bookkeeping; clients that need
+        // the findings hit `GET /security/scans/{id}` which works against the
+        // source id because the findings live there. `source_scan_id` is still
+        // exposed verbatim below for provenance.
+        let reported_id = match (s.is_reused, s.source_scan_id) {
+            (true, Some(source_id)) => source_id,
+            _ => s.id,
+        };
         Self {
-            id: s.id,
+            id: reported_id,
             artifact_id: s.artifact_id,
             artifact_name,
             artifact_version,
@@ -350,17 +385,40 @@ pub struct CreatePolicyRequest {
     pub require_signature: bool,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Partial-update payload for `PUT /security/policies/{id}`.
+///
+/// Every field is `Option<T>` so clients can send any subset of mutable
+/// columns; omitted fields leave the existing row value untouched. The
+/// previous shape required all of `name`, `max_severity`, `block_unscanned`,
+/// `block_on_fail`, `is_enabled` on every call. That was incompatible with
+/// the release-gate `scan-policy-crud` test (and external callers) which
+/// PATCH a subset like `{max_severity, is_enabled}`; under the strict shape
+/// the request was rejected as a 422 and the boolean toggle silently never
+/// took effect on a follow-up GET. See #1374.
+///
+/// For `min_staging_hours` / `max_artifact_age_days` the field is the inner
+/// nullable `i32`; "not provided" leaves the column untouched. Explicit
+/// `null` to clear those columns is not currently supported; the release
+/// gate only mutates the bool/enum fields, so the narrower semantics are
+/// sufficient and we avoid an ambiguous JSON contract.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdatePolicyRequest {
-    pub name: String,
-    pub max_severity: String,
-    pub block_unscanned: bool,
-    pub block_on_fail: bool,
-    pub is_enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub max_severity: Option<String>,
+    #[serde(default)]
+    pub block_unscanned: Option<bool>,
+    #[serde(default)]
+    pub block_on_fail: Option<bool>,
+    #[serde(default)]
+    pub is_enabled: Option<bool>,
+    #[serde(default)]
     pub min_staging_hours: Option<i32>,
+    #[serde(default)]
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
-    pub require_signature: bool,
+    pub require_signature: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -500,13 +558,14 @@ async fn list_scan_configs(
     responses(
         (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "bypass_dedup requested by non-admin caller", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn trigger_scan(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
     // 503 (not 500) because "scanner not configured" is a normal operational
@@ -518,19 +577,44 @@ async fn trigger_scan(
         .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
+    let bypass_dedup = body.bypass_dedup.unwrap_or(false);
+
+    // `bypass_dedup = true` skips the hash-based scan dedup short-circuit and
+    // fans out a fresh scanner run per artifact (and, at the repo level, one
+    // tokio::spawn worker per artifact in the repo). The pre-existing
+    // `force = true` path was naturally rate-limited because dedup would
+    // collapse repeated calls against the same checksum into a single cached
+    // result; `bypass_dedup` removes that safety. Gating on admin scope
+    // matches the inventory-backfill path in admin.rs which also touches
+    // every artifact in a repository (see issue #1469 review feedback).
+    if bypass_dedup && !auth.is_admin {
+        return Err(AppError::Authorization(
+            "bypass_dedup requires admin privileges".to_string(),
+        ));
+    }
+
     if let Some(artifact_id) = body.artifact_id {
         // Pre-allocate one scan_result row per configured scanner so the IDs
         // can be returned in this response. The actual scan work is still
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
         // instead of inserting new rows. See artifact-keeper#906.
-        let prepared = scanner.prepare_artifact_scan(artifact_id, true).await?;
+        //
+        // `bypass_dedup` (#1469) must be passed to BOTH prepare and execute:
+        // prepare needs it so the same-artifact short-circuit doesn't return
+        // the stale completed row's id (which would leave the worker with
+        // nothing to do); execute needs it so the cross-artifact reuse path
+        // doesn't copy the same stale row into a new `is_reused = true` row
+        // for the newly-allocated placeholder.
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, bypass_dedup)
+            .await?;
         let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
         let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
             if let Err(e) = scanner_for_spawn
-                .scan_artifact_with_prepared(artifact_id, prepared_map, true)
+                .scan_artifact_with_prepared(artifact_id, prepared_map, true, bypass_dedup)
                 .await
             {
                 tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
@@ -557,7 +641,7 @@ async fn trigger_scan(
 
     tokio::spawn(async move {
         if let Err(e) = scanner
-            .scan_repository_with_options(repository_id, true)
+            .scan_repository_with_options(repository_id, true, bypass_dedup)
             .await
         {
             tracing::error!("Repository scan failed for {}: {}", repository_id, e);
@@ -857,11 +941,13 @@ async fn update_policy(
     Json(body): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
     let svc = PolicyService::new(state.db.clone());
+    // PUT is partial-update friendly: any field client omits is left at its
+    // current DB value via COALESCE in the service layer. See #1374.
     let p = svc
         .update_policy(
             id,
-            &body.name,
-            &body.max_severity,
+            body.name.as_deref(),
+            body.max_severity.as_deref(),
             body.block_unscanned,
             body.block_on_fail,
             body.is_enabled,
@@ -1459,6 +1545,60 @@ mod tests {
         assert_eq!(json["source_scan_id"], source_id.to_string());
     }
 
+    /// B13 / #1373: a reused row must report the SOURCE scan id as its `id`
+    /// so two byte-identical artifacts surface the same logical scan_id. The
+    /// release-gate `scan-dedup-checksum` suite reads `.items[0].id` from each
+    /// artifact's `/scans` list and asserts they are equal. Before this fix the
+    /// reused row reported its own placeholder id, so the ids differed and the
+    /// assertion failed.
+    #[test]
+    fn test_scan_response_reused_row_reports_source_scan_id_as_id() {
+        let placeholder_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let scan = ScanResult {
+            id: placeholder_id,
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            scan_type: "trivy".to_string(),
+            status: "completed".to_string(),
+            findings_count: 3,
+            critical_count: 1,
+            high_count: 1,
+            medium_count: 1,
+            low_count: 0,
+            info_count: 0,
+            scanner_version: None,
+            error_message: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            is_reused: true,
+            source_scan_id: Some(source_id),
+        };
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(
+            resp.id, source_id,
+            "reused row must report the source scan id as its id (B13)"
+        );
+        // provenance is still exposed verbatim.
+        assert_eq!(resp.source_scan_id, Some(source_id));
+        assert!(resp.is_reused);
+    }
+
+    /// A reused row with `source_scan_id == None` (should not happen in
+    /// practice, but guard against a partial write) falls back to its own id
+    /// rather than panicking or emitting a nil UUID.
+    #[test]
+    fn test_scan_response_reused_without_source_falls_back_to_own_id() {
+        let own_id = Uuid::new_v4();
+        let mut scan = make_scan_result();
+        scan.id = own_id;
+        scan.is_reused = true;
+        scan.source_scan_id = None;
+        let resp = scan_result_to_response(scan, None, None);
+        assert_eq!(resp.id, own_id);
+    }
+
     #[test]
     fn test_scan_response_preserves_timestamps() {
         let scan = make_scan_result();
@@ -1551,6 +1691,32 @@ mod tests {
         let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.artifact_id, None);
         assert_eq!(req.repository_id, None);
+        assert_eq!(
+            req.bypass_dedup, None,
+            "bypass_dedup must default to None when the field is omitted, so existing \
+             clients that pre-date #1469 keep their cache-friendly trigger semantics"
+        );
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_true() {
+        // #1469: the explicit "rescan now, ignore cached results" path.
+        // Pinned because the handler maps None -> false, so a regression
+        // that drops the field from the struct or renames it would silently
+        // collapse `{"bypass_dedup": true}` back to the cached path.
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": true });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.artifact_id, Some(aid));
+        assert_eq!(req.bypass_dedup, Some(true));
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_false() {
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": false });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.bypass_dedup, Some(false));
     }
 
     // -----------------------------------------------------------------------
@@ -1620,6 +1786,190 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Regression: bypass_dedup must be admin-gated in trigger_scan.
+    //
+    // PR #1514 review feedback: `bypass_dedup` skips the hash-based scan
+    // dedup short-circuit and fans out unbounded tokio::spawn workers across
+    // an entire repository's artifacts. The pre-existing `force = true` path
+    // was naturally rate-limited because dedup collapsed repeated calls
+    // against the same checksum into a single cached result; `bypass_dedup`
+    // removes that safety, so a non-admin caller setting it to true would be
+    // a DoS amplifier.
+    //
+    // This test invokes the `trigger_scan` handler directly (not via the
+    // router) so it covers the actual 403 branch under `cargo llvm-cov`.
+    // It runs against a real Postgres pool when `DATABASE_URL` is set and
+    // no-ops cleanly otherwise, matching the `tdh::Fixture` pattern used
+    // by sibling handler tests.
+    //
+    // Coverage strategy: three call shapes prove the gate's behaviour
+    // without spinning up a real scan run:
+    //
+    //   1. non-admin + bypass_dedup=true  -> 403 Authorization (the gate)
+    //   2. admin + bypass_dedup=true + no ids -> 400 Validation
+    //      (the gate is bypassed for admins; we land on the next check)
+    //   3. non-admin + bypass_dedup omitted + no ids -> 400 Validation
+    //      (the gate does not fire for the normal trigger path)
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_trigger_scan_handler_admin_gates_bypass_dedup() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::Arc;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // no DATABASE_URL: skip cleanly
+        };
+
+        // Build a ScannerService so the handler gets past the 503 short-
+        // circuit. The 403 admin-gate check fires before any scanner method
+        // is invoked, so a vanilla constructor without trivy/openscap URLs
+        // is sufficient for this test.
+        let advisory_client = Arc::new(crate::services::scanner_service::AdvisoryClient::new(None));
+        let scan_result_service =
+            Arc::new(crate::services::scan_result_service::ScanResultService::new(fx.pool.clone()));
+        let scan_config_service =
+            Arc::new(crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone()));
+        let scanner = Arc::new(crate::services::scanner_service::ScannerService::new(
+            fx.pool.clone(),
+            advisory_client,
+            scan_result_service,
+            scan_config_service,
+            None, // trivy_url
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+            "/tmp/scan".to_string(),
+            None, // openscap_url
+            "standard".to_string(),
+        ));
+
+        // The fixture's SharedState is `Arc<AppState>` with `scanner_service:
+        // None`. Rebuild the inner AppState with the scanner wired in. We
+        // can't mutate the existing Arc once it's shared, so we construct a
+        // fresh AppState that points at the same pool / storage.
+        let mut state_inner = crate::api::AppState::new(
+            fx.state.config.clone(),
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+        );
+        state_inner.set_scanner_service(scanner);
+        let state: SharedState = Arc::new(state_inner);
+
+        let make_auth = |is_admin: bool| AuthExtension {
+            user_id: fx.user_id,
+            username: fx.username.clone(),
+            email: format!("{}@test.local", fx.username),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        // ---- Case 1: non-admin + bypass_dedup=true -> 403 Authorization
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(true),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("bypass_dedup"),
+                    "403 message should mention bypass_dedup, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected AppError::Authorization for non-admin bypass_dedup, got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 2: admin + bypass_dedup=true + no ids -> 400 Validation
+        // The gate is bypassed for admins; the handler falls through to the
+        // "either artifact_id or repository_id is required" validation.
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(true)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(true),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(
+                    msg.contains("artifact_id") || msg.contains("repository_id"),
+                    "admin bypass_dedup with no ids should hit the post-gate \
+                     validation check, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected AppError::Validation for admin bypass_dedup with no \
+                 ids (proves gate is bypassed for admins), got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 3: non-admin + bypass_dedup omitted + no ids -> 400 Validation
+        // The gate must not fire on the normal trigger path; non-admins
+        // should still be able to call trigger_scan without bypass_dedup.
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: None,
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(_)) => {} // expected
+            other => panic!(
+                "non-admin without bypass_dedup must not be 403'd; expected \
+                 AppError::Validation for the missing-ids case, got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        // ---- Case 4: non-admin + bypass_dedup=false -> 400 Validation
+        // Explicit `false` must behave the same as omitted (gate condition
+        // is `bypass_dedup && !auth.is_admin`, so false short-circuits).
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(false),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::Validation(_)) => {} // expected
+            other => panic!(
+                "non-admin with bypass_dedup=false must not be 403'd; \
+                 expected AppError::Validation for the missing-ids case, \
+                 got: {:?}",
+                other.as_ref().err()
+            ),
+        }
+
+        fx.teardown().await;
+    }
+
     #[test]
     fn test_create_policy_request_serde() {
         let json = serde_json::json!({
@@ -1670,9 +2020,11 @@ mod tests {
             "is_enabled": false,
         });
         let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.name, "updated-policy");
-        assert!(!req.is_enabled);
-        assert!(!req.require_signature);
+        assert_eq!(req.name.as_deref(), Some("updated-policy"));
+        assert_eq!(req.is_enabled, Some(false));
+        // require_signature was not in the payload; we expect None (== "leave alone"),
+        // never a synthesised `false` that would silently flip the persisted column.
+        assert_eq!(req.require_signature, None);
     }
 
     #[test]
@@ -1688,14 +2040,104 @@ mod tests {
             "require_signature": true,
         });
         let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.name, "full-update");
-        assert_eq!(req.max_severity, "low");
-        assert!(req.block_unscanned);
-        assert!(req.block_on_fail);
-        assert!(req.is_enabled);
+        assert_eq!(req.name.as_deref(), Some("full-update"));
+        assert_eq!(req.max_severity.as_deref(), Some("low"));
+        assert_eq!(req.block_unscanned, Some(true));
+        assert_eq!(req.block_on_fail, Some(true));
+        assert_eq!(req.is_enabled, Some(true));
         assert_eq!(req.min_staging_hours, Some(48));
         assert_eq!(req.max_artifact_age_days, Some(365));
-        assert!(req.require_signature);
+        assert_eq!(req.require_signature, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1374 regression: PUT must accept a partial body and surface every
+    // field that was sent. Previously the strict-shape DTO rejected
+    // `{max_severity, is_enabled}` as a 422 and the release-gate
+    // `scan-policy-crud` flow saw `is_enabled` come back unchanged on a
+    // follow-up GET (the observable "empty string" in the bash assertion).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_policy_request_partial_max_severity_and_is_enabled() {
+        // The exact shape the release-gate test sends. Without the partial-
+        // update fix this would fail to deserialise (missing `name`, etc.)
+        // and bubble up as a 422 from the handler.
+        let json = serde_json::json!({
+            "max_severity": "critical",
+            "is_enabled": false,
+        });
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+
+        // Both fields are observed -- the bug used to drop `is_enabled`.
+        assert_eq!(req.max_severity.as_deref(), Some("critical"));
+        assert_eq!(req.is_enabled, Some(false));
+
+        // Untouched fields stay None so the service-layer COALESCE keeps the
+        // existing DB value; they must NOT default to `false` / empty string.
+        assert!(req.name.is_none());
+        assert!(req.block_unscanned.is_none());
+        assert!(req.block_on_fail.is_none());
+        assert!(req.min_staging_hours.is_none());
+        assert!(req.max_artifact_age_days.is_none());
+        assert!(req.require_signature.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_request_empty_body_is_a_noop() {
+        // An empty body must parse cleanly so a no-op PUT does not 422.
+        // The COALESCE in `PolicyService::update_policy` then leaves the row
+        // unchanged; this is the regression boundary for #1374.
+        let json = serde_json::json!({});
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert!(req.name.is_none());
+        assert!(req.max_severity.is_none());
+        assert!(req.is_enabled.is_none());
+        assert!(req.block_unscanned.is_none());
+        assert!(req.block_on_fail.is_none());
+        assert!(req.require_signature.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_request_is_enabled_only() {
+        // The release-gate also exercises a single-field toggle of
+        // `is_enabled`. Make sure that path round-trips a `false` value
+        // (the bug was that bash saw an empty string here).
+        let json = serde_json::json!({ "is_enabled": false });
+        let req: UpdatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.is_enabled, Some(false));
+        // A bare `is_enabled: false` PATCH must not synthesise other fields.
+        assert!(req.name.is_none());
+        assert!(req.max_severity.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_response_has_concrete_bool_for_is_enabled() {
+        // Closes the loop with the response contract: PolicyResponse must
+        // always emit `is_enabled` as a JSON boolean, never absent or null,
+        // so jq queries in the release gate cannot observe an empty string.
+        let p = PolicyResponse {
+            id: Uuid::nil(),
+            name: "p".to_string(),
+            repository_id: None,
+            max_severity: "critical".to_string(),
+            block_unscanned: true,
+            block_on_fail: true,
+            is_enabled: false,
+            min_staging_hours: None,
+            max_artifact_age_days: None,
+            require_signature: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(
+            json["is_enabled"].is_boolean(),
+            "is_enabled must be a JSON bool, got {}",
+            json["is_enabled"]
+        );
+        assert_eq!(json["is_enabled"], false);
+        assert_eq!(json["max_severity"], "critical");
     }
 
     #[test]

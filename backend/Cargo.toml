@@ -44,12 +44,14 @@ blake2 = "0.10"
 
 # Encryption
 aes-gcm.workspace = true
+zeroize.workspace = true
 
 # S3 storage using Apache object_store crate
 object_store.workspace = true
 
 # HTTP types (presigned URL methods)
 http.workspace = true
+http-body-util.workspace = true
 
 # TLS (explicit provider selection for rustls 0.23+)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -138,6 +140,11 @@ opensearch = { workspace = true }
 
 # Temp files
 tempfile = "3.27"
+
+# Memory-mapped scan inputs: lets a multi-GiB artifact be staged to disk and
+# handed to scanners as file-backed (kernel-reclaimable) pages instead of anon
+# heap. Pairs with `Bytes::from_owner`.
+memmap2 = "0.9"
 
 # Directory walking
 walkdir = "2.5"
