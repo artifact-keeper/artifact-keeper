@@ -1896,6 +1896,10 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        // This is a proxy-cache entry, so surface the cache timestamp.
+        // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
+        cache_cached_at: Some(entry.cached_at),
+        cache_expires_at: None,
     }
 }
 
