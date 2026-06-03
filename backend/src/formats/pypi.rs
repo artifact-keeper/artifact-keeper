@@ -203,6 +203,129 @@ impl PypiHandler {
         result
     }
 
+    /// Extract the version from a PyPI filename (wheel or sdist), stripping a
+    /// PEP 658 `.metadata` suffix first. Reuses [`Self::parse_filename`] so the
+    /// guard and the publish/index paths agree on parsing. Returns `None` for
+    /// unparseable names; the version is the one encoded in the filename, which
+    /// for PEP 427-escaped versions may differ from the stored metadata version.
+    pub fn version_from_filename(filename: &str) -> Option<String> {
+        let filename = filename.strip_suffix(".metadata").unwrap_or(filename);
+        Self::parse_filename(filename)
+            .ok()
+            .and_then(|info| info.version)
+    }
+
+    /// Canonicalize a PEP 440 version into a comparable string.
+    ///
+    /// Two versions that PEP 440 considers equal produce the same output, so
+    /// `1.0` == `1.0.0`, `1.0a1` == `1.0-alpha-1`, `1.0.post1` == `1.0-1`, and
+    /// the local-version separators a PEP 427 filename escapes to `_`
+    /// (`1.0+abc.def` vs `1.0_abc_def`) compare equal to the stored metadata
+    /// form. Returns `None` for input that is not recognisably PEP 440; callers
+    /// fall back to exact matching in that case.
+    pub fn canonical_version(version: &str) -> Option<String> {
+        let v = version.trim().trim_start_matches(['v', 'V']);
+        if v.is_empty() {
+            return None;
+        }
+
+        // Local segment (everything after the first `+`). A PEP 427 wheel
+        // filename escapes `+` and `.` runs in the local part to `_`, so treat
+        // `_` as a local separator alongside `.`/`-`.
+        let (public, local) = match v.split_once('+') {
+            Some((p, l)) => (p, Some(l)),
+            None => (v, None),
+        };
+
+        let lower = public.to_ascii_lowercase();
+
+        // Epoch: `N!`.
+        let (epoch, rest) = match lower.split_once('!') {
+            Some((e, r)) => {
+                if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                (e.trim_start_matches('0'), r)
+            }
+            None => ("", lower.as_str()),
+        };
+        let epoch: &str = if epoch.is_empty() { "0" } else { epoch };
+
+        // Greedily take the leading release: `digits(.digits)*`. The remainder
+        // holds the optional pre / post / dev / implicit-post qualifiers.
+        let (release_str, suffix) = split_release(rest)?;
+        let release = canon_release(&release_str);
+
+        // Tokenize the qualifier suffix into alternating digit / alpha runs,
+        // treating `.`/`-`/`_` purely as separators (PEP 440 normalisation).
+        let tokens = tokenize_version(suffix)?;
+
+        let mut pre: Option<(&'static str, u64)> = None;
+        let mut post: Option<u64> = None;
+        let mut dev: Option<u64> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            let tok = &tokens[i];
+            // A bare number directly after the release is an implicit post
+            // release (`1.0-1`).
+            if tok.chars().all(|c| c.is_ascii_digit())
+                && pre.is_none()
+                && post.is_none()
+                && dev.is_none()
+            {
+                post = Some(tok.parse().ok()?);
+                i += 1;
+                continue;
+            }
+            let label = match tok.as_str() {
+                "a" | "alpha" => Some(("pre", "a")),
+                "b" | "beta" => Some(("pre", "b")),
+                "c" | "rc" | "pre" | "preview" => Some(("pre", "rc")),
+                "post" | "rev" | "r" => Some(("post", "")),
+                "dev" => Some(("dev", "")),
+                _ => None,
+            };
+            let (kind, prelabel) = label?;
+            // Optional trailing number for this qualifier.
+            let n = if i + 1 < tokens.len() && tokens[i + 1].chars().all(|c| c.is_ascii_digit()) {
+                let parsed = tokens[i + 1].parse().ok()?;
+                i += 2;
+                parsed
+            } else {
+                i += 1;
+                0
+            };
+            match kind {
+                "pre" => pre = Some((prelabel, n)),
+                "post" => post = Some(n),
+                "dev" => dev = Some(n),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut out = format!("{}!{}", epoch, release);
+        if let Some((label, n)) = pre {
+            out.push_str(&format!("{}{}", label, n));
+        }
+        if let Some(n) = post {
+            out.push_str(&format!(".post{}", n));
+        }
+        if let Some(n) = dev {
+            out.push_str(&format!(".dev{}", n));
+        }
+        if let Some(local) = local {
+            let parts: Vec<&str> = local
+                .split(['.', '-', '_'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                out.push('+');
+                out.push_str(&parts.join(".").to_ascii_lowercase());
+            }
+        }
+        Some(out)
+    }
+
     /// Extract metadata from PKG-INFO or METADATA file in sdist
     pub fn extract_sdist_metadata(content: &[u8]) -> Result<PkgInfo> {
         let gz = GzDecoder::new(content);
@@ -383,6 +506,91 @@ impl PypiHandler {
         html.push_str("</body>\n</html>\n");
         html
     }
+}
+
+/// Canonicalize a numeric PEP 440 release segment: drop leading zeros from
+/// each component and trailing zero components so `1.0` and `1.0.0` agree.
+fn canon_release(release: &str) -> String {
+    let parts: Vec<&str> = release.split('.').collect();
+    let mut nums: Vec<u64> = parts
+        .iter()
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect();
+    while nums.len() > 1 && *nums.last().unwrap() == 0 {
+        nums.pop();
+    }
+    nums.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Split the leading `digits(.digits)*` release off a PEP 440 public-version
+/// body (epoch already removed). Returns the release and the remaining
+/// qualifier suffix (which may start with a separator). `None` if the body
+/// does not start with a digit.
+fn split_release(body: &str) -> Option<(String, &str)> {
+    if !body.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let bytes = body.as_bytes();
+    let mut end = 0;
+    let mut expect_digit = true;
+    while end < bytes.len() {
+        let c = bytes[end] as char;
+        if c.is_ascii_digit() {
+            expect_digit = false;
+            end += 1;
+        } else if c == '.' && !expect_digit {
+            // A `.` continues the release only if another digit follows.
+            if bytes
+                .get(end + 1)
+                .map(|b| b.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                expect_digit = true;
+                end += 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Some((body[..end].to_string(), &body[end..]))
+}
+
+/// Split a PEP 440 public-version body into alternating digit / alpha runs,
+/// treating `.`/`-`/`_` as separators. Returns `None` on any other character.
+fn tokenize_version(body: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut cur_digit = false;
+    for c in body.chars() {
+        if c == '.' || c == '-' || c == '_' {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+        } else if c.is_ascii_digit() {
+            if !cur.is_empty() && !cur_digit {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            cur_digit = true;
+            cur.push(c);
+        } else if c.is_ascii_alphabetic() {
+            if !cur.is_empty() && cur_digit {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            cur_digit = false;
+            cur.push(c);
+        } else {
+            return None;
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    Some(tokens)
 }
 
 /// Minimal HTML escaper for the PEP 503 simple-index renderer. Escapes the
@@ -1149,5 +1357,137 @@ Project-URL: Documentation, https://docs.example.com
     #[test]
     fn test_pypi_handler_default() {
         let _handler = PypiHandler;
+    }
+
+    #[test]
+    fn test_version_from_filename_wheel() {
+        assert_eq!(
+            PypiHandler::version_from_filename("celery_message_consumer-1.1.1-py3-none-any.whl"),
+            Some("1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_version_from_filename_sdist() {
+        assert_eq!(
+            PypiHandler::version_from_filename("celery-message-consumer-1.1.1.tar.gz"),
+            Some("1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_version_from_filename_sdist_zip() {
+        assert_eq!(
+            PypiHandler::version_from_filename("my-pkg-2.0.0.zip"),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_version_from_filename_strips_pep658_metadata() {
+        assert_eq!(
+            PypiHandler::version_from_filename("foo-3.4.0-py3-none-any.whl.metadata"),
+            Some("3.4.0".to_string())
+        );
+        assert_eq!(
+            PypiHandler::version_from_filename("foo-3.4.0.tar.gz.metadata"),
+            Some("3.4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_version_from_filename_unparseable_returns_none() {
+        assert_eq!(PypiHandler::version_from_filename("not-a-package"), None);
+        assert_eq!(PypiHandler::version_from_filename(""), None);
+    }
+
+    // ========================================================================
+    // canonical_version tests: two PEP 440-equal versions must canonicalize to
+    // the same string so the shadowing guard cannot be bypassed by a release
+    // form difference, and cannot 404 a locally-owned version.
+    // ========================================================================
+
+    fn canon(v: &str) -> String {
+        PypiHandler::canonical_version(v).unwrap_or_else(|| panic!("unparseable: {v}"))
+    }
+
+    #[test]
+    fn test_canonical_version_release_padding() {
+        // 1.0 == 1.0.0 == 1.0.0.0 (trailing-zero release segments).
+        assert_eq!(canon("1.0"), canon("1.0.0"));
+        assert_eq!(canon("1.0"), canon("1.0.0.0"));
+        assert_ne!(canon("1.0"), canon("1.0.1"));
+    }
+
+    #[test]
+    fn test_canonical_version_leading_zeros_and_v_prefix() {
+        assert_eq!(canon("1.01"), canon("1.1"));
+        assert_eq!(canon("v1.2.3"), canon("1.2.3"));
+    }
+
+    #[test]
+    fn test_canonical_version_local_with_plus() {
+        // Metadata-form local versions keep the `+` and `.`/`-` separators;
+        // within the local segment those separators normalise equal.
+        assert_eq!(canon("1.0+abc.def"), canon("1.0+abc-def"));
+        assert_eq!(canon("1.0+abc.def"), canon("1.0+abc_def"));
+        assert_eq!(canon("1.0+ubuntu-1"), canon("1.0+ubuntu.1"));
+        // Local segment still distinguishes different builds.
+        assert_ne!(canon("1.0+abc"), canon("1.0+xyz"));
+        // Local present vs absent are distinct.
+        assert_ne!(canon("1.0"), canon("1.0+abc"));
+    }
+
+    #[test]
+    fn test_canonical_version_filename_escaped_local_is_unparseable() {
+        // A PEP 427 wheel filename escapes the local segment and DROPS the `+`,
+        // so `version_from_filename` yields e.g. `1.2.3_gitsha` (no `+`). That
+        // form is not recognisably PEP 440, so canonicalization returns None and
+        // the guard must fall back to name-only suppression (fail-safe), rather
+        // than mistakenly comparing-and-allowing fan-out. See the guard's
+        // requested_canon None branch in proxy_helpers.
+        assert_eq!(PypiHandler::canonical_version("1.2.3_gitsha"), None);
+        assert_eq!(PypiHandler::canonical_version("1.0_abc_def"), None);
+    }
+
+    #[test]
+    fn test_canonical_version_post() {
+        // .post1 spellings and the implicit `1.0-1` post form agree.
+        assert_eq!(canon("1.0.post1"), canon("1.0-post1"));
+        assert_eq!(canon("1.0.post1"), canon("1.0-1"));
+        assert_eq!(canon("1.0.post1"), canon("1.0.rev1"));
+        assert_ne!(canon("1.0"), canon("1.0.post1"));
+    }
+
+    #[test]
+    fn test_canonical_version_epoch() {
+        // Epoch dominates: 1!2.0 is not 2.0, and 1!2.0 == 1!2.0.0.
+        assert_ne!(canon("1!2.0"), canon("2.0"));
+        assert_eq!(canon("1!2.0"), canon("1!2.0.0"));
+        // Default epoch is 0.
+        assert_eq!(canon("2.0"), canon("0!2.0"));
+    }
+
+    #[test]
+    fn test_canonical_version_pre_release_spellings() {
+        assert_eq!(canon("1.0a1"), canon("1.0-alpha-1"));
+        assert_eq!(canon("1.0b2"), canon("1.0beta2"));
+        assert_eq!(canon("1.0rc1"), canon("1.0-c-1"));
+        assert_eq!(canon("1.0rc1"), canon("1.0preview1"));
+        assert_ne!(canon("1.0a1"), canon("1.0b1"));
+        assert_ne!(canon("1.0a1"), canon("1.0"));
+    }
+
+    #[test]
+    fn test_canonical_version_dev() {
+        assert_eq!(canon("1.0.dev1"), canon("1.0-dev-1"));
+        assert_ne!(canon("1.0.dev1"), canon("1.0"));
+    }
+
+    #[test]
+    fn test_canonical_version_unparseable_returns_none() {
+        assert_eq!(PypiHandler::canonical_version(""), None);
+        assert_eq!(PypiHandler::canonical_version("not a version"), None);
+        assert_eq!(PypiHandler::canonical_version("1.0!@#"), None);
     }
 }
