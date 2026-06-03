@@ -1896,6 +1896,10 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        // This response represents a recovered proxy cache entry, so surface
+        // when it was cached. The cache entry tracks no explicit expiry.
+        cache_cached_at: Some(entry.cached_at),
+        cache_expires_at: None,
     }
 }
 
