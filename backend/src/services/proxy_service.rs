@@ -537,6 +537,40 @@ async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<S
     })
 }
 
+/// Storage keys for a single proxy-cache entry: the artifact body and its
+/// `__cache_meta__.json` sidecar.
+///
+/// Both keys are derived together from the same `(repo_key, path)` pair and
+/// share identical validation; they differ only in their trailing suffix.
+/// [`CacheKeys::derive`] is the single source of truth for that formula so the
+/// content key (used for presigned URLs / freshness probes) and the metadata
+/// key (the cache sidecar) cannot drift apart (#1018). The legacy
+/// [`ProxyService::cache_storage_key`] / `cache_metadata_key` helpers are thin
+/// shims over this type.
+pub(crate) struct CacheKeys {
+    /// Storage key for the cached artifact body (`__content__` suffix).
+    pub(crate) content: String,
+    /// Storage key for the cache metadata sidecar (`__cache_meta__.json`).
+    pub(crate) metadata: String,
+}
+
+impl CacheKeys {
+    /// Derive both the content and metadata storage keys for a proxy-cache
+    /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
+    /// validation exactly once.
+    ///
+    /// Byte-for-byte equivalent to calling
+    /// [`ProxyService::cache_storage_key`] and `cache_metadata_key`
+    /// individually: same validation order, same error values, same key format.
+    pub(crate) fn derive(repo_key: &str, path: &str) -> Result<CacheKeys> {
+        let trimmed = ProxyService::validate_cache_path(path)?;
+        let content = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
+        let metadata = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
+        ProxyService::check_cache_key_length(repo_key, trimmed)?;
+        Ok(CacheKeys { content, metadata })
+    }
+}
+
 /// Proxy service for fetching and caching artifacts from upstream repositories
 pub struct ProxyService {
     db: PgPool,
@@ -1396,18 +1430,12 @@ impl ProxyService {
     /// the key formula prevents the freshness check and the presign
     /// target from drifting out of sync (#1018).
     pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
-        let trimmed = Self::validate_cache_path(path)?;
-        let key = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
-        Self::check_cache_key_length(repo_key, trimmed)?;
-        Ok(key)
+        CacheKeys::derive(repo_key, path).map(|k| k.content)
     }
 
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
-        let trimmed = Self::validate_cache_path(path)?;
-        let key = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
-        Self::check_cache_key_length(repo_key, trimmed)?;
-        Ok(key)
+        CacheKeys::derive(repo_key, path).map(|k| k.metadata)
     }
 
     /// Reject cache paths whose final formatted key would exceed
@@ -2855,6 +2883,81 @@ mod tests {
         let storage = ProxyService::cache_storage_key("repo", "package").unwrap();
         let metadata = ProxyService::cache_metadata_key("repo", "package").unwrap();
         assert_ne!(storage, metadata);
+    }
+
+    /// Equivalence oracle for the S1 refactor (#1628): `CacheKeys::derive` must
+    /// produce byte-identical results to the legacy `cache_storage_key` /
+    /// `cache_metadata_key` helpers, including identical error behavior. The
+    /// helpers are already thin shims over `derive`, so this test pins the
+    /// contract for any future change to either side.
+    #[test]
+    fn test_cache_keys_derive_equivalent_to_legacy_helpers() {
+        // Compare Result<String> via to_string() so both the Ok key value and
+        // the exact Err message are part of the equivalence check.
+        fn as_msg(r: Result<String>) -> std::result::Result<String, String> {
+            r.map_err(|e| e.to_string())
+        }
+
+        // A near-max-length path: the worst-case (metadata) key lands exactly
+        // at MAX_STORAGE_KEY_BYTES, so both keys derive successfully.
+        let repo = "r";
+        let fixed = 12 + repo.len() + 1 + 1 + 19; // see just_under_limit test
+        let near_max_path = "a".repeat(ProxyService::MAX_STORAGE_KEY_BYTES - fixed);
+
+        // A path that overflows even the smaller content suffix: both must err.
+        let over_limit_path =
+            "b".repeat(ProxyService::MAX_STORAGE_KEY_BYTES - (12 + repo.len() + 1 + 1 + 11) + 1);
+
+        let cases: &[(&str, &str)] = &[
+            // Normal path.
+            (
+                "maven-central",
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+            ),
+            // Needs normalization (leading + trailing slash trimmed).
+            ("pypi-remote", "/simple/numpy/"),
+            // Path-traversal attempt: must still error identically.
+            ("npm-proxy", "express/../lodash"),
+            // NUL-byte smuggling: another error path.
+            ("npm-proxy", "express\0evil"),
+            // Empty path after trimming: error path.
+            ("npm-proxy", "//"),
+            // Near-max-length key (success at the boundary).
+            (repo, near_max_path.as_str()),
+            // Over-limit key (length validation error).
+            (repo, over_limit_path.as_str()),
+        ];
+
+        for (repo_key, path) in cases {
+            let derived = CacheKeys::derive(repo_key, path);
+            let derived_content = derived.as_ref().map(|k| k.content.clone()).ok();
+            let derived_metadata = derived.as_ref().map(|k| k.metadata.clone()).ok();
+
+            // Content key equivalence (Ok value and Err message).
+            assert_eq!(
+                as_msg(CacheKeys::derive(repo_key, path).map(|k| k.content)),
+                as_msg(ProxyService::cache_storage_key(repo_key, path)),
+                "content key mismatch for ({repo_key:?}, {path:?})"
+            );
+            // Metadata key equivalence (Ok value and Err message).
+            assert_eq!(
+                as_msg(CacheKeys::derive(repo_key, path).map(|k| k.metadata)),
+                as_msg(ProxyService::cache_metadata_key(repo_key, path)),
+                "metadata key mismatch for ({repo_key:?}, {path:?})"
+            );
+
+            // The struct fields must agree with the legacy helpers directly.
+            assert_eq!(
+                derived_content,
+                ProxyService::cache_storage_key(repo_key, path).ok(),
+                "CacheKeys.content mismatch for ({repo_key:?}, {path:?})"
+            );
+            assert_eq!(
+                derived_metadata,
+                ProxyService::cache_metadata_key(repo_key, path).ok(),
+                "CacheKeys.metadata mismatch for ({repo_key:?}, {path:?})"
+            );
+        }
     }
 
     // =======================================================================
