@@ -356,6 +356,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        # Allow clean shutdown on Ctrl+C; cleanup is handled in finally.
         pass
     finally:
         server.server_close()
