@@ -229,6 +229,12 @@ pub fn router() -> Router<SharedState> {
         // `ProxyService::invalidate_cache` is idempotent so a second call for
         // an already-evicted path still returns 200.
         .route("/:key/cache/invalidate", post(invalidate_cache))
+        // PEP 708 tracks declarations for PyPI dependency-confusion control (#1600)
+        .route("/:key/pypi-tracks", get(list_pypi_tracks))
+        .route(
+            "/:key/pypi-tracks/:project",
+            put(put_pypi_track).delete(delete_pypi_track),
+        )
         // Routing rules for path rewriting on remote repositories
         .route(
             "/:key/routing-rules",
@@ -745,6 +751,196 @@ pub async fn invalidate_cache(
         path: query.path,
         invalidated: true,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// PEP 708 `tracks` declarations (#1600)
+// ---------------------------------------------------------------------------
+
+/// Body for declaring that a locally-owned PyPI project tracks an upstream one.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PypiTrackRequest {
+    /// Upstream Simple index project URL this local project tracks, e.g.
+    /// `https://pypi.org/simple/acme-sdk/`. Recorded and emitted as the PEP 708
+    /// `tracks` value.
+    pub tracks_url: String,
+}
+
+/// A single PEP 708 `tracks` declaration.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PypiTrackResponse {
+    pub repository_key: String,
+    /// PEP 503 normalized project name.
+    pub normalized_name: String,
+    pub tracks_url: String,
+}
+
+/// All `tracks` declarations on a repository.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PypiTracksListResponse {
+    pub items: Vec<PypiTrackResponse>,
+}
+
+#[allow(clippy::result_large_err)]
+fn require_pypi_tracks_repo(repo: &crate::models::repository::Repository) -> Result<()> {
+    // tracks is declared on the hosted repo that OWNS the project (PEP 708:
+    // tracks is a property of the project's own repository). It is meaningless
+    // on a proxy or virtual repo, which hold no authoritative local project.
+    if repo.repo_type != RepositoryType::Local && repo.repo_type != RepositoryType::Staging {
+        return Err(AppError::Validation(
+            "tracks declarations can only be set on a local (hosted) or staging repository"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// List the PEP 708 `tracks` declarations on a repository.
+#[utoipa::path(
+    get,
+    path = "/{key}/pypi-tracks",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(("key" = String, Path, description = "Repository key")),
+    responses(
+        (status = 200, description = "tracks declarations", body = PypiTracksListResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn list_pypi_tracks(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<PypiTracksListResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT normalized_name, tracks_url FROM pypi_project_tracks \
+         WHERE repository_id = $1 ORDER BY normalized_name",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(PypiTracksListResponse {
+        items: rows
+            .into_iter()
+            .map(|(normalized_name, tracks_url)| PypiTrackResponse {
+                repository_key: key.clone(),
+                normalized_name,
+                tracks_url,
+            })
+            .collect(),
+    }))
+}
+
+/// Declare (upsert) that a locally-owned PyPI project tracks an upstream one,
+/// allowing a virtual repository to merge versions across members for that name
+/// instead of isolating it (PEP 708, #1600).
+#[utoipa::path(
+    put,
+    path = "/{key}/pypi-tracks/{project}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name (PEP 503 normalized server-side)"),
+    ),
+    request_body = PypiTrackRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "tracks declaration stored", body = PypiTrackResponse),
+        (status = 400, description = "Invalid request or repository type"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn put_pypi_track(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, project)): Path<(String, String)>,
+    Json(payload): Json<PypiTrackRequest>,
+) -> Result<Json<PypiTrackResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+    require_pypi_tracks_repo(&repo)?;
+
+    let tracks_url = payload.tracks_url.trim().to_string();
+    if !(tracks_url.starts_with("http://") || tracks_url.starts_with("https://")) {
+        return Err(AppError::Validation(
+            "tracks_url must be an absolute http(s) URL".to_string(),
+        ));
+    }
+    let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
+    if normalized.is_empty() {
+        return Err(AppError::Validation("invalid project name".to_string()));
+    }
+
+    sqlx::query(
+        "INSERT INTO pypi_project_tracks (repository_id, normalized_name, tracks_url, created_by) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (repository_id, normalized_name) \
+         DO UPDATE SET tracks_url = EXCLUDED.tracks_url, created_by = EXCLUDED.created_by",
+    )
+    .bind(repo.id)
+    .bind(&normalized)
+    .bind(&tracks_url)
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(PypiTrackResponse {
+        repository_key: key,
+        normalized_name: normalized,
+        tracks_url,
+    }))
+}
+
+/// Remove a PEP 708 `tracks` declaration, restoring local-precedence isolation
+/// for that project name (#1600).
+#[utoipa::path(
+    delete,
+    path = "/{key}/pypi-tracks/{project}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name (PEP 503 normalized server-side)"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "tracks declaration removed (idempotent)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_pypi_track(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, project)): Path<(String, String)>,
+) -> Result<axum::http::StatusCode> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
+    sqlx::query(
+        "DELETE FROM pypi_project_tracks WHERE repository_id = $1 AND normalized_name = $2",
+    )
+    .bind(repo.id)
+    .bind(&normalized)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Resolve the effective cache TTL from a stored `repository_config` value.
@@ -4364,6 +4560,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         update_repository,
         delete_repository,
         set_cache_ttl,
+        list_pypi_tracks,
+        put_pypi_track,
+        delete_pypi_track,
         get_cache_ttl,
         invalidate_cache,
         list_artifacts,
@@ -4391,6 +4590,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         CacheTtlResponse,
         InvalidateCacheQuery,
         InvalidateCacheResponse,
+        PypiTrackRequest,
+        PypiTrackResponse,
+        PypiTracksListResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -10137,5 +10339,98 @@ mod tests {
             status,
             String::from_utf8_lossy(&body)
         );
+    }
+
+    /// PEP 708 (#1600): a PyPI virtual isolates a locally-owned project name by
+    /// default (so an unrelated public package of the same name is never served
+    /// through the virtual), and only unblocks the cross-member union when an
+    /// operator `tracks` declaration exists on the owning member.
+    #[tokio::test]
+    async fn pypi_virtual_isolates_locally_owned_name_until_tracks_declared() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, _lk, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (remote_id, _rk, remote_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (virtual_id, _vk, virtual_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+
+        for (member, priority) in [(local_id, 1_i32), (remote_id, 2_i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        // The local member owns the internal project `acme-sdk`.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(local_id)
+        .bind("acme-sdk/1.0.0/acme_sdk-1.0.0-py3-none-any.whl")
+        .bind("acme-sdk")
+        .bind(1_i64)
+        .bind("0".repeat(64))
+        .bind("application/octet-stream")
+        .bind("pypi/acme/1")
+        .execute(&pool)
+        .await
+        .expect("seed local artifact");
+
+        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream).
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
+                Ok(true)
+            ),
+            "a locally-owned name with no tracks declaration must be isolated"
+        );
+
+        // A name the local member does not own -> proxy normally (no isolation).
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "six").await,
+                Ok(false)
+            ),
+            "a name no local member owns must not be isolated"
+        );
+
+        // Operator declares the local project tracks upstream -> union allowed.
+        sqlx::query(
+            "INSERT INTO pypi_project_tracks (repository_id, normalized_name, tracks_url) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(local_id)
+        .bind("acme-sdk")
+        .bind("https://pypi.org/simple/acme-sdk/")
+        .execute(&pool)
+        .await
+        .expect("declare tracks");
+
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
+                Ok(false)
+            ),
+            "a tracks declaration must re-enable the cross-member union"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_id, virtual_id])
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
     }
 }
