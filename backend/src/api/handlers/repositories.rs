@@ -1370,6 +1370,84 @@ async fn purge_repo_oci_upload_temp_objects(
     }
 }
 
+/// Best-effort deletion of a repository's committed artifact objects from the
+/// storage backend, called BEFORE the repository row (and its cascading
+/// `artifacts` rows) are deleted. Without this, deleting a repository left
+/// every stored object orphaned on the backend, most visibly on S3 where the
+/// bytes simply stayed in the bucket with nothing referencing them (#1551).
+///
+/// Only objects owned *exclusively* by this repository are removed: a
+/// `storage_key` still referenced by another repository's artifact row
+/// (content-addressed dedup can share a key across repos on a shared backend)
+/// is left in place, so deleting one repository never destroys another's data.
+/// OCI blob objects (`oci_blobs`) are intentionally out of scope here; their
+/// cross-repo, content-addressed lifecycle is handled by blob GC.
+///
+/// Never blocks the delete: storage-resolution and per-object failures are
+/// logged and swallowed.
+async fn purge_repo_artifact_objects(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+) {
+    let storage = match state.storage_for_repo(location) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Could not resolve storage to purge artifact objects before repository delete"
+            );
+            return;
+        }
+    };
+
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT a.storage_key FROM artifacts a \
+         WHERE a.repository_id = $1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifacts b \
+               WHERE b.storage_key = a.storage_key AND b.repository_id <> $1 \
+           )",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to list artifact storage keys to purge before repository delete"
+        );
+        Vec::new()
+    });
+
+    let total = keys.len();
+    let mut failed = 0usize;
+    for key in keys {
+        match storage.delete(&key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    storage_key = %key,
+                    error = %e,
+                    "Failed to purge artifact object before repository delete"
+                );
+            }
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            repo_id = %repo_id,
+            purged = total - failed,
+            failed,
+            "Purged artifact storage objects for deleted repository"
+        );
+    }
+}
+
 /// Delete repository
 #[utoipa::path(
     delete,
@@ -1415,6 +1493,12 @@ pub async fn delete_repository(
     // storage BEFORE the repository row is deleted (see the helper). Best-effort:
     // never blocks the delete.
     purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
+
+    // Purge this repo's committed artifact objects from storage BEFORE the
+    // repository row is deleted (the artifacts rows CASCADE away with it). The
+    // DB delete alone left every stored object orphaned on S3/filesystem
+    // (#1551). Best-effort: never blocks the delete.
+    purge_repo_artifact_objects(&state, repo.id, &repo.storage_location()).await;
 
     service.delete(repo.id).await?;
 
@@ -8567,6 +8651,87 @@ mod tests {
             "purge must NOT delete the committed content-addressed blob {blob_key}"
         );
 
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_repository_purges_artifact_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        let insert_artifact = |repo_id: Uuid, path: &'static str, key: String| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO artifacts \
+                     (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(repo_id)
+                .bind(path)
+                .bind("file.bin")
+                .bind(6_i64)
+                .bind("0".repeat(64))
+                .bind("application/octet-stream")
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("insert artifact row");
+            }
+        };
+
+        // Object owned solely by this repository: must be purged.
+        let owned_key = format!("generic/{}/owned.bin", Uuid::new_v4());
+        storage
+            .put(&owned_key, bytes::Bytes::from_static(b"owned!"))
+            .await
+            .expect("put owned object");
+        insert_artifact(fx.repo_id, "a/owned.bin", owned_key.clone()).await;
+
+        // Object whose storage_key is also referenced by a SECOND repository
+        // (content-addressed dedup): must NOT be purged.
+        let (other_repo_id, _key, _dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let shared_key = format!("generic/{}/shared.bin", Uuid::new_v4());
+        storage
+            .put(&shared_key, bytes::Bytes::from_static(b"shared"))
+            .await
+            .expect("put shared object");
+        insert_artifact(fx.repo_id, "s/shared-a.bin", shared_key.clone()).await;
+        insert_artifact(other_repo_id, "s/shared-b.bin", shared_key.clone()).await;
+
+        assert!(storage.exists(&owned_key).await.expect("owned exists"));
+        assert!(storage.exists(&shared_key).await.expect("shared exists"));
+
+        purge_repo_artifact_objects(&state, fx.repo_id, &location).await;
+
+        assert!(
+            !storage
+                .exists(&owned_key)
+                .await
+                .expect("owned exists after"),
+            "exclusively-owned object must be purged"
+        );
+        assert!(
+            storage
+                .exists(&shared_key)
+                .await
+                .expect("shared exists after"),
+            "object referenced by another repository must be kept"
+        );
+
+        // Clean up the second repo (its artifacts CASCADE).
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete other repo");
         fx.teardown().await;
     }
 
