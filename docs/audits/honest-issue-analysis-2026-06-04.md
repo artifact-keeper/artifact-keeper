@@ -1,8 +1,8 @@
 # Honest Issue Analysis — Re-labeled from scratch
 
 **Date:** 2026-06-04
-**Method:** The existing GitHub labels are unreliable, so all **641 issues** (open + closed) were re-classified from their **title + body** by an LLM panel (22 agents, controlled vocabulary, instructed to ignore existing labels), loaded into SQLite, and queried. Dataset: `docs/audits/data/issue-classification-2026-06-04.csv`.
-**Coverage:** 641/641 classified, 0 parse errors, 0 missing. Classifier self-confidence: **86% high, 13% med, 1% low.**
+**Method:** The existing GitHub labels are unreliable, so all **641 issues** (open + closed) were re-classified from their **title + body** by an LLM panel (22 agents, controlled vocabulary, instructed to ignore existing labels), loaded into SQLite, and queried. A **follow-up pass (v2)** then re-judged the **269 closed defects that had a linked fix PR** using the *actual fix* (PR title/body + changed file paths) as ground truth. Dataset: `docs/audits/data/issue-classification-2026-06-04.csv` (includes both v1 and v2 columns).
+**Coverage:** 641/641 classified, 0 parse errors, 0 missing. v1 confidence: **86% high, 13% med, 1% low.** v2 re-judged 269 fixes and changed **58 labels** (see §8).
 
 > This report **corrects** the earlier `design-retro-2026-06-04.md`, which leaned on keyword matching over titles. Where they disagree, trust this one — but read the Caveats first.
 
@@ -146,11 +146,23 @@ The architecture verdict from `design-retro-2026-06-04.md` **stands** (an indepe
 
 ---
 
+## 8. Follow-up pass — root cause re-judged from the actual fix (v2)
+
+For the 269 closed defects with a linked fix PR, agents re-judged `component`/`root_cause`/`severity` using the fix's **changed file paths** as ground truth (e.g. a fix touching `backend/src/storage/s3.rs` is `storage-cas`, not whatever the title implied). **58 labels changed.** What the fixes revealed:
+
+- **We slightly *under*-counted our own fault.** **10 issues filed/labeled as `config-error` were actually our code bugs** once you read the fix — e.g. #237 (handlers hardcoded `FilesystemStorage`, ignoring `STORAGE_BACKEND`), #1298 (incus staging used the wrong storage path), #1089 (`filesystem.rs` mapped `ENOENT` to a 500 instead of NotFound, breaking proxy cache-miss refetch). `config-error` dropped 33 → 28.
+- **`format-compat` was under-counted (+5).** Bugs labeled `validation-input` were really native-format/protocol compatibility: #140 (Maven SNAPSHOT filename), #134 (SAML self-closing `AuthnStatement` XML parsing), #1576 (Nexus→AK enum mapping in migration). `format-compat` is now tied with `auth-logic` as the **single largest root cause (45 each).**
+- **The invariants were *over*-attributed, mostly `inv-lifecycle-gc` (11 → 6).** Reading fixes showed 5 "GC" bugs were something else — notably #735, which was not a GC design flaw but **S3 multi-delete being unsupported by Huawei OBS (405)** → `upstream-dependency`. The four invariants now total **36 of 356 defects = 10.1%** (was ~11.5%).
+- **1 "defect" was not a defect** (#905 — the ghcr semver tags *were* published; the repro just lacked `--paginate`).
+- **`design-gap-other` grew (36 → 47):** reading the fix often exposed a genuine code/design gap behind a vague title. This is the honest residue — real bugs we don't have a crisper bucket for, not mis-files.
+
+**Net effect on the conclusions:** unchanged in direction, tightened in fact. SBOM-scanning (now 50) and auth/SSO (45) remain the top two defect components; `format-compat` and `auth-logic` (45 each) are the top root causes; the invariants are real but **~10% of volume** and still over-represented in the severe/open tail (high-severity by v2 cause: `auth-logic` 28, `inv-streaming` 10, `inv-lifecycle-gc` 4). The §7 recommendation order (SBOM → auth → format-compat → invariants-by-severity) holds.
+
 ## Caveats (read these before quoting numbers)
 
 - **LLM classification, not ground truth.** Labels are an expert reading of title+body, not a verified post-mortem of each fix. 14% were med/low confidence. Treat counts as ±1 bucket, not exact.
 - **`affected_release` is unreliable** — the classifier assigned "yes" to ~85% of defects, which is implausibly high (it appears to default optimistically). That dimension is in the CSV but is **excluded from this report's conclusions.**
 - **Single primary component/root-cause per issue.** Cross-cutting issues (e.g. an OCI proxy streaming bug) are counted once, under their best-fit bucket — so component totals are conservative for cross-cutting subsystems.
 - **Bodies truncated to 2,500 chars** for classification; very long threads may be under-characterized.
-- **Closing PRs were not read** (we chose title+body scope). True root cause of a few "design-gap-other" / "unknown" defects could shift with the fix diff. A follow-up pass over closing PRs would tighten root-cause attribution.
+- **Closing PRs WERE read for the 269 closed defects that had one (v2, §8); the other 87 defects (68 closed without a linked PR + 19 open) are title+body only.** v2 used changed file **paths**, not full diffs — a deeper read of the patch hunks could refine the residual `design-gap-other` (47) bucket further.
 - Reproduce any number: `sqlite3` over `docs/audits/data/issue-classification-2026-06-04.csv`.
