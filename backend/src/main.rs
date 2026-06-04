@@ -487,6 +487,22 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         )
         .await;
 
+    // One-shot backfill of manifest_blob_refs for image manifests that
+    // pre-date migration 120 (artifact-keeper#1635). GC prerequisite for
+    // #1408 / #1610: reconstructs the (manifest -> blob) edges for the
+    // existing corpus so a future blob GC can judge oci_blobs orphanhood
+    // safely. ADDITIVE ONLY -- no deletion. Runs after the storage
+    // registry is wired up because it reads manifest bodies from per-repo
+    // backends. Failures are logged but do not block startup; on a fresh
+    // database or after the first successful run the candidate query
+    // returns zero rows and this is a near-instant no-op.
+    let _blob_refs_backfill_stats =
+        artifact_keeper_backend::services::manifest_blob_refs_backfill::run_backfill(
+            &db_pool,
+            storage_registry.clone(),
+        )
+        .await;
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));

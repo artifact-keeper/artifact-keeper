@@ -1568,6 +1568,109 @@ pub(crate) async fn record_oci_manifest_refs(
     Ok(res.rows_affected() as usize)
 }
 
+/// A single (blob_digest, kind) edge extracted from an image manifest.
+/// `kind` is `"config"` for the config blob and `"layer"` for each layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRef {
+    pub digest: String,
+    pub kind: &'static str,
+}
+
+/// Parse an OCI / Docker *image* manifest body and return the blob edges
+/// it pulls in: the single `config.digest` (kind `"config"`) plus every
+/// `layers[].digest` (kind `"layer"`). Used by both the push handler (to
+/// populate `manifest_blob_refs` synchronously) and the startup backfill
+/// (to reconstruct rows for manifests that pre-date this code) for #1635.
+///
+/// Returns an empty vec when the body is not parseable as JSON or carries
+/// no `config`/`layers` blobs. An image *index* (manifest list) has
+/// neither a `config` nor a `layers` array -- it lists child manifests
+/// under `manifests[]` -- so passing an index body here yields an empty
+/// vec. Callers are still expected to gate on [`is_index_content_type`]
+/// so index manifests never reach this path, but the empty-vec behaviour
+/// makes a stray call harmless.
+///
+/// Malformed entries (missing or non-string `digest`) are skipped rather
+/// than erroring, mirroring [`extract_child_digests`]: a single
+/// non-conformant manifest must not block blob-reference recording for
+/// the rest of the corpus.
+pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
+    let json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut refs = Vec::new();
+    if let Some(cfg) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+    {
+        refs.push(BlobRef {
+            digest: cfg.to_string(),
+            kind: "config",
+        });
+    }
+    if let Some(layers) = json.get("layers").and_then(|l| l.as_array()) {
+        for layer in layers {
+            if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
+                refs.push(BlobRef {
+                    digest: d.to_string(),
+                    kind: "layer",
+                });
+            }
+        }
+    }
+    refs
+}
+
+/// Insert (manifest_digest, blob_digest, repository_id, kind) rows into
+/// `manifest_blob_refs` for every config/layer blob of an image manifest.
+/// Idempotent: on conflict the existing row is kept.
+///
+/// Called inline from `handle_put_manifest` and from the startup backfill.
+/// The caller is responsible for verifying that `manifest_body` is a
+/// regular image manifest (NOT an image index -- use
+/// [`is_index_content_type`]); passing an index body just inserts zero
+/// rows because it has no config/layers.
+///
+/// ADDITIVE ONLY (#1635): this records references so a future GC can judge
+/// blob orphanhood safely. It performs no deletion.
+///
+/// Performance: the inserts run as a single round-trip via `UNNEST` so a
+/// manifest with N layers costs one DB call, not N. This matters because
+/// `handle_put_manifest` calls this synchronously on the request hot path.
+pub async fn record_manifest_blob_refs(
+    db: &PgPool,
+    repo_id: Uuid,
+    manifest_digest: &str,
+    manifest_body: &[u8],
+) -> Result<usize, sqlx::Error> {
+    let refs = extract_blob_refs(manifest_body);
+    if refs.is_empty() {
+        return Ok(0);
+    }
+    // Split into parallel arrays so a single UNNEST round-trip can pair
+    // each blob digest with its kind, all against the constant
+    // manifest_digest / repo_id.
+    let blob_digests: Vec<String> = refs.iter().map(|r| r.digest.clone()).collect();
+    let kinds: Vec<String> = refs.iter().map(|r| r.kind.to_string()).collect();
+    let res = sqlx::query(
+        r#"
+        INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+        SELECT $1, blob, $4, knd
+        FROM UNNEST($2::text[], $3::text[]) AS t(blob, knd)
+        ON CONFLICT (manifest_digest, blob_digest, repository_id) DO NOTHING
+        "#,
+    )
+    .bind(manifest_digest)
+    .bind(&blob_digests)
+    .bind(&kinds)
+    .bind(repo_id)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Tags/list and catalog response types
 // ---------------------------------------------------------------------------
@@ -5271,6 +5374,28 @@ async fn handle_put_manifest(
                 error = %e,
                 "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
                  child manifests as orphaned until the next backfill pass runs"
+            );
+        }
+    } else {
+        // For regular (non-index) image manifests, record the
+        // (manifest_digest -> blob_digest) edges (config + layers) so a
+        // future blob GC can safely judge `oci_blobs` orphanhood (#1635).
+        // Image indexes carry no blobs of their own, so they are skipped
+        // here; their child manifests are tracked via oci_manifest_refs
+        // above and each child records its own blob refs on its own PUT.
+        //
+        // Best-effort: a failure to write the refs is logged but does not
+        // fail the push, since the manifest and tag/artifact rows are
+        // already persisted. The startup backfill in main.rs reconstructs
+        // any gaps on the next restart.
+        if let Err(e) = record_manifest_blob_refs(&state.db, repo_id, &digest, &body).await {
+            warn!(
+                image = image_name,
+                reference = reference,
+                manifest_digest = digest.as_str(),
+                error = %e,
+                "Failed to record manifest_blob_refs for image manifest; blob references will \
+                 be reconstructed by the startup backfill on the next restart"
             );
         }
     }
@@ -10364,6 +10489,119 @@ mod oci_manifest_refs_tests {
         }"#;
         let children = extract_child_digests(body);
         assert_eq!(children, vec!["sha256:aaaa", "sha256:bbbb"]);
+    }
+
+    // -- manifest_blob_refs (#1635) blob-edge extraction --------------------
+
+    #[test]
+    fn extract_blob_refs_parses_config_and_layers() {
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 7023,
+                "digest": "sha256:config0"
+            },
+            "layers": [
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 32654, "digest": "sha256:layer1"},
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 16724, "digest": "sha256:layer2"}
+            ]
+        }"#;
+        let refs = extract_blob_refs(body);
+        assert_eq!(
+            refs,
+            vec![
+                BlobRef {
+                    digest: "sha256:config0".to_string(),
+                    kind: "config"
+                },
+                BlobRef {
+                    digest: "sha256:layer1".to_string(),
+                    kind: "layer"
+                },
+                BlobRef {
+                    digest: "sha256:layer2".to_string(),
+                    kind: "layer"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_empty_for_image_index() {
+        // An image index references child manifests, not blobs: it has no
+        // `config` and no `layers`, so it must produce zero blob edges.
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"digest": "sha256:childamd64", "platform": {"architecture": "amd64", "os": "linux"}},
+                {"digest": "sha256:childarm64", "platform": {"architecture": "arm64", "os": "linux"}}
+            ]
+        }"#;
+        assert!(
+            extract_blob_refs(body).is_empty(),
+            "image index has no config/layers blobs"
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_handles_missing_config_or_layers() {
+        // Config present, no layers array.
+        let cfg_only = br#"{"config": {"digest": "sha256:cfg"}}"#;
+        assert_eq!(
+            extract_blob_refs(cfg_only),
+            vec![BlobRef {
+                digest: "sha256:cfg".to_string(),
+                kind: "config"
+            }]
+        );
+        // Layers present, no config.
+        let layers_only = br#"{"layers": [{"digest": "sha256:l1"}]}"#;
+        assert_eq!(
+            extract_blob_refs(layers_only),
+            vec![BlobRef {
+                digest: "sha256:l1".to_string(),
+                kind: "layer"
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_empty_for_malformed_json() {
+        assert!(extract_blob_refs(b"not json").is_empty());
+        assert!(extract_blob_refs(b"").is_empty());
+        assert!(extract_blob_refs(b"{").is_empty());
+        assert!(extract_blob_refs(b"{}").is_empty());
+    }
+
+    #[test]
+    fn extract_blob_refs_skips_layers_missing_digest() {
+        let body = br#"{
+            "config": {"size": 1},
+            "layers": [
+                {"digest": "sha256:l1"},
+                {"size": 5},
+                {"digest": null},
+                {"digest": "sha256:l2"}
+            ]
+        }"#;
+        // Config has no digest -> skipped. Two valid layer digests remain.
+        let refs = extract_blob_refs(body);
+        assert_eq!(
+            refs,
+            vec![
+                BlobRef {
+                    digest: "sha256:l1".to_string(),
+                    kind: "layer"
+                },
+                BlobRef {
+                    digest: "sha256:l2".to_string(),
+                    kind: "layer"
+                },
+            ]
+        );
     }
 }
 
