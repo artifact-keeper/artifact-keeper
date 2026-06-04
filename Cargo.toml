@@ -112,7 +112,7 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # gRPC
 tonic = "0.12"
-tonic-reflection = "0.12"
+tonic-reflection = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.12"
