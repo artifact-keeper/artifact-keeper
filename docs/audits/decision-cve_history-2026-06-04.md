@@ -1,12 +1,16 @@
-# Decision: DROP `cve_history`, repoint reads at `scan_findings` (Issue #1616)
+# Decision: Repoint `cve_history` reads to `scan_findings` now; defer the table DROP to v1.3.0 (Issue #1616)
 
-**Date:** 2026-06-04 · **Status:** Recommendation (pending maintainer sign-off) · **Unblocks:** #1616, #1561
+**Date:** 2026-06-04 · **Status:** Recommendation (pending maintainer sign-off) · **Unblocks:** #1616, #1561, #1620
+
+> **⚠️ Correction (2026-06-04, after maintainer review):** An earlier draft of this doc recommended **dropping `cve_history` now**. That was walked back after re-reading `migration 112`, which records a *deliberate, existing team decision*: **keep the table, do not drop it**, because customers may have **hand-populated curated rows**, and **schedule removal for v1.3.0** with a migration that first copies extant rows into `scan_findings`. Pulling the DROP forward would contradict that plan and risk CASCADE-deleting customer data. **The drop is NOT in scope here.** This doc now recommends only the read-repointing, which fixes the live bugs (#1561, #1620) independently of the table's existence.
 
 ## Recommendation
 
-**Adopt Option A: DROP `cve_history` and make `scan_findings` the sole source of truth for per-artifact CVE state.** REPAIR (wiring a scanner write into `cve_history`) is the wrong call: it would create a second, perpetually-drifting copy of data that `scan_findings` already holds per scan run, re-introduce the dual-write/dual-acknowledge bug class that #1375/#1426 spent two issues partially untangling, and add no information `scan_findings` cannot already express. The only thing `cve_history` can represent that `scan_findings` cannot — a curated four-state lifecycle (`open/fixed/acknowledged/false_positive`) — has **zero production writers** and is already collapsed to a boolean by every live read path.
+**Repoint the remaining `cve_history` READS to `scan_findings` now (fixes #1561 and #1620); leave the table in place and let v1.3.0 own the DROP, exactly as `migration 112` already plans.**
 
-The codebase has already done ~80% of the DROP work incrementally (#1375 repointed the Security-tab reads; #1426 wired the acknowledge write to `scan_findings`). The table is formally deprecated in-schema (`backend/migrations/112_deprecate_cve_history.sql:23`). Finish the job rather than leave a half-migrated, false-positive-producing table in place through another release.
+The drop is *not necessary* to fix the user-facing bugs. `scan_findings` is the populated source of truth and already serves every live read via `build_cve_entries_from_scan_findings`; the only thing still reading the empty table is a small set of paths that should have been repointed by #1375/#1426 and weren't. Repointing them works whether or not the table exists, is reversible, and touches no destructive migration.
+
+**Why not DROP now:** `migration 112` explicitly retains the table so any customer-curated rows survive, and schedules removal for v1.3.0 with a data-preserving migration. Dropping now would contradict a documented decision and risk data loss for marginal cleanup benefit. **Why not REPAIR (add a writer):** that re-creates the dual-write/dual-acknowledge drift class #1375/#1426 spent two issues untangling, for a four-state lifecycle nothing consumes. So: neither drop nor repair — **repoint reads, defer drop to its existing v1.3.0 plan.**
 
 > **New defect found during this investigation:** `promotion_policy_service.rs:428-429` still reads `cve_history` (always empty), so **promotion policies that should block on open CVEs silently pass.** This was missed by #1375/#1426 and is a concrete, unfixed bug — repointing it is the most important behavioral fix in this work.
 
@@ -36,18 +40,18 @@ Only `INSERT INTO cve_history` is `SbomService::record_cve` (`sbom_service.rs:96
 ### 6. OpenAPI/handler contract
 Handlers respond with `CveHistoryEntry`/`Vec<CveHistoryEntry>`. The DTO stays; only its data source changes — **external contract unchanged.**
 
-## Implementation plan (Option A)
+## Implementation plan (repoint now)
 
-**Migration** `backend/migrations/113_drop_cve_history.sql` (confirm next number via `ls backend/migrations/ | tail -5`): guarded archive only if `COUNT(*) > 0` (almost certainly empty), then `DROP TABLE cve_history CASCADE;`.
+**No migration in this work.** The `cve_history` table stays; v1.3.0 owns the DROP per `migration 112`'s removal plan (copy curated rows → `scan_findings`, then drop). This change is code-only and reversible.
 
 **Read sites to repoint:**
 - `promotion_policy_service.rs:428-429` → `scan_findings`-based query: `SELECT DISTINCT sf.cve_id FROM scan_findings sf JOIN <latest completed scan_result for artifact> WHERE NOT sf.is_acknowledged AND sf.cve_id IS NOT NULL`. **Most important fix — restores promotion blocking.**
 - `get_cve_history` (`:1009`) / `get_cve_history_by_cve_id` (`:1070`): delete the `cve_history` SELECT blocks; call `build_cve_entries_from_scan_findings` directly (keep dedupe + `filter_entries_by_repo`).
 - `FIXED_CVES_COUNT_{REPO,ALL}_SQL` (`:563`, `:611`): drop the `curated_fixed` CTE + `UNION`; keep `disappeared`.
 
-**Write site:** Delete dead `record_cve` (`:969`), legacy `update_cve_status` (`:1224`) + route `POST /cve/status/:id` (`sbom.rs:104`, `:996`). Keep `update_cve_status_by_artifact_cve` and `security/findings/:id/acknowledge` as the **single** acknowledge surface.
+**Write sites — leave in place for now.** `migration 112` retains the table for the legacy admin/curated write path, so do **not** remove `record_cve` or the `POST /cve/status/:id` route in this change — that removal belongs with the v1.3.0 drop. Standardize *new* acknowledge traffic on `update_cve_status_by_artifact_cve` and `security/findings/:id/acknowledge` (already the working surface), but keep the legacy route functional until v1.3.0. This keeps the change additive and reversible.
 
-**Backward-compat:** External `CveHistoryEntry` JSON unchanged; gRPC unchanged. Removing `POST /cve/status/:id` is the one client-visible break (it only ever 404'd on synth rows) — note in PR "API Changes" + CHANGELOG.
+**Backward-compat:** External `CveHistoryEntry` JSON unchanged; gRPC unchanged; no routes removed; no migration. Purely repointing dead reads at the populated table. Nothing client-visible breaks.
 
 **Tests / E2E proving #1561 fixed:**
 - New promotion-policy test: an artifact with an unacknowledged `scan_findings` CVE yields non-empty `open_cves` and **blocks** promotion.
