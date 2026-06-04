@@ -1,70 +1,80 @@
--- Make every foreign key that references repositories(id) clean up on delete,
--- so deleting a repository no longer fails with a 500 DATABASE_ERROR (#1550).
+-- Make every foreign key that can block a repository delete clean up on delete,
+-- so DELETE /api/v1/repositories/{key} no longer fails with 500 DATABASE_ERROR
+-- (#1550).
 --
--- Several promotion and upload-session tables referenced repositories(id) with
--- the default NO ACTION. The most common trigger is upload_sessions: every
--- upload creates a row there, so any repository that has ever been uploaded to
--- could not be deleted (the FK violation surfaced as DATABASE_ERROR / HTTP 500).
--- promotion_history, promotion_approvals, and the nullable
--- repositories.promotion_target_id pointer had the same gap.
+-- Deleting a repository cascades to its `artifacts` rows, so a delete can be
+-- blocked by any FK referencing repositories(id) OR artifacts(id) that uses the
+-- default NO ACTION. A pg_catalog audit of a fully migrated database shows the
+-- blocking set is:
+--   * upload_sessions.repository_id             -> repositories (every upload creates a row)
+--   * promotion_history.source_repo_id/target   -> repositories
+--   * promotion_approvals.source_repo_id/target -> repositories (named fk_approval_*)
+--   * promotion_approvals.artifact_id           -> artifacts    (named fk_approval_artifact)
+-- plus the nullable self-pointer repositories.promotion_target_id -> repositories.
 --
--- Each block is guarded so it is a no-op when the table/column is absent, and
--- re-creatable (DROP CONSTRAINT IF EXISTS) so re-running is safe.
+-- This migration is NAME-AGNOSTIC: for each (table, column) it drops whatever
+-- single-column FK exists on that column (some were created with explicit names
+-- like fk_approval_source, others with the conventional <table>_<col>_fkey) and
+-- recreates a single canonical FK with the desired ON DELETE action. That makes
+-- it correct regardless of how the original constraint was named, and idempotent
+-- on re-run.
 
--- upload_sessions.repository_id: the "fails every time" case for uploaded repos.
 DO $$
+DECLARE
+    spec   RECORD;
+    fk     RECORD;
+    parent regclass;
 BEGIN
-    IF to_regclass('public.upload_sessions') IS NOT NULL THEN
-        ALTER TABLE upload_sessions DROP CONSTRAINT IF EXISTS upload_sessions_repository_id_fkey;
-        ALTER TABLE upload_sessions
-            ADD CONSTRAINT upload_sessions_repository_id_fkey
-            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE;
-    END IF;
-END $$;
+    FOR spec IN
+        SELECT *
+        FROM (VALUES
+            ('upload_sessions',     'repository_id',       'repositories', 'CASCADE'),
+            ('promotion_history',   'source_repo_id',      'repositories', 'CASCADE'),
+            ('promotion_history',   'target_repo_id',      'repositories', 'CASCADE'),
+            ('promotion_approvals', 'source_repo_id',      'repositories', 'CASCADE'),
+            ('promotion_approvals', 'target_repo_id',      'repositories', 'CASCADE'),
+            ('promotion_approvals', 'artifact_id',         'artifacts',    'CASCADE'),
+            ('repositories',        'promotion_target_id', 'repositories', 'SET NULL')
+        ) AS t(tbl, col, refs, action)
+    LOOP
+        -- Skip if the child table or the column does not exist in this database.
+        IF to_regclass('public.' || spec.tbl) IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = spec.tbl AND column_name = spec.col
+        ) THEN
+            CONTINUE;
+        END IF;
 
--- promotion_history source/target repositories.
-DO $$
-BEGIN
-    IF to_regclass('public.promotion_history') IS NOT NULL THEN
-        ALTER TABLE promotion_history DROP CONSTRAINT IF EXISTS promotion_history_source_repo_id_fkey;
-        ALTER TABLE promotion_history
-            ADD CONSTRAINT promotion_history_source_repo_id_fkey
-            FOREIGN KEY (source_repo_id) REFERENCES repositories(id) ON DELETE CASCADE;
+        parent := ('public.' || spec.refs)::regclass;
 
-        ALTER TABLE promotion_history DROP CONSTRAINT IF EXISTS promotion_history_target_repo_id_fkey;
-        ALTER TABLE promotion_history
-            ADD CONSTRAINT promotion_history_target_repo_id_fkey
-            FOREIGN KEY (target_repo_id) REFERENCES repositories(id) ON DELETE CASCADE;
-    END IF;
-END $$;
+        -- Drop every existing single-column FK on this column that points at the
+        -- expected parent, whatever it is named (handles both fk_approval_* and
+        -- the conventional names, plus any duplicate added by an earlier draft).
+        FOR fk IN
+            SELECT con.conname
+            FROM pg_constraint con
+            JOIN pg_attribute att
+              ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)
+            WHERE con.conrelid = ('public.' || spec.tbl)::regclass
+              AND con.contype = 'f'
+              AND con.confrelid = parent
+              AND att.attname = spec.col
+              AND array_length(con.conkey, 1) = 1
+        LOOP
+            EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', spec.tbl, fk.conname);
+        END LOOP;
 
--- promotion_approvals source/target repositories.
-DO $$
-BEGIN
-    IF to_regclass('public.promotion_approvals') IS NOT NULL THEN
-        ALTER TABLE promotion_approvals DROP CONSTRAINT IF EXISTS promotion_approvals_source_repo_id_fkey;
-        ALTER TABLE promotion_approvals
-            ADD CONSTRAINT promotion_approvals_source_repo_id_fkey
-            FOREIGN KEY (source_repo_id) REFERENCES repositories(id) ON DELETE CASCADE;
-
-        ALTER TABLE promotion_approvals DROP CONSTRAINT IF EXISTS promotion_approvals_target_repo_id_fkey;
-        ALTER TABLE promotion_approvals
-            ADD CONSTRAINT promotion_approvals_target_repo_id_fkey
-            FOREIGN KEY (target_repo_id) REFERENCES repositories(id) ON DELETE CASCADE;
-    END IF;
-END $$;
-
--- repositories.promotion_target_id is a nullable pointer at another repository;
--- deleting that target should just clear the pointer, not block the delete.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'repositories' AND column_name = 'promotion_target_id'
-    ) THEN
-        ALTER TABLE repositories DROP CONSTRAINT IF EXISTS repositories_promotion_target_id_fkey;
-        ALTER TABLE repositories
-            ADD CONSTRAINT repositories_promotion_target_id_fkey
-            FOREIGN KEY (promotion_target_id) REFERENCES repositories(id) ON DELETE SET NULL;
-    END IF;
+        -- Recreate a single canonical FK with the desired delete behavior.
+        EXECUTE format(
+            'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE %s',
+            spec.tbl,
+            spec.tbl || '_' || spec.col || '_fkey',
+            spec.col,
+            spec.refs,
+            spec.action
+        );
+    END LOOP;
 END $$;
