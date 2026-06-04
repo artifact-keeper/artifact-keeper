@@ -9,6 +9,10 @@
 # weekly schedule so the reproduction stays observable.
 name: Concurrency E2E (single-flight race)
 
+# Least-privilege default for GITHUB_TOKEN across all jobs (CodeQL hardening).
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:

@@ -36,7 +36,6 @@ Environment
 """
 
 import hashlib
-import io
 import os
 import sys
 import threading
@@ -218,7 +217,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        sys.stderr.write("[mock-upstream] shutting down on interrupt\n")
 
 
 if __name__ == "__main__":
