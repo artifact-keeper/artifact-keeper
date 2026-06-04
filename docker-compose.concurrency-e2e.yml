@@ -1,0 +1,168 @@
+# Multi-replica single-flight concurrency harness (#1624).
+#
+# Reproduces #1606: per-process singleflight races across replicas serving
+# partial/truncated artifacts. Acceptance gate for #1609.
+#
+# Topology:
+#   postgres        - one shared PostgreSQL (all replicas share metadata)
+#   minio + init    - one shared S3-compatible object store (all replicas share
+#                     blobs, so a blob cached by ONE replica is visible to ALL)
+#   mock-upstream   - controllable upstream serving ONE large artifact with a
+#                     known SHA-256, injectable latency, and a fetch counter
+#   backend         - >=3 replicas (scale via --scale backend=N), all pointed at
+#                     the SAME postgres + minio
+#   lb              - nginx round-robin in front of the backend replicas
+#
+# Usage (see scripts/concurrency/README.md):
+#   docker compose -f docker-compose.concurrency-e2e.yml build
+#   docker compose -f docker-compose.concurrency-e2e.yml up -d \
+#       --scale backend=3
+#   ./scripts/concurrency/run-singleflight-race.sh
+#   docker compose -f docker-compose.concurrency-e2e.yml down -v
+#
+# NOTE: this harness is RED on `main` by design (it reproduces #1606). It is NOT
+# wired into the per-PR gate. It flips green once #1609 (cross-process
+# single-flight) lands and then becomes its regression gate.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: concurrency-e2e-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    networks:
+      - concurrency-e2e-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: concurrency-e2e-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - concurrency_e2e_minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - concurrency-e2e-network
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: concurrency-e2e-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb local/artifact-keeper --ignore-existing &&
+      mc anonymous set none local/artifact-keeper &&
+      echo 'Bucket artifact-keeper created'
+      "
+    restart: "no"
+    networks:
+      - concurrency-e2e-network
+
+  mock-upstream:
+    build:
+      context: ./scripts/concurrency
+      dockerfile: Dockerfile.mock-upstream
+    image: ak-concurrency-mock-upstream:test
+    # No container_name: must be scalable-safe and we run a single instance.
+    environment:
+      # 256 MiB artifact, 1.5s latency to widen the race window.
+      ARTIFACT_SIZE_BYTES: "268435456"
+      ARTIFACT_NAME: big-artifact.bin
+      LATENCY_MS: "1500"
+      PORT: "9999"
+      SEED: "1624"
+    ports:
+      - "19999:9999"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9999/healthz',timeout=2).read()==b'ok' else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - concurrency-e2e-network
+
+  backend:
+    image: artifact-keeper-backend:test
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    # No container_name: compose appends a replica index when scaled.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      mock-upstream:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      # SHARED S3 object storage: a blob cached by one replica is visible to all.
+      STORAGE_BACKEND: s3
+      S3_BUCKET: artifact-keeper
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: concurrency-e2e-secret-key-32bytes-long
+      ADMIN_PASSWORD: TestRunner!2026secure
+      ENVIRONMENT: development
+      RUST_LOG: info
+      HOST: 0.0.0.0
+      PORT: "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+    networks:
+      - concurrency-e2e-network
+
+  lb:
+    image: nginx:alpine
+    container_name: concurrency-e2e-lb
+    depends_on:
+      - backend
+    volumes:
+      - ./scripts/concurrency/nginx-lb.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - concurrency-e2e-network
+
+networks:
+  concurrency-e2e-network:
+    name: concurrency-e2e-network
+    driver: bridge
+
+volumes:
+  concurrency_e2e_minio_data:
