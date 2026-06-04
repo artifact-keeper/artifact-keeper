@@ -1506,32 +1506,66 @@ impl ProxyService {
         Ok(trimmed)
     }
 
-    /// Attempt to retrieve a cached artifact if valid
+    /// Attempt to retrieve a cached artifact if valid.
+    ///
+    /// Thin shim over [`Self::get_cached`] with `allow_stale = false`: the
+    /// expiry gate is enforced and a transient metadata/body read error is
+    /// swallowed as a cache miss (B6) rather than surfaced as a 502.
     async fn get_cached_artifact(
         &self,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Check if metadata exists. A read/parse error on the sidecar (e.g. a
-        // waiter racing the single-flight leader's metadata write, or a
-        // half-written JSON) is treated as a cache miss rather than bubbling
-        // out as a 502 (B6): the caller re-fetches upstream and gets a clean
-        // 2xx or a 503, never a raw storage 502.
-        let metadata = match self.load_cache_metadata(metadata_key).await {
-            Ok(Some(m)) => m,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                tracing::warn!(
-                    metadata_key = %metadata_key,
-                    error = %e,
-                    "proxy cache metadata read failed; treating as miss and refetching upstream"
-                );
-                return Ok(None);
+        self.get_cached(cache_key, metadata_key, false).await
+    }
+
+    /// Shared cache-read path behind [`Self::get_cached_artifact`] (fresh) and
+    /// [`Self::get_stale_cached_artifact`] (stale fallback). The two callers
+    /// were near-duplicates; `allow_stale` reproduces every divergence exactly:
+    ///
+    /// * **Metadata read error.** Fresh treats a sidecar read/parse error as a
+    ///   cache miss (B6 — a waiter racing the single-flight leader's metadata
+    ///   write, or half-written JSON, must not bubble out as a 502). Stale
+    ///   propagates the error via `?`.
+    /// * **Expiry gate.** Fresh returns a miss once `Utc::now() > expires_at`;
+    ///   stale skips the gate entirely (that is the point of the fallback).
+    /// * **Body read error.** Fresh swallows a transient storage read error as
+    ///   a miss (B6); stale propagates it.
+    /// * **Log wording.** Fresh logs "Cache …"; stale logs "Stale cache …" and
+    ///   includes the expiry timestamp on a hit.
+    ///
+    /// The checksum verification (and its miss-on-mismatch) is identical for
+    /// both flags.
+    async fn get_cached(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        allow_stale: bool,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
+        // propagates it via `?` to match the original behavior precisely.
+        let metadata = if allow_stale {
+            match self.load_cache_metadata(metadata_key).await? {
+                Some(m) => m,
+                None => return Ok(None),
+            }
+        } else {
+            match self.load_cache_metadata(metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(
+                        metadata_key = %metadata_key,
+                        error = %e,
+                        "proxy cache metadata read failed; treating as miss and refetching upstream"
+                    );
+                    return Ok(None);
+                }
             }
         };
 
-        // Check if cache has expired
-        if Utc::now() > metadata.expires_at {
+        // Fresh reads enforce the expiry gate; the stale fallback skips it.
+        if !allow_stale && Utc::now() > metadata.expires_at {
             tracing::debug!("Cache expired for {}", cache_key);
             return Ok(None);
         }
@@ -1539,19 +1573,36 @@ impl ProxyService {
         // Try to get cached content
         match self.storage.get(cache_key).await {
             Ok(content) => {
-                // Verify checksum
+                // Verify checksum (identical for fresh and stale)
                 let actual_checksum = StorageService::calculate_hash(&content);
                 if actual_checksum != metadata.checksum_sha256 {
-                    tracing::warn!(
-                        "Cache checksum mismatch for {}: expected {}, got {}",
-                        cache_key,
-                        metadata.checksum_sha256,
-                        actual_checksum
-                    );
+                    if allow_stale {
+                        tracing::warn!(
+                            "Stale cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    }
                     return Ok(None);
                 }
 
-                tracing::debug!("Cache hit for {}", cache_key);
+                if allow_stale {
+                    tracing::debug!(
+                        "Stale cache hit for {} (expired at {})",
+                        cache_key,
+                        metadata.expires_at
+                    );
+                } else {
+                    tracing::debug!("Cache hit for {}", cache_key);
+                }
                 Ok(Some((content, metadata.content_type)))
             }
             Err(AppError::NotFound(_)) => Ok(None),
@@ -1564,14 +1615,19 @@ impl ProxyService {
             // 503 via `validate_upstream_status` when upstream itself is the
             // one failing. Surfacing the read error as `Err(e)` made it
             // `map_proxy_error` -> 502, which is exactly the raw status the
-            // stampede gate rejects.
+            // stampede gate rejects. The stale fallback keeps the original
+            // propagate-the-error behavior.
             Err(e) => {
-                tracing::warn!(
-                    cache_key = %cache_key,
-                    error = %e,
-                    "proxy cache read failed; treating as miss and refetching upstream"
-                );
-                Ok(None)
+                if allow_stale {
+                    Err(e)
+                } else {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache read failed; treating as miss and refetching upstream"
+                    );
+                    Ok(None)
+                }
             }
         }
     }
@@ -2093,42 +2149,17 @@ impl ProxyService {
 
     /// Attempt to retrieve a cached artifact even if it has expired.
     /// Used as a fallback when upstream is unavailable.
+    ///
+    /// Thin shim over [`Self::get_cached`] with `allow_stale = true`: the
+    /// expiry gate is skipped and metadata/body read errors propagate (the
+    /// caller is already in an upstream-unavailable fallback), while the
+    /// checksum is still verified.
     async fn get_stale_cached_artifact(
         &self,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Load metadata without checking expiry
-        let metadata = match self.load_cache_metadata(metadata_key).await? {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-
-        // Try to get cached content
-        match self.storage.get(cache_key).await {
-            Ok(content) => {
-                // Verify checksum
-                let actual_checksum = StorageService::calculate_hash(&content);
-                if actual_checksum != metadata.checksum_sha256 {
-                    tracing::warn!(
-                        "Stale cache checksum mismatch for {}: expected {}, got {}",
-                        cache_key,
-                        metadata.checksum_sha256,
-                        actual_checksum
-                    );
-                    return Ok(None);
-                }
-
-                tracing::debug!(
-                    "Stale cache hit for {} (expired at {})",
-                    cache_key,
-                    metadata.expires_at
-                );
-                Ok(Some((content, metadata.content_type)))
-            }
-            Err(AppError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.get_cached(cache_key, metadata_key, true).await
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer)
@@ -2299,6 +2330,17 @@ mod tests {
 
     fn is_cache_expired(expires_at: &DateTime<Utc>) -> bool {
         Utc::now() > *expires_at
+    }
+
+    /// Pure mirror of the expiry gate inside `ProxyService::get_cached`:
+    /// `if !allow_stale && Utc::now() > metadata.expires_at { miss }`.
+    ///
+    /// Returns `true` when the gate blocks the entry (fresh read of an expired
+    /// entry). The stale path (`allow_stale = true`) never blocks here, which
+    /// is the sole staleness divergence on the happy path — the checksum
+    /// verification that follows runs identically for both flags.
+    fn cache_expiry_gate_blocks(allow_stale: bool, expires_at: &DateTime<Utc>) -> bool {
+        !allow_stale && Utc::now() > *expires_at
     }
 
     fn compute_cache_expiry(cached_at: DateTime<Utc>, ttl_secs: i64) -> DateTime<Utc> {
@@ -2951,6 +2993,47 @@ mod tests {
             Utc::now() < valid_metadata.expires_at,
             "Cache should still be valid"
         );
+    }
+
+    #[test]
+    fn test_get_cached_expiry_gate_flag_behavior() {
+        // Exercises the `allow_stale` flag of `ProxyService::get_cached` via
+        // its pure mirror `cache_expiry_gate_blocks`. The flag's only happy-
+        // path divergence is whether the expiry gate is enforced; the checksum
+        // verification that runs afterward is identical for both flags, so a
+        // hit returned by either flag is still checksum-verified.
+        let now = Utc::now();
+        let expired = now - chrono::Duration::hours(1);
+        let valid = now + chrono::Duration::hours(23);
+
+        // allow_stale = false (get_cached_artifact): expired entry is rejected.
+        assert!(
+            cache_expiry_gate_blocks(false, &expired),
+            "fresh read must reject an expired entry"
+        );
+        // allow_stale = false: a still-valid entry passes the gate and proceeds
+        // to checksum verification.
+        assert!(
+            !cache_expiry_gate_blocks(false, &valid),
+            "fresh read must accept a still-valid entry"
+        );
+
+        // allow_stale = true (get_stale_cached_artifact): the gate is skipped
+        // for expired entries...
+        assert!(
+            !cache_expiry_gate_blocks(true, &expired),
+            "stale read must skip the expiry gate for an expired entry"
+        );
+        // ...and equally never blocks a valid entry.
+        assert!(
+            !cache_expiry_gate_blocks(true, &valid),
+            "stale read must never block on expiry"
+        );
+
+        // Sanity: only the fresh+expired combination blocks; everything else
+        // falls through to the shared (checksum-verified) hit path.
+        assert!(is_cache_expired(&expired));
+        assert!(!is_cache_expired(&valid));
     }
 
     #[test]
@@ -6425,6 +6508,255 @@ SHA256:
              Cached items live on disk under `self.storage` and are served \
              via `proxy_check_cache` -- they MUST NOT be reintroduced into \
              the `artifacts` table without an explicit storage-routing redesign."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_cached(allow_stale) behavioral tests (#1630, S2 of #1618)
+    //
+    // `get_cached_artifact` (allow_stale = false) and
+    // `get_stale_cached_artifact` (allow_stale = true) were collapsed into a
+    // single private `get_cached`. The two paths diverge in THREE ways and
+    // these tests pin every one against the flag:
+    //   1. Expiry gate — enforced only for the fresh (false) path.
+    //   2. Read-error policy — the fresh path SWALLOWS metadata/body read
+    //      errors as a cache miss (Ok(None), B6); the stale path PROPAGATES
+    //      them (Err). This is the dangerous divergence: a single B6 branch
+    //      applied to both flags would silently turn the stale path from
+    //      error-propagating into error-swallowing.
+    //   3. Log wording — "Cache …" vs "Stale cache …" (not asserted here;
+    //      logging is a side channel, but both code paths exist behind the
+    //      flag and are covered by the cargo build/clippy gate).
+    // The checksum verification is identical for both flags, so a hit
+    // returned by either flag is still checksum-verified — asserted below.
+    // -----------------------------------------------------------------------
+
+    const META_KEY: &str = "proxy/get-cached/__cache_meta__.json";
+    const BODY_KEY: &str = "proxy/get-cached/__content__";
+
+    /// Per-key behavior for [`GetCachedMock`]: serve bytes, simulate a missing
+    /// object (`AppError::NotFound`), or simulate a transient transport error
+    /// (`AppError::Storage`) — the latter is what exercises the swallow-vs-
+    /// propagate divergence.
+    enum KeyResponse {
+        Bytes(Bytes),
+        Missing,
+        Error,
+    }
+
+    /// Storage backend that serves a programmable response for the metadata
+    /// key and the body key independently, so a single test can wire e.g. a
+    /// valid sidecar plus a failing body read.
+    struct GetCachedMock {
+        metadata: KeyResponse,
+        body: KeyResponse,
+    }
+
+    impl GetCachedMock {
+        fn respond(key: &str, resp: &KeyResponse) -> Result<Bytes> {
+            match resp {
+                KeyResponse::Bytes(b) => Ok(b.clone()),
+                KeyResponse::Missing => Err(AppError::NotFound(key.to_string())),
+                KeyResponse::Error => Err(AppError::Storage(
+                    "simulated transient read failure".to_string(),
+                )),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for GetCachedMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            if key == META_KEY {
+                Self::respond(key, &self.metadata)
+            } else {
+                Self::respond(key, &self.body)
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Build a metadata sidecar whose checksum matches `body` and whose
+    /// `expires_at` is in the past (`expired = true`) or the future.
+    fn get_cached_metadata(body: &[u8], expired: bool) -> Bytes {
+        let now = Utc::now();
+        let expires_at = if expired {
+            now - chrono::Duration::hours(1)
+        } else {
+            now + chrono::Duration::hours(1)
+        };
+        let metadata = CacheMetadata {
+            cached_at: now - chrono::Duration::hours(2),
+            upstream_etag: None,
+            storage_etag: None,
+            expires_at,
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(body),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn service_with(metadata: KeyResponse, body: KeyResponse) -> ProxyService {
+        build_proxy_service_with_storage(Arc::new(GetCachedMock { metadata, body }))
+    }
+
+    // --- Divergence #1: expiry gate -----------------------------------------
+
+    #[tokio::test]
+    async fn test_get_cached_fresh_rejects_expired_entry() {
+        // allow_stale = false on an expired sidecar must miss before ever
+        // reading the body.
+        let body = b"payload";
+        let svc = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
+            KeyResponse::Bytes(Bytes::from_static(body)),
+        );
+        let out = svc.get_cached(BODY_KEY, META_KEY, false).await.unwrap();
+        assert!(out.is_none(), "fresh read must reject an expired entry");
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_stale_serves_expired_entry() {
+        // allow_stale = true skips the expiry gate and serves the body.
+        let body = b"payload";
+        let svc = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
+            KeyResponse::Bytes(Bytes::from_static(body)),
+        );
+        let out = svc.get_cached(BODY_KEY, META_KEY, true).await.unwrap();
+        let (content, ct) = out.expect("stale read must serve an expired entry");
+        assert_eq!(&content[..], body);
+        assert_eq!(ct.as_deref(), Some("application/octet-stream"));
+    }
+
+    // --- Checksum verification (identical for both flags) -------------------
+
+    #[tokio::test]
+    async fn test_get_cached_verifies_checksum_for_both_flags() {
+        // The stored body does NOT match the sidecar checksum: both flags must
+        // treat it as a miss, proving stale still verifies the checksum.
+        let good = b"the-checksummed-bytes";
+        let tampered = Bytes::from_static(b"different-bytes");
+
+        // Fresh + valid sidecar + tampered body -> miss.
+        let fresh = service_with(
+            KeyResponse::Bytes(get_cached_metadata(good, /* expired = */ false)),
+            KeyResponse::Bytes(tampered.clone()),
+        );
+        assert!(
+            fresh
+                .get_cached(BODY_KEY, META_KEY, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "fresh read must reject a checksum mismatch"
+        );
+
+        // Stale + expired sidecar + tampered body -> still a miss (checksum is
+        // verified even on the stale fallback path).
+        let stale = service_with(
+            KeyResponse::Bytes(get_cached_metadata(good, /* expired = */ true)),
+            KeyResponse::Bytes(tampered),
+        );
+        assert!(
+            stale
+                .get_cached(BODY_KEY, META_KEY, true)
+                .await
+                .unwrap()
+                .is_none(),
+            "stale read must still reject a checksum mismatch"
+        );
+    }
+
+    // --- Divergence #2: read-error policy (swallow vs propagate) ------------
+
+    #[tokio::test]
+    async fn test_get_cached_metadata_read_error_diverges_on_flag() {
+        // A metadata sidecar read error: fresh swallows -> Ok(None); stale
+        // propagates -> Err.
+        let fresh = service_with(KeyResponse::Error, KeyResponse::Missing);
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        assert!(
+            matches!(fresh_out, Ok(None)),
+            "fresh read must swallow a metadata read error as a cache miss (B6)"
+        );
+
+        let stale = service_with(KeyResponse::Error, KeyResponse::Missing);
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        assert!(
+            stale_out.is_err(),
+            "stale read must propagate a metadata read error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_body_read_error_diverges_on_flag() {
+        // A valid sidecar but a transient body read error: fresh swallows ->
+        // Ok(None); stale propagates -> Err.
+        let body = b"payload";
+
+        let fresh = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ false)),
+            KeyResponse::Error,
+        );
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        assert!(
+            matches!(fresh_out, Ok(None)),
+            "fresh read must swallow a body read error as a cache miss (B6)"
+        );
+
+        // Stale uses an expired sidecar (its real-world state) + body error.
+        let stale = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
+            KeyResponse::Error,
+        );
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        assert!(
+            stale_out.is_err(),
+            "stale read must propagate a body read error"
+        );
+    }
+
+    // --- NotFound is a miss for both flags (not an error) -------------------
+
+    #[tokio::test]
+    async fn test_get_cached_missing_body_is_miss_for_both_flags() {
+        let body = b"payload";
+
+        let fresh = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ false)),
+            KeyResponse::Missing,
+        );
+        assert!(
+            matches!(fresh.get_cached(BODY_KEY, META_KEY, false).await, Ok(None)),
+            "fresh: missing body is a miss, not an error"
+        );
+
+        let stale = service_with(
+            KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
+            KeyResponse::Missing,
+        );
+        assert!(
+            matches!(stale.get_cached(BODY_KEY, META_KEY, true).await, Ok(None)),
+            "stale: missing body is a miss, not an error"
         );
     }
 }
