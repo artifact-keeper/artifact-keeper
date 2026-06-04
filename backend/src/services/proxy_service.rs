@@ -1085,14 +1085,7 @@ impl ProxyService {
 
     /// Invalidate cached artifact
     pub async fn invalidate_cache(&self, repo: &Repository, path: &str) -> Result<()> {
-        let cache_key = Self::cache_storage_key(&repo.key, path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
-
-        // Delete both content and metadata
-        let _ = self.storage.delete(&cache_key).await;
-        let _ = self.storage.delete(&metadata_key).await;
-
-        Ok(())
+        self.invalidate_cache_keys(&repo.key, path).await
     }
 
     /// Invalidate cached artifact by repo key alone.
@@ -1102,10 +1095,22 @@ impl ProxyService {
     /// `RepoInfo` and need to evict sibling cache entries (e.g. APT
     /// invalidating stale Packages indices when Release changes, #1147).
     pub async fn invalidate_cache_by_key(&self, repo_key: &str, path: &str) -> Result<()> {
-        let cache_key = Self::cache_storage_key(repo_key, path)?;
-        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
-        let _ = self.storage.delete(&cache_key).await;
-        let _ = self.storage.delete(&metadata_key).await;
+        self.invalidate_cache_keys(repo_key, path).await
+    }
+
+    /// Shared invalidation core for [`Self::invalidate_cache`] (keyed off
+    /// `repo.key`) and [`Self::invalidate_cache_by_key`] (keyed off a bare
+    /// `repo_key`). The two public methods differ only in how they obtain the
+    /// repo key; the eviction itself — derive both cache keys, then delete the
+    /// content and metadata blobs in that order, ignoring delete errors — is
+    /// identical, so it lives here as a single source of truth (#1618 S3).
+    async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
+        let keys = CacheKeys::derive(repo_key, path)?;
+
+        // Delete both content and metadata
+        let _ = self.storage.delete(&keys.content).await;
+        let _ = self.storage.delete(&keys.metadata).await;
+
         Ok(())
     }
 
