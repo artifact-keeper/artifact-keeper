@@ -457,7 +457,7 @@ struct UpsertArtifactParams<'a> {
 
 /// Insert or update the artifact record and store metadata. Shared by
 /// monolithic and chunked upload finalization.
-async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> {
+async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     let UpsertArtifactParams {
         db,
         repo_id,
@@ -494,7 +494,7 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> 
     .bind(user_id)
     .fetch_one(db)
     .await
-    .map_err(db_err)?;
+    .map_err(|e| format!("database error: {e}"))?;
 
     let artifact_id: Uuid = artifact.get("id");
 
@@ -509,7 +509,7 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> 
     .bind(metadata)
     .execute(db)
     .await
-    .map_err(|e| fs_err("store metadata", e))?;
+    .map_err(|e| format!("store metadata: {e}"))?;
 
     // Surface Incus images in the top-level package browser. The generic
     // upload path (artifact_service) and the npm/pypi/nuget handlers populate
@@ -802,6 +802,7 @@ async fn download_image(
 async fn upload_image(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
+    OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     body: Body,
 ) -> Result<Response, Response> {
@@ -845,69 +846,71 @@ async fn upload_image(
     let metadata = IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path)
         .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
 
-    // Push the staged temp file to the configured storage backend.
+    // Record an upload session in `finalizing` state, then push to the
+    // StorageBackend on a background task and return 202. Doing the
+    // multi-GiB push inside the request would outlive an L7 gateway timeout
+    // (504) even though the body was fully received (#1471/#1494). The
+    // session row makes the async finalize observable: the client polls
+    // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`.
     let storage_key = build_storage_key(&repo.id, &artifact_path);
-    put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await?;
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    let session_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO incus_upload_sessions
+            (id, repository_id, user_id, artifact_path, product, version,
+             filename, bytes_received, storage_temp_path, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'finalizing')
+        "#,
+    )
+    .bind(session_id)
+    .bind(repo.id)
+    .bind(user_id)
+    .bind(&artifact_path)
+    .bind(&product)
+    .bind(&version)
+    .bind(&filename)
+    .bind(size_bytes)
+    .bind(temp_path.to_string_lossy().as_ref())
+    .execute(&state.db)
+    .await
+    .map_err(db_err)?;
+
+    // The staged temp file must outlive this request so the background
+    // finalize can read it; disarm the #1573 RAII guard here and hand cleanup
+    // to finalize_upload, which removes it after the push completes (or fails).
     staged.disarm();
 
-    let artifact_id = upsert_artifact(UpsertArtifactParams {
-        db: &state.db,
-        repo_id: repo.id,
-        artifact_path: &artifact_path,
-        product: &product,
-        version: &version,
-        size_bytes,
-        checksum: &checksum,
-        storage_key: &storage_key,
-        user_id,
-        metadata: &metadata,
-    })
-    .await?;
+    tokio::spawn(finalize_upload(
+        state.clone(),
+        repo.clone(),
+        FinalizeParams {
+            session_id,
+            repo_id: repo.id,
+            artifact_path: artifact_path.clone(),
+            product: product.clone(),
+            version: version.clone(),
+            size_bytes,
+            checksum: checksum.clone(),
+            storage_key,
+            user_id,
+            metadata,
+            temp_path: temp_path.clone(),
+        },
+    ));
 
-    // scan_on_upload trigger — format-native upload paths bypass
-    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
-    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
-    if let Some(scanner) = state.scanner_service.clone() {
-        let should_scan = sqlx::query_scalar!(
-            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-            repo.id
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-        crate::services::scanner_service::spawn_scan_on_upload(
-            should_scan,
-            artifact_id,
-            move |aid| async move {
-                if let Err(e) = scanner.scan_artifact(aid).await {
-                    tracing::warn!(
-                        artifact_id = %aid,
-                        error = %e,
-                        "scan_on_upload trigger failed"
-                    );
-                }
-            },
-        );
-    }
-
-    tracing::info!(
-        "Uploaded Incus image: {}/{}/{} ({}B, sha256:{})",
-        product,
-        version,
-        filename,
-        size_bytes,
-        &checksum[..12]
-    );
-
+    let prefix = mount_prefix_from_uri(&original_uri);
     Ok(Response::builder()
-        .status(StatusCode::CREATED)
+        .status(StatusCode::ACCEPTED)
         .header(CONTENT_TYPE, "application/json")
+        .header(
+            "Location",
+            build_upload_location(prefix, &repo_key, &session_id),
+        )
+        .header("Upload-UUID", session_id.to_string())
         .body(Body::from(
             serde_json::json!({
-                "id": artifact_id,
+                "session_id": session_id,
+                "status": "finalizing",
                 "product": product,
                 "version": version,
                 "file": filename,
@@ -977,7 +980,8 @@ async fn get_session(
     sqlx::query_as::<_, UploadSession>(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
-               filename, bytes_received, storage_temp_path
+               filename, bytes_received, storage_temp_path, status,
+               finalize_error, artifact_id
         FROM incus_upload_sessions
         WHERE id = $1 AND repository_id = $2
         "#,
@@ -1001,6 +1005,9 @@ struct UploadSession {
     filename: String,
     bytes_received: i64,
     storage_temp_path: String,
+    status: String,
+    finalize_error: Option<String>,
+    artifact_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,64 +1202,45 @@ async fn complete_chunked_upload(
     let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
         .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
 
-    // Push the staged temp file to the configured storage backend.
-    // See upload_image for the rationale (#1471).
+    // Finalize asynchronously: mark the session `finalizing`, push to the
+    // StorageBackend on a background task, and return 202. The assembled
+    // multi-GiB push can outlive an L7 gateway timeout the same way the
+    // monolithic PUT can, so the `complete` request must not block on it
+    // (#1471/#1494). The session row is retained (not deleted) so the client
+    // can poll `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`; the
+    // stale-session reaper cleans terminal rows after `max_age_hours`.
     let storage_key = build_storage_key(&session.repository_id, &session.artifact_path);
-    if let Err(e) = put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(e);
-    }
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    sqlx::query(
+        "UPDATE incus_upload_sessions \
+         SET status = 'finalizing', bytes_received = $2, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(session_id)
+    .bind(total_bytes)
+    .execute(&state.db)
+    .await
+    .map_err(db_err)?;
 
-    // Create artifact record
-    let artifact_id = upsert_artifact(UpsertArtifactParams {
-        db: &state.db,
-        repo_id: session.repository_id,
-        artifact_path: &session.artifact_path,
-        product: &session.product,
-        version: &session.version,
-        size_bytes: total_bytes,
-        checksum: &checksum,
-        storage_key: &storage_key,
-        user_id: session.user_id,
-        metadata: &metadata,
-    })
-    .await?;
-
-    // scan_on_upload trigger — see `upload_image` above.
-    if let Some(scanner) = state.scanner_service.clone() {
-        let should_scan = sqlx::query_scalar!(
-            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-            session.repository_id
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-        crate::services::scanner_service::spawn_scan_on_upload(
-            should_scan,
-            artifact_id,
-            move |aid| async move {
-                if let Err(e) = scanner.scan_artifact(aid).await {
-                    tracing::warn!(
-                        artifact_id = %aid,
-                        error = %e,
-                        "scan_on_upload trigger failed"
-                    );
-                }
-            },
-        );
-    }
-
-    // Clean up session
-    let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
-        .bind(session_id)
-        .execute(&state.db)
-        .await;
+    tokio::spawn(finalize_upload(
+        state.clone(),
+        repo.clone(),
+        FinalizeParams {
+            session_id,
+            repo_id: session.repository_id,
+            artifact_path: session.artifact_path.clone(),
+            product: session.product.clone(),
+            version: session.version.clone(),
+            size_bytes: total_bytes,
+            checksum: checksum.clone(),
+            storage_key,
+            user_id: session.user_id,
+            metadata,
+            temp_path: temp_path.clone(),
+        },
+    ));
 
     tracing::info!(
-        "Completed chunked upload {}: {}/{}/{} ({}B, sha256:{})",
+        "Finalizing chunked upload {}: {}/{}/{} ({}B, sha256:{})",
         session_id,
         session.product,
         session.version,
@@ -1262,11 +1250,12 @@ async fn complete_chunked_upload(
     );
 
     Ok(Response::builder()
-        .status(StatusCode::CREATED)
+        .status(StatusCode::ACCEPTED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
             serde_json::json!({
-                "id": artifact_id,
+                "session_id": session_id,
+                "status": "finalizing",
                 "product": session.product,
                 "version": session.version,
                 "file": session.filename,
@@ -1334,6 +1323,9 @@ async fn get_upload_progress(
                 "session_id": session.id,
                 "artifact_path": session.artifact_path,
                 "bytes_received": session.bytes_received,
+                "status": session.status,
+                "finalize_error": session.finalize_error,
+                "artifact_id": session.artifact_id,
             })
             .to_string(),
         ))
@@ -1477,30 +1469,145 @@ async fn put_temp_file_to_storage(
     repo: &RepoInfo,
     storage_key: &str,
     temp_path: &Path,
-) -> Result<(), Response> {
+) -> Result<(), String> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage backend resolution failed: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| format!("storage backend resolution failed: {e}"))?;
 
     let stream = open_temp_file_as_stream(temp_path)
         .await
-        .map_err(|e| fs_err("reopen temp for streaming put", e))?;
+        .map_err(|e| format!("reopen temp for streaming put: {e}"))?;
 
-    storage.put_stream(storage_key, stream).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage put_stream failed: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put_stream(storage_key, stream)
+        .await
+        .map_err(|e| format!("storage put_stream failed: {e}"))?;
 
     Ok(())
+}
+
+/// Owned inputs for the background finalize task. Everything is owned (no
+/// borrows) so the value can move into the spawned task.
+struct FinalizeParams {
+    session_id: Uuid,
+    repo_id: Uuid,
+    artifact_path: String,
+    product: String,
+    version: String,
+    size_bytes: i64,
+    checksum: String,
+    storage_key: String,
+    user_id: Uuid,
+    metadata: serde_json::Value,
+    temp_path: PathBuf,
+}
+
+/// Push the staged temp file to the repo's StorageBackend, create the
+/// artifact row, and fire the `scan_on_upload` trigger. Returns the new
+/// artifact id.
+///
+/// Errors are returned as strings (not an HTTP `Response`) because this runs
+/// on a background task after the client already received `202`; the caller
+/// records the string on the upload session so a failed finalize is
+/// observable rather than silently lost.
+async fn run_finalize(
+    state: &SharedState,
+    repo: &RepoInfo,
+    p: &FinalizeParams,
+) -> Result<Uuid, String> {
+    put_temp_file_to_storage(state, repo, &p.storage_key, &p.temp_path).await?;
+
+    let artifact_id = upsert_artifact(UpsertArtifactParams {
+        db: &state.db,
+        repo_id: p.repo_id,
+        artifact_path: &p.artifact_path,
+        product: &p.product,
+        version: &p.version,
+        size_bytes: p.size_bytes,
+        checksum: &p.checksum,
+        storage_key: &p.storage_key,
+        user_id: p.user_id,
+        metadata: &p.metadata,
+    })
+    .await?;
+
+    // scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
+    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            p.repo_id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
+
+    Ok(artifact_id)
+}
+
+/// Run [`run_finalize`] and record its outcome on the upload session, then
+/// remove the staged temp file. The client already received `202`, so a
+/// failed backend push must be observable: on success the session flips to
+/// `completed` with the new `artifact_id`; on failure it flips to `failed`
+/// with the error string, which `GET /incus/{repo}/uploads/{id}` surfaces.
+async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizeParams) {
+    let session_id = params.session_id;
+    match run_finalize(&state, &repo, &params).await {
+        Ok(artifact_id) => {
+            tracing::info!(
+                session = %session_id,
+                artifact = %artifact_id,
+                "Finalized Incus upload {} ({}B)",
+                params.artifact_path,
+                params.size_bytes
+            );
+            let _ = sqlx::query(
+                "UPDATE incus_upload_sessions \
+                 SET status = 'completed', artifact_id = $2, finalize_error = NULL, \
+                     updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(session_id)
+            .bind(artifact_id)
+            .execute(&state.db)
+            .await;
+        }
+        Err(msg) => {
+            tracing::error!(
+                session = %session_id,
+                error = %msg,
+                "Incus upload finalize failed for {}",
+                params.artifact_path
+            );
+            let _ = sqlx::query(
+                "UPDATE incus_upload_sessions \
+                 SET status = 'failed', finalize_error = $2, updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(session_id)
+            .bind(&msg)
+            .execute(&state.db)
+            .await;
+        }
+    }
+    let _ = tokio::fs::remove_file(&params.temp_path).await;
 }
 
 // ===========================================================================
@@ -3138,6 +3245,28 @@ mod streaming_pipeline_regression_tests {
     use axum::http::header;
     use tower::ServiceExt;
 
+    /// Poll `GET /{repo}/uploads/{id}` until the async finalize reaches a
+    /// terminal status, returning the final progress JSON. Panics on timeout.
+    async fn await_finalize(f: &tdh::Fixture, session_id: Uuid) -> serde_json::Value {
+        for _ in 0..400 {
+            let app = f.router_with_auth(router());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+                .body(Body::empty())
+                .expect("build progress GET");
+            let (status, body) = tdh::send(app, req).await;
+            assert_eq!(status, StatusCode::OK, "progress poll must return 200");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse progress JSON");
+            match json["status"].as_str() {
+                Some("completed") | Some("failed") => return json,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        panic!("finalize did not reach a terminal status in time");
+    }
+
     /// PUT a monolithic image, then GET it back. Exercises `upload_image`'s
     /// stream-to-temp-file → `put_temp_file_to_storage` → `put_stream`
     /// pipeline and the matching `download_image` → `get_stream` →
@@ -3170,20 +3299,39 @@ mod streaming_pipeline_regression_tests {
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(
             status,
-            StatusCode::CREATED,
-            "monolithic PUT must succeed: {}",
+            StatusCode::ACCEPTED,
+            "monolithic PUT must return 202 (async finalize): {}",
             String::from_utf8_lossy(&body)
         );
         let upload_json: serde_json::Value =
             serde_json::from_slice(&body).expect("parse upload response");
         assert_eq!(upload_json["size"].as_i64(), Some(payload.len() as i64));
+        assert_eq!(upload_json["status"].as_str(), Some("finalizing"));
         let returned_sha = upload_json["sha256"]
             .as_str()
             .expect("response has sha256 field")
             .to_string();
+        let session_id: Uuid = upload_json["session_id"]
+            .as_str()
+            .expect("response has session_id")
+            .parse()
+            .expect("session_id is a UUID");
+
+        // Poll the session until the background finalize completes.
+        let progress = await_finalize(&f, session_id).await;
+        assert_eq!(
+            progress["status"].as_str(),
+            Some("completed"),
+            "finalize must complete: {}",
+            progress
+        );
+        assert!(
+            progress["artifact_id"].as_str().is_some(),
+            "completed session must carry the artifact_id"
+        );
 
         // Confirm the artifact row was inserted with the storage key shape
-        // that `put_temp_file_to_storage` writes to.
+        // that the background finalize writes to.
         let storage_key: String = sqlx::query_scalar(
             "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2 LIMIT 1",
         )
@@ -3367,8 +3515,7 @@ mod streaming_pipeline_regression_tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::ACCEPTED, "PATCH chunk must be 202");
 
-        // PUT complete: this is where `put_temp_file_to_storage` runs and
-        // the temp file is removed.
+        // PUT complete: returns 202 and finalizes on a background task.
         let app = f.router_with_auth(router());
         let req = axum::http::Request::builder()
             .method("PUT")
@@ -3378,16 +3525,25 @@ mod streaming_pipeline_regression_tests {
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(
             status,
-            StatusCode::CREATED,
-            "PUT complete must succeed: {}",
+            StatusCode::ACCEPTED,
+            "PUT complete must return 202 (async finalize): {}",
             String::from_utf8_lossy(&body)
         );
 
-        // Staging temp file MUST be gone after complete.
+        // Poll until the background finalize completes.
+        let progress = await_finalize(&f, session_id).await;
+        assert_eq!(
+            progress["status"].as_str(),
+            Some("completed"),
+            "chunked finalize must complete: {}",
+            progress
+        );
+
+        // Staging temp file MUST be gone once finalize has run.
         let temp_path = temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id);
         assert!(
             !temp_path.exists(),
-            "staged temp file must be removed after complete_chunked_upload (path: {})",
+            "staged temp file must be removed after finalize (path: {})",
             temp_path.display()
         );
 
@@ -3410,6 +3566,83 @@ mod streaming_pipeline_regression_tests {
             bytes.as_ref(),
             expected.as_slice(),
             "chunked upload must round-trip through put_stream/get_stream"
+        );
+
+        f.teardown().await;
+    }
+
+    /// A finalize whose backend push fails must flip the session to `failed`
+    /// with an error string, so the client that already received `202` can
+    /// observe the failure via `GET /uploads/{id}` instead of it being lost.
+    #[tokio::test]
+    async fn failed_finalize_marks_session_failed() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        let session_id = Uuid::new_v4();
+        let artifact_path = build_artifact_path("ubuntu", "1", "incus.tar.xz");
+        // Temp file deliberately never created, so the finalize's backend push
+        // fails when it tries to reopen it for streaming.
+        let bogus_temp = std::env::temp_dir().join(format!("ak-incus-missing-{session_id}"));
+
+        sqlx::query(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status) \
+             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 0, $5, 'finalizing')",
+        )
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(&artifact_path)
+        .bind(bogus_temp.to_string_lossy().as_ref())
+        .execute(&f.pool)
+        .await
+        .expect("insert finalizing session");
+
+        let repo = RepoInfo {
+            id: f.repo_id,
+            key: f.repo_key.clone(),
+            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+
+        finalize_upload(
+            f.state.clone(),
+            repo,
+            FinalizeParams {
+                session_id,
+                repo_id: f.repo_id,
+                artifact_path: artifact_path.clone(),
+                product: "ubuntu".to_string(),
+                version: "1".to_string(),
+                size_bytes: 0,
+                checksum: "0".repeat(64),
+                storage_key: build_storage_key(&f.repo_id, &artifact_path),
+                user_id: f.user_id,
+                metadata: serde_json::json!({ "file_type": "unknown" }),
+                temp_path: bogus_temp,
+            },
+        )
+        .await;
+
+        let (status, err): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, finalize_error FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(
+            status, "failed",
+            "a failed finalize must mark the session 'failed'"
+        );
+        assert!(
+            err.is_some(),
+            "a failed finalize must record an observable error string"
         );
 
         f.teardown().await;
