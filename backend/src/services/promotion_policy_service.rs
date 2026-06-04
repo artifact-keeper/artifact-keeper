@@ -425,8 +425,27 @@ impl PromotionPolicyService {
             return Ok(None);
         };
 
+        // Open CVEs come from `scan_findings` (the populated source), not the
+        // never-written `cve_history` table. An artifact's open CVEs are the
+        // unacknowledged, cve_id-bearing findings from its latest completed
+        // scan -- the same `scan_findings` shape the SBOM read path uses. The
+        // old `cve_history` read was always empty, so a "block on open CVEs"
+        // gate silently passed (#1620; data source also addresses #1561).
         let cves: Vec<String> = sqlx::query_scalar(
-            r#"SELECT DISTINCT cve_id FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
+            r#"
+            WITH latest_scan AS (
+                SELECT id
+                FROM scan_results
+                WHERE artifact_id = $1 AND status = 'completed'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            SELECT DISTINCT sf.cve_id
+            FROM scan_findings sf
+            JOIN latest_scan ls ON sf.scan_result_id = ls.id
+            WHERE sf.cve_id IS NOT NULL
+              AND NOT sf.is_acknowledged
+            "#,
         )
         .bind(artifact_id)
         .fetch_all(&self.db)
