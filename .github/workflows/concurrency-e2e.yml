@@ -1,0 +1,116 @@
+# Multi-replica single-flight concurrency harness (#1624).
+#
+# Reproduces #1606 (per-process singleflight races across replicas serving
+# partial/truncated artifacts) and is the acceptance gate for #1609.
+#
+# IMPORTANT: this is RED on `main` BY DESIGN until #1609 (cross-process
+# single-flight) lands. It is therefore NOT wired into `pull_request` and must
+# never block the per-PR gate. It runs only on manual dispatch and an optional
+# weekly schedule so the reproduction stays observable.
+name: Concurrency E2E (single-flight race)
+
+on:
+  workflow_dispatch:
+    inputs:
+      replicas:
+        description: "Number of backend replicas"
+        required: false
+        default: "3"
+      concurrency:
+        description: "Number of concurrent GETs"
+        required: false
+        default: "200"
+      latency_ms:
+        description: "Mock upstream per-response latency (ms) to widen the race window"
+        required: false
+        default: "1500"
+      artifact_size_bytes:
+        description: "Mock artifact size in bytes (default 256 MiB)"
+        required: false
+        default: "268435456"
+  schedule:
+    # Weekly, Mondays 06:00 UTC. Keeps the #1606 reproduction observable on main.
+    - cron: "0 6 * * 1"
+
+# Never let this cancel or be cancelled by per-PR runs.
+concurrency:
+  group: concurrency-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Lint harness scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/concurrency/*.sh
+      - name: python syntax check
+        run: python3 -m py_compile scripts/concurrency/mock_upstream.py
+      - name: assert_lib unit tests (no Docker)
+        run: bash scripts/concurrency/test_assert_lib.sh
+      - name: compose config parses
+        run: docker compose -f docker-compose.concurrency-e2e.yml config >/dev/null
+
+  race:
+    name: Run single-flight race (allowed to fail on main)
+    runs-on: ubuntu-latest
+    needs: lint
+    # On `main` this job is EXPECTED to fail (it reproduces #1606). Do not let a
+    # red result mark the whole workflow failed in a way that pages people; the
+    # purpose is observability, not gating. Once #1609 lands, remove this.
+    continue-on-error: true
+    env:
+      REPLICAS: ${{ github.event.inputs.replicas || '3' }}
+      CONCURRENCY: ${{ github.event.inputs.concurrency || '200' }}
+      LATENCY_MS: ${{ github.event.inputs.latency_ms || '1500' }}
+      ARTIFACT_SIZE_BYTES: ${{ github.event.inputs.artifact_size_bytes || '268435456' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: |
+          docker compose -f docker-compose.concurrency-e2e.yml build
+
+      - name: Start stack with N backend replicas
+        run: |
+          # Override the mock upstream latency/size via env so the workflow
+          # inputs take effect.
+          export LATENCY_MS ARTIFACT_SIZE_BYTES
+          docker compose -f docker-compose.concurrency-e2e.yml up -d \
+            --scale backend="${REPLICAS}"
+
+      - name: Wait for the load balancer and replicas to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:18080/health >/dev/null 2>&1; then
+              echo "Backend reachable via LB."
+              break
+            fi
+            echo "waiting for stack... ($i)"
+            sleep 5
+          done
+          curl -sf http://localhost:19999/healthz
+
+      - name: Run the single-flight race driver
+        run: |
+          CONCURRENCY="${CONCURRENCY}" bash scripts/concurrency/run-singleflight-race.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concurrency-results
+          path: /tmp/concurrency-results/
+          if-no-files-found: ignore
+
+      - name: Dump backend logs on failure
+        if: failure() || always()
+        run: |
+          docker compose -f docker-compose.concurrency-e2e.yml logs --no-color > /tmp/concurrency-results/compose.log 2>&1 || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.concurrency-e2e.yml down -v || true
