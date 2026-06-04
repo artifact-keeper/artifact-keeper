@@ -60,15 +60,38 @@ pub async fn run_storage_gc(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<StorageGcRequest>,
 ) -> Result<Json<StorageGcResult>> {
-    if !auth.is_admin {
-        return Err(AppError::Unauthorized(
-            "Admin privileges required".to_string(),
-        ));
-    }
+    require_admin(auth.is_admin)?;
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
     let result = service.run_gc(payload.dry_run).await?;
     Ok(Json(result))
+}
+
+/// Gate an admin-only endpoint.
+///
+/// Returns `Ok(())` when the caller is an admin and an
+/// [`AppError::Unauthorized`] otherwise. Extracted from the handlers so the
+/// authorization branch is unit-testable without constructing a full axum
+/// request (the handlers themselves require a live DB-backed `SharedState`).
+fn require_admin(is_admin: bool) -> Result<()> {
+    if is_admin {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ))
+    }
+}
+
+/// Resolve the effective grace-window argument for the blob report from the
+/// optional `grace_hours` query parameter.
+///
+/// An absent parameter resolves to `0`, which the service layer then clamps
+/// to [`crate::services::storage_gc_service::BLOB_REPORT_GRACE_HOURS_DEFAULT`].
+/// Keeping this mapping in a pure helper makes the query-param handling
+/// coverable without standing up the HTTP stack.
+fn resolve_report_grace_hours(grace_hours: Option<i64>) -> i64 {
+    grace_hours.unwrap_or_default()
 }
 
 /// Query parameters for the read-only OCI blob footprint report.
@@ -103,15 +126,11 @@ pub async fn oci_blob_report(
     Extension(auth): Extension<AuthExtension>,
     Query(query): Query<OciBlobReportQuery>,
 ) -> Result<Json<OciBlobFootprintReport>> {
-    if !auth.is_admin {
-        return Err(AppError::Unauthorized(
-            "Admin privileges required".to_string(),
-        ));
-    }
+    require_admin(auth.is_admin)?;
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
     let report = service
-        .oci_blob_footprint_report(query.grace_hours.unwrap_or_default())
+        .oci_blob_footprint_report(resolve_report_grace_hours(query.grace_hours))
         .await?;
     Ok(Json(report))
 }
@@ -356,6 +375,49 @@ mod tests {
             json.contains("oci_blob_report"),
             "OpenAPI doc should contain operation ID 'oci_blob_report'"
         );
+    }
+
+    // -- require_admin authorization gate --
+
+    #[test]
+    fn test_require_admin_allows_admin() {
+        assert!(require_admin(true).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_rejects_non_admin() {
+        let err = require_admin(false).unwrap_err();
+        match err {
+            AppError::Unauthorized(msg) => {
+                assert!(
+                    msg.contains("Admin privileges required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    // -- resolve_report_grace_hours query-param mapping --
+
+    #[test]
+    fn test_resolve_report_grace_hours_absent_is_zero() {
+        // Absent resolves to 0, which the service clamps to the default
+        // window; the handler must not itself substitute a default.
+        assert_eq!(resolve_report_grace_hours(None), 0);
+    }
+
+    #[test]
+    fn test_resolve_report_grace_hours_passes_through_value() {
+        assert_eq!(resolve_report_grace_hours(Some(48)), 48);
+        assert_eq!(resolve_report_grace_hours(Some(0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_report_grace_hours_passes_through_negative() {
+        // Negative values are forwarded unchanged; clamping is the service's
+        // responsibility, not the handler's.
+        assert_eq!(resolve_report_grace_hours(Some(-7)), -7);
     }
 
     #[test]
