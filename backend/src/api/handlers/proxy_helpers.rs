@@ -12,6 +12,7 @@ use crate::api::download_response::try_presigned_redirect;
 use crate::api::handlers::error_helpers::map_storage_err;
 use crate::api::AppState;
 use crate::error::AppError;
+use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
@@ -1598,6 +1599,21 @@ pub async fn virtual_non_remote_owns_name(
     virtual_repo_id: Uuid,
     package_name: &str,
 ) -> Result<bool, Response> {
+    virtual_non_remote_owns_name_version(db, virtual_repo_id, package_name, None).await
+}
+
+/// Version-aware variant of [`virtual_non_remote_owns_name`]. When `version`
+/// is `Some`, the guard fires if a local member owns a PEP 440-equal version
+/// (`PypiHandler::canonical_version`), so `1.0`/`1.0.0` still match. The guard
+/// is fail-safe: `version = None`, or a requested version that cannot be
+/// canonicalized, falls back to name-only suppression (any local version of the
+/// name suppresses the proxy) rather than allowing fan-out.
+pub async fn virtual_non_remote_owns_name_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+    version: Option<&str>,
+) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
         .iter()
@@ -1609,28 +1625,77 @@ pub async fn virtual_non_remote_owns_name(
         return Ok(false);
     }
 
-    let exists = sqlx::query(
-        "SELECT 1 FROM artifacts \
-                              WHERE repository_id = ANY($1) \
-                                AND is_deleted = false \
-                                AND LOWER(name) = LOWER($2) \
-                              LIMIT 1",
+    // Name-only fallback (original behaviour): any local version of the name
+    // suppresses the proxy. Single round trip with a LIMIT 1 short-circuit.
+    let Some(version) = version else {
+        let exists = sqlx::query(
+            "SELECT 1 FROM artifacts \
+             WHERE repository_id = ANY($1) \
+               AND is_deleted = false \
+               AND LOWER(name) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(&non_remote_ids)
+        .bind(package_name)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+        return Ok(exists.is_some());
+    };
+
+    // Version-aware path. The requested version is parsed from the filename
+    // while `artifacts.version` is the upload-metadata version, and neither is
+    // PEP 440-canonical for legacy rows, so exact SQL equality both leaks
+    // (false negative) and 404s (false positive). Compare canonically in Rust:
+    // fetch the local versions for this name and match `1.0`==`1.0.0` etc.
+    let stored_versions: Vec<String> = sqlx::query_scalar(
+        "SELECT version FROM artifacts \
+         WHERE repository_id = ANY($1) \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version IS NOT NULL",
     )
     .bind(&non_remote_ids)
     .bind(package_name)
-    .fetch_optional(db)
+    .fetch_all(db)
     .await
-    .map_err(|e| {
-        tracing::error!(
-            event = "shadowing_guard_db_error",
-            virtual_repo_id = %virtual_repo_id,
-            error = %e,
-            "cross-format shadowing-guard DB query failed; failing closed to 500",
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
-    })?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
 
-    Ok(exists.is_some())
+    Ok(pypi_version_owned(version, &stored_versions))
+}
+
+/// Decide whether `requested` matches any of the locally-owned `stored`
+/// versions for the shadowing guard.
+///
+/// Fail-safe: when `requested` cannot be confidently canonicalized (e.g. a
+/// PEP 427 filename-escaped local segment that drops the `+`, yielding
+/// `1.2.3_gitsha`), we cannot prove it differs from the locally-owned versions,
+/// so we treat the name as owned (suppress the proxy) rather than allowing
+/// fan-out. Allowing fan-out for a locally-owned name+version is the
+/// dependency-confusion hole. When both sides canonicalize we compare by PEP 440
+/// equality; an unparseable stored row falls back to exact case-insensitive
+/// match.
+fn pypi_version_owned(requested: &str, stored_versions: &[String]) -> bool {
+    let Some(requested_canon) = PypiHandler::canonical_version(requested) else {
+        return true;
+    };
+
+    stored_versions
+        .iter()
+        .any(|stored| match PypiHandler::canonical_version(stored) {
+            Some(s) => requested_canon == s,
+            None => stored.eq_ignore_ascii_case(requested),
+        })
+}
+
+fn shadowing_guard_db_err(virtual_repo_id: Uuid, e: sqlx::Error) -> Response {
+    tracing::error!(
+        event = "shadowing_guard_db_error",
+        virtual_repo_id = %virtual_repo_id,
+        error = %e,
+        "cross-format shadowing-guard DB query failed; failing closed to 500",
+    );
+    (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -2371,6 +2436,40 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
+
+    // ── pypi_version_owned (shadowing guard) tests ──────────────────
+
+    #[test]
+    fn test_pypi_version_owned_canonical_match() {
+        // Clean dotted versions match across PEP 440-equal release forms.
+        let stored = vec!["1.1.1".to_string()];
+        assert!(pypi_version_owned("1.1.1", &stored));
+        assert!(pypi_version_owned("1.1.1.0", &stored));
+        // A version not held locally allows fan-out (not owned).
+        assert!(!pypi_version_owned("1.0.0", &stored));
+    }
+
+    #[test]
+    fn test_pypi_version_owned_fails_safe_on_unparseable_request() {
+        // PEP 427 filename-escaped local segment drops the `+`, so the requested
+        // version is unparseable. The guard must suppress (treat as owned) when a
+        // local version of the name exists, never allow fan-out.
+        let stored = vec!["1.2.3+gitsha".to_string()];
+        assert!(pypi_version_owned("1.2.3_gitsha", &stored));
+        // Even an unrelated stored version suppresses, because we cannot prove
+        // the requested version differs.
+        let other = vec!["9.9.9".to_string()];
+        assert!(pypi_version_owned("1.2.3_gitsha", &other));
+    }
+
+    #[test]
+    fn test_pypi_version_owned_legacy_unparseable_stored_exact_match() {
+        // A stored row that is not PEP 440 falls back to exact case-insensitive
+        // match against the requested version.
+        let stored = vec!["weird-local".to_string()];
+        assert!(pypi_version_owned("WEIRD-LOCAL", &stored));
+        assert!(!pypi_version_owned("1.0.0", &stored));
+    }
 
     // ── reverse_suffix_for_like tests ───────────────────────────────
 
