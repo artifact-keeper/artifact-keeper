@@ -3441,6 +3441,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Credential-change session invalidation — HTTP plane (issue #1636,
+    // regression of #505). The HTTP auth middleware validates every request
+    // through `validate_access_token_async`, which shares the
+    // `invalidate_user_tokens` watermark map with the synchronous
+    // `validate_access_token` exercised here. A password change calls
+    // `invalidate_user_tokens(user_id)` (see
+    // `api::handlers::users::change_password`), so a JWT minted before that
+    // call MUST be rejected and a JWT minted after it MUST be accepted.
+    //
+    // This pins the invariant at the public `AuthService` token-validation
+    // surface so a refactor that drops the `is_token_invalidated` consult
+    // from `validate_access_token` is caught even when the lower-level
+    // `is_token_invalidated` unit tests still pass against the orphaned
+    // helper.
+    // -----------------------------------------------------------------------
+
+    /// Build a `super-secret`-keyed `AuthService` over a lazy (never-connected)
+    /// pool. The sync `validate_access_token` path performs no DB I/O, so the
+    /// lazy pool is sufficient and keeps this a pure unit test.
+    fn invalidation_test_service() -> (AuthService, Arc<Config>) {
+        let cfg = make_test_config();
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
+            .expect("connect_lazy never errors on construction");
+        (AuthService::new(pool, cfg.clone()), cfg)
+    }
+
+    /// Mint an access JWT for `user` with an explicit `iat` (seconds), signed
+    /// with the service's configured secret — exactly the shape the HTTP
+    /// middleware decodes.
+    fn mint_access_token_at(cfg: &Config, user: &User, iat: i64) -> String {
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            iat,
+            exp: iat + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode access token")
+    }
+
+    // `#[tokio::test]`: `connect_lazy` defers connection but its pool
+    // machinery still requires a Tokio reactor in scope on first touch. The
+    // sync `validate_access_token` performs no DB I/O, so no real connection
+    // is ever opened — the runtime is only needed for the lazy pool's
+    // construction guard.
+    #[tokio::test]
+    async fn test_http_token_minted_before_password_change_is_rejected() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // A token minted strictly before the credential change. We backdate
+        // `iat` by 10 s so the invalidation watermark (now, or now+1) lands
+        // strictly after it regardless of sub-second timing.
+        let pre_change_iat = Utc::now().timestamp() - 10;
+        let pre_change_token = mint_access_token_at(&cfg, &user, pre_change_iat);
+
+        // Before the password change the token is accepted on the HTTP plane.
+        assert!(
+            service.validate_access_token(&pre_change_token).is_ok(),
+            "freshly minted pre-change token should validate before invalidation"
+        );
+
+        // Password change fires `invalidate_user_tokens(user_id)`.
+        invalidate_user_tokens(user.id);
+
+        // The previously-valid token is now rejected — the #505 regression.
+        let err = service
+            .validate_access_token(&pre_change_token)
+            .expect_err("pre-change token MUST be rejected after credential change");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "rejection must be an authentication failure, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_token_minted_after_password_change_is_accepted() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // Credential change happens first.
+        invalidate_user_tokens(user.id);
+
+        // A token minted at least one whole second after the invalidation.
+        // The watermark is `now + 1` (#1436), so `now + 2` is strictly newer.
+        let post_change_iat = Utc::now().timestamp() + 2;
+        let post_change_token = mint_access_token_at(&cfg, &user, post_change_iat);
+
+        assert!(
+            service.validate_access_token(&post_change_token).is_ok(),
+            "a token minted after the credential change MUST be accepted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // API-token cache invalidation on user deactivation (issue #931)
     // -----------------------------------------------------------------------
 
