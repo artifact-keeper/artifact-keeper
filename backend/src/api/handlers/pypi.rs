@@ -1001,21 +1001,15 @@ async fn serve_file(
                 }
 
                 // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // PEP 503 normalizes project names (lowercase, runs of
-                // non-alphanumeric collapsed to `-`), so the canonical
-                // identity we compare against `artifacts.name` is the
-                // normalized form. If any non-Remote member already owns
-                // the normalized name, refuse to fan out to Remote
-                // members. This mirrors the hex / cargo / npm /
-                // rubygems behavior; for PyPI specifically, this defeats
-                // the "operator publishes `mycompany-utils` to a Local
-                // member; attacker publishes the same name on pypi.org"
-                // dependency-confusion attack.
+                // Version-aware: suppress the proxy only when a local member
+                // owns the requested version, not any version of the name (#1582).
                 let normalized_project = PypiHandler::normalize_name(project);
-                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name(
+                let requested_version = PypiHandler::version_from_filename(filename);
+                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name_version(
                     &state.db,
                     repo.id,
                     &normalized_project,
+                    requested_version.as_deref(),
                 )
                 .await?;
 

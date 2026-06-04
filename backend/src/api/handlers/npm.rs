@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Extension;
 use axum::Router;
 use base64::Engine;
@@ -50,6 +50,18 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/-/npm/v1/security/audits/quick",
             post(security_audits_quick),
+        )
+        // dist-tags (npm dist-tag ls/add/rm + `npm install pkg@<tag>` resolution).
+        // npm percent-encodes scoped names here (`@scope%2Fname`), so a single
+        // `:package` segment captures both scoped and unscoped. Literal `-/package`
+        // keeps these ahead of the `:package` catch-alls (see issue #1543).
+        .route(
+            "/:repo_key/-/package/:package/dist-tags",
+            get(dist_tags_get),
+        )
+        .route(
+            "/:repo_key/-/package/:package/dist-tags/:tag",
+            put(dist_tags_put).delete(dist_tags_delete),
         )
         // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
         .route(
@@ -423,9 +435,10 @@ fn build_npm_metadata_response(
     package_name: &str,
     base_url: &str,
     repo_key: &str,
+    stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Response, Response> {
     let mut versions = serde_json::Map::new();
-    let mut latest_version: Option<String> = None;
+    let mut version_list: Vec<String> = Vec::new();
 
     for artifact in artifacts {
         let version = match &artifact.version {
@@ -476,22 +489,105 @@ fn build_npm_metadata_response(
         );
 
         versions.insert(version.clone(), version_obj);
-        latest_version = Some(version);
+        version_list.push(version);
     }
 
-    let dist_tags = serde_json::json!({
-        "latest": latest_version.unwrap_or_default()
-    });
+    // Emit the stored dist-tags map verbatim, then ensure a usable `latest`:
+    // keep an explicit `latest` that still resolves to a known version,
+    // otherwise derive it as the highest non-prerelease semver (issue #1543).
+    let mut dist_tags = stored_dist_tags.clone();
+    let latest_resolves = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(|l| version_list.iter().any(|v| v == l))
+        .unwrap_or(false);
+    if !latest_resolves {
+        if let Some(latest) = derive_latest_version(&version_list) {
+            dist_tags.insert("latest".to_string(), serde_json::Value::String(latest));
+        }
+    }
 
     let response = serde_json::json!({
         "name": package_name,
         "versions": versions,
-        "dist-tags": dist_tags,
+        "dist-tags": serde_json::Value::Object(dist_tags),
     });
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&response).unwrap(),
     ))
+}
+
+/// Choose the `latest` dist-tag for a set of versions when none is recorded.
+///
+/// Per npm convention `latest` should be the highest **non-prerelease** semver,
+/// never auto-set to a prerelease by recency. We compare on the numeric
+/// `major.minor.patch` core (build metadata and prerelease suffixes are
+/// stripped); a version carrying a `-prerelease` suffix is excluded from the
+/// stable candidates. Falls back to the highest version overall when every
+/// version is a prerelease, and to the last (most-recently-created) version
+/// when nothing parses as semver. Returns `None` only for an empty input.
+fn derive_latest_version(versions: &[String]) -> Option<String> {
+    // Parse into (major, minor, patch, is_prerelease); `None` if not semver-ish.
+    fn parse(v: &str) -> Option<(u64, u64, u64, bool)> {
+        let core = v.split('+').next().unwrap_or(v); // drop +build metadata
+        let (mmp, is_pre) = match core.split_once('-') {
+            Some((head, _pre)) => (head, true),
+            None => (core, false),
+        };
+        let mut parts = mmp.split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+        let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+        Some((major, minor, patch, is_pre))
+    }
+
+    let mut best_stable: Option<(&String, (u64, u64, u64))> = None;
+    let mut best_any: Option<(&String, (u64, u64, u64))> = None;
+    for v in versions {
+        if let Some((major, minor, patch, is_pre)) = parse(v) {
+            let key = (major, minor, patch);
+            // Prefer the later-listed (more recent) version on ties.
+            if best_any.as_ref().map_or(true, |(_, k)| key >= *k) {
+                best_any = Some((v, key));
+            }
+            if !is_pre && best_stable.as_ref().map_or(true, |(_, k)| key >= *k) {
+                best_stable = Some((v, key));
+            }
+        }
+    }
+
+    best_stable
+        .map(|(v, _)| v.clone())
+        .or_else(|| best_any.map(|(v, _)| v.clone()))
+        .or_else(|| versions.last().cloned())
+}
+
+/// Fetch the stored npm dist-tags map for a package from the `npm_dist_tags`
+/// table, which holds exactly one row per (repository_id, name). Best-effort:
+/// returns an empty map when there is no row, no tags, or on any query error
+/// (the caller still derives a `latest` from the versions).
+async fn fetch_npm_dist_tags(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    package_name: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    // PRIMARY KEY (repository_id, name) guarantees at most one row, so
+    // fetch_optional is safe here (unlike a per-version `packages` read).
+    let stored: Option<serde_json::Value> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT tags FROM npm_dist_tags WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repository_id)
+    .bind(package_name)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    stored
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Fetch all non-deleted artifacts for a given package from a single repository,
@@ -590,7 +686,14 @@ async fn get_package_metadata(
             {
                 let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
                 if !meta.is_empty() {
-                    return build_npm_metadata_response(&meta, package_name, &base_url, repo_key);
+                    let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
+                    return build_npm_metadata_response(
+                        &meta,
+                        package_name,
+                        &base_url,
+                        repo_key,
+                        &dist_tags,
+                    );
                 }
                 continue;
             }
@@ -647,7 +750,14 @@ async fn get_package_metadata(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    build_npm_metadata_response(&meta_artifacts, package_name, &base_url, repo_key)
+    let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
+    build_npm_metadata_response(
+        &meta_artifacts,
+        package_name,
+        &base_url,
+        repo_key,
+        &dist_tags,
+    )
 }
 
 /// Fetch the full packument and extract a single version's metadata.
@@ -677,7 +787,14 @@ async fn get_package_version_metadata(
         if artifacts.is_empty() {
             return Err(AppError::NotFound("Package not found".to_string()).into_response());
         }
-        let resp = build_npm_metadata_response(&artifacts, package_name, &base_url, repo_key)?;
+        // Version extraction ignores dist-tags; pass an empty map.
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            package_name,
+            &base_url,
+            repo_key,
+            &serde_json::Map::new(),
+        )?;
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| {
@@ -752,7 +869,13 @@ async fn fetch_virtual_packument(
         {
             let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
             if !meta.is_empty() {
-                let resp = build_npm_metadata_response(&meta, package_name, base_url, repo_key)?;
+                let resp = build_npm_metadata_response(
+                    &meta,
+                    package_name,
+                    base_url,
+                    repo_key,
+                    &serde_json::Map::new(),
+                )?;
                 let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
                     .await
                     .map_err(|e| {
@@ -1194,6 +1317,9 @@ async fn publish_scoped(
 /// Parsed and validated npm publish payload ready for storage.
 struct ParsedNpmPublish {
     versions: Vec<NpmVersionToPublish>,
+    /// The `dist-tags` object from the publish body (e.g. `{"latest": "1.0.0"}`,
+    /// or `{"next": "2.0.0-rc.1"}` for `npm publish --tag next`).
+    dist_tags: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A single version extracted from the npm publish payload.
@@ -1250,7 +1376,18 @@ fn parse_npm_publish_payload(
         versions.push(parsed);
     }
 
-    Ok(ParsedNpmPublish { versions })
+    // npm sends the tag being published in `dist-tags` (default `latest`, or the
+    // value of `--tag <tag>`). Capture it so it can be persisted (issue #1543).
+    let dist_tags = payload
+        .get("dist-tags")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(ParsedNpmPublish {
+        versions,
+        dist_tags,
+    })
 }
 
 /// Extract and decode the tarball for a single version from the attachments map.
@@ -1448,6 +1585,32 @@ async fn publish_package(
         .await?;
     }
 
+    // Persist custom dist-tags from the publish body into npm_dist_tags
+    // (one row per repository_id+name; jsonb `||` overwrites matching keys).
+    //
+    // We deliberately DROP `latest` here. A plain `npm publish` always sends
+    // {"latest": "<this version>"}, so persisting it verbatim would pin
+    // `latest` to the just-published version — including a prerelease published
+    // without `--tag` (e.g. `2.0.0-rc.1`), which is exactly the bug #1543
+    // targets. `latest` is computed by semver in build_npm_metadata_response
+    // (highest non-prerelease); an explicit `npm dist-tag add <pkg>@<v> latest`
+    // (dist_tags_put) still sets it deterministically.
+    let mut publish_tags = parsed.dist_tags.clone();
+    publish_tags.remove("latest");
+    if !publish_tags.is_empty() {
+        let tags_value = serde_json::Value::Object(publish_tags);
+        let _ = sqlx::query(
+            "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+             ON CONFLICT (repository_id, name) DO UPDATE \
+             SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
+        )
+        .bind(repo.id)
+        .bind(package_name)
+        .bind(&tags_value)
+        .execute(&state.db)
+        .await;
+    }
+
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -1455,6 +1618,155 @@ async fn publish_package(
     )
     .execute(&state.db)
     .await;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// dist-tags endpoints (`npm dist-tag ls/add/rm`)
+// ---------------------------------------------------------------------------
+
+/// `GET /npm/{repo}/-/package/{pkg}/dist-tags` — list the package's dist-tags.
+///
+/// Delegates to the packument path so local, virtual and remote repos all
+/// resolve consistently, then returns just its `dist-tags` object.
+async fn dist_tags_get(
+    State(state): State<SharedState>,
+    Path((repo_key, package)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+
+    let resp = get_package_metadata(&state, &repo_key, &package, &headers).await?;
+    if !resp.status().is_success() {
+        return Ok(resp);
+    }
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+        })?;
+    let packument: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        AppError::Internal(format!("Failed to parse packument JSON: {}", e)).into_response()
+    })?;
+    let dist_tags = packument
+        .get("dist-tags")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&dist_tags).unwrap(),
+    ))
+}
+
+/// `PUT /npm/{repo}/-/package/{pkg}/dist-tags/{tag}` — point `tag` at a version
+/// (`npm dist-tag add pkg@ver tag`). The body is a JSON string of the version.
+async fn dist_tags_put(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, tag)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    let _user_id =
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    if tag.is_empty() {
+        return Err(
+            AppError::Validation("dist-tag name must not be empty".to_string()).into_response(),
+        );
+    }
+
+    // Body is a bare JSON string, e.g. "1.2.3".
+    let version = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .ok_or_else(|| {
+            AppError::Validation("dist-tag body must be a JSON version string".to_string())
+                .into_response()
+        })?;
+
+    // The target version must exist in this repo for this package.
+    let existing: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+    )
+    .bind(repo.id)
+    .bind(&package)
+    .bind(&version)
+    .fetch_one(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    if existing == 0 {
+        return Err(
+            AppError::NotFound(format!("Version {} of {} not found", version, package))
+                .into_response(),
+        );
+    }
+
+    let mut patch = serde_json::Map::new();
+    patch.insert(tag.clone(), serde_json::Value::String(version));
+    let patch_value = serde_json::Value::Object(patch);
+    // Upsert the (repository_id, name) row — the version-existence check above
+    // already 404s a tag pointed at a nonexistent version, and the package's
+    // dist-tags row may not exist yet (first tag for the package).
+    sqlx::query(
+        "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+         ON CONFLICT (repository_id, name) DO UPDATE \
+         SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
+    )
+    .bind(repo.id)
+    .bind(&package)
+    .bind(&patch_value)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
+}
+
+/// `DELETE /npm/{repo}/-/package/{pkg}/dist-tags/{tag}` — remove a dist-tag.
+/// `latest` cannot be removed (a package must always have a `latest`).
+async fn dist_tags_delete(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, tag)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    let _user_id =
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    if tag == "latest" {
+        return Err(
+            AppError::Validation("the 'latest' dist-tag cannot be removed".to_string())
+                .into_response(),
+        );
+    }
+
+    let _ = sqlx::query(
+        "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
+         WHERE repository_id = $2 AND name = $3",
+    )
+    .bind(&tag)
+    .bind(repo.id)
+    .bind(&package)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -2409,8 +2721,14 @@ mod tests {
         base_url: &str,
         repo_key: &str,
     ) -> serde_json::Value {
-        let resp =
-            build_npm_metadata_response(artifacts, package_name, base_url, repo_key).unwrap();
+        let resp = build_npm_metadata_response(
+            artifacts,
+            package_name,
+            base_url,
+            repo_key,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2776,14 +3094,20 @@ mod tests {
             metadata: None,
         }];
 
-        let resp_unscoped =
-            build_npm_metadata_response(&unscoped, "mdurl", "http://localhost:8080", "npm-hosted")
-                .unwrap();
+        let resp_unscoped = build_npm_metadata_response(
+            &unscoped,
+            "mdurl",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        )
+        .unwrap();
         let resp_scoped = build_npm_metadata_response(
             &scoped,
             "@types/mdurl",
             "http://localhost:8080",
             "npm-hosted",
+            &serde_json::Map::new(),
         )
         .unwrap();
 
@@ -3206,5 +3530,358 @@ mod tests {
         );
 
         cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // dist-tags (#1543): `latest` derivation + custom-tag persistence/emit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_latest_prefers_stable_over_prerelease() {
+        // 2.0.0-rc.1 is created last, but `latest` must be the highest stable.
+        let versions = vec![
+            "1.0.0".to_string(),
+            "1.1.0".to_string(),
+            "2.0.0-rc.1".to_string(),
+        ];
+        assert_eq!(derive_latest_version(&versions), Some("1.1.0".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_picks_highest_stable_numerically() {
+        // 1.10.0 > 1.2.0 numerically (not lexically).
+        let versions = vec![
+            "1.2.0".to_string(),
+            "1.10.0".to_string(),
+            "1.3.0".to_string(),
+        ];
+        assert_eq!(derive_latest_version(&versions), Some("1.10.0".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_all_prerelease_falls_back_to_highest_core() {
+        let versions = vec![
+            "2.0.0-rc.1".to_string(),
+            "2.0.0-rc.2".to_string(),
+            "1.9.0-beta".to_string(),
+        ];
+        // No stable version exists -> highest core, later-listed wins the tie.
+        assert_eq!(
+            derive_latest_version(&versions),
+            Some("2.0.0-rc.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_latest_non_semver_falls_back_to_last() {
+        let versions = vec!["alpha".to_string(), "nightly".to_string()];
+        assert_eq!(
+            derive_latest_version(&versions),
+            Some("nightly".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_latest_ignores_build_metadata() {
+        let versions = vec!["1.0.0+build.5".to_string(), "1.0.1".to_string()];
+        assert_eq!(derive_latest_version(&versions), Some("1.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_empty_is_none() {
+        assert_eq!(derive_latest_version(&[]), None);
+    }
+
+    /// #1543 end-to-end: a custom dist-tag is served in the packument and
+    /// `latest` is the highest non-prerelease version, not the most recently
+    /// created one. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_packument_dist_tags_served_and_latest_is_stable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // Seed three versions; the prerelease is created LAST (the worst case
+        // for the old recency-based `latest`).
+        for ver in ["1.0.0", "1.1.0", "2.0.0-rc.1"] {
+            let path = format!("widget/{ver}/widget-{ver}.tgz");
+            let storage_key = format!("npm/{path}");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &storage_key,
+                &path,
+                "widget",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+
+        // Record a custom `next` tag as `npm publish --tag next` would, in the
+        // dedicated per-package table (PK repository_id, name). Note there are
+        // THREE versions seeded above: the per-(repo,name) row makes the read
+        // single-row regardless of version count.
+        sqlx::query("INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3)")
+            .bind(fx.repo_id)
+            .bind("widget")
+            .bind(serde_json::json!({ "next": "2.0.0-rc.1" }))
+            .execute(&fx.pool)
+            .await
+            .expect("seed npm_dist_tags");
+
+        let result =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        // Tear down before asserting so a failure never leaks DB/storage state.
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => panic!("get_package_metadata failed: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument json");
+        let dist_tags = &json["dist-tags"];
+
+        // Custom tag preserved...
+        assert_eq!(dist_tags["next"], "2.0.0-rc.1");
+        // ...and `latest` is the highest STABLE version, not the prerelease.
+        assert_eq!(dist_tags["latest"], "1.1.0");
+    }
+
+    /// #1543 finding-2: a plain `npm publish` of a PRERELEASE must not pin
+    /// `latest` to it. Every publish body carries `"dist-tags":{"latest":
+    /// "<this version>"}`; the publish path drops `latest` so it stays the
+    /// semver-derived highest stable. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_prerelease_does_not_clobber_latest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // A stable release already exists.
+        let path = "widget/1.1.0/widget-1.1.0.tgz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            "widget",
+            "1.1.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        // `npm publish` of a prerelease with NO explicit --tag: the client
+        // still sends `dist-tags: { latest: <this version> }`.
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "2.0.0-rc.1": { "name": "widget", "version": "2.0.0-rc.1" }
+            },
+            "_attachments": {
+                "widget-2.0.0-rc.1.tgz": { "data": tarball_b64 }
+            },
+            "dist-tags": { "latest": "2.0.0-rc.1" }
+        });
+        let publish = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+
+        // Read back the stored tags and the served packument.
+        let stored = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        let meta =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        fx.teardown().await;
+
+        assert!(
+            publish.is_ok(),
+            "prerelease publish should succeed: {:?}",
+            publish.err().map(|r| r.status())
+        );
+        // The publish-body `latest` was dropped, never persisted.
+        assert!(
+            !stored.contains_key("latest"),
+            "publish must not persist `latest` from the body; stored: {stored:?}"
+        );
+        let resp = meta.expect("packument");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse packument json");
+        // `latest` resolves to the highest STABLE (1.1.0), not the just-published
+        // prerelease — the whole point of #1543.
+        assert_eq!(
+            json["dist-tags"]["latest"], "1.1.0",
+            "latest must stay the highest stable, not the published prerelease"
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_extracts_dist_tags() {
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let body = serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "2.0.0-rc.1": { "name": "widget", "version": "2.0.0-rc.1" }
+            },
+            "_attachments": {
+                "widget-2.0.0-rc.1.tgz": { "data": tarball_b64 }
+            },
+            "dist-tags": { "next": "2.0.0-rc.1" }
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let parsed = parse_npm_publish_payload(&bytes, "widget").expect("payload should parse");
+        assert_eq!(
+            parsed.dist_tags.get("next").and_then(|v| v.as_str()),
+            Some("2.0.0-rc.1")
+        );
+        assert_eq!(parsed.versions.len(), 1);
+    }
+
+    /// #1543: the dist-tags endpoints backing `npm dist-tag add/ls/rm`.
+    /// Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_dist_tags_endpoints_put_get_delete() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // Seed two versions so the PUT existence check passes.
+        for ver in ["1.0.0", "2.0.0-rc.1"] {
+            let path = format!("widget/{ver}/widget-{ver}.tgz");
+            let storage_key = format!("npm/{path}");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &storage_key,
+                &path,
+                "widget",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+        // No npm_dist_tags pre-seed: dist_tags_put UPSERTs the row itself, and
+        // its target-version check reads `artifacts` (seeded above), so the two
+        // real versions are all the setup the handlers need.
+
+        // PUT next -> 2.0.0-rc.1 (a real version)
+        let put_next = super::dist_tags_put(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+            Bytes::from_static(b"\"2.0.0-rc.1\""),
+        )
+        .await;
+
+        // PUT a tag pointing at a version that does not exist -> error.
+        let put_missing = super::dist_tags_put(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "beta".to_string(),
+            )),
+            HeaderMap::new(),
+            Bytes::from_static(b"\"9.9.9\""),
+        )
+        .await;
+
+        // GET the dist-tags map.
+        let get_tags = super::dist_tags_get(
+            axum::extract::State(fx.state.clone()),
+            axum::extract::Path((fx.repo_key.clone(), "widget".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // DELETE the custom tag.
+        let del_next = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // `latest` cannot be deleted.
+        let del_latest = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "latest".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert!(
+            put_next.is_ok(),
+            "PUT of an existing version should succeed"
+        );
+        assert!(
+            put_missing.is_err(),
+            "PUT of a nonexistent version should fail"
+        );
+
+        // GET returns the custom tag plus a derived stable `latest`
+        // (1.0.0 is stable; 2.0.0-rc.1 is a prerelease, so latest != next).
+        let resp = match get_tags {
+            Ok(r) => r,
+            Err(r) => panic!("dist_tags_get failed: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read dist-tags body");
+        let tags: serde_json::Value = serde_json::from_slice(&body).expect("parse dist-tags json");
+        assert_eq!(tags["next"], "2.0.0-rc.1");
+        assert_eq!(tags["latest"], "1.0.0");
+
+        assert!(del_next.is_ok(), "DELETE of a custom tag should succeed");
+        assert!(del_latest.is_err(), "DELETE of `latest` must be rejected");
     }
 }

@@ -84,9 +84,9 @@ impl RepositoryType {
     /// Convert to Artifact Keeper repository type string
     pub fn to_artifact_keeper(&self) -> &'static str {
         match self {
-            Self::Local => "hosted",
-            Self::Remote => "proxy",
-            Self::Virtual => "group",
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::Virtual => "virtual",
         }
     }
 }
@@ -1460,9 +1460,9 @@ mod tests {
 
     #[test]
     fn test_repository_type_to_artifact_keeper() {
-        assert_eq!(RepositoryType::Local.to_artifact_keeper(), "hosted");
-        assert_eq!(RepositoryType::Remote.to_artifact_keeper(), "proxy");
-        assert_eq!(RepositoryType::Virtual.to_artifact_keeper(), "group");
+        assert_eq!(RepositoryType::Local.to_artifact_keeper(), "local");
+        assert_eq!(RepositoryType::Remote.to_artifact_keeper(), "remote");
+        assert_eq!(RepositoryType::Virtual.to_artifact_keeper(), "virtual");
     }
 
     #[test]
@@ -1472,7 +1472,7 @@ mod tests {
             let ak_type = repo_type.to_artifact_keeper();
             // Verify the AK type is valid
             assert!(
-                ["hosted", "proxy", "group"].contains(&ak_type),
+                ["local", "remote", "virtual"].contains(&ak_type),
                 "Unexpected AK type '{}' for '{}'",
                 ak_type,
                 rclass

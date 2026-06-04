@@ -523,6 +523,75 @@ impl AzureBackend {
         url
     }
 
+    fn download_range_header(offset: u64, length: usize) -> Result<String> {
+        if length == 0 {
+            return Err(AppError::Storage(
+                "Requested range length must be greater than zero".to_string(),
+            ));
+        }
+
+        let length = u64::try_from(length).map_err(|_| {
+            AppError::Storage(format!(
+                "Requested range length {} does not fit in u64",
+                length
+            ))
+        })?;
+        let end_exclusive = offset.checked_add(length).ok_or_else(|| {
+            AppError::Storage(format!(
+                "Requested range offset {} length {} overflows u64",
+                offset, length
+            ))
+        })?;
+        let end_inclusive = end_exclusive - 1;
+
+        Ok(format!("bytes={offset}-{end_inclusive}"))
+    }
+
+    async fn try_fallback_get_range(&self, key: &str, range_header: &str) -> Result<Option<Bytes>> {
+        if !self.path_format.has_fallback() {
+            return Ok(None);
+        }
+
+        let Some(fallback_key) = self.try_artifactory_fallback(key) else {
+            return Ok(None);
+        };
+
+        tracing::debug!(
+            original = %key,
+            fallback = %fallback_key,
+            range = %range_header,
+            "Trying Artifactory fallback path range"
+        );
+        let fallback_url = self.read_url(&fallback_key, Duration::from_secs(300))?;
+        let response = self
+            .authorized_get_range(&fallback_url, range_header)
+            .await?;
+
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            tracing::info!(
+                key = %key,
+                fallback = %fallback_key,
+                "Found artifact range at Artifactory fallback path"
+            );
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+            return Ok(Some(bytes));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "Azure fallback ranged download failed with status {} for {} ({}): {}",
+            status, key, range_header, body
+        )))
+    }
+
     fn write_url(&self, key: &str) -> Result<String> {
         match &self.auth {
             AzureAuthMode::SharedKey { .. } => {
@@ -715,6 +784,39 @@ impl AzureBackend {
                     .send()
                     .await
                     .map_err(|e| AppError::Storage(format!("Azure download failed: {}", e)))
+            }
+        }
+    }
+
+    /// Build an authorized ranged GET request.
+    async fn authorized_get_range(
+        &self,
+        url: &str,
+        range_header: &str,
+    ) -> Result<reqwest::Response> {
+        match &self.auth {
+            AzureAuthMode::SharedKey { .. } => self
+                .client
+                .get(url)
+                .header(reqwest::header::RANGE, range_header)
+                .header("x-ms-range", range_header)
+                .send()
+                .await
+                .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e))),
+            AzureAuthMode::TokenCredential { provider } => {
+                let token = provider.get_token().await?;
+                let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+                self.client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-ms-date", &date_str)
+                    .header("x-ms-version", "2021-06-08")
+                    .header(reqwest::header::RANGE, range_header)
+                    .header("x-ms-range", range_header)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e)))
             }
         }
     }
@@ -1097,6 +1199,37 @@ impl StorageBackend for AzureBackend {
             .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
 
         Ok(bytes)
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let range_header = Self::download_range_header(offset, length)?;
+        let url = self.read_url(key, Duration::from_secs(300))?;
+        let response = self.authorized_get_range(&url, &range_header).await?;
+
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            return response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if let Some(bytes) = self.try_fallback_get_range(key, &range_header).await? {
+                return Ok(bytes);
+            }
+            return Err(AppError::NotFound(format!("Blob not found: {}", key)));
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "Azure ranged download failed with status {} for {} ({}): {}",
+            status, key, range_header, body
+        )))
     }
 
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
@@ -1532,7 +1665,10 @@ mod tests {
         }
     }
 
-    fn create_cached_rbac_backend_with_endpoint(endpoint: String) -> AzureBackend {
+    fn create_cached_rbac_backend_with_endpoint_and_path_format(
+        endpoint: String,
+        path_format: StoragePathFormat,
+    ) -> AzureBackend {
         let client = reqwest::Client::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
@@ -1544,14 +1680,22 @@ mod tests {
         };
         let mut config = create_rbac_config();
         config.endpoint = Some(endpoint);
+        config.path_format = path_format;
         AzureBackend {
             config,
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
             },
-            path_format: StoragePathFormat::Native,
+            path_format,
         }
+    }
+
+    fn create_cached_rbac_backend_with_endpoint(endpoint: String) -> AzureBackend {
+        create_cached_rbac_backend_with_endpoint_and_path_format(
+            endpoint,
+            StoragePathFormat::Native,
+        )
     }
 
     fn service_principal_cred() -> TokenCredentialSource {
@@ -1604,6 +1748,23 @@ mod tests {
     fn test_redirect_compatible_rbac_without_redirect() {
         let key: Option<String> = None;
         assert!(is_redirect_compatible(&key, false));
+    }
+
+    #[test]
+    fn test_download_range_header_is_inclusive() {
+        assert_eq!(
+            AzureBackend::download_range_header(1_024, 4_096).unwrap(),
+            "bytes=1024-5119"
+        );
+    }
+
+    #[test]
+    fn test_download_range_header_rejects_overflow() {
+        let err = AzureBackend::download_range_header(u64::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "error should explain overflow: {err}"
+        );
     }
 
     // ── Config ───────────────────────────────────────────────────────────
@@ -1811,6 +1972,64 @@ mod tests {
                 .is_some_and(|value| value == "BlockBlob")),
             "Azure put_stream must not fall back to a single buffered Put Blob"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_range_sends_azure_range_headers() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer/test/file.txt"))
+            .and(header("range", "bytes=5-12"))
+            .and(header("x-ms-range", "bytes=5-12"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(Vec::from(&b"fghijklm"[..])))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let bytes = StorageBackendTrait::get_range(&backend, "test/file.txt", 5, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"fghijklm"));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_fallback_sends_azure_range_headers() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path(format!("/testcontainer/repos/generic/{checksum}")))
+            .and(header("range", "bytes=10-15"))
+            .and(header("x-ms-range", "bytes=10-15"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/testcontainer/ab/{checksum}")))
+            .and(header("range", "bytes=10-15"))
+            .and(header("x-ms-range", "bytes=10-15"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(Vec::from(&b"klmnop"[..])))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+        let bytes =
+            StorageBackendTrait::get_range(&backend, &format!("repos/generic/{checksum}"), 10, 6)
+                .await
+                .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"klmnop"));
     }
 
     #[tokio::test]

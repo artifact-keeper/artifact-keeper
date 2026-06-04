@@ -6,5 +6,5 @@
 -- path at completion time.
 
 ALTER TABLE upload_sessions
-    ADD COLUMN artifact_name TEXT,
-    ADD COLUMN artifact_version TEXT;
+    ADD COLUMN IF NOT EXISTS artifact_name TEXT,
+    ADD COLUMN IF NOT EXISTS artifact_version TEXT;

@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# Artifact Keeper pre-push hook.
+#
+# Runs the same fast checks CI gates on, before code leaves your machine,
+# so compile errors and unit-test failures are caught locally instead of in
+# a red PR. Mirrors CI's "Check Rust" (compile) and "Backend Unit Tests".
+#
+# SQLX_OFFLINE=true matches CI and uses the committed .sqlx/ query cache, so
+# no database is required.
+#
+# Bypass in an emergency with `git push --no-verify`.
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not found, skipping checks" >&2
+    exit 0
+fi
+
+export SQLX_OFFLINE=true
+
+echo "pre-push: cargo check --workspace --all-targets"
+if ! cargo check --workspace --all-targets; then
+    echo >&2
+    echo "Build failed. Fix the compile errors above before pushing." >&2
+    echo "(Bypass with 'git push --no-verify' only if you know what you are doing.)" >&2
+    exit 1
+fi
+
+echo "pre-push: cargo test --workspace --lib"
+if ! cargo test --workspace --lib; then
+    echo >&2
+    echo "Unit tests failed. Fix them before pushing." >&2
+    exit 1
+fi
+
+# Note: clippy (-D warnings), the 70% new-line coverage gate, and the 3%
+# duplication gate are also enforced in CI. They are not run here to keep
+# push times reasonable. Run clippy manually before large changes:
+#   cargo clippy --workspace --all-targets -- -D warnings
+
+exit 0
