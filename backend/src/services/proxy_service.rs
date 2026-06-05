@@ -623,10 +623,344 @@ impl CacheKeys {
     }
 }
 
+/// Owns the proxy-cache body + `__cache_meta__.json` sidecar lifecycle
+/// (#1618 S7 — first structural extraction).
+///
+/// This is a pure structural relocation of the cache read/write/invalidate/
+/// freshness operations that previously lived as scattered methods on
+/// [`ProxyService`]. [`ProxyService`] now holds a `CacheStore` and its public
+/// cache methods delegate here; no behavior, logging, error type, ordering,
+/// or call-site signature changed in the move.
+///
+/// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
+/// for these operations, so reads and writes target the global default
+/// backend exactly as before (#1278).
+pub(crate) struct CacheStore {
+    storage: Arc<StorageService>,
+}
+
+impl CacheStore {
+    /// Construct a `CacheStore` over the given storage handle.
+    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
+        Self { storage }
+    }
+
+    /// Load cache metadata from storage.
+    ///
+    /// Relocated verbatim from `ProxyService::load_cache_metadata`: `NotFound`
+    /// is a miss (`Ok(None)`), any other storage error propagates.
+    async fn load_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
+        match self.storage.get(metadata_key).await {
+            Ok(data) => {
+                let metadata: CacheMetadata = serde_json::from_slice(&data)?;
+                Ok(Some(metadata))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Shared cache-read path behind the fresh (`allow_stale = false`) and
+    /// stale (`allow_stale = true`) lookups. Relocated verbatim from
+    /// `ProxyService::get_cached`; every divergence is preserved exactly:
+    ///
+    /// * **Metadata read error.** Fresh treats a sidecar read/parse error as a
+    ///   cache miss (B6 — a waiter racing the single-flight leader's metadata
+    ///   write, or half-written JSON, must not bubble out as a 502). Stale
+    ///   propagates the error via `?`.
+    /// * **Expiry gate.** Fresh returns a miss once `Utc::now() > expires_at`;
+    ///   stale skips the gate entirely (that is the point of the fallback).
+    /// * **Body read error.** Fresh swallows a transient storage read error as
+    ///   a miss (B6); stale propagates it.
+    /// * **Log wording.** Fresh logs "Cache …"; stale logs "Stale cache …" and
+    ///   includes the expiry timestamp on a hit.
+    ///
+    /// The checksum verification (and its miss-on-mismatch) is identical for
+    /// both flags.
+    async fn get(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        allow_stale: bool,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
+        // propagates it via `?` to match the original behavior precisely.
+        let metadata = if allow_stale {
+            match self.load_metadata(metadata_key).await? {
+                Some(m) => m,
+                None => return Ok(None),
+            }
+        } else {
+            match self.load_metadata(metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(
+                        metadata_key = %metadata_key,
+                        error = %e,
+                        "proxy cache metadata read failed; treating as miss and refetching upstream"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+
+        // Fresh reads enforce the expiry gate; the stale fallback skips it.
+        if !allow_stale && Utc::now() > metadata.expires_at {
+            tracing::debug!("Cache expired for {}", cache_key);
+            return Ok(None);
+        }
+
+        // Try to get cached content
+        match self.storage.get(cache_key).await {
+            Ok(content) => {
+                // Verify checksum (identical for fresh and stale)
+                let actual_checksum = StorageService::calculate_hash(&content);
+                if actual_checksum != metadata.checksum_sha256 {
+                    if allow_stale {
+                        tracing::warn!(
+                            "Stale cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                if allow_stale {
+                    tracing::debug!(
+                        "Stale cache hit for {} (expired at {})",
+                        cache_key,
+                        metadata.expires_at
+                    );
+                } else {
+                    tracing::debug!("Cache hit for {}", cache_key);
+                }
+                Ok(Some((content, metadata.content_type)))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            // B6 (coalescing 502 leak): a transient storage read error here
+            // (e.g. a waiter reading the cache body while the single-flight
+            // leader is mid-write, or a partially-written / poisoned entry)
+            // must NOT bubble out as a raw 502 to every concurrent waiter.
+            // Treat it as a cache miss so the caller re-fetches upstream; the
+            // upstream path then surfaces a clean 2xx (cache repopulated) or a
+            // 503 via `validate_upstream_status` when upstream itself is the
+            // one failing. Surfacing the read error as `Err(e)` made it
+            // `map_proxy_error` -> 502, which is exactly the raw status the
+            // stampede gate rejects. The stale fallback keeps the original
+            // propagate-the-error behavior.
+            Err(e) => {
+                if allow_stale {
+                    Err(e)
+                } else {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache read failed; treating as miss and refetching upstream"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Cache artifact content and its metadata sidecar.
+    ///
+    /// Relocated verbatim from `ProxyService::cache_artifact` (the DB-write
+    /// side was already removed under #1278). Preserves the #1365 zero-byte
+    /// guard, the #1051 ETag pin, and the identical write ordering
+    /// (content first, then sidecar).
+    #[allow(clippy::too_many_arguments)]
+    async fn write(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        content: &Bytes,
+        content_type: Option<String>,
+        etag: Option<String>,
+        ttl_secs: i64,
+        repository_id: Uuid,
+        artifact_path: &str,
+    ) -> Result<()> {
+        // #1365: never cache a zero-byte body on the buffered path either.
+        // An empty upstream response (204 / empty 200) must not become a
+        // fresh cache entry that a later request serves as
+        // `Content-Length: 0`. Skip the write entirely so the next request
+        // refetches from upstream; the caller treats a cache miss as the
+        // normal path. The streaming sibling `tee_upstream_to_cache` applies
+        // the same guard after `put_stream`.
+        if content.is_empty() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "proxy upstream returned an empty body; not caching the zero-byte \
+                 object so the next request refetches upstream"
+            );
+            return Ok(());
+        }
+
+        // Calculate checksum
+        let checksum = StorageService::calculate_hash(content);
+
+        // Store content first so we can read the backend's ETag back for
+        // the integrity-revalidation pin (#1051).
+        self.storage.put(cache_key, content.clone()).await?;
+
+        // Best-effort: capture the backend's ETag right after the PUT so
+        // the fast path can re-HEAD on each hit and reject tampered or
+        // replaced objects. See [`pin_storage_etag`] for the failure
+        // semantics; a failure here only disables revalidation for this
+        // entry, the cache write itself still succeeds.
+        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
+
+        // Create metadata
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: etag,
+            storage_etag,
+            expires_at: now + chrono::Duration::seconds(ttl_secs),
+            content_type,
+            size_bytes: content.len() as i64,
+            checksum_sha256: checksum.clone(),
+        };
+
+        // Store metadata
+        let metadata_json = serde_json::to_vec(&metadata)?;
+        self.storage
+            .put(metadata_key, Bytes::from(metadata_json))
+            .await?;
+
+        // Proxy-cached content is intentionally NOT recorded in the
+        // `artifacts` table (issue #1278). The previous behaviour inserted
+        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
+        // alongside the global-backend write above, which caused every
+        // subsequent format-handler read to take the
+        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
+        // path -- a per-repo `FilesystemStorage` rooted at
+        // `repo.storage_path` that resolves to a doubled-prefix path
+        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
+        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
+        // object-store backends were unaffected because their registry
+        // shares the same instance regardless of `location.path`.
+        //
+        // The cached body and metadata sidecar are still on disk under
+        // `self.storage` (the global default). The format-handler hot path
+        // already checks the proxy cache via `proxy_check_cache`
+        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
+        // falling through to the upstream fetch, so cache hits are served
+        // through that path with no `artifacts` row needed. Reads through
+        // the global backend match the writes above.
+        //
+        // Tradeoff: proxy-cached items no longer surface in the
+        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
+        // counted toward `storage_used_bytes`. That UX/accounting gap is
+        // tracked separately; correctness (no more 500s on cached reads)
+        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
+        // versions stay in `artifacts` and continue to surface in
+        // listings until they are explicitly invalidated, which is a
+        // graceful degradation, not a regression.
+        let _ = repository_id;
+        let _ = artifact_path;
+        let _ = checksum;
+
+        tracing::debug!(
+            "Cached artifact {} ({} bytes, expires at {})",
+            cache_key,
+            content.len(),
+            metadata.expires_at
+        );
+
+        Ok(())
+    }
+
+    /// Evict a cache entry: derive both keys, then delete the content and
+    /// metadata blobs in that order, ignoring delete errors.
+    ///
+    /// Relocated verbatim from `ProxyService::invalidate_cache_keys` (the
+    /// shared invalidate core from #1618 S3).
+    async fn invalidate(&self, keys: &CacheKeys) -> Result<()> {
+        // Delete both content and metadata
+        let _ = self.storage.delete(&keys.content).await;
+        let _ = self.storage.delete(&keys.metadata).await;
+
+        Ok(())
+    }
+
+    /// Metadata-only freshness probe with #1051 ETag revalidation.
+    ///
+    /// Relocated verbatim from `ProxyService::is_cache_fresh` (the body that
+    /// runs once the keys are derived). Returns `true` only when the metadata
+    /// exists, is unexpired, and the content object passes ETag revalidation
+    /// (or, for filesystem/legacy entries with no pinned ETag, an existence
+    /// check).
+    async fn is_fresh(&self, keys: &CacheKeys) -> bool {
+        let cache_key = &keys.content;
+
+        let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
+            return false;
+        };
+        if Utc::now() > metadata.expires_at {
+            return false;
+        }
+
+        // ETag-based integrity revalidation (#1051). Only meaningful when
+        // we have a pinned ETag from cache-write time AND the backend
+        // surfaces an ETag now. Either side being `None` falls back to
+        // pre-#1051 behavior (existence check only): filesystem entries
+        // and legacy sidecars are unaffected.
+        match metadata.storage_etag {
+            Some(ref pinned) => match self.storage.head_etag(cache_key).await {
+                Ok(Some(current)) => {
+                    if current != *pinned {
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            pinned_etag = %pinned,
+                            current_etag = %current,
+                            "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
+                        );
+                        return false;
+                    }
+                    // ETag matched → object is present and unchanged
+                    // since cache write. Skip the redundant exists() call.
+                    true
+                }
+                // Backend lost the object (None) or errored: treat as
+                // not-fresh. The slow path will re-fetch and re-cache.
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache head_etag failed during revalidation; treating as not fresh"
+                    );
+                    false
+                }
+            },
+            None => {
+                // No pinned ETag (filesystem / legacy entry). Preserve
+                // pre-#1051 semantics: existence check only.
+                matches!(self.storage.exists(cache_key).await, Ok(true))
+            }
+        }
+    }
+}
+
 /// Proxy service for fetching and caching artifacts from upstream repositories
 pub struct ProxyService {
     db: PgPool,
     storage: Arc<StorageService>,
+    /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
+    /// The cache-facing public methods on `ProxyService` delegate here.
+    cache_store: CacheStore,
     http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
@@ -654,9 +988,12 @@ impl ProxyService {
             .build()
             .expect("Failed to create HTTP client");
 
+        let cache_store = CacheStore::new(Arc::clone(&storage));
+
         Self {
             db,
             storage,
+            cache_store,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
         }
@@ -766,59 +1103,10 @@ impl ProxyService {
         // we'd want to redirect to anyway: treat it as a miss so the caller
         // falls through to the slow path / upstream fetch, where the same
         // validation will surface the error to the client.
-        let Ok(cache_key) = Self::cache_storage_key(repo_key, path) else {
+        let Ok(keys) = CacheKeys::derive(repo_key, path) else {
             return false;
         };
-        let Ok(metadata_key) = Self::cache_metadata_key(repo_key, path) else {
-            return false;
-        };
-
-        let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
-            return false;
-        };
-        if Utc::now() > metadata.expires_at {
-            return false;
-        }
-
-        // ETag-based integrity revalidation (#1051). Only meaningful when
-        // we have a pinned ETag from cache-write time AND the backend
-        // surfaces an ETag now. Either side being `None` falls back to
-        // pre-#1051 behavior (existence check only): filesystem entries
-        // and legacy sidecars are unaffected.
-        match metadata.storage_etag {
-            Some(ref pinned) => match self.storage.head_etag(&cache_key).await {
-                Ok(Some(current)) => {
-                    if current != *pinned {
-                        tracing::warn!(
-                            cache_key = %cache_key,
-                            pinned_etag = %pinned,
-                            current_etag = %current,
-                            "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
-                        );
-                        return false;
-                    }
-                    // ETag matched → object is present and unchanged
-                    // since cache write. Skip the redundant exists() call.
-                    true
-                }
-                // Backend lost the object (None) or errored: treat as
-                // not-fresh. The slow path will re-fetch and re-cache.
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        error = %e,
-                        "proxy cache head_etag failed during revalidation; treating as not fresh"
-                    );
-                    false
-                }
-            },
-            None => {
-                // No pinned ETag (filesystem / legacy entry). Preserve
-                // pre-#1051 semantics: existence check only.
-                matches!(self.storage.exists(&cache_key).await, Ok(true))
-            }
-        }
+        self.cache_store.is_fresh(&keys).await
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -1131,12 +1419,7 @@ impl ProxyService {
     /// identical, so it lives here as a single source of truth (#1618 S3).
     async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
         let keys = CacheKeys::derive(repo_key, path)?;
-
-        // Delete both content and metadata
-        let _ = self.storage.delete(&keys.content).await;
-        let _ = self.storage.delete(&keys.metadata).await;
-
-        Ok(())
+        self.cache_store.invalidate(&keys).await
     }
 
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
@@ -1620,106 +1903,16 @@ impl ProxyService {
         metadata_key: &str,
         allow_stale: bool,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
-        // propagates it via `?` to match the original behavior precisely.
-        let metadata = if allow_stale {
-            match self.load_cache_metadata(metadata_key).await? {
-                Some(m) => m,
-                None => return Ok(None),
-            }
-        } else {
-            match self.load_cache_metadata(metadata_key).await {
-                Ok(Some(m)) => m,
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    tracing::warn!(
-                        metadata_key = %metadata_key,
-                        error = %e,
-                        "proxy cache metadata read failed; treating as miss and refetching upstream"
-                    );
-                    return Ok(None);
-                }
-            }
-        };
-
-        // Fresh reads enforce the expiry gate; the stale fallback skips it.
-        if !allow_stale && Utc::now() > metadata.expires_at {
-            tracing::debug!("Cache expired for {}", cache_key);
-            return Ok(None);
-        }
-
-        // Try to get cached content
-        match self.storage.get(cache_key).await {
-            Ok(content) => {
-                // Verify checksum (identical for fresh and stale)
-                let actual_checksum = StorageService::calculate_hash(&content);
-                if actual_checksum != metadata.checksum_sha256 {
-                    if allow_stale {
-                        tracing::warn!(
-                            "Stale cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
-                        );
-                    }
-                    return Ok(None);
-                }
-
-                if allow_stale {
-                    tracing::debug!(
-                        "Stale cache hit for {} (expired at {})",
-                        cache_key,
-                        metadata.expires_at
-                    );
-                } else {
-                    tracing::debug!("Cache hit for {}", cache_key);
-                }
-                Ok(Some((content, metadata.content_type)))
-            }
-            Err(AppError::NotFound(_)) => Ok(None),
-            // B6 (coalescing 502 leak): a transient storage read error here
-            // (e.g. a waiter reading the cache body while the single-flight
-            // leader is mid-write, or a partially-written / poisoned entry)
-            // must NOT bubble out as a raw 502 to every concurrent waiter.
-            // Treat it as a cache miss so the caller re-fetches upstream; the
-            // upstream path then surfaces a clean 2xx (cache repopulated) or a
-            // 503 via `validate_upstream_status` when upstream itself is the
-            // one failing. Surfacing the read error as `Err(e)` made it
-            // `map_proxy_error` -> 502, which is exactly the raw status the
-            // stampede gate rejects. The stale fallback keeps the original
-            // propagate-the-error behavior.
-            Err(e) => {
-                if allow_stale {
-                    Err(e)
-                } else {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        error = %e,
-                        "proxy cache read failed; treating as miss and refetching upstream"
-                    );
-                    Ok(None)
-                }
-            }
-        }
+        self.cache_store
+            .get(cache_key, metadata_key, allow_stale)
+            .await
     }
 
-    /// Load cache metadata from storage
+    /// Load cache metadata from storage.
+    ///
+    /// Thin delegation to [`CacheStore::load_metadata`] (#1618 S7).
     async fn load_cache_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
-        match self.storage.get(metadata_key).await {
-            Ok(data) => {
-                let metadata: CacheMetadata = serde_json::from_slice(&data)?;
-                Ok(Some(metadata))
-            }
-            Err(AppError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.cache_store.load_metadata(metadata_key).await
     }
 
     /// Fetch artifact from upstream URL.
@@ -2134,95 +2327,18 @@ impl ProxyService {
         repository_id: Uuid,
         artifact_path: &str,
     ) -> Result<()> {
-        // #1365: never cache a zero-byte body on the buffered path either.
-        // An empty upstream response (204 / empty 200) must not become a
-        // fresh cache entry that a later request serves as
-        // `Content-Length: 0`. Skip the write entirely so the next request
-        // refetches from upstream; the caller treats a cache miss as the
-        // normal path. The streaming sibling `tee_upstream_to_cache` applies
-        // the same guard after `put_stream`.
-        if content.is_empty() {
-            tracing::warn!(
-                cache_key = %cache_key,
-                "proxy upstream returned an empty body; not caching the zero-byte \
-                 object so the next request refetches upstream"
-            );
-            return Ok(());
-        }
-
-        // Calculate checksum
-        let checksum = StorageService::calculate_hash(content);
-
-        // Store content first so we can read the backend's ETag back for
-        // the integrity-revalidation pin (#1051).
-        self.storage.put(cache_key, content.clone()).await?;
-
-        // Best-effort: capture the backend's ETag right after the PUT so
-        // the fast path can re-HEAD on each hit and reject tampered or
-        // replaced objects. See [`pin_storage_etag`] for the failure
-        // semantics; a failure here only disables revalidation for this
-        // entry, the cache write itself still succeeds.
-        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
-
-        // Create metadata
-        let now = Utc::now();
-        let metadata = CacheMetadata {
-            cached_at: now,
-            upstream_etag: etag,
-            storage_etag,
-            expires_at: now + chrono::Duration::seconds(ttl_secs),
-            content_type,
-            size_bytes: content.len() as i64,
-            checksum_sha256: checksum.clone(),
-        };
-
-        // Store metadata
-        let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
-            .put(metadata_key, Bytes::from(metadata_json))
-            .await?;
-
-        // Proxy-cached content is intentionally NOT recorded in the
-        // `artifacts` table (issue #1278). The previous behaviour inserted
-        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
-        // alongside the global-backend write above, which caused every
-        // subsequent format-handler read to take the
-        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
-        // path -- a per-repo `FilesystemStorage` rooted at
-        // `repo.storage_path` that resolves to a doubled-prefix path
-        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
-        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
-        // object-store backends were unaffected because their registry
-        // shares the same instance regardless of `location.path`.
-        //
-        // The cached body and metadata sidecar are still on disk under
-        // `self.storage` (the global default). The format-handler hot path
-        // already checks the proxy cache via `proxy_check_cache`
-        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
-        // falling through to the upstream fetch, so cache hits are served
-        // through that path with no `artifacts` row needed. Reads through
-        // the global backend match the writes above.
-        //
-        // Tradeoff: proxy-cached items no longer surface in the
-        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
-        // counted toward `storage_used_bytes`. That UX/accounting gap is
-        // tracked separately; correctness (no more 500s on cached reads)
-        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
-        // versions stay in `artifacts` and continue to surface in
-        // listings until they are explicitly invalidated, which is a
-        // graceful degradation, not a regression.
-        let _ = repository_id;
-        let _ = artifact_path;
-        let _ = checksum;
-
-        tracing::debug!(
-            "Cached artifact {} ({} bytes, expires at {})",
-            cache_key,
-            content.len(),
-            metadata.expires_at
-        );
-
-        Ok(())
+        self.cache_store
+            .write(
+                cache_key,
+                metadata_key,
+                content,
+                content_type,
+                etag,
+                ttl_secs,
+                repository_id,
+                artifact_path,
+            )
+            .await
     }
 
     /// Emit a structured warning when a brand-new artifact is cached from
