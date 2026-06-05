@@ -43,6 +43,64 @@ pub struct LicenseSummary {
     pub unknown_licenses: Vec<String>,
 }
 
+/// Severity counts from the latest completed scan for an artifact, used to
+/// assemble a [`CveSummary`]. Lifted to module scope (out of the DB-bound
+/// `get_cve_summary` body) so the row -> summary assembly is unit-testable
+/// without a database.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ScanRow {
+    critical_count: i32,
+    high_count: i32,
+    medium_count: i32,
+    low_count: i32,
+    findings_count: i32,
+}
+
+/// SQL for the latest completed scan's severity counts for an artifact.
+const LATEST_SCAN_COUNTS_SQL: &str = r#"
+    SELECT critical_count, high_count, medium_count, low_count, findings_count
+    FROM scan_results
+    WHERE artifact_id = $1 AND status = 'completed'
+    ORDER BY created_at DESC
+    LIMIT 1
+"#;
+
+/// SQL for an artifact's open CVEs, sourced from `scan_findings` (the populated
+/// source), not the never-written `cve_history` table. An artifact's open CVEs
+/// are the unacknowledged, cve_id-bearing findings from its latest completed
+/// scan -- the same `scan_findings` shape the SBOM read path uses. The old
+/// `cve_history` read was always empty, so a "block on open CVEs" gate silently
+/// passed (#1620; data source also addresses #1561).
+const OPEN_CVES_SQL: &str = r#"
+    WITH latest_scan AS (
+        SELECT id
+        FROM scan_results
+        WHERE artifact_id = $1 AND status = 'completed'
+        ORDER BY created_at DESC
+        LIMIT 1
+    )
+    SELECT DISTINCT sf.cve_id
+    FROM scan_findings sf
+    JOIN latest_scan ls ON sf.scan_result_id = ls.id
+    WHERE sf.cve_id IS NOT NULL
+      AND NOT sf.is_acknowledged
+"#;
+
+/// Assemble a [`CveSummary`] from a latest-scan [`ScanRow`] and the open-CVE
+/// id list. Pure (no DB): the severity counts come straight from the scan row
+/// and `open_cves` is carried through verbatim. Kept separate from the SQL
+/// execution so the mapping is covered by unit tests.
+fn build_cve_summary(scan: ScanRow, open_cves: Vec<String>) -> CveSummary {
+    CveSummary {
+        critical_count: scan.critical_count,
+        high_count: scan.high_count,
+        medium_count: scan.medium_count,
+        low_count: scan.low_count,
+        total_count: scan.findings_count,
+        open_cves,
+    }
+}
+
 /// Evaluate CVE counts against a severity threshold, returning violations for
 /// any severity level that exceeds the implied limit.
 fn evaluate_cve_thresholds(
@@ -399,47 +457,21 @@ impl PromotionPolicyService {
     }
 
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
-        #[derive(sqlx::FromRow)]
-        struct ScanRow {
-            critical_count: i32,
-            high_count: i32,
-            medium_count: i32,
-            low_count: i32,
-            findings_count: i32,
-        }
-
-        let scan: Option<ScanRow> = sqlx::query_as(
-            r#"
-            SELECT critical_count, high_count, medium_count, low_count, findings_count
-            FROM scan_results
-            WHERE artifact_id = $1 AND status = 'completed'
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(artifact_id)
-        .fetch_optional(&self.db)
-        .await?;
+        let scan: Option<ScanRow> = sqlx::query_as(LATEST_SCAN_COUNTS_SQL)
+            .bind(artifact_id)
+            .fetch_optional(&self.db)
+            .await?;
 
         let Some(scan) = scan else {
             return Ok(None);
         };
 
-        let cves: Vec<String> = sqlx::query_scalar(
-            r#"SELECT DISTINCT cve_id FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
-        )
-        .bind(artifact_id)
-        .fetch_all(&self.db)
-        .await?;
+        let open_cves: Vec<String> = sqlx::query_scalar(OPEN_CVES_SQL)
+            .bind(artifact_id)
+            .fetch_all(&self.db)
+            .await?;
 
-        Ok(Some(CveSummary {
-            critical_count: scan.critical_count,
-            high_count: scan.high_count,
-            medium_count: scan.medium_count,
-            low_count: scan.low_count,
-            total_count: scan.findings_count,
-            open_cves: cves,
-        }))
+        Ok(Some(build_cve_summary(scan, open_cves)))
     }
 
     async fn get_license_summary(&self, artifact_id: Uuid) -> Result<Option<LicenseSummary>> {
@@ -596,6 +628,74 @@ struct LicensePolicyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // build_cve_summary tests (row -> summary assembly, no DB)
+    // =======================================================================
+
+    fn scan_row(critical: i32, high: i32, medium: i32, low: i32, findings: i32) -> ScanRow {
+        ScanRow {
+            critical_count: critical,
+            high_count: high,
+            medium_count: medium,
+            low_count: low,
+            findings_count: findings,
+        }
+    }
+
+    #[test]
+    fn test_build_cve_summary_maps_counts_and_carries_open_cves() {
+        let open = vec!["CVE-2021-44228".to_string(), "CVE-2019-10744".to_string()];
+        let summary = build_cve_summary(scan_row(1, 2, 3, 4, 10), open.clone());
+
+        assert_eq!(summary.critical_count, 1);
+        assert_eq!(summary.high_count, 2);
+        assert_eq!(summary.medium_count, 3);
+        assert_eq!(summary.low_count, 4);
+        // total_count maps from the scan row's findings_count, not the open-CVE len.
+        assert_eq!(summary.total_count, 10);
+        assert_eq!(summary.open_cves, open);
+    }
+
+    #[test]
+    fn test_build_cve_summary_empty_open_cves_is_passing_shape() {
+        let summary = build_cve_summary(scan_row(0, 0, 0, 0, 0), Vec::new());
+
+        assert!(summary.open_cves.is_empty());
+        assert_eq!(summary.total_count, 0);
+        // An all-zero summary with no open CVEs must not trip a block-on-CVE gate.
+        let violations = evaluate_cve_thresholds(&summary, "critical", true);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_build_cve_summary_preserves_open_cve_order_and_dupes() {
+        // The helper carries the open-CVE list through verbatim; dedupe/order is
+        // the SQL's responsibility (DISTINCT), not this pure mapper's.
+        let open = vec![
+            "CVE-A".to_string(),
+            "CVE-A".to_string(),
+            "CVE-B".to_string(),
+        ];
+        let summary = build_cve_summary(scan_row(0, 1, 0, 0, 5), open.clone());
+        assert_eq!(summary.open_cves, open);
+    }
+
+    #[test]
+    fn test_open_cves_sql_targets_scan_findings_not_cve_history() {
+        // Guards the #1620 repoint: the query must read unacknowledged,
+        // cve_id-bearing rows from the latest completed scan's scan_findings,
+        // and must NOT touch the dead cve_history table.
+        assert!(OPEN_CVES_SQL.contains("FROM scan_findings"));
+        assert!(OPEN_CVES_SQL.contains("NOT sf.is_acknowledged"));
+        assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
+        assert!(OPEN_CVES_SQL.contains("status = 'completed'"));
+        assert!(!OPEN_CVES_SQL.contains("cve_history"));
+
+        // The counts query feeds the same latest-completed-scan contract.
+        assert!(LATEST_SCAN_COUNTS_SQL.contains("FROM scan_results"));
+        assert!(LATEST_SCAN_COUNTS_SQL.contains("status = 'completed'"));
+    }
 
     // =======================================================================
     // evaluate_cve_thresholds tests
