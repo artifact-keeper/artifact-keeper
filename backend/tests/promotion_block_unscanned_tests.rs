@@ -319,7 +319,7 @@ async fn test_completed_clean_scan_passes() {
 }
 
 /// Default-change safety: a policy whose stored block_unscanned is false keeps
-/// failing open even after migration 120 changed the COLUMN DEFAULT to true.
+/// failing open even after migration 121 changed the COLUMN DEFAULT to true.
 /// The migration must not rewrite existing rows.
 #[tokio::test]
 #[ignore]
