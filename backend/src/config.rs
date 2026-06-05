@@ -11,6 +11,20 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Parse an opt-in boolean flag from an optional env value.
+///
+/// Returns `true` only for `"true"` / `"1"` (case-insensitive, trimmed);
+/// every other value — including `None` (unset), empty, or garbage — is
+/// `false`. Used for safety-critical opt-ins like blob GC where the
+/// default MUST be off and only an explicit, recognized affirmative
+/// enables it. Pure so the truth table is unit-testable without env.
+fn parse_opt_in_flag(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("true" | "1")
+    )
+}
+
 /// Minimum reap-threshold for the stuck-scan janitor.
 ///
 /// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
@@ -205,6 +219,15 @@ pub struct Config {
 
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
+
+    /// Whether scheduled blob garbage collection is allowed to actually
+    /// delete blobs (#1408). Defaults to `false`: blob deletion is the
+    /// dangerous part of GC, so the scheduled pass runs in DRY-RUN mode
+    /// (logs what it would reclaim, deletes nothing) unless an operator
+    /// explicitly opts in with `BLOB_GC_ENABLED=true`. Even when enabled,
+    /// the pass is still gated behind the `manifest_blob_refs` readiness
+    /// check, so it never deletes while ref coverage is incomplete.
+    pub blob_gc_enabled: bool,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -450,6 +473,7 @@ redacted_debug!(Config {
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
     show gc_schedule,
+    show blob_gc_enabled,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -535,6 +559,7 @@ impl Default for Config {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
+            blob_gc_enabled: false,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -675,6 +700,11 @@ impl Config {
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
+            // Blob deletion is the dangerous half of GC. Defaults to false
+            // so the scheduled pass dry-runs unless an operator opts in.
+            // Accepts "true" / "1" (case-insensitive); anything else
+            // (empty, garbage, unset) keeps live blob deletion disabled.
+            blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -880,6 +910,71 @@ mod tests {
     // Environment variable tests must be serialized because env is global state.
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // parse_opt_in_flag (pure; blob GC opt-in, #1408)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_opt_in_flag_truth_table() {
+        // Affirmatives (case-insensitive, trimmed) enable.
+        assert!(parse_opt_in_flag(Some("true")));
+        assert!(parse_opt_in_flag(Some("TRUE")));
+        assert!(parse_opt_in_flag(Some("  True  ")));
+        assert!(parse_opt_in_flag(Some("1")));
+        // Everything else — including unset — stays off. Safety-critical:
+        // blob deletion must never enable by accident.
+        assert!(!parse_opt_in_flag(None));
+        assert!(!parse_opt_in_flag(Some("")));
+        assert!(!parse_opt_in_flag(Some("false")));
+        assert!(!parse_opt_in_flag(Some("0")));
+        assert!(!parse_opt_in_flag(Some("yes")));
+        assert!(!parse_opt_in_flag(Some("on")));
+        assert!(!parse_opt_in_flag(Some("2")));
+        assert!(!parse_opt_in_flag(Some("garbage")));
+    }
+
+    #[test]
+    fn test_config_blob_gc_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("BLOB_GC_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("BLOB_GC_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(
+            !config.blob_gc_enabled,
+            "blob GC must default to disabled (dry-run) when BLOB_GC_ENABLED is unset"
+        );
+
+        env::set_var("BLOB_GC_ENABLED", "true");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.blob_gc_enabled,
+            "BLOB_GC_ENABLED=true must opt into live blob deletion"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("BLOB_GC_ENABLED", v);
+        } else {
+            env::remove_var("BLOB_GC_ENABLED");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Default / test_config
