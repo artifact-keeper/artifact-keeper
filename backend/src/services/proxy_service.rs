@@ -311,191 +311,6 @@ pub(crate) fn proxy_scan_skipped_warning(
     ))
 }
 
-/// Tee an upstream byte stream into a returned client stream AND a
-/// background storage writer that populates the proxy cache. The
-/// returned stream yields the same chunks the upstream produced, in
-/// order, with no buffering beyond the bounded channel below.
-///
-/// Storage failure semantics:
-/// * Storage writer task receives chunks via a bounded mpsc channel.
-///   When the channel is full, the upstream reader awaits a slot — that
-///   is the backpressure path. When the writer is gone (e.g. it
-///   already failed and dropped its receiver), `try_send` short-
-///   circuits and we keep yielding to the client without caching.
-/// * On any error from `put_stream`, the writer logs at `warn` and
-///   exits without writing the metadata sidecar. The cache is left
-///   without a metadata sidecar so the NEXT request misses the cache
-///   and re-fetches upstream — the system self-heals.
-/// * On client disconnect mid-stream, the tee task ends, the channel
-///   drops, and the writer commits or aborts whatever it has buffered.
-///   No leaked temp files (FilesystemBackend cleans up via the
-///   `put_stream` error path).
-///
-/// Error categories (#1185):
-/// * Upstream stream errors observed mid-body are wrapped as
-///   [`AppError::BadGateway`] before being forwarded to the writer
-///   channel and surfaced to the client. This keeps operator log /
-///   metric buckets honest: a flaky mirror does not inflate the
-///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
-///   not get hidden as `BAD_GATEWAY`.
-fn tee_upstream_to_cache(
-    upstream: BoxStream<'static, Result<Bytes>>,
-    storage: Arc<StorageService>,
-    cache_key: String,
-    metadata_key: String,
-    template: CacheMetadataTemplate,
-) -> BoxStream<'static, Result<Bytes>> {
-    // Channel for chunks flowing reader -> writer. mpsc to keep order
-    // (broadcast would let storage skip chunks under backpressure,
-    // which we explicitly want to avoid - skipping chunks corrupts the
-    // cached SHA-256).
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
-
-    // Spawn the storage writer. It consumes the channel as a stream
-    // and calls put_stream. On completion, writes the metadata sidecar
-    // with the observed SHA-256 + byte count.
-    let storage_clone = storage.clone();
-    let cache_key_for_writer = cache_key.clone();
-    tokio::spawn(async move {
-        // Adapter: receiver -> futures::Stream<Result<Bytes>>.
-        let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-
-        let put_result = storage_clone
-            .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
-            .await;
-
-        match put_result {
-            Ok(result) if result.bytes_written == 0 => {
-                // #1365: never cache a zero-byte body. A Maven client
-                // resolving dependencies can drive an upstream response
-                // with no body (a 204, a 200 with `Content-Length: 0`, or
-                // a HEAD-style probe that reaches the streaming download
-                // path), and the upstream POM/JAR is non-empty. Writing the
-                // metadata sidecar here would mark the empty object as a
-                // fresh, non-expired cache hit; the next GET would then
-                // serve `Content-Length: 0`, and Gradle fails parsing the
-                // POM with "Content is not allowed in prolog." Skip the
-                // sidecar so the entry is treated as a miss, and delete the
-                // empty object we just wrote so a later GET re-fetches the
-                // real body from upstream (self-heal).
-                tracing::warn!(
-                    cache_key = %cache_key_for_writer,
-                    "proxy upstream returned an empty body; not caching the zero-byte \
-                     object (no metadata sidecar) so the next request refetches upstream"
-                );
-                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                    tracing::debug!(
-                        cache_key = %cache_key_for_writer,
-                        error = %e,
-                        "best-effort delete of empty proxy-cache object failed; \
-                         the missing metadata sidecar still forces a refetch"
-                    );
-                }
-            }
-            Ok(result) => {
-                let now = Utc::now();
-                // Pin the storage backend's ETag at write time so the
-                // fast path can re-HEAD on each hit and detect tampering
-                // / backend-side replacement (#1051). See [`pin_storage_etag`]
-                // for the best-effort semantics on backends without an
-                // ETag concept or on transport error.
-                let storage_etag = pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
-                let metadata = CacheMetadata {
-                    cached_at: now,
-                    upstream_etag: template.etag,
-                    storage_etag,
-                    expires_at: now + chrono::Duration::seconds(template.ttl_secs),
-                    content_type: template.content_type,
-                    size_bytes: result.bytes_written as i64,
-                    checksum_sha256: result.checksum_sha256,
-                };
-                match serde_json::to_vec(&metadata) {
-                    Ok(json) => {
-                        if let Err(e) = storage_clone.put(&metadata_key, Bytes::from(json)).await {
-                            tracing::warn!(
-                                cache_key = %cache_key_for_writer,
-                                metadata_key = %metadata_key,
-                                error = %e,
-                                "proxy cache metadata sidecar write failed; cache will refetch next request"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            cache_key = %cache_key_for_writer,
-                            error = %e,
-                            "proxy cache metadata JSON serialization failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    cache_key = %cache_key_for_writer,
-                    error = %e,
-                    "proxy cache put_stream failed; cache will refetch next request"
-                );
-            }
-        }
-    });
-
-    // Build the client-facing stream. For each chunk from upstream:
-    //   * forward the same chunk to the storage channel (backpressure
-    //     applies; if storage went away, drop silently and continue).
-    //   * yield the chunk to the client.
-    // On upstream error: forward the error to storage (so put_stream
-    // sees the error and aborts cleanly) and surface to the client.
-    let tee_stream = async_stream::try_stream! {
-        let mut upstream = upstream;
-        while let Some(chunk_result) = upstream.next().await {
-            match chunk_result {
-                Ok(mut bytes) => {
-                    // #1184: cap the per-channel-message size so an upstream
-                    // that hands us a multi-megabyte chunk does not blow
-                    // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
-                    // memory budget. Splitting preserves byte order and the
-                    // total payload; the client sees the same bytes, just
-                    // in smaller pieces. `Bytes::split_to` is a cheap
-                    // reference-count adjustment, not a copy.
-                    while !bytes.is_empty() {
-                        let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
-                        let slice = bytes.split_to(take);
-                        // Best-effort send to the cache writer. If the
-                        // writer is gone (it already failed and dropped
-                        // its receiver), drop the caching half silently
-                        // and keep yielding to the client.
-                        let _ = tx.send(Ok(slice.clone())).await;
-                        yield slice;
-                    }
-                }
-                Err(e) => {
-                    // #1185: upstream stream errors are upstream/network
-                    // failures, not storage failures. Tagging them
-                    // `BadGateway` on the writer channel lets operators
-                    // bucket them correctly in logs / metrics (the
-                    // previous `Storage` tag hid upstream incidents inside
-                    // the storage error rate). The cache writer treats
-                    // any Err it observes as a reason to abandon the
-                    // cache regardless of category. The original error
-                    // surfaces to the client unchanged — handlers map it
-                    // to a 502 via `map_proxy_error` on the request path.
-                    let storage_msg = Err(AppError::BadGateway(format!(
-                        "upstream stream error: {}",
-                        e
-                    )));
-                    let _ = tx.send(storage_msg).await;
-                    Err(e)?;
-                }
-            }
-        }
-        // upstream EOF: drop tx so the writer sees end-of-stream
-        drop(tx);
-    };
-    Box::pin(tee_stream)
-}
-
 /// A single proxy-cached artifact, reconstructed from the storage backend
 /// for the repository artifact-listing endpoint (#1548, web #424).
 ///
@@ -773,115 +588,6 @@ impl CacheStore {
         }
     }
 
-    /// Cache artifact content and its metadata sidecar.
-    ///
-    /// Relocated verbatim from `ProxyService::cache_artifact` (the DB-write
-    /// side was already removed under #1278). Preserves the #1365 zero-byte
-    /// guard, the #1051 ETag pin, and the identical write ordering
-    /// (content first, then sidecar).
-    #[allow(clippy::too_many_arguments)]
-    async fn write(
-        &self,
-        cache_key: &str,
-        metadata_key: &str,
-        content: &Bytes,
-        content_type: Option<String>,
-        etag: Option<String>,
-        ttl_secs: i64,
-        repository_id: Uuid,
-        artifact_path: &str,
-    ) -> Result<()> {
-        // #1365: never cache a zero-byte body on the buffered path either.
-        // An empty upstream response (204 / empty 200) must not become a
-        // fresh cache entry that a later request serves as
-        // `Content-Length: 0`. Skip the write entirely so the next request
-        // refetches from upstream; the caller treats a cache miss as the
-        // normal path. The streaming sibling `tee_upstream_to_cache` applies
-        // the same guard after `put_stream`.
-        if content.is_empty() {
-            tracing::warn!(
-                cache_key = %cache_key,
-                "proxy upstream returned an empty body; not caching the zero-byte \
-                 object so the next request refetches upstream"
-            );
-            return Ok(());
-        }
-
-        // Calculate checksum
-        let checksum = StorageService::calculate_hash(content);
-
-        // Store content first so we can read the backend's ETag back for
-        // the integrity-revalidation pin (#1051).
-        self.storage.put(cache_key, content.clone()).await?;
-
-        // Best-effort: capture the backend's ETag right after the PUT so
-        // the fast path can re-HEAD on each hit and reject tampered or
-        // replaced objects. See [`pin_storage_etag`] for the failure
-        // semantics; a failure here only disables revalidation for this
-        // entry, the cache write itself still succeeds.
-        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
-
-        // Create metadata
-        let now = Utc::now();
-        let metadata = CacheMetadata {
-            cached_at: now,
-            upstream_etag: etag,
-            storage_etag,
-            expires_at: now + chrono::Duration::seconds(ttl_secs),
-            content_type,
-            size_bytes: content.len() as i64,
-            checksum_sha256: checksum.clone(),
-        };
-
-        // Store metadata
-        let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
-            .put(metadata_key, Bytes::from(metadata_json))
-            .await?;
-
-        // Proxy-cached content is intentionally NOT recorded in the
-        // `artifacts` table (issue #1278). The previous behaviour inserted
-        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
-        // alongside the global-backend write above, which caused every
-        // subsequent format-handler read to take the
-        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
-        // path -- a per-repo `FilesystemStorage` rooted at
-        // `repo.storage_path` that resolves to a doubled-prefix path
-        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
-        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
-        // object-store backends were unaffected because their registry
-        // shares the same instance regardless of `location.path`.
-        //
-        // The cached body and metadata sidecar are still on disk under
-        // `self.storage` (the global default). The format-handler hot path
-        // already checks the proxy cache via `proxy_check_cache`
-        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
-        // falling through to the upstream fetch, so cache hits are served
-        // through that path with no `artifacts` row needed. Reads through
-        // the global backend match the writes above.
-        //
-        // Tradeoff: proxy-cached items no longer surface in the
-        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
-        // counted toward `storage_used_bytes`. That UX/accounting gap is
-        // tracked separately; correctness (no more 500s on cached reads)
-        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
-        // versions stay in `artifacts` and continue to surface in
-        // listings until they are explicitly invalidated, which is a
-        // graceful degradation, not a regression.
-        let _ = repository_id;
-        let _ = artifact_path;
-        let _ = checksum;
-
-        tracing::debug!(
-            "Cached artifact {} ({} bytes, expires at {})",
-            cache_key,
-            content.len(),
-            metadata.expires_at
-        );
-
-        Ok(())
-    }
-
     /// Evict a cache entry: derive both keys, then delete the content and
     /// metadata blobs in that order, ignoring delete errors.
     ///
@@ -951,6 +657,358 @@ impl CacheStore {
                 matches!(self.storage.exists(cache_key).await, Ok(true))
             }
         }
+    }
+}
+
+/// Owns the post-proxy persistence concern — seam (b) of the #1618 refactor
+/// (S9). Both write-to-cache paths funnel through here:
+///
+/// * [`Self::write_buffered`] ← `ProxyService::cache_artifact` /
+///   `CacheStore::write` — the buffered path that has the whole body in
+///   memory.
+/// * [`Self::tee_stream`] ← the `tee_upstream_to_cache` free function — the
+///   streaming path that tees the upstream body to the client AND a
+///   background cache writer concurrently.
+///
+/// This is a pure structural relocation: no behavior, logging, error type,
+/// ordering, or call-site signature changed in the move. The two paths
+/// previously each independently implemented the same load-bearing
+/// invariants, all preserved here byte-for-byte and annotated `// #1618 S9`
+/// so future editors do not "fix" them:
+///
+/// 1. **#1365 zero-byte guard.** Neither path ever caches an empty body
+///    (buffered: skip the write; streaming: skip the sidecar + delete the
+///    empty object). Same log string in both.
+/// 2. **#1051 ETag pin.** `pin_storage_etag` is read off the backend right
+///    after the content write and stored in the sidecar so the fast path can
+///    revalidate; a backend with no ETag concept falls back to pre-#1051
+///    existence-only semantics.
+/// 3. **Body → sidecar write ordering.** The content object is written
+///    first, then the cache-metadata sidecar. Never reordered.
+///
+/// Streaming-tee failure semantics ([`Self::tee_stream`]) are unchanged: a
+/// cache-write failure must not corrupt the client stream, upstream errors
+/// surface to the client while the writer abandons the cache, etc. See that
+/// method's doc for the full contract.
+///
+/// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
+/// for cache writes, so writes target the global default backend exactly as
+/// before (#1278).
+pub(crate) struct CachePersister {
+    storage: Arc<StorageService>,
+}
+
+impl CachePersister {
+    /// Construct a `CachePersister` over the given storage handle.
+    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
+        Self { storage }
+    }
+
+    /// Cache artifact content and its metadata sidecar (buffered path).
+    ///
+    /// Relocated verbatim from `ProxyService::cache_artifact` /
+    /// `CacheStore::write` (#1618 S9; the DB-write side was already removed
+    /// under #1278). Preserves the #1365 zero-byte guard, the #1051 ETag
+    /// pin, and the identical write ordering (content first, then sidecar).
+    #[allow(clippy::too_many_arguments)]
+    async fn write_buffered(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        content: &Bytes,
+        content_type: Option<String>,
+        etag: Option<String>,
+        ttl_secs: i64,
+        repository_id: Uuid,
+        artifact_path: &str,
+    ) -> Result<()> {
+        // #1618 S9 / #1365: never cache a zero-byte body on the buffered
+        // path either. An empty upstream response (204 / empty 200) must
+        // not become a fresh cache entry that a later request serves as
+        // `Content-Length: 0`. Skip the write entirely so the next request
+        // refetches from upstream; the caller treats a cache miss as the
+        // normal path. The streaming sibling [`Self::tee_stream`] applies
+        // the same guard after `put_stream`.
+        if content.is_empty() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "proxy upstream returned an empty body; not caching the zero-byte \
+                 object so the next request refetches upstream"
+            );
+            return Ok(());
+        }
+
+        // Calculate checksum
+        let checksum = StorageService::calculate_hash(content);
+
+        // #1618 S9: body → sidecar write ordering. Store content first so we
+        // can read the backend's ETag back for the integrity-revalidation
+        // pin (#1051).
+        self.storage.put(cache_key, content.clone()).await?;
+
+        // #1618 S9 / #1051: best-effort capture of the backend's ETag right
+        // after the PUT so the fast path can re-HEAD on each hit and reject
+        // tampered or replaced objects. See [`pin_storage_etag`] for the
+        // failure semantics; a failure here only disables revalidation for
+        // this entry, the cache write itself still succeeds.
+        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
+
+        // Create metadata
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: etag,
+            storage_etag,
+            expires_at: now + chrono::Duration::seconds(ttl_secs),
+            content_type,
+            size_bytes: content.len() as i64,
+            checksum_sha256: checksum,
+        };
+
+        // #1618 S9: sidecar written second, after the content object above.
+        let metadata_json = serde_json::to_vec(&metadata)?;
+        self.storage
+            .put(metadata_key, Bytes::from(metadata_json))
+            .await?;
+
+        // Proxy-cached content is intentionally NOT recorded in the
+        // `artifacts` table (issue #1278). The previous behaviour inserted
+        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
+        // alongside the global-backend write above, which caused every
+        // subsequent format-handler read to take the
+        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
+        // path -- a per-repo `FilesystemStorage` rooted at
+        // `repo.storage_path` that resolves to a doubled-prefix path
+        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
+        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
+        // object-store backends were unaffected because their registry
+        // shares the same instance regardless of `location.path`.
+        //
+        // The cached body and metadata sidecar are still on disk under
+        // `self.storage` (the global default). The format-handler hot path
+        // already checks the proxy cache via `proxy_check_cache`
+        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
+        // falling through to the upstream fetch, so cache hits are served
+        // through that path with no `artifacts` row needed. Reads through
+        // the global backend match the writes above.
+        //
+        // Tradeoff: proxy-cached items no longer surface in the
+        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
+        // counted toward `storage_used_bytes`. That UX/accounting gap is
+        // tracked separately; correctness (no more 500s on cached reads)
+        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
+        // versions stay in `artifacts` and continue to surface in
+        // listings until they are explicitly invalidated, which is a
+        // graceful degradation, not a regression.
+        let _ = repository_id;
+        let _ = artifact_path;
+
+        tracing::debug!(
+            "Cached artifact {} ({} bytes, expires at {})",
+            cache_key,
+            content.len(),
+            metadata.expires_at
+        );
+
+        Ok(())
+    }
+
+    /// Tee an upstream byte stream into a returned client stream AND a
+    /// background storage writer that populates the proxy cache (streaming
+    /// path). The returned stream yields the same chunks the upstream
+    /// produced, in order, with no buffering beyond the bounded channel
+    /// below.
+    ///
+    /// Relocated verbatim from the `tee_upstream_to_cache` free function
+    /// (#1618 S9). Storage failure semantics:
+    /// * Storage writer task receives chunks via a bounded mpsc channel.
+    ///   When the channel is full, the upstream reader awaits a slot — that
+    ///   is the backpressure path. When the writer is gone (e.g. it
+    ///   already failed and dropped its receiver), `try_send` short-
+    ///   circuits and we keep yielding to the client without caching.
+    /// * On any error from `put_stream`, the writer logs at `warn` and
+    ///   exits without writing the metadata sidecar. The cache is left
+    ///   without a metadata sidecar so the NEXT request misses the cache
+    ///   and re-fetches upstream — the system self-heals.
+    /// * On client disconnect mid-stream, the tee task ends, the channel
+    ///   drops, and the writer commits or aborts whatever it has buffered.
+    ///   No leaked temp files (FilesystemBackend cleans up via the
+    ///   `put_stream` error path).
+    ///
+    /// Error categories (#1185):
+    /// * Upstream stream errors observed mid-body are wrapped as
+    ///   [`AppError::BadGateway`] before being forwarded to the writer
+    ///   channel and surfaced to the client. This keeps operator log /
+    ///   metric buckets honest: a flaky mirror does not inflate the
+    ///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
+    ///   not get hidden as `BAD_GATEWAY`.
+    fn tee_stream(
+        &self,
+        upstream: BoxStream<'static, Result<Bytes>>,
+        cache_key: String,
+        metadata_key: String,
+        template: CacheMetadataTemplate,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let storage = Arc::clone(&self.storage);
+
+        // Channel for chunks flowing reader -> writer. mpsc to keep order
+        // (broadcast would let storage skip chunks under backpressure,
+        // which we explicitly want to avoid - skipping chunks corrupts the
+        // cached SHA-256).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
+
+        // Spawn the storage writer. It consumes the channel as a stream
+        // and calls put_stream. On completion, writes the metadata sidecar
+        // with the observed SHA-256 + byte count.
+        let storage_clone = storage.clone();
+        let cache_key_for_writer = cache_key.clone();
+        tokio::spawn(async move {
+            // Adapter: receiver -> futures::Stream<Result<Bytes>>.
+            let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+
+            let put_result = storage_clone
+                .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
+                .await;
+
+            match put_result {
+                Ok(result) if result.bytes_written == 0 => {
+                    // #1618 S9 / #1365: never cache a zero-byte body. A
+                    // Maven client resolving dependencies can drive an
+                    // upstream response with no body (a 204, a 200 with
+                    // `Content-Length: 0`, or a HEAD-style probe that
+                    // reaches the streaming download path), and the upstream
+                    // POM/JAR is non-empty. Writing the metadata sidecar
+                    // here would mark the empty object as a fresh,
+                    // non-expired cache hit; the next GET would then serve
+                    // `Content-Length: 0`, and Gradle fails parsing the POM
+                    // with "Content is not allowed in prolog." Skip the
+                    // sidecar so the entry is treated as a miss, and delete
+                    // the empty object we just wrote so a later GET
+                    // re-fetches the real body from upstream (self-heal).
+                    // The buffered sibling [`Self::write_buffered`] applies
+                    // the same guard before the content write.
+                    tracing::warn!(
+                        cache_key = %cache_key_for_writer,
+                        "proxy upstream returned an empty body; not caching the zero-byte \
+                         object (no metadata sidecar) so the next request refetches upstream"
+                    );
+                    if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                        tracing::debug!(
+                            cache_key = %cache_key_for_writer,
+                            error = %e,
+                            "best-effort delete of empty proxy-cache object failed; \
+                             the missing metadata sidecar still forces a refetch"
+                        );
+                    }
+                }
+                Ok(result) => {
+                    let now = Utc::now();
+                    // #1618 S9 / #1051: pin the storage backend's ETag at
+                    // write time so the fast path can re-HEAD on each hit
+                    // and detect tampering / backend-side replacement. See
+                    // [`pin_storage_etag`] for the best-effort semantics on
+                    // backends without an ETag concept or on transport
+                    // error.
+                    let storage_etag =
+                        pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
+                    let metadata = CacheMetadata {
+                        cached_at: now,
+                        upstream_etag: template.etag,
+                        storage_etag,
+                        expires_at: now + chrono::Duration::seconds(template.ttl_secs),
+                        content_type: template.content_type,
+                        size_bytes: result.bytes_written as i64,
+                        checksum_sha256: result.checksum_sha256,
+                    };
+                    match serde_json::to_vec(&metadata) {
+                        Ok(json) => {
+                            // #1618 S9: sidecar written second, after the
+                            // streaming content write (put_stream) above.
+                            if let Err(e) =
+                                storage_clone.put(&metadata_key, Bytes::from(json)).await
+                            {
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    metadata_key = %metadata_key,
+                                    error = %e,
+                                    "proxy cache metadata sidecar write failed; cache will refetch next request"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                error = %e,
+                                "proxy cache metadata JSON serialization failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %cache_key_for_writer,
+                        error = %e,
+                        "proxy cache put_stream failed; cache will refetch next request"
+                    );
+                }
+            }
+        });
+
+        // Build the client-facing stream. For each chunk from upstream:
+        //   * forward the same chunk to the storage channel (backpressure
+        //     applies; if storage went away, drop silently and continue).
+        //   * yield the chunk to the client.
+        // On upstream error: forward the error to storage (so put_stream
+        // sees the error and aborts cleanly) and surface to the client.
+        let tee_stream = async_stream::try_stream! {
+            let mut upstream = upstream;
+            while let Some(chunk_result) = upstream.next().await {
+                match chunk_result {
+                    Ok(mut bytes) => {
+                        // #1184: cap the per-channel-message size so an upstream
+                        // that hands us a multi-megabyte chunk does not blow
+                        // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
+                        // memory budget. Splitting preserves byte order and the
+                        // total payload; the client sees the same bytes, just
+                        // in smaller pieces. `Bytes::split_to` is a cheap
+                        // reference-count adjustment, not a copy.
+                        while !bytes.is_empty() {
+                            let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
+                            let slice = bytes.split_to(take);
+                            // Best-effort send to the cache writer. If the
+                            // writer is gone (it already failed and dropped
+                            // its receiver), drop the caching half silently
+                            // and keep yielding to the client.
+                            let _ = tx.send(Ok(slice.clone())).await;
+                            yield slice;
+                        }
+                    }
+                    Err(e) => {
+                        // #1185: upstream stream errors are upstream/network
+                        // failures, not storage failures. Tagging them
+                        // `BadGateway` on the writer channel lets operators
+                        // bucket them correctly in logs / metrics (the
+                        // previous `Storage` tag hid upstream incidents inside
+                        // the storage error rate). The cache writer treats
+                        // any Err it observes as a reason to abandon the
+                        // cache regardless of category. The original error
+                        // surfaces to the client unchanged — handlers map it
+                        // to a 502 via `map_proxy_error` on the request path.
+                        let storage_msg = Err(AppError::BadGateway(format!(
+                            "upstream stream error: {}",
+                            e
+                        )));
+                        let _ = tx.send(storage_msg).await;
+                        Err(e)?;
+                    }
+                }
+            }
+            // upstream EOF: drop tx so the writer sees end-of-stream
+            drop(tx);
+        };
+        Box::pin(tee_stream)
     }
 }
 
@@ -1510,6 +1568,10 @@ pub struct ProxyService {
     /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
     /// The cache-facing public methods on `ProxyService` delegate here.
     cache_store: CacheStore,
+    /// Owns the post-proxy persistence concern (#1618 S9, seam (b)): the
+    /// buffered (`cache_artifact`) and streaming (tee) write-to-cache paths
+    /// both route through here. Holds the same global-default storage handle.
+    cache_persister: CachePersister,
     /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
     /// (#1618 S8). The upstream-facing methods on `ProxyService`
     /// (`fetch_from_upstream*`, `check_etag_changed`, `parse_bearer_challenge`)
@@ -1540,12 +1602,14 @@ impl ProxyService {
             .expect("Failed to create HTTP client");
 
         let cache_store = CacheStore::new(Arc::clone(&storage));
+        let cache_persister = CachePersister::new(Arc::clone(&storage));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
 
         Self {
             db,
             storage,
             cache_store,
+            cache_persister,
             upstream_client,
         }
     }
@@ -1860,9 +1924,8 @@ impl ProxyService {
         // setting is observable in logs rather than silently doing nothing.
         self.warn_if_proxy_scan_unsupported(repo.id, path).await;
 
-        let body = tee_upstream_to_cache(
+        let body = self.cache_persister.tee_stream(
             upstream.body,
-            self.storage.clone(),
             cache_key,
             metadata_key,
             CacheMetadataTemplate {
@@ -2538,8 +2601,8 @@ impl ProxyService {
         repository_id: Uuid,
         artifact_path: &str,
     ) -> Result<()> {
-        self.cache_store
-            .write(
+        self.cache_persister
+            .write_buffered(
                 cache_key,
                 metadata_key,
                 content,
@@ -5143,6 +5206,21 @@ SHA256:
         ))
     }
 
+    /// Test shim that preserves the original `tee_upstream_to_cache` free-fn
+    /// call shape (#1618 S9 moved the body into [`CachePersister::tee_stream`]).
+    /// Constructs a `CachePersister` over the given storage and delegates, so
+    /// the established streaming-tee tests keep their `(upstream, storage, …)`
+    /// signature unchanged.
+    fn tee_upstream_to_cache(
+        upstream: BoxStream<'static, Result<Bytes>>,
+        storage: Arc<StorageService>,
+        cache_key: String,
+        metadata_key: String,
+        template: CacheMetadataTemplate,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        CachePersister::new(storage).tee_stream(upstream, cache_key, metadata_key, template)
+    }
+
     fn template() -> CacheMetadataTemplate {
         CacheMetadataTemplate {
             content_type: Some("application/octet-stream".to_string()),
@@ -5506,6 +5584,160 @@ SHA256:
         assert!(
             metadata.storage_etag.is_none(),
             "no backend ETag means no pin, preserving pre-#1051 fast-path semantics"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CachePersister::write_buffered (#1618 S9): the buffered write-to-cache
+    // path. Recording backend captures every `put` in order so a test can
+    // assert the body→sidecar write ordering, the #1051 ETag pin, and the
+    // #1365 zero-byte guard without a real storage backend.
+    // -----------------------------------------------------------------------
+
+    /// Records every `put(key, body)` in call order and surfaces a
+    /// configurable `head_etag`. Shared by the buffered-path tests below so
+    /// they do not each re-implement a stub backend (jscpd).
+    struct BufferedRecordingBackend {
+        puts: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        etag: Option<String>,
+    }
+
+    impl BufferedRecordingBackend {
+        fn new(etag: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                puts: tokio::sync::Mutex::new(Vec::new()),
+                etag: etag.map(|s| s.to_string()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for BufferedRecordingBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.puts.lock().await.push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound("n/a".into()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(self.etag.clone())
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _p: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _s: &str, _d: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _k: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            _stream: ServiceBoxStream<'static, Result<Bytes>>,
+        ) -> Result<ServicePutStreamResult> {
+            unreachable!("buffered path does not call put_stream")
+        }
+    }
+
+    /// Run `write_buffered` against a recording backend and return the
+    /// recorded `put` calls. Keeps the per-test setup in one place.
+    async fn run_write_buffered(
+        backend: Arc<BufferedRecordingBackend>,
+        content: &Bytes,
+        etag: Option<String>,
+    ) -> Vec<(String, Bytes)> {
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let persister = CachePersister::new(storage);
+        persister
+            .write_buffered(
+                "proxy-cache/repo/path/__content__",
+                "proxy-cache/repo/path/__cache_meta__.json",
+                content,
+                Some("application/octet-stream".to_string()),
+                etag,
+                3600,
+                Uuid::nil(),
+                "repo/path",
+            )
+            .await
+            .expect("write_buffered should succeed");
+        backend.puts.lock().await.clone()
+    }
+
+    /// Happy path: body is written FIRST, then the sidecar (#1618 S9 write
+    /// ordering). The sidecar carries the correct size, checksum, content
+    /// type, upstream etag, and the #1051 pinned storage ETag.
+    #[tokio::test]
+    async fn test_write_buffered_writes_body_then_sidecar_and_pins_etag() {
+        let backend = BufferedRecordingBackend::new(Some("\"backend-etag\""));
+        let body = Bytes::from_static(b"hello world");
+        let puts = run_write_buffered(backend, &body, Some("\"upstream-etag\"".to_string())).await;
+
+        assert_eq!(puts.len(), 2, "exactly one body put and one sidecar put");
+        // #1618 S9: content object first.
+        assert_eq!(puts[0].0, "proxy-cache/repo/path/__content__");
+        assert_eq!(puts[0].1.as_ref(), b"hello world");
+        // #1618 S9: sidecar second.
+        assert_eq!(puts[1].0, "proxy-cache/repo/path/__cache_meta__.json");
+
+        let metadata: CacheMetadata =
+            serde_json::from_slice(&puts[1].1).expect("sidecar JSON parseable");
+        assert_eq!(metadata.size_bytes, 11);
+        // SHA-256("hello world") known value:
+        assert_eq!(
+            metadata.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(
+            metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(metadata.upstream_etag.as_deref(), Some("\"upstream-etag\""));
+        // #1051 pin: the backend's post-put ETag is recorded.
+        assert_eq!(metadata.storage_etag.as_deref(), Some("\"backend-etag\""));
+        let ttl_seen = (metadata.expires_at - metadata.cached_at).num_seconds();
+        assert!(
+            (3595..=3605).contains(&ttl_seen),
+            "expected expires_at - cached_at ~= 3600s, got {}s",
+            ttl_seen
+        );
+    }
+
+    /// #1051 fall-through: a backend with no ETag concept (filesystem /
+    /// legacy) leaves `storage_etag = None`, preserving pre-#1051 fast-path
+    /// existence-only revalidation semantics.
+    #[tokio::test]
+    async fn test_write_buffered_leaves_etag_none_when_backend_has_no_etag() {
+        let backend = BufferedRecordingBackend::new(None);
+        let body = Bytes::from_static(b"payload");
+        let puts = run_write_buffered(backend, &body, None).await;
+
+        assert_eq!(puts.len(), 2);
+        let metadata: CacheMetadata = serde_json::from_slice(&puts[1].1).unwrap();
+        assert!(
+            metadata.storage_etag.is_none(),
+            "no backend ETag means no pin (pre-#1051 semantics)"
+        );
+    }
+
+    /// #1618 S9 / #1365: an empty body must NOT be cached on the buffered
+    /// path. No content put, no sidecar put — the next request refetches.
+    #[tokio::test]
+    async fn test_write_buffered_empty_body_is_not_cached() {
+        let backend = BufferedRecordingBackend::new(Some("\"etag\""));
+        let body = Bytes::new();
+        let puts = run_write_buffered(backend, &body, None).await;
+        assert!(
+            puts.is_empty(),
+            "zero-byte body must skip BOTH the content and sidecar writes (#1365)"
         );
     }
 
