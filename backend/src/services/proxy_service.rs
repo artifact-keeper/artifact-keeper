@@ -7315,4 +7315,818 @@ SHA256:
             "stale: missing body is a miss, not an error"
         );
     }
+
+    // =======================================================================
+    // UpstreamClient coverage (#1618 S8).
+    //
+    // S8 relocated the upstream-fetch lifecycle (`fetch_buffered`,
+    // `fetch_stream`, `read_upstream_response*`, `exchange_bearer_then`,
+    // `obtain_bearer_token`, `get_cached_token`, `check_etag_changed`) into
+    // `UpstreamClient`. Those network methods load per-repo auth from the DB
+    // before issuing the HTTP request, so the unit tests below drive them end
+    // to end against a `wiremock` upstream with a live `DATABASE_URL` (the
+    // same fixture pattern the rest of this suite uses). They no-op on runners
+    // without a test DB and run in CI's coverage job, which provisions one.
+    //
+    // The `obtain_bearer_token` cache-hit / TTL-cap / eviction decisions and
+    // `get_cached_token` freshness math are pure (no network) and are tested
+    // by constructing an `UpstreamClient` directly and seeding its token cache.
+    // =======================================================================
+
+    /// Build a Remote `Repository` whose `upstream_url` points at `upstream`.
+    /// `repo.id` is random and intentionally absent from the DB: the upstream
+    /// methods only run `load_upstream_auth`, whose query returns no rows
+    /// (`Ok(None)`) for an unknown id and then proceeds to the HTTP request.
+    fn wiremock_remote_repo(key: &str, upstream: &str, storage_path: &str) -> Repository {
+        Repository {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: storage_path.to_string(),
+            upstream_url: Some(upstream.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // -- get_cached_token: pure TTL-freshness decision -----------------------
+
+    #[tokio::test]
+    async fn test_get_cached_token_returns_fresh_entry_within_90pct_ttl() {
+        // A token cached "just now" with a 1000s TTL is well inside the 90%
+        // freshness window and must be returned verbatim.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        {
+            let mut cache = client.token_cache.write().await;
+            cache.insert(
+                "k".to_string(),
+                ("tok-fresh".to_string(), Instant::now(), 1000),
+            );
+        }
+        assert_eq!(
+            client.get_cached_token("k").await.as_deref(),
+            Some("tok-fresh"),
+            "a token inside the 90% TTL window is a cache hit",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_token_treats_aged_entry_past_90pct_as_miss() {
+        // created_at far enough in the past that elapsed() >= ttl*9/10. With a
+        // 10s TTL the window is 9s; backdate the entry by 20s so it is stale.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        {
+            let mut cache = client.token_cache.write().await;
+            let aged = Instant::now()
+                .checked_sub(Duration::from_secs(20))
+                .expect("subtract 20s");
+            cache.insert("k".to_string(), ("tok-old".to_string(), aged, 10));
+        }
+        assert!(
+            client.get_cached_token("k").await.is_none(),
+            "an entry past 90% of its TTL must be treated as a miss",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_token_absent_key_is_miss() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        assert!(client.get_cached_token("nope").await.is_none());
+    }
+
+    // -- obtain_bearer_token: cache hit short-circuit (no network) -----------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_returns_cached_without_network() {
+        // A fresh cache entry under the exact "{realm}\0{service}\0{scope}"
+        // key must short-circuit before any token-endpoint request. The realm
+        // points at an unroutable host so a network attempt would fail the
+        // test; the cache hit makes it never happen.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = "http://127.0.0.1:0/token";
+        let service = "registry.example";
+        let scope = "repository:library/alpine:pull";
+        let key = format!("{}\0{}\0{}", realm, service, scope);
+        {
+            let mut cache = client.token_cache.write().await;
+            cache.insert(key, ("cached-bearer".to_string(), Instant::now(), 1000));
+        }
+        let token = client
+            .obtain_bearer_token(realm, service, scope, &None)
+            .await
+            .expect("cache hit must return Ok without contacting the realm");
+        assert_eq!(token, "cached-bearer");
+    }
+
+    // -- obtain_bearer_token: full token-endpoint exchange via wiremock ------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_exchanges_and_caps_ttl() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Token endpoint echoes a token and an absurd expires_in; the TTL must
+        // be capped at MAX_TOKEN_TTL_SECS by the caching logic.
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("service", "reg.test"))
+            .and(query_param("scope", "repository:img:pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "exchanged-token",
+                "expires_in": 10_000_000u64,
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let token = client
+            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .await
+            .expect("token exchange against a 200 token endpoint must succeed");
+        assert_eq!(token, "exchanged-token");
+
+        // The entry is now cached with the capped TTL, so a second call is a
+        // cache hit (no second request is registered on the mock).
+        let again = client
+            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .await
+            .expect("second call must hit the cache");
+        assert_eq!(again, "exchanged-token");
+
+        let cache = client.token_cache.read().await;
+        let (_, _, ttl) = cache
+            .get(&format!(
+                "{}\0{}\0{}",
+                realm, "reg.test", "repository:img:pull"
+            ))
+            .expect("entry cached");
+        assert_eq!(
+            *ttl, MAX_TOKEN_TTL_SECS,
+            "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_uses_access_token_field_and_default_ttl() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // No `service`/`scope` params -> the token URL is the bare realm. The
+        // response uses the `access_token` alias and omits `expires_in`, so the
+        // default TTL applies.
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "alias-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/realm", server.uri());
+
+        let token = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect("access_token alias must be accepted");
+        assert_eq!(token, "alias-token");
+
+        let cache = client.token_cache.read().await;
+        let (_, _, ttl) = cache
+            .get(&format!("{}\0\0", realm))
+            .expect("entry cached under empty service/scope");
+        assert_eq!(
+            *ttl, DEFAULT_TOKEN_TTL_SECS,
+            "a missing expires_in must fall back to DEFAULT_TOKEN_TTL_SECS",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_errors_on_non_success_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let err = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect_err("a 403 from the token endpoint must surface as an error");
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_errors_when_response_has_no_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "expires_in": 60 })),
+            )
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let err = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect_err("a token response with neither token nor access_token must error");
+        assert!(matches!(err, AppError::Storage(_)));
+    }
+
+    // -- fetch_buffered + read_upstream_response (success / error) -----------
+
+    #[tokio::test]
+    async fn test_fetch_buffered_returns_body_headers_and_etag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("link", "<next>; rel=next")
+                    .set_body_bytes(b"buffered-bytes".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-buf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/pkg/file.bin", server.uri());
+
+        let resp = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .expect("buffered fetch of a 200 upstream must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(&resp.content[..], b"buffered-bytes");
+        assert_eq!(
+            resp.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(resp.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(resp.link.as_deref(), Some("<next>; rel=next"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_buffered_maps_upstream_404_to_error() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/missing", server.uri());
+
+        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            result.is_err(),
+            "a 404 upstream must surface as an error, not a body",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_buffered_maps_upstream_503_to_service_unavailable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-503-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/down", server.uri());
+
+        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let err = result
+            .err()
+            .expect("a 5xx upstream must surface as an error");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "5xx upstream must map to ServiceUnavailable, got {err:?}",
+        );
+    }
+
+    // -- fetch_upstream_direct(+_with_link): drive fetch_buffered + headers --
+
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_returns_effective_url() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/simple/foo/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"<html/>".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-direct-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-direct", &server.uri(), tmp.to_str().unwrap());
+
+        let (body, ct, effective) = proxy
+            .fetch_upstream_direct(&repo, "simple/foo/")
+            .await
+            .expect("direct fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"<html/>");
+        assert_eq!(ct.as_deref(), Some("text/html"));
+        assert!(
+            effective.ends_with("/simple/foo/"),
+            "effective url: {effective}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_with_link_preserves_link_header() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/_catalog"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", "</v2/_catalog?last=z>; rel=\"next\"")
+                    .set_body_bytes(b"{}".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-link-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-link", &server.uri(), tmp.to_str().unwrap());
+
+        let (_body, _ct, link) = proxy
+            .fetch_upstream_direct_with_link(&repo, "v2/_catalog")
+            .await
+            .expect("direct-with-link fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(link.as_deref(), Some("</v2/_catalog?last=z>; rel=\"next\""));
+    }
+
+    // -- fetch_stream + read_upstream_response_streaming ---------------------
+
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_streams_upstream_body_on_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"streamed-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-stream-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-stream", &server.uri(), tmp.to_str().unwrap());
+
+        let result = proxy
+            .fetch_artifact_streaming(&repo, "blob")
+            .await
+            .expect("streaming fetch on a cache miss must succeed");
+        assert_eq!(
+            result.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+
+        let mut collected = Vec::new();
+        let mut body = result.body;
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(collected, b"streamed-body");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_maps_upstream_5xx_to_error() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-stream5xx-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-stream5xx", &server.uri(), tmp.to_str().unwrap());
+
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "blob")
+            .await
+            .err()
+            .expect("a 5xx upstream must fail the streaming fetch");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    // -- exchange_bearer_then: OCI 401 Bearer challenge handling -------------
+    //
+    // The full success path (parse challenge -> validate realm -> token
+    // exchange -> bearer retry) cannot be exercised by a unit test: the only
+    // host a wiremock server binds to is loopback, and loopback is a HARD SSRF
+    // block in `validate_outbound_url` that the `UPSTREAM_ALLOW_PRIVATE_IPS`
+    // toggle does NOT relax (api::validation::is_blocked_ipv4). So the realm
+    // validation inside `exchange_bearer_then` rejects a loopback realm before
+    // any token request. The two tests below pin the branches we CAN reach:
+    //   1. a parseable Bearer challenge whose realm is SSRF-blocked surfaces
+    //      the validation error (covers the parse + realm-extract + validate
+    //      path of `exchange_bearer_then`), and
+    //   2. a 401 that is NOT a Bearer challenge returns `Ok(None)` and the
+    //      caller maps it to the original "upstream error status".
+
+    #[tokio::test]
+    async fn test_buffered_fetch_rejects_ssrf_bearer_realm() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A 401 Bearer challenge whose realm points at a metadata/internal
+        // address. `exchange_bearer_then` must parse the challenge, extract the
+        // realm, and reject it via `validate_outbound_url` BEFORE issuing any
+        // outbound token request (the anti-SSRF guard, #1618 S8 doc).
+        Mock::given(method("GET"))
+            .and(path("/v2/lib/img/manifests/latest"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                "Bearer realm=\"http://169.254.169.254/latest/token\",service=\"reg\",scope=\"pull\"",
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-ssrf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/v2/lib/img/manifests/latest", server.uri());
+
+        let err = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .err()
+            .expect("a Bearer realm pointing at an internal address must be rejected");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "an SSRF-blocked OCI token realm must surface as a validation error, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_fetch_401_without_bearer_challenge_errors() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A 401 whose WWW-Authenticate is NOT a Bearer challenge: exchange
+        // returns Ok(None) and the caller maps it to the original error.
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("www-authenticate", "Basic realm=\"x\""),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-401basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/private", server.uri());
+
+        let err = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .err()
+            .expect("a non-Bearer 401 must surface as an error");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(matches!(err, AppError::Storage(_)), "{err:?}");
+    }
+
+    // -- check_etag_changed via check_upstream (304 / changed / unchanged) ---
+
+    #[tokio::test]
+    async fn test_check_upstream_etag_304_reports_unchanged() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Seed the cache by fetching once with an ETag.
+        Mock::given(method("GET"))
+            .and(path("/etagged"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"abc\"")
+                    .set_body_bytes(b"body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+        // HEAD revalidation returns 304 Not Modified.
+        Mock::given(method("HEAD"))
+            .and(path("/etagged"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-etag304-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-etag304", &server.uri(), tmp.to_str().unwrap());
+
+        // Prime the cache (writes a metadata sidecar carrying upstream_etag).
+        proxy
+            .fetch_artifact(&repo, "etagged")
+            .await
+            .expect("prime cache");
+
+        let changed = proxy
+            .check_upstream(&repo, "etagged")
+            .await
+            .expect("etag check must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!changed, "a 304 from the HEAD revalidation means unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_check_upstream_etag_changed_when_head_returns_new_etag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/etagged2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"old\"")
+                    .set_body_bytes(b"body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+        // HEAD returns 200 with a different ETag -> changed.
+        Mock::given(method("HEAD"))
+            .and(path("/etagged2"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"new\""))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-etagchg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-etagchg", &server.uri(), tmp.to_str().unwrap());
+
+        proxy
+            .fetch_artifact(&repo, "etagged2")
+            .await
+            .expect("prime cache");
+
+        let changed = proxy
+            .check_upstream(&repo, "etagged2")
+            .await
+            .expect("etag check must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(changed, "a different ETag on the HEAD means changed");
+    }
+
+    // -- fetch_dists_detecting_change: drives buffered fetch + SHA compare ---
+
+    #[tokio::test]
+    async fn test_fetch_dists_detecting_change_reports_changed_on_first_fetch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dists/stable/Release"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"Release: v1".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-dists-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-dists", &server.uri(), tmp.to_str().unwrap());
+
+        let (content, _ct, changed) = proxy
+            .fetch_dists_detecting_change(&repo, "dists/stable/Release")
+            .await
+            .expect("dists fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&content[..], b"Release: v1");
+        assert!(
+            changed,
+            "first fetch with no prior body is always 'changed'"
+        );
+    }
+
+    // -- get_cache_ttl_for_repo: DB lookup with default fallback -------------
+
+    #[tokio::test]
+    async fn test_fetch_artifact_with_cache_path_round_trips_then_serves_from_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // The upstream is only allowed to be hit ONCE: the second request must
+        // be served from the proxy cache, exercising the cache-hit fast path
+        // in fetch_artifact_with_cache_path_and_accept and get_cache_ttl_for_repo.
+        Mock::given(method("GET"))
+            .and(path("/dl/pkg.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/gzip")
+                    .set_body_bytes(b"tarball".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-cachepath-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-cachepath", &server.uri(), tmp.to_str().unwrap());
+
+        let (b1, ct1) = proxy
+            .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
+            .await
+            .expect("first fetch hits upstream and caches");
+        assert_eq!(&b1[..], b"tarball");
+        assert_eq!(ct1.as_deref(), Some("application/gzip"));
+
+        // Second call: upstream mock is exhausted (up_to_n_times(1)); a cache
+        // hit is the only way this can succeed.
+        let (b2, _ct2) = proxy
+            .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
+            .await
+            .expect("second fetch must be served from the proxy cache");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
+    }
+
+    // -- parse_bearer_challenge: unquoted-value and trailing branches --------
+
+    #[test]
+    fn test_parse_bearer_challenge_unquoted_values() {
+        // Unquoted, comma-separated params exercise the else-branch that reads
+        // up to the next comma (lines around the unquoted-value path).
+        let params = UpstreamClient::parse_bearer_challenge(
+            "Bearer realm=https://auth.example/token,service=reg,scope=pull",
+        );
+        assert_eq!(
+            params.get("realm").map(String::as_str),
+            Some("https://auth.example/token")
+        );
+        assert_eq!(params.get("service").map(String::as_str), Some("reg"));
+        assert_eq!(params.get("scope").map(String::as_str), Some("pull"));
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_trailing_key_without_value_breaks() {
+        // A dangling key with no '=' after a valid pair: the loop breaks on the
+        // missing '=' so only the first pair is captured.
+        let params = UpstreamClient::parse_bearer_challenge("Bearer realm=\"r\",dangling");
+        assert_eq!(params.get("realm").map(String::as_str), Some("r"));
+        assert!(!params.contains_key("dangling"));
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_mixed_quoted_then_unquoted_tail() {
+        // Quoted value followed by an unquoted final param (no trailing comma)
+        // covers the `end < remaining.len()` false branch of the unquoted arm.
+        let params =
+            UpstreamClient::parse_bearer_challenge("Bearer realm=\"https://r/\",service=svc");
+        assert_eq!(params.get("realm").map(String::as_str), Some("https://r/"));
+        assert_eq!(params.get("service").map(String::as_str), Some("svc"));
+    }
 }
