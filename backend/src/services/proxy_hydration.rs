@@ -79,6 +79,112 @@ fn acquire_local_hydration(key: &str) -> LocalHydrationRole {
     })
 }
 
+/// Single-flight coordination seam for proxy cache hydration (#1631).
+///
+/// This trait is the stable seam that the proxy path elects a leader through.
+/// Layer 1 (#1631) defines it and provides the in-process [`BufferedCoordinator`]
+/// implementation that hosts the existing buffered single-flight behavior
+/// ([`coordinate_proxy_hydration`]) unchanged. Two further layers are designed
+/// to plug in here *without reshaping this method*:
+///
+/// * **Layer 2 — streaming broadcast fan-out (#1631 / #895).** The streaming
+///   proxy path ([`ProxyService::fetch_artifact_streaming`]) has a
+///   fundamentally different follower semantic: followers cannot re-check the
+///   cache mid-flight because the body is not cached until the tee completes,
+///   so they must SUBSCRIBE to the leader's chunks (a `tokio::sync::broadcast`
+///   fan-out) instead of waiting-then-rechecking. That is a *different
+///   primitive*, not a tweak of [`Self::coordinate`]: it will be added as a
+///   SEPARATE method on this trait (e.g. `coordinate_stream`) or a sibling
+///   trait, never by forcing a stream through the buffered method here. See the
+///   clean-room design audit §1.3 and the #1618 plan Amendment 4. The seam is
+///   left deliberately open: do NOT generalize [`Self::coordinate`]'s `T` to
+///   carry a stream — add the streaming entry point alongside it.
+///   // #1631 layer 2 seam: add `coordinate_stream` here.
+///
+/// * **Layer 3 — cross-replica advisory-lock decorator (#1609).** The
+///   leader-election decision (currently [`acquire_local_hydration`], driven
+///   inside [`Self::coordinate`]) must be wrappable so a decorator can gate it
+///   behind `pg_try_advisory_xact_lock(hash(repo_id‖path))`. Because election
+///   is factored behind this trait, a decorator can implement `Coordinator` by
+///   wrapping an inner `Coordinator`, taking the advisory lock around the inner
+///   leader-election step, then delegating. No change to [`Self::coordinate`]'s
+///   signature is required for that.
+///   // #1631 layer 3 seam: an advisory-lock `Coordinator` decorator wraps the
+///   //                     inner coordinator's election step.
+///
+/// The trait is intentionally NOT object-safe (the method is generic over the
+/// caller's closures, mirroring [`coordinate_proxy_hydration`]). It is injected
+/// into `ProxyService` as a concrete field, the same way `CacheStore` (#1618
+/// S7), `UpstreamClient` (S8), and `CachePersister` (S9) are.
+pub trait Coordinator {
+    /// Buffered single-flight coordination for a single cache key.
+    ///
+    /// Contract (preserved byte-for-byte from [`coordinate_proxy_hydration`]):
+    /// the elected leader runs `produce` (which also performs the cache write);
+    /// followers wait on a per-key notify, then re-run `check` to observe the
+    /// leader's result. B6 semantics — a transient cache read error surfaced by
+    /// `check` is the caller's concern (fresh swallows / stale propagates inside
+    /// the closure); this method only loops on `Ok(None)`. `timeout_error`
+    /// builds the error returned when the wait deadline elapses.
+    ///
+    /// Layer 2's streaming fan-out does NOT go through this method (see the
+    /// trait-level docs) — it gets its own entry point. // #1631
+    ///
+    /// This is a PROVIDED method: the default body is the buffered single-flight
+    /// (it delegates to [`coordinate_proxy_hydration`]). [`BufferedCoordinator`]
+    /// uses the default unchanged. A layer-3 advisory-lock decorator (#1609)
+    /// OVERRIDES this to wrap the inner coordinator's leader-election step — the
+    /// provided default is exactly the seam such a decorator wraps. // #1631
+    #[allow(async_fn_in_trait)]
+    async fn coordinate<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+        &self,
+        lease_key: &str,
+        check: Check,
+        produce: Produce,
+        timeout_error: TimeoutErr,
+    ) -> std::result::Result<T, E>
+    where
+        Check: Fn() -> CheckFut,
+        CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+        Produce: FnOnce() -> ProduceFut,
+        ProduceFut: Future<Output = std::result::Result<T, E>>,
+        TimeoutErr: Fn() -> E,
+    {
+        // Delegate, don't copy: the buffered logic stays in one authoritative
+        // place ([`coordinate_proxy_hydration`]) so behavior — and its unit
+        // tests — is preserved byte-for-byte.
+        coordinate_proxy_hydration(lease_key, check, produce, timeout_error).await
+    }
+}
+
+/// In-process buffered single-flight coordinator (#1631 layer 1).
+///
+/// Zero-sized: the actual coordination state lives in the process-global
+/// [`local_hydration_map`], so this type carries no fields. It is the relocation
+/// target for the existing buffered behavior — [`Coordinator::coordinate`]
+/// delegates to the free function [`coordinate_proxy_hydration`], which is kept
+/// as the implementation body so behavior is preserved exactly (no copy of the
+/// logic, so the leader-produce / follower-re-check / timeout / B6 paths and
+/// their tests stay authoritative in one place).
+///
+/// Layer 3's advisory-lock decorator (#1609) will be a *different*
+/// `Coordinator` impl that wraps this one's election step; it is not built here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BufferedCoordinator;
+
+impl BufferedCoordinator {
+    /// Construct the in-process buffered coordinator. Mirrors the `::new`
+    /// constructors of the other injected seams (`CacheStore`, `UpstreamClient`,
+    /// `CachePersister`) for a consistent `ProxyService::new` wiring idiom.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+// `BufferedCoordinator` uses the trait's provided buffered default unchanged —
+// no method body to repeat, which keeps the seam free of duplicated signatures.
+impl Coordinator for BufferedCoordinator {}
+
 pub async fn coordinate_proxy_hydration<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
     lease_key: &str,
     check: Check,
@@ -227,6 +333,119 @@ mod tests {
             coordinate_proxy_hydration(&key, || async { Ok(None) }, || async { Ok(99) }, || ())
                 .await;
         assert_eq!(result, Ok(99));
+        assert!(!map_contains(&key));
+    }
+
+    // ---- #1631 layer 1: Coordinator trait / BufferedCoordinator ----
+    //
+    // The trait seam must behave identically to the relocated free function.
+    // To prove that WITHOUT copying the free-function test bodies (which would
+    // duplicate logic and trip the jscpd gate), the trait tests drive the same
+    // behavioral assertions through [`Coordinator::coordinate`] but exercise
+    // scenarios distinct from the verbatim free-function cases above:
+    //   * leader-produces + follower-re-check in a single end-to-end flow,
+    //   * the timeout/cancellation slot-reclaim path,
+    //   * producer-error slot release,
+    // each routed through the injectable trait rather than the free function.
+
+    #[tokio::test]
+    async fn buffered_coordinator_leader_produces_then_follower_rechecks() {
+        // End-to-end through the trait: the leader produces + "caches" a value,
+        // then a second caller (follower) observes it on re-check and does NOT
+        // re-run its producer. Covers both the leader-produces and the
+        // follower-re-check semantics in one flow via the injectable seam.
+        let coordinator = BufferedCoordinator::new();
+        let key = format!("test-trait-{}", uuid::Uuid::new_v4());
+        let cache: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let produced = Arc::new(AtomicUsize::new(0));
+
+        let check = {
+            let cache = Arc::clone(&cache);
+            move || {
+                let cache = Arc::clone(&cache);
+                async move { Ok::<Option<u32>, ()>(*cache.lock().unwrap()) }
+            }
+        };
+
+        let leader = coordinator
+            .coordinate(
+                &key,
+                check.clone(),
+                {
+                    let cache = Arc::clone(&cache);
+                    let produced = Arc::clone(&produced);
+                    || async move {
+                        produced.fetch_add(1, Ordering::SeqCst);
+                        *cache.lock().unwrap() = Some(123);
+                        Ok(123)
+                    }
+                },
+                || (),
+            )
+            .await;
+        assert_eq!(leader, Ok(123));
+
+        let follower = coordinator
+            .coordinate(
+                &key,
+                check,
+                || async { panic!("follower must not run producer; value is cached") },
+                || (),
+            )
+            .await;
+        assert_eq!(follower, Ok(123));
+        assert_eq!(produced.load(Ordering::SeqCst), 1);
+        assert!(!map_contains(&key));
+    }
+
+    #[tokio::test]
+    async fn buffered_coordinator_timeout_path_drops_leader_slot() {
+        // A leader parked forever inside `produce` occupies the slot. When the
+        // surrounding future is cancelled (request disconnect / wait timeout),
+        // the Drop guard must reclaim the slot through the trait seam, exactly
+        // as the free-function path does. Then a fresh caller wins election.
+        let coordinator = BufferedCoordinator::new();
+        let key = format!("test-trait-timeout-{}", uuid::Uuid::new_v4());
+
+        {
+            let fut = coordinator.coordinate(
+                &key,
+                || async { Ok::<Option<u32>, &'static str>(None) },
+                || async {
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                },
+                || "timeout",
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
+        }
+        assert!(!map_contains(&key));
+
+        let reborn = coordinator
+            .coordinate(
+                &key,
+                || async { Ok(None) },
+                || async { Ok(99u32) },
+                || "timeout",
+            )
+            .await;
+        assert_eq!(reborn, Ok(99));
+        assert!(!map_contains(&key));
+    }
+
+    #[tokio::test]
+    async fn buffered_coordinator_slot_released_after_producer_error() {
+        let coordinator = BufferedCoordinator::new();
+        let key = format!("test-trait-err-{}", uuid::Uuid::new_v4());
+        let result = coordinator
+            .coordinate(
+                &key,
+                || async { Ok::<Option<u32>, &'static str>(None) },
+                || async { Err("boom") },
+                || "timeout",
+            )
+            .await;
+        assert_eq!(result, Err("boom"));
         assert!(!map_contains(&key));
     }
 }
