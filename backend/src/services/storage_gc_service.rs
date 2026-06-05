@@ -91,6 +91,57 @@ AND NOT EXISTS (
 )
 "#;
 
+/// Minimum age (seconds) a blob must reach before [`StorageGcService::run_blob_gc`]
+/// will consider it for deletion (#1408).
+///
+/// Pushes do not commit `oci_blobs` and `manifest_blob_refs` in a single
+/// transaction: blobs are uploaded one by one through their own PUT
+/// requests, then the manifest is pushed at the end. Between the blob
+/// upload and the manifest push, the row exists with no live reference —
+/// it is technically orphan but only because the client is mid-push. A
+/// grace period absorbs the normal push window so blob GC can stay cheap
+/// (no global advisory lock) while still being safe in practice.
+/// Twenty-four hours is far above the longest realistic
+/// upload-then-manifest gap and short enough that abandoned uploads do
+/// not waste storage indefinitely. The bound is pinned by compile-time
+/// `assert!`s in the test module to keep accidental drift out of band.
+pub(crate) const MIN_BLOB_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// SQL fragment: `EXISTS (...)` — true when some `manifest_blob_refs` row
+/// still protects the outer blob row aliased `ob` (joined to its
+/// repository aliased `r`). Negate it to get "this blob is orphaned".
+///
+/// Scope mirrors the cloud/filesystem branch of [`ORPHAN_PREDICATE_SQL`],
+/// because blob storage is content-addressed under `oci-blobs/<digest>`:
+/// - Cloud backends (S3/Azure/GCS) share one bucket, so that key resolves
+///   to the SAME physical object for every repo on the backend. A
+///   reference from ANY same-backend repo must protect it; deleting on the
+///   first orphan `(repo, digest)` row would destroy a blob other repos
+///   still serve — the cross-repo dedup incident this table guards (57
+///   blobs across 85 tags broken in prod by a per-`(repo,digest)`
+///   reconciler).
+/// - Filesystem repos each root their own tree at `storage_path`, so the
+///   key resolves to a DISTINCT file per repo. Only a reference whose repo
+///   shares this `storage_path` protects this repo's copy; another repo's
+///   copy is independently reclaimable.
+///
+/// The outer query must expose `ob` (oci_blobs) and `r` (repositories) so
+/// the initial scan and the locked re-check feed off one definition and
+/// cannot drift (the #1180 lesson, applied to blob GC).
+const BLOB_PROTECTED_BY_REFS_SQL: &str = r#"
+    EXISTS (
+        SELECT 1
+        FROM manifest_blob_refs mbr
+        JOIN repositories mr ON mr.id = mbr.repository_id
+        WHERE mbr.blob_digest = ob.digest
+          AND mr.storage_backend = r.storage_backend
+          AND (
+            r.storage_backend <> 'filesystem'
+            OR mr.storage_path = r.storage_path
+          )
+    )
+"#;
+
 /// Result of a storage GC run.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StorageGcResult {
@@ -409,6 +460,207 @@ impl StorageGcService {
         }
 
         Ok(result)
+    }
+
+    /// Reclaim OCI blob layers that no live manifest references (#1408).
+    ///
+    /// Deletion design originated in #1409; this rebuilds it on top of the
+    /// merged `manifest_blob_refs` table + backfill (#1641/#1635).
+    ///
+    /// Iterates `oci_blobs` rows whose digest has zero matching rows in
+    /// `manifest_blob_refs` and deletes both the storage object and the DB
+    /// row.
+    ///
+    /// The orphan predicate is **backend-aware** (see
+    /// [`BLOB_PROTECTED_BY_REFS_SQL`]). Blob storage is content-addressed
+    /// under `oci-blobs/<digest>`: on cloud backends (S3/Azure/GCS) that
+    /// key is one shared object across every repo on the bucket, so a
+    /// reference from ANY same-backend repo protects it and orphan-ness is
+    /// scoped per digest cross-repo — deleting per `(repo, digest)` would
+    /// destroy a blob other repos still serve (`BLOB_UNKNOWN` on pull). On
+    /// filesystem each repo roots its own tree, so the key is a distinct
+    /// file per repo and orphan-ness is scoped to the same `storage_path`.
+    /// This mirrors the cloud/filesystem branch of `ORPHAN_PREDICATE_SQL`.
+    ///
+    /// Grace period (`MIN_BLOB_AGE_SECS`) shields in-flight pushes: a
+    /// client first uploads blobs, then PUTs the manifest, which writes the
+    /// matching `manifest_blob_refs` rows. Between those two steps the blob
+    /// is "orphan" in the strict sense; skipping rows younger than the
+    /// grace period covers the typical push window without serializing push
+    /// throughput on a global lock.
+    ///
+    /// Per-row deletion runs in its own transaction with a `FOR UPDATE`
+    /// lock on the `oci_blobs` row and a re-check of the orphan predicate
+    /// inside the tx (#1180 style). A residual TOCTOU still exists if a new
+    /// manifest's `INSERT manifest_blob_refs` interleaves with this flow at
+    /// sub-grace-period speeds; closing it fully would require the
+    /// manifest-push path to take `SELECT ... FOR UPDATE` on `oci_blobs`
+    /// rows before writing `manifest_blob_refs`. That is left as a follow-up
+    /// to keep this change focused.
+    ///
+    /// SAFETY: callers (the scheduler) must additionally gate the live pass
+    /// behind
+    /// [`manifest_blob_refs_backfill::any_live_manifest_missing_refs`] and
+    /// an explicit operator opt-in; this method itself only enforces the
+    /// grace window and the per-row locked re-check. Every deletion is
+    /// audit-logged at INFO with the digest and freed byte count.
+    pub async fn run_blob_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
+        let orphans = self.select_orphan_blobs().await?;
+
+        let mut result = empty_gc_result(dry_run);
+
+        if dry_run {
+            for row in &orphans {
+                let digest: String = row.try_get("digest").unwrap_or_default();
+                let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+                tracing::info!(
+                    digest = digest.as_str(),
+                    size_bytes = bytes,
+                    "Blob GC (dry-run): would reclaim orphan blob"
+                );
+                accumulate_dry_run(&mut result, bytes, 1);
+            }
+            return Ok(result);
+        }
+
+        for row in &orphans {
+            let digest: String = row.try_get("digest").unwrap_or_default();
+            let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+            let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
+            let storage_path: String = row.try_get("storage_path").unwrap_or_default();
+            let repository_id: Uuid = match row.try_get("repository_id") {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format_gc_error("read repo id", &digest, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+            let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+
+            let location = StorageLocation {
+                backend: storage_backend.clone(),
+                path: storage_path.clone(),
+            };
+            let storage = match self.storage_for_location(&location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format_gc_error("resolve storage", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            let mut tx = match self.db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = format_gc_error("begin blob gc tx", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            match is_blob_still_orphan(&mut tx, repository_id, &digest).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = tx.rollback().await;
+                    tracing::debug!(
+                        digest = digest.as_str(),
+                        "Blob GC skipped digest: no longer orphan after row-lock re-check"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error("re-check blob orphan", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            if let Err(e) = storage.delete(&storage_key).await {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("delete blob storage", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if let Err(e) =
+                sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1 AND digest = $2")
+                    .bind(repository_id)
+                    .bind(&digest)
+                    .execute(&mut *tx)
+                    .await
+            {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error("delete oci_blobs row", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if let Err(e) = tx.commit().await {
+                let msg = format_gc_error("commit blob gc tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            // Audit log: every committed blob deletion is recorded with its
+            // digest and freed bytes. Blob deletion is irreversible, so this
+            // trail is the operator's record of exactly what GC reclaimed.
+            tracing::info!(
+                digest = digest.as_str(),
+                size_bytes = bytes,
+                storage_key = storage_key.as_str(),
+                "Blob GC: reclaimed orphan blob"
+            );
+            record_gc_success(&mut result, bytes, 1);
+        }
+
+        if result.storage_keys_deleted > 0 {
+            tracing::info!(
+                "Blob GC: deleted {} blob objects, freed {} bytes",
+                result.storage_keys_deleted,
+                result.bytes_freed
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// List `oci_blobs` rows older than the grace period whose digest is
+    /// not protected by any in-scope `manifest_blob_refs` row
+    /// ([`BLOB_PROTECTED_BY_REFS_SQL`]: cloud backends protect cross-repo on
+    /// the shared bucket; filesystem protects only within the same
+    /// `storage_path`). The grace period is the only safeguard against the
+    /// push-time race described on [`Self::run_blob_gc`].
+    async fn select_orphan_blobs(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let sql = format!(
+            r#"
+            SELECT ob.repository_id,
+                   ob.digest,
+                   ob.size_bytes,
+                   ob.storage_key,
+                   r.storage_backend,
+                   r.storage_path
+            FROM oci_blobs ob
+            JOIN repositories r ON r.id = ob.repository_id
+            WHERE ob.created_at < NOW() - make_interval(secs => $1::BIGINT)
+              AND NOT {protected}
+            "#,
+            protected = BLOB_PROTECTED_BY_REFS_SQL,
+        );
+        sqlx::query(&sql)
+            .bind(MIN_BLOB_AGE_SECS as i64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))
     }
 
     /// Initial scan that lists candidate orphan storage keys.
@@ -1152,6 +1404,60 @@ async fn is_still_orphan(
         .bind(storage_key)
         .bind(storage_backend)
         .bind(storage_path)
+        .fetch_one(&mut **tx)
+        .await?;
+
+    Ok(row.try_get::<bool, _>("still_orphan").unwrap_or(false))
+}
+
+/// Re-verify the blob-orphan predicate for a single (repo, digest) inside
+/// an open transaction with a `FOR UPDATE` lock on the `oci_blobs` row
+/// (#1408; design from #1409).
+///
+/// The lock is narrowed to the (repo, digest) row because
+/// `oci_blobs.repository_id` is part of its primary key. The orphan
+/// re-check uses the same backend-aware [`BLOB_PROTECTED_BY_REFS_SQL`]
+/// fragment as [`StorageGcService::select_orphan_blobs`] (cloud =
+/// cross-repo on the shared bucket, filesystem = same `storage_path`), so
+/// the initial scan and the locked re-check cannot drift.
+///
+/// `bool_and` collapses to a single value; an empty result (row gone)
+/// returns `false` so the caller skips the delete.
+async fn is_blob_still_orphan(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: Uuid,
+    digest: &str,
+) -> sqlx::Result<bool> {
+    // Step 1: lock the (repo, digest) row so a racing pusher cannot
+    // re-reference this blob between the re-check and the delete.
+    sqlx::query(
+        r#"
+        SELECT id FROM oci_blobs
+        WHERE repository_id = $1 AND digest = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(repository_id)
+    .bind(digest)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    // Step 2: join the locked row back to its repository so the shared
+    // `ob`/`r`-correlated fragment can resolve the row's backend and
+    // storage_path; this keeps the re-check identical in scope to the
+    // initial scan.
+    let sql = format!(
+        r#"
+        SELECT COALESCE(bool_and(NOT {protected}), false) AS still_orphan
+        FROM oci_blobs ob
+        JOIN repositories r ON r.id = ob.repository_id
+        WHERE ob.repository_id = $1 AND ob.digest = $2
+        "#,
+        protected = BLOB_PROTECTED_BY_REFS_SQL,
+    );
+    let row = sqlx::query(&sql)
+        .bind(repository_id)
+        .bind(digest)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -3565,5 +3871,488 @@ mod tests {
         assert!(json.contains("\"per_repository\":[]"));
         let restored: OciBlobFootprintReport = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, report);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_blob_gc (#1408; deletion design ported from #1409)
+    //
+    // The no-DB error-mapping tests run anywhere. The database-backed tests
+    // exercise the blob-orphan source against a real postgres + filesystem
+    // backend; they are gated on `tdh::Fixture::setup` returning Some, which
+    // only happens when DATABASE_URL is set and migrations are applied (the
+    // same gate the pre-existing storage GC tests above use).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_blob_gc_returns_error_when_db_unreachable() {
+        let service = make_service("filesystem");
+        let result = service.run_blob_gc(false).await;
+        assert!(
+            result.is_err(),
+            "run_blob_gc must fail when select_orphan_blobs cannot reach DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_blob_gc_dry_run_returns_error_when_db_unreachable() {
+        let service = make_service("s3");
+        let result = service.run_blob_gc(true).await;
+        assert!(
+            result.is_err(),
+            "run_blob_gc dry_run shares the same SELECT and must also fail without a DB"
+        );
+    }
+
+    // Compile-time pins: the grace period stays inside a sane corridor.
+    // 1 hour minimum gives in-flight pushes room to finish blob upload and
+    // manifest PUT; 7 days maximum prevents long-lived debris from
+    // accumulating after the user has long forgotten the abandoned upload.
+    // Any change crossing these bounds should be a conscious policy
+    // decision, not an accidental typo.
+    const _BLOB_AGE_LOWER: () = assert!(MIN_BLOB_AGE_SECS >= 60 * 60);
+    const _BLOB_AGE_UPPER: () = assert!(MIN_BLOB_AGE_SECS <= 7 * 24 * 60 * 60);
+
+    /// Stash a blob row with a `created_at` far enough in the past that
+    /// `MIN_BLOB_AGE_SECS` does not protect it.
+    async fn insert_old_blob(
+        pool: &PgPool,
+        repo_id: Uuid,
+        digest: &str,
+        storage_key: &str,
+        size: i64,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, created_at)
+            VALUES ($1, $2, $3, $4, NOW() - INTERVAL '30 days')
+            "#,
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .bind(size)
+        .bind(storage_key)
+        .execute(pool)
+        .await
+        .expect("insert old oci_blobs row");
+    }
+
+    /// Flip a test repo to a cloud backend. On cloud, blob storage is a
+    /// single content-addressed object shared by every repo on the bucket,
+    /// so the GC predicate protects it cross-repo; filesystem fixtures (the
+    /// default) get an independent copy per `storage_path`. Exercises the
+    /// cloud branch of [`BLOB_PROTECTED_BY_REFS_SQL`].
+    async fn set_repo_backend(pool: &PgPool, repo_id: Uuid, backend: &str) {
+        sqlx::query("UPDATE repositories SET storage_backend = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(backend)
+            .execute(pool)
+            .await
+            .expect("update repo storage_backend");
+    }
+
+    /// Set up two repos that both hold the same aged blob digest, with a
+    /// `manifest_blob_refs` entry only in repo A. Returns `(fixture_a,
+    /// fixture_b, shared_digest)` or `None` when no DB is configured. Shared
+    /// by the cloud and filesystem scope tests so they assert the backend
+    /// difference without duplicating the setup.
+    async fn setup_two_repos_one_ref(
+        digest_seed: char,
+    ) -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        crate::api::handlers::test_db_helpers::Fixture,
+        String,
+    )> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let fixture_a = tdh::Fixture::setup("local", "docker").await?;
+        let Some(fixture_b) = tdh::Fixture::setup("local", "docker").await else {
+            fixture_a.teardown().await;
+            return None;
+        };
+
+        let shared_digest = format!("sha256:{}", digest_seed.to_string().repeat(64));
+        let storage_key = format!("oci-blobs/{}", shared_digest);
+        // Repo A has the blob and a manifest referencing it.
+        insert_old_blob(
+            &fixture_a.pool,
+            fixture_a.repo_id,
+            &shared_digest,
+            &storage_key,
+            555,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+            VALUES ($1, $2, $3, 'layer')
+            "#,
+        )
+        .bind(format!("sha256:{}", "1".repeat(64)))
+        .bind(&shared_digest)
+        .bind(fixture_a.repo_id)
+        .execute(&fixture_a.pool)
+        .await
+        .expect("insert ref in repo A");
+        // Repo B has the same blob digest but no manifest references it.
+        insert_old_blob(
+            &fixture_b.pool,
+            fixture_b.repo_id,
+            &shared_digest,
+            &storage_key,
+            555,
+        )
+        .await;
+
+        Some((fixture_a, fixture_b, shared_digest))
+    }
+
+    /// Report whether the blob `(repo_id, digest)` WOULD be flagged orphan,
+    /// re-evaluating the exact backend-aware predicate `select_orphan_blobs`
+    /// uses ([`BLOB_PROTECTED_BY_REFS_SQL`]). Scoped to one (repo, digest)
+    /// so concurrent tests' rows can't leak into the assertion, and so
+    /// cloud-vs-filesystem scoping is observable from the evaluated repo's
+    /// perspective.
+    async fn would_gc_flag_blob(pool: &PgPool, repo_id: Uuid, digest: &str) -> bool {
+        let sql = format!(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM oci_blobs ob
+                JOIN repositories r ON r.id = ob.repository_id
+                WHERE ob.repository_id = $1
+                  AND ob.digest = $2
+                  AND ob.created_at < NOW() - make_interval(secs => $3::BIGINT)
+                  AND NOT {protected}
+            )
+            "#,
+            protected = BLOB_PROTECTED_BY_REFS_SQL,
+        );
+        sqlx::query_scalar::<_, bool>(&sql)
+            .bind(repo_id)
+            .bind(digest)
+            .bind(MIN_BLOB_AGE_SECS as i64)
+            .fetch_one(pool)
+            .await
+            .expect("orphan-blob predicate check")
+    }
+
+    #[tokio::test]
+    async fn test_run_blob_gc_flags_orphan_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        insert_old_blob(&fixture.pool, fixture.repo_id, &digest, &storage_key, 789).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        // Dry-run must complete without errors. We don't pin a count because
+        // concurrent tests may insert other orphans.
+        let result = service.run_blob_gc(true).await.expect("dry-run succeeds");
+        assert!(
+            result.dry_run,
+            "dry-run result must carry the dry_run flag for the scheduler's gate"
+        );
+        assert!(
+            result.errors.is_empty(),
+            "blob gc dry-run must not surface errors: {:?}",
+            result.errors
+        );
+        // OUR digest must be flagged orphan by the underlying predicate.
+        let flagged = would_gc_flag_blob(&fixture.pool, fixture.repo_id, &digest).await;
+
+        fixture.teardown().await;
+
+        assert!(
+            flagged,
+            "an aged oci_blobs row with no manifest_blob_refs must be flagged orphan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_blob_gc_keeps_blob_referenced_by_manifest_blob_refs() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_digest = format!("sha256:{}", "d".repeat(64));
+        let blob_digest = format!("sha256:{}", "e".repeat(64));
+        let storage_key = format!("oci-blobs/{}", blob_digest);
+
+        insert_old_blob(
+            &fixture.pool,
+            fixture.repo_id,
+            &blob_digest,
+            &storage_key,
+            321,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+            VALUES ($1, $2, $3, 'layer')
+            "#,
+        )
+        .bind(&manifest_digest)
+        .bind(&blob_digest)
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert manifest_blob_refs row");
+
+        let flagged = would_gc_flag_blob(&fixture.pool, fixture.repo_id, &blob_digest).await;
+
+        fixture.teardown().await;
+
+        assert!(
+            !flagged,
+            "blob must not be flagged orphan while manifest_blob_refs references it"
+        );
+    }
+
+    /// Incident-replay (the production bug that motivated #1409): on CLOUD
+    /// backends blob storage is a single content-addressed object per
+    /// bucket, so an `oci_blobs` row in any same-backend repo with a live
+    /// `manifest_blob_refs` entry must protect the shared object — even when
+    /// the row being evaluated lives in a different repo with no references
+    /// of its own. The earlier per-`(repo,digest)` reconciler deleted on the
+    /// first orphan row and destroyed a shared blob (57 blobs / 85 tags).
+    #[tokio::test]
+    async fn test_run_blob_gc_keeps_blob_referenced_from_another_repo() {
+        let Some((fixture_a, fixture_b, shared_digest)) = setup_two_repos_one_ref('9').await else {
+            return;
+        };
+        // Both repos live on the same cloud backend, where the digest
+        // resolves to one shared object.
+        set_repo_backend(&fixture_a.pool, fixture_a.repo_id, "s3").await;
+        set_repo_backend(&fixture_b.pool, fixture_b.repo_id, "s3").await;
+
+        // Evaluate from repo B (the one WITHOUT a local ref): repo A's
+        // reference on the shared cloud object must still protect it.
+        let flagged = would_gc_flag_blob(&fixture_b.pool, fixture_b.repo_id, &shared_digest).await;
+
+        fixture_a.teardown().await;
+        fixture_b.teardown().await;
+
+        assert!(
+            !flagged,
+            "on a cloud backend a blob must not be flagged orphan while ANY same-backend repo's \
+             manifest_blob_refs references the digest; otherwise blob GC would delete the shared \
+             object and break the other repo"
+        );
+    }
+
+    /// Apply-mode counterpart to [`test_run_blob_gc_flags_orphan_blob`]. The
+    /// live pass must actually delete the file from storage and the row from
+    /// `oci_blobs`. Covers the per-row loop body in
+    /// [`StorageGcService::run_blob_gc`] that dry-run skips.
+    #[tokio::test]
+    async fn test_run_blob_gc_apply_deletes_orphan_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let blob_body = Bytes::from_static(b"orphan-payload");
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, blob_body.clone())
+            .await
+            .expect("write blob to storage");
+
+        insert_old_blob(
+            &fixture.pool,
+            fixture.repo_id,
+            &digest,
+            &storage_key,
+            blob_body.len() as i64,
+        )
+        .await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let _ = service.run_blob_gc(false).await.expect("apply succeeds");
+
+        let row_remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE digest = $1")
+                .bind(&digest)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count oci_blobs");
+        let file_still_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 0,
+            "live blob GC must hard-delete the oci_blobs row for an orphan digest"
+        );
+        assert!(
+            !file_still_exists,
+            "live blob GC must delete the storage object for an orphan digest"
+        );
+    }
+
+    /// Apply-mode counterpart to
+    /// [`test_run_blob_gc_keeps_blob_referenced_by_manifest_blob_refs`].
+    /// Ensures the per-row `is_blob_still_orphan` re-check inside the
+    /// transaction sees the live `manifest_blob_refs` row and skips delete.
+    #[tokio::test]
+    async fn test_run_blob_gc_apply_keeps_referenced_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_digest = format!("sha256:{}", "2".repeat(64));
+        let blob_digest = format!("sha256:{}", "3".repeat(64));
+        let storage_key = format!("oci-blobs/{}", blob_digest);
+        let blob_body = Bytes::from_static(b"referenced-payload");
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, blob_body.clone())
+            .await
+            .expect("write blob to storage");
+
+        insert_old_blob(
+            &fixture.pool,
+            fixture.repo_id,
+            &blob_digest,
+            &storage_key,
+            blob_body.len() as i64,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+            VALUES ($1, $2, $3, 'layer')
+            "#,
+        )
+        .bind(&manifest_digest)
+        .bind(&blob_digest)
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert manifest_blob_refs row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let _ = service.run_blob_gc(false).await.expect("apply succeeds");
+
+        let row_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count oci_blobs");
+        let file_still_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 1,
+            "oci_blobs row must survive when a manifest_blob_refs entry references the digest"
+        );
+        assert!(
+            file_still_exists,
+            "storage object must survive when a manifest_blob_refs entry references the digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_blob_gc_respects_grace_period() {
+        // Even with zero manifest_blob_refs rows, a blob still inside the
+        // grace window represents an in-flight push and must be left alone.
+        // This is the explicit safeguard against the upload-then-manifest
+        // race documented on run_blob_gc.
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "f".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        // created_at = NOW() default; well inside MIN_BLOB_AGE_SECS.
+        sqlx::query(
+            r#"
+            INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key)
+            VALUES ($1, $2, 1024, $3)
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&digest)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert fresh oci_blobs row");
+
+        let flagged = would_gc_flag_blob(&fixture.pool, fixture.repo_id, &digest).await;
+
+        fixture.teardown().await;
+
+        assert!(
+            !flagged,
+            "blobs younger than MIN_BLOB_AGE_SECS must be skipped to protect in-flight pushes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_blob_gc_filesystem_scopes_orphan_per_storage_path() {
+        // Filesystem counterpart to the cloud cross-repo test: each
+        // filesystem repo roots its own tree, so the same digest is a
+        // DISTINCT physical file per repo. A reference in repo A must NOT
+        // protect repo B's independent copy (otherwise B's orphan file would
+        // leak forever), while repo A's own copy stays protected. The
+        // predicate is backend-aware, not unconditionally global.
+        let Some((fixture_a, fixture_b, shared_digest)) = setup_two_repos_one_ref('7').await else {
+            return;
+        };
+        // Both repos keep the default `filesystem` backend, each with its
+        // own storage_path.
+
+        let flagged_b =
+            would_gc_flag_blob(&fixture_b.pool, fixture_b.repo_id, &shared_digest).await;
+        let flagged_a =
+            would_gc_flag_blob(&fixture_a.pool, fixture_a.repo_id, &shared_digest).await;
+
+        fixture_a.teardown().await;
+        fixture_b.teardown().await;
+
+        assert!(
+            flagged_b,
+            "on filesystem a blob referenced only from another repo's storage_path must still be \
+             flagged orphan: the copies are physically distinct files"
+        );
+        assert!(
+            !flagged_a,
+            "repo A's own copy must remain protected by its own manifest_blob_refs entry"
+        );
     }
 }
