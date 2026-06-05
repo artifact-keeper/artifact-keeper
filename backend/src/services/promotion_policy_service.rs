@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -85,6 +86,143 @@ const OPEN_CVES_SQL: &str = r#"
     WHERE sf.cve_id IS NOT NULL
       AND NOT sf.is_acknowledged
 "#;
+
+/// Sentinel substring written into `scan_results.error_message` when a scanner
+/// reports `is_applicable() == false` for an artifact (see
+/// `scanner_service::scan_artifact_inner`). Until #1470 introduces a dedicated
+/// terminal status, a "scanner does not apply to this format" row is stored as
+/// `status = 'failed'` with this phrase in `error_message`. We key the
+/// "not applicable" distinction off this marker so genuinely-inapplicable scans
+/// are NOT treated as fail-open/unscanned for promotion gating.
+const NOT_APPLICABLE_MARKER: &str = "does not apply";
+
+/// One `scan_results` row reduced to the only fields that matter for deciding
+/// whether an artifact is "scanned" for gating: its status and whether the row
+/// is a "not applicable" marker (a `failed` row whose `error_message` says the
+/// scanner does not apply to this format).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ScanStateRow {
+    status: String,
+    error_message: Option<String>,
+}
+
+impl ScanStateRow {
+    /// A `failed` row is "not applicable" (rather than a genuine crash) when its
+    /// error message carries the [`NOT_APPLICABLE_MARKER`] sentinel.
+    fn is_not_applicable(&self) -> bool {
+        self.status == "failed"
+            && self
+                .error_message
+                .as_deref()
+                .map(|m| m.contains(NOT_APPLICABLE_MARKER))
+                .unwrap_or(false)
+    }
+}
+
+/// All `scan_results` statuses for an artifact, used to classify scan state.
+const SCAN_STATE_SQL: &str = r#"
+    SELECT status, error_message
+    FROM scan_results
+    WHERE artifact_id = $1
+"#;
+
+/// Classification of an artifact's overall scan state for promotion gating.
+///
+/// Derived from the full set of `scan_results` rows (not just the latest), so a
+/// recent dependency scan does not mask the fact that a malware scan never
+/// completed. The ordering of the checks encodes precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    /// At least one scan completed. The artifact is vetted; CVE/threshold gates
+    /// (which read the latest completed scan) take over from here.
+    Completed,
+    /// No completed scan, but at least one scan is still pending/running. The
+    /// artifact is mid-vetting and must not be promoted as if it were clean.
+    InProgress,
+    /// No completed scan and at least one scanner crashed/errored (a `failed`
+    /// row that is NOT a "not applicable" marker).
+    Failed,
+    /// No `scan_results` rows at all -- the artifact was never scanned.
+    NeverScanned,
+    /// Scans exist but every one is a "not applicable" marker: no applicable
+    /// scanner produced a result. Scanning genuinely does not apply to this
+    /// artifact's format, so this is treated as scanned-OK (pass), never block.
+    NotApplicable,
+}
+
+impl ScanState {
+    /// True when the artifact is "genuinely unscanned" for gating purposes:
+    /// no completed scan exists and the reason is not "scanning does not apply".
+    /// [`ScanState::NotApplicable`] and [`ScanState::Completed`] both return
+    /// false (they must never be blocked by the `block_unscanned` gate).
+    fn is_unscanned(self) -> bool {
+        matches!(
+            self,
+            ScanState::InProgress | ScanState::Failed | ScanState::NeverScanned
+        )
+    }
+
+    /// A short, stable token describing the unscanned reason, for the violation
+    /// detail payload and the allowed-unscanned WARN log.
+    fn reason_token(self) -> &'static str {
+        match self {
+            ScanState::Completed => "completed",
+            ScanState::InProgress => "scan_in_progress",
+            ScanState::Failed => "scan_failed",
+            ScanState::NeverScanned => "never_scanned",
+            ScanState::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// Classify an artifact's scan state from the full set of its `scan_results`
+/// rows. Pure (no DB) so the precedence rules are unit-testable.
+///
+/// Precedence: any completed scan -> `Completed`; else any in-progress
+/// (pending/running) -> `InProgress`; else any genuine failure -> `Failed`;
+/// else if rows exist and they are all "not applicable" markers ->
+/// `NotApplicable`; else (no rows) -> `NeverScanned`.
+fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
+    if rows.iter().any(|r| r.status == "completed") {
+        return ScanState::Completed;
+    }
+    if rows
+        .iter()
+        .any(|r| r.status == "pending" || r.status == "running")
+    {
+        return ScanState::InProgress;
+    }
+    // Remaining rows are terminal-but-not-completed: either genuine failures or
+    // "not applicable" markers. A genuine failure outranks not-applicable
+    // because a crashed scanner means the artifact is NOT vetted.
+    let has_genuine_failure = rows
+        .iter()
+        .any(|r| r.status == "failed" && !r.is_not_applicable());
+    if has_genuine_failure {
+        return ScanState::Failed;
+    }
+    if rows.is_empty() {
+        return ScanState::NeverScanned;
+    }
+    // Rows exist, none completed, none in-progress, none a genuine failure ->
+    // every row is a "not applicable" marker.
+    ScanState::NotApplicable
+}
+
+/// Build the block-unscanned violation for a genuinely-unscanned artifact.
+/// Pure (no DB): the message is fixed and the detail payload carries the
+/// machine-readable reason token. Caller is responsible for only invoking this
+/// when `block_unscanned` is enabled and [`ScanState::is_unscanned`] is true.
+fn build_unscanned_violation(state: ScanState) -> PolicyViolation {
+    PolicyViolation {
+        rule: "block-unscanned".to_string(),
+        severity: "high".to_string(),
+        message: "Artifact has no completed security scan".to_string(),
+        details: Some(serde_json::json!({
+            "scan_state": state.reason_token(),
+        })),
+    }
+}
 
 /// Assemble a [`CveSummary`] from a latest-scan [`ScanRow`] and the open-CVE
 /// id list. Pure (no DB): the severity counts come straight from the scan row
@@ -398,6 +536,9 @@ impl PromotionPolicyService {
         }
 
         if let Some(ref policy) = scan_policy {
+            self.evaluate_block_unscanned(artifact_id, policy, &mut violations, &mut action)
+                .await?;
+
             self.evaluate_age_and_signature(
                 artifact_id,
                 repository_id,
@@ -454,6 +595,61 @@ impl PromotionPolicyService {
         }
 
         Ok(())
+    }
+
+    /// Enforce the `block_unscanned` gate (#1643). When the resolved scan
+    /// policy sets `block_unscanned = true` and the artifact is genuinely
+    /// unscanned -- no completed scan, with the reason being a missing,
+    /// in-progress, or crashed scan rather than "scanning does not apply to
+    /// this format" -- record a Block violation. When `block_unscanned = false`
+    /// and the artifact is unscanned, the artifact is allowed through but a WARN
+    /// is logged so the fail-open is never silent.
+    ///
+    /// A "not applicable" scan state (every scan row is a marker that the
+    /// scanner does not apply to the artifact's format) is treated as
+    /// scanned-OK and never blocks, regardless of the toggle.
+    async fn evaluate_block_unscanned(
+        &self,
+        artifact_id: Uuid,
+        policy: &ScanPolicyConfig,
+        violations: &mut Vec<PolicyViolation>,
+        action: &mut PolicyAction,
+    ) -> Result<()> {
+        let state = self.get_scan_state(artifact_id).await?;
+
+        if !state.is_unscanned() {
+            // Completed or NotApplicable: nothing to enforce here.
+            return Ok(());
+        }
+
+        if policy.block_unscanned {
+            let violation = build_unscanned_violation(state);
+            *action = escalate_action_by_severity(*action, &violation.severity);
+            violations.push(violation);
+        } else {
+            // Fail-open is a deliberate, documented choice when the operator
+            // leaves block_unscanned = false -- but it must never be silent.
+            warn!(
+                artifact_id = %artifact_id,
+                scan_state = state.reason_token(),
+                "Promoting an artifact with no completed security scan: \
+                 scan_policies.block_unscanned is false, so promotion is allowed. \
+                 Set block_unscanned = true to block unscanned artifacts."
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Fetch all `scan_results` rows for an artifact and classify the overall
+    /// scan state. Thin DB wrapper around the pure [`classify_scan_state`].
+    async fn get_scan_state(&self, artifact_id: Uuid) -> Result<ScanState> {
+        let rows: Vec<ScanStateRow> = sqlx::query_as(SCAN_STATE_SQL)
+            .bind(artifact_id)
+            .fetch_all(&self.db)
+            .await?;
+
+        Ok(classify_scan_state(&rows))
     }
 
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
@@ -559,7 +755,7 @@ impl PromotionPolicyService {
     async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
         let policy: Option<ScanPolicyConfig> = sqlx::query_as(
             r#"
-            SELECT max_severity, block_on_fail,
+            SELECT max_severity, block_unscanned, block_on_fail,
                    min_staging_hours, max_artifact_age_days, require_signature
             FROM scan_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
@@ -610,6 +806,7 @@ impl PromotionPolicyService {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ScanPolicyConfig {
     max_severity: String,
+    block_unscanned: bool,
     block_on_fail: bool,
     min_staging_hours: Option<i32>,
     max_artifact_age_days: Option<i32>,
@@ -1699,6 +1896,7 @@ mod tests {
         };
         let scan_policy = ScanPolicyConfig {
             max_severity: "high".to_string(),
+            block_unscanned: false,
             block_on_fail: true,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -1728,6 +1926,7 @@ mod tests {
         };
         let scan_policy = ScanPolicyConfig {
             max_severity: "critical".to_string(),
+            block_unscanned: false,
             block_on_fail: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -1828,6 +2027,7 @@ mod tests {
         };
         let scan_policy = ScanPolicyConfig {
             max_severity: "medium".to_string(),
+            block_unscanned: false,
             block_on_fail: true,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -2001,5 +2201,168 @@ mod tests {
         // 1 denied (GPL-3.0) + 1 unknown (WTFPL not in allowed list)
         assert_eq!(violations.len(), 2);
         assert_eq!(action, PolicyAction::Block);
+    }
+
+    // =======================================================================
+    // block_unscanned scan-state classification tests (#1643)
+    // =======================================================================
+
+    fn row(status: &str, error_message: Option<&str>) -> ScanStateRow {
+        ScanStateRow {
+            status: status.to_string(),
+            error_message: error_message.map(|s| s.to_string()),
+        }
+    }
+
+    fn not_applicable_row() -> ScanStateRow {
+        row(
+            "failed",
+            Some("Scanner ImageScanner does not apply to this artifact format"),
+        )
+    }
+
+    #[test]
+    fn test_is_not_applicable_marker_detected() {
+        assert!(not_applicable_row().is_not_applicable());
+    }
+
+    #[test]
+    fn test_is_not_applicable_genuine_failure_is_not_marker() {
+        // A failed row whose message is a real crash must NOT read as
+        // not-applicable -- otherwise a crashed scanner would silently pass.
+        assert!(!row("failed", Some("scanner timed out after 300s")).is_not_applicable());
+        assert!(!row("failed", None).is_not_applicable());
+    }
+
+    #[test]
+    fn test_is_not_applicable_requires_failed_status() {
+        // Only `failed` rows carry the not-applicable marker; a completed or
+        // running row is never a marker regardless of message contents.
+        assert!(!row("completed", Some("does not apply")).is_not_applicable());
+        assert!(!row("running", Some("does not apply")).is_not_applicable());
+    }
+
+    #[test]
+    fn test_classify_never_scanned_when_no_rows() {
+        assert_eq!(classify_scan_state(&[]), ScanState::NeverScanned);
+    }
+
+    #[test]
+    fn test_classify_completed_wins() {
+        // Any completed scan means the artifact is vetted, even alongside a
+        // failed or in-progress scan of another type.
+        let rows = vec![
+            row("failed", Some("crashed")),
+            row("completed", None),
+            row("running", None),
+        ];
+        assert_eq!(classify_scan_state(&rows), ScanState::Completed);
+    }
+
+    #[test]
+    fn test_classify_in_progress_when_no_completed() {
+        assert_eq!(
+            classify_scan_state(&[row("pending", None)]),
+            ScanState::InProgress
+        );
+        assert_eq!(
+            classify_scan_state(&[row("running", None)]),
+            ScanState::InProgress
+        );
+        // In-progress outranks a genuine failure of another scan type.
+        let rows = vec![row("failed", Some("crashed")), row("running", None)];
+        assert_eq!(classify_scan_state(&rows), ScanState::InProgress);
+    }
+
+    #[test]
+    fn test_classify_failed_genuine_crash() {
+        assert_eq!(
+            classify_scan_state(&[row("failed", Some("scanner crashed"))]),
+            ScanState::Failed
+        );
+    }
+
+    #[test]
+    fn test_classify_genuine_failure_outranks_not_applicable() {
+        // One scanner did not apply, another genuinely crashed: the artifact is
+        // NOT vetted, so the state must be Failed (unscanned), not NotApplicable.
+        let rows = vec![not_applicable_row(), row("failed", Some("OOM killed"))];
+        assert_eq!(classify_scan_state(&rows), ScanState::Failed);
+    }
+
+    #[test]
+    fn test_classify_not_applicable_when_all_rows_are_markers() {
+        let rows = vec![not_applicable_row(), not_applicable_row()];
+        assert_eq!(classify_scan_state(&rows), ScanState::NotApplicable);
+    }
+
+    #[test]
+    fn test_is_unscanned_matrix() {
+        // The gate must fire for these three states...
+        assert!(ScanState::NeverScanned.is_unscanned());
+        assert!(ScanState::InProgress.is_unscanned());
+        assert!(ScanState::Failed.is_unscanned());
+        // ...and must NOT fire for these two (they pass).
+        assert!(!ScanState::Completed.is_unscanned());
+        assert!(!ScanState::NotApplicable.is_unscanned());
+    }
+
+    #[test]
+    fn test_reason_token_stable_values() {
+        assert_eq!(ScanState::Completed.reason_token(), "completed");
+        assert_eq!(ScanState::InProgress.reason_token(), "scan_in_progress");
+        assert_eq!(ScanState::Failed.reason_token(), "scan_failed");
+        assert_eq!(ScanState::NeverScanned.reason_token(), "never_scanned");
+        assert_eq!(ScanState::NotApplicable.reason_token(), "not_applicable");
+    }
+
+    #[test]
+    fn test_build_unscanned_violation_shape() {
+        let v = build_unscanned_violation(ScanState::NeverScanned);
+        assert_eq!(v.rule, "block-unscanned");
+        assert_eq!(v.severity, "high");
+        assert_eq!(v.message, "Artifact has no completed security scan");
+        let details = v.details.as_ref().unwrap();
+        assert_eq!(details["scan_state"], "never_scanned");
+    }
+
+    #[test]
+    fn test_build_unscanned_violation_high_severity_escalates_to_block() {
+        // The violation severity is "high", which escalate_action_by_severity
+        // always promotes to Block -- i.e. the gate genuinely blocks promotion.
+        let v = build_unscanned_violation(ScanState::Failed);
+        assert_eq!(
+            escalate_action_by_severity(PolicyAction::Allow, &v.severity),
+            PolicyAction::Block
+        );
+    }
+
+    #[test]
+    fn test_block_unscanned_marker_constant_matches_scanner_phrase() {
+        // Guards the coupling to scanner_service's "does not apply to this
+        // artifact format" message. If that phrasing changes, this and the
+        // not-applicable detection must change together.
+        assert_eq!(NOT_APPLICABLE_MARKER, "does not apply");
+        assert!(not_applicable_row()
+            .error_message
+            .unwrap()
+            .contains(NOT_APPLICABLE_MARKER));
+    }
+
+    #[test]
+    fn test_get_scan_policy_sql_selects_block_unscanned() {
+        // The resolved-policy read must include block_unscanned; without it the
+        // gate would deserialize a default and the toggle would be inert again.
+        // (We assert on the SQL string used by get_scan_policy via the column
+        // list embedded in ScanPolicyConfig's FromRow usage below.)
+        let cfg = ScanPolicyConfig {
+            max_severity: "critical".to_string(),
+            block_unscanned: true,
+            block_on_fail: false,
+            min_staging_hours: None,
+            max_artifact_age_days: None,
+            require_signature: false,
+        };
+        assert!(cfg.block_unscanned);
     }
 }

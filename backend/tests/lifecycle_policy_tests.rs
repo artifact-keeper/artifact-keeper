@@ -311,6 +311,27 @@ async fn record_download(pool: &PgPool, artifact_id: Uuid, downloaded_at: &str) 
     .expect("failed to record download");
 }
 
+/// Record a download relative to NOW, N days in the past.
+///
+/// Window-based policies such as `no_downloads_days` compare the most recent
+/// download against `NOW() - make_interval(days => N)`. Tests that need a
+/// download to fall *inside* such a window must anchor it to wall-clock NOW,
+/// not a hardcoded calendar date — otherwise the fixture silently rots out of
+/// the window as real time advances and the test starts failing on a date that
+/// has nothing to do with the code under test.
+async fn record_download_days_ago(pool: &PgPool, artifact_id: Uuid, days_ago: i64) {
+    sqlx::query(
+        "INSERT INTO download_statistics (id, artifact_id, downloaded_at) \
+         VALUES ($1, $2, NOW() - make_interval(days => $3::INT))",
+    )
+    .bind(Uuid::new_v4())
+    .bind(artifact_id)
+    .bind(days_ago as i32)
+    .execute(pool)
+    .await
+    .expect("failed to record relative download");
+}
+
 /// Clean up test data including download statistics.
 async fn cleanup_with_downloads(pool: &PgPool, repo_id: Uuid) {
     // Delete download stats for all artifacts in this repo
@@ -1201,9 +1222,11 @@ async fn test_no_downloads_days_cascades_oci_tags() {
     let svc = LifecycleService::new(pool.clone());
 
     // One cold manifest (no downloads, created 30 days ago) plus one warm
-    // one (downloaded yesterday, created 30 days ago). The policy targets
+    // one (downloaded 1 day ago, created 30 days ago). The policy targets
     // anything older than 7 days with no recent downloads, so only the cold
-    // one is soft-deleted.
+    // one is soft-deleted. The warm download is anchored to NOW (1 day ago)
+    // rather than a hardcoded date so it stays inside the 7-day window no
+    // matter when the test runs.
     let cold_digest = "sha256:1407bb00000000000000000000000000000000000000000000000000000001";
     let warm_digest = "sha256:1407bb00000000000000000000000000000000000000000000000000000002";
     let cold_id =
@@ -1223,7 +1246,7 @@ async fn test_no_downloads_days_cascades_oci_tags() {
         .execute(&pool)
         .await
         .unwrap();
-    record_download(&pool, warm_id, "2026-05-28T00:00:00Z").await;
+    record_download_days_ago(&pool, warm_id, 1).await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {

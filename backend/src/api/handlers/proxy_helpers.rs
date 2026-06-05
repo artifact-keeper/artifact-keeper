@@ -1314,6 +1314,95 @@ pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Respons
     .map_err(|e| e.into_response())
 }
 
+/// Selector for the canonical local-artifact lookup. Each variant maps to a
+/// single `WHERE` shape over the `artifacts` table; the surrounding skeleton
+/// (quarantine check → storage resolution → `storage.get` → coordinated retry)
+/// is identical and lives in [`local_lookup_artifact`] / [`read_local_content`].
+pub(crate) enum LocalLookup<'a> {
+    /// Match on the exact stored `path`.
+    Path(&'a str),
+    /// Match on `name` + `version`.
+    NameVersion(&'a str, &'a str),
+}
+
+impl LocalLookup<'_> {
+    /// The full `SELECT` for this selector. Pure (no I/O) so the per-variant
+    /// `WHERE` shape has at-rest unit coverage. The two queries differ only in
+    /// the `WHERE` clause and are byte-identical to the original inlined SQL.
+    pub(crate) fn select_sql(&self) -> &'static str {
+        match self {
+            LocalLookup::Path(_) => {
+                "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+                 LIMIT 1"
+            }
+            LocalLookup::NameVersion(_, _) => {
+                "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
+                 LIMIT 1"
+            }
+        }
+    }
+
+    /// Run the shared row lookup for this selector, mapping a miss to 404 and a
+    /// DB error to 500. Behavior is identical across selectors apart from the
+    /// `WHERE` clause and its bound parameters.
+    async fn fetch_row(&self, db: &PgPool, repo_id: Uuid) -> Result<LocalArtifactRow, Response> {
+        let query = sqlx::query_as::<_, LocalArtifactRow>(self.select_sql()).bind(repo_id);
+        let query = match self {
+            LocalLookup::Path(path) => query.bind(*path),
+            LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
+        };
+
+        query
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("Database", e))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())
+    }
+}
+
+/// Shared skeleton step 1: resolve the artifact row for `lookup`, enforce the
+/// quarantine policy, and resolve the repo's storage backend. Returns the row
+/// and storage so callers can either read bytes or short-circuit (e.g. the
+/// presigned redirect in [`local_fetch_or_redirect`]) before reading.
+async fn local_lookup_artifact(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    lookup: LocalLookup<'_>,
+) -> Result<
+    (
+        LocalArtifactRow,
+        std::sync::Arc<dyn crate::storage::StorageBackend>,
+    ),
+    Response,
+> {
+    let artifact = lookup.fetch_row(db, repo_id).await?;
+    check_quarantine_row(&artifact)?;
+    let storage = state.storage_for_repo_or_500(location)?;
+    Ok((artifact, storage))
+}
+
+/// Shared skeleton step 2: read the artifact's content from storage, falling
+/// back to the coordinated retry path on a `NotFound` miss.
+async fn read_local_content(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<Bytes, Response> {
+    match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => Ok(bytes),
+        Err(crate::error::AppError::NotFound(_)) => {
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await
+        }
+        Err(e) => Err(map_storage_err(e)),
+    }
+}
+
 /// Generic local artifact fetch by exact path match.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
@@ -1323,30 +1412,15 @@ pub async fn local_fetch_by_path(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-         LIMIT 1",
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::Path(artifact_path),
     )
-    .bind(repo_id)
-    .bind(artifact_path)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
-
+    .await?;
+    let content = read_local_content(db, &artifact, &*storage).await?;
     Ok((content, Some(artifact.content_type)))
 }
 
@@ -1360,31 +1434,15 @@ pub async fn local_fetch_by_name_version(
     name: &str,
     version: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
-         LIMIT 1",
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::NameVersion(name, version),
     )
-    .bind(repo_id)
-    .bind(name)
-    .bind(version)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
-
+    .await?;
+    let content = read_local_content(db, &artifact, &*storage).await?;
     Ok((content, Some(artifact.content_type)))
 }
 
@@ -1464,22 +1522,14 @@ pub async fn local_fetch_or_redirect(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<Response, Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-         LIMIT 1",
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::Path(artifact_path),
     )
-    .bind(repo_id)
-    .bind(artifact_path)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
+    .await?;
 
     // Try presigned redirect before reading content into memory
     if state.config.presigned_downloads_enabled {
@@ -1491,13 +1541,7 @@ pub async fn local_fetch_or_redirect(
         }
     }
 
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
+    let content = read_local_content(db, &artifact, &*storage).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2472,6 +2516,40 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
+
+    // ── LocalLookup dispatch tests ──────────────────────────────────
+
+    #[test]
+    fn test_local_lookup_path_select_sql() {
+        // Path variant matches on `path = $2` and never references name/version.
+        let sql = LocalLookup::Path("a/b/c.tgz").select_sql();
+        assert!(sql.contains("WHERE repository_id = $1 AND path = $2 AND is_deleted = false"));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(!sql.contains("name = $2"));
+        assert!(!sql.contains("version = $3"));
+    }
+
+    #[test]
+    fn test_local_lookup_name_version_select_sql() {
+        // NameVersion variant matches on `name = $2 AND version = $3`.
+        let sql = LocalLookup::NameVersion("pkg", "1.0.0").select_sql();
+        assert!(sql.contains(
+            "WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false"
+        ));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(!sql.contains("path = $2"));
+    }
+
+    #[test]
+    fn test_local_lookup_select_columns_identical() {
+        // Both variants select the same LocalArtifactRow columns; only the
+        // WHERE clause differs (the whole point of the S6 collapse).
+        let cols = "SELECT id, storage_key, content_type, quarantine_status, quarantine_until";
+        assert!(LocalLookup::Path("x").select_sql().starts_with(cols));
+        assert!(LocalLookup::NameVersion("n", "v")
+            .select_sql()
+            .starts_with(cols));
+    }
 
     // ── pypi_version_owned (shadowing guard) tests ──────────────────
 

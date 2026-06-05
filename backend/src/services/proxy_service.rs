@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
-use crate::services::proxy_hydration::coordinate_proxy_hydration;
+use crate::services::proxy_hydration::{BufferedCoordinator, Coordinator};
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -259,189 +259,56 @@ fn extract_streaming_headers(
     (content_type, etag, content_length)
 }
 
-/// Tee an upstream byte stream into a returned client stream AND a
-/// background storage writer that populates the proxy cache. The
-/// returned stream yields the same chunks the upstream produced, in
-/// order, with no buffering beyond the bounded channel below.
+/// Decide whether to emit a "scan-on-proxy is configured but did not run"
+/// warning for a freshly cached upstream artifact.
 ///
-/// Storage failure semantics:
-/// * Storage writer task receives chunks via a bounded mpsc channel.
-///   When the channel is full, the upstream reader awaits a slot — that
-///   is the backpressure path. When the writer is gone (e.g. it
-///   already failed and dropped its receiver), `try_send` short-
-///   circuits and we keep yielding to the client without caching.
-/// * On any error from `put_stream`, the writer logs at `warn` and
-///   exits without writing the metadata sidecar. The cache is left
-///   without a metadata sidecar so the NEXT request misses the cache
-///   and re-fetches upstream — the system self-heals.
-/// * On client disconnect mid-stream, the tee task ends, the channel
-///   drops, and the writer commits or aborts whatever it has buffered.
-///   No leaked temp files (FilesystemBackend cleans up via the
-///   `put_stream` error path).
+/// Background (#1274): the `scan_on_proxy` per-repo flag exists in
+/// `scan_configs` and is surfaced in the UI, but the security scanner
+/// pipeline operates exclusively on rows in the `artifacts` table
+/// (`scan_results.artifact_id` is `NOT NULL REFERENCES artifacts(id)`,
+/// migration 022:21). Proxy-cached content is intentionally NOT recorded
+/// in `artifacts` (#1278, enforced by the `cache_artifact` meta-test), so
+/// there is no row to scan and nowhere to persist a `scan_results` record.
+/// A real scan-on-proxy implementation needs a dedicated proxy-cache
+/// artifact model and is tracked for v1.3.0.
 ///
-/// Error categories (#1185):
-/// * Upstream stream errors observed mid-body are wrapped as
-///   [`AppError::BadGateway`] before being forwarded to the writer
-///   channel and surfaced to the client. This keeps operator log /
-///   metric buckets honest: a flaky mirror does not inflate the
-///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
-///   not get hidden as `BAD_GATEWAY`.
-fn tee_upstream_to_cache(
-    upstream: BoxStream<'static, Result<Bytes>>,
-    storage: Arc<StorageService>,
-    cache_key: String,
-    metadata_key: String,
-    template: CacheMetadataTemplate,
-) -> BoxStream<'static, Result<Bytes>> {
-    // Channel for chunks flowing reader -> writer. mpsc to keep order
-    // (broadcast would let storage skip chunks under backpressure,
-    // which we explicitly want to avoid - skipping chunks corrupts the
-    // cached SHA-256).
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
+/// Until that lands, the worst failure mode is *silent*: an operator
+/// enables "Scan on Proxy", pulls packages, sees zero scans, and assumes
+/// they are protected. This helper drives a loud, structured warning so
+/// the gap is observable in logs/alerts instead of being invisible.
+///
+/// Returns `true` only when scan-on-proxy is enabled for the repo AND the
+/// cache write actually created a new entry (`newly_cached`). A plain
+/// cache hit re-serves already-cached bytes and must not log on every
+/// request; a failed/empty cache write (`newly_cached == false`) created
+/// nothing to warn about.
+pub(crate) fn should_warn_proxy_scan_skipped(proxy_scan_enabled: bool, newly_cached: bool) -> bool {
+    proxy_scan_enabled && newly_cached
+}
 
-    // Spawn the storage writer. It consumes the channel as a stream
-    // and calls put_stream. On completion, writes the metadata sidecar
-    // with the observed SHA-256 + byte count.
-    let storage_clone = storage.clone();
-    let cache_key_for_writer = cache_key.clone();
-    tokio::spawn(async move {
-        // Adapter: receiver -> futures::Stream<Result<Bytes>>.
-        let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-
-        let put_result = storage_clone
-            .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
-            .await;
-
-        match put_result {
-            Ok(result) if result.bytes_written == 0 => {
-                // #1365: never cache a zero-byte body. A Maven client
-                // resolving dependencies can drive an upstream response
-                // with no body (a 204, a 200 with `Content-Length: 0`, or
-                // a HEAD-style probe that reaches the streaming download
-                // path), and the upstream POM/JAR is non-empty. Writing the
-                // metadata sidecar here would mark the empty object as a
-                // fresh, non-expired cache hit; the next GET would then
-                // serve `Content-Length: 0`, and Gradle fails parsing the
-                // POM with "Content is not allowed in prolog." Skip the
-                // sidecar so the entry is treated as a miss, and delete the
-                // empty object we just wrote so a later GET re-fetches the
-                // real body from upstream (self-heal).
-                tracing::warn!(
-                    cache_key = %cache_key_for_writer,
-                    "proxy upstream returned an empty body; not caching the zero-byte \
-                     object (no metadata sidecar) so the next request refetches upstream"
-                );
-                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                    tracing::debug!(
-                        cache_key = %cache_key_for_writer,
-                        error = %e,
-                        "best-effort delete of empty proxy-cache object failed; \
-                         the missing metadata sidecar still forces a refetch"
-                    );
-                }
-            }
-            Ok(result) => {
-                let now = Utc::now();
-                // Pin the storage backend's ETag at write time so the
-                // fast path can re-HEAD on each hit and detect tampering
-                // / backend-side replacement (#1051). See [`pin_storage_etag`]
-                // for the best-effort semantics on backends without an
-                // ETag concept or on transport error.
-                let storage_etag = pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
-                let metadata = CacheMetadata {
-                    cached_at: now,
-                    upstream_etag: template.etag,
-                    storage_etag,
-                    expires_at: now + chrono::Duration::seconds(template.ttl_secs),
-                    content_type: template.content_type,
-                    size_bytes: result.bytes_written as i64,
-                    checksum_sha256: result.checksum_sha256,
-                };
-                match serde_json::to_vec(&metadata) {
-                    Ok(json) => {
-                        if let Err(e) = storage_clone.put(&metadata_key, Bytes::from(json)).await {
-                            tracing::warn!(
-                                cache_key = %cache_key_for_writer,
-                                metadata_key = %metadata_key,
-                                error = %e,
-                                "proxy cache metadata sidecar write failed; cache will refetch next request"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            cache_key = %cache_key_for_writer,
-                            error = %e,
-                            "proxy cache metadata JSON serialization failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    cache_key = %cache_key_for_writer,
-                    error = %e,
-                    "proxy cache put_stream failed; cache will refetch next request"
-                );
-            }
-        }
-    });
-
-    // Build the client-facing stream. For each chunk from upstream:
-    //   * forward the same chunk to the storage channel (backpressure
-    //     applies; if storage went away, drop silently and continue).
-    //   * yield the chunk to the client.
-    // On upstream error: forward the error to storage (so put_stream
-    // sees the error and aborts cleanly) and surface to the client.
-    let tee_stream = async_stream::try_stream! {
-        let mut upstream = upstream;
-        while let Some(chunk_result) = upstream.next().await {
-            match chunk_result {
-                Ok(mut bytes) => {
-                    // #1184: cap the per-channel-message size so an upstream
-                    // that hands us a multi-megabyte chunk does not blow
-                    // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
-                    // memory budget. Splitting preserves byte order and the
-                    // total payload; the client sees the same bytes, just
-                    // in smaller pieces. `Bytes::split_to` is a cheap
-                    // reference-count adjustment, not a copy.
-                    while !bytes.is_empty() {
-                        let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
-                        let slice = bytes.split_to(take);
-                        // Best-effort send to the cache writer. If the
-                        // writer is gone (it already failed and dropped
-                        // its receiver), drop the caching half silently
-                        // and keep yielding to the client.
-                        let _ = tx.send(Ok(slice.clone())).await;
-                        yield slice;
-                    }
-                }
-                Err(e) => {
-                    // #1185: upstream stream errors are upstream/network
-                    // failures, not storage failures. Tagging them
-                    // `BadGateway` on the writer channel lets operators
-                    // bucket them correctly in logs / metrics (the
-                    // previous `Storage` tag hid upstream incidents inside
-                    // the storage error rate). The cache writer treats
-                    // any Err it observes as a reason to abandon the
-                    // cache regardless of category. The original error
-                    // surfaces to the client unchanged — handlers map it
-                    // to a 502 via `map_proxy_error` on the request path.
-                    let storage_msg = Err(AppError::BadGateway(format!(
-                        "upstream stream error: {}",
-                        e
-                    )));
-                    let _ = tx.send(storage_msg).await;
-                    Err(e)?;
-                }
-            }
-        }
-        // upstream EOF: drop tx so the writer sees end-of-stream
-        drop(tx);
-    };
-    Box::pin(tee_stream)
+/// Build the operator-facing message for the scan-on-proxy gap (#1274), or
+/// `None` when no warning is warranted.
+///
+/// Returns `Some(message)` only when [`should_warn_proxy_scan_skipped`] is
+/// true. Pulling both the gate decision and the message text into one pure
+/// function keeps the async wrapper trivial and lets the wording (which an
+/// operator may grep for or alert on) be asserted directly in unit tests.
+pub(crate) fn proxy_scan_skipped_warning(
+    proxy_scan_enabled: bool,
+    newly_cached: bool,
+    artifact_path: &str,
+) -> Option<String> {
+    if !should_warn_proxy_scan_skipped(proxy_scan_enabled, newly_cached) {
+        return None;
+    }
+    Some(format!(
+        "scan_on_proxy is enabled for this repository but proxied artifacts are not \
+         yet scanned (#1274): the security scanner operates on the `artifacts` table \
+         and proxy-cached content is not recorded there (#1278). The artifact '{}' \
+         was cached UNSCANNED. Run a manual scan or host the package instead of \
+         proxying it if a scan is required.",
+        artifact_path
+    ))
 }
 
 /// A single proxy-cached artifact, reconstructed from the storage backend
@@ -571,14 +438,1159 @@ impl CacheKeys {
     }
 }
 
-/// Proxy service for fetching and caching artifacts from upstream repositories
-pub struct ProxyService {
-    db: PgPool,
+/// Owns the proxy-cache body + `__cache_meta__.json` sidecar lifecycle
+/// (#1618 S7 — first structural extraction).
+///
+/// This is a pure structural relocation of the cache read/write/invalidate/
+/// freshness operations that previously lived as scattered methods on
+/// [`ProxyService`]. [`ProxyService`] now holds a `CacheStore` and its public
+/// cache methods delegate here; no behavior, logging, error type, ordering,
+/// or call-site signature changed in the move.
+///
+/// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
+/// for these operations, so reads and writes target the global default
+/// backend exactly as before (#1278).
+pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
+}
+
+impl CacheStore {
+    /// Construct a `CacheStore` over the given storage handle.
+    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
+        Self { storage }
+    }
+
+    /// Load cache metadata from storage.
+    ///
+    /// Relocated verbatim from `ProxyService::load_cache_metadata`: `NotFound`
+    /// is a miss (`Ok(None)`), any other storage error propagates.
+    async fn load_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
+        match self.storage.get(metadata_key).await {
+            Ok(data) => {
+                let metadata: CacheMetadata = serde_json::from_slice(&data)?;
+                Ok(Some(metadata))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Shared cache-read path behind the fresh (`allow_stale = false`) and
+    /// stale (`allow_stale = true`) lookups. Relocated verbatim from
+    /// `ProxyService::get_cached`; every divergence is preserved exactly:
+    ///
+    /// * **Metadata read error.** Fresh treats a sidecar read/parse error as a
+    ///   cache miss (B6 — a waiter racing the single-flight leader's metadata
+    ///   write, or half-written JSON, must not bubble out as a 502). Stale
+    ///   propagates the error via `?`.
+    /// * **Expiry gate.** Fresh returns a miss once `Utc::now() > expires_at`;
+    ///   stale skips the gate entirely (that is the point of the fallback).
+    /// * **Body read error.** Fresh swallows a transient storage read error as
+    ///   a miss (B6); stale propagates it.
+    /// * **Log wording.** Fresh logs "Cache …"; stale logs "Stale cache …" and
+    ///   includes the expiry timestamp on a hit.
+    ///
+    /// The checksum verification (and its miss-on-mismatch) is identical for
+    /// both flags.
+    async fn get(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        allow_stale: bool,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
+        // propagates it via `?` to match the original behavior precisely.
+        let metadata = if allow_stale {
+            match self.load_metadata(metadata_key).await? {
+                Some(m) => m,
+                None => return Ok(None),
+            }
+        } else {
+            match self.load_metadata(metadata_key).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(
+                        metadata_key = %metadata_key,
+                        error = %e,
+                        "proxy cache metadata read failed; treating as miss and refetching upstream"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+
+        // Fresh reads enforce the expiry gate; the stale fallback skips it.
+        if !allow_stale && Utc::now() > metadata.expires_at {
+            tracing::debug!("Cache expired for {}", cache_key);
+            return Ok(None);
+        }
+
+        // Try to get cached content
+        match self.storage.get(cache_key).await {
+            Ok(content) => {
+                // Verify checksum (identical for fresh and stale)
+                let actual_checksum = StorageService::calculate_hash(&content);
+                if actual_checksum != metadata.checksum_sha256 {
+                    if allow_stale {
+                        tracing::warn!(
+                            "Stale cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Cache checksum mismatch for {}: expected {}, got {}",
+                            cache_key,
+                            metadata.checksum_sha256,
+                            actual_checksum
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                if allow_stale {
+                    tracing::debug!(
+                        "Stale cache hit for {} (expired at {})",
+                        cache_key,
+                        metadata.expires_at
+                    );
+                } else {
+                    tracing::debug!("Cache hit for {}", cache_key);
+                }
+                Ok(Some((content, metadata.content_type)))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            // B6 (coalescing 502 leak): a transient storage read error here
+            // (e.g. a waiter reading the cache body while the single-flight
+            // leader is mid-write, or a partially-written / poisoned entry)
+            // must NOT bubble out as a raw 502 to every concurrent waiter.
+            // Treat it as a cache miss so the caller re-fetches upstream; the
+            // upstream path then surfaces a clean 2xx (cache repopulated) or a
+            // 503 via `validate_upstream_status` when upstream itself is the
+            // one failing. Surfacing the read error as `Err(e)` made it
+            // `map_proxy_error` -> 502, which is exactly the raw status the
+            // stampede gate rejects. The stale fallback keeps the original
+            // propagate-the-error behavior.
+            Err(e) => {
+                if allow_stale {
+                    Err(e)
+                } else {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache read failed; treating as miss and refetching upstream"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Evict a cache entry: derive both keys, then delete the content and
+    /// metadata blobs in that order, ignoring delete errors.
+    ///
+    /// Relocated verbatim from `ProxyService::invalidate_cache_keys` (the
+    /// shared invalidate core from #1618 S3).
+    async fn invalidate(&self, keys: &CacheKeys) -> Result<()> {
+        // Delete both content and metadata
+        let _ = self.storage.delete(&keys.content).await;
+        let _ = self.storage.delete(&keys.metadata).await;
+
+        Ok(())
+    }
+
+    /// Metadata-only freshness probe with #1051 ETag revalidation.
+    ///
+    /// Relocated verbatim from `ProxyService::is_cache_fresh` (the body that
+    /// runs once the keys are derived). Returns `true` only when the metadata
+    /// exists, is unexpired, and the content object passes ETag revalidation
+    /// (or, for filesystem/legacy entries with no pinned ETag, an existence
+    /// check).
+    async fn is_fresh(&self, keys: &CacheKeys) -> bool {
+        let cache_key = &keys.content;
+
+        let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
+            return false;
+        };
+        if Utc::now() > metadata.expires_at {
+            return false;
+        }
+
+        // ETag-based integrity revalidation (#1051). Only meaningful when
+        // we have a pinned ETag from cache-write time AND the backend
+        // surfaces an ETag now. Either side being `None` falls back to
+        // pre-#1051 behavior (existence check only): filesystem entries
+        // and legacy sidecars are unaffected.
+        match metadata.storage_etag {
+            Some(ref pinned) => match self.storage.head_etag(cache_key).await {
+                Ok(Some(current)) => {
+                    if current != *pinned {
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            pinned_etag = %pinned,
+                            current_etag = %current,
+                            "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
+                        );
+                        return false;
+                    }
+                    // ETag matched → object is present and unchanged
+                    // since cache write. Skip the redundant exists() call.
+                    true
+                }
+                // Backend lost the object (None) or errored: treat as
+                // not-fresh. The slow path will re-fetch and re-cache.
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache head_etag failed during revalidation; treating as not fresh"
+                    );
+                    false
+                }
+            },
+            None => {
+                // No pinned ETag (filesystem / legacy entry). Preserve
+                // pre-#1051 semantics: existence check only.
+                matches!(self.storage.exists(cache_key).await, Ok(true))
+            }
+        }
+    }
+}
+
+/// Owns the post-proxy persistence concern — seam (b) of the #1618 refactor
+/// (S9). Both write-to-cache paths funnel through here:
+///
+/// * [`Self::write_buffered`] ← `ProxyService::cache_artifact` /
+///   `CacheStore::write` — the buffered path that has the whole body in
+///   memory.
+/// * [`Self::tee_stream`] ← the `tee_upstream_to_cache` free function — the
+///   streaming path that tees the upstream body to the client AND a
+///   background cache writer concurrently.
+///
+/// This is a pure structural relocation: no behavior, logging, error type,
+/// ordering, or call-site signature changed in the move. The two paths
+/// previously each independently implemented the same load-bearing
+/// invariants, all preserved here byte-for-byte and annotated `// #1618 S9`
+/// so future editors do not "fix" them:
+///
+/// 1. **#1365 zero-byte guard.** Neither path ever caches an empty body
+///    (buffered: skip the write; streaming: skip the sidecar + delete the
+///    empty object). Same log string in both.
+/// 2. **#1051 ETag pin.** `pin_storage_etag` is read off the backend right
+///    after the content write and stored in the sidecar so the fast path can
+///    revalidate; a backend with no ETag concept falls back to pre-#1051
+///    existence-only semantics.
+/// 3. **Body → sidecar write ordering.** The content object is written
+///    first, then the cache-metadata sidecar. Never reordered.
+///
+/// Streaming-tee failure semantics ([`Self::tee_stream`]) are unchanged: a
+/// cache-write failure must not corrupt the client stream, upstream errors
+/// surface to the client while the writer abandons the cache, etc. See that
+/// method's doc for the full contract.
+///
+/// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
+/// for cache writes, so writes target the global default backend exactly as
+/// before (#1278).
+pub(crate) struct CachePersister {
+    storage: Arc<StorageService>,
+}
+
+impl CachePersister {
+    /// Construct a `CachePersister` over the given storage handle.
+    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
+        Self { storage }
+    }
+
+    /// Cache artifact content and its metadata sidecar (buffered path).
+    ///
+    /// Relocated verbatim from `ProxyService::cache_artifact` /
+    /// `CacheStore::write` (#1618 S9; the DB-write side was already removed
+    /// under #1278). Preserves the #1365 zero-byte guard, the #1051 ETag
+    /// pin, and the identical write ordering (content first, then sidecar).
+    #[allow(clippy::too_many_arguments)]
+    async fn write_buffered(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        content: &Bytes,
+        content_type: Option<String>,
+        etag: Option<String>,
+        ttl_secs: i64,
+        repository_id: Uuid,
+        artifact_path: &str,
+    ) -> Result<()> {
+        // #1618 S9 / #1365: never cache a zero-byte body on the buffered
+        // path either. An empty upstream response (204 / empty 200) must
+        // not become a fresh cache entry that a later request serves as
+        // `Content-Length: 0`. Skip the write entirely so the next request
+        // refetches from upstream; the caller treats a cache miss as the
+        // normal path. The streaming sibling [`Self::tee_stream`] applies
+        // the same guard after `put_stream`.
+        if content.is_empty() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "proxy upstream returned an empty body; not caching the zero-byte \
+                 object so the next request refetches upstream"
+            );
+            return Ok(());
+        }
+
+        // Calculate checksum
+        let checksum = StorageService::calculate_hash(content);
+
+        // #1618 S9: body → sidecar write ordering. Store content first so we
+        // can read the backend's ETag back for the integrity-revalidation
+        // pin (#1051).
+        self.storage.put(cache_key, content.clone()).await?;
+
+        // #1618 S9 / #1051: best-effort capture of the backend's ETag right
+        // after the PUT so the fast path can re-HEAD on each hit and reject
+        // tampered or replaced objects. See [`pin_storage_etag`] for the
+        // failure semantics; a failure here only disables revalidation for
+        // this entry, the cache write itself still succeeds.
+        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
+
+        // Create metadata
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: etag,
+            storage_etag,
+            expires_at: now + chrono::Duration::seconds(ttl_secs),
+            content_type,
+            size_bytes: content.len() as i64,
+            checksum_sha256: checksum,
+        };
+
+        // #1618 S9: sidecar written second, after the content object above.
+        let metadata_json = serde_json::to_vec(&metadata)?;
+        self.storage
+            .put(metadata_key, Bytes::from(metadata_json))
+            .await?;
+
+        // Proxy-cached content is intentionally NOT recorded in the
+        // `artifacts` table (issue #1278). The previous behaviour inserted
+        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
+        // alongside the global-backend write above, which caused every
+        // subsequent format-handler read to take the
+        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
+        // path -- a per-repo `FilesystemStorage` rooted at
+        // `repo.storage_path` that resolves to a doubled-prefix path
+        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
+        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
+        // object-store backends were unaffected because their registry
+        // shares the same instance regardless of `location.path`.
+        //
+        // The cached body and metadata sidecar are still on disk under
+        // `self.storage` (the global default). The format-handler hot path
+        // already checks the proxy cache via `proxy_check_cache`
+        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
+        // falling through to the upstream fetch, so cache hits are served
+        // through that path with no `artifacts` row needed. Reads through
+        // the global backend match the writes above.
+        //
+        // Tradeoff: proxy-cached items no longer surface in the
+        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
+        // counted toward `storage_used_bytes`. That UX/accounting gap is
+        // tracked separately; correctness (no more 500s on cached reads)
+        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
+        // versions stay in `artifacts` and continue to surface in
+        // listings until they are explicitly invalidated, which is a
+        // graceful degradation, not a regression.
+        let _ = repository_id;
+        let _ = artifact_path;
+
+        tracing::debug!(
+            "Cached artifact {} ({} bytes, expires at {})",
+            cache_key,
+            content.len(),
+            metadata.expires_at
+        );
+
+        Ok(())
+    }
+
+    /// Tee an upstream byte stream into a returned client stream AND a
+    /// background storage writer that populates the proxy cache (streaming
+    /// path). The returned stream yields the same chunks the upstream
+    /// produced, in order, with no buffering beyond the bounded channel
+    /// below.
+    ///
+    /// Relocated verbatim from the `tee_upstream_to_cache` free function
+    /// (#1618 S9). Storage failure semantics:
+    /// * Storage writer task receives chunks via a bounded mpsc channel.
+    ///   When the channel is full, the upstream reader awaits a slot — that
+    ///   is the backpressure path. When the writer is gone (e.g. it
+    ///   already failed and dropped its receiver), `try_send` short-
+    ///   circuits and we keep yielding to the client without caching.
+    /// * On any error from `put_stream`, the writer logs at `warn` and
+    ///   exits without writing the metadata sidecar. The cache is left
+    ///   without a metadata sidecar so the NEXT request misses the cache
+    ///   and re-fetches upstream — the system self-heals.
+    /// * On client disconnect mid-stream, the tee task ends, the channel
+    ///   drops, and the writer commits or aborts whatever it has buffered.
+    ///   No leaked temp files (FilesystemBackend cleans up via the
+    ///   `put_stream` error path).
+    ///
+    /// Error categories (#1185):
+    /// * Upstream stream errors observed mid-body are wrapped as
+    ///   [`AppError::BadGateway`] before being forwarded to the writer
+    ///   channel and surfaced to the client. This keeps operator log /
+    ///   metric buckets honest: a flaky mirror does not inflate the
+    ///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
+    ///   not get hidden as `BAD_GATEWAY`.
+    fn tee_stream(
+        &self,
+        upstream: BoxStream<'static, Result<Bytes>>,
+        cache_key: String,
+        metadata_key: String,
+        template: CacheMetadataTemplate,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let storage = Arc::clone(&self.storage);
+
+        // Channel for chunks flowing reader -> writer. mpsc to keep order
+        // (broadcast would let storage skip chunks under backpressure,
+        // which we explicitly want to avoid - skipping chunks corrupts the
+        // cached SHA-256).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
+
+        // Spawn the storage writer. It consumes the channel as a stream
+        // and calls put_stream. On completion, writes the metadata sidecar
+        // with the observed SHA-256 + byte count.
+        let storage_clone = storage.clone();
+        let cache_key_for_writer = cache_key.clone();
+        tokio::spawn(async move {
+            // Adapter: receiver -> futures::Stream<Result<Bytes>>.
+            let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+
+            let put_result = storage_clone
+                .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
+                .await;
+
+            match put_result {
+                Ok(result) if result.bytes_written == 0 => {
+                    // #1618 S9 / #1365: never cache a zero-byte body. A
+                    // Maven client resolving dependencies can drive an
+                    // upstream response with no body (a 204, a 200 with
+                    // `Content-Length: 0`, or a HEAD-style probe that
+                    // reaches the streaming download path), and the upstream
+                    // POM/JAR is non-empty. Writing the metadata sidecar
+                    // here would mark the empty object as a fresh,
+                    // non-expired cache hit; the next GET would then serve
+                    // `Content-Length: 0`, and Gradle fails parsing the POM
+                    // with "Content is not allowed in prolog." Skip the
+                    // sidecar so the entry is treated as a miss, and delete
+                    // the empty object we just wrote so a later GET
+                    // re-fetches the real body from upstream (self-heal).
+                    // The buffered sibling [`Self::write_buffered`] applies
+                    // the same guard before the content write.
+                    tracing::warn!(
+                        cache_key = %cache_key_for_writer,
+                        "proxy upstream returned an empty body; not caching the zero-byte \
+                         object (no metadata sidecar) so the next request refetches upstream"
+                    );
+                    if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                        tracing::debug!(
+                            cache_key = %cache_key_for_writer,
+                            error = %e,
+                            "best-effort delete of empty proxy-cache object failed; \
+                             the missing metadata sidecar still forces a refetch"
+                        );
+                    }
+                }
+                Ok(result) => {
+                    let now = Utc::now();
+                    // #1618 S9 / #1051: pin the storage backend's ETag at
+                    // write time so the fast path can re-HEAD on each hit
+                    // and detect tampering / backend-side replacement. See
+                    // [`pin_storage_etag`] for the best-effort semantics on
+                    // backends without an ETag concept or on transport
+                    // error.
+                    let storage_etag =
+                        pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
+                    let metadata = CacheMetadata {
+                        cached_at: now,
+                        upstream_etag: template.etag,
+                        storage_etag,
+                        expires_at: now + chrono::Duration::seconds(template.ttl_secs),
+                        content_type: template.content_type,
+                        size_bytes: result.bytes_written as i64,
+                        checksum_sha256: result.checksum_sha256,
+                    };
+                    match serde_json::to_vec(&metadata) {
+                        Ok(json) => {
+                            // #1618 S9: sidecar written second, after the
+                            // streaming content write (put_stream) above.
+                            if let Err(e) =
+                                storage_clone.put(&metadata_key, Bytes::from(json)).await
+                            {
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    metadata_key = %metadata_key,
+                                    error = %e,
+                                    "proxy cache metadata sidecar write failed; cache will refetch next request"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                error = %e,
+                                "proxy cache metadata JSON serialization failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %cache_key_for_writer,
+                        error = %e,
+                        "proxy cache put_stream failed; cache will refetch next request"
+                    );
+                }
+            }
+        });
+
+        // Build the client-facing stream. For each chunk from upstream:
+        //   * forward the same chunk to the storage channel (backpressure
+        //     applies; if storage went away, drop silently and continue).
+        //   * yield the chunk to the client.
+        // On upstream error: forward the error to storage (so put_stream
+        // sees the error and aborts cleanly) and surface to the client.
+        let tee_stream = async_stream::try_stream! {
+            let mut upstream = upstream;
+            while let Some(chunk_result) = upstream.next().await {
+                match chunk_result {
+                    Ok(mut bytes) => {
+                        // #1184: cap the per-channel-message size so an upstream
+                        // that hands us a multi-megabyte chunk does not blow
+                        // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
+                        // memory budget. Splitting preserves byte order and the
+                        // total payload; the client sees the same bytes, just
+                        // in smaller pieces. `Bytes::split_to` is a cheap
+                        // reference-count adjustment, not a copy.
+                        while !bytes.is_empty() {
+                            let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
+                            let slice = bytes.split_to(take);
+                            // Best-effort send to the cache writer. If the
+                            // writer is gone (it already failed and dropped
+                            // its receiver), drop the caching half silently
+                            // and keep yielding to the client.
+                            let _ = tx.send(Ok(slice.clone())).await;
+                            yield slice;
+                        }
+                    }
+                    Err(e) => {
+                        // #1185: upstream stream errors are upstream/network
+                        // failures, not storage failures. Tagging them
+                        // `BadGateway` on the writer channel lets operators
+                        // bucket them correctly in logs / metrics (the
+                        // previous `Storage` tag hid upstream incidents inside
+                        // the storage error rate). The cache writer treats
+                        // any Err it observes as a reason to abandon the
+                        // cache regardless of category. The original error
+                        // surfaces to the client unchanged — handlers map it
+                        // to a 502 via `map_proxy_error` on the request path.
+                        let storage_msg = Err(AppError::BadGateway(format!(
+                            "upstream stream error: {}",
+                            e
+                        )));
+                        let _ = tx.send(storage_msg).await;
+                        Err(e)?;
+                    }
+                }
+            }
+            // upstream EOF: drop tx so the writer sees end-of-stream
+            drop(tx);
+        };
+        Box::pin(tee_stream)
+    }
+}
+
+/// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
+/// (#1618 S8 — the highest-risk structural extraction).
+///
+/// This is a pure structural relocation of the upstream-facing methods that
+/// previously lived directly on [`ProxyService`]: the buffered fetch
+/// (`fetch_buffered` ← `fetch_from_upstream_with_accept`), the streaming fetch
+/// (`fetch_stream` ← `fetch_from_upstream_streaming`), the ETag revalidation
+/// HEAD (`check_etag_changed`), and the OCI bearer-token cache
+/// (`obtain_bearer_token` / `get_cached_token` / `parse_bearer_challenge`).
+/// [`ProxyService`] now holds an `UpstreamClient` and the corresponding methods
+/// delegate here; no behavior, logging, error type, ordering, header set, or
+/// call-site signature changed in the move.
+///
+/// Holds the same `http_client`, the bearer `token_cache`, and a `db` handle
+/// (used only to load per-repo upstream auth via
+/// `upstream_auth::load_upstream_auth`) that [`ProxyService`] used before.
+///
+/// The two fetch paths each previously inlined an identical 401 Bearer
+/// state machine; it is now extracted ONCE into [`Self::exchange_bearer_then`].
+/// The caller-supplied `build_request` closure is what preserves the
+/// **intentional OCI `Accept`-header asymmetry** — see that method's doc.
+pub(crate) struct UpstreamClient {
+    db: PgPool,
     http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+}
+
+impl UpstreamClient {
+    /// Construct an `UpstreamClient` over the given HTTP client and db handle.
+    /// Starts with an empty bearer-token cache (matching the previous
+    /// `ProxyService::new` initialization exactly).
+    pub(crate) fn new(db: PgPool, http_client: Client) -> Self {
+        Self {
+            db,
+            http_client,
+            token_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Buffered upstream fetch. Relocated verbatim from
+    /// `ProxyService::fetch_from_upstream_with_accept`.
+    ///
+    /// Variant of the plain fetch that adds an `Accept` header to BOTH the
+    /// initial request and the post-token-exchange retry.
+    ///
+    /// OCI manifest fetches need this so the upstream registry returns the
+    /// content type the caller actually understands. Without an `Accept`
+    /// header Docker Hub picks a default representation (typically the
+    /// OCI image index for multi-arch images) but other registries respond
+    /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
+    /// Mirroring the client's `Accept` upstream removes that source of
+    /// silent content-type mismatches and the spurious 404s they trigger.
+    async fn fetch_buffered(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<UpstreamResponse> {
+        tracing::info!(
+            "Fetching artifact from upstream: {} (accept={:?})",
+            url,
+            accept
+        );
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        // BUFFERED path sets `Accept` on the INITIAL request. The streaming
+        // path deliberately does NOT — see `exchange_bearer_then` /
+        // `fetch_stream` for why this asymmetry is intentional (#1618 S8).
+        if let Some(accept_value) = accept {
+            request = request.header(ACCEPT, accept_value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+
+        let status = response.status();
+
+        // Handle 401 with bearer token exchange (required by Docker Hub and
+        // other OCI registries, even for anonymous/public pulls).
+        if status == StatusCode::UNAUTHORIZED {
+            // The buffered closure RE-ADDS `Accept` on the bearer retry,
+            // mirroring the initial request. The bearer-exchange helper itself
+            // never touches `Accept`; the closure owns that decision so the
+            // buffered/streaming asymmetry is preserved (#1618 S8).
+            if let Some(retry_response) = self
+                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    if let Some(accept_value) = accept {
+                        req.header(ACCEPT, accept_value)
+                    } else {
+                        req
+                    }
+                })
+                .await?
+            {
+                return Self::read_upstream_response(retry_response, url).await;
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response(response, url).await
+    }
+
+    /// Extract content, content-type, etag, effective URL, and Link header from
+    /// an upstream HTTP response. Callers are responsible for handling 401 before
+    /// invoking. Relocated verbatim from `ProxyService::read_upstream_response`.
+    async fn read_upstream_response(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<UpstreamResponse> {
+        let status = response.status();
+        let effective_url = response.url().to_string();
+
+        // Centralise the 404/4xx/5xx classification through
+        // `validate_upstream_status` (#1445) so the buffered fetch path
+        // gets the same 5xx -> ServiceUnavailable mapping the streaming
+        // path does. Previously this inlined a "non-2xx -> Storage" rule
+        // that surfaced raw upstream 502/503/504 to clients as 502.
+        validate_upstream_status(status, url)?;
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let link = response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let content = response
+            .bytes()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
+
+        tracing::info!(
+            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
+            content.len(),
+            content_type,
+            etag,
+            link
+        );
+
+        Ok(UpstreamResponse {
+            content,
+            content_type,
+            etag,
+            effective_url,
+            link,
+        })
+    }
+
+    /// Streaming upstream fetch. Relocated verbatim from
+    /// `ProxyService::fetch_from_upstream_streaming` (#895).
+    ///
+    /// Returns the upstream body as a stream of `Bytes` chunks instead of
+    /// buffering the whole body into memory. Used by the OOM-mitigation path
+    /// that tees the upstream stream simultaneously to the client and to the
+    /// storage cache.
+    ///
+    /// Auth handling (Basic + OCI bearer token exchange) mirrors the
+    /// buffered variant; only the body extraction differs — and, critically,
+    /// the streaming path sets NO `Accept` header anywhere (see below).
+    async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
+        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        // NOTE: the streaming path intentionally sets NO `Accept` header on the
+        // initial request, in contrast to the buffered path which sets it on
+        // both the initial request and the retry. This asymmetry is deliberate
+        // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+
+        let status = response.status();
+
+        if status == StatusCode::UNAUTHORIZED {
+            // The streaming closure is the IDENTITY transform: it adds NO
+            // `Accept` header on the bearer retry, preserving the asymmetry
+            // with the buffered path (#1618 S8).
+            if let Some(retry_response) = self
+                .exchange_bearer_then(response, url, &upstream_auth, |req| req)
+                .await?
+            {
+                return Self::read_upstream_response_streaming(retry_response, url);
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response_streaming(response, url)
+    }
+
+    /// Shared OCI 401 Bearer-challenge state machine, extracted ONCE from the
+    /// previously copy-pasted blocks in the buffered and streaming fetch paths
+    /// (#1618 S8).
+    ///
+    /// Given the upstream's 401 `response`, this:
+    /// 1. parses the `WWW-Authenticate: Bearer ...` challenge,
+    /// 2. validates the advertised realm against SSRF rules
+    ///    (`validate_outbound_url`) BEFORE any outbound request,
+    /// 3. obtains a bearer token (cache hit or token-endpoint exchange), and
+    /// 4. rebuilds a fresh GET via the caller-supplied `build_request` closure
+    ///    (already carrying `bearer_auth(token)`), sends it, and returns the
+    ///    RAW [`reqwest::Response`].
+    ///
+    /// Returns `Ok(Some(response))` when the 401 carried a usable Bearer
+    /// challenge and the retry was issued; `Ok(None)` when the response was not
+    /// a parseable Bearer challenge (the caller then maps that to the original
+    /// "Upstream returned error status" error, exactly as before).
+    ///
+    /// CRITICAL — this helper deliberately returns the raw response and does
+    /// NOT read the body: the caller picks `read_upstream_response` (buffered,
+    /// fully buffered) vs `read_upstream_response_streaming` (streaming, bounded
+    /// memory). Reading the body here would collapse streaming into buffering
+    /// and break its bounded-memory guarantee (#1618 S8 review).
+    ///
+    /// CRITICAL — this helper NEVER sets an `Accept` header. The OCI `Accept`
+    /// asymmetry between the buffered and streaming paths is intentional and is
+    /// owned entirely by the caller's `build_request` closure: the buffered
+    /// caller re-adds `Accept` on the retry, the streaming caller adds nothing.
+    /// Do NOT "helpfully" add `Accept` here (#1618 S8 review).
+    async fn exchange_bearer_then<F>(
+        &self,
+        response: reqwest::Response,
+        url: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        build_request: F,
+    ) -> Result<Option<reqwest::Response>>
+    where
+        F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    {
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if challenge.starts_with("Bearer ") {
+            let params = Self::parse_bearer_challenge(&challenge);
+            if let Some(realm) = params.get("realm") {
+                let scope = params.get("scope").cloned().unwrap_or_default();
+                let service = params.get("service").cloned().unwrap_or_default();
+
+                // Validate the realm URL against SSRF rules before making
+                // any outbound request. A malicious upstream could set
+                // realm to an internal address.
+                crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
+
+                let token = self
+                    .obtain_bearer_token(realm, &service, &scope, upstream_auth)
+                    .await?;
+
+                // Retry with the bearer token only. The original upstream
+                // Basic credentials were already forwarded to the token
+                // endpoint in obtain_bearer_token(); adding them here
+                // would produce two Authorization headers.
+                //
+                // The caller's `build_request` closure decides whether to
+                // re-add `Accept` (buffered: yes; streaming: no) — see the
+                // method doc on the intentional asymmetry (#1618 S8).
+                let retry_request = build_request(self.http_client.get(url).bearer_auth(&token));
+
+                let retry_response = retry_request.send().await.map_err(|e| {
+                    AppError::Storage(format!(
+                        "Failed to fetch from upstream after token exchange: {}",
+                        e
+                    ))
+                })?;
+
+                return Ok(Some(retry_response));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Stream the upstream HTTP response body without buffering. Mirrors
+    /// the shape of [`Self::read_upstream_response`] but returns the body
+    /// as a stream. Status/header validation happens up front; the
+    /// stream itself yields one [`Bytes`] chunk per `reqwest` body
+    /// frame. Relocated verbatim from
+    /// `ProxyService::read_upstream_response_streaming`.
+    fn read_upstream_response_streaming(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<UpstreamStream> {
+        validate_upstream_status(response.status(), url)?;
+        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
+
+        let body = response.bytes_stream().map(|r| {
+            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
+        });
+
+        Ok(UpstreamStream {
+            body: Box::pin(body),
+            content_type,
+            etag,
+            content_length,
+        })
+    }
+
+    /// Obtain a bearer token for an OCI registry, using the in-memory cache
+    /// when possible. Relocated verbatim from
+    /// `ProxyService::obtain_bearer_token`.
+    async fn obtain_bearer_token(
+        &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<String> {
+        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
+
+        if let Some(token) = self.get_cached_token(&cache_key).await {
+            return Ok(token);
+        }
+
+        // Build token request URL with query parameters.
+        let token_url = {
+            let mut parts = Vec::new();
+            if !service.is_empty() {
+                parts.push(format!("service={}", urlencoding::encode(service)));
+            }
+            if !scope.is_empty() {
+                parts.push(format!("scope={}", urlencoding::encode(scope)));
+            }
+            if parts.is_empty() {
+                realm.to_string()
+            } else {
+                let sep = if realm.contains('?') { "&" } else { "?" };
+                format!("{}{}{}", realm, sep, parts.join("&"))
+            }
+        };
+        let mut token_request = self.http_client.get(&token_url);
+
+        // Forward configured Basic credentials for private registries.
+        if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username,
+            password,
+        }) = upstream_auth
+        {
+            token_request = token_request.basic_auth(username, Some(password));
+        }
+
+        tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
+
+        let token_response = token_request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to request bearer token from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        if !token_response.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "Token endpoint {} returned status {}",
+                realm,
+                token_response.status()
+            )));
+        }
+
+        let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to parse token response from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        let token = body
+            .token
+            .or(body.access_token)
+            .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
+
+        // Cap TTL to prevent overflow and unreasonably long cache entries.
+        let ttl = body
+            .expires_in
+            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
+            .min(MAX_TOKEN_TTL_SECS);
+
+        // Cache the token, evicting expired entries to prevent unbounded growth.
+        {
+            let mut cache = self.token_cache.write().await;
+            cache.retain(|_, (_, created_at, entry_ttl)| {
+                created_at.elapsed() < Duration::from_secs(*entry_ttl)
+            });
+            cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
+        }
+
+        Ok(token)
+    }
+
+    /// Return a cached bearer token if present and not expired. Relocated
+    /// verbatim from `ProxyService::get_cached_token`.
+    async fn get_cached_token(&self, cache_key: &str) -> Option<String> {
+        let cache = self.token_cache.read().await;
+        let (token, created_at, ttl_secs) = cache.get(cache_key)?;
+        if created_at.elapsed() < Duration::from_secs(ttl_secs.saturating_mul(9) / 10) {
+            Some(token.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
+    /// header into a map of key-value pairs. Relocated verbatim from
+    /// `ProxyService::parse_bearer_challenge`.
+    fn parse_bearer_challenge(header: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        let bearer_params = match header.strip_prefix("Bearer ") {
+            Some(p) => p,
+            None => return params,
+        };
+
+        let mut remaining = bearer_params.trim();
+        while !remaining.is_empty() {
+            let eq_pos = match remaining.find('=') {
+                Some(p) => p,
+                None => break,
+            };
+            let key = remaining[..eq_pos].trim().to_lowercase();
+            remaining = remaining[eq_pos + 1..].trim();
+
+            let value;
+            if remaining.starts_with('"') {
+                remaining = &remaining[1..];
+                let end = remaining.find('"').unwrap_or(remaining.len());
+                value = remaining[..end].to_string();
+                remaining = if end + 1 < remaining.len() {
+                    remaining[end + 1..].trim_start_matches(',').trim()
+                } else {
+                    ""
+                };
+            } else {
+                let end = remaining.find(',').unwrap_or(remaining.len());
+                value = remaining[..end].trim().to_string();
+                remaining = if end < remaining.len() {
+                    remaining[end + 1..].trim()
+                } else {
+                    ""
+                };
+            }
+
+            params.insert(key, value);
+        }
+
+        params
+    }
+
+    /// Check if upstream ETag has changed (returns true if changed/newer).
+    /// Relocated verbatim from `ProxyService::check_etag_changed`.
+    async fn check_etag_changed(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+    ) -> Result<bool> {
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self
+            .http_client
+            .head(url)
+            .header(IF_NONE_MATCH, cached_etag);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+        })?;
+
+        match response.status() {
+            StatusCode::NOT_MODIFIED => {
+                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
+                Ok(false)
+            }
+            StatusCode::OK => {
+                // Check if ETag in response differs
+                let new_etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok());
+
+                match new_etag {
+                    Some(etag) if etag == cached_etag => {
+                        tracing::debug!("Upstream ETag unchanged for {}", url);
+                        Ok(false)
+                    }
+                    _ => {
+                        tracing::debug!("Upstream has newer content for {}", url);
+                        Ok(true)
+                    }
+                }
+            }
+            StatusCode::UNAUTHORIZED => {
+                // OCI registries require bearer token exchange even for HEAD
+                // requests. Rather than duplicating the token exchange here,
+                // treat this as "needs re-fetch" and let fetch_from_upstream
+                // handle the full 401 flow on the next access.
+                tracing::debug!(
+                    "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
+                    url
+                );
+                Ok(true)
+            }
+            status => {
+                tracing::warn!(
+                    "Unexpected status {} checking upstream {}, assuming changed",
+                    status,
+                    url
+                );
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// Proxy service for fetching and caching artifacts from upstream repositories
+pub struct ProxyService {
+    db: PgPool,
+    storage: Arc<StorageService>,
+    /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
+    /// The cache-facing public methods on `ProxyService` delegate here.
+    cache_store: CacheStore,
+    /// Owns the post-proxy persistence concern (#1618 S9, seam (b)): the
+    /// buffered (`cache_artifact`) and streaming (tee) write-to-cache paths
+    /// both route through here. Holds the same global-default storage handle.
+    cache_persister: CachePersister,
+    /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
+    /// (#1618 S8). The upstream-facing methods on `ProxyService`
+    /// (`fetch_from_upstream*`, `check_etag_changed`, `parse_bearer_challenge`)
+    /// delegate here. It holds the shared `http_client` and the bearer
+    /// `token_cache` that previously lived directly on `ProxyService`.
+    upstream_client: UpstreamClient,
+    /// Single-flight coordinator for proxy cache hydration (#1631 layer 1).
+    /// The buffered slow path (`fetch_artifact_with_cache_path_and_accept`)
+    /// elects a leader through this seam; the leader runs the upstream fetch +
+    /// cache write while followers wait and re-check the cache. Injected as a
+    /// concrete field, mirroring `CacheStore`/`UpstreamClient`/`CachePersister`
+    /// (#1618 S7/S8/S9).
+    ///
+    /// // #1631 layer 2: the streaming path (`fetch_artifact_streaming`) will
+    /// //               coordinate through a streaming entry point on this same
+    /// //               seam (broadcast fan-out, not buffered re-check).
+    /// // #1631 layer 3: a cross-replica advisory-lock decorator (#1609) can
+    /// //               replace this field with a wrapping `Coordinator` impl.
+    coordinator: BufferedCoordinator,
 }
 
 impl ProxyService {
@@ -602,11 +1614,21 @@ impl ProxyService {
             .build()
             .expect("Failed to create HTTP client");
 
+        let cache_store = CacheStore::new(Arc::clone(&storage));
+        let cache_persister = CachePersister::new(Arc::clone(&storage));
+        let upstream_client = UpstreamClient::new(db.clone(), http_client);
+        // #1631 layer 1: inject the in-process buffered single-flight
+        // coordinator. Layer 3 (#1609) can swap this for an advisory-lock
+        // decorator without touching call sites.
+        let coordinator = BufferedCoordinator::new();
+
         Self {
             db,
             storage,
-            http_client,
-            token_cache: RwLock::new(HashMap::new()),
+            cache_store,
+            cache_persister,
+            upstream_client,
+            coordinator,
         }
     }
 
@@ -714,59 +1736,10 @@ impl ProxyService {
         // we'd want to redirect to anyway: treat it as a miss so the caller
         // falls through to the slow path / upstream fetch, where the same
         // validation will surface the error to the client.
-        let Ok(cache_key) = Self::cache_storage_key(repo_key, path) else {
+        let Ok(keys) = CacheKeys::derive(repo_key, path) else {
             return false;
         };
-        let Ok(metadata_key) = Self::cache_metadata_key(repo_key, path) else {
-            return false;
-        };
-
-        let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
-            return false;
-        };
-        if Utc::now() > metadata.expires_at {
-            return false;
-        }
-
-        // ETag-based integrity revalidation (#1051). Only meaningful when
-        // we have a pinned ETag from cache-write time AND the backend
-        // surfaces an ETag now. Either side being `None` falls back to
-        // pre-#1051 behavior (existence check only): filesystem entries
-        // and legacy sidecars are unaffected.
-        match metadata.storage_etag {
-            Some(ref pinned) => match self.storage.head_etag(&cache_key).await {
-                Ok(Some(current)) => {
-                    if current != *pinned {
-                        tracing::warn!(
-                            cache_key = %cache_key,
-                            pinned_etag = %pinned,
-                            current_etag = %current,
-                            "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
-                        );
-                        return false;
-                    }
-                    // ETag matched → object is present and unchanged
-                    // since cache write. Skip the redundant exists() call.
-                    true
-                }
-                // Backend lost the object (None) or errored: treat as
-                // not-fresh. The slow path will re-fetch and re-cache.
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        error = %e,
-                        "proxy cache head_etag failed during revalidation; treating as not fresh"
-                    );
-                    false
-                }
-            },
-            None => {
-                // No pinned ETag (filesystem / legacy entry). Preserve
-                // pre-#1051 semantics: existence check only.
-                matches!(self.storage.exists(&cache_key).await, Ok(true))
-            }
-        }
+        self.cache_store.is_fresh(&keys).await
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -811,7 +1784,10 @@ impl ProxyService {
         }
 
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
-        coordinate_proxy_hydration(
+        // #1631 layer 1: buffered single-flight via the injected coordinator
+        // seam (was a direct `coordinate_proxy_hydration` call). The streaming
+        // path below (`fetch_artifact_streaming`) is the layer-2 plug-in point.
+        self.coordinator.coordinate(
             &hydration_lease_key,
             || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
             || async {
@@ -856,6 +1832,12 @@ impl ProxyService {
                                 "proxy cache write failed after successful upstream fetch; \
                                  serving fetched bytes and leaving cache to self-heal on next request"
                             );
+                        } else {
+                            // New artifact cached from upstream: surface the
+                            // scan-on-proxy gap (#1274) so an enabled-but-
+                            // unimplemented setting fails loudly, not silently.
+                            self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
+                                .await;
                         }
 
                         Ok((resp.content, resp.content_type))
@@ -956,9 +1938,15 @@ impl ProxyService {
             .await?;
 
         let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-        let body = tee_upstream_to_cache(
+
+        // Cache miss + successful upstream fetch: a new artifact is being
+        // cached. Surface the scan-on-proxy gap (#1274) before teeing to
+        // the background cache writer so an enabled-but-unimplemented
+        // setting is observable in logs rather than silently doing nothing.
+        self.warn_if_proxy_scan_unsupported(repo.id, path).await;
+
+        let body = self.cache_persister.tee_stream(
             upstream.body,
-            self.storage.clone(),
             cache_key,
             metadata_key,
             CacheMetadataTemplate {
@@ -1066,12 +2054,7 @@ impl ProxyService {
     /// identical, so it lives here as a single source of truth (#1618 S3).
     async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
         let keys = CacheKeys::derive(repo_key, path)?;
-
-        // Delete both content and metadata
-        let _ = self.storage.delete(&keys.content).await;
-        let _ = self.storage.delete(&keys.metadata).await;
-
-        Ok(())
+        self.cache_store.invalidate(&keys).await
     }
 
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
@@ -1555,106 +2538,16 @@ impl ProxyService {
         metadata_key: &str,
         allow_stale: bool,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
-        // propagates it via `?` to match the original behavior precisely.
-        let metadata = if allow_stale {
-            match self.load_cache_metadata(metadata_key).await? {
-                Some(m) => m,
-                None => return Ok(None),
-            }
-        } else {
-            match self.load_cache_metadata(metadata_key).await {
-                Ok(Some(m)) => m,
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    tracing::warn!(
-                        metadata_key = %metadata_key,
-                        error = %e,
-                        "proxy cache metadata read failed; treating as miss and refetching upstream"
-                    );
-                    return Ok(None);
-                }
-            }
-        };
-
-        // Fresh reads enforce the expiry gate; the stale fallback skips it.
-        if !allow_stale && Utc::now() > metadata.expires_at {
-            tracing::debug!("Cache expired for {}", cache_key);
-            return Ok(None);
-        }
-
-        // Try to get cached content
-        match self.storage.get(cache_key).await {
-            Ok(content) => {
-                // Verify checksum (identical for fresh and stale)
-                let actual_checksum = StorageService::calculate_hash(&content);
-                if actual_checksum != metadata.checksum_sha256 {
-                    if allow_stale {
-                        tracing::warn!(
-                            "Stale cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
-                        );
-                    }
-                    return Ok(None);
-                }
-
-                if allow_stale {
-                    tracing::debug!(
-                        "Stale cache hit for {} (expired at {})",
-                        cache_key,
-                        metadata.expires_at
-                    );
-                } else {
-                    tracing::debug!("Cache hit for {}", cache_key);
-                }
-                Ok(Some((content, metadata.content_type)))
-            }
-            Err(AppError::NotFound(_)) => Ok(None),
-            // B6 (coalescing 502 leak): a transient storage read error here
-            // (e.g. a waiter reading the cache body while the single-flight
-            // leader is mid-write, or a partially-written / poisoned entry)
-            // must NOT bubble out as a raw 502 to every concurrent waiter.
-            // Treat it as a cache miss so the caller re-fetches upstream; the
-            // upstream path then surfaces a clean 2xx (cache repopulated) or a
-            // 503 via `validate_upstream_status` when upstream itself is the
-            // one failing. Surfacing the read error as `Err(e)` made it
-            // `map_proxy_error` -> 502, which is exactly the raw status the
-            // stampede gate rejects. The stale fallback keeps the original
-            // propagate-the-error behavior.
-            Err(e) => {
-                if allow_stale {
-                    Err(e)
-                } else {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        error = %e,
-                        "proxy cache read failed; treating as miss and refetching upstream"
-                    );
-                    Ok(None)
-                }
-            }
-        }
+        self.cache_store
+            .get(cache_key, metadata_key, allow_stale)
+            .await
     }
 
-    /// Load cache metadata from storage
+    /// Load cache metadata from storage.
+    ///
+    /// Thin delegation to [`CacheStore::load_metadata`] (#1618 S7).
     async fn load_cache_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
-        match self.storage.get(metadata_key).await {
-            Ok(data) => {
-                let metadata: CacheMetadata = serde_json::from_slice(&data)?;
-                Ok(Some(metadata))
-            }
-            Err(AppError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.cache_store.load_metadata(metadata_key).await
     }
 
     /// Fetch artifact from upstream URL.
@@ -1672,387 +2565,47 @@ impl ProxyService {
     /// Variant of [`Self::fetch_from_upstream`] that adds an `Accept` header
     /// to both the initial request and the post-token-exchange retry.
     ///
-    /// OCI manifest fetches need this so the upstream registry returns the
-    /// content type the caller actually understands. Without an `Accept`
-    /// header Docker Hub picks a default representation (typically the
-    /// OCI image index for multi-arch images) but other registries respond
-    /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
-    /// Mirroring the client's `Accept` upstream removes that source of
-    /// silent content-type mismatches and the spurious 404s they trigger.
+    /// Thin delegation to [`UpstreamClient::fetch_buffered`] (#1618 S8). The
+    /// buffered path's OCI `Accept` semantics (set on the initial request AND
+    /// re-added on the bearer retry) live there; this signature and every
+    /// external call site are unchanged.
     async fn fetch_from_upstream_with_accept(
         &self,
         url: &str,
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<UpstreamResponse> {
-        tracing::info!(
-            "Fetching artifact from upstream: {} (accept={:?})",
-            url,
-            accept
-        );
-
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self.http_client.get(url);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-        if let Some(accept_value) = accept {
-            request = request.header(ACCEPT, accept_value);
-        }
-
-        let response = request
-            .send()
+        self.upstream_client
+            .fetch_buffered(url, repo_id, accept)
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
-
-        let status = response.status();
-
-        // Handle 401 with bearer token exchange (required by Docker Hub and
-        // other OCI registries, even for anonymous/public pulls).
-        if status == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if challenge.starts_with("Bearer ") {
-                let params = Self::parse_bearer_challenge(&challenge);
-                if let Some(realm) = params.get("realm") {
-                    let scope = params.get("scope").cloned().unwrap_or_default();
-                    let service = params.get("service").cloned().unwrap_or_default();
-
-                    // Validate the realm URL against SSRF rules before making
-                    // any outbound request. A malicious upstream could set
-                    // realm to an internal address.
-                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
-
-                    let token = self
-                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
-                        .await?;
-
-                    // Retry with the bearer token only. The original upstream
-                    // Basic credentials were already forwarded to the token
-                    // endpoint in obtain_bearer_token(); adding them here
-                    // would produce two Authorization headers.
-                    let mut retry_request = self.http_client.get(url).bearer_auth(&token);
-                    if let Some(accept_value) = accept {
-                        retry_request = retry_request.header(ACCEPT, accept_value);
-                    }
-
-                    let retry_response = retry_request.send().await.map_err(|e| {
-                        AppError::Storage(format!(
-                            "Failed to fetch from upstream after token exchange: {}",
-                            e
-                        ))
-                    })?;
-
-                    return Self::read_upstream_response(retry_response, url).await;
-                }
-            }
-
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
-
-        Self::read_upstream_response(response, url).await
-    }
-
-    /// Extract content, content-type, etag, effective URL, and Link header from
-    /// an upstream HTTP response. Callers are responsible for handling 401 before
-    /// invoking.
-    async fn read_upstream_response(
-        response: reqwest::Response,
-        url: &str,
-    ) -> Result<UpstreamResponse> {
-        let status = response.status();
-        let effective_url = response.url().to_string();
-
-        // Centralise the 404/4xx/5xx classification through
-        // `validate_upstream_status` (#1445) so the buffered fetch path
-        // gets the same 5xx -> ServiceUnavailable mapping the streaming
-        // path does. Previously this inlined a "non-2xx -> Storage" rule
-        // that surfaced raw upstream 502/503/504 to clients as 502.
-        validate_upstream_status(status, url)?;
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let link = response
-            .headers()
-            .get("link")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let content = response
-            .bytes()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
-
-        tracing::info!(
-            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
-            content.len(),
-            content_type,
-            etag,
-            link
-        );
-
-        Ok(UpstreamResponse {
-            content,
-            content_type,
-            etag,
-            effective_url,
-            link,
-        })
     }
 
     /// Streaming variant of [`Self::fetch_from_upstream`] used by the
     /// proxy slow path (#895). Returns the upstream body as a stream of
     /// `Bytes` chunks instead of buffering the whole body into memory.
-    /// Used by the OOM-mitigation path that tees the upstream stream
-    /// simultaneously to the client and to the storage cache.
     ///
-    /// Auth handling (Basic + OCI bearer token exchange) mirrors the
-    /// buffered variant; only the body extraction differs.
+    /// Thin delegation to [`UpstreamClient::fetch_stream`] (#1618 S8). The
+    /// streaming path deliberately sets NO `Accept` header (the intentional
+    /// asymmetry with the buffered path); that decision lives there.
     async fn fetch_from_upstream_streaming(
         &self,
         url: &str,
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
-        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
-
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self.http_client.get(url);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
-
-        let status = response.status();
-
-        if status == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if challenge.starts_with("Bearer ") {
-                let params = Self::parse_bearer_challenge(&challenge);
-                if let Some(realm) = params.get("realm") {
-                    let scope = params.get("scope").cloned().unwrap_or_default();
-                    let service = params.get("service").cloned().unwrap_or_default();
-                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
-                    let token = self
-                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
-                        .await?;
-                    let retry_request = self.http_client.get(url).bearer_auth(&token);
-                    let retry_response = retry_request.send().await.map_err(|e| {
-                        AppError::Storage(format!(
-                            "Failed to fetch from upstream after token exchange: {}",
-                            e
-                        ))
-                    })?;
-                    return Self::read_upstream_response_streaming(retry_response, url);
-                }
-            }
-
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
-
-        Self::read_upstream_response_streaming(response, url)
-    }
-
-    /// Stream the upstream HTTP response body without buffering. Mirrors
-    /// the shape of [`Self::read_upstream_response`] but returns the body
-    /// as a stream. Status/header validation happens up front; the
-    /// stream itself yields one [`Bytes`] chunk per `reqwest` body
-    /// frame.
-    fn read_upstream_response_streaming(
-        response: reqwest::Response,
-        url: &str,
-    ) -> Result<UpstreamStream> {
-        validate_upstream_status(response.status(), url)?;
-        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
-
-        let body = response.bytes_stream().map(|r| {
-            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
-        });
-
-        Ok(UpstreamStream {
-            body: Box::pin(body),
-            content_type,
-            etag,
-            content_length,
-        })
-    }
-
-    /// Obtain a bearer token for an OCI registry, using the in-memory cache
-    /// when possible.
-    async fn obtain_bearer_token(
-        &self,
-        realm: &str,
-        service: &str,
-        scope: &str,
-        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
-    ) -> Result<String> {
-        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
-
-        if let Some(token) = self.get_cached_token(&cache_key).await {
-            return Ok(token);
-        }
-
-        // Build token request URL with query parameters.
-        let token_url = {
-            let mut parts = Vec::new();
-            if !service.is_empty() {
-                parts.push(format!("service={}", urlencoding::encode(service)));
-            }
-            if !scope.is_empty() {
-                parts.push(format!("scope={}", urlencoding::encode(scope)));
-            }
-            if parts.is_empty() {
-                realm.to_string()
-            } else {
-                let sep = if realm.contains('?') { "&" } else { "?" };
-                format!("{}{}{}", realm, sep, parts.join("&"))
-            }
-        };
-        let mut token_request = self.http_client.get(&token_url);
-
-        // Forward configured Basic credentials for private registries.
-        if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
-            username,
-            password,
-        }) = upstream_auth
-        {
-            token_request = token_request.basic_auth(username, Some(password));
-        }
-
-        tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
-
-        let token_response = token_request.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to request bearer token from {}: {}",
-                realm, e
-            ))
-        })?;
-
-        if !token_response.status().is_success() {
-            return Err(AppError::Storage(format!(
-                "Token endpoint {} returned status {}",
-                realm,
-                token_response.status()
-            )));
-        }
-
-        let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to parse token response from {}: {}",
-                realm, e
-            ))
-        })?;
-
-        let token = body
-            .token
-            .or(body.access_token)
-            .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
-
-        // Cap TTL to prevent overflow and unreasonably long cache entries.
-        let ttl = body
-            .expires_in
-            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
-            .min(MAX_TOKEN_TTL_SECS);
-
-        // Cache the token, evicting expired entries to prevent unbounded growth.
-        {
-            let mut cache = self.token_cache.write().await;
-            cache.retain(|_, (_, created_at, entry_ttl)| {
-                created_at.elapsed() < Duration::from_secs(*entry_ttl)
-            });
-            cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
-        }
-
-        Ok(token)
-    }
-
-    /// Return a cached bearer token if present and not expired.
-    async fn get_cached_token(&self, cache_key: &str) -> Option<String> {
-        let cache = self.token_cache.read().await;
-        let (token, created_at, ttl_secs) = cache.get(cache_key)?;
-        if created_at.elapsed() < Duration::from_secs(ttl_secs.saturating_mul(9) / 10) {
-            Some(token.clone())
-        } else {
-            None
-        }
+        self.upstream_client.fetch_stream(url, repo_id).await
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
     /// header into a map of key-value pairs.
+    ///
+    /// Thin delegation to [`UpstreamClient::parse_bearer_challenge`] (#1618 S8);
+    /// retained on `ProxyService` so the existing bearer-challenge-parse unit
+    /// tests keep calling `ProxyService::parse_bearer_challenge` unchanged.
+    /// The runtime callers now use [`UpstreamClient::parse_bearer_challenge`]
+    /// directly, so this wrapper exists only for the test oracle.
+    #[cfg(test)]
     fn parse_bearer_challenge(header: &str) -> HashMap<String, String> {
-        let mut params = HashMap::new();
-        let bearer_params = match header.strip_prefix("Bearer ") {
-            Some(p) => p,
-            None => return params,
-        };
-
-        let mut remaining = bearer_params.trim();
-        while !remaining.is_empty() {
-            let eq_pos = match remaining.find('=') {
-                Some(p) => p,
-                None => break,
-            };
-            let key = remaining[..eq_pos].trim().to_lowercase();
-            remaining = remaining[eq_pos + 1..].trim();
-
-            let value;
-            if remaining.starts_with('"') {
-                remaining = &remaining[1..];
-                let end = remaining.find('"').unwrap_or(remaining.len());
-                value = remaining[..end].to_string();
-                remaining = if end + 1 < remaining.len() {
-                    remaining[end + 1..].trim_start_matches(',').trim()
-                } else {
-                    ""
-                };
-            } else {
-                let end = remaining.find(',').unwrap_or(remaining.len());
-                value = remaining[..end].trim().to_string();
-                remaining = if end < remaining.len() {
-                    remaining[end + 1..].trim()
-                } else {
-                    ""
-                };
-            }
-
-            params.insert(key, value);
-        }
-
-        params
+        UpstreamClient::parse_bearer_challenge(header)
     }
 
     /// Cache artifact content and metadata, and record the artifact in the
@@ -2069,95 +2622,52 @@ impl ProxyService {
         repository_id: Uuid,
         artifact_path: &str,
     ) -> Result<()> {
-        // #1365: never cache a zero-byte body on the buffered path either.
-        // An empty upstream response (204 / empty 200) must not become a
-        // fresh cache entry that a later request serves as
-        // `Content-Length: 0`. Skip the write entirely so the next request
-        // refetches from upstream; the caller treats a cache miss as the
-        // normal path. The streaming sibling `tee_upstream_to_cache` applies
-        // the same guard after `put_stream`.
-        if content.is_empty() {
-            tracing::warn!(
-                cache_key = %cache_key,
-                "proxy upstream returned an empty body; not caching the zero-byte \
-                 object so the next request refetches upstream"
-            );
-            return Ok(());
+        self.cache_persister
+            .write_buffered(
+                cache_key,
+                metadata_key,
+                content,
+                content_type,
+                etag,
+                ttl_secs,
+                repository_id,
+                artifact_path,
+            )
+            .await
+    }
+
+    /// Emit a structured warning when a brand-new artifact is cached from
+    /// upstream through a repository that has `scan_on_proxy` enabled.
+    ///
+    /// See [`should_warn_proxy_scan_skipped`] for the rationale (#1274):
+    /// scan-on-proxy is not yet wired to the scanner pipeline because
+    /// proxy-cached items are deliberately absent from the `artifacts`
+    /// table (#1278). This makes the no-op observable instead of silent.
+    ///
+    /// Best-effort: a failure to read the scan config never affects the
+    /// proxy fetch. Called only on the new-cache path, never on cache hits.
+    ///
+    /// Reads the `scan_on_proxy` flag directly from `scan_configs` (mirrors
+    /// `ScanConfigService::is_proxy_scan_enabled`) so `ProxyService` does not
+    /// need a service handle on the hot cache-write path. A read failure or
+    /// missing config row degrades to `false` (no warning); the decision and
+    /// message are produced by the unit-tested pure
+    /// [`proxy_scan_skipped_warning`]. `newly_cached = true` because this is
+    /// only invoked on the new-cache path.
+    async fn warn_if_proxy_scan_unsupported(&self, repository_id: Uuid, artifact_path: &str) {
+        let proxy_scan_enabled = sqlx::query_scalar!(
+            r#"SELECT scan_on_proxy FROM scan_configs WHERE repository_id = $1"#,
+            repository_id
+        )
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+
+        if let Some(message) = proxy_scan_skipped_warning(proxy_scan_enabled, true, artifact_path) {
+            tracing::warn!(repository_id = %repository_id, "{}", message);
         }
-
-        // Calculate checksum
-        let checksum = StorageService::calculate_hash(content);
-
-        // Store content first so we can read the backend's ETag back for
-        // the integrity-revalidation pin (#1051).
-        self.storage.put(cache_key, content.clone()).await?;
-
-        // Best-effort: capture the backend's ETag right after the PUT so
-        // the fast path can re-HEAD on each hit and reject tampered or
-        // replaced objects. See [`pin_storage_etag`] for the failure
-        // semantics; a failure here only disables revalidation for this
-        // entry, the cache write itself still succeeds.
-        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
-
-        // Create metadata
-        let now = Utc::now();
-        let metadata = CacheMetadata {
-            cached_at: now,
-            upstream_etag: etag,
-            storage_etag,
-            expires_at: now + chrono::Duration::seconds(ttl_secs),
-            content_type,
-            size_bytes: content.len() as i64,
-            checksum_sha256: checksum.clone(),
-        };
-
-        // Store metadata
-        let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
-            .put(metadata_key, Bytes::from(metadata_json))
-            .await?;
-
-        // Proxy-cached content is intentionally NOT recorded in the
-        // `artifacts` table (issue #1278). The previous behaviour inserted
-        // a row with `storage_key = "proxy-cache/<repo_key>/<path>/__content__"`
-        // alongside the global-backend write above, which caused every
-        // subsequent format-handler read to take the
-        // `state.storage_for_repo(repo.storage_location()).get(&artifact.storage_key)`
-        // path -- a per-repo `FilesystemStorage` rooted at
-        // `repo.storage_path` that resolves to a doubled-prefix path
-        // (`<repo.storage_path>/proxy-cache/<repo_key>/...`) and returned
-        // `NotFound` (HTTP 500) on every cache hit after the first. S3 /
-        // object-store backends were unaffected because their registry
-        // shares the same instance regardless of `location.path`.
-        //
-        // The cached body and metadata sidecar are still on disk under
-        // `self.storage` (the global default). The format-handler hot path
-        // already checks the proxy cache via `proxy_check_cache`
-        // (`get_cached_artifact_by_path` -> `self.storage.get`) BEFORE
-        // falling through to the upstream fetch, so cache hits are served
-        // through that path with no `artifacts` row needed. Reads through
-        // the global backend match the writes above.
-        //
-        // Tradeoff: proxy-cached items no longer surface in the
-        // repository `GET /api/v1/repositories/{key}/artifacts` listing or
-        // counted toward `storage_used_bytes`. That UX/accounting gap is
-        // tracked separately; correctness (no more 500s on cached reads)
-        // is the immediate fix for v1.2.0-rc.2. Existing rows from prior
-        // versions stay in `artifacts` and continue to surface in
-        // listings until they are explicitly invalidated, which is a
-        // graceful degradation, not a regression.
-        let _ = repository_id;
-        let _ = artifact_path;
-        let _ = checksum;
-
-        tracing::debug!(
-            "Cached artifact {} ({} bytes, expires at {})",
-            cache_key,
-            content.len(),
-            metadata.expires_at
-        );
-
-        Ok(())
     }
 
     /// Attempt to retrieve a cached artifact even if it has expired.
@@ -2175,68 +2685,18 @@ impl ProxyService {
         self.get_cached(cache_key, metadata_key, true).await
     }
 
-    /// Check if upstream ETag has changed (returns true if changed/newer)
+    /// Check if upstream ETag has changed (returns true if changed/newer).
+    ///
+    /// Thin delegation to [`UpstreamClient::check_etag_changed`] (#1618 S8).
     async fn check_etag_changed(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self
-            .http_client
-            .head(url)
-            .header(IF_NONE_MATCH, cached_etag);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
-        })?;
-
-        match response.status() {
-            StatusCode::NOT_MODIFIED => {
-                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
-                Ok(false)
-            }
-            StatusCode::OK => {
-                // Check if ETag in response differs
-                let new_etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok());
-
-                match new_etag {
-                    Some(etag) if etag == cached_etag => {
-                        tracing::debug!("Upstream ETag unchanged for {}", url);
-                        Ok(false)
-                    }
-                    _ => {
-                        tracing::debug!("Upstream has newer content for {}", url);
-                        Ok(true)
-                    }
-                }
-            }
-            StatusCode::UNAUTHORIZED => {
-                // OCI registries require bearer token exchange even for HEAD
-                // requests. Rather than duplicating the token exchange here,
-                // treat this as "needs re-fetch" and let fetch_from_upstream
-                // handle the full 401 flow on the next access.
-                tracing::debug!(
-                    "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
-                    url
-                );
-                Ok(true)
-            }
-            status => {
-                tracing::warn!(
-                    "Unexpected status {} checking upstream {}, assuming changed",
-                    status,
-                    url
-                );
-                Ok(true)
-            }
-        }
+        self.upstream_client
+            .check_etag_changed(url, cached_etag, repo_id)
+            .await
     }
 }
 
@@ -2336,6 +2796,57 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // should_warn_proxy_scan_skipped — scan-on-proxy gap warning gate (#1274)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_scan_warns_only_when_enabled_and_newly_cached() {
+        // The exact condition the warning fires on: setting enabled AND a
+        // brand-new cache entry was created from upstream.
+        assert!(should_warn_proxy_scan_skipped(true, true));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_when_disabled() {
+        // scan_on_proxy off => never warn, even on a fresh cache write.
+        assert!(!should_warn_proxy_scan_skipped(false, true));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_on_cache_hit() {
+        // A plain cache hit (nothing newly cached) must not warn on every
+        // request, even with the setting enabled.
+        assert!(!should_warn_proxy_scan_skipped(true, false));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_when_disabled_and_cache_hit() {
+        assert!(!should_warn_proxy_scan_skipped(false, false));
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_includes_path_and_issue_refs() {
+        let msg = proxy_scan_skipped_warning(true, true, "react/-/react-18.2.0.tgz")
+            .expect("warning must be produced when enabled + newly cached");
+        // Operators grep/alert on these tokens; pin them.
+        assert!(msg.contains("scan_on_proxy is enabled"));
+        assert!(msg.contains("#1274"));
+        assert!(msg.contains("#1278"));
+        assert!(msg.contains("UNSCANNED"));
+        assert!(msg.contains("react/-/react-18.2.0.tgz"));
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_none_when_disabled() {
+        assert!(proxy_scan_skipped_warning(false, true, "any/path").is_none());
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_none_on_cache_hit() {
+        assert!(proxy_scan_skipped_warning(true, false, "any/path").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
@@ -4716,6 +5227,21 @@ SHA256:
         ))
     }
 
+    /// Test shim that preserves the original `tee_upstream_to_cache` free-fn
+    /// call shape (#1618 S9 moved the body into [`CachePersister::tee_stream`]).
+    /// Constructs a `CachePersister` over the given storage and delegates, so
+    /// the established streaming-tee tests keep their `(upstream, storage, …)`
+    /// signature unchanged.
+    fn tee_upstream_to_cache(
+        upstream: BoxStream<'static, Result<Bytes>>,
+        storage: Arc<StorageService>,
+        cache_key: String,
+        metadata_key: String,
+        template: CacheMetadataTemplate,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        CachePersister::new(storage).tee_stream(upstream, cache_key, metadata_key, template)
+    }
+
     fn template() -> CacheMetadataTemplate {
         CacheMetadataTemplate {
             content_type: Some("application/octet-stream".to_string()),
@@ -5079,6 +5605,160 @@ SHA256:
         assert!(
             metadata.storage_etag.is_none(),
             "no backend ETag means no pin, preserving pre-#1051 fast-path semantics"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CachePersister::write_buffered (#1618 S9): the buffered write-to-cache
+    // path. Recording backend captures every `put` in order so a test can
+    // assert the body→sidecar write ordering, the #1051 ETag pin, and the
+    // #1365 zero-byte guard without a real storage backend.
+    // -----------------------------------------------------------------------
+
+    /// Records every `put(key, body)` in call order and surfaces a
+    /// configurable `head_etag`. Shared by the buffered-path tests below so
+    /// they do not each re-implement a stub backend (jscpd).
+    struct BufferedRecordingBackend {
+        puts: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        etag: Option<String>,
+    }
+
+    impl BufferedRecordingBackend {
+        fn new(etag: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                puts: tokio::sync::Mutex::new(Vec::new()),
+                etag: etag.map(|s| s.to_string()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for BufferedRecordingBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.puts.lock().await.push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound("n/a".into()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(self.etag.clone())
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _p: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _s: &str, _d: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _k: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            _stream: ServiceBoxStream<'static, Result<Bytes>>,
+        ) -> Result<ServicePutStreamResult> {
+            unreachable!("buffered path does not call put_stream")
+        }
+    }
+
+    /// Run `write_buffered` against a recording backend and return the
+    /// recorded `put` calls. Keeps the per-test setup in one place.
+    async fn run_write_buffered(
+        backend: Arc<BufferedRecordingBackend>,
+        content: &Bytes,
+        etag: Option<String>,
+    ) -> Vec<(String, Bytes)> {
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let persister = CachePersister::new(storage);
+        persister
+            .write_buffered(
+                "proxy-cache/repo/path/__content__",
+                "proxy-cache/repo/path/__cache_meta__.json",
+                content,
+                Some("application/octet-stream".to_string()),
+                etag,
+                3600,
+                Uuid::nil(),
+                "repo/path",
+            )
+            .await
+            .expect("write_buffered should succeed");
+        backend.puts.lock().await.clone()
+    }
+
+    /// Happy path: body is written FIRST, then the sidecar (#1618 S9 write
+    /// ordering). The sidecar carries the correct size, checksum, content
+    /// type, upstream etag, and the #1051 pinned storage ETag.
+    #[tokio::test]
+    async fn test_write_buffered_writes_body_then_sidecar_and_pins_etag() {
+        let backend = BufferedRecordingBackend::new(Some("\"backend-etag\""));
+        let body = Bytes::from_static(b"hello world");
+        let puts = run_write_buffered(backend, &body, Some("\"upstream-etag\"".to_string())).await;
+
+        assert_eq!(puts.len(), 2, "exactly one body put and one sidecar put");
+        // #1618 S9: content object first.
+        assert_eq!(puts[0].0, "proxy-cache/repo/path/__content__");
+        assert_eq!(puts[0].1.as_ref(), b"hello world");
+        // #1618 S9: sidecar second.
+        assert_eq!(puts[1].0, "proxy-cache/repo/path/__cache_meta__.json");
+
+        let metadata: CacheMetadata =
+            serde_json::from_slice(&puts[1].1).expect("sidecar JSON parseable");
+        assert_eq!(metadata.size_bytes, 11);
+        // SHA-256("hello world") known value:
+        assert_eq!(
+            metadata.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(
+            metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(metadata.upstream_etag.as_deref(), Some("\"upstream-etag\""));
+        // #1051 pin: the backend's post-put ETag is recorded.
+        assert_eq!(metadata.storage_etag.as_deref(), Some("\"backend-etag\""));
+        let ttl_seen = (metadata.expires_at - metadata.cached_at).num_seconds();
+        assert!(
+            (3595..=3605).contains(&ttl_seen),
+            "expected expires_at - cached_at ~= 3600s, got {}s",
+            ttl_seen
+        );
+    }
+
+    /// #1051 fall-through: a backend with no ETag concept (filesystem /
+    /// legacy) leaves `storage_etag = None`, preserving pre-#1051 fast-path
+    /// existence-only revalidation semantics.
+    #[tokio::test]
+    async fn test_write_buffered_leaves_etag_none_when_backend_has_no_etag() {
+        let backend = BufferedRecordingBackend::new(None);
+        let body = Bytes::from_static(b"payload");
+        let puts = run_write_buffered(backend, &body, None).await;
+
+        assert_eq!(puts.len(), 2);
+        let metadata: CacheMetadata = serde_json::from_slice(&puts[1].1).unwrap();
+        assert!(
+            metadata.storage_etag.is_none(),
+            "no backend ETag means no pin (pre-#1051 semantics)"
+        );
+    }
+
+    /// #1618 S9 / #1365: an empty body must NOT be cached on the buffered
+    /// path. No content put, no sidecar put — the next request refetches.
+    #[tokio::test]
+    async fn test_write_buffered_empty_body_is_not_cached() {
+        let backend = BufferedRecordingBackend::new(Some("\"etag\""));
+        let body = Bytes::new();
+        let puts = run_write_buffered(backend, &body, None).await;
+        assert!(
+            puts.is_empty(),
+            "zero-byte body must skip BOTH the content and sidecar writes (#1365)"
         );
     }
 
@@ -6887,5 +7567,819 @@ SHA256:
             matches!(stale.get_cached(BODY_KEY, META_KEY, true).await, Ok(None)),
             "stale: missing body is a miss, not an error"
         );
+    }
+
+    // =======================================================================
+    // UpstreamClient coverage (#1618 S8).
+    //
+    // S8 relocated the upstream-fetch lifecycle (`fetch_buffered`,
+    // `fetch_stream`, `read_upstream_response*`, `exchange_bearer_then`,
+    // `obtain_bearer_token`, `get_cached_token`, `check_etag_changed`) into
+    // `UpstreamClient`. Those network methods load per-repo auth from the DB
+    // before issuing the HTTP request, so the unit tests below drive them end
+    // to end against a `wiremock` upstream with a live `DATABASE_URL` (the
+    // same fixture pattern the rest of this suite uses). They no-op on runners
+    // without a test DB and run in CI's coverage job, which provisions one.
+    //
+    // The `obtain_bearer_token` cache-hit / TTL-cap / eviction decisions and
+    // `get_cached_token` freshness math are pure (no network) and are tested
+    // by constructing an `UpstreamClient` directly and seeding its token cache.
+    // =======================================================================
+
+    /// Build a Remote `Repository` whose `upstream_url` points at `upstream`.
+    /// `repo.id` is random and intentionally absent from the DB: the upstream
+    /// methods only run `load_upstream_auth`, whose query returns no rows
+    /// (`Ok(None)`) for an unknown id and then proceeds to the HTTP request.
+    fn wiremock_remote_repo(key: &str, upstream: &str, storage_path: &str) -> Repository {
+        Repository {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: storage_path.to_string(),
+            upstream_url: Some(upstream.to_string()),
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // -- get_cached_token: pure TTL-freshness decision -----------------------
+
+    #[tokio::test]
+    async fn test_get_cached_token_returns_fresh_entry_within_90pct_ttl() {
+        // A token cached "just now" with a 1000s TTL is well inside the 90%
+        // freshness window and must be returned verbatim.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        {
+            let mut cache = client.token_cache.write().await;
+            cache.insert(
+                "k".to_string(),
+                ("tok-fresh".to_string(), Instant::now(), 1000),
+            );
+        }
+        assert_eq!(
+            client.get_cached_token("k").await.as_deref(),
+            Some("tok-fresh"),
+            "a token inside the 90% TTL window is a cache hit",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_token_treats_aged_entry_past_90pct_as_miss() {
+        // created_at far enough in the past that elapsed() >= ttl*9/10. With a
+        // 10s TTL the window is 9s; backdate the entry by 20s so it is stale.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        {
+            let mut cache = client.token_cache.write().await;
+            let aged = Instant::now()
+                .checked_sub(Duration::from_secs(20))
+                .expect("subtract 20s");
+            cache.insert("k".to_string(), ("tok-old".to_string(), aged, 10));
+        }
+        assert!(
+            client.get_cached_token("k").await.is_none(),
+            "an entry past 90% of its TTL must be treated as a miss",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_token_absent_key_is_miss() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        assert!(client.get_cached_token("nope").await.is_none());
+    }
+
+    // -- obtain_bearer_token: cache hit short-circuit (no network) -----------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_returns_cached_without_network() {
+        // A fresh cache entry under the exact "{realm}\0{service}\0{scope}"
+        // key must short-circuit before any token-endpoint request. The realm
+        // points at an unroutable host so a network attempt would fail the
+        // test; the cache hit makes it never happen.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = "http://127.0.0.1:0/token";
+        let service = "registry.example";
+        let scope = "repository:library/alpine:pull";
+        let key = format!("{}\0{}\0{}", realm, service, scope);
+        {
+            let mut cache = client.token_cache.write().await;
+            cache.insert(key, ("cached-bearer".to_string(), Instant::now(), 1000));
+        }
+        let token = client
+            .obtain_bearer_token(realm, service, scope, &None)
+            .await
+            .expect("cache hit must return Ok without contacting the realm");
+        assert_eq!(token, "cached-bearer");
+    }
+
+    // -- obtain_bearer_token: full token-endpoint exchange via wiremock ------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_exchanges_and_caps_ttl() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Token endpoint echoes a token and an absurd expires_in; the TTL must
+        // be capped at MAX_TOKEN_TTL_SECS by the caching logic.
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("service", "reg.test"))
+            .and(query_param("scope", "repository:img:pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "exchanged-token",
+                "expires_in": 10_000_000u64,
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let token = client
+            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .await
+            .expect("token exchange against a 200 token endpoint must succeed");
+        assert_eq!(token, "exchanged-token");
+
+        // The entry is now cached with the capped TTL, so a second call is a
+        // cache hit (no second request is registered on the mock).
+        let again = client
+            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .await
+            .expect("second call must hit the cache");
+        assert_eq!(again, "exchanged-token");
+
+        let cache = client.token_cache.read().await;
+        let (_, _, ttl) = cache
+            .get(&format!(
+                "{}\0{}\0{}",
+                realm, "reg.test", "repository:img:pull"
+            ))
+            .expect("entry cached");
+        assert_eq!(
+            *ttl, MAX_TOKEN_TTL_SECS,
+            "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_uses_access_token_field_and_default_ttl() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // No `service`/`scope` params -> the token URL is the bare realm. The
+        // response uses the `access_token` alias and omits `expires_in`, so the
+        // default TTL applies.
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "alias-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/realm", server.uri());
+
+        let token = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect("access_token alias must be accepted");
+        assert_eq!(token, "alias-token");
+
+        let cache = client.token_cache.read().await;
+        let (_, _, ttl) = cache
+            .get(&format!("{}\0\0", realm))
+            .expect("entry cached under empty service/scope");
+        assert_eq!(
+            *ttl, DEFAULT_TOKEN_TTL_SECS,
+            "a missing expires_in must fall back to DEFAULT_TOKEN_TTL_SECS",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_errors_on_non_success_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let err = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect_err("a 403 from the token endpoint must surface as an error");
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_errors_when_response_has_no_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "expires_in": 60 })),
+            )
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+
+        let err = client
+            .obtain_bearer_token(&realm, "", "", &None)
+            .await
+            .expect_err("a token response with neither token nor access_token must error");
+        assert!(matches!(err, AppError::Storage(_)));
+    }
+
+    // -- fetch_buffered + read_upstream_response (success / error) -----------
+
+    #[tokio::test]
+    async fn test_fetch_buffered_returns_body_headers_and_etag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("link", "<next>; rel=next")
+                    .set_body_bytes(b"buffered-bytes".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-buf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/pkg/file.bin", server.uri());
+
+        let resp = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .expect("buffered fetch of a 200 upstream must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(&resp.content[..], b"buffered-bytes");
+        assert_eq!(
+            resp.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(resp.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(resp.link.as_deref(), Some("<next>; rel=next"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_buffered_maps_upstream_404_to_error() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/missing", server.uri());
+
+        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            result.is_err(),
+            "a 404 upstream must surface as an error, not a body",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_buffered_maps_upstream_503_to_service_unavailable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-503-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/down", server.uri());
+
+        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let err = result
+            .err()
+            .expect("a 5xx upstream must surface as an error");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "5xx upstream must map to ServiceUnavailable, got {err:?}",
+        );
+    }
+
+    // -- fetch_upstream_direct(+_with_link): drive fetch_buffered + headers --
+
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_returns_effective_url() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/simple/foo/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"<html/>".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-direct-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-direct", &server.uri(), tmp.to_str().unwrap());
+
+        let (body, ct, effective) = proxy
+            .fetch_upstream_direct(&repo, "simple/foo/")
+            .await
+            .expect("direct fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"<html/>");
+        assert_eq!(ct.as_deref(), Some("text/html"));
+        assert!(
+            effective.ends_with("/simple/foo/"),
+            "effective url: {effective}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_with_link_preserves_link_header() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/_catalog"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", "</v2/_catalog?last=z>; rel=\"next\"")
+                    .set_body_bytes(b"{}".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-link-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-link", &server.uri(), tmp.to_str().unwrap());
+
+        let (_body, _ct, link) = proxy
+            .fetch_upstream_direct_with_link(&repo, "v2/_catalog")
+            .await
+            .expect("direct-with-link fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(link.as_deref(), Some("</v2/_catalog?last=z>; rel=\"next\""));
+    }
+
+    // -- fetch_stream + read_upstream_response_streaming ---------------------
+
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_streams_upstream_body_on_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"streamed-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-stream-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-stream", &server.uri(), tmp.to_str().unwrap());
+
+        let result = proxy
+            .fetch_artifact_streaming(&repo, "blob")
+            .await
+            .expect("streaming fetch on a cache miss must succeed");
+        assert_eq!(
+            result.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+
+        let mut collected = Vec::new();
+        let mut body = result.body;
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(collected, b"streamed-body");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_maps_upstream_5xx_to_error() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-stream5xx-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-stream5xx", &server.uri(), tmp.to_str().unwrap());
+
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "blob")
+            .await
+            .err()
+            .expect("a 5xx upstream must fail the streaming fetch");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    // -- exchange_bearer_then: OCI 401 Bearer challenge handling -------------
+    //
+    // The full success path (parse challenge -> validate realm -> token
+    // exchange -> bearer retry) cannot be exercised by a unit test: the only
+    // host a wiremock server binds to is loopback, and loopback is a HARD SSRF
+    // block in `validate_outbound_url` that the `UPSTREAM_ALLOW_PRIVATE_IPS`
+    // toggle does NOT relax (api::validation::is_blocked_ipv4). So the realm
+    // validation inside `exchange_bearer_then` rejects a loopback realm before
+    // any token request. The two tests below pin the branches we CAN reach:
+    //   1. a parseable Bearer challenge whose realm is SSRF-blocked surfaces
+    //      the validation error (covers the parse + realm-extract + validate
+    //      path of `exchange_bearer_then`), and
+    //   2. a 401 that is NOT a Bearer challenge returns `Ok(None)` and the
+    //      caller maps it to the original "upstream error status".
+
+    #[tokio::test]
+    async fn test_buffered_fetch_rejects_ssrf_bearer_realm() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A 401 Bearer challenge whose realm points at a metadata/internal
+        // address. `exchange_bearer_then` must parse the challenge, extract the
+        // realm, and reject it via `validate_outbound_url` BEFORE issuing any
+        // outbound token request (the anti-SSRF guard, #1618 S8 doc).
+        Mock::given(method("GET"))
+            .and(path("/v2/lib/img/manifests/latest"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                "Bearer realm=\"http://169.254.169.254/latest/token\",service=\"reg\",scope=\"pull\"",
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-ssrf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/v2/lib/img/manifests/latest", server.uri());
+
+        let err = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .err()
+            .expect("a Bearer realm pointing at an internal address must be rejected");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "an SSRF-blocked OCI token realm must surface as a validation error, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_fetch_401_without_bearer_challenge_errors() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A 401 whose WWW-Authenticate is NOT a Bearer challenge: exchange
+        // returns Ok(None) and the caller maps it to the original error.
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("www-authenticate", "Basic realm=\"x\""),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-401basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/private", server.uri());
+
+        let err = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4())
+            .await
+            .err()
+            .expect("a non-Bearer 401 must surface as an error");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(matches!(err, AppError::Storage(_)), "{err:?}");
+    }
+
+    // -- check_etag_changed via check_upstream (304 / changed / unchanged) ---
+
+    #[tokio::test]
+    async fn test_check_upstream_etag_304_reports_unchanged() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Seed the cache by fetching once with an ETag.
+        Mock::given(method("GET"))
+            .and(path("/etagged"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"abc\"")
+                    .set_body_bytes(b"body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+        // HEAD revalidation returns 304 Not Modified.
+        Mock::given(method("HEAD"))
+            .and(path("/etagged"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-etag304-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-etag304", &server.uri(), tmp.to_str().unwrap());
+
+        // Prime the cache (writes a metadata sidecar carrying upstream_etag).
+        proxy
+            .fetch_artifact(&repo, "etagged")
+            .await
+            .expect("prime cache");
+
+        let changed = proxy
+            .check_upstream(&repo, "etagged")
+            .await
+            .expect("etag check must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!changed, "a 304 from the HEAD revalidation means unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_check_upstream_etag_changed_when_head_returns_new_etag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/etagged2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"old\"")
+                    .set_body_bytes(b"body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+        // HEAD returns 200 with a different ETag -> changed.
+        Mock::given(method("HEAD"))
+            .and(path("/etagged2"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"new\""))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-etagchg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-etagchg", &server.uri(), tmp.to_str().unwrap());
+
+        proxy
+            .fetch_artifact(&repo, "etagged2")
+            .await
+            .expect("prime cache");
+
+        let changed = proxy
+            .check_upstream(&repo, "etagged2")
+            .await
+            .expect("etag check must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(changed, "a different ETag on the HEAD means changed");
+    }
+
+    // -- fetch_dists_detecting_change: drives buffered fetch + SHA compare ---
+
+    #[tokio::test]
+    async fn test_fetch_dists_detecting_change_reports_changed_on_first_fetch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dists/stable/Release"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"Release: v1".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-dists-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-dists", &server.uri(), tmp.to_str().unwrap());
+
+        let (content, _ct, changed) = proxy
+            .fetch_dists_detecting_change(&repo, "dists/stable/Release")
+            .await
+            .expect("dists fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&content[..], b"Release: v1");
+        assert!(
+            changed,
+            "first fetch with no prior body is always 'changed'"
+        );
+    }
+
+    // -- get_cache_ttl_for_repo: DB lookup with default fallback -------------
+
+    #[tokio::test]
+    async fn test_fetch_artifact_with_cache_path_round_trips_then_serves_from_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // The upstream is only allowed to be hit ONCE: the second request must
+        // be served from the proxy cache, exercising the cache-hit fast path
+        // in fetch_artifact_with_cache_path_and_accept and get_cache_ttl_for_repo.
+        Mock::given(method("GET"))
+            .and(path("/dl/pkg.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/gzip")
+                    .set_body_bytes(b"tarball".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-cachepath-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-cachepath", &server.uri(), tmp.to_str().unwrap());
+
+        let (b1, ct1) = proxy
+            .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
+            .await
+            .expect("first fetch hits upstream and caches");
+        assert_eq!(&b1[..], b"tarball");
+        assert_eq!(ct1.as_deref(), Some("application/gzip"));
+
+        // Second call: upstream mock is exhausted (up_to_n_times(1)); a cache
+        // hit is the only way this can succeed.
+        let (b2, _ct2) = proxy
+            .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
+            .await
+            .expect("second fetch must be served from the proxy cache");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
+    }
+
+    // -- parse_bearer_challenge: unquoted-value and trailing branches --------
+
+    #[test]
+    fn test_parse_bearer_challenge_unquoted_values() {
+        // Unquoted, comma-separated params exercise the else-branch that reads
+        // up to the next comma (lines around the unquoted-value path).
+        let params = UpstreamClient::parse_bearer_challenge(
+            "Bearer realm=https://auth.example/token,service=reg,scope=pull",
+        );
+        assert_eq!(
+            params.get("realm").map(String::as_str),
+            Some("https://auth.example/token")
+        );
+        assert_eq!(params.get("service").map(String::as_str), Some("reg"));
+        assert_eq!(params.get("scope").map(String::as_str), Some("pull"));
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_trailing_key_without_value_breaks() {
+        // A dangling key with no '=' after a valid pair: the loop breaks on the
+        // missing '=' so only the first pair is captured.
+        let params = UpstreamClient::parse_bearer_challenge("Bearer realm=\"r\",dangling");
+        assert_eq!(params.get("realm").map(String::as_str), Some("r"));
+        assert!(!params.contains_key("dangling"));
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_mixed_quoted_then_unquoted_tail() {
+        // Quoted value followed by an unquoted final param (no trailing comma)
+        // covers the `end < remaining.len()` false branch of the unquoted arm.
+        let params =
+            UpstreamClient::parse_bearer_challenge("Bearer realm=\"https://r/\",service=svc");
+        assert_eq!(params.get("realm").map(String::as_str), Some("https://r/"));
+        assert_eq!(params.get("service").map(String::as_str), Some("svc"));
     }
 }
