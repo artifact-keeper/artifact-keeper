@@ -372,11 +372,22 @@ pub struct AcknowledgeRequest {
     pub reason: String,
 }
 
+/// Secure default for `block_unscanned` on policy creation (#1643). When a
+/// client omits the field, a new policy blocks unscanned artifacts by default
+/// rather than silently failing open. Existing policies are untouched (the
+/// migration only changes the column default for future rows; stored values are
+/// not rewritten). Kept defaulted-secure rather than hard-required so IaC and
+/// automation that omit the field stay backward-compatible.
+fn default_block_unscanned() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePolicyRequest {
     pub name: String,
     pub repository_id: Option<Uuid>,
     pub max_severity: String,
+    #[serde(default = "default_block_unscanned")]
     pub block_unscanned: bool,
     pub block_on_fail: bool,
     pub min_staging_hours: Option<i32>,
@@ -1987,6 +1998,36 @@ mod tests {
         assert_eq!(req.repository_id, None);
         assert_eq!(req.min_staging_hours, None);
         assert_eq!(req.max_artifact_age_days, None);
+    }
+
+    #[test]
+    fn test_create_policy_request_block_unscanned_defaults_true_when_omitted() {
+        // #1643: omitting block_unscanned must default to true (secure default),
+        // not deserialize-fail or fall open to false. Backward-compatible for
+        // IaC/automation that does not send the field.
+        let json = serde_json::json!({
+            "name": "no-toggle",
+            "max_severity": "high",
+            "block_on_fail": false,
+        });
+        let req: CreatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert!(
+            req.block_unscanned,
+            "omitted block_unscanned must default to true (#1643)"
+        );
+    }
+
+    #[test]
+    fn test_create_policy_request_explicit_false_is_respected() {
+        // An operator who explicitly opts out must still be able to.
+        let json = serde_json::json!({
+            "name": "opt-out",
+            "max_severity": "high",
+            "block_unscanned": false,
+            "block_on_fail": false,
+        });
+        let req: CreatePolicyRequest = serde_json::from_value(json).unwrap();
+        assert!(!req.block_unscanned);
     }
 
     #[test]
