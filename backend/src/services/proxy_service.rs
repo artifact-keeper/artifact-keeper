@@ -797,15 +797,7 @@ impl ProxyService {
         cache_path: &str,
         accept: Option<&str>,
     ) -> Result<(Bytes, Option<String>)> {
-        if repo.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "Proxy operations only supported for remote repositories".to_string(),
-            ));
-        }
-
-        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
-            AppError::Config("Remote repository missing upstream_url".to_string())
-        })?;
+        let upstream_url = Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
@@ -921,15 +913,7 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<StreamingFetchResult> {
-        if repo.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "Proxy operations only supported for remote repositories".to_string(),
-            ));
-        }
-
-        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
-            AppError::Config("Remote repository missing upstream_url".to_string())
-        })?;
+        let upstream_url = Self::remote_target(repo)?;
 
         let cache_key = Self::cache_storage_key(&repo.key, path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
@@ -995,15 +979,7 @@ impl ProxyService {
     /// Returns true if upstream has newer content or cache is expired.
     pub async fn check_upstream(&self, repo: &Repository, path: &str) -> Result<bool> {
         // Validate repository type
-        if repo.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "Proxy operations only supported for remote repositories".to_string(),
-            ));
-        }
-
-        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
-            AppError::Config("Remote repository missing upstream_url".to_string())
-        })?;
+        let upstream_url = Self::remote_target(repo)?;
 
         let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
@@ -1043,15 +1019,7 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, String)> {
-        if repo.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "Proxy operations only supported for remote repositories".to_string(),
-            ));
-        }
-
-        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
-            AppError::Config("Remote repository missing upstream_url".to_string())
-        })?;
+        let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
         let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
@@ -1068,15 +1036,7 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, Option<String>)> {
-        if repo.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "Proxy operations only supported for remote repositories".to_string(),
-            ));
-        }
-
-        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
-            AppError::Config("Remote repository missing upstream_url".to_string())
-        })?;
+        let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
         let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
@@ -1405,6 +1365,26 @@ impl ProxyService {
             }
             _ => DEFAULT_CACHE_TTL_SECS,
         }
+    }
+
+    /// Validate that `repo` is a remote proxy and return its upstream URL.
+    ///
+    /// Performs the two checks shared by every proxy fetch/check method, in
+    /// order: the repository must be a [`RepositoryType::Remote`] (otherwise
+    /// [`AppError::Validation`]), and it must have an `upstream_url`
+    /// (otherwise [`AppError::Config`]). The returned `&str` borrows from
+    /// `repo`, so it stays valid across the `.await` points inside the
+    /// hydration closures that use it.
+    fn remote_target(repo: &Repository) -> Result<&str> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "Proxy operations only supported for remote repositories".to_string(),
+            ));
+        }
+
+        repo.upstream_url
+            .as_deref()
+            .ok_or_else(|| AppError::Config("Remote repository missing upstream_url".to_string()))
     }
 
     /// Build full upstream URL for an artifact path.
@@ -6390,6 +6370,47 @@ SHA256:
             curation_auto_fetch: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_remote_target_returns_borrowed_upstream_for_remote_repo() {
+        let repo = remote_repo_for(
+            "maven-proxy",
+            "https://repo.maven.apache.org/maven2",
+            "/tmp/x",
+        );
+        let url = ProxyService::remote_target(&repo).expect("remote repo with upstream is valid");
+        assert_eq!(url, "https://repo.maven.apache.org/maven2");
+    }
+
+    #[test]
+    fn test_remote_target_rejects_non_remote_repo() {
+        let mut repo = remote_repo_for("local", "https://example.com", "/tmp/x");
+        repo.repo_type = RepositoryType::Local;
+        let err = ProxyService::remote_target(&repo).expect_err("non-remote repo must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert_eq!(
+                    msg,
+                    "Proxy operations only supported for remote repositories"
+                );
+            }
+            other => panic!("expected AppError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remote_target_rejects_remote_repo_missing_upstream() {
+        let mut repo = remote_repo_for("no-upstream", "https://example.com", "/tmp/x");
+        repo.upstream_url = None;
+        let err =
+            ProxyService::remote_target(&repo).expect_err("missing upstream_url must be rejected");
+        match err {
+            AppError::Config(msg) => {
+                assert_eq!(msg, "Remote repository missing upstream_url");
+            }
+            other => panic!("expected AppError::Config, got {other:?}"),
         }
     }
 
