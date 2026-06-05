@@ -259,6 +259,58 @@ fn extract_streaming_headers(
     (content_type, etag, content_length)
 }
 
+/// Decide whether to emit a "scan-on-proxy is configured but did not run"
+/// warning for a freshly cached upstream artifact.
+///
+/// Background (#1274): the `scan_on_proxy` per-repo flag exists in
+/// `scan_configs` and is surfaced in the UI, but the security scanner
+/// pipeline operates exclusively on rows in the `artifacts` table
+/// (`scan_results.artifact_id` is `NOT NULL REFERENCES artifacts(id)`,
+/// migration 022:21). Proxy-cached content is intentionally NOT recorded
+/// in `artifacts` (#1278, enforced by the `cache_artifact` meta-test), so
+/// there is no row to scan and nowhere to persist a `scan_results` record.
+/// A real scan-on-proxy implementation needs a dedicated proxy-cache
+/// artifact model and is tracked for v1.3.0.
+///
+/// Until that lands, the worst failure mode is *silent*: an operator
+/// enables "Scan on Proxy", pulls packages, sees zero scans, and assumes
+/// they are protected. This helper drives a loud, structured warning so
+/// the gap is observable in logs/alerts instead of being invisible.
+///
+/// Returns `true` only when scan-on-proxy is enabled for the repo AND the
+/// cache write actually created a new entry (`newly_cached`). A plain
+/// cache hit re-serves already-cached bytes and must not log on every
+/// request; a failed/empty cache write (`newly_cached == false`) created
+/// nothing to warn about.
+pub(crate) fn should_warn_proxy_scan_skipped(proxy_scan_enabled: bool, newly_cached: bool) -> bool {
+    proxy_scan_enabled && newly_cached
+}
+
+/// Build the operator-facing message for the scan-on-proxy gap (#1274), or
+/// `None` when no warning is warranted.
+///
+/// Returns `Some(message)` only when [`should_warn_proxy_scan_skipped`] is
+/// true. Pulling both the gate decision and the message text into one pure
+/// function keeps the async wrapper trivial and lets the wording (which an
+/// operator may grep for or alert on) be asserted directly in unit tests.
+pub(crate) fn proxy_scan_skipped_warning(
+    proxy_scan_enabled: bool,
+    newly_cached: bool,
+    artifact_path: &str,
+) -> Option<String> {
+    if !should_warn_proxy_scan_skipped(proxy_scan_enabled, newly_cached) {
+        return None;
+    }
+    Some(format!(
+        "scan_on_proxy is enabled for this repository but proxied artifacts are not \
+         yet scanned (#1274): the security scanner operates on the `artifacts` table \
+         and proxy-cached content is not recorded there (#1278). The artifact '{}' \
+         was cached UNSCANNED. Run a manual scan or host the package instead of \
+         proxying it if a scan is required.",
+        artifact_path
+    ))
+}
+
 /// Tee an upstream byte stream into a returned client stream AND a
 /// background storage writer that populates the proxy cache. The
 /// returned stream yields the same chunks the upstream produced, in
@@ -1695,6 +1747,12 @@ impl ProxyService {
                                 "proxy cache write failed after successful upstream fetch; \
                                  serving fetched bytes and leaving cache to self-heal on next request"
                             );
+                        } else {
+                            // New artifact cached from upstream: surface the
+                            // scan-on-proxy gap (#1274) so an enabled-but-
+                            // unimplemented setting fails loudly, not silently.
+                            self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
+                                .await;
                         }
 
                         Ok((resp.content, resp.content_type))
@@ -1795,6 +1853,13 @@ impl ProxyService {
             .await?;
 
         let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+
+        // Cache miss + successful upstream fetch: a new artifact is being
+        // cached. Surface the scan-on-proxy gap (#1274) before teeing to
+        // the background cache writer so an enabled-but-unimplemented
+        // setting is observable in logs rather than silently doing nothing.
+        self.warn_if_proxy_scan_unsupported(repo.id, path).await;
+
         let body = tee_upstream_to_cache(
             upstream.body,
             self.storage.clone(),
@@ -2487,6 +2552,40 @@ impl ProxyService {
             .await
     }
 
+    /// Emit a structured warning when a brand-new artifact is cached from
+    /// upstream through a repository that has `scan_on_proxy` enabled.
+    ///
+    /// See [`should_warn_proxy_scan_skipped`] for the rationale (#1274):
+    /// scan-on-proxy is not yet wired to the scanner pipeline because
+    /// proxy-cached items are deliberately absent from the `artifacts`
+    /// table (#1278). This makes the no-op observable instead of silent.
+    ///
+    /// Best-effort: a failure to read the scan config never affects the
+    /// proxy fetch. Called only on the new-cache path, never on cache hits.
+    ///
+    /// Reads the `scan_on_proxy` flag directly from `scan_configs` (mirrors
+    /// `ScanConfigService::is_proxy_scan_enabled`) so `ProxyService` does not
+    /// need a service handle on the hot cache-write path. A read failure or
+    /// missing config row degrades to `false` (no warning); the decision and
+    /// message are produced by the unit-tested pure
+    /// [`proxy_scan_skipped_warning`]. `newly_cached = true` because this is
+    /// only invoked on the new-cache path.
+    async fn warn_if_proxy_scan_unsupported(&self, repository_id: Uuid, artifact_path: &str) {
+        let proxy_scan_enabled = sqlx::query_scalar!(
+            r#"SELECT scan_on_proxy FROM scan_configs WHERE repository_id = $1"#,
+            repository_id
+        )
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+
+        if let Some(message) = proxy_scan_skipped_warning(proxy_scan_enabled, true, artifact_path) {
+            tracing::warn!(repository_id = %repository_id, "{}", message);
+        }
+    }
+
     /// Attempt to retrieve a cached artifact even if it has expired.
     /// Used as a fallback when upstream is unavailable.
     ///
@@ -2613,6 +2712,57 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // should_warn_proxy_scan_skipped — scan-on-proxy gap warning gate (#1274)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_scan_warns_only_when_enabled_and_newly_cached() {
+        // The exact condition the warning fires on: setting enabled AND a
+        // brand-new cache entry was created from upstream.
+        assert!(should_warn_proxy_scan_skipped(true, true));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_when_disabled() {
+        // scan_on_proxy off => never warn, even on a fresh cache write.
+        assert!(!should_warn_proxy_scan_skipped(false, true));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_on_cache_hit() {
+        // A plain cache hit (nothing newly cached) must not warn on every
+        // request, even with the setting enabled.
+        assert!(!should_warn_proxy_scan_skipped(true, false));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_when_disabled_and_cache_hit() {
+        assert!(!should_warn_proxy_scan_skipped(false, false));
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_includes_path_and_issue_refs() {
+        let msg = proxy_scan_skipped_warning(true, true, "react/-/react-18.2.0.tgz")
+            .expect("warning must be produced when enabled + newly cached");
+        // Operators grep/alert on these tokens; pin them.
+        assert!(msg.contains("scan_on_proxy is enabled"));
+        assert!(msg.contains("#1274"));
+        assert!(msg.contains("#1278"));
+        assert!(msg.contains("UNSCANNED"));
+        assert!(msg.contains("react/-/react-18.2.0.tgz"));
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_none_when_disabled() {
+        assert!(proxy_scan_skipped_warning(false, true, "any/path").is_none());
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_none_on_cache_hit() {
+        assert!(proxy_scan_skipped_warning(true, false, "any/path").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
