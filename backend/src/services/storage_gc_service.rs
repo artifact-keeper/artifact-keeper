@@ -101,6 +101,68 @@ pub struct StorageGcResult {
     pub errors: Vec<String>,
 }
 
+/// Default grace window (hours) used to classify "recent" OCI blobs in the
+/// reclaimable report. A blob younger than this is excluded from the
+/// `aged_*` figures because its parent manifest push may still be in
+/// flight (the upload writes the `oci_blobs` row before the manifest that
+/// references it commits). This mirrors the grace-window guard that the
+/// future blob GC sweep will use, but here it only affects *reporting* —
+/// nothing is ever deleted by this path.
+pub const BLOB_REPORT_GRACE_HOURS_DEFAULT: i64 = 24;
+
+/// Per-repository row in the OCI blob footprint report.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct OciBlobRepoFootprint {
+    /// Repository id owning these `oci_blobs` rows.
+    pub repository_id: Uuid,
+    /// Number of `oci_blobs` rows attributed to this repository.
+    pub blob_rows: i64,
+    /// Sum of `oci_blobs.size_bytes` for this repository's rows. Because OCI
+    /// blob storage is content-addressed and deduplicated across repos, the
+    /// same physical bytes can be counted under more than one repository
+    /// here; see [`OciBlobFootprintReport::physical_bytes`] for the
+    /// dedup-aware total.
+    pub logical_bytes: i64,
+}
+
+/// Read-only OCI blob storage footprint report (issue #1408).
+///
+/// This is a **reporting-only** view. It performs no deletion and takes no
+/// locks. It surfaces how much storage the tracked `oci_blobs` rows
+/// account for so operators can see the magnitude of un-reclaimed blob
+/// layers before any garbage-collection mechanism is enabled.
+///
+/// It deliberately does NOT attempt to classify which blobs are
+/// "reclaimable orphans": that requires a manifest -> blob reference table
+/// that does not yet exist in the schema, and any per-`(repository_id,
+/// digest)` orphan heuristic would mis-handle the cross-repo dedup case
+/// (multiple `oci_blobs` rows, one physical object) and report in-use
+/// blobs as reclaimable. The numbers here are exact aggregates only.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct OciBlobFootprintReport {
+    /// Total number of `oci_blobs` rows across all repositories.
+    pub total_blob_rows: i64,
+    /// Number of distinct blob digests (content-addressed identities). When
+    /// this is smaller than `total_blob_rows`, the difference is cross-repo
+    /// deduplication: rows that share one physical storage object.
+    pub distinct_digests: i64,
+    /// Sum of `size_bytes` over every `oci_blobs` row. Double-counts
+    /// deduplicated blobs once per referencing repository.
+    pub logical_bytes: i64,
+    /// Sum of `size_bytes` counting each distinct digest exactly once. This
+    /// approximates the physical bytes occupied in the storage backend.
+    pub physical_bytes: i64,
+    /// Grace window (hours) applied to the `aged_*` figures below.
+    pub grace_hours: i64,
+    /// Distinct digests older than `grace_hours` (eligible to be *considered*
+    /// by a future GC sweep once a reference table exists). Reporting only.
+    pub aged_distinct_digests: i64,
+    /// Physical bytes (distinct-digest) older than `grace_hours`.
+    pub aged_physical_bytes: i64,
+    /// Per-repository logical footprint, largest `logical_bytes` first.
+    pub per_repository: Vec<OciBlobRepoFootprint>,
+}
+
 /// Storage garbage collection service.
 ///
 /// For cloud backends (S3/Azure/GCS), the shared storage instance handles all
@@ -381,6 +443,99 @@ impl StorageGcService {
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
+    }
+
+    /// Build the read-only OCI blob footprint report (issue #1408).
+    ///
+    /// Performs only `SELECT` aggregates against `oci_blobs`; it never
+    /// deletes anything, takes no row locks, and touches no storage
+    /// backend. Safe to call on a hot production database — the two
+    /// aggregate queries are index-friendly scans of `oci_blobs`.
+    ///
+    /// `grace_hours` is clamped to a sane range via
+    /// [`clamp_grace_hours`]; the clamped value is echoed back in the
+    /// report so callers see exactly what window was applied.
+    pub async fn oci_blob_footprint_report(
+        &self,
+        grace_hours: i64,
+    ) -> Result<OciBlobFootprintReport> {
+        let grace_hours = clamp_grace_hours(grace_hours);
+
+        // Aggregate 1: global totals + dedup-aware physical bytes + aged
+        // figures, all in one pass. `size_bytes` is taken as MAX per digest
+        // so a single physical object is counted once even though it has one
+        // row per referencing repository (rows for the same digest share a
+        // size, so MAX == the per-object size).
+        let totals_sql = r#"
+            WITH per_digest AS (
+                SELECT digest,
+                       MAX(size_bytes) AS size_bytes,
+                       MIN(created_at) AS first_seen
+                FROM oci_blobs
+                GROUP BY digest
+            )
+            SELECT
+                (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
+                (SELECT COALESCE(SUM(size_bytes), 0) FROM oci_blobs)   AS logical_bytes,
+                COUNT(*)                                               AS distinct_digests,
+                COALESCE(SUM(size_bytes), 0)                           AS physical_bytes,
+                COUNT(*) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1)
+                )                                                      AS aged_distinct_digests,
+                COALESCE(SUM(size_bytes) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1)
+                ), 0)                                                  AS aged_physical_bytes
+            FROM per_digest
+        "#;
+
+        let totals = sqlx::query(totals_sql)
+            .bind(grace_hours)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Aggregate 2: per-repository logical footprint, biggest first.
+        let per_repo_sql = r#"
+            SELECT repository_id,
+                   COUNT(*) AS blob_rows,
+                   COALESCE(SUM(size_bytes), 0) AS logical_bytes
+            FROM oci_blobs
+            GROUP BY repository_id
+            ORDER BY logical_bytes DESC, repository_id ASC
+        "#;
+        let per_repo_rows = sqlx::query(per_repo_sql)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let per_repository = per_repo_rows
+            .into_iter()
+            .map(|row| {
+                let repository_id = row
+                    .try_get("repository_id")
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                Ok(map_repo_footprint(
+                    repository_id,
+                    row.try_get("blob_rows").unwrap_or(0),
+                    row.try_get("logical_bytes").unwrap_or(0),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let totals = BlobFootprintTotals {
+            total_blob_rows: totals.try_get("total_blob_rows").unwrap_or(0),
+            distinct_digests: totals.try_get("distinct_digests").unwrap_or(0),
+            logical_bytes: totals.try_get("logical_bytes").unwrap_or(0),
+            physical_bytes: totals.try_get("physical_bytes").unwrap_or(0),
+            aged_distinct_digests: totals.try_get("aged_distinct_digests").unwrap_or(0),
+            aged_physical_bytes: totals.try_get("aged_physical_bytes").unwrap_or(0),
+        };
+
+        Ok(assemble_blob_footprint_report(
+            totals,
+            grace_hours,
+            per_repository,
+        ))
     }
 
     async fn cleanup_abandoned_oci_uploads(
@@ -1020,6 +1175,84 @@ pub(crate) fn record_gc_success(result: &mut StorageGcResult, bytes: i64, count:
 /// Format a GC error message for a specific operation and storage key.
 pub(crate) fn format_gc_error(operation: &str, storage_key: &str, error: &str) -> String {
     format!("Failed to {} for key {}: {}", operation, storage_key, error)
+}
+
+/// Decoded global aggregate values for the OCI blob footprint report.
+///
+/// This is the row-free intermediate between the `totals_sql` query in
+/// [`StorageGcService::oci_blob_footprint_report`] and the final
+/// [`OciBlobFootprintReport`]. Splitting it out lets the report-assembly
+/// logic (which is pure arithmetic/struct shuffling, not I/O) be unit
+/// tested without a live database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobFootprintTotals {
+    pub total_blob_rows: i64,
+    pub distinct_digests: i64,
+    pub logical_bytes: i64,
+    pub physical_bytes: i64,
+    pub aged_distinct_digests: i64,
+    pub aged_physical_bytes: i64,
+}
+
+/// Build a single per-repository footprint row from decoded column values.
+///
+/// Pure mapping helper shared by the per-repo aggregate decode loop and
+/// the unit tests. Holds no row/DB dependency so the construction can be
+/// exercised without Postgres.
+pub(crate) fn map_repo_footprint(
+    repository_id: Uuid,
+    blob_rows: i64,
+    logical_bytes: i64,
+) -> OciBlobRepoFootprint {
+    OciBlobRepoFootprint {
+        repository_id,
+        blob_rows,
+        logical_bytes,
+    }
+}
+
+/// Assemble the final [`OciBlobFootprintReport`] from already-decoded
+/// totals, the (already clamped) grace window, and the per-repository
+/// rows.
+///
+/// Pure: it does no I/O and takes no locks. Extracted from
+/// [`StorageGcService::oci_blob_footprint_report`] so the report-assembly
+/// step is covered by `--lib` unit tests even though the surrounding query
+/// execution requires a database.
+pub(crate) fn assemble_blob_footprint_report(
+    totals: BlobFootprintTotals,
+    grace_hours: i64,
+    per_repository: Vec<OciBlobRepoFootprint>,
+) -> OciBlobFootprintReport {
+    OciBlobFootprintReport {
+        total_blob_rows: totals.total_blob_rows,
+        distinct_digests: totals.distinct_digests,
+        logical_bytes: totals.logical_bytes,
+        physical_bytes: totals.physical_bytes,
+        grace_hours,
+        aged_distinct_digests: totals.aged_distinct_digests,
+        aged_physical_bytes: totals.aged_physical_bytes,
+        per_repository,
+    }
+}
+
+/// Clamp a caller-supplied grace window (hours) for the blob footprint
+/// report into a defensible range.
+///
+/// A non-positive or absurd value is coerced rather than rejected so the
+/// reporting endpoint never errors on a bad query parameter:
+/// - values `<= 0` fall back to [`BLOB_REPORT_GRACE_HOURS_DEFAULT`]
+///   (a zero/negative grace window would mark freshly-uploaded blobs as
+///   "aged", defeating the upload-race guard the window represents);
+/// - values are capped at one year (8760 h) so `make_interval` cannot be
+///   handed a pathological argument.
+pub(crate) fn clamp_grace_hours(grace_hours: i64) -> i64 {
+    const MAX_GRACE_HOURS: i64 = 24 * 365;
+    if grace_hours <= 0 {
+        BLOB_REPORT_GRACE_HOURS_DEFAULT
+    } else {
+        grace_hours.min(MAX_GRACE_HOURS)
+    }
 }
 
 /// Check whether a storage backend type uses a shared (cloud) backend.
@@ -3096,5 +3329,241 @@ mod tests {
             "the soft-deleted artifact row must still exist (not hard-deleted) after the racing \
              tag insert"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // clamp_grace_hours (issue #1408 blob footprint report)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_grace_hours_zero_falls_back_to_default() {
+        assert_eq!(clamp_grace_hours(0), BLOB_REPORT_GRACE_HOURS_DEFAULT);
+    }
+
+    #[test]
+    fn test_clamp_grace_hours_negative_falls_back_to_default() {
+        assert_eq!(clamp_grace_hours(-5), BLOB_REPORT_GRACE_HOURS_DEFAULT);
+        assert_eq!(clamp_grace_hours(i64::MIN), BLOB_REPORT_GRACE_HOURS_DEFAULT);
+    }
+
+    #[test]
+    fn test_clamp_grace_hours_passes_through_normal_values() {
+        assert_eq!(clamp_grace_hours(1), 1);
+        assert_eq!(clamp_grace_hours(24), 24);
+        assert_eq!(clamp_grace_hours(168), 168);
+    }
+
+    #[test]
+    fn test_clamp_grace_hours_caps_at_one_year() {
+        let one_year = 24 * 365;
+        assert_eq!(clamp_grace_hours(one_year), one_year);
+        assert_eq!(clamp_grace_hours(one_year + 1), one_year);
+        assert_eq!(clamp_grace_hours(i64::MAX), one_year);
+    }
+
+    #[test]
+    fn test_clamp_grace_hours_default_is_positive() {
+        // A zero input must clamp to a strictly positive window, otherwise
+        // the upload-race guard the grace window represents is defeated.
+        assert!(clamp_grace_hours(0) > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // OciBlobFootprintReport / OciBlobRepoFootprint serde contract
+    // -----------------------------------------------------------------------
+
+    fn sample_report() -> OciBlobFootprintReport {
+        OciBlobFootprintReport {
+            total_blob_rows: 120,
+            distinct_digests: 95,
+            logical_bytes: 432_000_000_000,
+            physical_bytes: 403_000_000_000,
+            grace_hours: 24,
+            aged_distinct_digests: 80,
+            aged_physical_bytes: 344_000_000_000,
+            per_repository: vec![
+                OciBlobRepoFootprint {
+                    repository_id: Uuid::nil(),
+                    blob_rows: 70,
+                    logical_bytes: 300_000_000_000,
+                },
+                OciBlobRepoFootprint {
+                    repository_id: Uuid::from_u128(1),
+                    blob_rows: 50,
+                    logical_bytes: 132_000_000_000,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_blob_footprint_report_serde_roundtrip() {
+        let original = sample_report();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: OciBlobFootprintReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_blob_footprint_report_field_names() {
+        let json = serde_json::to_string(&sample_report()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for field in [
+            "total_blob_rows",
+            "distinct_digests",
+            "logical_bytes",
+            "physical_bytes",
+            "grace_hours",
+            "aged_distinct_digests",
+            "aged_physical_bytes",
+            "per_repository",
+        ] {
+            assert!(value.get(field).is_some(), "missing field '{field}'");
+        }
+    }
+
+    #[test]
+    fn test_blob_footprint_report_preserves_large_byte_totals() {
+        // The whole point of the report is making ~403 GB visible; ensure the
+        // i64 byte fields survive a serde round trip without truncation.
+        let json = serde_json::to_string(&sample_report()).unwrap();
+        let restored: OciBlobFootprintReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.logical_bytes, 432_000_000_000);
+        assert_eq!(restored.physical_bytes, 403_000_000_000);
+        assert_eq!(restored.aged_physical_bytes, 344_000_000_000);
+    }
+
+    #[test]
+    fn test_blob_footprint_report_physical_le_logical_in_sample() {
+        // Dedup-aware physical bytes can never exceed the double-counting
+        // logical sum; the sample data must respect that invariant.
+        let r = sample_report();
+        assert!(r.physical_bytes <= r.logical_bytes);
+        assert!(r.distinct_digests <= r.total_blob_rows);
+        assert!(r.aged_physical_bytes <= r.physical_bytes);
+        assert!(r.aged_distinct_digests <= r.distinct_digests);
+    }
+
+    #[test]
+    fn test_blob_repo_footprint_serde_roundtrip() {
+        let original = OciBlobRepoFootprint {
+            repository_id: Uuid::from_u128(42),
+            blob_rows: 7,
+            logical_bytes: 9_999,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: OciBlobRepoFootprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_repo_footprint / assemble_blob_footprint_report (pure assembly)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_repo_footprint_copies_all_fields() {
+        let id = Uuid::from_u128(7);
+        let row = map_repo_footprint(id, 13, 4096);
+        assert_eq!(row.repository_id, id);
+        assert_eq!(row.blob_rows, 13);
+        assert_eq!(row.logical_bytes, 4096);
+    }
+
+    #[test]
+    fn test_map_repo_footprint_zero_values() {
+        let row = map_repo_footprint(Uuid::nil(), 0, 0);
+        assert_eq!(row.repository_id, Uuid::nil());
+        assert_eq!(row.blob_rows, 0);
+        assert_eq!(row.logical_bytes, 0);
+    }
+
+    fn sample_totals() -> BlobFootprintTotals {
+        BlobFootprintTotals {
+            total_blob_rows: 120,
+            distinct_digests: 95,
+            logical_bytes: 432_000_000_000,
+            physical_bytes: 403_000_000_000,
+            aged_distinct_digests: 80,
+            aged_physical_bytes: 344_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_assemble_blob_footprint_report_maps_every_total() {
+        let totals = sample_totals();
+        let per_repo = vec![
+            map_repo_footprint(Uuid::nil(), 70, 300_000_000_000),
+            map_repo_footprint(Uuid::from_u128(1), 50, 132_000_000_000),
+        ];
+        let report = assemble_blob_footprint_report(totals, 24, per_repo.clone());
+
+        assert_eq!(report.total_blob_rows, totals.total_blob_rows);
+        assert_eq!(report.distinct_digests, totals.distinct_digests);
+        assert_eq!(report.logical_bytes, totals.logical_bytes);
+        assert_eq!(report.physical_bytes, totals.physical_bytes);
+        assert_eq!(report.aged_distinct_digests, totals.aged_distinct_digests);
+        assert_eq!(report.aged_physical_bytes, totals.aged_physical_bytes);
+        assert_eq!(report.per_repository, per_repo);
+    }
+
+    #[test]
+    fn test_assemble_blob_footprint_report_echoes_grace_hours() {
+        // The clamped grace window is threaded straight through; assembly
+        // must not re-clamp or otherwise mutate it.
+        let report = assemble_blob_footprint_report(sample_totals(), 168, vec![]);
+        assert_eq!(report.grace_hours, 168);
+        assert!(report.per_repository.is_empty());
+    }
+
+    #[test]
+    fn test_assemble_blob_footprint_report_matches_sample_report_shape() {
+        // Building via the assembly helper must yield the same value as the
+        // hand-written sample used by the serde contract tests.
+        let report = assemble_blob_footprint_report(
+            sample_totals(),
+            24,
+            vec![
+                map_repo_footprint(Uuid::nil(), 70, 300_000_000_000),
+                map_repo_footprint(Uuid::from_u128(1), 50, 132_000_000_000),
+            ],
+        );
+        assert_eq!(report, sample_report());
+    }
+
+    #[test]
+    fn test_assemble_blob_footprint_report_empty_repositories() {
+        let report = assemble_blob_footprint_report(
+            BlobFootprintTotals {
+                total_blob_rows: 0,
+                distinct_digests: 0,
+                logical_bytes: 0,
+                physical_bytes: 0,
+                aged_distinct_digests: 0,
+                aged_physical_bytes: 0,
+            },
+            BLOB_REPORT_GRACE_HOURS_DEFAULT,
+            vec![],
+        );
+        assert_eq!(report.total_blob_rows, 0);
+        assert_eq!(report.grace_hours, BLOB_REPORT_GRACE_HOURS_DEFAULT);
+        assert!(report.per_repository.is_empty());
+    }
+
+    #[test]
+    fn test_blob_footprint_report_empty_per_repository() {
+        let report = OciBlobFootprintReport {
+            total_blob_rows: 0,
+            distinct_digests: 0,
+            logical_bytes: 0,
+            physical_bytes: 0,
+            grace_hours: BLOB_REPORT_GRACE_HOURS_DEFAULT,
+            aged_distinct_digests: 0,
+            aged_physical_bytes: 0,
+            per_repository: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"per_repository\":[]"));
+        let restored: OciBlobFootprintReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
     }
 }
