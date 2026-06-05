@@ -694,13 +694,23 @@ async fn execute_chunked_transfer(
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| "Missing session id in transfer init response".to_string())?;
 
-    // 2. Read the full artifact through the configured storage backend, then
-    //    upload it chunk by chunk. Reading once (rather than per chunk) keeps
-    //    the transfer backend-agnostic: object stores (S3/GCS/Azure) do not
-    //    expose the local-filesystem seek semantics the previous code relied
-    //    on, and re-fetching the object for every chunk would be wasteful.
-    let artifact_bytes = match read_artifact_from_storage(storage, &task.storage_key).await {
-        Ok(bytes) => bytes,
+    // 2. Stream the artifact through the configured storage backend and upload
+    //    it chunk by chunk. We deliberately avoid `storage.get()` here: that
+    //    materializes the entire (potentially multi-GB) object in RAM before
+    //    slicing, which defeats the purpose of the chunked path and would OOM
+    //    the host on large Docker images / ML models. Instead we pull a byte
+    //    stream from the backend (S3/GCS/Azure/filesystem all implement genuine
+    //    streaming) and re-frame it into fixed `chunk_size` windows via a
+    //    rolling buffer, so peak read memory stays ~chunk_size regardless of
+    //    artifact size. The emitted boundaries are identical to what
+    //    `compute_chunk_ranges` produces (contiguous `chunk_size` windows with
+    //    a remainder at the end), so the receiver reassembles by offset/length
+    //    exactly as before — wire protocol and chunk numbering are unchanged.
+    let total_chunks = compute_chunk_ranges(task.artifact_size, chunk_size).len();
+    let mut bytes_transferred: i64 = 0;
+
+    let mut byte_stream = match storage.get_stream(&task.storage_key).await {
+        Ok(s) => s,
         Err(e) => {
             let msg = format!("Storage read error: {e}");
             handle_transfer_failure(db, task, &msg).await;
@@ -708,24 +718,33 @@ async fn execute_chunked_transfer(
         }
     };
 
-    let chunk_ranges = compute_chunk_ranges(task.artifact_size, chunk_size);
-    let mut bytes_transferred: i64 = 0;
+    let mut chunker = StreamChunker::new(chunk_size);
+    let mut next_chunk_index: i32 = 0;
+    let mut next_byte_offset: i64 = 0;
 
-    for (chunk_index, byte_offset, byte_length) in &chunk_ranges {
-        // Slice just this chunk out of the in-memory artifact bytes.
-        let chunk_data =
-            match slice_artifact_chunk(&artifact_bytes, *byte_offset as u64, *byte_length as usize)
-            {
-                Ok(data) => data,
-                Err(e) => {
-                    let msg = format!(
-                        "Failed to read chunk {} (offset={}, len={}): {e}",
-                        chunk_index, byte_offset, byte_length
-                    );
-                    handle_transfer_failure(db, task, &msg).await;
-                    return Err(msg);
-                }
-            };
+    loop {
+        // Pull the next memory-bounded framed chunk from the stream.
+        let chunk_data = match next_framed_chunk(&mut byte_stream, &mut chunker).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                handle_transfer_failure(db, task, &e).await;
+                return Err(e);
+            }
+        };
+
+        // Derive this chunk's wire offset/length/index from a running counter.
+        // These MUST match `compute_chunk_ranges` so the receiver reassembles
+        // by offset/length exactly as before.
+        let (chunk_index, byte_offset, byte_length) =
+            next_chunk_coords(next_chunk_index, next_byte_offset, chunk_data.len());
+        next_chunk_index = chunk_index + 1;
+        next_byte_offset = byte_offset + byte_length as i64;
+        // Bind as references so the existing per-chunk upload logic, which was
+        // written against `&` destructured tuple fields, works unchanged.
+        let chunk_index = &chunk_index;
+        let byte_offset = &byte_offset;
+        let byte_length = &byte_length;
 
         // Compute SHA-256 of this chunk for verification.
         let mut hasher = Sha256::new();
@@ -779,7 +798,7 @@ async fn execute_chunked_transfer(
                 tracing::debug!(
                     "Chunk {}/{} uploaded for task {} ({} bytes)",
                     chunk_index + 1,
-                    chunk_ranges.len(),
+                    total_chunks,
                     task.id,
                     byte_length
                 );
@@ -819,7 +838,7 @@ async fn execute_chunked_transfer(
                 "Chunked transfer complete for artifact '{}' ({} bytes in {} chunks) to peer (task {})",
                 task.artifact_name,
                 bytes_transferred,
-                chunk_ranges.len(),
+                total_chunks,
                 task.id
             );
             Ok(())
@@ -907,26 +926,107 @@ async fn read_artifact_from_storage(
         .map_err(|e| format!("Failed to read '{storage_key}': {e}"))
 }
 
-/// Extract a `length`-byte chunk starting at `offset` from already-read
-/// artifact bytes.
+/// Re-frames an arbitrarily-chunked byte stream into fixed-size `chunk_size`
+/// windows using a rolling buffer.
 ///
-/// The chunked-transfer path reads the full artifact once via the storage
-/// backend and then slices it here. Returns an error if the requested range
-/// extends past the end of the buffer, which would indicate the recorded
-/// artifact size disagrees with the stored object.
-fn slice_artifact_chunk(bytes: &[u8], offset: u64, length: usize) -> Result<Vec<u8>, String> {
-    let start = usize::try_from(offset)
-        .map_err(|_| format!("Chunk offset {offset} exceeds addressable range"))?;
-    let end = start
-        .checked_add(length)
-        .ok_or_else(|| format!("Chunk range overflow (offset={offset}, len={length})"))?;
-    if end > bytes.len() {
-        return Err(format!(
-            "Chunk range {start}..{end} out of bounds for artifact of {} bytes",
-            bytes.len()
-        ));
+/// The chunked-transfer path pulls a byte stream from the storage backend
+/// (`get_stream`), whose items have backend-dependent sizes (256 KiB for the
+/// filesystem, variable for S3/GCS/Azure). To keep the wire protocol unchanged
+/// we must emit chunks whose offsets/lengths match `compute_chunk_ranges`:
+/// contiguous `chunk_size` windows with a short remainder at the end.
+///
+/// Memory is bounded: the internal buffer never holds more than `chunk_size`
+/// bytes of *un-emitted* data plus at most one inbound stream item, so peak
+/// read memory is O(chunk_size), not O(artifact_size). This is the whole point
+/// of the chunked path — it exists to keep multi-GB Docker images and ML
+/// models from exhausting host memory during peer replication.
+struct StreamChunker {
+    chunk_size: usize,
+    buf: Vec<u8>,
+}
+
+impl StreamChunker {
+    /// Create a chunker that emits `chunk_size`-byte windows. A non-positive
+    /// `chunk_size` is clamped to 1 so the chunker always makes progress; in
+    /// practice `chunk_size` is `sync_chunk_size_bytes()` (>= 1).
+    fn new(chunk_size: i32) -> Self {
+        Self {
+            chunk_size: chunk_size.max(1) as usize,
+            buf: Vec::new(),
+        }
     }
-    Ok(bytes[start..end].to_vec())
+
+    /// Append freshly-read stream bytes to the rolling buffer.
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Emit one full `chunk_size` window if the buffer has accumulated at least
+    /// that many bytes, draining it from the front. Returns `None` when not yet
+    /// enough data is buffered (the caller should pull more from the stream).
+    fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        if self.buf.len() >= self.chunk_size {
+            let rest = self.buf.split_off(self.chunk_size);
+            Some(std::mem::replace(&mut self.buf, rest))
+        } else {
+            None
+        }
+    }
+
+    /// At end-of-stream, emit the trailing remainder (the final short chunk),
+    /// or `None` if the buffer is empty.
+    fn flush(&mut self) -> Option<Vec<u8>> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buf))
+        }
+    }
+
+    /// Current number of buffered, un-emitted bytes. Used by tests to assert
+    /// the buffer never grows beyond ~chunk_size (the memory bound).
+    #[cfg(test)]
+    fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// Compute the wire `(chunk_index, byte_offset, byte_length)` for the next
+/// emitted chunk from the running index/offset counters and the chunk's length.
+///
+/// Pure helper so the offset/length bookkeeping the receiver reassembles
+/// against is unit-testable. The boundaries this produces are identical to
+/// `compute_chunk_ranges` because both walk contiguous windows from offset 0.
+fn next_chunk_coords(chunk_index: i32, byte_offset: i64, chunk_len: usize) -> (i32, i64, i32) {
+    (chunk_index, byte_offset, chunk_len as i32)
+}
+
+/// Pull the next `chunk_size`-framed window from a byte stream using `chunker`
+/// as the rolling buffer.
+///
+/// Drains a full window from the buffer if one is already available; otherwise
+/// pulls more items from `stream` until a full window accumulates. At EOF the
+/// trailing remainder is flushed as the final (short) chunk, after which `None`
+/// signals the stream is exhausted. Peak memory is bounded by `chunk_size` plus
+/// one inbound stream item — the artifact is never fully buffered.
+///
+/// This is the memory-bounded core of the chunked replication path, extracted
+/// as a standalone async fn so it can be unit-tested against an in-memory
+/// stream without a database or peer HTTP server.
+async fn next_framed_chunk(
+    stream: &mut futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+    chunker: &mut StreamChunker,
+) -> Result<Option<Vec<u8>>, String> {
+    loop {
+        if let Some(chunk) = chunker.next_chunk() {
+            return Ok(Some(chunk));
+        }
+        match futures::StreamExt::next(stream).await {
+            Some(Ok(bytes)) => chunker.push(&bytes),
+            Some(Err(e)) => return Err(format!("Storage stream error: {e}")),
+            None => return Ok(chunker.flush()),
+        }
+    }
 }
 
 /// Handle a successful transfer: mark task completed, update peer counters.
@@ -1480,55 +1580,188 @@ mod tests {
         assert!(err.contains("cas/ze/ro/missing"), "error was: {err}");
     }
 
-    #[test]
-    fn test_slice_artifact_chunk_basic() {
-        let data = b"abcdefghij";
-        assert_eq!(slice_artifact_chunk(data, 0, 4).unwrap(), b"abcd");
-        assert_eq!(slice_artifact_chunk(data, 4, 3).unwrap(), b"efg");
-        assert_eq!(slice_artifact_chunk(data, 7, 3).unwrap(), b"hij");
+    /// Drive a `StreamChunker` exactly the way `execute_chunked_transfer`
+    /// does: feed it stream items, draining full windows as they become
+    /// available, then flush the remainder at EOF. Returns the emitted chunks
+    /// plus the peak buffered length observed (the memory-bound witness).
+    fn drive_chunker(chunk_size: i32, stream_items: &[&[u8]]) -> (Vec<Vec<u8>>, usize) {
+        let mut chunker = StreamChunker::new(chunk_size);
+        let mut chunks = Vec::new();
+        let mut peak = 0usize;
+        for item in stream_items {
+            chunker.push(item);
+            peak = peak.max(chunker.buffered_len());
+            while let Some(chunk) = chunker.next_chunk() {
+                peak = peak.max(chunker.buffered_len());
+                chunks.push(chunk);
+            }
+        }
+        if let Some(rem) = chunker.flush() {
+            chunks.push(rem);
+        }
+        (chunks, peak)
     }
 
     #[test]
-    fn test_slice_artifact_chunk_full_and_empty() {
-        let data = b"abcdef";
-        assert_eq!(slice_artifact_chunk(data, 0, 6).unwrap(), b"abcdef");
-        assert_eq!(slice_artifact_chunk(data, 6, 0).unwrap(), b"");
-        assert_eq!(slice_artifact_chunk(data, 0, 0).unwrap(), b"");
-    }
-
-    #[test]
-    fn test_slice_artifact_chunk_out_of_bounds() {
-        let data = b"abc";
-        let err = slice_artifact_chunk(data, 2, 5).expect_err("range past end must fail");
-        assert!(err.contains("out of bounds"), "error was: {err}");
-    }
-
-    #[test]
-    fn test_slice_artifact_chunk_overflow_offset() {
-        let data = b"abc";
-        let err = slice_artifact_chunk(data, u64::MAX, 1).expect_err("overflowing range must fail");
-        // On 64-bit targets `u64::MAX` fits in `usize`, so the failure surfaces
-        // as the checked_add overflow guard; on 32-bit it would be the
-        // addressable-range guard. Either way the read must be rejected.
-        assert!(
-            err.contains("overflow") || err.contains("addressable range"),
-            "error was: {err}"
+    fn test_stream_chunker_reframes_to_fixed_windows() {
+        // Inbound items have irregular sizes (mimicking S3/filesystem reads);
+        // output must be contiguous 4-byte windows with a 2-byte remainder.
+        let (chunks, _) = drive_chunker(4, &[b"ab", b"cde", b"fghij"]);
+        assert_eq!(
+            chunks,
+            vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ij".to_vec()]
         );
     }
 
     #[test]
-    fn test_slice_artifact_chunk_reassembles_full_artifact() {
-        // Slicing every computed chunk range and concatenating must reproduce
-        // the original artifact exactly — the invariant the chunked transfer
-        // relies on.
+    fn test_stream_chunker_single_large_item_split() {
+        // One big inbound item must still split into multiple windows.
+        let (chunks, _) = drive_chunker(3, &[b"abcdefg"]);
+        assert_eq!(
+            chunks,
+            vec![b"abc".to_vec(), b"def".to_vec(), b"g".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_stream_chunker_exact_multiple_no_remainder() {
+        let (chunks, _) = drive_chunker(2, &[b"abcd"]);
+        assert_eq!(chunks, vec![b"ab".to_vec(), b"cd".to_vec()]);
+    }
+
+    #[test]
+    fn test_stream_chunker_empty_stream_emits_nothing() {
+        let (chunks, peak) = drive_chunker(4, &[]);
+        assert!(chunks.is_empty());
+        assert_eq!(peak, 0);
+    }
+
+    #[test]
+    fn test_stream_chunker_boundaries_match_compute_chunk_ranges() {
+        // The streamed chunk boundaries (offset/length, derived from a running
+        // counter as the worker does) MUST equal what `compute_chunk_ranges`
+        // produces, because the receiver reassembles by offset/length. This is
+        // the contract that keeps the wire protocol unchanged.
+        let chunk_size = 256i32;
         let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
-        let ranges = compute_chunk_ranges(data.len() as i64, 256);
+
+        // Feed the artifact in deliberately mis-aligned stream items.
+        let stream_items: Vec<&[u8]> = data.chunks(97).collect();
+        let (chunks, peak) = drive_chunker(chunk_size, &stream_items);
+
+        // Memory bound: the rolling buffer never exceeds chunk_size + one
+        // inbound item, i.e. it never holds the whole artifact.
+        let total_len = data.len();
+        let bound = chunk_size as usize + 97;
+        assert!(peak < total_len, "buffer held {peak} of {total_len} bytes");
+        assert!(peak <= bound, "peak {peak} exceeded bound {bound}");
+
+        // Derive offsets/lengths from the emitted chunks the same way the
+        // worker does, and compare against compute_chunk_ranges.
+        let expected = compute_chunk_ranges(data.len() as i64, chunk_size);
+        assert_eq!(chunks.len(), expected.len());
+        let mut offset = 0i64;
         let mut reassembled = Vec::new();
-        for (_idx, offset, length) in &ranges {
-            let chunk = slice_artifact_chunk(&data, *offset as u64, *length as usize).unwrap();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let (exp_idx, exp_offset, exp_len) = expected[i];
+            assert_eq!(exp_idx as usize, i);
+            assert_eq!(exp_offset, offset, "offset mismatch at chunk {i}");
+            assert_eq!(
+                exp_len as usize,
+                chunk.len(),
+                "length mismatch at chunk {i}"
+            );
+            offset += chunk.len() as i64;
+            reassembled.extend_from_slice(chunk);
+        }
+
+        // And the concatenation must reproduce the original artifact exactly.
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn test_stream_chunker_non_positive_chunk_size_clamped() {
+        // A zero/negative chunk size is clamped to 1 so the chunker still makes
+        // progress instead of spinning forever.
+        let (chunks, _) = drive_chunker(0, &[b"ab"]);
+        assert_eq!(chunks, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn test_next_chunk_coords_passthrough() {
+        assert_eq!(next_chunk_coords(0, 0, 256), (0, 0, 256));
+        assert_eq!(next_chunk_coords(3, 768, 100), (3, 768, 100));
+        assert_eq!(next_chunk_coords(0, 0, 0), (0, 0, 0));
+    }
+
+    /// Build a `BoxStream` from a list of byte slices so `next_framed_chunk`
+    /// can be driven exactly as the worker drives it, but without a database
+    /// or peer HTTP server.
+    fn stream_from(
+        items: Vec<&[u8]>,
+    ) -> futures::stream::BoxStream<'static, crate::error::Result<Bytes>> {
+        let owned: Vec<crate::error::Result<Bytes>> = items
+            .into_iter()
+            .map(|i| Ok(Bytes::copy_from_slice(i)))
+            .collect();
+        Box::pin(futures::stream::iter(owned))
+    }
+
+    #[tokio::test]
+    async fn test_next_framed_chunk_reframes_and_walks_boundaries() {
+        // Irregular inbound items, fixed 256-byte windows. Pulling repeatedly
+        // must yield contiguous windows whose derived offsets/lengths match
+        // compute_chunk_ranges, and concatenating must reproduce the input.
+        let chunk_size = 256i32;
+        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let items: Vec<&[u8]> = data.chunks(97).collect();
+        let mut stream = stream_from(items);
+        let mut chunker = StreamChunker::new(chunk_size);
+
+        let mut idx = 0i32;
+        let mut offset = 0i64;
+        let mut reassembled = Vec::new();
+        let mut peak = 0usize;
+        while let Some(chunk) = next_framed_chunk(&mut stream, &mut chunker).await.unwrap() {
+            peak = peak.max(chunker.buffered_len());
+            let (ci, off, len) = next_chunk_coords(idx, offset, chunk.len());
+            assert_eq!(ci, idx);
+            assert_eq!(off, offset);
+            assert_eq!(len as usize, chunk.len());
+            idx += 1;
+            offset += len as i64;
             reassembled.extend_from_slice(&chunk);
         }
+
+        let expected = compute_chunk_ranges(data.len() as i64, chunk_size);
+        assert_eq!(idx as usize, expected.len());
         assert_eq!(reassembled, data);
+        // Memory bound: never buffers the whole artifact.
+        assert!(peak < data.len());
+    }
+
+    #[tokio::test]
+    async fn test_next_framed_chunk_empty_stream_is_none() {
+        let mut stream = stream_from(vec![]);
+        let mut chunker = StreamChunker::new(256);
+        assert!(next_framed_chunk(&mut stream, &mut chunker)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_next_framed_chunk_propagates_stream_error() {
+        // A stream that errors must surface as Err, not silently terminate.
+        let items: Vec<crate::error::Result<Bytes>> =
+            vec![Err(crate::error::AppError::Storage("boom".into()))];
+        let mut stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::iter(items));
+        let mut chunker = StreamChunker::new(256);
+        let err = next_framed_chunk(&mut stream, &mut chunker)
+            .await
+            .expect_err("stream error must propagate");
+        assert!(err.contains("boom"), "error was: {err}");
     }
 
     // ── calculate_backoff ───────────────────────────────────────────────
