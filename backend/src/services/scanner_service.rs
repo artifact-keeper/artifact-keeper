@@ -1256,6 +1256,17 @@ fn extract_tar_gz_safe(content: &[u8], target: &Path) -> Result<()> {
 // Scanner trait
 // ---------------------------------------------------------------------------
 
+/// Immutable target identity supplied by scanner orchestration.
+///
+/// `Artifact::path` is repository-internal. Scanners that need an externally
+/// routable identity (currently Grype's OCI `registry:` mode) must use the
+/// repository fields from this context instead of guessing from the path.
+pub struct ScanTarget<'a> {
+    pub artifact: &'a Artifact,
+    pub repository_key: &'a str,
+    pub repository_type: &'a str,
+}
+
 /// A pluggable vulnerability scanner.
 #[async_trait]
 pub trait Scanner: Send + Sync {
@@ -1289,6 +1300,13 @@ pub trait Scanner: Send + Sync {
         true
     }
 
+    /// Context-aware applicability hook. The default preserves compatibility
+    /// with existing scanners while allowing scanners that need repository
+    /// routing context to override only this method.
+    fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+        self.is_applicable(target.artifact)
+    }
+
     /// Run the scan against artifact content and metadata. Returns both
     /// vulnerability findings AND the full package inventory observed by
     /// the scanner — the inventory drives SBOM generation (#903) and must
@@ -1310,6 +1328,17 @@ pub trait Scanner: Send + Sync {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput>;
+
+    /// Context-aware scan hook. The default delegates to the legacy scan
+    /// method so existing scanner implementations remain unchanged.
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+    ) -> Result<ScanOutput> {
+        self.scan(target.artifact, metadata, content).await
+    }
 
     /// Best-effort scanner-binary version string (e.g. `trivy-0.62.1`,
     /// `grype-0.83.0`). Persisted on `scan_results.scanner_version` so
@@ -2695,6 +2724,26 @@ impl ScannerService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
+        // The artifact path is repository-internal; scanners that need an
+        // externally routable identity (Grype's OCI `registry:` mode) require
+        // the owning repository's key and type. Fetch those separately so the
+        // artifact load stays compile-time column-checked via `query_as!`.
+        let repo_routing = sqlx::query!(
+            r#"
+            SELECT key AS repository_key, repo_type::text AS repository_type
+            FROM repositories
+            WHERE id = $1
+            "#,
+            artifact.repository_id,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let repository_key = repo_routing.repository_key;
+        let repository_type = repo_routing
+            .repository_type
+            .ok_or_else(|| AppError::Database("repository repo_type was NULL".to_string()))?;
+
         // Check if scanning is enabled for this repo (skip check if forced)
         if !force
             && !self
@@ -2731,6 +2780,11 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         let mut prepared = prepared.unwrap_or_default();
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: &repository_key,
+            repository_type: &repository_type,
+        };
 
         for scanner in &self.scanners {
             // Take any pre-allocated row id committed by the trigger handler.
@@ -2749,7 +2803,7 @@ impl ScannerService {
             // failed with a "not applicable" reason so the operator still
             // sees a deterministic record of the decision rather than a
             // ghost `pending` row that never transitions.
-            if !scanner.is_applicable(&artifact) {
+            if !scanner.is_applicable_for_target(&target) {
                 info!(
                     "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
                     scanner.name(),
@@ -2924,7 +2978,10 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner.scan(&artifact, metadata.as_ref(), &content).await {
+            match scanner
+                .scan_target(&target, metadata.as_ref(), &content)
+                .await
+            {
                 Ok(ScanOutput {
                     findings,
                     packages,
@@ -10981,6 +11038,241 @@ mod tests {
             "digest ref must not use ':' between name and digest: {}",
             joined
         );
+    }
+
+    struct ContextOnlyScanner;
+
+    #[async_trait]
+    impl Scanner for ContextOnlyScanner {
+        fn name(&self) -> &str {
+            "context-only"
+        }
+
+        fn scan_type(&self) -> &str {
+            "context-only"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            false
+        }
+
+        fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+            target.repository_key == "docker-local" && target.repository_type == "local"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput::default())
+        }
+    }
+
+    struct LegacyOnlyScanner;
+
+    #[async_trait]
+    impl Scanner for LegacyOnlyScanner {
+        fn name(&self) -> &str {
+            "legacy-only"
+        }
+
+        fn scan_type(&self) -> &str {
+            "legacy-only"
+        }
+
+        fn is_applicable(&self, artifact: &Artifact) -> bool {
+            artifact.path == "v2/library/nginx/manifests/latest"
+        }
+
+        async fn scan(
+            &self,
+            artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput {
+                findings: Vec::new(),
+                packages: Vec::new(),
+                scan_completeness: if artifact.name == "nginx" {
+                    ScanCompleteness::Complete
+                } else {
+                    ScanCompleteness::Partial
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn test_scan_target_context_can_drive_applicability() {
+        let scanner = ContextOnlyScanner;
+        let artifact = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+        };
+
+        assert!(scanner.is_applicable_for_target(&target));
+        assert!(
+            !scanner.is_applicable(&artifact),
+            "legacy applicability lacks repository context and should not be used by orchestration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_target_default_methods_preserve_legacy_scanners() {
+        let scanner = LegacyOnlyScanner;
+        let artifact = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+        };
+
+        assert!(scanner.is_applicable_for_target(&target));
+        let output = scanner
+            .scan_target(&target, None, &Bytes::from_static(b"{}"))
+            .await
+            .expect("legacy default scan_target must delegate to scan");
+        assert_eq!(output.scan_completeness, ScanCompleteness::Complete);
+    }
+
+    struct RecordingContextScanner {
+        seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Scanner for RecordingContextScanner {
+        fn name(&self) -> &str {
+            "recording-context"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Must be an allowed value for the scan_results_scan_type_check
+            // constraint, since this scanner runs against a real database and
+            // the orchestrator persists a scan_results row using this type.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            false
+        }
+
+        fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+            target.repository_key == "docker-local" && target.repository_type == "local"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so repository context is available")
+        }
+
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            self.seen.lock().unwrap().push((
+                target.repository_key.to_string(),
+                target.repository_type.to_string(),
+                target.artifact.path.clone(),
+            ));
+            Ok(ScanOutput::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_artifact_inner_supplies_repository_context_to_scanners() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        sqlx::query(
+            "UPDATE repositories SET key = 'docker-local', name = 'docker-local' WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("rename fixture repository");
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scan-context/{artifact_id}.json");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"{}"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, 'nginx', 'v2/library/nginx/manifests/latest', 2, $3,
+                    'application/vnd.oci.image.manifest.v1+json', $4, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert OCI artifact");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(RecordingContextScanner { seen: seen.clone() })],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan must run with context-aware scanner");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(
+                "docker-local".to_string(),
+                "local".to_string(),
+                "v2/library/nginx/manifests/latest".to_string(),
+            )],
+            "scanner orchestration must load repository key/type and preserve the internal artifact path"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 
     /// The `TrivyFsScanner` is the inverse case: it must apply to the

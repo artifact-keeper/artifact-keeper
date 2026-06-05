@@ -17,6 +17,38 @@ use std::time::Duration;
 
 use crate::error::Result;
 
+/// Build an inclusive HTTP `Range` header (`bytes=START-END`) for a download
+/// window, validating that the requested length is non-zero and that
+/// `offset + length` does not overflow `u64`.
+///
+/// Shared by the GCS and Azure backends, both of which issue ranged GETs with
+/// the same inclusive byte-range semantics.
+pub(crate) fn download_range_header(offset: u64, length: usize) -> Result<String> {
+    use crate::error::AppError;
+
+    if length == 0 {
+        return Err(AppError::Storage(
+            "Requested range length must be greater than zero".to_string(),
+        ));
+    }
+
+    let length = u64::try_from(length).map_err(|_| {
+        AppError::Storage(format!(
+            "Requested range length {} does not fit in u64",
+            length
+        ))
+    })?;
+    let end_exclusive = offset.checked_add(length).ok_or_else(|| {
+        AppError::Storage(format!(
+            "Requested range offset {} length {} overflows u64",
+            offset, length
+        ))
+    })?;
+    let end_inclusive = end_exclusive - 1;
+
+    Ok(format!("bytes={offset}-{end_inclusive}"))
+}
+
 /// Result of a streaming put operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutStreamResult {
@@ -146,6 +178,51 @@ pub trait StorageBackend: Send + Sync {
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let content = self.get(key).await?;
         Ok(Box::pin(futures::stream::once(async { Ok(content) })))
+    }
+
+    /// Retrieve a byte range from an object.
+    ///
+    /// Backends with native random/ranged reads should override this method
+    /// so large-object consumers do not have to re-download and discard bytes
+    /// for every chunk. The default implementation remains correct for
+    /// backends without native ranges by streaming once and collecting only
+    /// the requested window.
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        use futures::StreamExt;
+
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let mut stream = self.get_stream(key).await?;
+        let mut consumed = 0u64;
+        let mut remaining = length;
+        let mut out = Vec::with_capacity(length);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let chunk_len = chunk.len() as u64;
+            let chunk_end = consumed.saturating_add(chunk_len);
+
+            if chunk_end <= offset {
+                consumed = chunk_end;
+                continue;
+            }
+
+            let start = offset.saturating_sub(consumed) as usize;
+            let available = &chunk[start..];
+            let take = available.len().min(remaining);
+            out.extend_from_slice(&available[..take]);
+            remaining -= take;
+
+            if remaining == 0 {
+                break;
+            }
+
+            consumed = chunk_end;
+        }
+
+        Ok(Bytes::from(out))
     }
 
     /// Store content from a byte stream, computing a SHA-256 checksum
@@ -379,12 +456,14 @@ mod tests {
                 Ok(Bytes::from_static(b"copied bytes"))
             }
 
+            // `copy` routes through get_stream/put_stream only; these are never
+            // touched by this test, so fail loudly if that ever changes.
             async fn exists(&self, _key: &str) -> Result<bool> {
-                Ok(true)
+                unreachable!("copy default path must not call exists")
             }
 
             async fn delete(&self, _key: &str) -> Result<()> {
-                Ok(())
+                unreachable!("copy default path must not call delete")
             }
         }
 
@@ -399,6 +478,52 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, "dest-key");
         assert_eq!(writes[0].1, Bytes::from_static(b"copied bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_default_get_range_slices_streamed_bytes() {
+        let backend = TestBackend;
+
+        let range = backend.get_range("any-key", 1, 2).await.unwrap();
+
+        assert_eq!(range, Bytes::from_static(b"es"));
+    }
+
+    #[tokio::test]
+    async fn test_default_get_range_zero_length() {
+        let backend = TestBackend;
+
+        let range = backend.get_range("any-key", 2, 0).await.unwrap();
+
+        assert!(range.is_empty());
+    }
+
+    #[test]
+    fn test_download_range_header_is_inclusive() {
+        // offset 1024, length 4096 -> bytes=1024-5119 (inclusive end).
+        assert_eq!(
+            download_range_header(1_024, 4_096).unwrap(),
+            "bytes=1024-5119"
+        );
+        assert_eq!(download_range_header(0, 1).unwrap(), "bytes=0-0");
+    }
+
+    #[test]
+    fn test_download_range_header_rejects_zero_length() {
+        let err = download_range_header(0, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "error should explain zero length: {err}"
+        );
+    }
+
+    #[test]
+    fn test_download_range_header_rejects_overflow() {
+        let err = download_range_header(u64::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "error should explain overflow: {err}"
+        );
     }
 
     #[tokio::test]
@@ -597,17 +722,19 @@ mod tests {
 
         #[async_trait]
         impl StorageBackend for OverridingBackend {
+            // Only put_file/put_stream are relevant to this test; the basic CRUD
+            // methods must never be hit on the put_file override path.
             async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
-                Ok(())
+                unreachable!("put_file override path must not call put")
             }
             async fn get(&self, _key: &str) -> Result<Bytes> {
-                Ok(Bytes::new())
+                unreachable!("put_file override path must not call get")
             }
             async fn exists(&self, _key: &str) -> Result<bool> {
-                Ok(false)
+                unreachable!("put_file override path must not call exists")
             }
             async fn delete(&self, _key: &str) -> Result<()> {
-                Ok(())
+                unreachable!("put_file override path must not call delete")
             }
             async fn put_file(&self, _key: &str, _path: &std::path::Path) -> Result<()> {
                 *self.put_file_called.lock().unwrap() = true;
