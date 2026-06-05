@@ -902,6 +902,555 @@ impl CacheStore {
     }
 }
 
+/// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
+/// (#1618 S8 — the highest-risk structural extraction).
+///
+/// This is a pure structural relocation of the upstream-facing methods that
+/// previously lived directly on [`ProxyService`]: the buffered fetch
+/// (`fetch_buffered` ← `fetch_from_upstream_with_accept`), the streaming fetch
+/// (`fetch_stream` ← `fetch_from_upstream_streaming`), the ETag revalidation
+/// HEAD (`check_etag_changed`), and the OCI bearer-token cache
+/// (`obtain_bearer_token` / `get_cached_token` / `parse_bearer_challenge`).
+/// [`ProxyService`] now holds an `UpstreamClient` and the corresponding methods
+/// delegate here; no behavior, logging, error type, ordering, header set, or
+/// call-site signature changed in the move.
+///
+/// Holds the same `http_client`, the bearer `token_cache`, and a `db` handle
+/// (used only to load per-repo upstream auth via
+/// `upstream_auth::load_upstream_auth`) that [`ProxyService`] used before.
+///
+/// The two fetch paths each previously inlined an identical 401 Bearer
+/// state machine; it is now extracted ONCE into [`Self::exchange_bearer_then`].
+/// The caller-supplied `build_request` closure is what preserves the
+/// **intentional OCI `Accept`-header asymmetry** — see that method's doc.
+pub(crate) struct UpstreamClient {
+    db: PgPool,
+    http_client: Client,
+    /// In-memory cache for OCI registry bearer tokens.
+    /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
+    token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+}
+
+impl UpstreamClient {
+    /// Construct an `UpstreamClient` over the given HTTP client and db handle.
+    /// Starts with an empty bearer-token cache (matching the previous
+    /// `ProxyService::new` initialization exactly).
+    pub(crate) fn new(db: PgPool, http_client: Client) -> Self {
+        Self {
+            db,
+            http_client,
+            token_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Buffered upstream fetch. Relocated verbatim from
+    /// `ProxyService::fetch_from_upstream_with_accept`.
+    ///
+    /// Variant of the plain fetch that adds an `Accept` header to BOTH the
+    /// initial request and the post-token-exchange retry.
+    ///
+    /// OCI manifest fetches need this so the upstream registry returns the
+    /// content type the caller actually understands. Without an `Accept`
+    /// header Docker Hub picks a default representation (typically the
+    /// OCI image index for multi-arch images) but other registries respond
+    /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
+    /// Mirroring the client's `Accept` upstream removes that source of
+    /// silent content-type mismatches and the spurious 404s they trigger.
+    async fn fetch_buffered(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<UpstreamResponse> {
+        tracing::info!(
+            "Fetching artifact from upstream: {} (accept={:?})",
+            url,
+            accept
+        );
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        // BUFFERED path sets `Accept` on the INITIAL request. The streaming
+        // path deliberately does NOT — see `exchange_bearer_then` /
+        // `fetch_stream` for why this asymmetry is intentional (#1618 S8).
+        if let Some(accept_value) = accept {
+            request = request.header(ACCEPT, accept_value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+
+        let status = response.status();
+
+        // Handle 401 with bearer token exchange (required by Docker Hub and
+        // other OCI registries, even for anonymous/public pulls).
+        if status == StatusCode::UNAUTHORIZED {
+            // The buffered closure RE-ADDS `Accept` on the bearer retry,
+            // mirroring the initial request. The bearer-exchange helper itself
+            // never touches `Accept`; the closure owns that decision so the
+            // buffered/streaming asymmetry is preserved (#1618 S8).
+            if let Some(retry_response) = self
+                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    if let Some(accept_value) = accept {
+                        req.header(ACCEPT, accept_value)
+                    } else {
+                        req
+                    }
+                })
+                .await?
+            {
+                return Self::read_upstream_response(retry_response, url).await;
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response(response, url).await
+    }
+
+    /// Extract content, content-type, etag, effective URL, and Link header from
+    /// an upstream HTTP response. Callers are responsible for handling 401 before
+    /// invoking. Relocated verbatim from `ProxyService::read_upstream_response`.
+    async fn read_upstream_response(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<UpstreamResponse> {
+        let status = response.status();
+        let effective_url = response.url().to_string();
+
+        // Centralise the 404/4xx/5xx classification through
+        // `validate_upstream_status` (#1445) so the buffered fetch path
+        // gets the same 5xx -> ServiceUnavailable mapping the streaming
+        // path does. Previously this inlined a "non-2xx -> Storage" rule
+        // that surfaced raw upstream 502/503/504 to clients as 502.
+        validate_upstream_status(status, url)?;
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let link = response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let content = response
+            .bytes()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
+
+        tracing::info!(
+            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
+            content.len(),
+            content_type,
+            etag,
+            link
+        );
+
+        Ok(UpstreamResponse {
+            content,
+            content_type,
+            etag,
+            effective_url,
+            link,
+        })
+    }
+
+    /// Streaming upstream fetch. Relocated verbatim from
+    /// `ProxyService::fetch_from_upstream_streaming` (#895).
+    ///
+    /// Returns the upstream body as a stream of `Bytes` chunks instead of
+    /// buffering the whole body into memory. Used by the OOM-mitigation path
+    /// that tees the upstream stream simultaneously to the client and to the
+    /// storage cache.
+    ///
+    /// Auth handling (Basic + OCI bearer token exchange) mirrors the
+    /// buffered variant; only the body extraction differs — and, critically,
+    /// the streaming path sets NO `Accept` header anywhere (see below).
+    async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
+        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        // NOTE: the streaming path intentionally sets NO `Accept` header on the
+        // initial request, in contrast to the buffered path which sets it on
+        // both the initial request and the retry. This asymmetry is deliberate
+        // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+
+        let status = response.status();
+
+        if status == StatusCode::UNAUTHORIZED {
+            // The streaming closure is the IDENTITY transform: it adds NO
+            // `Accept` header on the bearer retry, preserving the asymmetry
+            // with the buffered path (#1618 S8).
+            if let Some(retry_response) = self
+                .exchange_bearer_then(response, url, &upstream_auth, |req| req)
+                .await?
+            {
+                return Self::read_upstream_response_streaming(retry_response, url);
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response_streaming(response, url)
+    }
+
+    /// Shared OCI 401 Bearer-challenge state machine, extracted ONCE from the
+    /// previously copy-pasted blocks in the buffered and streaming fetch paths
+    /// (#1618 S8).
+    ///
+    /// Given the upstream's 401 `response`, this:
+    /// 1. parses the `WWW-Authenticate: Bearer ...` challenge,
+    /// 2. validates the advertised realm against SSRF rules
+    ///    (`validate_outbound_url`) BEFORE any outbound request,
+    /// 3. obtains a bearer token (cache hit or token-endpoint exchange), and
+    /// 4. rebuilds a fresh GET via the caller-supplied `build_request` closure
+    ///    (already carrying `bearer_auth(token)`), sends it, and returns the
+    ///    RAW [`reqwest::Response`].
+    ///
+    /// Returns `Ok(Some(response))` when the 401 carried a usable Bearer
+    /// challenge and the retry was issued; `Ok(None)` when the response was not
+    /// a parseable Bearer challenge (the caller then maps that to the original
+    /// "Upstream returned error status" error, exactly as before).
+    ///
+    /// CRITICAL — this helper deliberately returns the raw response and does
+    /// NOT read the body: the caller picks `read_upstream_response` (buffered,
+    /// fully buffered) vs `read_upstream_response_streaming` (streaming, bounded
+    /// memory). Reading the body here would collapse streaming into buffering
+    /// and break its bounded-memory guarantee (#1618 S8 review).
+    ///
+    /// CRITICAL — this helper NEVER sets an `Accept` header. The OCI `Accept`
+    /// asymmetry between the buffered and streaming paths is intentional and is
+    /// owned entirely by the caller's `build_request` closure: the buffered
+    /// caller re-adds `Accept` on the retry, the streaming caller adds nothing.
+    /// Do NOT "helpfully" add `Accept` here (#1618 S8 review).
+    async fn exchange_bearer_then<F>(
+        &self,
+        response: reqwest::Response,
+        url: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        build_request: F,
+    ) -> Result<Option<reqwest::Response>>
+    where
+        F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    {
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if challenge.starts_with("Bearer ") {
+            let params = Self::parse_bearer_challenge(&challenge);
+            if let Some(realm) = params.get("realm") {
+                let scope = params.get("scope").cloned().unwrap_or_default();
+                let service = params.get("service").cloned().unwrap_or_default();
+
+                // Validate the realm URL against SSRF rules before making
+                // any outbound request. A malicious upstream could set
+                // realm to an internal address.
+                crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
+
+                let token = self
+                    .obtain_bearer_token(realm, &service, &scope, upstream_auth)
+                    .await?;
+
+                // Retry with the bearer token only. The original upstream
+                // Basic credentials were already forwarded to the token
+                // endpoint in obtain_bearer_token(); adding them here
+                // would produce two Authorization headers.
+                //
+                // The caller's `build_request` closure decides whether to
+                // re-add `Accept` (buffered: yes; streaming: no) — see the
+                // method doc on the intentional asymmetry (#1618 S8).
+                let retry_request = build_request(self.http_client.get(url).bearer_auth(&token));
+
+                let retry_response = retry_request.send().await.map_err(|e| {
+                    AppError::Storage(format!(
+                        "Failed to fetch from upstream after token exchange: {}",
+                        e
+                    ))
+                })?;
+
+                return Ok(Some(retry_response));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Stream the upstream HTTP response body without buffering. Mirrors
+    /// the shape of [`Self::read_upstream_response`] but returns the body
+    /// as a stream. Status/header validation happens up front; the
+    /// stream itself yields one [`Bytes`] chunk per `reqwest` body
+    /// frame. Relocated verbatim from
+    /// `ProxyService::read_upstream_response_streaming`.
+    fn read_upstream_response_streaming(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<UpstreamStream> {
+        validate_upstream_status(response.status(), url)?;
+        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
+
+        let body = response.bytes_stream().map(|r| {
+            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
+        });
+
+        Ok(UpstreamStream {
+            body: Box::pin(body),
+            content_type,
+            etag,
+            content_length,
+        })
+    }
+
+    /// Obtain a bearer token for an OCI registry, using the in-memory cache
+    /// when possible. Relocated verbatim from
+    /// `ProxyService::obtain_bearer_token`.
+    async fn obtain_bearer_token(
+        &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<String> {
+        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
+
+        if let Some(token) = self.get_cached_token(&cache_key).await {
+            return Ok(token);
+        }
+
+        // Build token request URL with query parameters.
+        let token_url = {
+            let mut parts = Vec::new();
+            if !service.is_empty() {
+                parts.push(format!("service={}", urlencoding::encode(service)));
+            }
+            if !scope.is_empty() {
+                parts.push(format!("scope={}", urlencoding::encode(scope)));
+            }
+            if parts.is_empty() {
+                realm.to_string()
+            } else {
+                let sep = if realm.contains('?') { "&" } else { "?" };
+                format!("{}{}{}", realm, sep, parts.join("&"))
+            }
+        };
+        let mut token_request = self.http_client.get(&token_url);
+
+        // Forward configured Basic credentials for private registries.
+        if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username,
+            password,
+        }) = upstream_auth
+        {
+            token_request = token_request.basic_auth(username, Some(password));
+        }
+
+        tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
+
+        let token_response = token_request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to request bearer token from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        if !token_response.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "Token endpoint {} returned status {}",
+                realm,
+                token_response.status()
+            )));
+        }
+
+        let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to parse token response from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        let token = body
+            .token
+            .or(body.access_token)
+            .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
+
+        // Cap TTL to prevent overflow and unreasonably long cache entries.
+        let ttl = body
+            .expires_in
+            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
+            .min(MAX_TOKEN_TTL_SECS);
+
+        // Cache the token, evicting expired entries to prevent unbounded growth.
+        {
+            let mut cache = self.token_cache.write().await;
+            cache.retain(|_, (_, created_at, entry_ttl)| {
+                created_at.elapsed() < Duration::from_secs(*entry_ttl)
+            });
+            cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
+        }
+
+        Ok(token)
+    }
+
+    /// Return a cached bearer token if present and not expired. Relocated
+    /// verbatim from `ProxyService::get_cached_token`.
+    async fn get_cached_token(&self, cache_key: &str) -> Option<String> {
+        let cache = self.token_cache.read().await;
+        let (token, created_at, ttl_secs) = cache.get(cache_key)?;
+        if created_at.elapsed() < Duration::from_secs(ttl_secs.saturating_mul(9) / 10) {
+            Some(token.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
+    /// header into a map of key-value pairs. Relocated verbatim from
+    /// `ProxyService::parse_bearer_challenge`.
+    fn parse_bearer_challenge(header: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        let bearer_params = match header.strip_prefix("Bearer ") {
+            Some(p) => p,
+            None => return params,
+        };
+
+        let mut remaining = bearer_params.trim();
+        while !remaining.is_empty() {
+            let eq_pos = match remaining.find('=') {
+                Some(p) => p,
+                None => break,
+            };
+            let key = remaining[..eq_pos].trim().to_lowercase();
+            remaining = remaining[eq_pos + 1..].trim();
+
+            let value;
+            if remaining.starts_with('"') {
+                remaining = &remaining[1..];
+                let end = remaining.find('"').unwrap_or(remaining.len());
+                value = remaining[..end].to_string();
+                remaining = if end + 1 < remaining.len() {
+                    remaining[end + 1..].trim_start_matches(',').trim()
+                } else {
+                    ""
+                };
+            } else {
+                let end = remaining.find(',').unwrap_or(remaining.len());
+                value = remaining[..end].trim().to_string();
+                remaining = if end < remaining.len() {
+                    remaining[end + 1..].trim()
+                } else {
+                    ""
+                };
+            }
+
+            params.insert(key, value);
+        }
+
+        params
+    }
+
+    /// Check if upstream ETag has changed (returns true if changed/newer).
+    /// Relocated verbatim from `ProxyService::check_etag_changed`.
+    async fn check_etag_changed(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+    ) -> Result<bool> {
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self
+            .http_client
+            .head(url)
+            .header(IF_NONE_MATCH, cached_etag);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+        })?;
+
+        match response.status() {
+            StatusCode::NOT_MODIFIED => {
+                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
+                Ok(false)
+            }
+            StatusCode::OK => {
+                // Check if ETag in response differs
+                let new_etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok());
+
+                match new_etag {
+                    Some(etag) if etag == cached_etag => {
+                        tracing::debug!("Upstream ETag unchanged for {}", url);
+                        Ok(false)
+                    }
+                    _ => {
+                        tracing::debug!("Upstream has newer content for {}", url);
+                        Ok(true)
+                    }
+                }
+            }
+            StatusCode::UNAUTHORIZED => {
+                // OCI registries require bearer token exchange even for HEAD
+                // requests. Rather than duplicating the token exchange here,
+                // treat this as "needs re-fetch" and let fetch_from_upstream
+                // handle the full 401 flow on the next access.
+                tracing::debug!(
+                    "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
+                    url
+                );
+                Ok(true)
+            }
+            status => {
+                tracing::warn!(
+                    "Unexpected status {} checking upstream {}, assuming changed",
+                    status,
+                    url
+                );
+                Ok(true)
+            }
+        }
+    }
+}
+
 /// Proxy service for fetching and caching artifacts from upstream repositories
 pub struct ProxyService {
     db: PgPool,
@@ -909,10 +1458,12 @@ pub struct ProxyService {
     /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
     /// The cache-facing public methods on `ProxyService` delegate here.
     cache_store: CacheStore,
-    http_client: Client,
-    /// In-memory cache for OCI registry bearer tokens.
-    /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
-    token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+    /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
+    /// (#1618 S8). The upstream-facing methods on `ProxyService`
+    /// (`fetch_from_upstream*`, `check_etag_changed`, `parse_bearer_challenge`)
+    /// delegate here. It holds the shared `http_client` and the bearer
+    /// `token_cache` that previously lived directly on `ProxyService`.
+    upstream_client: UpstreamClient,
 }
 
 impl ProxyService {
@@ -937,13 +1488,13 @@ impl ProxyService {
             .expect("Failed to create HTTP client");
 
         let cache_store = CacheStore::new(Arc::clone(&storage));
+        let upstream_client = UpstreamClient::new(db.clone(), http_client);
 
         Self {
             db,
             storage,
             cache_store,
-            http_client,
-            token_cache: RwLock::new(HashMap::new()),
+            upstream_client,
         }
     }
 
@@ -1865,387 +2416,47 @@ impl ProxyService {
     /// Variant of [`Self::fetch_from_upstream`] that adds an `Accept` header
     /// to both the initial request and the post-token-exchange retry.
     ///
-    /// OCI manifest fetches need this so the upstream registry returns the
-    /// content type the caller actually understands. Without an `Accept`
-    /// header Docker Hub picks a default representation (typically the
-    /// OCI image index for multi-arch images) but other registries respond
-    /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
-    /// Mirroring the client's `Accept` upstream removes that source of
-    /// silent content-type mismatches and the spurious 404s they trigger.
+    /// Thin delegation to [`UpstreamClient::fetch_buffered`] (#1618 S8). The
+    /// buffered path's OCI `Accept` semantics (set on the initial request AND
+    /// re-added on the bearer retry) live there; this signature and every
+    /// external call site are unchanged.
     async fn fetch_from_upstream_with_accept(
         &self,
         url: &str,
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<UpstreamResponse> {
-        tracing::info!(
-            "Fetching artifact from upstream: {} (accept={:?})",
-            url,
-            accept
-        );
-
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self.http_client.get(url);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-        if let Some(accept_value) = accept {
-            request = request.header(ACCEPT, accept_value);
-        }
-
-        let response = request
-            .send()
+        self.upstream_client
+            .fetch_buffered(url, repo_id, accept)
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
-
-        let status = response.status();
-
-        // Handle 401 with bearer token exchange (required by Docker Hub and
-        // other OCI registries, even for anonymous/public pulls).
-        if status == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if challenge.starts_with("Bearer ") {
-                let params = Self::parse_bearer_challenge(&challenge);
-                if let Some(realm) = params.get("realm") {
-                    let scope = params.get("scope").cloned().unwrap_or_default();
-                    let service = params.get("service").cloned().unwrap_or_default();
-
-                    // Validate the realm URL against SSRF rules before making
-                    // any outbound request. A malicious upstream could set
-                    // realm to an internal address.
-                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
-
-                    let token = self
-                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
-                        .await?;
-
-                    // Retry with the bearer token only. The original upstream
-                    // Basic credentials were already forwarded to the token
-                    // endpoint in obtain_bearer_token(); adding them here
-                    // would produce two Authorization headers.
-                    let mut retry_request = self.http_client.get(url).bearer_auth(&token);
-                    if let Some(accept_value) = accept {
-                        retry_request = retry_request.header(ACCEPT, accept_value);
-                    }
-
-                    let retry_response = retry_request.send().await.map_err(|e| {
-                        AppError::Storage(format!(
-                            "Failed to fetch from upstream after token exchange: {}",
-                            e
-                        ))
-                    })?;
-
-                    return Self::read_upstream_response(retry_response, url).await;
-                }
-            }
-
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
-
-        Self::read_upstream_response(response, url).await
-    }
-
-    /// Extract content, content-type, etag, effective URL, and Link header from
-    /// an upstream HTTP response. Callers are responsible for handling 401 before
-    /// invoking.
-    async fn read_upstream_response(
-        response: reqwest::Response,
-        url: &str,
-    ) -> Result<UpstreamResponse> {
-        let status = response.status();
-        let effective_url = response.url().to_string();
-
-        // Centralise the 404/4xx/5xx classification through
-        // `validate_upstream_status` (#1445) so the buffered fetch path
-        // gets the same 5xx -> ServiceUnavailable mapping the streaming
-        // path does. Previously this inlined a "non-2xx -> Storage" rule
-        // that surfaced raw upstream 502/503/504 to clients as 502.
-        validate_upstream_status(status, url)?;
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let link = response
-            .headers()
-            .get("link")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let content = response
-            .bytes()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
-
-        tracing::info!(
-            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
-            content.len(),
-            content_type,
-            etag,
-            link
-        );
-
-        Ok(UpstreamResponse {
-            content,
-            content_type,
-            etag,
-            effective_url,
-            link,
-        })
     }
 
     /// Streaming variant of [`Self::fetch_from_upstream`] used by the
     /// proxy slow path (#895). Returns the upstream body as a stream of
     /// `Bytes` chunks instead of buffering the whole body into memory.
-    /// Used by the OOM-mitigation path that tees the upstream stream
-    /// simultaneously to the client and to the storage cache.
     ///
-    /// Auth handling (Basic + OCI bearer token exchange) mirrors the
-    /// buffered variant; only the body extraction differs.
+    /// Thin delegation to [`UpstreamClient::fetch_stream`] (#1618 S8). The
+    /// streaming path deliberately sets NO `Accept` header (the intentional
+    /// asymmetry with the buffered path); that decision lives there.
     async fn fetch_from_upstream_streaming(
         &self,
         url: &str,
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
-        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
-
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self.http_client.get(url);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
-
-        let status = response.status();
-
-        if status == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if challenge.starts_with("Bearer ") {
-                let params = Self::parse_bearer_challenge(&challenge);
-                if let Some(realm) = params.get("realm") {
-                    let scope = params.get("scope").cloned().unwrap_or_default();
-                    let service = params.get("service").cloned().unwrap_or_default();
-                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
-                    let token = self
-                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
-                        .await?;
-                    let retry_request = self.http_client.get(url).bearer_auth(&token);
-                    let retry_response = retry_request.send().await.map_err(|e| {
-                        AppError::Storage(format!(
-                            "Failed to fetch from upstream after token exchange: {}",
-                            e
-                        ))
-                    })?;
-                    return Self::read_upstream_response_streaming(retry_response, url);
-                }
-            }
-
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, url
-            )));
-        }
-
-        Self::read_upstream_response_streaming(response, url)
-    }
-
-    /// Stream the upstream HTTP response body without buffering. Mirrors
-    /// the shape of [`Self::read_upstream_response`] but returns the body
-    /// as a stream. Status/header validation happens up front; the
-    /// stream itself yields one [`Bytes`] chunk per `reqwest` body
-    /// frame.
-    fn read_upstream_response_streaming(
-        response: reqwest::Response,
-        url: &str,
-    ) -> Result<UpstreamStream> {
-        validate_upstream_status(response.status(), url)?;
-        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
-
-        let body = response.bytes_stream().map(|r| {
-            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
-        });
-
-        Ok(UpstreamStream {
-            body: Box::pin(body),
-            content_type,
-            etag,
-            content_length,
-        })
-    }
-
-    /// Obtain a bearer token for an OCI registry, using the in-memory cache
-    /// when possible.
-    async fn obtain_bearer_token(
-        &self,
-        realm: &str,
-        service: &str,
-        scope: &str,
-        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
-    ) -> Result<String> {
-        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
-
-        if let Some(token) = self.get_cached_token(&cache_key).await {
-            return Ok(token);
-        }
-
-        // Build token request URL with query parameters.
-        let token_url = {
-            let mut parts = Vec::new();
-            if !service.is_empty() {
-                parts.push(format!("service={}", urlencoding::encode(service)));
-            }
-            if !scope.is_empty() {
-                parts.push(format!("scope={}", urlencoding::encode(scope)));
-            }
-            if parts.is_empty() {
-                realm.to_string()
-            } else {
-                let sep = if realm.contains('?') { "&" } else { "?" };
-                format!("{}{}{}", realm, sep, parts.join("&"))
-            }
-        };
-        let mut token_request = self.http_client.get(&token_url);
-
-        // Forward configured Basic credentials for private registries.
-        if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
-            username,
-            password,
-        }) = upstream_auth
-        {
-            token_request = token_request.basic_auth(username, Some(password));
-        }
-
-        tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
-
-        let token_response = token_request.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to request bearer token from {}: {}",
-                realm, e
-            ))
-        })?;
-
-        if !token_response.status().is_success() {
-            return Err(AppError::Storage(format!(
-                "Token endpoint {} returned status {}",
-                realm,
-                token_response.status()
-            )));
-        }
-
-        let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to parse token response from {}: {}",
-                realm, e
-            ))
-        })?;
-
-        let token = body
-            .token
-            .or(body.access_token)
-            .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
-
-        // Cap TTL to prevent overflow and unreasonably long cache entries.
-        let ttl = body
-            .expires_in
-            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
-            .min(MAX_TOKEN_TTL_SECS);
-
-        // Cache the token, evicting expired entries to prevent unbounded growth.
-        {
-            let mut cache = self.token_cache.write().await;
-            cache.retain(|_, (_, created_at, entry_ttl)| {
-                created_at.elapsed() < Duration::from_secs(*entry_ttl)
-            });
-            cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
-        }
-
-        Ok(token)
-    }
-
-    /// Return a cached bearer token if present and not expired.
-    async fn get_cached_token(&self, cache_key: &str) -> Option<String> {
-        let cache = self.token_cache.read().await;
-        let (token, created_at, ttl_secs) = cache.get(cache_key)?;
-        if created_at.elapsed() < Duration::from_secs(ttl_secs.saturating_mul(9) / 10) {
-            Some(token.clone())
-        } else {
-            None
-        }
+        self.upstream_client.fetch_stream(url, repo_id).await
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
     /// header into a map of key-value pairs.
+    ///
+    /// Thin delegation to [`UpstreamClient::parse_bearer_challenge`] (#1618 S8);
+    /// retained on `ProxyService` so the existing bearer-challenge-parse unit
+    /// tests keep calling `ProxyService::parse_bearer_challenge` unchanged.
+    /// The runtime callers now use [`UpstreamClient::parse_bearer_challenge`]
+    /// directly, so this wrapper exists only for the test oracle.
+    #[cfg(test)]
     fn parse_bearer_challenge(header: &str) -> HashMap<String, String> {
-        let mut params = HashMap::new();
-        let bearer_params = match header.strip_prefix("Bearer ") {
-            Some(p) => p,
-            None => return params,
-        };
-
-        let mut remaining = bearer_params.trim();
-        while !remaining.is_empty() {
-            let eq_pos = match remaining.find('=') {
-                Some(p) => p,
-                None => break,
-            };
-            let key = remaining[..eq_pos].trim().to_lowercase();
-            remaining = remaining[eq_pos + 1..].trim();
-
-            let value;
-            if remaining.starts_with('"') {
-                remaining = &remaining[1..];
-                let end = remaining.find('"').unwrap_or(remaining.len());
-                value = remaining[..end].to_string();
-                remaining = if end + 1 < remaining.len() {
-                    remaining[end + 1..].trim_start_matches(',').trim()
-                } else {
-                    ""
-                };
-            } else {
-                let end = remaining.find(',').unwrap_or(remaining.len());
-                value = remaining[..end].trim().to_string();
-                remaining = if end < remaining.len() {
-                    remaining[end + 1..].trim()
-                } else {
-                    ""
-                };
-            }
-
-            params.insert(key, value);
-        }
-
-        params
+        UpstreamClient::parse_bearer_challenge(header)
     }
 
     /// Cache artifact content and metadata, and record the artifact in the
@@ -2291,68 +2502,18 @@ impl ProxyService {
         self.get_cached(cache_key, metadata_key, true).await
     }
 
-    /// Check if upstream ETag has changed (returns true if changed/newer)
+    /// Check if upstream ETag has changed (returns true if changed/newer).
+    ///
+    /// Thin delegation to [`UpstreamClient::check_etag_changed`] (#1618 S8).
     async fn check_etag_changed(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
-
-        let mut request = self
-            .http_client
-            .head(url)
-            .header(IF_NONE_MATCH, cached_etag);
-        if let Some(ref auth) = upstream_auth {
-            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
-        })?;
-
-        match response.status() {
-            StatusCode::NOT_MODIFIED => {
-                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
-                Ok(false)
-            }
-            StatusCode::OK => {
-                // Check if ETag in response differs
-                let new_etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok());
-
-                match new_etag {
-                    Some(etag) if etag == cached_etag => {
-                        tracing::debug!("Upstream ETag unchanged for {}", url);
-                        Ok(false)
-                    }
-                    _ => {
-                        tracing::debug!("Upstream has newer content for {}", url);
-                        Ok(true)
-                    }
-                }
-            }
-            StatusCode::UNAUTHORIZED => {
-                // OCI registries require bearer token exchange even for HEAD
-                // requests. Rather than duplicating the token exchange here,
-                // treat this as "needs re-fetch" and let fetch_from_upstream
-                // handle the full 401 flow on the next access.
-                tracing::debug!(
-                    "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
-                    url
-                );
-                Ok(true)
-            }
-            status => {
-                tracing::warn!(
-                    "Unexpected status {} checking upstream {}, assuming changed",
-                    status,
-                    url
-                );
-                Ok(true)
-            }
-        }
+        self.upstream_client
+            .check_etag_changed(url, cached_etag, repo_id)
+            .await
     }
 }
 
