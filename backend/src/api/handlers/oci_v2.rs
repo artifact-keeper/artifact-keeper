@@ -1623,6 +1623,28 @@ pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
     refs
 }
 
+/// Split a slice of [`BlobRef`] into the two parallel column vectors the
+/// `UNNEST`-based insert in [`record_manifest_blob_refs`] binds: the blob
+/// digests (`$2::text[]`) and their kinds (`$3::text[]`), index-aligned so
+/// row `i` pairs `digests[i]` with `kinds[i]`. Returns `None` when there
+/// is nothing to insert (empty input), letting the caller short-circuit
+/// the DB round-trip.
+///
+/// Pure and DB-free so the array-pairing logic is unit-testable without a
+/// database (the raw `sqlx::query(...).execute()` is exercised only by the
+/// Tier-2 integration tests).
+fn blob_refs_to_columns(refs: &[BlobRef]) -> Option<(Vec<String>, Vec<String>)> {
+    if refs.is_empty() {
+        return None;
+    }
+    // Split into parallel arrays so a single UNNEST round-trip can pair
+    // each blob digest with its kind, all against the constant
+    // manifest_digest / repo_id.
+    let blob_digests: Vec<String> = refs.iter().map(|r| r.digest.clone()).collect();
+    let kinds: Vec<String> = refs.iter().map(|r| r.kind.to_string()).collect();
+    Some((blob_digests, kinds))
+}
+
 /// Insert (manifest_digest, blob_digest, repository_id, kind) rows into
 /// `manifest_blob_refs` for every config/layer blob of an image manifest.
 /// Idempotent: on conflict the existing row is kept.
@@ -1646,14 +1668,10 @@ pub async fn record_manifest_blob_refs(
     manifest_body: &[u8],
 ) -> Result<usize, sqlx::Error> {
     let refs = extract_blob_refs(manifest_body);
-    if refs.is_empty() {
-        return Ok(0);
-    }
-    // Split into parallel arrays so a single UNNEST round-trip can pair
-    // each blob digest with its kind, all against the constant
-    // manifest_digest / repo_id.
-    let blob_digests: Vec<String> = refs.iter().map(|r| r.digest.clone()).collect();
-    let kinds: Vec<String> = refs.iter().map(|r| r.kind.to_string()).collect();
+    let (blob_digests, kinds) = match blob_refs_to_columns(&refs) {
+        Some(cols) => cols,
+        None => return Ok(0),
+    };
     let res = sqlx::query(
         r#"
         INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
@@ -10602,6 +10620,77 @@ mod oci_manifest_refs_tests {
                 },
             ]
         );
+    }
+
+    // -- blob_refs_to_columns (#1635) UNNEST column-pairing -----------------
+
+    #[test]
+    fn blob_refs_to_columns_none_for_empty() {
+        // No refs -> no insert; caller short-circuits the DB round-trip.
+        assert!(blob_refs_to_columns(&[]).is_none());
+    }
+
+    #[test]
+    fn blob_refs_to_columns_pairs_digests_and_kinds_in_order() {
+        let refs = vec![
+            BlobRef {
+                digest: "sha256:config0".to_string(),
+                kind: "config",
+            },
+            BlobRef {
+                digest: "sha256:layer1".to_string(),
+                kind: "layer",
+            },
+            BlobRef {
+                digest: "sha256:layer2".to_string(),
+                kind: "layer",
+            },
+        ];
+        let (digests, kinds) =
+            blob_refs_to_columns(&refs).expect("non-empty refs yield Some columns");
+        // The two arrays must be index-aligned: digests[i] pairs kinds[i]
+        // for the UNNEST($2, $3) insert.
+        assert_eq!(
+            digests,
+            vec![
+                "sha256:config0".to_string(),
+                "sha256:layer1".to_string(),
+                "sha256:layer2".to_string(),
+            ]
+        );
+        assert_eq!(
+            kinds,
+            vec![
+                "config".to_string(),
+                "layer".to_string(),
+                "layer".to_string(),
+            ]
+        );
+        assert_eq!(digests.len(), kinds.len());
+    }
+
+    #[test]
+    fn blob_refs_to_columns_round_trips_extracted_refs() {
+        // End-to-end of the pure pipeline: parse a manifest body, then map
+        // it to the two insert columns the UNNEST query binds.
+        let body = br#"{
+            "config": {"digest": "sha256:cfg"},
+            "layers": [{"digest": "sha256:l1"}, {"digest": "sha256:l2"}]
+        }"#;
+        let refs = extract_blob_refs(body);
+        let (digests, kinds) =
+            blob_refs_to_columns(&refs).expect("manifest with blobs yields columns");
+        assert_eq!(digests, vec!["sha256:cfg", "sha256:l1", "sha256:l2"]);
+        assert_eq!(kinds, vec!["config", "layer", "layer"]);
+    }
+
+    #[test]
+    fn blob_refs_to_columns_none_for_blobless_manifest_body() {
+        // An image index has no config/layers -> extract yields nothing ->
+        // columns are None so record_manifest_blob_refs inserts zero rows.
+        let index = br#"{"manifests": [{"digest": "sha256:child"}]}"#;
+        let refs = extract_blob_refs(index);
+        assert!(blob_refs_to_columns(&refs).is_none());
     }
 }
 

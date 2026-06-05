@@ -49,6 +49,31 @@ pub struct BackfillStats {
     pub candidates_failed: usize,
 }
 
+impl BackfillStats {
+    /// Initial stats for a pass over `n` candidates: `candidates_scanned`
+    /// is fixed up front (it equals the number of distinct manifests we
+    /// will visit), the per-candidate counters start at zero. Pure so the
+    /// initialization is unit-testable without a DB scan.
+    fn for_candidates(n: usize) -> Self {
+        Self {
+            candidates_scanned: n,
+            ..Self::default()
+        }
+    }
+
+    /// Fold one candidate's outcome into the running totals: a success adds
+    /// its inserted-edge count, a failure bumps `candidates_failed`.
+    /// `candidates_scanned` is untouched (it is fixed by
+    /// [`for_candidates`]). Pure so the loop's accounting is unit-testable
+    /// without exercising the DB-backed `process_candidate`.
+    fn record_candidate_result(&mut self, outcome: &Result<usize, String>) {
+        match outcome {
+            Ok(inserted) => self.edges_inserted += inserted,
+            Err(_) => self.candidates_failed += 1,
+        }
+    }
+}
+
 /// Run the one-shot backfill. Returns a stats struct; never errors at the
 /// function boundary (backfill failures are logged and counted in
 /// `candidates_failed`). Server startup must not be blocked by a single
@@ -65,10 +90,7 @@ pub async fn run_backfill(db: &PgPool, registry: Arc<StorageRegistry>) -> Backfi
         }
     };
 
-    let mut stats = BackfillStats {
-        candidates_scanned: candidates.len(),
-        ..BackfillStats::default()
-    };
+    let mut stats = BackfillStats::for_candidates(candidates.len());
 
     if candidates.is_empty() {
         return stats;
@@ -80,18 +102,16 @@ pub async fn run_backfill(db: &PgPool, registry: Arc<StorageRegistry>) -> Backfi
     );
 
     for candidate in candidates {
-        match process_candidate(db, &registry, &candidate).await {
-            Ok(inserted) => stats.edges_inserted += inserted,
-            Err(e) => {
-                tracing::warn!(
-                    manifest_digest = candidate.manifest_digest.as_str(),
-                    repository_id = %candidate.repository_id,
-                    error = %e,
-                    "manifest_blob_refs backfill: skipped image manifest"
-                );
-                stats.candidates_failed += 1;
-            }
+        let outcome = process_candidate(db, &registry, &candidate).await;
+        if let Err(e) = &outcome {
+            tracing::warn!(
+                manifest_digest = candidate.manifest_digest.as_str(),
+                repository_id = %candidate.repository_id,
+                error = %e,
+                "manifest_blob_refs backfill: skipped image manifest"
+            );
         }
+        stats.record_candidate_result(&outcome);
     }
 
     tracing::info!(
@@ -103,12 +123,82 @@ pub async fn run_backfill(db: &PgPool, registry: Arc<StorageRegistry>) -> Backfi
     stats
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BackfillCandidate {
     manifest_digest: String,
     repository_id: Uuid,
     storage_backend: String,
     storage_path: String,
+}
+
+impl BackfillCandidate {
+    /// Build a candidate from the four scalar columns of the selection
+    /// query. Pure (no DB row coupling) so the field wiring is unit-
+    /// testable; `select_unbackfilled_manifests` calls this once per row.
+    fn new(
+        manifest_digest: String,
+        repository_id: Uuid,
+        storage_backend: String,
+        storage_path: String,
+    ) -> Self {
+        Self {
+            manifest_digest,
+            repository_id,
+            storage_backend,
+            storage_path,
+        }
+    }
+
+    /// The storage key under which an OCI image manifest body is stored.
+    /// Kept here (next to its only consumer) and pure so the key layout is
+    /// pinned by a unit test rather than only exercised by Tier-2 storage
+    /// reads.
+    fn storage_key(&self) -> String {
+        format!("oci-manifests/{}", self.manifest_digest)
+    }
+
+    /// The [`StorageLocation`] used to resolve this candidate's backend.
+    fn location(&self) -> StorageLocation {
+        StorageLocation {
+            backend: self.storage_backend.clone(),
+            path: self.storage_path.clone(),
+        }
+    }
+}
+
+/// Reject a manifest body that exceeds [`MAX_IMAGE_MANIFEST_BYTES`] before
+/// it is parsed, returning the WARN-level skip reason. Pure size check,
+/// split out so the cap behaviour is unit-testable without storage.
+fn check_manifest_size(len: usize) -> Result<(), String> {
+    if len > MAX_IMAGE_MANIFEST_BYTES {
+        return Err(format!(
+            "image manifest body exceeds {} bytes (got {}); skipping JSON parse",
+            MAX_IMAGE_MANIFEST_BYTES, len
+        ));
+    }
+    Ok(())
+}
+
+/// The skip reason recorded when a candidate's storage backend cannot be
+/// resolved. Pure formatter so the message is unit-testable without a
+/// `StorageRegistry`; `process_candidate` maps the backend-resolution
+/// error through it.
+fn backend_resolve_error(e: impl std::fmt::Display) -> String {
+    format!("resolve storage backend: {}", e)
+}
+
+/// The skip reason recorded when the manifest body cannot be read from
+/// storage (missing key, IO failure). Pure formatter, mapped from the
+/// storage `get` error in `process_candidate`.
+fn storage_read_error(e: impl std::fmt::Display) -> String {
+    format!("read manifest from storage: {}", e)
+}
+
+/// The skip reason recorded when the `manifest_blob_refs` insert fails.
+/// Pure formatter, mapped from the `record_manifest_blob_refs` DB error in
+/// `process_candidate`.
+fn insert_rows_error(e: impl std::fmt::Display) -> String {
+    format!("insert manifest_blob_refs rows: {}", e)
 }
 
 /// Select the distinct (manifest_digest, repository_id) tuples for image
@@ -161,11 +251,13 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
 
     let candidates = rows
         .into_iter()
-        .map(|r| BackfillCandidate {
-            manifest_digest: r.try_get("manifest_digest").unwrap_or_default(),
-            repository_id: r.try_get("repository_id").unwrap_or_default(),
-            storage_backend: r.try_get("storage_backend").unwrap_or_default(),
-            storage_path: r.try_get("storage_path").unwrap_or_default(),
+        .map(|r| {
+            BackfillCandidate::new(
+                r.try_get("manifest_digest").unwrap_or_default(),
+                r.try_get("repository_id").unwrap_or_default(),
+                r.try_get("storage_backend").unwrap_or_default(),
+                r.try_get("storage_path").unwrap_or_default(),
+            )
         })
         .collect();
     Ok(candidates)
@@ -188,27 +280,16 @@ async fn process_candidate(
     registry: &StorageRegistry,
     candidate: &BackfillCandidate,
 ) -> Result<usize, String> {
-    let location = StorageLocation {
-        backend: candidate.storage_backend.clone(),
-        path: candidate.storage_path.clone(),
-    };
     let storage = registry
-        .backend_for(&location)
-        .map_err(|e| format!("resolve storage backend: {}", e))?;
+        .backend_for(&candidate.location())
+        .map_err(backend_resolve_error)?;
 
-    let storage_key = format!("oci-manifests/{}", candidate.manifest_digest);
     let body = storage
-        .get(&storage_key)
+        .get(&candidate.storage_key())
         .await
-        .map_err(|e| format!("read manifest from storage: {}", e))?;
+        .map_err(storage_read_error)?;
 
-    if body.len() > MAX_IMAGE_MANIFEST_BYTES {
-        return Err(format!(
-            "image manifest body exceeds {} bytes (got {}); skipping JSON parse",
-            MAX_IMAGE_MANIFEST_BYTES,
-            body.len()
-        ));
-    }
+    check_manifest_size(body.len())?;
 
     let inserted = crate::api::handlers::oci_v2::record_manifest_blob_refs(
         db,
@@ -217,7 +298,7 @@ async fn process_candidate(
         &body,
     )
     .await
-    .map_err(|e| format!("insert manifest_blob_refs rows: {}", e))?;
+    .map_err(insert_rows_error)?;
 
     Ok(inserted)
 }
@@ -250,4 +331,127 @@ mod tests {
     // invocation.
     const _SANE_LOWER: () = assert!(MAX_IMAGE_MANIFEST_BYTES >= 64 * 1024);
     const _SANE_UPPER: () = assert!(MAX_IMAGE_MANIFEST_BYTES <= 16 * 1024 * 1024);
+
+    // -- BackfillStats accounting helpers -----------------------------------
+
+    #[test]
+    fn for_candidates_fixes_scanned_and_zeroes_counters() {
+        let s = BackfillStats::for_candidates(7);
+        assert_eq!(s.candidates_scanned, 7);
+        assert_eq!(s.edges_inserted, 0);
+        assert_eq!(s.candidates_failed, 0);
+    }
+
+    #[test]
+    fn for_candidates_zero_is_all_zero() {
+        let s = BackfillStats::for_candidates(0);
+        assert_eq!(s.candidates_scanned, 0);
+        assert_eq!(s.edges_inserted, 0);
+        assert_eq!(s.candidates_failed, 0);
+    }
+
+    #[test]
+    fn record_candidate_result_accumulates_inserted_edges() {
+        let mut s = BackfillStats::for_candidates(3);
+        s.record_candidate_result(&Ok(2));
+        s.record_candidate_result(&Ok(5));
+        assert_eq!(s.edges_inserted, 7);
+        assert_eq!(s.candidates_failed, 0);
+        // candidates_scanned is fixed up front, never touched by folding.
+        assert_eq!(s.candidates_scanned, 3);
+    }
+
+    #[test]
+    fn record_candidate_result_counts_failures() {
+        let mut s = BackfillStats::for_candidates(3);
+        s.record_candidate_result(&Err("boom".to_string()));
+        s.record_candidate_result(&Ok(4));
+        s.record_candidate_result(&Err("missing".to_string()));
+        assert_eq!(s.candidates_failed, 2);
+        assert_eq!(s.edges_inserted, 4);
+        assert_eq!(s.candidates_scanned, 3);
+    }
+
+    #[test]
+    fn record_candidate_result_ok_zero_is_noop_on_counts() {
+        // A successfully-processed manifest that contributed no new edges
+        // (e.g. all rows already present) must not be counted as a failure.
+        let mut s = BackfillStats::for_candidates(1);
+        s.record_candidate_result(&Ok(0));
+        assert_eq!(s.edges_inserted, 0);
+        assert_eq!(s.candidates_failed, 0);
+    }
+
+    // -- BackfillCandidate pure derivations ---------------------------------
+
+    fn sample_candidate() -> BackfillCandidate {
+        BackfillCandidate::new(
+            "sha256:abc123".to_string(),
+            Uuid::nil(),
+            "filesystem".to_string(),
+            "/var/lib/ak/repo".to_string(),
+        )
+    }
+
+    #[test]
+    fn candidate_new_wires_all_fields() {
+        let c = sample_candidate();
+        assert_eq!(c.manifest_digest, "sha256:abc123");
+        assert_eq!(c.repository_id, Uuid::nil());
+        assert_eq!(c.storage_backend, "filesystem");
+        assert_eq!(c.storage_path, "/var/lib/ak/repo");
+    }
+
+    #[test]
+    fn candidate_storage_key_prefixes_oci_manifests() {
+        assert_eq!(
+            sample_candidate().storage_key(),
+            "oci-manifests/sha256:abc123"
+        );
+    }
+
+    #[test]
+    fn candidate_location_carries_backend_and_path() {
+        let loc = sample_candidate().location();
+        assert_eq!(loc.backend, "filesystem");
+        assert_eq!(loc.path, "/var/lib/ak/repo");
+    }
+
+    // -- check_manifest_size cap --------------------------------------------
+
+    #[test]
+    fn check_manifest_size_accepts_small_and_boundary_bodies() {
+        assert!(check_manifest_size(0).is_ok());
+        assert!(check_manifest_size(1024).is_ok());
+        // Exactly at the cap is allowed; only strictly-larger is rejected.
+        assert!(check_manifest_size(MAX_IMAGE_MANIFEST_BYTES).is_ok());
+    }
+
+    #[test]
+    fn check_manifest_size_rejects_oversized_body() {
+        let err = check_manifest_size(MAX_IMAGE_MANIFEST_BYTES + 1)
+            .expect_err("body over the cap must be rejected");
+        assert!(err.contains("exceeds"));
+        assert!(err.contains(&(MAX_IMAGE_MANIFEST_BYTES + 1).to_string()));
+    }
+
+    // -- per-stage skip-reason formatters -----------------------------------
+
+    #[test]
+    fn backend_resolve_error_describes_stage_and_cause() {
+        let msg = backend_resolve_error("no such backend 's3'");
+        assert_eq!(msg, "resolve storage backend: no such backend 's3'");
+    }
+
+    #[test]
+    fn storage_read_error_describes_stage_and_cause() {
+        let msg = storage_read_error("key not found");
+        assert_eq!(msg, "read manifest from storage: key not found");
+    }
+
+    #[test]
+    fn insert_rows_error_describes_stage_and_cause() {
+        let msg = insert_rows_error("connection reset");
+        assert_eq!(msg, "insert manifest_blob_refs rows: connection reset");
+    }
 }
