@@ -64,12 +64,14 @@ pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
 }
 
 /// Collect a case-insensitive (upper-cased) set of CVE identifiers from a
-/// slice of curated `CveHistoryEntry` rows.
+/// slice of `CveHistoryEntry` rows.
 ///
-/// Pulled out of the read paths so the dedupe-by-cve normalization is
-/// covered by unit tests without needing a database. The CVE-history
-/// pipeline calls this once per query to build the `known` set passed to
-/// `build_cve_entries_from_scan_findings`.
+/// Pulled out so the dedupe-by-cve normalization is covered by unit tests
+/// without needing a database. As of #1616/#1620 the read paths source CVE
+/// data solely from `scan_findings` (the `cve_history` reads were dead), so
+/// the production `known` set is always empty; this helper is retained for
+/// the dedupe-contract unit tests of `scan_row_passes_known_filter`.
+#[cfg(test)]
 pub(crate) fn build_known_cve_set(entries: &[CveHistoryEntry]) -> HashSet<String> {
     entries
         .iter()
@@ -557,20 +559,12 @@ FROM (
 ) inner_ranked
 "#;
 
-/// `fixed_cves` count: union of curated `cve_history` rows with status='fixed'
-/// and "fell off on rescan" CVEs, deduped by (artifact_id, cve_id). Repo-
-/// scoped variant. (#1375)
+/// `fixed_cves` count: "fell off on rescan" CVEs, deduped by (artifact_id,
+/// cve_id). Repo-scoped variant. The legacy `curated_fixed` CTE (from the
+/// never-written `cve_history` table) was dropped (#1616/#1620); only the
+/// `disappeared`-from-`scan_findings` half ever contributed real data. (#1375)
 pub(crate) const FIXED_CVES_COUNT_REPO_SQL: &str = r#"
-WITH curated_fixed AS (
-    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
-    FROM cve_history ch
-    JOIN artifacts a ON ch.artifact_id = a.id
-    WHERE ch.status = 'fixed'
-      AND ch.cve_id IS NOT NULL
-      AND a.repository_id = $1
-      AND NOT a.is_deleted
-),
-latest_scans AS (
+WITH latest_scans AS (
     SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
         sr.id, sr.artifact_id, sr.scan_type
     FROM scan_results sr
@@ -598,26 +592,15 @@ disappeared AS (
     SELECT e.artifact_id, e.cve_id FROM ever_seen e
     EXCEPT
     SELECT s.artifact_id, s.cve_id FROM still_present s
-),
-unioned AS (
-    SELECT artifact_id, cve_id FROM curated_fixed
-    UNION
-    SELECT artifact_id, cve_id FROM disappeared
 )
-SELECT COUNT(*) FROM unioned
+SELECT COUNT(*) FROM disappeared
 "#;
 
-/// `fixed_cves` count, all-repos variant.
+/// `fixed_cves` count, all-repos variant. The legacy `curated_fixed` CTE
+/// (from the never-written `cve_history` table) was dropped (#1616/#1620);
+/// only the `disappeared`-from-`scan_findings` half ever contributed data.
 pub(crate) const FIXED_CVES_COUNT_ALL_SQL: &str = r#"
-WITH curated_fixed AS (
-    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
-    FROM cve_history ch
-    JOIN artifacts a ON ch.artifact_id = a.id
-    WHERE ch.status = 'fixed'
-      AND ch.cve_id IS NOT NULL
-      AND NOT a.is_deleted
-),
-latest_scans AS (
+WITH latest_scans AS (
     SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
         sr.id, sr.artifact_id, sr.scan_type
     FROM scan_results sr
@@ -643,13 +626,8 @@ disappeared AS (
     SELECT e.artifact_id, e.cve_id FROM ever_seen e
     EXCEPT
     SELECT s.artifact_id, s.cve_id FROM still_present s
-),
-unioned AS (
-    SELECT artifact_id, cve_id FROM curated_fixed
-    UNION
-    SELECT artifact_id, cve_id FROM disappeared
 )
-SELECT COUNT(*) FROM unioned
+SELECT COUNT(*) FROM disappeared
 "#;
 
 /// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
@@ -1006,40 +984,30 @@ impl SbomService {
     }
 
     /// Get CVE history for an artifact.
+    ///
+    /// Sourced entirely from `scan_findings`, the populated source of truth.
+    /// The legacy `cve_history` SELECT was dropped (#1616/#1620): the table is
+    /// never written, so it only ever returned empty rows. We still de-dupe by
+    /// `cve_id` (case-insensitive) for safety. The `cve_history` table itself
+    /// is retained per migration 112 (v1.3.0 owns the drop).
     pub async fn get_cve_history(&self, artifact_id: Uuid) -> Result<Vec<CveHistoryEntry>> {
-        // Primary source: legacy `cve_history` table (manual / promoted entries).
-        let mut entries = sqlx::query_as::<_, CveHistoryEntry>(
-            r#"
-            SELECT * FROM cve_history
-            WHERE artifact_id = $1
-            ORDER BY first_detected_at DESC
-            "#,
-        )
-        .bind(artifact_id)
-        .fetch_all(&self.db)
-        .await?;
-
-        // Fallback / supplement: derive CVE-shaped entries from `scan_findings`
-        // for findings the scanner produced but never wrote into `cve_history`
-        // (see #1375: `record_cve` is presently dead code, so the scan-derived
-        // path is the only source of real CVE data). De-dupe by `cve_id` so a
-        // CVE that exists in both tables surfaces once with the curated row.
-        // Normalize to upper-case so the dedupe is case-insensitive (schema
-        // does not constrain `cve_id` case in either table).
-        let known = build_known_cve_set(&entries);
-        let scan_entries = self
+        // Derive CVE-shaped entries from `scan_findings` -- the only source of
+        // real CVE data (see #1375: `record_cve` is dead code, `cve_history`
+        // has zero writers). Empty known-set: no curated rows to dedupe against.
+        let known = HashSet::new();
+        let mut entries = self
             .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
             .await?;
-        entries.extend(scan_entries);
         sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
 
     /// Get CVE history for a single CVE identifier across artifacts.
     ///
-    /// Reads from both `cve_history` (curated rows) and `scan_findings` (live
-    /// scanner output) so that callers see the full set of artifacts where
-    /// this CVE has ever been detected.
+    /// Reads from `scan_findings` (live scanner output) so that callers see
+    /// the full set of artifacts where this CVE has ever been detected. The
+    /// legacy `cve_history` read was dropped (#1616/#1620): that table is never
+    /// written, so it only ever returned empty rows.
     ///
     /// # `allowed_repo_ids` contract (ADMIN-ONLY when `None`)
     ///
@@ -1078,60 +1046,23 @@ impl SbomService {
         // upper-cased form for display/known-set dedupe below.
         let cve_id_upper = cve_id.to_ascii_uppercase();
 
-        // 1. Curated rows from cve_history. We join through artifacts so we
-        //    can filter by allowed_repo_ids without a second round-trip.
-        //    LOWER(...)=LOWER(...) so a scanner that wrote lower-case still
-        //    matches an upper-case query (and vice versa).
-        let mut entries: Vec<CveHistoryEntry> = if let Some(repo_ids) = allowed_repo_ids {
-            sqlx::query_as::<_, CveHistoryEntry>(
-                r#"
-                SELECT ch.*
-                FROM cve_history ch
-                JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE LOWER(ch.cve_id) = LOWER($1)
-                  AND a.repository_id = ANY($2)
-                  AND NOT a.is_deleted
-                ORDER BY ch.first_detected_at DESC
-                "#,
-            )
-            .bind(&cve_id_upper)
-            .bind(repo_ids)
-            .fetch_all(&self.db)
-            .await?
-        } else {
-            sqlx::query_as::<_, CveHistoryEntry>(
-                r#"
-                SELECT ch.*
-                FROM cve_history ch
-                JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE LOWER(ch.cve_id) = LOWER($1)
-                  AND NOT a.is_deleted
-                ORDER BY ch.first_detected_at DESC
-                "#,
-            )
-            .bind(&cve_id_upper)
-            .fetch_all(&self.db)
-            .await?
-        };
-
-        // 2. Live findings from scan_findings, skipping cve_ids we already
-        //    surfaced via the curated path. `known` is normalized so the
-        //    dedupe is case-insensitive too.
-        let known = build_known_cve_set(&entries);
+        // Live findings from `scan_findings`, the only populated source. The
+        // legacy `cve_history` SELECT was dropped (#1616/#1620): the table is
+        // never written, so it only ever contributed empty rows. Empty
+        // known-set: no curated rows to dedupe against.
+        let known = HashSet::new();
         let scan_entries = self
             .build_cve_entries_from_scan_findings(None, Some(&cve_id_upper), &known)
             .await?;
-        // For scan-derived entries we additionally enforce the repo filter
-        // (artifact-level lookup already enforced it inside the helper, so
-        // here we only need to re-scope by allowed_repo_ids).
-        let scan_entries = match allowed_repo_ids {
+        // Enforce the repo filter on scan-derived entries (they are synthesized
+        // on the fly, so the filter cannot live in the SQL `WHERE`).
+        let mut entries = match allowed_repo_ids {
             None => scan_entries,
             Some(repo_ids) => {
                 let allowed: HashSet<Uuid> = repo_ids.iter().copied().collect();
                 self.filter_entries_by_repo(scan_entries, &allowed).await?
             }
         };
-        entries.extend(scan_entries);
         sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
@@ -1376,15 +1307,12 @@ impl SbomService {
     /// direct equivalent in `scan_findings`. We approximate:
     ///   - open: findings where `NOT is_acknowledged`
     ///   - acknowledged: findings where `is_acknowledged`
-    ///   - fixed: union of two sources, deduped by (artifact_id, cve_id):
-    ///     (a) curated `cve_history` rows with `status='fixed'` (preserves
-    ///     the legacy admin/promotion-policy semantic for the rare callers
-    ///     that write to that table); plus
-    ///     (b) CVEs that appeared in an earlier `scan_findings` row for an
+    ///   - fixed: CVEs that appeared in an earlier `scan_findings` row for an
     ///     artifact but are absent from that artifact's most recent
     ///     `scan_results` (per `scan_type`). "Disappeared on rescan" is the
     ///     closest signal we have to a fixed CVE without a real fixed-at
-    ///     timestamp.
+    ///     timestamp. (#1616/#1620 dropped the dead `cve_history` curated half,
+    ///     which always contributed zero.)
     ///
     /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
     /// double-count a single vulnerability.
@@ -1428,13 +1356,10 @@ impl SbomService {
 
         let timeline = project_timeline_rows(&timeline_rows, Utc::now());
 
-        // fixed_cves: union of two definitions, deduped by (artifact_id, cve_id):
-        //   (a) curated `cve_history` rows with status='fixed'
-        //   (b) CVEs present in an earlier scan_findings row for an artifact
-        //       but absent from that artifact's most recent scan_result per
-        //       scan_type (i.e. they "fell off" on rescan)
-        // This avoids the silent-zero regression while still being correct
-        // when no curated rows exist.
+        // fixed_cves: CVEs present in an earlier scan_findings row for an
+        // artifact but absent from that artifact's most recent scan_result per
+        // scan_type (i.e. they "fell off" on rescan). #1616/#1620 dropped the
+        // dead `cve_history` curated-fixed half, which was always empty.
         let fixed_cves: i64 = if let Some(repo_id) = repository_id {
             sqlx::query_scalar(FIXED_CVES_COUNT_REPO_SQL)
                 .bind(repo_id)
@@ -4075,18 +4000,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_cves_count_repo_sql_unions_curated_and_disappeared() {
-        // fixed = curated_fixed UNION disappeared (dedup by artifact_id +
-        // cve_id). Losing either CTE would silently zero one of the two
-        // signals.
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("WITH curated_fixed AS"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("latest_scans AS"));
+    fn test_fixed_cves_count_repo_sql_counts_disappeared_from_scan_findings() {
+        // fixed = disappeared (ever_seen EXCEPT still_present, from
+        // scan_findings). The legacy `curated_fixed` CTE was dropped
+        // (#1616/#1620): `cve_history` is never written, so it always added
+        // zero. The scan-derived CTE chain must survive.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("WITH latest_scans AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ever_seen AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("still_present AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("disappeared AS"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM curated_fixed"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("UNION"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM disappeared"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT COUNT(*) FROM disappeared"));
+        // The dead curated path must be gone, not merely unused.
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("curated_fixed"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("UNION"));
     }
 
     #[test]
@@ -4115,11 +4042,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_cves_count_repo_sql_curated_fixed_uses_status_fixed() {
-        // Curated fixed rows must filter by status='fixed', not by the
-        // acknowledged column (a different semantic).
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ch.status = 'fixed'"));
-        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("ch.status = 'fixed'"));
+    fn test_fixed_cves_count_sql_drops_dead_cve_history_curated_path() {
+        // #1616/#1620: the `curated_fixed` CTE read from the never-written
+        // `cve_history` table and always contributed zero. Both variants must
+        // count fixed CVEs solely from the scan-derived `disappeared` CTE.
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("curated_fixed"));
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.contains("curated_fixed"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("SELECT COUNT(*) FROM disappeared"));
     }
 
     #[test]
@@ -4131,10 +4062,10 @@ mod tests {
 
     #[test]
     fn test_fixed_cves_count_repo_sql_lowercases_cve_id() {
-        // The dedupe is on LOWER(cve_id) so the curated and scan paths
-        // collide regardless of how each side cased the id.
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(ch.cve_id)"));
+        // The scan-derived CTEs normalize on LOWER(cve_id) so the ever_seen /
+        // still_present EXCEPT collides regardless of how the scanner cased id.
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(sf.cve_id)"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("LOWER(sf.cve_id)"));
     }
 
     #[test]
