@@ -365,6 +365,41 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
     }
 }
 
+/// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
+///
+/// Every buffered/uncached wrapper follows the same three-step shape:
+/// build a minimal [`Repository`] via [`build_remote_repo`], invoke one
+/// `ProxyService` method against it, and translate any [`AppError`] into an
+/// HTTP error [`Response`] via [`map_proxy_error`]. This helper performs the
+/// build and the error mapping once; the caller supplies the middle step as a
+/// closure that receives the constructed `&Repository`.
+///
+/// The closure is generic over its success type `T` so wrappers returning
+/// `(Bytes, Option<String>)`, `(Bytes, Option<String>, String)`, etc. all route
+/// through the same code path without behaviour change.
+///
+/// `error_path` is the value forwarded to [`map_proxy_error`]; callers pass
+/// whatever path their original wrapper logged (e.g. `proxy_fetch_with_cache_key`
+/// passes its `fetch_path`, not the cache path).
+async fn with_proxy_repo<T, F, Fut>(
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    error_path: &str,
+    fetch: F,
+) -> Result<T, Response>
+where
+    F: FnOnce(Repository) -> Fut,
+    Fut: Future<Output = Result<T, AppError>>,
+{
+    // Construct a minimal Repository that satisfies the ProxyService methods.
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    fetch(repo)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, error_path, e))
+}
+
 /// Attempt to fetch an artifact from the upstream via the proxy service.
 /// Constructs a minimal `Repository` model from handler-level repo info.
 /// Returns `(content_bytes, content_type)` on success.
@@ -383,13 +418,10 @@ pub async fn proxy_fetch(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    // Construct a minimal Repository that satisfies ProxyService::fetch_artifact
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_artifact(&repo, path).await
+    })
+    .await
 }
 
 /// Variant of [`proxy_fetch`] that forwards an `Accept` header to the upstream.
@@ -406,12 +438,12 @@ pub async fn proxy_fetch_with_accept(
     path: &str,
     accept: Option<&str>,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact_with_accept(&repo, path, accept)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_with_accept(&repo, path, accept)
+            .await
+    })
+    .await
 }
 
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
@@ -815,12 +847,18 @@ pub async fn proxy_fetch_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
+                .await
+        },
+    )
+    .await
 }
 
 /// Fetch from upstream directly, bypassing the proxy cache.
@@ -838,12 +876,10 @@ pub async fn proxy_fetch_uncached(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>, String), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_upstream_direct(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_upstream_direct(&repo, path).await
+    })
+    .await
 }
 
 /// Fetch from upstream directly, preserving the upstream `Link` header.
@@ -854,12 +890,12 @@ pub async fn proxy_fetch_uncached_with_link(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_upstream_direct_with_link(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_with_link(&repo, path)
+            .await
+    })
+    .await
 }
 
 /// Strategy for fetching an artifact from a single virtual member.
@@ -2812,6 +2848,87 @@ mod tests {
         let after = Utc::now();
         assert!(repo.created_at >= before && repo.created_at <= after);
         assert!(repo.updated_at >= before && repo.updated_at <= after);
+    }
+
+    // ── with_proxy_repo tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_passes_through_ok_value() {
+        // On success the helper forwards the closure's value unchanged and
+        // hands the constructed Repository (built from the supplied args) to
+        // the closure.
+        let id = Uuid::new_v4();
+        let result: Result<(Bytes, Option<String>), Response> = with_proxy_repo(
+            id,
+            "ok-repo",
+            "https://upstream.example.com",
+            "some/path",
+            |repo| async move {
+                assert_eq!(repo.id, id);
+                assert_eq!(repo.key, "ok-repo");
+                assert_eq!(
+                    repo.upstream_url.as_deref(),
+                    Some("https://upstream.example.com")
+                );
+                Ok((
+                    Bytes::from_static(b"payload"),
+                    Some("text/plain".to_string()),
+                ))
+            },
+        )
+        .await;
+
+        let (bytes, content_type) = result.expect("expected Ok result");
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert_eq!(content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_not_found_to_404() {
+        // An upstream NotFound is mapped via map_proxy_error to a 404.
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "missing-repo",
+            "https://upstream.example.com",
+            "missing/path",
+            |_repo| async move { Err(AppError::NotFound("nope".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_validation_to_400() {
+        // A Validation error is mapped to a 400 (path-traversal guard).
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "bad-path-repo",
+            "https://upstream.example.com",
+            "../escape",
+            |_repo| async move { Err(AppError::Validation("bad".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_other_error_to_502() {
+        // Anything else (timeouts, TLS, body read) folds into 502.
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "flaky-repo",
+            "https://upstream.example.com",
+            "p",
+            |_repo| async move { Err(AppError::Internal("boom".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     // ── reject_write_if_not_hosted tests ─────────────────────────────
