@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
-use crate::services::proxy_hydration::coordinate_proxy_hydration;
+use crate::services::proxy_hydration::{BufferedCoordinator, Coordinator};
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -1578,6 +1578,19 @@ pub struct ProxyService {
     /// delegate here. It holds the shared `http_client` and the bearer
     /// `token_cache` that previously lived directly on `ProxyService`.
     upstream_client: UpstreamClient,
+    /// Single-flight coordinator for proxy cache hydration (#1631 layer 1).
+    /// The buffered slow path (`fetch_artifact_with_cache_path_and_accept`)
+    /// elects a leader through this seam; the leader runs the upstream fetch +
+    /// cache write while followers wait and re-check the cache. Injected as a
+    /// concrete field, mirroring `CacheStore`/`UpstreamClient`/`CachePersister`
+    /// (#1618 S7/S8/S9).
+    ///
+    /// // #1631 layer 2: the streaming path (`fetch_artifact_streaming`) will
+    /// //               coordinate through a streaming entry point on this same
+    /// //               seam (broadcast fan-out, not buffered re-check).
+    /// // #1631 layer 3: a cross-replica advisory-lock decorator (#1609) can
+    /// //               replace this field with a wrapping `Coordinator` impl.
+    coordinator: BufferedCoordinator,
 }
 
 impl ProxyService {
@@ -1604,6 +1617,10 @@ impl ProxyService {
         let cache_store = CacheStore::new(Arc::clone(&storage));
         let cache_persister = CachePersister::new(Arc::clone(&storage));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
+        // #1631 layer 1: inject the in-process buffered single-flight
+        // coordinator. Layer 3 (#1609) can swap this for an advisory-lock
+        // decorator without touching call sites.
+        let coordinator = BufferedCoordinator::new();
 
         Self {
             db,
@@ -1611,6 +1628,7 @@ impl ProxyService {
             cache_store,
             cache_persister,
             upstream_client,
+            coordinator,
         }
     }
 
@@ -1766,7 +1784,10 @@ impl ProxyService {
         }
 
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
-        coordinate_proxy_hydration(
+        // #1631 layer 1: buffered single-flight via the injected coordinator
+        // seam (was a direct `coordinate_proxy_hydration` call). The streaming
+        // path below (`fetch_artifact_streaming`) is the layer-2 plug-in point.
+        self.coordinator.coordinate(
             &hydration_lease_key,
             || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
             || async {
