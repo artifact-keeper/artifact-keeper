@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::services::package_service::PackageService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,16 @@ pub struct CreateSessionRequest {
     pub repository_key: String,
     /// Path within the repository (e.g. "images/vm.ova")
     pub artifact_path: String,
+    /// Artifact name to persist when the upload completes.
+    ///
+    /// Optional for regular client uploads. Peer replication sets this from
+    /// the source artifact row so chunked replication preserves metadata.
+    pub artifact_name: Option<String>,
+    /// Artifact version to persist when the upload completes.
+    ///
+    /// Optional for regular client uploads. Peer replication sets this from
+    /// the source artifact row so chunked replication preserves metadata.
+    pub artifact_version: Option<String>,
     /// Total file size in bytes
     pub total_size: i64,
     /// Expected SHA256 checksum of the complete file
@@ -150,6 +161,8 @@ async fn create_session(
         repo_id: repo.0,
         repo_key: &req.repository_key,
         artifact_path: &req.artifact_path,
+        artifact_name: req.artifact_name.as_deref(),
+        artifact_version: req.artifact_version.as_deref(),
         total_size: req.total_size,
         chunk_size: req.chunk_size,
         checksum_sha256: &req.checksum_sha256,
@@ -387,21 +400,24 @@ async fn complete(
     let _ = tokio::fs::remove_file(&temp_path).await;
 
     // Create artifact record
+    let artifact_name = completed_artifact_name(&session);
+    let artifact_version = completed_artifact_version(&session);
     let artifact_id: Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
                                checksum_sha256, content_type, storage_key, uploaded_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (repository_id, path) DO UPDATE SET
-            size_bytes = $5, checksum_sha256 = $6, content_type = $7, storage_key = $8,
-            uploaded_by = $9, updated_at = NOW(), is_deleted = false
+            name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
+            content_type = $7, storage_key = $8, uploaded_by = $9,
+            updated_at = NOW(), is_deleted = false
         RETURNING id
         "#,
     )
     .bind(session.repository_id)
     .bind(&session.artifact_path)
-    .bind(artifact_name_from_path(&session.artifact_path))
-    .bind::<Option<String>>(None) // version
+    .bind(artifact_name)
+    .bind(artifact_version)
     .bind(session.total_size)
     .bind(&session.checksum_sha256)
     .bind(&session.content_type)
@@ -410,6 +426,20 @@ async fn complete(
     .fetch_one(&state.db)
     .await
     .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if let Some((package_name, package_version)) = completed_package_catalog_entry(&session) {
+        PackageService::new(state.db.clone())
+            .try_create_or_update_from_artifact(
+                session.repository_id,
+                package_name,
+                package_version,
+                session.total_size,
+                &session.checksum_sha256,
+                None,
+                None,
+            )
+            .await;
+    }
 
     tracing::info!(
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
@@ -523,6 +553,28 @@ fn artifact_name_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+fn completed_artifact_name(session: &upload_service::UploadSession) -> &str {
+    session
+        .artifact_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| artifact_name_from_path(&session.artifact_path))
+}
+
+fn completed_artifact_version(session: &upload_service::UploadSession) -> Option<&str> {
+    session
+        .artifact_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+}
+
+fn completed_package_catalog_entry(
+    session: &upload_service::UploadSession,
+) -> Option<(&str, &str)> {
+    let version = completed_artifact_version(session)?;
+    Some((completed_artifact_name(session), version))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -583,6 +635,80 @@ mod tests {
         );
     }
 
+    fn test_upload_session(
+        path: &str,
+        name: Option<&str>,
+        version: Option<&str>,
+    ) -> upload_service::UploadSession {
+        upload_service::UploadSession {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            repository_key: "repo".to_string(),
+            artifact_path: path.to_string(),
+            artifact_name: name.map(str::to_string),
+            artifact_version: version.map(str::to_string),
+            content_type: "application/octet-stream".to_string(),
+            total_size: 1,
+            chunk_size: 1_048_576,
+            total_chunks: 1,
+            completed_chunks: 1,
+            bytes_received: 1,
+            checksum_sha256: "deadbeef".to_string(),
+            temp_file_path: "/tmp/upload-session".to_string(),
+            status: "completed".to_string(),
+            error_message: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_completed_artifact_metadata_prefers_session_metadata() {
+        let session = test_upload_session(
+            "name-check/20260603T072902Z/large-160m.bin",
+            Some("name-check"),
+            Some("20260603T072902Z"),
+        );
+
+        assert_eq!(completed_artifact_name(&session), "name-check");
+        assert_eq!(
+            completed_artifact_version(&session),
+            Some("20260603T072902Z")
+        );
+    }
+
+    #[test]
+    fn test_completed_artifact_metadata_falls_back_to_path_basename() {
+        let session = test_upload_session("name-check/20260603T072902Z/large-160m.bin", None, None);
+
+        assert_eq!(completed_artifact_name(&session), "large-160m.bin");
+        assert_eq!(completed_artifact_version(&session), None);
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_uses_session_metadata() {
+        let session = test_upload_session(
+            "large-check/20260603T082854Z/large-160m.bin",
+            Some("large-check"),
+            Some("20260603T082854Z"),
+        );
+
+        assert_eq!(
+            completed_package_catalog_entry(&session),
+            Some(("large-check", "20260603T082854Z"))
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_skips_unversioned_upload() {
+        let session =
+            test_upload_session("large-check/20260603T082854Z/large-160m.bin", None, None);
+
+        assert_eq!(completed_package_catalog_entry(&session), None);
+    }
+
     // -----------------------------------------------------------------------
     // CreateSessionRequest deserialization
     // -----------------------------------------------------------------------
@@ -592,6 +718,8 @@ mod tests {
         let json = r#"{
             "repository_key": "my-repo",
             "artifact_path": "images/vm.ova",
+            "artifact_name": "vm-image",
+            "artifact_version": "2026.06.03",
             "total_size": 21474836480,
             "checksum_sha256": "abc123def456",
             "chunk_size": 16777216,
@@ -600,6 +728,8 @@ mod tests {
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.repository_key, "my-repo");
         assert_eq!(req.artifact_path, "images/vm.ova");
+        assert_eq!(req.artifact_name.as_deref(), Some("vm-image"));
+        assert_eq!(req.artifact_version.as_deref(), Some("2026.06.03"));
         assert_eq!(req.total_size, 21_474_836_480);
         assert_eq!(req.checksum_sha256, "abc123def456");
         assert_eq!(req.chunk_size, Some(16_777_216));
@@ -617,6 +747,8 @@ mod tests {
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.repository_key, "repo");
         assert_eq!(req.artifact_path, "file.bin");
+        assert_eq!(req.artifact_name, None);
+        assert_eq!(req.artifact_version, None);
         assert_eq!(req.total_size, 1024);
         assert_eq!(req.checksum_sha256, "deadbeef");
         assert!(req.chunk_size.is_none());
@@ -1061,6 +1193,8 @@ mod tests {
         let req = CreateSessionRequest {
             repository_key: "repo".into(),
             artifact_path: "file.bin".into(),
+            artifact_name: None,
+            artifact_version: None,
             total_size: 100,
             checksum_sha256: "abc".into(),
             chunk_size: None,
