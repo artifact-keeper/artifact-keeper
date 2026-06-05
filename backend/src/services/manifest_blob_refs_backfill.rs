@@ -263,6 +263,28 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
     Ok(candidates)
 }
 
+/// Blob-GC readiness gate (#1408; design from #1409 review, finding 3).
+///
+/// Returns `true` while any *live* image manifest (a tagged non-index
+/// manifest, or a per-architecture child of a tagged index) still has
+/// zero rows in `manifest_blob_refs` — i.e. a successful backfill has not
+/// yet established the full live blob set.
+///
+/// Blob GC MUST NOT delete while this holds: a blob that looks
+/// unreferenced may simply belong to a manifest whose refs have not been
+/// backfilled yet (e.g. the startup backfill could not read some bodies
+/// because object storage was briefly unreachable). Deleting it would
+/// corrupt a live image. The check is self-healing — once refs are
+/// complete (backfill finished, or the affected manifests were re-pushed
+/// through the push handler) it returns `false` and GC resumes on the
+/// next scheduler tick.
+///
+/// Reuses [`select_unbackfilled_manifests`] so the gate and the backfill
+/// can never disagree on what counts as a live manifest missing refs.
+pub async fn any_live_manifest_missing_refs(db: &PgPool) -> sqlx::Result<bool> {
+    Ok(!select_unbackfilled_manifests(db).await?.is_empty())
+}
+
 /// Hard cap on the manifest body size we are willing to load and parse
 /// during backfill. OCI image manifests are tiny in practice (one JSON
 /// entry per layer, a few hundred bytes each); a 4 MiB ceiling is far
@@ -453,5 +475,85 @@ mod tests {
     fn insert_rows_error_describes_stage_and_cause() {
         let msg = insert_rows_error("connection reset");
         assert_eq!(msg, "insert manifest_blob_refs rows: connection reset");
+    }
+
+    // -- readiness gate (#1408; DB-backed, skips without DATABASE_URL) -------
+
+    /// `any_live_manifest_missing_refs` is the blob-GC readiness gate
+    /// (design from #1409 review, finding 3). A live tagged image manifest
+    /// with no `manifest_blob_refs` rows must make it return `true` so the
+    /// scheduler skips the destructive blob-GC pass until the backfill (or
+    /// an atomic push) has established the refs.
+    #[tokio::test]
+    async fn any_live_manifest_missing_refs_flags_unbackfilled_tag() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        // A tagged image manifest (non-index) with NO manifest_blob_refs.
+        let manifest_digest = format!("sha256:{}", "4".repeat(64));
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+            VALUES ($1, 'gate/app', 'latest', $2, 'application/vnd.oci.image.manifest.v1+json')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&manifest_digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert tagged manifest");
+
+        let missing = any_live_manifest_missing_refs(&fixture.pool)
+            .await
+            .expect("gate query runs");
+
+        // Now record refs for it; the gate must clear (for this manifest).
+        sqlx::query(
+            r#"
+            INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+            VALUES ($1, $2, $3, 'config')
+            "#,
+        )
+        .bind(&manifest_digest)
+        .bind(format!("sha256:{}", "5".repeat(64)))
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert ref");
+
+        // Other concurrent test repos may still be unbackfilled, so we can
+        // only assert this specific tag no longer appears as a candidate,
+        // not the global flag. Re-scope via the candidate predicate.
+        let still_candidate: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM oci_tags ot
+            WHERE ot.repository_id = $1
+              AND ot.manifest_digest = $2
+              AND NOT EXISTS (
+                SELECT 1 FROM manifest_blob_refs mbr
+                WHERE mbr.manifest_digest = ot.manifest_digest
+                  AND mbr.repository_id = ot.repository_id
+              )
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("scoped candidate count");
+
+        fixture.teardown().await;
+
+        assert!(
+            missing,
+            "a live tagged image manifest with no manifest_blob_refs must gate blob GC off"
+        );
+        assert_eq!(
+            still_candidate, 0,
+            "once refs are recorded the manifest must no longer be an unbackfilled candidate"
+        );
     }
 }
