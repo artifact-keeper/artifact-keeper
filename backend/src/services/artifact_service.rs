@@ -19,6 +19,44 @@ use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
 use crate::storage::StorageBackend;
 
+/// Cancel any in-flight push retries for an artifact that is being deleted, so
+/// a delete supersedes pending/failed uploads instead of racing with them.
+const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
+            UPDATE sync_tasks
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                error_message = 'superseded by artifact delete'
+            WHERE artifact_id = $1
+              AND task_type = 'push'
+              AND status IN ('pending', 'failed')
+            "#;
+
+/// Fan out a `delete` sync task to every eligible peer subscribed to the
+/// artifact's repository in push/mirror mode.
+const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
+                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                FROM peer_instances pi
+                JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
+                JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                WHERE pi.is_local = false
+                  AND pi.status IN ('online', 'syncing')
+                  AND prs.replication_mode::text IN ('push', 'mirror')
+                  AND prs.sync_enabled = true
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                "#;
+
+/// Select all peer subscriptions (with their optional artifact filter) that are
+/// eligible to receive a push of a newly uploaded artifact in the repository.
+const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
+                    SELECT prs.peer_instance_id, sp.artifact_filter
+                    FROM peer_repo_subscriptions prs
+                    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
+                    WHERE prs.repository_id = $1
+                      AND prs.sync_enabled = true
+                      AND prs.replication_mode::text IN ('push', 'mirror')
+                    "#;
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
@@ -212,6 +250,32 @@ impl ArtifactService {
         content_type: &str,
         data: Bytes,
         uploaded_by: Option<Uuid>,
+    ) -> Result<Artifact> {
+        self.upload_with_sync_options(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            data,
+            uploaded_by,
+            true,
+        )
+        .await
+    }
+
+    /// Upload an artifact, optionally suppressing peer sync task fan-out.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        data: Bytes,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
     ) -> Result<Artifact> {
         let size_bytes = data.len() as i64;
 
@@ -417,7 +481,7 @@ impl ArtifactService {
             .await;
 
         // Queue sync tasks for peer replication (non-blocking)
-        {
+        if enqueue_sync_tasks {
             let db = self.db.clone();
             let artifact_id = artifact.id;
             let repository_id = artifact.repository_id;
@@ -432,19 +496,11 @@ impl ArtifactService {
                     artifact_filter: Option<serde_json::Value>,
                 }
 
-                let subscriptions: std::result::Result<Vec<SubWithFilter>, _> = sqlx::query_as(
-                    r#"
-                    SELECT prs.peer_instance_id, sp.artifact_filter
-                    FROM peer_repo_subscriptions prs
-                    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-                    WHERE prs.repository_id = $1
-                      AND prs.sync_enabled = true
-                      AND prs.replication_mode::text IN ('push', 'mirror')
-                    "#,
-                )
-                .bind(repository_id)
-                .fetch_all(&db)
-                .await;
+                let subscriptions: std::result::Result<Vec<SubWithFilter>, _> =
+                    sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
+                        .bind(repository_id)
+                        .fetch_all(&db)
+                        .await;
 
                 match subscriptions {
                     Ok(subs) if !subs.is_empty() => {
@@ -846,6 +902,11 @@ impl ArtifactService {
 
     /// Soft-delete an artifact
     pub async fn delete(&self, id: Uuid) -> Result<()> {
+        self.delete_with_sync_options(id, true).await
+    }
+
+    /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
+    pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
         // Get artifact info for plugin hooks
         let artifact = self.get_by_id(id).await?;
         let artifact_info = ArtifactInfo::from(&artifact);
@@ -866,32 +927,35 @@ impl ArtifactService {
             return Err(AppError::NotFound("Artifact not found".to_string()));
         }
 
-        // Enqueue delete sync tasks for all eligible peers (non-blocking)
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-            SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
-            FROM peer_instances pi
-            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
-            JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
-            WHERE pi.is_local = false
-              AND pi.status IN ('online', 'syncing')
-              AND prs.replication_mode::text IN ('push', 'mirror')
-              AND prs.sync_enabled = true
-            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
-            "#,
-        )
-        .bind(id)
-        .execute(&self.db)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                "Failed to enqueue delete sync tasks for artifact {}: {}",
-                id,
+        // A delete supersedes any upload retries for the same artifact.
+        let _ = sqlx::query(CANCEL_SUPERSEDED_PUSH_TASKS_SQL)
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Failed to cancel superseded push sync tasks for artifact {}: {}",
+                    id,
+                    e
+                );
                 e
-            );
-            e
-        });
+            });
+
+        // Enqueue delete sync tasks for all eligible peers (non-blocking)
+        if enqueue_sync_tasks {
+            let _ = sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+                .bind(id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        "Failed to enqueue delete sync tasks for artifact {}: {}",
+                        id,
+                        e
+                    );
+                    e
+                });
+        }
 
         // Trigger AfterDelete hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
@@ -1687,18 +1751,9 @@ mod tests {
 
     #[test]
     fn test_delete_sync_task_sql_contains_required_clauses() {
-        let sql = r#"
-            INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-            SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
-            FROM peer_instances pi
-            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
-            JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
-            WHERE pi.is_local = false
-              AND pi.status IN ('online', 'syncing')
-              AND prs.replication_mode::text IN ('push', 'mirror')
-              AND prs.sync_enabled = true
-            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
-        "#;
+        // Assert against the actual query the delete path runs (not a copy) so
+        // the clauses that gate peer fan-out can't silently drift.
+        let sql = ENQUEUE_DELETE_SYNC_TASKS_SQL;
         assert!(sql.contains("INSERT INTO sync_tasks"));
         assert!(sql.contains("'delete'"));
         assert!(sql.contains("peer_repo_subscriptions"));
@@ -1706,6 +1761,27 @@ mod tests {
         assert!(sql.contains("sync_enabled"));
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn test_push_mirror_subscriptions_sql_filters_enabled_push_mirror() {
+        let sql = PUSH_MIRROR_SUBSCRIPTIONS_SQL;
+        assert!(sql.contains("FROM peer_repo_subscriptions prs"));
+        assert!(sql.contains("LEFT JOIN sync_policies sp"));
+        assert!(sql.contains("prs.sync_enabled = true"));
+        assert!(sql.contains("replication_mode::text IN ('push', 'mirror')"));
+    }
+
+    #[test]
+    fn test_cancel_superseded_push_tasks_sql_targets_pending_and_failed() {
+        // A delete must supersede only in-flight push retries, never deletes or
+        // already-completed tasks.
+        let sql = CANCEL_SUPERSEDED_PUSH_TASKS_SQL;
+        assert!(sql.contains("UPDATE sync_tasks"));
+        assert!(sql.contains("status = 'cancelled'"));
+        assert!(sql.contains("task_type = 'push'"));
+        assert!(sql.contains("status IN ('pending', 'failed')"));
+        assert!(sql.contains("superseded by artifact delete"));
     }
 
     // --- get_download_stats_batch ---
