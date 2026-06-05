@@ -312,7 +312,10 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
 
         let entry = self
             .service
-            .update_cve_status(id, status, None, Some(&req.reason))
+            // `None` repo scope: the gRPC surface is an admin/system path
+            // (no per-call repo restriction), so synth-id resolution (#1561)
+            // runs unrestricted, matching the admin-when-`None` contract.
+            .update_cve_status(id, status, None, Some(&req.reason), None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
