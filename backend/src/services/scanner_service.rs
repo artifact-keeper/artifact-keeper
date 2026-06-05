@@ -2705,88 +2705,44 @@ impl ScannerService {
         bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
     ) -> Result<()> {
-        use sqlx::Row;
-
         // Fetch artifact and content
-        let artifact_row = sqlx::query(
+        let artifact = sqlx::query_as!(
+            Artifact,
             r#"
-            SELECT a.id, a.repository_id, a.path, a.name, a.version, a.size_bytes,
-                   a.checksum_sha256, a.checksum_md5, a.checksum_sha1,
-                   a.content_type, a.storage_key, a.is_deleted, a.uploaded_by,
-                   a.quarantine_status, a.quarantine_until,
-                   a.created_at, a.updated_at,
-                   r.key AS repository_key,
-                   r.repo_type::text AS repository_type
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.id = $1 AND a.is_deleted = false
+            SELECT id, repository_id, path, name, version, size_bytes,
+                   checksum_sha256, checksum_md5, checksum_sha1,
+                   content_type, storage_key, is_deleted, uploaded_by,
+                   quarantine_status, quarantine_until,
+                   created_at, updated_at
+            FROM artifacts
+            WHERE id = $1 AND is_deleted = false
             "#,
+            artifact_id,
         )
-        .bind(artifact_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-        let artifact = Artifact {
-            id: artifact_row
-                .try_get("id")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            repository_id: artifact_row
-                .try_get("repository_id")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            path: artifact_row
-                .try_get("path")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            name: artifact_row
-                .try_get("name")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            version: artifact_row
-                .try_get("version")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            size_bytes: artifact_row
-                .try_get("size_bytes")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            checksum_sha256: artifact_row
-                .try_get("checksum_sha256")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            checksum_md5: artifact_row
-                .try_get("checksum_md5")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            checksum_sha1: artifact_row
-                .try_get("checksum_sha1")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            content_type: artifact_row
-                .try_get("content_type")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            storage_key: artifact_row
-                .try_get("storage_key")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            is_deleted: artifact_row
-                .try_get("is_deleted")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            uploaded_by: artifact_row
-                .try_get("uploaded_by")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            quarantine_status: artifact_row
-                .try_get("quarantine_status")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            quarantine_until: artifact_row
-                .try_get("quarantine_until")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            created_at: artifact_row
-                .try_get("created_at")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-            updated_at: artifact_row
-                .try_get("updated_at")
-                .map_err(|e| AppError::Database(e.to_string()))?,
-        };
-        let repository_key: String = artifact_row
-            .try_get("repository_key")
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let repository_type: String = artifact_row
-            .try_get("repository_type")
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // The artifact path is repository-internal; scanners that need an
+        // externally routable identity (Grype's OCI `registry:` mode) require
+        // the owning repository's key and type. Fetch those separately so the
+        // artifact load stays compile-time column-checked via `query_as!`.
+        let repo_routing = sqlx::query!(
+            r#"
+            SELECT key AS repository_key, repo_type::text AS repository_type
+            FROM repositories
+            WHERE id = $1
+            "#,
+            artifact.repository_id,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let repository_key = repo_routing.repository_key;
+        let repository_type = repo_routing
+            .repository_type
+            .ok_or_else(|| AppError::Database("repository repo_type was NULL".to_string()))?;
 
         // Check if scanning is enabled for this repo (skip check if forced)
         if !force
@@ -11202,7 +11158,10 @@ mod tests {
         }
 
         fn scan_type(&self) -> &str {
-            "recording-context"
+            // Must be an allowed value for the scan_results_scan_type_check
+            // constraint, since this scanner runs against a real database and
+            // the orchestrator persists a scan_results row using this type.
+            "grype"
         }
 
         fn is_applicable(&self, _artifact: &Artifact) -> bool {
