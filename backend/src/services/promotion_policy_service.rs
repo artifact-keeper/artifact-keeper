@@ -87,13 +87,18 @@ const OPEN_CVES_SQL: &str = r#"
       AND NOT sf.is_acknowledged
 "#;
 
-/// Sentinel substring written into `scan_results.error_message` when a scanner
-/// reports `is_applicable() == false` for an artifact (see
-/// `scanner_service::scan_artifact_inner`). Until #1470 introduces a dedicated
-/// terminal status, a "scanner does not apply to this format" row is stored as
-/// `status = 'failed'` with this phrase in `error_message`. We key the
-/// "not applicable" distinction off this marker so genuinely-inapplicable scans
-/// are NOT treated as fail-open/unscanned for promotion gating.
+/// Terminal status persisted (#1470) when a scanner reports
+/// `is_applicable() == false` for an artifact (see
+/// `scanner_service::scan_artifact_inner`). A `not_applicable` row means the
+/// scanner genuinely does not apply to the artifact's format; it is NOT a
+/// failure and must NOT be treated as fail-open/unscanned for promotion gating.
+const NOT_APPLICABLE_STATUS: &str = "not_applicable";
+
+/// Sentinel substring written into `scan_results.error_message` on the legacy
+/// (pre-#1470) "does not apply" path, where the row was stored as
+/// `status = 'failed'` with this phrase in `error_message`. We still recognize
+/// it so historical rows persisted before migration 124 keep classifying as
+/// "not applicable" rather than as genuine crashes.
 const NOT_APPLICABLE_MARKER: &str = "does not apply";
 
 /// One `scan_results` row reduced to the only fields that matter for deciding
@@ -107,9 +112,18 @@ struct ScanStateRow {
 }
 
 impl ScanStateRow {
-    /// A `failed` row is "not applicable" (rather than a genuine crash) when its
-    /// error message carries the [`NOT_APPLICABLE_MARKER`] sentinel.
+    /// A row is "not applicable" (the scanner does not apply to this format,
+    /// rather than a genuine crash) when:
+    ///
+    /// * its status is the dedicated `not_applicable` terminal status (#1470,
+    ///   the canonical path for rows persisted from migration 124 onward), or
+    /// * (legacy) its status is `failed` and its error message carries the
+    ///   [`NOT_APPLICABLE_MARKER`] sentinel — historical rows written before the
+    ///   dedicated status existed.
     fn is_not_applicable(&self) -> bool {
+        if self.status == NOT_APPLICABLE_STATUS {
+            return true;
+        }
         self.status == "failed"
             && self
                 .error_message
@@ -193,8 +207,10 @@ fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
         return ScanState::InProgress;
     }
     // Remaining rows are terminal-but-not-completed: either genuine failures or
-    // "not applicable" markers. A genuine failure outranks not-applicable
-    // because a crashed scanner means the artifact is NOT vetted.
+    // "not applicable" rows (the dedicated `not_applicable` status from #1470,
+    // or a legacy `failed` row carrying the does-not-apply marker). A genuine
+    // failure outranks not-applicable because a crashed scanner means the
+    // artifact is NOT vetted.
     let has_genuine_failure = rows
         .iter()
         .any(|r| r.status == "failed" && !r.is_not_applicable());
@@ -205,7 +221,7 @@ fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
         return ScanState::NeverScanned;
     }
     // Rows exist, none completed, none in-progress, none a genuine failure ->
-    // every row is a "not applicable" marker.
+    // every row is "not applicable".
     ScanState::NotApplicable
 }
 
@@ -2294,6 +2310,50 @@ mod tests {
     fn test_classify_not_applicable_when_all_rows_are_markers() {
         let rows = vec![not_applicable_row(), not_applicable_row()];
         assert_eq!(classify_scan_state(&rows), ScanState::NotApplicable);
+    }
+
+    /// #1470: a row carrying the dedicated `not_applicable` status (no error
+    /// message text required) is recognized as not-applicable, just like the
+    /// legacy `failed` + marker rows.
+    #[test]
+    fn test_is_not_applicable_dedicated_status() {
+        assert!(row("not_applicable", None).is_not_applicable());
+        assert!(row("not_applicable", Some("does not apply")).is_not_applicable());
+    }
+
+    /// #1470: an artifact whose every scan is the dedicated `not_applicable`
+    /// status classifies as NotApplicable (scanned-OK), NOT Failed and NOT
+    /// unscanned. This is the regression guard that such scans no longer block
+    /// promotion under block_unscanned.
+    #[test]
+    fn test_classify_not_applicable_dedicated_status_rows() {
+        let rows = vec![
+            row("not_applicable", Some("Scanner Grype does not apply")),
+            row(
+                "not_applicable",
+                Some("Scanner ImageScanner does not apply"),
+            ),
+        ];
+        assert_eq!(classify_scan_state(&rows), ScanState::NotApplicable);
+    }
+
+    /// #1470: the dedicated status and the legacy marker can coexist (mixed
+    /// historical + fresh rows) and still classify as NotApplicable.
+    #[test]
+    fn test_classify_mixed_dedicated_and_legacy_not_applicable() {
+        let rows = vec![row("not_applicable", None), not_applicable_row()];
+        assert_eq!(classify_scan_state(&rows), ScanState::NotApplicable);
+    }
+
+    /// #1470: a genuine crash still outranks a dedicated `not_applicable` row,
+    /// so a half-vetted artifact is never silently passed.
+    #[test]
+    fn test_classify_genuine_failure_outranks_dedicated_not_applicable() {
+        let rows = vec![
+            row("not_applicable", None),
+            row("failed", Some("OOM killed")),
+        ];
+        assert_eq!(classify_scan_state(&rows), ScanState::Failed);
     }
 
     #[test]

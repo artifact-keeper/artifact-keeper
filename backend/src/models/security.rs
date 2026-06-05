@@ -29,6 +29,14 @@ pub enum ScanStatus {
     Running,
     Completed,
     Failed,
+    /// Terminal status for "this scanner does not apply to the artifact's
+    /// format" (#1470). Distinct from `Failed`, which is reserved for a scanner
+    /// that started running and crashed / timed out / errored. A
+    /// `NotApplicable` scan is a benign terminal state: neither a
+    /// pass-with-findings nor a failure, and it must never be treated as an
+    /// error when statuses are interpreted (promotion gating, findings display,
+    /// "did the scan fail" predicates).
+    NotApplicable,
 }
 
 /// Severity of a finding. Ordered from most severe to least.
@@ -288,6 +296,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // Severity
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // ScanStatus (#1470)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_status_not_applicable_serializes_snake_case() {
+        // The DB CHECK constraint (migration 124) and every status-string
+        // consumer use the literal `not_applicable`; the serde wire form must
+        // match so API responses round-trip cleanly.
+        let json = serde_json::to_string(&ScanStatus::NotApplicable).expect("serialize");
+        assert_eq!(json, "\"not_applicable\"");
+    }
+
+    #[test]
+    fn test_scan_status_not_applicable_round_trips() {
+        for status in [
+            ScanStatus::Pending,
+            ScanStatus::Running,
+            ScanStatus::Completed,
+            ScanStatus::Failed,
+            ScanStatus::NotApplicable,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let back: ScanStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(status, back);
+        }
+    }
+
+    #[test]
+    fn test_scan_status_not_applicable_is_distinct_from_failed() {
+        assert_ne!(ScanStatus::NotApplicable, ScanStatus::Failed);
+        assert_ne!(ScanStatus::NotApplicable, ScanStatus::Completed);
+    }
 
     #[test]
     fn test_severity_penalty_weights() {
