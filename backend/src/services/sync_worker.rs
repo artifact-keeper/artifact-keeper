@@ -868,21 +868,12 @@ async fn execute_transfer(
     // 3. PUT the artifact to the remote peer.
     let url = build_transfer_url(peer_endpoint, &task.repository_key, &task.artifact_path);
 
-    let result = client
-        .put(&url)
-        .header("Authorization", format!("Bearer {}", peer_api_key))
-        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
-        .header("Content-Type", &task.content_type)
-        .header("X-Artifact-Name", &task.artifact_name)
-        .header(
-            "X-Artifact-Version",
-            task.artifact_version.as_deref().unwrap_or(""),
-        )
-        .header("X-Artifact-Path", &task.artifact_path)
-        .header(CHECKSUM_SHA256_HEADER, &task.checksum_sha256)
-        .body(file_bytes)
-        .send()
-        .await;
+    let request = replication_put_headers(task, peer_api_key)
+        .into_iter()
+        .fold(client.put(&url), |req, (name, value)| {
+            req.header(name, value)
+        });
+    let result = request.body(file_bytes).send().await;
 
     match result {
         Ok(response) if response.status().is_success() => {
@@ -901,8 +892,8 @@ async fn execute_transfer(
             let body = response
                 .text()
                 .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            let msg = format!("Remote peer returned {status}: {body}");
+                .unwrap_or_else(|_| unreadable_response_body());
+            let msg = format_peer_response_failure("Remote peer returned", status.as_u16(), &body);
             handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
         }
@@ -961,8 +952,9 @@ async fn execute_chunked_transfer(
         let body = init_response
             .text()
             .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
-        let msg = format!("Chunked upload init returned {status}: {body}");
+            .unwrap_or_else(|_| unreadable_response_body());
+        let msg =
+            format_peer_response_failure("Chunked upload init returned", status.as_u16(), &body);
         handle_transfer_failure(db, task, &msg, retry_policy).await;
         return Err(msg);
     }
@@ -976,10 +968,7 @@ async fn execute_chunked_transfer(
         }
     };
 
-    let session_id = match session["session_id"]
-        .as_str()
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
+    let session_id = match parse_chunked_session_id(&session) {
         Some(session_id) => session_id,
         None => {
             let msg = "Missing session_id in chunked upload init response".to_string();
@@ -1049,7 +1038,7 @@ async fn execute_chunked_transfer(
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                    .unwrap_or_else(|_| unreadable_response_body());
                 let msg = format!("Chunk {} upload returned {status}: {body}", chunk_index);
                 cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
                     .await;
@@ -1095,7 +1084,7 @@ async fn execute_chunked_transfer(
             let body = resp
                 .text()
                 .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+                .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Chunked upload session complete returned {status}: {body}");
             cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
             handle_transfer_failure(db, task, &msg, retry_policy).await;
@@ -1129,7 +1118,7 @@ async fn execute_delete(
         .await;
 
     match result {
-        Ok(response) if response.status().is_success() || response.status().as_u16() == 404 => {
+        Ok(response) if delete_response_is_success(response.status().as_u16()) => {
             // 404 is acceptable: the artifact may already be gone.
             handle_transfer_success(db, task, 0).await;
             tracing::info!(
@@ -1144,7 +1133,7 @@ async fn execute_delete(
             let body = response
                 .text()
                 .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+                .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Remote peer returned {status} for delete: {body}");
             handle_transfer_failure(db, task, &msg, retry_policy).await;
             Err(msg)
@@ -1482,6 +1471,68 @@ fn build_chunked_upload_session_body(task: &TaskRow, chunk_size: i32) -> serde_j
         "chunk_size": chunk_size,
         "content_type": task.content_type,
     })
+}
+
+/// Build the ordered header set for a single-request replication PUT.
+///
+/// Returns `(name, value)` pairs in the exact order the receiving peer's upload
+/// handler expects: bearer auth, the replication marker, content type, the
+/// artifact name/version/path metadata, and finally the source SHA-256 the peer
+/// re-verifies against the streamed bytes. A missing artifact version is sent as
+/// an empty string, matching the direct-upload contract.
+fn replication_put_headers(task: &TaskRow, peer_api_key: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("Authorization", format!("Bearer {}", peer_api_key)),
+        (
+            REPLICATION_REQUEST_HEADER,
+            REPLICATION_REQUEST_VALUE.to_string(),
+        ),
+        ("Content-Type", task.content_type.clone()),
+        ("X-Artifact-Name", task.artifact_name.clone()),
+        (
+            "X-Artifact-Version",
+            task.artifact_version.clone().unwrap_or_default(),
+        ),
+        ("X-Artifact-Path", task.artifact_path.clone()),
+        (CHECKSUM_SHA256_HEADER, task.checksum_sha256.clone()),
+    ]
+}
+
+/// Extract the resumable upload session id from a peer's init response body.
+///
+/// The peer returns a JSON object containing a `session_id` string field. This
+/// returns `None` when the field is absent, not a string, or not a valid UUID —
+/// in every one of those cases the caller treats the init as failed.
+pub(crate) fn parse_chunked_session_id(session: &serde_json::Value) -> Option<Uuid> {
+    session["session_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+/// Decide whether a peer's response to a replicated delete counts as success.
+///
+/// Any 2xx status is success. `404 Not Found` is also treated as success because
+/// the artifact may already be absent on the peer (idempotent delete); retrying
+/// would never make it "more deleted".
+pub(crate) fn delete_response_is_success(status: u16) -> bool {
+    (200..300).contains(&status) || status == 404
+}
+
+/// Placeholder used when a peer's HTTP error response body cannot be read.
+///
+/// Shared by every transfer path so a network error while reading the body of
+/// an already-failed response never masks the original status code.
+pub(crate) fn unreadable_response_body() -> String {
+    "<unreadable>".to_string()
+}
+
+/// Build the error message for a peer that returned a non-success status during
+/// replication, in the form `"<action> <status>: <body>"`.
+///
+/// `action` describes the replication step that failed (e.g.
+/// `"Remote peer returned"` or `"Chunked upload init returned"`).
+pub(crate) fn format_peer_response_failure(action: &str, status: u16, body: &str) -> String {
+    format!("{action} {status}: {body}")
 }
 
 /// Build the URL to upload one chunk to a resumable upload session.
@@ -1894,6 +1945,316 @@ mod tests {
     #[test]
     fn test_replication_upload_checksum_header_matches_put_handler() {
         assert_eq!(CHECKSUM_SHA256_HEADER, "x-checksum-sha256");
+    }
+
+    /// Storage backend whose reads always fail, used to exercise the storage
+    /// error-handling branches in the transfer path without a real backend.
+    struct FailingReadBackend;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for FailingReadBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(crate::error::AppError::Storage("boom-get".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get_stream(
+            &self,
+            _key: &str,
+        ) -> crate::error::Result<BoxStream<'static, crate::error::Result<Bytes>>> {
+            Err(crate::error::AppError::Storage("boom-stream".to_string()))
+        }
+
+        async fn get_range(
+            &self,
+            _key: &str,
+            _offset: u64,
+            _length: usize,
+        ) -> crate::error::Result<Bytes> {
+            Err(crate::error::AppError::Storage("boom-range".to_string()))
+        }
+    }
+
+    fn registry_with(
+        name: &str,
+        backend: Arc<dyn crate::storage::StorageBackend>,
+    ) -> StorageRegistry {
+        let mut backends: HashMap<String, Arc<dyn crate::storage::StorageBackend>> = HashMap::new();
+        backends.insert(name.to_string(), backend);
+        StorageRegistry::new(backends, name.to_string())
+    }
+
+    #[test]
+    fn test_storage_for_task_resolves_registered_backend() {
+        let registry = registry_with("s3-peer", Arc::new(FailingReadBackend));
+        let task = test_task("s3-peer");
+        assert!(storage_for_task(&registry, &task).is_ok());
+    }
+
+    #[test]
+    fn test_storage_for_task_reports_unresolvable_backend() {
+        let registry = registry_with("s3-peer", Arc::new(FailingReadBackend));
+        let task = test_task("does-not-exist");
+        let err = match storage_for_task(&registry, &task) {
+            Ok(_) => panic!("expected unresolvable backend to error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("Failed to resolve storage backend"));
+        assert!(err.contains("does-not-exist"));
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_from_storage_success() {
+        let backend = Arc::new(RangeRecordingBackend::new(b"hello-world"));
+        let registry = registry_with("s3-peer", backend);
+        let task = test_task("s3-peer");
+
+        let bytes = read_artifact_from_storage(&registry, &task).await.unwrap();
+        assert_eq!(bytes, b"hello-world");
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_from_storage_reports_backend_error() {
+        let registry = registry_with("s3-peer", Arc::new(FailingReadBackend));
+        let task = test_task("s3-peer");
+
+        let err = read_artifact_from_storage(&registry, &task)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Failed to read"));
+        assert!(err.contains("boom-get"));
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_chunk_zero_length_short_circuits_without_backend_call() {
+        let registry = registry_with("s3-peer", Arc::new(FailingReadBackend));
+        let task = test_task("s3-peer");
+
+        // A zero-length chunk must return empty bytes without ever touching the
+        // backend (which would otherwise error).
+        let chunk = read_artifact_chunk_from_storage(&registry, &task, 0, 0)
+            .await
+            .unwrap();
+        assert!(chunk.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_chunk_reports_backend_range_error() {
+        let registry = registry_with("s3-peer", Arc::new(FailingReadBackend));
+        let task = test_task("s3-peer");
+
+        let err = read_artifact_chunk_from_storage(&registry, &task, 5, 8)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Failed to read range"));
+        assert!(err.contains("boom-range"));
+    }
+
+    #[test]
+    fn test_delete_response_is_success_status_boundaries() {
+        // 199 is below the 2xx range; 300 is above it; both must be failures.
+        assert!(!delete_response_is_success(199));
+        assert!(!delete_response_is_success(300));
+        // 299 is the inclusive top of the 2xx range.
+        assert!(delete_response_is_success(299));
+        // 403/410 are ordinary failures even though they are "not present"-ish.
+        assert!(!delete_response_is_success(410));
+    }
+
+    #[test]
+    fn test_format_peer_response_failure_preserves_multiline_body() {
+        let body = "line1\nline2";
+        let msg = format_peer_response_failure("Remote peer returned", 422, body);
+        assert!(msg.starts_with("Remote peer returned 422: "));
+        assert!(msg.ends_with("line1\nline2"));
+    }
+
+    // ── replication_put_headers ──────────────────────────────────────────
+
+    #[test]
+    fn test_replication_put_headers_order_and_values() {
+        let mut task = test_task("s3-peer");
+        task.content_type = "application/zip".to_string();
+        task.artifact_name = "pkg.bin".to_string();
+        task.artifact_version = Some("1.2.3".to_string());
+        task.artifact_path = "a/b/pkg.bin".to_string();
+        task.checksum_sha256 = "deadbeef".to_string();
+
+        let headers = replication_put_headers(&task, "secret-key");
+
+        assert_eq!(
+            headers,
+            vec![
+                ("Authorization", "Bearer secret-key".to_string()),
+                (REPLICATION_REQUEST_HEADER, "true".to_string()),
+                ("Content-Type", "application/zip".to_string()),
+                ("X-Artifact-Name", "pkg.bin".to_string()),
+                ("X-Artifact-Version", "1.2.3".to_string()),
+                ("X-Artifact-Path", "a/b/pkg.bin".to_string()),
+                (CHECKSUM_SHA256_HEADER, "deadbeef".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_replication_put_headers_missing_version_sends_empty_string() {
+        let mut task = test_task("s3-peer");
+        task.artifact_version = None;
+
+        let headers = replication_put_headers(&task, "k");
+        let version = headers
+            .iter()
+            .find(|(name, _)| *name == "X-Artifact-Version")
+            .map(|(_, value)| value.clone());
+        assert_eq!(version, Some(String::new()));
+    }
+
+    // ── parse_chunked_session_id ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_chunked_session_id_accepts_valid_uuid() {
+        let id = Uuid::new_v4();
+        let body = serde_json::json!({ "session_id": id.to_string() });
+        assert_eq!(parse_chunked_session_id(&body), Some(id));
+    }
+
+    #[test]
+    fn test_parse_chunked_session_id_rejects_missing_field() {
+        let body = serde_json::json!({ "other": "value" });
+        assert_eq!(parse_chunked_session_id(&body), None);
+    }
+
+    #[test]
+    fn test_parse_chunked_session_id_rejects_non_string_field() {
+        let body = serde_json::json!({ "session_id": 1234 });
+        assert_eq!(parse_chunked_session_id(&body), None);
+    }
+
+    #[test]
+    fn test_parse_chunked_session_id_rejects_malformed_uuid() {
+        let body = serde_json::json!({ "session_id": "not-a-uuid" });
+        assert_eq!(parse_chunked_session_id(&body), None);
+    }
+
+    #[test]
+    fn test_parse_chunked_session_id_rejects_null_and_non_object() {
+        let null_field = serde_json::json!({ "session_id": serde_json::Value::Null });
+        assert_eq!(parse_chunked_session_id(&null_field), None);
+
+        let array_body = serde_json::json!(["session_id"]);
+        assert_eq!(parse_chunked_session_id(&array_body), None);
+    }
+
+    #[test]
+    fn test_parse_chunked_session_id_accepts_hyphenated_uuid_roundtrip() {
+        let id = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let body = serde_json::json!({ "session_id": "123e4567-e89b-12d3-a456-426614174000" });
+        assert_eq!(parse_chunked_session_id(&body), Some(id));
+    }
+
+    // ── chunk reads at multiple offsets ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_read_artifact_chunk_reads_distinct_offsets() {
+        let backend = Arc::new(RangeRecordingBackend::new(b"0123456789"));
+        let registry = registry_with("s3-peer", backend.clone());
+        let task = test_task("s3-peer");
+
+        let head = read_artifact_chunk_from_storage(&registry, &task, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(head, b"0123");
+
+        let tail = read_artifact_chunk_from_storage(&registry, &task, 6, 4)
+            .await
+            .unwrap();
+        assert_eq!(tail, b"6789");
+
+        let calls = backend.range_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("object-key".to_string(), 0, 4),
+                ("object-key".to_string(), 6, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_chunked_upload_session_body_serializes_absent_version_as_null() {
+        let mut task = test_task("filesystem");
+        task.artifact_version = None;
+
+        let body = build_chunked_upload_session_body(&task, 1_024);
+        assert!(body["artifact_version"].is_null());
+        assert_eq!(body["chunk_size"], 1_024);
+        assert_eq!(body["total_size"], task.artifact_size);
+        assert_eq!(body["checksum_sha256"], task.checksum_sha256);
+    }
+
+    // ── delete_response_is_success ───────────────────────────────────────
+
+    #[test]
+    fn test_delete_response_is_success_for_2xx() {
+        assert!(delete_response_is_success(200));
+        assert!(delete_response_is_success(202));
+        assert!(delete_response_is_success(299));
+    }
+
+    #[test]
+    fn test_delete_response_is_success_treats_404_as_idempotent() {
+        assert!(delete_response_is_success(404));
+    }
+
+    #[test]
+    fn test_delete_response_is_success_rejects_other_errors() {
+        assert!(!delete_response_is_success(400));
+        assert!(!delete_response_is_success(403));
+        assert!(!delete_response_is_success(409));
+        assert!(!delete_response_is_success(500));
+        assert!(!delete_response_is_success(503));
+    }
+
+    // ── peer failure message helpers ─────────────────────────────────────
+
+    #[test]
+    fn test_unreadable_response_body_placeholder() {
+        assert_eq!(unreadable_response_body(), "<unreadable>");
+    }
+
+    #[test]
+    fn test_format_peer_response_failure_includes_status_and_body() {
+        assert_eq!(
+            format_peer_response_failure("Remote peer returned", 500, "boom"),
+            "Remote peer returned 500: boom"
+        );
+    }
+
+    #[test]
+    fn test_format_peer_response_failure_supports_dynamic_action() {
+        assert_eq!(
+            format_peer_response_failure("Chunk 3 upload returned", 409, "conflict"),
+            "Chunk 3 upload returned 409: conflict"
+        );
+    }
+
+    #[test]
+    fn test_format_peer_response_failure_with_empty_body() {
+        assert_eq!(
+            format_peer_response_failure("Chunked upload init returned", 502, ""),
+            "Chunked upload init returned 502: "
+        );
     }
 
     // ── calculate_backoff ───────────────────────────────────────────────
