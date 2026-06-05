@@ -496,12 +496,33 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // backends. Failures are logged but do not block startup; on a fresh
     // database or after the first successful run the candidate query
     // returns zero rows and this is a near-instant no-op.
-    let _blob_refs_backfill_stats =
+    let blob_refs_backfill_stats =
         artifact_keeper_backend::services::manifest_blob_refs_backfill::run_backfill(
             &db_pool,
             storage_registry.clone(),
         )
         .await;
+    // A failed candidate (body missing from storage, over-cap, DB write
+    // error) leaves that manifest ref-less, which keeps the blob-GC readiness
+    // gate closed — the feature stays OFF. This startup log is the earliest
+    // signal; the scheduler escalates per-tick thereafter (#1409).
+    if blob_refs_backfill_stats.candidates_failed > 0 {
+        tracing::error!(
+            candidates_scanned = blob_refs_backfill_stats.candidates_scanned,
+            edges_inserted = blob_refs_backfill_stats.edges_inserted,
+            candidates_failed = blob_refs_backfill_stats.candidates_failed,
+            "manifest_blob_refs backfill left {} live manifest(s) un-backfilled; \
+             blob GC will stay gated off until they are resolved (re-pushed, or \
+             the offending tag deleted)",
+            blob_refs_backfill_stats.candidates_failed
+        );
+    } else {
+        tracing::info!(
+            candidates_scanned = blob_refs_backfill_stats.candidates_scanned,
+            edges_inserted = blob_refs_backfill_stats.edges_inserted,
+            "manifest_blob_refs backfill complete"
+        );
+    }
 
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));

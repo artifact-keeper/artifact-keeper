@@ -505,6 +505,23 @@ impl StorageGcService {
     /// grace window and the per-row locked re-check. Every deletion is
     /// audit-logged at INFO with the digest and freed byte count.
     pub async fn run_blob_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
+        // Apply mode: first prune `manifest_blob_refs` of manifests that are no
+        // longer live (tag overwrite / lifecycle expiry / index or manifest
+        // deletion), so their config + layer blobs become eligible in this same
+        // pass (#1409 H1). Without this the protect predicate keeps a digest
+        // pinned forever once any manifest referenced it, even after every
+        // referencing manifest is gone. Dry-run stays strictly read-only and so
+        // reports the pre-prune orphan set only.
+        if !dry_run {
+            match self.prune_orphan_blob_refs().await {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::info!("Blob GC: pruned {} stale manifest_blob_refs rows", pruned);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Blob GC: manifest_blob_refs prune failed: {}", e),
+            }
+        }
+
         let orphans = self.select_orphan_blobs().await?;
 
         let mut result = empty_gc_result(dry_run);
@@ -632,6 +649,42 @@ impl StorageGcService {
         }
 
         Ok(result)
+    }
+
+    /// Delete `manifest_blob_refs` rows whose manifest is no longer live, so
+    /// the blobs they pinned become reclaimable (#1409 H1).
+    ///
+    /// A ref is stale when its `manifest_digest` is neither tagged in its repo
+    /// (`oci_tags`) nor a live per-architecture child of a tagged index
+    /// (`oci_manifest_refs` -> tagged `parent_digest`). Tag overwrite, lifecycle
+    /// expiry and manifest/index deletion all leave such orphan refs behind;
+    /// without pruning them [`BLOB_PROTECTED_BY_REFS_SQL`] would protect the
+    /// digest forever. Conservative: any still-reachable manifest keeps its
+    /// refs, so this can only ever over-protect (a leak), never expose a live
+    /// blob.
+    async fn prune_orphan_blob_refs(&self) -> Result<u64> {
+        let res = sqlx::query(
+            r#"
+            DELETE FROM manifest_blob_refs mbr
+            WHERE NOT EXISTS (
+                SELECT 1 FROM oci_tags ot
+                WHERE ot.repository_id = mbr.repository_id
+                  AND ot.manifest_digest = mbr.manifest_digest
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM oci_manifest_refs omr
+                JOIN oci_tags ot2
+                  ON ot2.repository_id = omr.repository_id
+                 AND ot2.manifest_digest = omr.parent_digest
+                WHERE omr.repository_id = mbr.repository_id
+                  AND omr.child_digest = mbr.manifest_digest
+            )
+            "#,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+        Ok(res.rows_affected())
     }
 
     /// List `oci_blobs` rows older than the grace period whose digest is
@@ -4258,6 +4311,25 @@ mod tests {
         .execute(&fixture.pool)
         .await
         .expect("insert manifest_blob_refs row");
+        // The referencing manifest must be LIVE (tagged) for the ref to be
+        // legitimate: apply-mode prunes refs of manifests that are no longer
+        // reachable (#1409 H1), so an untagged manifest's ref would be
+        // correctly removed and its blob reclaimed. Tagging keeps this the
+        // "referenced by a live manifest" case the test asserts.
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (
+                repository_id, name, tag, manifest_digest, manifest_content_type
+            )
+            VALUES ($1, 'keep-img', 'latest', $2,
+                    'application/vnd.oci.image.manifest.v1+json')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&manifest_digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("tag referencing manifest so its ref is live");
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
@@ -4282,6 +4354,100 @@ mod tests {
         assert!(
             file_still_exists,
             "storage object must survive when a manifest_blob_refs entry references the digest"
+        );
+    }
+
+    /// H1 (#1409): apply-mode first prunes `manifest_blob_refs` whose
+    /// manifest is no longer live, so a blob pinned only by a dead manifest is
+    /// reclaimed in the same pass. Here the referencing manifest is never
+    /// tagged and is not an index child, so its ref is stale; after prune the
+    /// blob has no protection and must be deleted. This is the headline
+    /// scenario ("reclaim orphan blobs once their manifests are gone") that
+    /// could not happen before H1 because the ref pinned the digest forever.
+    #[tokio::test]
+    async fn test_run_blob_gc_prunes_orphan_ref_and_reclaims_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_digest = format!("sha256:{}", "4".repeat(64));
+        let blob_digest = format!("sha256:{}", "5".repeat(64));
+        let storage_key = format!("oci-blobs/{}", blob_digest);
+        let blob_body = Bytes::from_static(b"dead-manifest-payload");
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&storage_key, blob_body.clone())
+            .await
+            .expect("write blob to storage");
+
+        insert_old_blob(
+            &fixture.pool,
+            fixture.repo_id,
+            &blob_digest,
+            &storage_key,
+            blob_body.len() as i64,
+        )
+        .await;
+        // A ref from a manifest that is NOT tagged and NOT an index child:
+        // stale, so prune must remove it.
+        sqlx::query(
+            r#"
+            INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+            VALUES ($1, $2, $3, 'layer')
+            "#,
+        )
+        .bind(&manifest_digest)
+        .bind(&blob_digest)
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert stale manifest_blob_refs row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let _ = service.run_blob_gc(false).await.expect("apply succeeds");
+
+        let refs_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(fixture.repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count manifest_blob_refs");
+        let blob_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count oci_blobs");
+        let file_still_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            refs_remaining, 0,
+            "apply-mode must prune the manifest_blob_refs row of a manifest that is no longer live"
+        );
+        assert_eq!(
+            blob_remaining, 0,
+            "once its only (stale) ref is pruned, the orphan blob row must be reclaimed in the same pass"
+        );
+        assert!(
+            !file_still_exists,
+            "the orphan blob's storage object must be deleted after its stale ref is pruned"
         );
     }
 

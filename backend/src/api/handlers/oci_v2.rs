@@ -1499,6 +1499,69 @@ pub(crate) fn is_index_content_type(content_type: &str) -> bool {
     )
 }
 
+const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const OCI_IMAGE_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// Content-based classification of a manifest body, independent of the
+/// declared media type.
+///
+/// The blob-GC readiness gate keys on the stored `manifest_content_type`,
+/// which is the (absent/spoofable) request/upstream header. So an index
+/// pushed with an image/missing Content-Type — or a degenerate body with
+/// neither a `manifests` array nor a `config` descriptor — must be
+/// recognised by CONTENT, else it lands as a ref-less "live image" and pins
+/// the gate forever (#1409 C1). Classifying by content lets the push path
+/// reject the degenerate case and lets callers store a media type that
+/// matches the body.
+#[derive(Debug)]
+pub(crate) enum ManifestClass {
+    /// Has a `manifests` array: an image index / manifest list. Protected
+    /// through `oci_manifest_refs`, not `manifest_blob_refs`.
+    Index,
+    /// Has a `config` descriptor: a normal image manifest.
+    Image,
+    /// Unparseable, or neither an index nor an image. The push path rejects
+    /// these; nothing may create a live tag for one.
+    Malformed,
+}
+
+pub(crate) fn classify_manifest(body: &[u8]) -> ManifestClass {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ManifestClass::Malformed;
+    };
+    if json.get("manifests").and_then(|m| m.as_array()).is_some() {
+        return ManifestClass::Index;
+    }
+    if json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+        .is_some()
+    {
+        return ManifestClass::Image;
+    }
+    ManifestClass::Malformed
+}
+
+/// The media type to STORE in `oci_tags.manifest_content_type`, derived from
+/// the manifest's CONTENT rather than trusting the (absent/spoofable)
+/// header, so it can never disagree with the body (the blob-GC gate keys on
+/// it, #1409 C1):
+/// - `Index`  → keep the header if it is already an index media type
+///   (preserving the OCI-vs-Docker variant), else the canonical OCI index
+///   type, so the gate always excludes it (even an empty index).
+/// - `Image`  → keep the header if it is a non-index type, else the canonical
+///   OCI image type (an image must never be stored with an index media type,
+///   which the gate would wrongly exclude).
+/// - `Malformed` → header verbatim; callers must not persist a tag for one.
+pub(crate) fn stored_media_type_for(class: &ManifestClass, header: &str) -> String {
+    match class {
+        ManifestClass::Index if !is_index_content_type(header) => OCI_INDEX_MEDIA_TYPE.to_string(),
+        ManifestClass::Image if is_index_content_type(header) => OCI_IMAGE_MEDIA_TYPE.to_string(),
+        _ => header.to_string(),
+    }
+}
+
 /// Parse an OCI image index manifest body and return the list of child
 /// manifest digests. Used by both the push handler (to populate
 /// `oci_manifest_refs` synchronously) and the startup backfill (to fill
@@ -2501,9 +2564,29 @@ async fn cache_manifest_reference_locally(
         .await
         .map_err(|e| e.to_string())?;
 
-    let manifest_content_type = content_type
-        .unwrap_or("application/vnd.oci.image.manifest.v1+json")
-        .to_string();
+    // Classify by CONTENT — the upstream Content-Type is advisory. A body we
+    // cannot classify as an image or an index is not a real manifest: keep
+    // the cached body for the client, but do NOT create an `oci_tags` row, or
+    // a ref-less live tag would pin the blob-GC gate deployment-wide
+    // (#1409 C1).
+    let class = classify_manifest(content);
+    if matches!(class, ManifestClass::Malformed) {
+        tracing::warn!(
+            repo = %repo.key,
+            image = %repo.image,
+            reference = %reference,
+            manifest_digest = %digest,
+            "Proxied manifest is neither an index nor an image; cached the body \
+             but recorded no oci_tags row or refs (would otherwise pin blob GC)"
+        );
+        return Ok(digest);
+    }
+    // Store a media type derived from content, not the upstream header, so the
+    // gate can't be misled by a mislabeled index.
+    let manifest_content_type = stored_media_type_for(
+        &class,
+        content_type.unwrap_or("application/vnd.oci.image.manifest.v1+json"),
+    );
     let cached_reference = cached_manifest_reference_key(&repo.repo_type, reference, &digest);
 
     sqlx::query(
@@ -2683,20 +2766,42 @@ async fn cache_manifest_reference_locally(
     // `handle_put_manifest`. The manifest body and oci_tags rows are already
     // persisted; failure here only affects GC/UI accounting until the
     // startup backfill in main.rs runs again.
-    if is_index_content_type(&manifest_content_type) {
-        if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
-            tracing::warn!(
-                repo = %repo.key,
-                image = %repo.image,
-                reference = %reference,
-                parent_digest = %digest,
-                error = %e,
-                "Failed to record oci_manifest_refs for proxied index manifest; \
-                 storage GC may treat child manifests as orphaned and the UI \
-                 size accounting will under-report multi-arch totals until the \
-                 next backfill pass runs"
-            );
+    // Route on the CONTENT classification (not a re-derived string): an
+    // image needs its blob refs recorded too, or a proxy-cached image is a
+    // live tag with zero refs that pins the blob-GC gate (#1409). Best-effort
+    // + warn (the startup backfill reconciles any gap); `Malformed` returned
+    // early above without a tag.
+    match &class {
+        ManifestClass::Index => {
+            if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
+                tracing::warn!(
+                    repo = %repo.key,
+                    image = %repo.image,
+                    reference = %reference,
+                    parent_digest = %digest,
+                    error = %e,
+                    "Failed to record oci_manifest_refs for proxied index manifest; \
+                     storage GC may treat child manifests as orphaned and the UI \
+                     size accounting will under-report multi-arch totals until the \
+                     next backfill pass runs"
+                );
+            }
         }
+        ManifestClass::Image => {
+            if let Err(e) = record_manifest_blob_refs(&state.db, repo.id, &digest, content).await {
+                tracing::warn!(
+                    repo = %repo.key,
+                    image = %repo.image,
+                    reference = %reference,
+                    manifest_digest = %digest,
+                    error = %e,
+                    "Failed to record manifest_blob_refs for proxied image manifest; \
+                     blob GC stays gated deployment-wide until the refs are recorded \
+                     (next proxy refresh or startup backfill), but no blob is at risk"
+                );
+            }
+        }
+        ManifestClass::Malformed => {}
     }
 
     Ok(digest)
@@ -5330,6 +5435,27 @@ async fn handle_put_manifest(
     let digest = compute_sha256(&body);
     let manifest_key = manifest_storage_key(&digest);
 
+    // Classify by content BEFORE storing or tagging. The Content-Type header
+    // is unreliable (defaults to the image type when absent), so a degenerate
+    // body — neither an index (`manifests[]`) nor an image (`config.digest`),
+    // or unparseable — must be rejected here; accepting it would create a
+    // live tag with zero `manifest_blob_refs` and pin the blob-GC gate
+    // deployment-wide (#1409 C1).
+    let class = classify_manifest(&body);
+    if matches!(class, ManifestClass::Malformed) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "manifest is neither an image index (no `manifests`) nor an image \
+             (no `config` descriptor), or is not valid JSON",
+        );
+    }
+    // Store a media type derived from content, not the header, so the gate
+    // (which keys on it) treats an index as an index even when pushed with an
+    // image/missing Content-Type. The index/image ref-routing below then
+    // stays correct because it reads this canonicalized value.
+    let content_type = stored_media_type_for(&class, &content_type);
+
     // Store manifest
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -5341,10 +5467,12 @@ async fn handle_put_manifest(
             )
         }
     };
+    // A storage write failure is a server/storage fault, not an invalid
+    // manifest (the body already passed classification) — surface 500.
     if let Err(e) = storage.put(&manifest_key, body.clone()).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "MANIFEST_INVALID",
+            "INTERNAL_ERROR",
             &e.to_string(),
         );
     }
@@ -5383,39 +5511,41 @@ async fn handle_put_manifest(
     // the push, since the manifest itself has been persisted and the tag
     // upsert succeeded. The startup backfill in main.rs will fill in any
     // gaps on the next restart.
-    if is_index_content_type(&content_type) {
-        if let Err(e) = record_oci_manifest_refs(&state.db, repo_id, &digest, &body).await {
-            warn!(
-                image = image_name,
-                reference = reference,
-                parent_digest = digest.as_str(),
-                error = %e,
-                "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
-                 child manifests as orphaned until the next backfill pass runs"
-            );
+    // Route ref-recording on the CONTENT classification, not a re-derived
+    // media-type string: an image body pushed with an index Content-Type
+    // would otherwise record `oci_manifest_refs` (0 children) and skip its
+    // blob refs, leaving a live image's layers unreferenced — blob GC would
+    // delete them after the grace period (#1409 C1). `Malformed` was
+    // rejected with 400 above.
+    match class {
+        ManifestClass::Index => {
+            if let Err(e) = record_oci_manifest_refs(&state.db, repo_id, &digest, &body).await {
+                warn!(
+                    image = image_name,
+                    reference = reference,
+                    parent_digest = digest.as_str(),
+                    error = %e,
+                    "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
+                     child manifests as orphaned until the next backfill pass runs"
+                );
+            }
         }
-    } else {
-        // For regular (non-index) image manifests, record the
-        // (manifest_digest -> blob_digest) edges (config + layers) so a
-        // future blob GC can safely judge `oci_blobs` orphanhood (#1635).
-        // Image indexes carry no blobs of their own, so they are skipped
-        // here; their child manifests are tracked via oci_manifest_refs
-        // above and each child records its own blob refs on its own PUT.
-        //
-        // Best-effort: a failure to write the refs is logged but does not
-        // fail the push, since the manifest and tag/artifact rows are
-        // already persisted. The startup backfill in main.rs reconstructs
-        // any gaps on the next restart.
-        if let Err(e) = record_manifest_blob_refs(&state.db, repo_id, &digest, &body).await {
-            warn!(
-                image = image_name,
-                reference = reference,
-                manifest_digest = digest.as_str(),
-                error = %e,
-                "Failed to record manifest_blob_refs for image manifest; blob references will \
-                 be reconstructed by the startup backfill on the next restart"
-            );
+        ManifestClass::Image => {
+            // (manifest_digest -> blob_digest) edges (config + layers) so a
+            // future blob GC can safely judge `oci_blobs` orphanhood (#1635).
+            // Best-effort: the startup backfill reconstructs any gap.
+            if let Err(e) = record_manifest_blob_refs(&state.db, repo_id, &digest, &body).await {
+                warn!(
+                    image = image_name,
+                    reference = reference,
+                    manifest_digest = digest.as_str(),
+                    error = %e,
+                    "Failed to record manifest_blob_refs for image manifest; blob references will \
+                     be reconstructed by the startup backfill on the next restart"
+                );
+            }
         }
+        ManifestClass::Malformed => {}
     }
 
     // Calculate total image size from manifest (config + layers)
@@ -6232,6 +6362,45 @@ async fn catalog_local_entries(
     Ok((entries, has_more))
 }
 
+/// Remove the `manifest_blob_refs` rows for a manifest being deleted, so its
+/// config + layer blobs become reclaimable by blob GC once nothing else
+/// references them (#1409). Without this, refs live forever and a blob stays
+/// pinned even after every referencing manifest is gone.
+///
+/// Scoped to NOT delete refs for a digest that is still a live
+/// per-architecture child of a tagged image index: such a child's blobs are
+/// protected ONLY by these rows (the blob-orphan predicate has no
+/// `oci_manifest_refs` join), so deleting them while the index still serves
+/// the child would strip a live image's protection. The caller deletes the
+/// manifest's `oci_tags` rows first; this then runs in the same delete path.
+async fn delete_manifest_blob_refs(
+    db: &PgPool,
+    repo_id: Uuid,
+    manifest_digest: &str,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        r#"
+        DELETE FROM manifest_blob_refs
+        WHERE repository_id = $1
+          AND manifest_digest = $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM oci_manifest_refs omr
+            JOIN oci_tags ot
+              ON ot.repository_id = omr.repository_id
+             AND ot.manifest_digest = omr.parent_digest
+            WHERE omr.repository_id = $1
+              AND omr.child_digest = $2
+          )
+        "#,
+    )
+    .bind(repo_id)
+    .bind(manifest_digest)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 async fn handle_delete_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6257,9 +6426,12 @@ async fn handle_delete_manifest(
         Err(e) => return e,
     };
 
-    // Resolve the manifest digest. The reference may be a tag name or a digest.
-    let manifest_digest: Option<String> = if reference.starts_with("sha256:") {
-        // Verify the digest actually exists in our tag table
+    // Resolve the manifest digest. The reference may be a tag name or a
+    // digest. A query error must surface as 500, never be flattened into a
+    // 404: an OCI client treats 404 as "already deleted" and stops retrying,
+    // so masking a transient DB outage as MANIFEST_UNKNOWN would silently
+    // abandon the delete and hide the outage in the logs as not-founds.
+    let manifest_digest: Result<Option<String>, sqlx::Error> = if reference.starts_with("sha256:") {
         sqlx::query_scalar!(
             "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id,
@@ -6267,8 +6439,6 @@ async fn handle_delete_manifest(
         )
         .fetch_optional(&state.db)
         .await
-        .ok()
-        .flatten()
     } else {
         sqlx::query_scalar!(
             "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
@@ -6278,17 +6448,22 @@ async fn handle_delete_manifest(
         )
         .fetch_optional(&state.db)
         .await
-        .ok()
-        .flatten()
     };
 
     let digest = match manifest_digest {
-        Some(d) => d,
-        None => {
+        Ok(Some(d)) => d,
+        Ok(None) => {
             return oci_error(
                 StatusCode::NOT_FOUND,
                 "MANIFEST_UNKNOWN",
                 "manifest not found",
+            )
+        }
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
             )
         }
     };
@@ -6306,6 +6481,21 @@ async fn handle_delete_manifest(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             &e.to_string(),
+        );
+    }
+
+    // #1409: drop the manifest's blob refs so its config + layer blobs become
+    // reclaimable once nothing else references them. Scoped to skip a digest
+    // still referenced as a live per-architecture child of a tagged index
+    // (its blobs are protected ONLY by these rows). Best-effort: leaving refs
+    // only over-protects (a leak), never deletes a live blob.
+    if let Err(e) = delete_manifest_blob_refs(&state.db, repo.id, &digest).await {
+        warn!(
+            image = image_name,
+            digest = %digest,
+            error = %e,
+            "Failed to delete manifest_blob_refs on manifest deletion; the \
+             manifest's blobs stay GC-protected until this is retried"
         );
     }
 
@@ -10415,6 +10605,111 @@ mod oci_manifest_refs_tests {
     use super::*;
 
     #[test]
+    fn classify_manifest_detects_index_image_and_malformed() {
+        assert!(matches!(
+            classify_manifest(br#"{"manifests":[{"digest":"sha256:c"}]}"#),
+            ManifestClass::Index
+        ));
+        assert!(matches!(
+            classify_manifest(br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#),
+            ManifestClass::Image
+        ));
+        // Neither manifests[] nor config.digest, and unparseable.
+        assert!(matches!(
+            classify_manifest(br#"{"schemaVersion":2}"#),
+            ManifestClass::Malformed
+        ));
+        assert!(matches!(
+            classify_manifest(b"not json"),
+            ManifestClass::Malformed
+        ));
+        // An index wins even when a config is also present.
+        assert!(matches!(
+            classify_manifest(br#"{"manifests":[],"config":{"digest":"sha256:x"}}"#),
+            ManifestClass::Index
+        ));
+    }
+
+    /// #1409 C1: the STORED media type is derived from content, so the gate
+    /// can't be misled. An index body (even empty) stores an index media type
+    /// even when pushed with an image/missing Content-Type; images keep their
+    /// non-index header.
+    #[test]
+    fn stored_media_type_is_derived_from_content() {
+        let img = "application/vnd.oci.image.manifest.v1+json";
+        let docker_list = "application/vnd.docker.distribution.manifest.list.v2+json";
+        let idx = classify_manifest(br#"{"manifests":[{"digest":"sha256:c"}]}"#);
+        assert!(is_index_content_type(&stored_media_type_for(&idx, img)));
+        let empty_idx = classify_manifest(br#"{"manifests":[]}"#);
+        assert!(is_index_content_type(&stored_media_type_for(
+            &empty_idx, img
+        )));
+        // Docker manifest-list variant preserved.
+        assert_eq!(stored_media_type_for(&idx, docker_list), docker_list);
+        // Image keeps its (non-index) header.
+        let image = classify_manifest(br#"{"config":{"digest":"sha256:cfg"}}"#);
+        assert_eq!(stored_media_type_for(&image, img), img);
+        assert!(!is_index_content_type(&stored_media_type_for(&image, img)));
+        // #1409 C1: an image body pushed with an INDEX Content-Type must NOT
+        // be stored as an index type (the gate would wrongly exclude it).
+        assert!(!is_index_content_type(&stored_media_type_for(
+            &image,
+            docker_list
+        )));
+    }
+
+    /// #1409: delete_manifest_blob_refs removes a deleted manifest's refs but
+    /// preserves a digest still live as a tagged index's child.
+    #[tokio::test]
+    async fn delete_manifest_blob_refs_preserves_live_index_child() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let standalone = format!("sha256:{}", "1".repeat(64));
+        let index = format!("sha256:{}", "2".repeat(64));
+        let child = format!("sha256:{}", "3".repeat(64));
+        for m in [&standalone, &child] {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+                 VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+            )
+            .bind(m)
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .expect("seed refs");
+        }
+        sqlx::query("INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) VALUES ($1,$2,$3)")
+            .bind(&index).bind(&child).bind(repo).execute(&fixture.pool).await.expect("seed edge");
+        sqlx::query("INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) VALUES ($1,'i/x','latest',$2,'application/vnd.oci.image.index.v1+json')")
+            .bind(repo).bind(&index).execute(&fixture.pool).await.expect("seed index tag");
+
+        let removed = delete_manifest_blob_refs(&fixture.pool, repo, &standalone)
+            .await
+            .expect("delete standalone");
+        let child_removed = delete_manifest_blob_refs(&fixture.pool, repo, &child)
+            .await
+            .expect("delete child (guarded)");
+        let child_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id=$1 AND manifest_digest=$2",
+        )
+        .bind(repo)
+        .bind(&child)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count");
+        fixture.teardown().await;
+        assert_eq!(removed, 2, "standalone manifest's refs removed");
+        assert_eq!(
+            child_removed, 0,
+            "live index child's refs must be preserved"
+        );
+        assert_eq!(child_rows, 2, "child refs still present");
+    }
+
+    #[test]
     fn is_index_content_type_matches_oci_and_docker_index() {
         assert!(is_index_content_type(
             "application/vnd.oci.image.index.v1+json"
@@ -10864,6 +11159,148 @@ mod oci_blob_upload_streaming_tests {
             .await
             .expect("response body");
         (status, headers, body)
+    }
+
+    async fn count_manifest_blob_refs(f: &OciUploadFixture, digest: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count manifest_blob_refs")
+    }
+
+    /// #1409 C1: a non-index PUT that is neither an image nor an index (here
+    /// valid JSON with neither, no Content-Type so the header defaults to the
+    /// image type) must be rejected (400) and create NO live tag.
+    #[tokio::test]
+    async fn put_degenerate_manifest_is_rejected_and_creates_no_tag() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let body = Bytes::from_static(br#"{"schemaVersion":2,"layers":[]}"#);
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::PUT,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "degenerate manifest must be rejected"
+        );
+        let tags: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count tags");
+        f.teardown().await;
+        assert_eq!(
+            tags, 0,
+            "a rejected degenerate manifest must not create a live tag"
+        );
+    }
+
+    /// #1409: a manifest DELETE removes its blob refs (so the blobs become
+    /// reclaimable) end-to-end through the router.
+    #[tokio::test]
+    async fn delete_manifest_removes_blob_refs() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+             VALUES ($1, 'app', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed tag");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&digest)
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed refs");
+
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "delete must return 202");
+        let remaining = count_manifest_blob_refs(&f, &digest).await;
+        f.teardown().await;
+        assert_eq!(remaining, 0, "manifest delete must remove its blob refs");
+    }
+
+    /// #1409: deleting a child by digest while its index is still tagged must
+    /// NOT strip the child's blob refs.
+    #[tokio::test]
+    async fn delete_manifest_preserves_live_index_child_blob_refs() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let index = format!("sha256:{}", "1".repeat(64));
+        let child = format!("sha256:{}", "2".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+             VALUES ($1, 'app', 'latest', $2, 'application/vnd.oci.image.index.v1+json'),
+                    ($1, 'app', $3, $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&index)
+        .bind(&child)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed tags");
+        sqlx::query("INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) VALUES ($1,$2,$3)")
+            .bind(&index).bind(&child).bind(f.inner.repo_id).execute(&f.inner.pool).await.expect("seed edge");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&child)
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed child refs");
+
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/{}", f.inner.repo_key, child),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "child delete must return 202");
+        let child_refs = count_manifest_blob_refs(&f, &child).await;
+        f.teardown().await;
+        assert_eq!(
+            child_refs, 2,
+            "a live index child's refs must survive its by-digest delete"
+        );
     }
 
     async fn oci_blob_count(f: &OciUploadFixture, digest: &str) -> i64 {
@@ -15389,7 +15826,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
 
         // First and second proxy fetches both call cache_manifest_reference_locally.
@@ -15577,6 +16014,60 @@ mod proxy_manifest_artifact_indexing_tests {
         );
     }
 
+    /// #1409 C1: a proxied body that is neither an index nor an image
+    /// (malformed) is cached for the client but must NOT create an `oci_tags`
+    /// row — a ref-less live tag would pin the blob-GC gate deployment-wide.
+    #[tokio::test]
+    async fn cache_manifest_malformed_body_writes_no_tag() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: "library/redis".to_string(),
+        };
+        let body = Bytes::from_static(br#"{"schemaVersion":2}"#);
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache must succeed — body is still stored");
+
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count tags");
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert_eq!(
+            tag_count, 0,
+            "a malformed proxied body must NOT create an oci_tags row"
+        );
+    }
+
     /// For multi-arch image-index manifests the proxy path must also
     /// populate `oci_manifest_refs`, mirroring the push-path behaviour in
     /// `handle_put_manifest`. Without these rows the storage GC over-
@@ -15705,7 +16196,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
         let _ = cache_manifest_reference_locally(
             &state,
@@ -15798,7 +16289,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
         // Caller supplies a digest reference, NOT a human-readable tag.
         let digest_ref = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
