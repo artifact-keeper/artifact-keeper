@@ -220,13 +220,30 @@ jobs:
       - name: New code coverage gate
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
         run: |
-          # Fetch base branch so we can diff against it (checkout is shallow by default)
-          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+          # Fetch base branch so we can diff against it (checkout is shallow by default).
+          # Fetch with depth (not --depth=1) and deepen the PR head so that
+          # `git merge-base` can resolve a common ancestor in this shallow checkout.
+          git fetch --no-tags --depth=50 origin ${{ github.base_ref }}
+          git fetch --no-tags --deepen=50 origin || true
+
+          # Diff against the MERGE-BASE between the PR head and the base branch tip,
+          # NOT the raw base tip (FETCH_HEAD). Diffing against the tip counts changes
+          # from OTHER PRs that merged after this branch was cut as a phantom delta,
+          # producing false coverage failures on stale branches (see issue #1646).
+          # The merge-base is where this branch actually diverged, so the diff
+          # reflects only the lines THIS branch changed.
+          MERGE_BASE=$(git merge-base FETCH_HEAD HEAD)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::warning::Could not compute merge-base; falling back to base tip"
+            MERGE_BASE=FETCH_HEAD
+          fi
+          echo "Diffing new code against merge-base: $MERGE_BASE"
+          export MERGE_BASE
 
           # Check coverage on new/changed lines only (not the entire file).
           # Uses unified diff to extract exact line numbers that were added or modified,
           # then cross-references with lcov to measure coverage of those specific lines.
-          CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
+          CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null || true)
           if [ -z "$CHANGED_FILES" ]; then
             echo "No .rs files changed, skipping new code coverage check"
             echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
@@ -236,11 +253,14 @@ jobs:
           # Parse the unified diff to find which lines were added/changed in each file,
           # then cross-reference with lcov.info to compute coverage on those lines only.
           RESULT=$(python3 -c "
-          import subprocess, re
+          import subprocess, re, os
 
-          # Step 1: Parse unified diff to find added line numbers per file
+          # Step 1: Parse unified diff to find added line numbers per file.
+          # Diff against the merge-base (passed in via env) so intervening merges
+          # from other PRs do not show up as a phantom delta (issue #1646).
+          merge_base = os.environ.get('MERGE_BASE', 'FETCH_HEAD')
           diff = subprocess.run(
-              ['git', 'diff', '-U0', 'FETCH_HEAD', '--', '*.rs'],
+              ['git', 'diff', '-U0', merge_base, '--', '*.rs'],
               capture_output=True, text=True
           ).stdout
 
