@@ -819,6 +819,22 @@ impl S3Backend {
         artifactory_fallback_path(key)
     }
 
+    fn byte_range(offset: u64, length: usize) -> Result<std::ops::Range<u64>> {
+        let length = u64::try_from(length).map_err(|_| {
+            AppError::Storage(format!(
+                "Requested range length {} does not fit in u64",
+                length
+            ))
+        })?;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            AppError::Storage(format!(
+                "Requested range offset {} length {} overflows u64",
+                offset, length
+            ))
+        })?;
+        Ok(offset..end)
+    }
+
     async fn try_fallback_get(&self, key: &str, reason: &'static str) -> Result<Option<Bytes>> {
         if !self.path_format.has_fallback() {
             return Ok(None);
@@ -853,6 +869,49 @@ impl S3Backend {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(AppError::Storage(format!(
                 "Failed to get fallback object '{}' for '{}': {}",
+                fallback_key, key, e
+            ))),
+        }
+    }
+
+    async fn try_fallback_get_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+        reason: &'static str,
+    ) -> Result<Option<Bytes>> {
+        if !self.path_format.has_fallback() {
+            return Ok(None);
+        }
+
+        let Some(fallback_key) = self.try_artifactory_fallback(key) else {
+            return Ok(None);
+        };
+
+        let fallback_full_key = self.full_key(&fallback_key);
+        tracing::debug!(
+            original = %key,
+            fallback = %fallback_key,
+            range_start = range.start,
+            range_end = range.end,
+            reason,
+            "Trying Artifactory fallback path range"
+        );
+
+        let path: ObjectPath = fallback_full_key.into();
+        match self.store.get_range(&path, range).await {
+            Ok(bytes) => {
+                tracing::info!(
+                    key = %key,
+                    fallback = %fallback_key,
+                    size = bytes.len(),
+                    "Found artifact range at Artifactory fallback path"
+                );
+                Ok(Some(bytes))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get fallback object range '{}' for '{}': {}",
                 fallback_key, key, e
             ))),
         }
@@ -1132,6 +1191,45 @@ impl super::StorageBackend for S3Backend {
             .map(|r| r.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
 
         Ok(Box::pin(stream))
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let range = Self::byte_range(offset, length)?;
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+
+        match self.store.get_range(&path, range.clone()).await {
+            Ok(bytes) => {
+                tracing::debug!(
+                    key = %key,
+                    offset,
+                    length,
+                    size = bytes.len(),
+                    "S3 get object range successful"
+                );
+                Ok(bytes)
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                if let Some(bytes) = self
+                    .try_fallback_get_range(key, range, "primary range not found")
+                    .await?
+                {
+                    return Ok(bytes);
+                }
+                Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key
+                )))
+            }
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get object range '{}' (offset={}, length={}): {}",
+                key, offset, length, e
+            ))),
+        }
     }
 
     /// Streams `stream` to S3 as a multipart upload.
@@ -1592,6 +1690,20 @@ mod tests {
         let key = format!("a/b/c/d/{}", checksum);
         let result = artifactory_fallback_path(&key);
         assert_eq!(result.unwrap(), format!("91/{}", checksum));
+    }
+
+    #[test]
+    fn test_byte_range_is_end_exclusive() {
+        assert_eq!(S3Backend::byte_range(1_024, 4_096).unwrap(), 1_024..5_120);
+    }
+
+    #[test]
+    fn test_byte_range_rejects_overflow() {
+        let err = S3Backend::byte_range(u64::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "error should explain overflow: {err}"
+        );
     }
 
     // --- S3Config constructor / builder tests ---
