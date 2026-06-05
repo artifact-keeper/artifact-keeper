@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
-use crate::services::proxy_hydration::{BufferedCoordinator, Coordinator};
+use crate::services::proxy_hydration::{
+    BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
+};
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -66,6 +68,19 @@ pub struct StreamingFetchResult {
     /// without a length advertised, in which case the outbound response
     /// uses chunked transfer encoding.
     pub content_length: Option<u64>,
+}
+
+impl From<StreamHandle> for StreamingFetchResult {
+    /// Lower a coordinator [`StreamHandle`] (leader or follower) into the
+    /// handler-facing fetch result. Shared by every streaming exit path so the
+    /// field mapping lives in exactly one place (#1631 layer 2).
+    fn from(handle: StreamHandle) -> Self {
+        Self {
+            body: handle.body,
+            content_type: handle.headers.content_type,
+            content_length: handle.headers.content_length,
+        }
+    }
 }
 
 /// Metadata fields known up-front when teeing an upstream stream into
@@ -1895,8 +1910,37 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<StreamingFetchResult> {
-        let upstream_url = Self::remote_target(repo)?;
+        // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
+        // N concurrent requests for the same uncached object open upstream ONCE.
+        // The streaming coordinator's followers subscribe to the leader's
+        // broadcast instead of re-checking the cache mid-flight (the body is not
+        // cached until the tee completes). The fall-back outcome (`Ok(None)`)
+        // re-enters the cache hit / leader election below — by then the leader is
+        // usually done and the cache is warm. We loop a bounded number of times
+        // to avoid an unbounded re-enter storm; in practice one re-enter hits the
+        // warm cache or wins the election outright.
+        const STREAM_REENTER_BUDGET: usize = 8;
+        for _ in 0..STREAM_REENTER_BUDGET {
+            if let Some(result) = self.try_fetch_artifact_streaming_once(repo, path).await? {
+                return Ok(result);
+            }
+        }
+        // Exhausted re-enters (pathological contention): do one final
+        // uncoordinated attempt so the request never spuriously fails.
+        self.fetch_artifact_streaming_uncoordinated(repo, path)
+            .await
+    }
 
+    /// One coordinated attempt of the streaming fetch. Returns `Ok(None)` when
+    /// the streaming coordinator asked the caller to fall back (re-enter):
+    /// either a late would-be follower that would miss leading bytes, or a
+    /// follower whose leader vanished before publishing headers. The caller
+    /// loops; a re-enter typically lands on the now-warm cache.
+    async fn try_fetch_artifact_streaming_once(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&repo.key, path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
@@ -1907,15 +1951,45 @@ impl ProxyService {
         // the storage backend's own integrity guarantees apply just as
         // they do for presigned redirects (#1018 R-tradeoff already
         // accepted upstream).
-        if let Some(metadata) = self.load_cache_metadata(&metadata_key).await? {
+        if let Some(result) = self
+            .try_streaming_cache_hit(&cache_key, &metadata_key)
+            .await?
+        {
+            return Ok(Some(result));
+        }
+
+        // Cache miss: elect a single streaming leader. The leader opens
+        // upstream once and tees to client + cache; followers subscribe to its
+        // broadcast. `Ok(None)` means fall back / re-enter.
+        let stream_lease_key = format!("proxy-stream:{cache_key}");
+        let handle = self
+            .coordinator
+            .coordinate_stream(&stream_lease_key, || {
+                self.open_streaming_leader(repo, path, cache_key.clone(), metadata_key.clone())
+            })
+            .await?;
+
+        Ok(handle.map(StreamingFetchResult::from))
+    }
+
+    /// Streaming cache-hit fast path, factored out so both the coordinated
+    /// attempt and the uncoordinated fall-back share one implementation.
+    /// Returns `Ok(None)` on a miss (no fresh sidecar, or sidecar present but
+    /// body evicted), in which case the caller fetches upstream.
+    async fn try_streaming_cache_hit(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Result<Option<StreamingFetchResult>> {
+        if let Some(metadata) = self.load_cache_metadata(metadata_key).await? {
             if Utc::now() <= metadata.expires_at {
-                match self.storage.get_stream(&cache_key).await {
+                match self.storage.get_stream(cache_key).await {
                     Ok(body) => {
-                        return Ok(StreamingFetchResult {
+                        return Ok(Some(StreamingFetchResult {
                             body,
                             content_type: metadata.content_type,
                             content_length: Some(metadata.size_bytes as u64),
-                        });
+                        }));
                     }
                     Err(AppError::NotFound(_)) => {
                         // Metadata says cached but body is gone (probably
@@ -1929,9 +2003,22 @@ impl ProxyService {
                 }
             }
         }
+        Ok(None)
+    }
 
-        // Cache miss: fetch upstream as a stream, tee to the cache writer
-        // and to the client.
+    /// The streaming leader body: open upstream ONCE, tee to client + cache,
+    /// and hand the coordinator a [`StreamHandle`] it fans out to followers.
+    /// All cache-correctness invariants (#1365 zero-byte guard, #1051 ETag pin,
+    /// body→sidecar ordering) stay inside [`CachePersister::tee_stream`] — this
+    /// method does not touch bytes.
+    async fn open_streaming_leader(
+        &self,
+        repo: &Repository,
+        path: &str,
+        cache_key: String,
+        metadata_key: String,
+    ) -> Result<StreamHandle> {
+        let upstream_url = Self::remote_target(repo)?;
         let full_url = Self::build_upstream_url(upstream_url, path);
         let upstream = self
             .fetch_from_upstream_streaming(&full_url, repo.id)
@@ -1945,22 +2032,49 @@ impl ProxyService {
         // setting is observable in logs rather than silently doing nothing.
         self.warn_if_proxy_scan_unsupported(repo.id, path).await;
 
+        let headers = StreamHeaders {
+            content_type: upstream.content_type.clone(),
+            content_length: upstream.content_length,
+        };
+
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
             metadata_key,
             CacheMetadataTemplate {
-                content_type: upstream.content_type.clone(),
+                content_type: upstream.content_type,
                 etag: upstream.etag,
                 ttl_secs: cache_ttl,
             },
         );
 
-        Ok(StreamingFetchResult {
-            body,
-            content_type: upstream.content_type,
-            content_length: upstream.content_length,
-        })
+        Ok(StreamHandle { body, headers })
+    }
+
+    /// Uncoordinated streaming fetch (cache hit fast path + direct upstream tee
+    /// with no single-flight). Used as the last-resort fall-back after the
+    /// coordinated path exhausts its re-enter budget under pathological
+    /// contention, so a request never spuriously fails. This is the original
+    /// pre-#1694 behavior, preserved verbatim minus the inlined cache hit.
+    async fn fetch_artifact_streaming_uncoordinated(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<StreamingFetchResult> {
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+
+        if let Some(result) = self
+            .try_streaming_cache_hit(&cache_key, &metadata_key)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        let handle = self
+            .open_streaming_leader(repo, path, cache_key, metadata_key)
+            .await?;
+        Ok(StreamingFetchResult::from(handle))
     }
 
     /// Check if upstream has a newer version of the artifact.
@@ -8081,6 +8195,85 @@ SHA256:
             .expect("a 5xx upstream must fail the streaming fetch");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    /// #1631 layer 2 (#1694): N concurrent cold-cache streaming requests for
+    /// the SAME uncached path must open upstream exactly ONCE — one leader tees
+    /// to client + cache, the rest follow its broadcast or land on the now-warm
+    /// cache. The wiremock upstream is counted via a single 200 mock and the
+    /// post-run `received_requests`, asserting the upstream was hit once.
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_single_flights_concurrent_cold_misses() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A deliberately slow upstream so concurrent followers pile up behind
+        // the leader rather than each racing to a fast independent fetch.
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"single-flight-body".as_ref())
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-sf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::new(tdh::build_proxy_service_with_fs(
+            pool,
+            tmp.to_str().unwrap(),
+        ));
+        let repo = Arc::new(wiremock_remote_repo(
+            "s8-sf",
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        ));
+
+        // Fire N concurrent streamers for the same uncached path.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let proxy = Arc::clone(&proxy);
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                let result = proxy
+                    .fetch_artifact_streaming(&repo, "blob")
+                    .await
+                    .expect("concurrent streaming fetch must succeed");
+                let mut body = result.body;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    bytes.extend_from_slice(&chunk.expect("chunk ok"));
+                }
+                bytes
+            }));
+        }
+
+        for t in tasks {
+            let bytes = t.await.expect("join");
+            assert_eq!(bytes, b"single-flight-body", "every client gets full body");
+        }
+
+        // The upstream must have been hit AT MOST once for all 8 streamers.
+        let hits = server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .into_iter()
+            .filter(|r| r.url.path() == "/blob")
+            .count();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            hits, 1,
+            "single-flight: exactly one upstream open for N concurrent cold misses, got {hits}"
+        );
     }
 
     // -- exchange_bearer_then: OCI 401 Bearer challenge handling -------------
