@@ -83,11 +83,11 @@ impl AuthExtension {
         }
         match &self.scopes {
             None => true,
-            Some(scopes) => {
-                scopes.iter().any(|s| s == scope)
-                    || scopes.iter().any(|s| s == "*")
-                    || scopes.iter().any(|s| s == "admin")
-            }
+            // Delegate the wildcard-aware scope decision to the single
+            // canonical helper (`*` / `admin` short-circuit) instead of
+            // re-inlining a brittle string match here. Keeping the wildcard
+            // policy in one place is what the #1316 grep gate enforces.
+            Some(scopes) => crate::services::token_service::scopes_grant_access(scopes, scope),
         }
     }
 
@@ -1623,6 +1623,36 @@ mod tests {
     fn test_has_scope_admin_grants_all() {
         let ext = make_api_token_ext(vec!["admin".to_string()], None);
         assert!(ext.has_scope("delete:artifacts"));
+    }
+
+    // #1316: pin the authorization decision now that `has_scope` delegates to
+    // the canonical `token_service::scopes_grant_access` helper instead of an
+    // inline `== "admin"` string match. Behavior must be identical: an
+    // `admin`-scoped API token authorizes any required scope, and a token
+    // lacking the required scope (and any wildcard) is rejected.
+    #[test]
+    fn test_has_scope_admin_token_authorizes_every_scope_via_canonical_helper() {
+        let ext = make_api_token_ext(vec!["admin".to_string()], None);
+        // Same decision as the canonical helper for several distinct scopes.
+        for scope in ["read:artifacts", "write:users", "delete:repositories"] {
+            assert!(ext.has_scope(scope), "admin token should grant {scope}");
+            assert_eq!(
+                ext.has_scope(scope),
+                crate::services::token_service::scopes_grant_access(&["admin".to_string()], scope),
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_scope_non_admin_token_rejected_when_scope_absent() {
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(!ext.has_scope("write:users"));
+        assert!(!ext.has_scope("delete:artifacts"));
+        // The canonical helper agrees: no wildcard / admin present.
+        assert!(!crate::services::token_service::scopes_grant_access(
+            &["read:artifacts".to_string()],
+            "write:users",
+        ));
     }
 
     #[test]
