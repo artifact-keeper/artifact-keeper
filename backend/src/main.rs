@@ -544,6 +544,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
+    // The sync worker reads artifact bytes through the configured storage
+    // backend (filesystem/S3/GCS/Azure) so peer replication honors object
+    // storage instead of assuming a local filesystem path (issue #1565).
+    let sync_worker_storage = primary_storage.clone();
     let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
         db_pool.clone(),
@@ -685,7 +689,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let grpc_db_pool = db_pool.clone();
 
     // Spawn background sync worker for peer replication
-    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
+    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool, sync_worker_storage)
+        .await;
     tracing::info!("Sync worker started");
 
     // Conditionally clone state for the metrics listener before the router takes
