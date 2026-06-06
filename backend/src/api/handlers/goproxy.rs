@@ -627,16 +627,11 @@ async fn get_mod_file(
                 )
                 .await?;
 
-                let mut builder = Response::builder().status(StatusCode::OK).header(
-                    "Content-Type",
-                    result
-                        .content_type
-                        .unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "text/plain; charset=utf-8",
+                    None,
                 );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
 
             return Err(not_found);
@@ -772,16 +767,7 @@ async fn download_zip(
                 )
                 .await?;
 
-                let mut builder = Response::builder().status(StatusCode::OK).header(
-                    "Content-Type",
-                    result
-                        .content_type
-                        .unwrap_or_else(|| "application/zip".to_string()),
-                );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(result, "application/zip", None);
             }
 
             return Err(not_found);

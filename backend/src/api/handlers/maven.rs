@@ -1335,17 +1335,11 @@ async fn serve_artifact(
                 )
                 .await?;
 
-                let ct = result
-                    .content_type
-                    .unwrap_or_else(|| content_type_for_path(path).to_string());
-
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct);
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    content_type_for_path(path),
+                    None,
+                );
             }
 
             // For hosted repos, fall back to serving from storage directly.

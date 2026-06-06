@@ -511,22 +511,11 @@ async fn download_archive(
 
                 let filename = format!("{}-{}.zip", package, version);
 
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        result
-                            .content_type
-                            .unwrap_or_else(|| "application/zip".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/zip",
+                    Some(&filename),
+                );
             }
             return Err(not_found);
         }

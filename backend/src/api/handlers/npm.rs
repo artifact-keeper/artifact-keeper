@@ -3223,6 +3223,63 @@ mod tests {
         assert_eq!(NPM_TARBALL_CONTENT_TYPE, publish_content_type);
     }
 
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_sets_headers() {
+        // The streaming tarball response (used for the get_stream download path)
+        // must emit the gzip content-type (or the supplied upstream type), a
+        // Content-Disposition with the filename, and Content-Length when known.
+        use futures::StreamExt as _;
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tgz-bytes"))
+            }));
+        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(9));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some(NPM_TARBALL_CONTENT_TYPE)
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg-1.0.0.tgz\"")
+        );
+        assert_eq!(
+            h.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            Some("9")
+        );
+        // Body must stream the supplied bytes verbatim.
+        let collected = resp
+            .into_body()
+            .into_data_stream()
+            .fold(Vec::new(), |mut acc, c| async move {
+                acc.extend_from_slice(&c.unwrap());
+                acc
+            })
+            .await;
+        assert_eq!(&collected[..], b"tgz-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_uses_upstream_ct_and_omits_length() {
+        // An upstream-provided content-type wins over the default, and Content-
+        // Length is omitted when unknown (chunked transfer).
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::iter(Vec::new()));
+        let resp = build_tarball_response_stream(
+            body,
+            "x.tgz",
+            Some("application/x-custom".to_string()),
+            None,
+        );
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/x-custom")
+        );
+        assert!(h.get(CONTENT_LENGTH).is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Regression tests for #1377 — scoped tarball remote-proxy flow.
     // -----------------------------------------------------------------------

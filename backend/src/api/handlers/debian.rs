@@ -1249,22 +1249,11 @@ async fn pool_download(
                 .await?;
 
                 let filename = path.rsplit('/').next().unwrap_or(&path);
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        result
-                            .content_type
-                            .unwrap_or_else(|| "application/vnd.debian.binary-package".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/vnd.debian.binary-package",
+                    Some(filename),
+                );
             }
 
             return Err(not_found);

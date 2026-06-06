@@ -446,16 +446,7 @@ async fn download_archive(
                 )
                 .await?;
 
-                let mut builder = Response::builder().status(StatusCode::OK).header(
-                    "Content-Type",
-                    result
-                        .content_type
-                        .unwrap_or_else(|| "application/zip".to_string()),
-                );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(result, "application/zip", None);
             }
 
             return Err(swift_error_response(

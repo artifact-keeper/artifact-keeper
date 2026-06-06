@@ -583,6 +583,22 @@ pub(crate) fn build_streaming_response_with_disposition(
     builder.body(body)
 }
 
+/// Handler-facing convenience over [`build_streaming_response_with_disposition`]
+/// that maps the rare malformed-header [`axum::http::Error`] into a `500`
+/// [`Response`], so format handlers can serve a resolved
+/// [`StreamingFetchResult`] (e.g. from [`resolve_virtual_download`]) in a single
+/// line instead of re-inlining the same header-building block. Pass a
+/// `filename` to emit `Content-Disposition: attachment`; pass `None` to omit it.
+#[allow(clippy::result_large_err)]
+pub fn stream_fetch_result(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+    filename: Option<&str>,
+) -> std::result::Result<Response, Response> {
+    build_streaming_response_with_disposition(result, default_content_type, filename)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+}
+
 /// Fetch from upstream via the proxy service, returning a presigned redirect
 /// if the storage backend supports it and presigned downloads are enabled.
 ///
@@ -2573,7 +2589,8 @@ mod tests {
     fn test_local_lookup_select_columns_identical() {
         // Both variants select the same LocalArtifactRow columns; only the
         // WHERE clause differs (the whole point of the S6 collapse).
-        let cols = "SELECT id, storage_key, content_type, quarantine_status, quarantine_until";
+        let cols =
+            "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until";
         assert!(LocalLookup::Path("x").select_sql().starts_with(cols));
         assert!(LocalLookup::NameVersion("n", "v")
             .select_sql()
@@ -5151,6 +5168,54 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(weird)
         );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_sets_headers_and_disposition() {
+        // The handler-facing convenience must emit the same headers as the
+        // underlying builder: upstream content-type wins, content-length is set
+        // when known, and a filename produces a Content-Disposition.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(1234),
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
+            .expect("stream_fetch_result must build a response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/zip")
+        );
+        assert_eq!(
+            h.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("1234")
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg.whl\"")
+        );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_falls_back_to_default_and_omits_optionals() {
+        // No upstream content-type, no length, no filename: default type is
+        // used and neither content-length nor content-disposition is emitted.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", None)
+            .expect("stream_fetch_result must build a response");
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert!(h.get("content-length").is_none());
+        assert!(h.get("content-disposition").is_none());
     }
 
     // -------------------------------------------------------------------

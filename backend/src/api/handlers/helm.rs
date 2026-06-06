@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -338,22 +338,12 @@ async fn download_chart_via_index(
                 )
                 .await
                 {
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            result
-                                .content_type
-                                .unwrap_or_else(|| "application/gzip".to_string()),
-                        )
-                        .header(
-                            "Content-Disposition",
-                            format!("attachment; filename=\"{}\"", filename),
-                        );
-                    if let Some(size) = result.content_length {
-                        builder = builder.header(CONTENT_LENGTH, size.to_string());
-                    }
-                    return Ok(Some(builder.body(Body::from_stream(result.body)).unwrap()));
+                    return proxy_helpers::stream_fetch_result(
+                        result,
+                        "application/gzip",
+                        Some(filename),
+                    )
+                    .map(Some);
                 }
                 continue;
             }

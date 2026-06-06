@@ -897,6 +897,32 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// #1016 contract (streaming half): a missing key passed to `get_stream`
+    /// MUST surface as `AppError::NotFound`, exactly like the buffered `get`
+    /// and `get_range`. Callers such as `maven_proxy.rs` sibling fall-through
+    /// and the local hydration retry distinguish NotFound (→ 404 / coordinated
+    /// retry) from a real I/O error (→ 500); lumping a missing file into
+    /// `AppError::Storage` would turn a legitimate 404 into a 500. This test
+    /// guards the regression introduced when the local download path migrated
+    /// to streaming (PR #1393 / #1608 download invariant).
+    #[tokio::test]
+    async fn test_get_stream_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // The Ok arm holds a BoxStream (not Debug), so match rather than
+        // `unwrap_err` to extract the error.
+        let err = match storage.get_stream("does-not-exist-stream").await {
+            Ok(_) => panic!("expected an error for a missing key"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for a missing key, got {err:?}"
+        );
+    }
+
     // --- put_stream tests ---
 
     #[tokio::test]

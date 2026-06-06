@@ -2822,9 +2822,7 @@ mod tests {
     /// Drain a `get_remote_cached_or_refetch_stream` body into a single `Bytes`
     /// so the existing buffered-semantics assertions still hold against the
     /// streaming implementation.
-    async fn collect_stream(
-        stream: BoxStream<'static, Result<Bytes, std::io::Error>>,
-    ) -> Bytes {
+    async fn collect_stream(stream: BoxStream<'static, Result<Bytes, std::io::Error>>) -> Bytes {
         let mut s = stream;
         let mut buf = Vec::new();
         while let Some(chunk) = s.next().await {
@@ -2930,17 +2928,13 @@ mod tests {
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
-            storage_key,
-            move || {
-                let refetch_calls_clone = refetch_calls_clone.clone();
-                async move {
-                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"refetched-bytes"))
-                }
-            },
-        )
+        let stream = super::get_remote_cached_or_refetch_stream(&storage, storage_key, move || {
+            let refetch_calls_clone = refetch_calls_clone.clone();
+            async move {
+                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::from_static(b"refetched-bytes"))
+            }
+        })
         .await
         .expect("refetch should succeed");
         let content = collect_stream(stream).await;
@@ -3065,7 +3059,12 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("non-NotFound storage errors must propagate");
+        // The Ok arm carries a BoxStream (not Debug), so match instead of
+        // `expect_err` to extract the error Response.
+        let response = match result {
+            Ok(_) => panic!("non-NotFound storage errors must propagate"),
+            Err(resp) => resp,
+        };
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3096,7 +3095,12 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("refetch failures must propagate to caller");
+        // The Ok arm carries a BoxStream (not Debug), so match instead of
+        // `expect_err` to extract the error Response.
+        let response = match result {
+            Ok(_) => panic!("refetch failures must propagate to caller"),
+            Err(resp) => resp,
+        };
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),

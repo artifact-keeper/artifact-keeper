@@ -550,22 +550,11 @@ async fn flatcontainer_download(
                 )
                 .await?;
 
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        result
-                            .content_type
-                            .unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    );
-                if let Some(size) = result.content_length {
-                    builder = builder.header(CONTENT_LENGTH, size.to_string());
-                }
-                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    Some(&filename),
+                );
             }
             return Err(not_found);
         }
@@ -624,22 +613,28 @@ async fn flatcontainer_download(
                 .await?;
                 Box::pin(futures::stream::once(async move { Ok(content) }))
             } else {
-                storage.get_stream(&artifact.storage_key).await.map_err(|e| {
+                storage
+                    .get_stream(&artifact.storage_key)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Storage error: {}", e),
+                        )
+                            .into_response()
+                    })?
+            }
+        } else {
+            storage
+                .get_stream(&artifact.storage_key)
+                .await
+                .map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Storage error: {}", e),
                     )
                         .into_response()
                 })?
-            }
-        } else {
-            storage.get_stream(&artifact.storage_key).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
-                )
-                    .into_response()
-            })?
         };
 
     // Record download.

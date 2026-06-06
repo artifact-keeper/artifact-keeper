@@ -8218,8 +8218,7 @@ SHA256:
         let err = proxy
             .fetch_artifact_streaming(&repo, "blob")
             .await
-            .err()
-            .expect("a 5xx upstream must fail the streaming fetch");
+            .expect_err("a 5xx upstream must fail the streaming fetch");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
     }

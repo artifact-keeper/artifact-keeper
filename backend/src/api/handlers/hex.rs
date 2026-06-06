@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -334,22 +334,7 @@ async fn serve_virtual_tarball_local_only(
     )
     .await?;
 
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            "Content-Type",
-            result
-                .content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-        )
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        );
-    if let Some(size) = result.content_length {
-        builder = builder.header(CONTENT_LENGTH, size.to_string());
-    }
-    Ok(builder.body(Body::from_stream(result.body)).unwrap())
+    proxy_helpers::stream_fetch_result(result, "application/octet-stream", Some(filename))
 }
 
 // ---------------------------------------------------------------------------
