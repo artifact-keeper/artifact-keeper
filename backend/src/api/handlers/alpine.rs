@@ -563,7 +563,7 @@ async fn download_package(
                 let db = state.db.clone();
                 let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
                 let artifact_path_clone = artifact_path.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -582,16 +582,11 @@ async fn download_package(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type
-                            .unwrap_or_else(|| "application/vnd.alpine.package".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/vnd.alpine.package",
+                    None,
+                );
             }
 
             return Err(not_found);
@@ -606,8 +601,8 @@ async fn download_package(
         .await
         .map_err(|e| e.into_response())?;
 
-    match storage.get(&artifact.storage_key).await {
-        Ok(content) => {
+    match storage.get_stream(&artifact.storage_key).await {
+        Ok(stream) => {
             // Record download
             let _ = sqlx::query!(
                 "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
@@ -623,9 +618,9 @@ async fn download_package(
                     "Content-Disposition",
                     format!("attachment; filename=\"{}\"", filename),
                 )
-                .header(CONTENT_LENGTH, content.len().to_string())
+                .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
                 .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from(content))
+                .body(Body::from_stream(stream))
                 .unwrap())
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {

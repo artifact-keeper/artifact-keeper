@@ -1339,7 +1339,7 @@ async fn download(
                     let upstream_path = format!("modules/{}/commits/{}", module_name, digest);
                     let mname = module_name.clone();
 
-                    let (bundle_data, _content_type) = proxy_helpers::resolve_virtual_download(
+                    let result = proxy_helpers::resolve_virtual_download(
                         &state.db,
                         state.proxy_service.as_deref(),
                         repo.id,
@@ -1357,6 +1357,8 @@ async fn download(
                         },
                     )
                     .await?;
+
+                    let bundle_data = result.collect().await.map_err(|e| e.into_response())?;
 
                     let files = extract_files_from_bundle(&bundle_data)?;
                     let commit = CommitInfo {

@@ -264,9 +264,17 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to open {}: {}", key, e)))?;
+        let file = fs::File::open(&path).await.map_err(|e| {
+            // #1016: a missing key MUST map to AppError::NotFound so callers
+            // (e.g. maven_proxy sibling fall-through, local hydration retry)
+            // see a 404, not a 500. Mirror the buffered `get`/`get_range`
+            // mapping; anything that is not a NotFound stays a Storage error.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
 
         let reader = BufReader::new(file);
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
@@ -887,6 +895,32 @@ mod tests {
 
         let result = storage.get_stream("nonexistent-key1234").await;
         assert!(result.is_err());
+    }
+
+    /// #1016 contract (streaming half): a missing key passed to `get_stream`
+    /// MUST surface as `AppError::NotFound`, exactly like the buffered `get`
+    /// and `get_range`. Callers such as `maven_proxy.rs` sibling fall-through
+    /// and the local hydration retry distinguish NotFound (→ 404 / coordinated
+    /// retry) from a real I/O error (→ 500); lumping a missing file into
+    /// `AppError::Storage` would turn a legitimate 404 into a 500. This test
+    /// guards the regression introduced when the local download path migrated
+    /// to streaming (PR #1393 / #1608 download invariant).
+    #[tokio::test]
+    async fn test_get_stream_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // The Ok arm holds a BoxStream (not Debug), so match rather than
+        // `unwrap_err` to extract the error.
+        let err = match storage.get_stream("does-not-exist-stream").await {
+            Ok(_) => panic!("expected an error for a missing key"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for a missing key, got {err:?}"
+        );
     }
 
     // --- put_stream tests ---

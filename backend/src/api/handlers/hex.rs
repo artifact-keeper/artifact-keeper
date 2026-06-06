@@ -313,7 +313,7 @@ async fn serve_virtual_tarball_local_only(
     let state_arc = state.clone();
     let suffix = filename.to_string();
 
-    let (content, content_type) = proxy_helpers::resolve_virtual_download(
+    let result = proxy_helpers::resolve_virtual_download(
         &state.db,
         // Explicit None: any Remote member would route to upstream, which is
         // exactly what the shadowing guard must block. Local members fall
@@ -334,12 +334,7 @@ async fn serve_virtual_tarball_local_only(
     )
     .await?;
 
-    Ok(proxy_helpers::build_download_response(
-        content,
-        content_type,
-        "application/octet-stream",
-        Some(filename),
-    ))
+    proxy_helpers::stream_fetch_result(result, "application/octet-stream", Some(filename))
 }
 
 // ---------------------------------------------------------------------------
