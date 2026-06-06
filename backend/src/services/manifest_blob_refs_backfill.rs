@@ -205,8 +205,12 @@ fn insert_rows_error(e: impl std::fmt::Display) -> String {
 /// manifests that have zero rows in `manifest_blob_refs`. Two reachability
 /// sources are unioned:
 ///
-///   1. `oci_tags` rows whose content-type is NOT an image index -- these
-///      are directly tagged image manifests.
+///   1. `oci_tags` rows whose content-type is NOT an image index AND which
+///      are not structurally an index (no children in `oci_manifest_refs`)
+///      -- these are directly tagged image manifests. The structural guard
+///      (#1409 C1) keeps an index pushed with a wrong/absent Content-Type
+///      out of the image-candidate set, since it has no blobs of its own and
+///      would otherwise pin the readiness gate forever.
 ///   2. `oci_manifest_refs.child_digest` -- the per-architecture child
 ///      manifests of multi-arch image indexes. These never appear in
 ///      `oci_tags` directly but are image manifests with their own blobs.
@@ -232,6 +236,19 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
             WHERE ot.manifest_content_type NOT IN (
                     'application/vnd.oci.image.index.v1+json',
                     'application/vnd.docker.distribution.manifest.list.v2+json'
+                )
+              -- Structural index guard (#1409 C1): exclude any tagged digest
+              -- that is itself an index (has children in oci_manifest_refs),
+              -- even when its stored content-type does not match the two
+              -- index media types above (pushed with a wrong/absent
+              -- Content-Type). An index carries no blobs of its own, so it
+              -- can never gain manifest_blob_refs rows; left in the candidate
+              -- set it would pin the readiness gate true forever and disable
+              -- blob GC permanently.
+              AND NOT EXISTS (
+                    SELECT 1 FROM oci_manifest_refs omr_parent
+                    WHERE omr_parent.repository_id = ot.repository_id
+                      AND omr_parent.parent_digest = ot.manifest_digest
                 )
             UNION
             SELECT omr.child_digest AS manifest_digest,
@@ -554,6 +571,75 @@ mod tests {
         assert_eq!(
             still_candidate, 0,
             "once refs are recorded the manifest must no longer be an unbackfilled candidate"
+        );
+    }
+
+    /// C1 (#1409): a tagged manifest that is structurally an index (has
+    /// children in `oci_manifest_refs`) but was pushed with a wrong/absent
+    /// Content-Type must NOT appear as an unbackfilled image candidate. An
+    /// index carries no blobs of its own, so it can never gain
+    /// `manifest_blob_refs` rows; if it stayed in the candidate set it would
+    /// pin `any_live_manifest_missing_refs` true forever and disable blob GC
+    /// for the whole deployment. The structural guard in
+    /// [`select_unbackfilled_manifests`] excludes it regardless of its stored
+    /// content-type.
+    #[tokio::test]
+    async fn select_unbackfilled_manifests_excludes_mislabeled_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let index_digest = format!("sha256:{}", "a".repeat(64));
+        let child_digest = format!("sha256:{}", "b".repeat(64));
+
+        // Tag the index with a NON-index content-type, so only the structural
+        // guard (its oci_manifest_refs children), not the content-type filter,
+        // can keep it out of the candidate set.
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+            VALUES ($1, 'c1/index', 'latest', $2, 'application/octet-stream')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&index_digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert mislabeled index tag");
+        sqlx::query(
+            r#"
+            INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(&index_digest)
+        .bind(&child_digest)
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert index child");
+
+        let candidates = select_unbackfilled_manifests(&fixture.pool)
+            .await
+            .expect("candidate query runs");
+
+        fixture.teardown().await;
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.manifest_digest == index_digest && c.repository_id == fixture.repo_id),
+            "a tagged index with a non-index content-type must be excluded from image candidates; \
+             otherwise it would pin the readiness gate forever and disable blob GC"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.manifest_digest == child_digest && c.repository_id == fixture.repo_id),
+            "the index's per-architecture child (a real image manifest with no refs) must still be \
+             enumerated as an unbackfilled candidate"
         );
     }
 }

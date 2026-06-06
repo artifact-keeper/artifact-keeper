@@ -94,6 +94,24 @@ jobs:
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
       CARGO_INCREMENTAL: "0"
+    services:
+      # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
+      # readiness gate) that silently no-op via `Fixture::setup` when
+      # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
+      # so they actually run (#1409 review).
+      postgres:
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -122,10 +140,40 @@ jobs:
             exit 1
           fi
 
+      - name: Wait for Postgres
+        run: |
+          set -euo pipefail
+          # The service --health-cmd already runs pg_isready, but the step can
+          # start before health flips to "healthy" on slower runners. A short
+          # TCP readiness loop avoids a flaky first connect.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              echo "Postgres reachable on attempt $i"
+              exit 0
+            fi
+            echo "  waiting for postgres... ($i/30)"
+            sleep 1
+          done
+          echo "ERROR: Postgres did not become reachable within 30s"
+          exit 1
+
+      - name: Run database migrations
+        run: sqlx migrate run --source backend/migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
       - name: Run unit tests
         env:
+          # SQLX_OFFLINE keeps the build using the committed .sqlx cache;
+          # DATABASE_URL lets the DB-backed lib tests run for real against the
+          # Postgres service above instead of no-op'ing.
           SQLX_OFFLINE: true
-        run: cargo test --workspace --lib --verbose
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        # --test-threads=1: these DB-backed suites share global tables and the
+        # blob-GC readiness gate is a cluster-wide query, so a concurrent
+        # cross-module test's transient rows can make gate/GC assertions flaky.
+        run: cargo test --workspace --lib --verbose -- --test-threads=1
 
   shell-tests:
     name: 🐚 Shell Tests
@@ -147,11 +195,20 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
-    # Disable incremental codegen (#1679): the coverage build compiles the
-    # same lib-test crate that OOM-killed check-rust. Incremental is useless
-    # in CI's clean checkout and inflates peak RSS.
+    # Memory guards for the instrumented lib-test compile (#1679/#1680,
+    # extended here to the coverage job). This job builds the same lib-test
+    # crate that OOM-killed check-rust, but under `-C instrument-coverage`
+    # *and* `-C debuginfo=2` — the heaviest compile in CI, which got SIGKILL'd
+    # (OOM) on larger PRs. CARGO_INCREMENTAL=0 drops incremental codegen
+    # (useless in a clean checkout), CARGO_BUILD_JOBS caps parallel rustc, and
+    # dropping debuginfo cuts peak RSS the most. Coverage mapping comes from
+    # the instrumentation (`__llvm_covmap`), not DWARF, so debuginfo=0 does
+    # not affect line-coverage accuracy.
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       postgres:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
