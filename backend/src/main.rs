@@ -1089,29 +1089,41 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
 /// env vars (OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, etc.) without
 /// needing admin API access first.
 async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+    use artifact_keeper_backend::services::auth_config_service::{
+        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    };
 
     let req = match build_oidc_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
 
-    // Only bootstrap when no OIDC configs exist in the database
+    // Reconcile the env-managed provider (matched by name) on every boot so
+    // changing OIDC_* env and redeploying takes effect. Other (UI-created)
+    // providers are left untouched.
     let existing = AuthConfigService::list_oidc(db).await?;
-    if !existing.is_empty() {
-        tracing::debug!(
-            "OIDC env vars present but {} config(s) already exist in DB, skipping bootstrap",
-            existing.len()
-        );
-        return Ok(());
-    }
+    let pairs: Vec<(uuid::Uuid, String)> =
+        existing.iter().map(|c| (c.id, c.name.clone())).collect();
 
-    let config = AuthConfigService::create_oidc(db, req).await?;
-    tracing::info!(
-        "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
-        config.name,
-        config.id
-    );
+    match plan_provider_reconcile(&req.name, &pairs) {
+        ReconcileAction::Create => {
+            let config = AuthConfigService::create_oidc(db, req).await?;
+            tracing::info!(
+                "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
+                config.name,
+                config.id
+            );
+        }
+        ReconcileAction::Update(id) => {
+            let name = req.name.clone();
+            let cfg = AuthConfigService::update_oidc(db, id, req.into()).await?;
+            tracing::info!(
+                "Reconciled env-managed OIDC provider '{}' (id={}) from environment variables",
+                name,
+                cfg.id
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1202,29 +1214,41 @@ fn build_oidc_request_from_values(
 /// env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN, etc.) without needing admin
 /// API access first.  Mirrors `bootstrap_oidc_from_env` (fixes #1434).
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+    use artifact_keeper_backend::services::auth_config_service::{
+        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
 
-    // Only bootstrap when no LDAP configs exist in the database
+    // Reconcile the env-managed provider (matched by name) on every boot so
+    // changing LDAP_* env and redeploying takes effect. Other (UI-created)
+    // providers are left untouched.
     let existing = AuthConfigService::list_ldap(db).await?;
-    if !existing.is_empty() {
-        tracing::debug!(
-            "LDAP env vars present but {} config(s) already exist in DB, skipping bootstrap",
-            existing.len()
-        );
-        return Ok(());
-    }
+    let pairs: Vec<(uuid::Uuid, String)> =
+        existing.iter().map(|c| (c.id, c.name.clone())).collect();
 
-    let config = AuthConfigService::create_ldap(db, req).await?;
-    tracing::info!(
-        "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
-        config.name,
-        config.id
-    );
+    match plan_provider_reconcile(&req.name, &pairs) {
+        ReconcileAction::Create => {
+            let config = AuthConfigService::create_ldap(db, req).await?;
+            tracing::info!(
+                "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+                config.name,
+                config.id
+            );
+        }
+        ReconcileAction::Update(id) => {
+            let name = req.name.clone();
+            let cfg = AuthConfigService::update_ldap(db, id, req.into()).await?;
+            tracing::info!(
+                "Reconciled env-managed LDAP provider '{}' (id={}) from environment variables",
+                name,
+                cfg.id
+            );
+        }
+    }
 
     Ok(())
 }
