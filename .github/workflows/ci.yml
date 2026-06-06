@@ -57,6 +57,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Forbidden-pattern gate (#1316): authorization on API-token scopes must
+      # use the canonical `token_service::scopes_grant_access` helper, never an
+      # inline `== "admin"` / `.any(|s| s == "admin")` raw-string scope match.
+      # This grep gate fails the build if the legacy idiom reappears in
+      # backend/src (test modules and the canonical helper are excluded).
+      - name: No legacy admin scope check
+        run: ./scripts/ci/check-no-legacy-admin-scope.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
