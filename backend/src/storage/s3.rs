@@ -1066,9 +1066,19 @@ impl super::StorageBackend for S3Backend {
         if self.disable_multi_delete {
             self.single_object_delete(&path, key).await?;
         } else {
-            self.store.delete(&path).await.map_err(|e| {
-                AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
-            })?;
+            // Deleting a missing object is idempotent (matches
+            // `single_object_delete` and the filesystem backend): map
+            // NotFound to Ok so callers like blob GC can treat "already
+            // gone" as success instead of re-erroring every pass (#1409 H3).
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    return Err(AppError::Storage(format!(
+                        "Failed to delete object '{}': {}",
+                        key, e
+                    )))
+                }
+            }
         }
 
         tracing::debug!(key = %key, "S3 delete object successful");
