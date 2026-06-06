@@ -430,16 +430,38 @@ jobs:
           git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
           CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
+          # Exclude the per-ecosystem package-format handlers
+          # (backend/src/api/handlers/<format>.rs). These are inherent structural
+          # near-duplicates of one another (~18% cross-file duplication on main,
+          # dominant clones are whole-file matches like sbt.rs <-> vscode.rs incl.
+          # the shared import block). Without this exclusion ANY PR that legitimately
+          # edits the download/upload path across several formats trips the 3% gate
+          # regardless of code quality (#1704). The exclusion list is the single
+          # source of truth in .jscpd.json; we filter the changed-file list here
+          # rather than relying on jscpd's own ignore globs so the behavior is
+          # deterministic regardless of jscpd version. The gate stays STRICT on all
+          # other code (services, storage, middleware, non-format handlers, ...)
+          # where duplication is a real smell.
+          IGNORE_RE=$(python3 -c "
+          import json, re
+          cfg = json.load(open('.jscpd.json'))
+          pats = [p for p in cfg.get('ignore', []) if p.startswith('backend/src/api/handlers/')]
+          print('|'.join(re.escape(p) for p in pats))
+          ")
+          if [ -n "$IGNORE_RE" ]; then
+            CHANGED_RS=$(printf '%s\n' "$CHANGED_RS" | grep -Ev "^(${IGNORE_RE})$" || true)
+          fi
+
           if [ -z "$CHANGED_RS" ]; then
-            echo "No .rs source files changed, skipping duplication check"
-            echo "### Code Duplication: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            echo "No measurable .rs source files changed (none, or only ignored format handlers), skipping duplication check"
+            echo "### Code Duplication: N/A (no measurable Rust changes)" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
 
           # Write changed files to a list for jscpd
           echo "$CHANGED_RS" > /tmp/changed-files.txt
 
-          # Run jscpd on changed files only (min 10 lines, threshold 3%)
+          # Run jscpd on the filtered changed files (min 10 lines, threshold 3%).
           RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
             --format rust --output /tmp/jscpd-report \
             $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
