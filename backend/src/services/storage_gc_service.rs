@@ -1074,6 +1074,17 @@ impl StorageGcService {
                     SELECT 1 FROM oci_upload_parts p
                     WHERE p.storage_key = oci_upload_cleanup_keys.storage_key
                   )
+                  -- A cleanup key may be a final `oci-blobs/<digest>` object
+                  -- (journaled around the blob copy/commit so a failed
+                  -- `oci_blobs` INSERT does not orphan it). Once an `oci_blobs`
+                  -- row references the key the blob is live: never reap it, even
+                  -- if a concurrent push committed the row after this writer's
+                  -- own commit failed. This is the guard that makes journaling
+                  -- the blob key safe against data loss.
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_blobs b
+                    WHERE b.storage_key = oci_upload_cleanup_keys.storage_key
+                  )
                 "#,
             )
             .bind(cleanup_key.id)
@@ -1124,6 +1135,14 @@ impl StorageGcService {
               AND NOT EXISTS (
                 SELECT 1 FROM oci_upload_parts p
                 WHERE p.storage_key = c.storage_key
+              )
+              -- Never select a key that a live `oci_blobs` row references: it is
+              -- a committed blob, not an orphan. The storage object is deleted
+              -- before the row DELETE re-asserts predicates, so this guard MUST
+              -- live on the SELECT to prevent deleting a live blob's bytes.
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_blobs b
+                WHERE b.storage_key = c.storage_key
               )
             ORDER BY c.created_at ASC
             LIMIT $1
@@ -1224,6 +1243,14 @@ impl StorageGcService {
                     SELECT 1 FROM oci_upload_parts p
                     WHERE p.storage_key = oci_upload_cleanup_keys.storage_key
                   )
+                  -- A pending key may be a final blob key whose copy succeeded
+                  -- but whose `oci_blobs` commit failed (left NULL-marked). If a
+                  -- concurrent push has since committed an `oci_blobs` row for
+                  -- the same digest/key, the blob is live: never reap it.
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_blobs b
+                    WHERE b.storage_key = oci_upload_cleanup_keys.storage_key
+                  )
                 "#,
             )
             .bind(cleanup_key.id)
@@ -1270,6 +1297,14 @@ impl StorageGcService {
               AND NOT EXISTS (
                 SELECT 1 FROM oci_upload_parts p
                 WHERE p.storage_key = c.storage_key
+              )
+              -- Never reap a pending key that a live `oci_blobs` row references
+              -- (a concurrent push committed the same digest). The storage
+              -- delete runs before the row DELETE, so this guard is required on
+              -- the SELECT to avoid destroying a live blob's bytes.
+              AND NOT EXISTS (
+                SELECT 1 FROM oci_blobs b
+                WHERE b.storage_key = c.storage_key
               )
             ORDER BY c.created_at ASC
             LIMIT $1
@@ -2647,6 +2682,179 @@ mod tests {
         assert!(
             result.storage_keys_deleted >= 1,
             "GC result should include the cleanup-key storage object"
+        );
+    }
+
+    /// Regression for #1527: a blob key (`oci-blobs/<digest>`) journaled around
+    /// the blob copy/commit must NEVER be reclaimed once an `oci_blobs` row
+    /// references it, even for an aged committed cleanup row. A concurrent push
+    /// of the same digest can commit the row after a different writer's commit
+    /// failed; reaping then would destroy a live blob's bytes (data loss).
+    #[tokio::test]
+    async fn test_run_gc_keeps_cleanup_key_referenced_by_committed_oci_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let blob_key = format!("oci-blobs/{}", digest);
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&blob_key, Bytes::from_static(b"live blob bytes"))
+            .await
+            .expect("write live blob object");
+
+        // A live `oci_blobs` row references the key (concurrent committed push).
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fixture.repo_id)
+        .bind(&digest)
+        .bind(15_i64)
+        .bind(&blob_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert referencing oci_blobs row");
+
+        // An aged, committed cleanup-journal entry for the same key (left behind
+        // when the success-path clear was lost, e.g. a transient DB blip).
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, storage_key, created_at, storage_write_completed_at
+            )
+            VALUES ($1, $2, NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert committed cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&blob_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&blob_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors for referenced blob key: {:?}",
+            key_errors
+        );
+        assert!(
+            key_exists,
+            "GC must NEVER delete a blob object referenced by a live oci_blobs row"
+        );
+        assert_eq!(
+            cleanup_key_count, 1,
+            "GC must keep the cleanup row while an oci_blobs row references the key"
+        );
+    }
+
+    /// Regression for #1527: when an `oci_blobs` commit fails after the blob
+    /// object was copied, the orphaned `oci-blobs/<digest>` object is left
+    /// journaled but NULL-marked (write never confirmed). With no referencing
+    /// `oci_blobs` row, the pending reaper must reclaim it once aged.
+    #[tokio::test]
+    async fn test_run_gc_reaps_pending_orphaned_blob_key_without_oci_blob_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let blob_key = format!("oci-blobs/{}", digest);
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&blob_key, Bytes::from_static(b"orphaned blob bytes"))
+            .await
+            .expect("write orphaned blob object");
+
+        // NULL-marked (storage_write_completed_at IS NULL) aged journal entry,
+        // no referencing oci_blobs row: the orphan left by a failed commit.
+        sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (
+                repository_id, storage_key, created_at
+            )
+            VALUES ($1, $2, NOW() - INTERVAL '25 hours')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert pending cleanup key row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service.run_gc(false).await.expect("live gc succeeds");
+
+        let key_exists = storage.exists(&blob_key).await.expect("exists check");
+        let cleanup_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count cleanup key rows");
+        let key_errors = result
+            .errors
+            .iter()
+            .filter(|err| err.contains(&blob_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        fixture.teardown().await;
+
+        assert!(
+            key_errors.is_empty(),
+            "GC produced errors reaping orphaned blob key: {:?}",
+            key_errors
+        );
+        assert!(
+            !key_exists,
+            "GC must reclaim the orphaned blob object (no oci_blobs row references it)"
+        );
+        assert_eq!(
+            cleanup_key_count, 0,
+            "GC must delete the cleanup row for the reclaimed orphan"
         );
     }
 
