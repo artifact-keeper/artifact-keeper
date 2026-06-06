@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 
 /// Admin-only user-management routes. Mount under `admin_middleware`.
 ///
-/// Every handler in this set also calls `if !auth.is_admin { 403 }` as
+/// Every handler in this set also calls `auth.require_admin()?` as
 /// defense in depth (see #1257) so the middleware and the handler form
 /// two independent layers of admin-gating. Password-mutating routes
 /// live in the [`self_password_router`] / [`admin_password_router`] pair
@@ -42,8 +42,8 @@ pub fn router() -> Router<SharedState> {
 /// `auth_middleware` (NOT `admin_middleware`) so non-admins can act on
 /// their own user record.
 ///
-/// Each handler enforces `if auth.user_id != id && !auth.is_admin { 403 }`
-/// internally; mounting these under `admin_middleware` (as the legacy
+/// Each handler enforces self-or-admin internally via
+/// `auth.require_self_or_admin(id, ..)?`; mounting these under `admin_middleware` (as the legacy
 /// single-router topology did pre-#1257) made those checks dead code
 /// and 403'd every non-admin self-action — including `POST
 /// /api/v1/users/<self-id>/tokens` (the "Create API key" flow) which is
@@ -203,9 +203,7 @@ pub async fn list_users(
     // Defense-in-depth admin gate. Production traffic goes through
     // `admin_middleware` first; this guard ensures the route stays safe
     // if someone moves it between routers in the future. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -378,11 +376,7 @@ pub async fn get_user(
     Path(id): Path<Uuid>,
 ) -> Result<Json<AdminUserResponse>> {
     // Self-or-admin: a user may read their own record; anyone else needs admin.
-    if auth.user_id != id && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Cannot view other users' records".to_string(),
-        ));
-    }
+    auth.require_self_or_admin(id, "Cannot view other users' records")?;
     let user = sqlx::query_as!(
         User,
         r#"
@@ -431,9 +425,7 @@ pub async fn update_user(
     // Defense-in-depth admin gate. Production traffic also passes
     // through `admin_middleware`; this guard is what keeps the route
     // safe if someone reroutes it. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     // When an admin deactivates a user, immediately invalidate every cached
     // API-token and JWT for that user. Without this, a compromised account
     // would keep authenticating against any AuthService instance whose
@@ -520,9 +512,7 @@ pub async fn delete_user(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     // Defense-in-depth admin gate. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     // Prevent self-deletion
     if auth.user_id == id {
         return Err(AppError::Validation("Cannot delete yourself".to_string()));
@@ -596,9 +586,7 @@ pub async fn get_user_roles(
     Path(id): Path<Uuid>,
 ) -> Result<Json<RoleListResponse>> {
     // Defense-in-depth admin gate. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     let roles = sqlx::query!(
         r#"
         SELECT r.id, r.name, r.description, r.permissions
@@ -653,9 +641,7 @@ pub async fn assign_role(
     Json(payload): Json<AssignRoleRequest>,
 ) -> Result<()> {
     // Defense-in-depth admin gate. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     sqlx::query!(
         r#"
         INSERT INTO user_roles (user_id, role_id)
@@ -694,9 +680,7 @@ pub async fn revoke_role(
     Path((user_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
     // Defense-in-depth admin gate. See #1257.
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     let result = sqlx::query!(
         "DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2",
         user_id,
@@ -764,11 +748,7 @@ pub async fn list_user_tokens(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiTokenListResponse>> {
     // Users can only view their own tokens unless admin
-    if auth.user_id != id && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Cannot view other users' tokens".to_string(),
-        ));
-    }
+    auth.require_self_or_admin(id, "Cannot view other users' tokens")?;
 
     let tokens = sqlx::query!(
         r#"
@@ -823,11 +803,7 @@ pub async fn create_api_token(
     Json(payload): Json<CreateApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
-    if auth.user_id != id && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Cannot create tokens for other users".to_string(),
-        ));
-    }
+    auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
 
     // Refuse admin-class scopes from non-admin callers. See
     // `token_service::ADMIN_ONLY_SCOPES` for the policy rationale —
@@ -873,11 +849,7 @@ pub async fn revoke_api_token(
     Path((user_id, token_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
     // Users can only revoke their own tokens unless admin
-    if auth.user_id != user_id && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Cannot revoke other users' tokens".to_string(),
-        ));
-    }
+    auth.require_self_or_admin(user_id, "Cannot revoke other users' tokens")?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, user_id).await?;
@@ -921,11 +893,7 @@ pub async fn change_password(
     validate_password_with_policy(&payload.new_password, &policy)?;
 
     // Non-admin trying to change another user's password
-    if auth.user_id != id && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Cannot change other users' passwords".to_string(),
-        ));
-    }
+    auth.require_self_or_admin(id, "Cannot change other users' passwords")?;
 
     // Fetch user row once: password_hash + must_change_password
     let user_row = sqlx::query_as::<_, (Option<String>, bool)>(
