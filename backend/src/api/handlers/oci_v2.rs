@@ -767,6 +767,31 @@ async fn mark_oci_upload_cleanup_key_committed(
     Ok(())
 }
 
+/// Remove a cleanup-journal row once the storage object it tracked is durably
+/// referenced (an `oci_blobs` row now points at it). Used on the blob-upload
+/// success path so a now-live `oci-blobs/<digest>` key does not leave a journal
+/// row behind forever. Best-effort: a failed delete only leaves a stale row,
+/// and the reaper's `oci_blobs` EXISTS guard still refuses to reclaim the live
+/// blob, so it is never data loss — just a row to be cleaned up later.
+async fn clear_oci_upload_cleanup_key_best_effort(db: &PgPool, storage_key: &str) {
+    if let Err(e) = sqlx::query(
+        r#"
+        DELETE FROM oci_upload_cleanup_keys
+        WHERE storage_key = $1
+        "#,
+    )
+    .bind(storage_key)
+    .execute(db)
+    .await
+    {
+        warn!(
+            storage_key = %storage_key,
+            error = %e,
+            "Failed to clear OCI upload cleanup-key row after blob became referenced"
+        );
+    }
+}
+
 async fn delete_storage_key_for_upload_cancel(
     storage: &Arc<dyn crate::storage::StorageBackend>,
     key: &str,
@@ -3816,6 +3841,23 @@ async fn handle_start_upload(
         let canonical_digest = computed.as_prefixed();
         let key = blob_storage_key(&canonical_digest);
 
+        // The final `oci-blobs/<digest>` object is written before the
+        // `oci_blobs` row is committed. If the INSERT then fails, the object
+        // would otherwise be orphaned (no row references it, and the
+        // abandoned-session sweep only walks temp/part keys). Journal the final
+        // key first so the cleanup-key reaper can reclaim it on DB failure; the
+        // reaper treats a blob key as referenced once an `oci_blobs` row for the
+        // digest exists, so a committed/referenced blob is never reclaimed.
+        if let Err(resp) = register_oci_upload_cleanup_key(&state.db, repo_id, None, &key).await {
+            delete_storage_key_best_effort(
+                &storage,
+                &temp_key,
+                "monolithic blob cleanup registration failed",
+            )
+            .await;
+            return resp;
+        }
+
         if let Err(e) = storage.copy(&temp_key, &key).await {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob copy failed")
                 .await;
@@ -3834,6 +3876,12 @@ async fn handle_start_upload(
         .execute(&state.db)
         .await
         {
+            // Leave the (still NULL-marked) journal entry for the blob key in
+            // place: the pending reaper reclaims the orphaned
+            // `oci-blobs/<digest>` object since no `oci_blobs` row references it.
+            // Do NOT delete the blob object here — a concurrent push of the same
+            // digest may be committing it (the reaper's `oci_blobs` EXISTS guard
+            // protects that live blob).
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob row insert failed")
                 .await;
             return oci_error(
@@ -3843,6 +3891,10 @@ async fn handle_start_upload(
             );
         }
 
+        // The blob row is durable, so the blob key is now referenced. Drop its
+        // journal entry; the reaper would in any case refuse to reclaim it via
+        // the `oci_blobs` EXISTS guard.
+        clear_oci_upload_cleanup_key_best_effort(&state.db, &key).await;
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
 
         return Response::builder()
@@ -4713,6 +4765,32 @@ async fn handle_complete_upload(
             )
             .await;
         }
+        // Journal the final blob key before promoting the part to it. If the
+        // `oci_blobs` commit below fails, the copied `oci-blobs/<digest>` object
+        // would otherwise be an unreclaimable orphan. The reaper treats the key
+        // as referenced once an `oci_blobs` row exists, so a committed blob is
+        // never reclaimed; see `clear_oci_upload_cleanup_key_best_effort` after
+        // the transaction commits.
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &blob_key,
+        )
+        .await
+        {
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
         if let Err(e) = storage.copy(&parts[0].storage_key, &blob_key).await {
             if let Err(reset_resp) = reset_oci_upload_session_state(
                 &state.db,
@@ -4960,6 +5038,44 @@ async fn handle_complete_upload(
                 ),
             );
         }
+        // Journal the final blob key before promoting the concatenated object to
+        // it, mirroring the single-part branch above. On `oci_blobs` commit
+        // failure the reaper reclaims the orphaned `oci-blobs/<digest>` object;
+        // once the row commits the reaper treats the key as referenced.
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &blob_key,
+        )
+        .await
+        {
+            delete_storage_key_best_effort(
+                &storage,
+                &completion_temp_key,
+                "completion blob cleanup registration failed",
+            )
+            .await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion blob cleanup registration failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
         if let Err(e) = storage.copy(&completion_temp_key, &blob_key).await {
             delete_storage_key_best_effort(
                 &storage,
@@ -5146,6 +5262,10 @@ async fn handle_complete_upload(
         .await
         {
             Ok(true) => {
+                // The `oci_blobs` row is durable, so the blob key is now
+                // referenced. Drop its journal entry (the reaper's `oci_blobs`
+                // guard would refuse to reclaim it regardless).
+                clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
                 let mut cleanup_keys: Vec<String> =
                     parts.iter().map(|part| part.storage_key.clone()).collect();
                 cleanup_keys.push(session.storage_temp_key.clone());
@@ -5195,6 +5315,12 @@ async fn handle_complete_upload(
             &e.to_string(),
         );
     }
+
+    // The `oci_blobs` row committed durably, so the blob key is now referenced.
+    // Drop its journal entry. (The reaper independently refuses to reclaim it via
+    // the `oci_blobs` EXISTS guard, so a committed blob is never reclaimed even
+    // if this best-effort clear is lost.)
+    clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
 
     let mut cleanup_keys: Vec<String> = parts.iter().map(|part| part.storage_key.clone()).collect();
     cleanup_keys.push(session.storage_temp_key.clone());
@@ -12037,6 +12163,111 @@ mod oci_blob_upload_streaming_tests {
         }
     }
 
+    /// Storage backend whose `copy` succeeds (so the `oci-blobs/<digest>`
+    /// object is written) but installs a temporary trigger that makes the
+    /// subsequent `oci_blobs` INSERT raise, *without* deleting the repository
+    /// (so the cleanup-journal row survives, unlike `DeleteRepoOnCopyStorage`).
+    /// Used to prove the orphan is journaled for GC reclamation (#1527).
+    struct RejectBlobInsertStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        pool: PgPool,
+        repository_id: Uuid,
+        digest: String,
+        trigger_name: String,
+    }
+
+    impl RejectBlobInsertStorage {
+        fn new(pool: PgPool, repository_id: Uuid, digest: String) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                pool,
+                repository_id,
+                digest,
+                trigger_name: format!("reject_blob_{}", Uuid::new_v4().simple()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for RejectBlobInsertStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+
+            // Install a trigger that raises only for this repo+digest, so the
+            // handler's `oci_blobs` INSERT fails like a real DB constraint
+            // error while every other row (and the journal) is untouched.
+            let fn_name = format!("{}_fn", self.trigger_name);
+            sqlx::query(&format!(
+                r#"
+                CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
+                BEGIN
+                    IF NEW.repository_id = '{repo}'::uuid AND NEW.digest = '{digest}' THEN
+                        RAISE EXCEPTION 'injected oci_blobs insert failure';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                "#,
+                fn_name = fn_name,
+                repo = self.repository_id,
+                digest = self.digest,
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::from)?;
+            sqlx::query(&format!(
+                r#"
+                CREATE TRIGGER {trig}
+                    BEFORE INSERT ON oci_blobs
+                    FOR EACH ROW EXECUTE FUNCTION {fn_name}()
+                "#,
+                trig = self.trigger_name,
+                fn_name = fn_name,
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::from)?;
+
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn single_patch_upload_copies_streamed_temp_blob_on_completion() {
         let Some(f) = OciUploadFixture::setup().await else {
@@ -12734,6 +12965,173 @@ mod oci_blob_upload_streaming_tests {
             keys.iter().any(|key| key == &blob_storage_key(&digest)),
             "digest-global blob object must not be deleted on DB failure because another same-digest upload may be committing it: {:?}",
             keys
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_journals_orphaned_blob_when_insert_fails() {
+        // Regression for #1527: when the `oci_blobs` INSERT fails AFTER the blob
+        // object was copied to `oci-blobs/<digest>`, the surviving object must be
+        // recorded in the cleanup journal so storage GC can reclaim the orphan.
+        // The INSERT here is failed by a poisoned `oci_blobs` row (a duplicate
+        // (repository_id, digest) with a deferred-conflicting state) — see
+        // `RejectBlobInsertStorage`, which leaves the repository (and thus the
+        // journal row) intact, unlike the repo-deleting failure path above.
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"monolithic orphan journal");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let storage = Arc::new(RejectBlobInsertStorage::new(
+            f.inner.pool.clone(),
+            f.inner.repo_id,
+            digest.clone(),
+        ));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("reject-blob-insert".to_string(), storage_backend);
+        sqlx::query("UPDATE repositories SET storage_backend = 'reject-blob-insert' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry =
+            Arc::new(StorageRegistry::new(backends, "reject-blob-insert".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload must fail when the oci_blobs insert is rejected: {:?}",
+            body
+        );
+
+        // The orphaned blob object survives (no naive delete) AND is journaled.
+        assert!(
+            storage.exists(&blob_key).await.expect("blob exists check"),
+            "orphaned blob object must survive a DB insert failure"
+        );
+        let journal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup journal rows for orphaned blob key");
+        assert_eq!(
+            journal_count, 1,
+            "orphaned blob key must have a cleanup-journal entry so GC can reclaim it"
+        );
+        // The orphan is journaled NULL-marked (write never confirmed via the
+        // post-commit clear), so the pending reaper — not the unreferenced one —
+        // reclaims it once aged.
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1 AND storage_write_completed_at IS NULL",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count pending journal rows");
+        assert_eq!(
+            pending_count, 1,
+            "orphaned blob journal entry must be NULL-marked for the pending reaper"
+        );
+
+        // Drop the injected trigger so it cannot affect other tests sharing the
+        // `oci_blobs` table.
+        sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
+            trig = storage.trigger_name
+        ))
+        .execute(&f.inner.pool)
+        .await
+        .expect("drop injected trigger");
+        sqlx::query(&format!(
+            "DROP FUNCTION IF EXISTS {trig}_fn()",
+            trig = storage.trigger_name
+        ))
+        .execute(&f.inner.pool)
+        .await
+        .expect("drop injected trigger function");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_clears_blob_cleanup_journal_on_success() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"monolithic success clears journal");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let (status, _headers, body) = send(
+            f.app(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "monolithic upload should succeed: {:?}",
+            body
+        );
+
+        // Happy path: the blob row is committed and references the key, so no
+        // cleanup-journal entry should remain that could cause GC to reclaim the
+        // live blob (the reaper's `oci_blobs` guard backstops this, but the row
+        // is also explicitly cleared to avoid unbounded table growth).
+        let journal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup journal rows for committed blob key");
+        assert_eq!(
+            journal_count, 0,
+            "committed blob key must not leave a spurious cleanup-journal entry"
+        );
+
+        let blob_row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count oci_blobs rows");
+        assert_eq!(
+            blob_row_count, 1,
+            "successful upload must leave exactly one referencing oci_blobs row"
         );
 
         f.teardown().await;
