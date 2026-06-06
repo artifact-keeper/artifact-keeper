@@ -12,8 +12,8 @@
 #
 # Idempotence strategy:
 # - If /shared/dtrack-api-key already exists, do NOT rotate the key.
-#   Instead, log in, find the team, ensure the required permissions,
-#   and exit successfully.
+#   Instead, best-effort log in, find the team, ensure the required
+#   permissions, and exit successfully.
 # - If the key file does not exist, rotate/create the init-managed key,
 #   write it to /shared/dtrack-api-key, and ensure permissions.
 #
@@ -50,6 +50,7 @@ dt_login() {
 }
 
 ensure_team_permissions() {
+  REQUIRED_MODE="${1:-required}"
   echo "[dtrack-init] Granting required permissions to $DT_TEAM_NAME team..."
 
   for PERM in $REQUIRED_PERMISSIONS; do
@@ -62,19 +63,48 @@ ensure_team_permissions() {
         echo "[dtrack-init]   - $PERM: ensured (HTTP $PERM_CODE)"
         ;;
       *)
-        echo "[dtrack-init]   ERROR: granting $PERM returned HTTP $PERM_CODE" >&2
+        if [ "$REQUIRED_MODE" = "best-effort" ]; then
+          echo "[dtrack-init]   WARNING: granting $PERM returned HTTP $PERM_CODE; continuing because API key already exists" >&2
+        else
+          echo "[dtrack-init]   ERROR: granting $PERM returned HTTP $PERM_CODE" >&2
+        fi
         echo "[dtrack-init]   Response:" >&2
         cat /tmp/dtrack-permission-response.txt >&2 || true
+        if [ "$REQUIRED_MODE" = "best-effort" ]; then
+          continue
+        fi
         exit 1
         ;;
     esac
   done
 }
 
+finish_existing_key_path() {
+  : > "$BOOTSTRAP_MARKER" 2>/dev/null || true
+  echo "[dtrack-init] Existing API key preserved; done"
+  exit 0
+}
+
+API_KEY_ALREADY_PROVISIONED=false
+
+if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
+  echo "[dtrack-init] API key already provisioned at $API_KEY_FILE; will best-effort verify team permissions"
+  API_KEY_ALREADY_PROVISIONED=true
+  if [ "$FORCE_ROTATE" = "true" ]; then
+    echo "[dtrack-init] DTRACK_INIT_FORCE_ROTATE=true; existing API key will be rotated"
+    API_KEY_ALREADY_PROVISIONED=false
+  fi
+fi
+
 echo "[dtrack-init] Waiting for Dependency-Track at $DT_URL ..."
 for i in $(seq 1 60); do
   if curl -sf "$DT_URL/api/version" > /dev/null 2>&1; then
     break
+  fi
+
+  if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
+    echo "[dtrack-init] WARNING: Dependency-Track is not reachable; keeping existing API key and skipping permission verification" >&2
+    finish_existing_key_path
   fi
 
   if [ "$i" -eq 60 ]; then
@@ -86,17 +116,15 @@ for i in $(seq 1 60); do
 done
 echo "[dtrack-init] Dependency-Track is up"
 
-API_KEY_ALREADY_PROVISIONED=false
-
-if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
-  echo "[dtrack-init] API key already provisioned at $API_KEY_FILE; will verify team permissions"
-  API_KEY_ALREADY_PROVISIONED=true
-fi
-
 # Try login with the new password first.
 TOKEN=$(dt_login "$DT_NEW_PASS")
 
 if [ -z "$TOKEN" ] || echo "$TOKEN" | grep -qi "FORCE_PASSWORD_CHANGE"; then
+  if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
+    echo "[dtrack-init] WARNING: Could not authenticate with Dependency-Track admin credentials; keeping existing API key and skipping permission verification" >&2
+    finish_existing_key_path
+  fi
+
   echo "[dtrack-init] Changing default admin password..."
 
   CHANGE_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
@@ -112,6 +140,10 @@ if [ -z "$TOKEN" ] || echo "$TOKEN" | grep -qi "FORCE_PASSWORD_CHANGE"; then
 fi
 
 if [ -z "$TOKEN" ]; then
+  if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
+    echo "[dtrack-init] WARNING: Could not authenticate with Dependency-Track; keeping existing API key and skipping permission verification" >&2
+    finish_existing_key_path
+  fi
   echo "[dtrack-init] ERROR: Could not authenticate with Dependency-Track" >&2
   exit 1
 fi
@@ -121,6 +153,10 @@ echo "[dtrack-init] Authenticated successfully"
 TEAM_JSON=$(curl -sf "$DT_URL/api/v1/team" -H "Authorization: Bearer $TOKEN" || true)
 
 if [ -z "$TEAM_JSON" ]; then
+  if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
+    echo "[dtrack-init] WARNING: Could not list teams; keeping existing API key and skipping permission verification" >&2
+    finish_existing_key_path
+  fi
   echo "[dtrack-init] ERROR: Could not list teams" >&2
   exit 1
 fi
@@ -129,6 +165,10 @@ TEAM_UUID=$(echo "$TEAM_JSON" | jq -r --arg name "$DT_TEAM_NAME" \
   '.[] | select(.name == $name) | .uuid // empty')
 
 if [ -z "$TEAM_UUID" ]; then
+  if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
+    echo "[dtrack-init] WARNING: Could not find $DT_TEAM_NAME team; keeping existing API key and skipping permission verification" >&2
+    finish_existing_key_path
+  fi
   echo "[dtrack-init] ERROR: Could not find $DT_TEAM_NAME team" >&2
   echo "[dtrack-init] Available teams:" >&2
   echo "$TEAM_JSON" | jq -r '.[].name' 2>/dev/null >&2 || true
@@ -141,10 +181,9 @@ echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
 # This fixes the previous bootstrap bug where the script exited before
 # granting permissions on existing deployments.
 if [ "$API_KEY_ALREADY_PROVISIONED" = "true" ]; then
-  ensure_team_permissions
-  : > "$BOOTSTRAP_MARKER" 2>/dev/null || true
+  ensure_team_permissions best-effort
   echo "[dtrack-init] Existing API key permissions verified; done"
-  exit 0
+  finish_existing_key_path
 fi
 
 EXISTING_PUBLIC_IDS=$(echo "$TEAM_JSON" | jq -r --arg name "$DT_TEAM_NAME" \
@@ -242,8 +281,6 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 )
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
-
-fi  # end: rotate/mint block (skipped on fast path)
 
 ensure_team_permissions
 
