@@ -329,7 +329,7 @@ async fn download_chart_via_index(
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
-                if let Ok((content, ct)) = proxy_helpers::local_fetch_by_path_suffix(
+                if let Ok(result) = proxy_helpers::local_fetch_by_path_suffix(
                     &state.db,
                     state,
                     member.id,
@@ -338,12 +338,12 @@ async fn download_chart_via_index(
                 )
                 .await
                 {
-                    return Ok(Some(proxy_helpers::build_download_response(
-                        content,
-                        ct,
+                    return proxy_helpers::stream_fetch_result(
+                        result,
                         "application/gzip",
                         Some(filename),
-                    )));
+                    )
+                    .map(Some);
                 }
                 continue;
             }

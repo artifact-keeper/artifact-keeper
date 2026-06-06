@@ -72,6 +72,38 @@ pub struct OpenScapScanner {
     cached_version: VersionCache,
 }
 
+/// Map a workspace-creation IO error to an actionable [`AppError`].
+///
+/// The default deployment shares a single `scan_workspace` named volume
+/// between the backend (read-write) and the OpenSCAP/Trivy sidecars
+/// (read-only). On hosts where the container runtime does not propagate the
+/// image mountpoint's ownership to a freshly-created named volume — notably
+/// Podman + SELinux on Fedora (issue #1563) — the volume root ends up owned
+/// by `root` and mode `0755`, so the non-root backend (UID 1001) cannot
+/// create the per-scan subdirectory and `create_dir_all` fails with EACCES
+/// (`os error 13`).
+///
+/// A bare "Permission denied" gives operators nothing to act on, so for the
+/// permission-denied case we point them at the volume ownership fix. This is a
+/// pure function so the message-building logic is unit-testable without
+/// depending on filesystem permission state.
+fn workspace_create_error(base: &str, err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        AppError::Internal(format!(
+            "Failed to create scan workspace under {base}: {err}. \
+             The shared scan-workspace volume is not writable by the backend \
+             (UID 1001). Ensure the volume is owned by 1001:0 (e.g. run the \
+             scan-workspace-init step in the compose file, or `chown -R 1001:0` \
+             the volume) — this is common on Podman/SELinux hosts where named \
+             volumes are not chowned to the image's mountpoint owner."
+        ))
+    } else {
+        AppError::Internal(format!(
+            "Failed to create scan workspace under {base}: {err}"
+        ))
+    }
+}
+
 impl OpenScapScanner {
     pub fn new(openscap_url: String, profile: String, scan_workspace: String) -> Self {
         let http = crate::services::http_client::base_client_builder()
@@ -141,9 +173,18 @@ impl OpenScapScanner {
     async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
         let workspace =
             ScanWorkspace::workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
+        // Create the base first (idempotent) so a missing/unwritable shared
+        // volume root surfaces as a clear, actionable error rather than a bare
+        // "Permission denied (os error 13)" against the per-scan subdir
+        // (issue #1563). The OpenSCAP sidecar reads this same volume read-only,
+        // so the path must stay under the configured base; we do not silently
+        // relocate it.
+        if let Err(e) = tokio::fs::create_dir_all(&self.scan_workspace).await {
+            return Err(workspace_create_error(&self.scan_workspace, &e));
+        }
         tokio::fs::create_dir_all(&workspace)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+            .map_err(|e| workspace_create_error(&self.scan_workspace, &e))?;
 
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
@@ -595,6 +636,81 @@ mod tests {
             name
         );
         assert!(workspace.is_dir(), "workspace must exist on disk");
+    }
+
+    /// Regression for issue #1563: `prepare_workspace` must create the
+    /// configured base directory itself if it does not yet exist, not just the
+    /// per-scan subdirectory. The original code only created the leaf via
+    /// `create_dir_all(<base>/openscap-<id>)`; while that also creates parents,
+    /// creating the base explicitly first lets us surface a clear,
+    /// actionable error (see `workspace_create_error`) when the shared volume
+    /// root is present but unwritable. Here the base does not exist, so the
+    /// scan must still succeed by creating it.
+    #[tokio::test]
+    async fn test_prepare_workspace_creates_missing_base() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point the scanner at a not-yet-created subpath of the tempdir.
+        let base = dir.path().join("nested").join("scan-workspace");
+        let scanner = OpenScapScanner::new(
+            "http://localhost:0".to_string(),
+            "standard".to_string(),
+            base.to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "nginx-1.24.0-1.el9.x86_64.rpm",
+            "application/x-rpm",
+            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
+        );
+        let workspace = scanner
+            .prepare_workspace(&artifact, &bytes::Bytes::from_static(b"fake rpm"))
+            .await
+            .expect("prepare_workspace must create the missing base and succeed");
+        assert!(base.is_dir(), "base must have been created");
+        assert!(
+            workspace.starts_with(&base),
+            "workspace must live under base"
+        );
+        assert!(workspace.is_dir(), "per-scan workspace must exist on disk");
+    }
+
+    /// `workspace_create_error` maps an EACCES (`PermissionDenied`) IO error to
+    /// an actionable message that names the base path and points operators at
+    /// the volume-ownership fix. This is the exact failure mode reported in
+    /// issue #1563 (Podman/SELinux on Fedora).
+    #[test]
+    fn test_workspace_create_error_permission_denied_is_actionable() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let err = workspace_create_error("/scan-workspace", &io_err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/scan-workspace"),
+            "error must name the base path, got: {msg}"
+        );
+        assert!(
+            msg.contains("1001"),
+            "permission-denied error must mention the backend UID, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("volume"),
+            "permission-denied error must point at the volume fix, got: {msg}"
+        );
+    }
+
+    /// `workspace_create_error` for a non-permission IO error keeps a plain
+    /// message (no spurious volume-ownership advice that would mislead).
+    #[test]
+    fn test_workspace_create_error_other_kind_is_plain() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let err = workspace_create_error("/scan-workspace", &io_err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/scan-workspace") && msg.contains("no such file"),
+            "error must include base and cause, got: {msg}"
+        );
+        assert!(
+            !msg.contains("1001"),
+            "non-permission error must not mention UID-ownership advice, got: {msg}"
+        );
     }
 
     /// Happy path: when the wrapper sidecar accepts the path and returns
