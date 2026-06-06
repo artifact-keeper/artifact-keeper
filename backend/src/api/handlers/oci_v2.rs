@@ -5408,6 +5408,11 @@ async fn handle_get_manifest(
         };
         let manifest_key = manifest_storage_key(&manifest_digest);
 
+        // Manifests are small metadata, not large artifact bodies: keep this
+        // path buffered so we can emit an accurate Content-Length. Container
+        // clients (docker, podman, containerd) require Content-Length on
+        // manifest responses, and the oci_tags row carries no size column to
+        // set it from a stream. Only large blob BODIES are streamed (above).
         if let Ok(data) = storage.get(&manifest_key).await {
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: serving from migrated oci_tags (local hit)");
             return Response::builder()

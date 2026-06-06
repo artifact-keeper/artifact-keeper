@@ -18,6 +18,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::proxy_service::ProxyService;
+pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::storage::StorageLocation;
 use std::future::Future;
 use std::time::Duration;
@@ -582,6 +583,22 @@ pub(crate) fn build_streaming_response_with_disposition(
     builder.body(body)
 }
 
+/// Handler-facing convenience over [`build_streaming_response_with_disposition`]
+/// that maps the rare malformed-header [`axum::http::Error`] into a `500`
+/// [`Response`], so format handlers can serve a resolved
+/// [`StreamingFetchResult`] (e.g. from [`resolve_virtual_download`]) in a single
+/// line instead of re-inlining the same header-building block. Pass a
+/// `filename` to emit `Content-Disposition: attachment`; pass `None` to omit it.
+#[allow(clippy::result_large_err)]
+pub fn stream_fetch_result(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+    filename: Option<&str>,
+) -> std::result::Result<Response, Response> {
+    build_streaming_response_with_disposition(result, default_content_type, filename)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+}
+
 /// Fetch from upstream via the proxy service, returning a presigned redirect
 /// if the storage backend supports it and presigned downloads are enabled.
 ///
@@ -989,10 +1006,10 @@ pub async fn resolve_virtual_download<F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     local_fetch: F,
-) -> Result<(Bytes, Option<String>), Response>
+) -> Result<StreamingFetchResult, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -1014,9 +1031,8 @@ where
                 if let (Some(proxy), Some(upstream_url)) =
                     (proxy_service, member.upstream_url.as_deref())
                 {
-                    if let Ok(result) =
-                        proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
-                    {
+                    let repo = build_remote_repo(member.id, &member.key, upstream_url);
+                    if let Ok(result) = proxy.fetch_artifact_streaming(&repo, path).await {
                         return Ok(result);
                     }
                 }
@@ -1073,7 +1089,7 @@ pub async fn resolve_virtual_download_streaming<F, Fut>(
 ) -> Result<Response, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -1109,15 +1125,15 @@ where
                 }
             }
             VirtualMemberFetchStrategy::Local => {
-                if let Ok((content, content_type)) =
-                    local_fetch(member.id, member.storage_location()).await
-                {
-                    return Ok(build_download_response(
-                        content,
-                        content_type,
+                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
+                    return build_streaming_response_with_disposition(
+                        result,
                         default_content_type,
                         content_disposition_filename,
-                    ));
+                    )
+                    .map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    });
                 }
             }
             VirtualMemberFetchStrategy::Skip => {}
@@ -1299,6 +1315,7 @@ pub(crate) struct LocalArtifactRow {
     pub id: Uuid,
     pub storage_key: String,
     pub content_type: String,
+    pub size_bytes: i64,
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1332,13 +1349,13 @@ impl LocalLookup<'_> {
     pub(crate) fn select_sql(&self) -> &'static str {
         match self {
             LocalLookup::Path(_) => {
-                "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
                  FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersion(_, _) => {
-                "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
@@ -1403,6 +1420,36 @@ async fn read_local_content(
     }
 }
 
+/// Streaming sibling of [`read_local_content`]: open the artifact body as a
+/// byte stream (so large artifact bodies never buffer in memory) while keeping
+/// the exact same `NotFound` → coordinated-retry hydration fallback used by the
+/// buffered path. On a storage miss we still funnel through
+/// [`coordinated_retry_get`] (which buffers the small recovery read) and wrap
+/// the recovered `Bytes` back into a one-shot stream so callers see a uniform
+/// [`StreamingFetchResult`]. Returns the full [`StreamingFetchResult`] with the
+/// row's `content_type` and `size_bytes` (for an accurate `Content-Length`).
+async fn read_local_stream(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<StreamingFetchResult, Response> {
+    let body = match storage.get_stream(&artifact.storage_key).await {
+        Ok(stream) => stream,
+        Err(crate::error::AppError::NotFound(_)) => {
+            // Hydration recovery is a small buffered read; re-wrap as a stream.
+            let bytes =
+                coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await?;
+            Box::pin(futures::stream::once(async move { Ok(bytes) }))
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
+    Ok(StreamingFetchResult {
+        body,
+        content_type: Some(artifact.content_type.clone()),
+        content_length: Some(artifact.size_bytes as u64),
+    })
+}
+
 /// Generic local artifact fetch by exact path match.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
@@ -1411,7 +1458,7 @@ pub async fn local_fetch_by_path(
     repo_id: Uuid,
     location: &StorageLocation,
     artifact_path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let (artifact, storage) = local_lookup_artifact(
         db,
         state,
@@ -1420,8 +1467,7 @@ pub async fn local_fetch_by_path(
         LocalLookup::Path(artifact_path),
     )
     .await?;
-    let content = read_local_content(db, &artifact, &*storage).await?;
-    Ok((content, Some(artifact.content_type)))
+    read_local_stream(db, &artifact, &*storage).await
 }
 
 /// Generic local artifact fetch by name and version.
@@ -1433,7 +1479,7 @@ pub async fn local_fetch_by_name_version(
     location: &StorageLocation,
     name: &str,
     version: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let (artifact, storage) = local_lookup_artifact(
         db,
         state,
@@ -1442,8 +1488,7 @@ pub async fn local_fetch_by_name_version(
         LocalLookup::NameVersion(name, version),
     )
     .await?;
-    let content = read_local_content(db, &artifact, &*storage).await?;
-    Ok((content, Some(artifact.content_type)))
+    read_local_stream(db, &artifact, &*storage).await
 }
 
 /// Generic local artifact fetch by trailing path-suffix (LIKE match).
@@ -1468,7 +1513,7 @@ pub async fn local_fetch_by_path_suffix(
     repo_id: Uuid,
     location: &StorageLocation,
     path_suffix: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let path: String = sqlx::query_scalar(
         "SELECT path FROM artifacts \
@@ -2544,7 +2589,8 @@ mod tests {
     fn test_local_lookup_select_columns_identical() {
         // Both variants select the same LocalArtifactRow columns; only the
         // WHERE clause differs (the whole point of the S6 collapse).
-        let cols = "SELECT id, storage_key, content_type, quarantine_status, quarantine_until";
+        let cols =
+            "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until";
         assert!(LocalLookup::Path("x").select_sql().starts_with(cols));
         assert!(LocalLookup::NameVersion("n", "v")
             .select_sql()
@@ -4893,18 +4939,19 @@ mod tests {
         .expect("insert");
 
         let location = repo.storage_location();
-        let (content, ct) =
-            local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
-                .await
-                .expect("fetch");
+        let result = local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
+            .await
+            .expect("fetch");
+        let ct = result.content_type.clone();
+        let content = result.collect().await.unwrap();
         assert_eq!(&content[..], b"abc123");
         assert_eq!(ct.as_deref(), Some("application/zip"));
 
         // Also exercise the suffix variant.
-        let (content2, _) =
-            local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
-                .await
-                .expect("fetch suffix");
+        let result2 = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
+            .await
+            .expect("fetch suffix");
+        let content2 = result2.collect().await.unwrap();
         assert_eq!(&content2[..], b"abc123");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -5121,6 +5168,54 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(weird)
         );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_sets_headers_and_disposition() {
+        // The handler-facing convenience must emit the same headers as the
+        // underlying builder: upstream content-type wins, content-length is set
+        // when known, and a filename produces a Content-Disposition.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(1234),
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
+            .expect("stream_fetch_result must build a response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/zip")
+        );
+        assert_eq!(
+            h.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("1234")
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg.whl\"")
+        );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_falls_back_to_default_and_omits_optionals() {
+        // No upstream content-type, no length, no filename: default type is
+        // used and neither content-length nor content-disposition is emitted.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", None)
+            .expect("stream_fetch_result must build a response");
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert!(h.get("content-length").is_none());
+        assert!(h.get("content-disposition").is_none());
     }
 
     // -------------------------------------------------------------------

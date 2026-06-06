@@ -83,6 +83,33 @@ impl From<StreamHandle> for StreamingFetchResult {
     }
 }
 
+impl std::fmt::Debug for StreamingFetchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingFetchResult")
+            .field("content_type", &self.content_type)
+            .field("content_length", &self.content_length)
+            .field("body", &"<stream>")
+            .finish()
+    }
+}
+
+impl StreamingFetchResult {
+    /// Collect the entire stream into a single `Bytes` buffer.
+    ///
+    /// Use only when the caller needs the full content for parsing.
+    /// Normal download paths should pass `self.body` directly to
+    /// `Body::from_stream`.
+    pub async fn collect(self) -> Result<Bytes> {
+        use futures::StreamExt;
+        let mut buf = Vec::new();
+        let mut stream = self.body;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        Ok(Bytes::from(buf))
+    }
+}
+
 /// Metadata fields known up-front when teeing an upstream stream into
 /// the proxy cache. The size + sha-256 fields of [`CacheMetadata`] are
 /// observed during the stream itself and filled in by the writer task
@@ -8191,8 +8218,7 @@ SHA256:
         let err = proxy
             .fetch_artifact_streaming(&repo, "blob")
             .await
-            .err()
-            .expect("a 5xx upstream must fail the streaming fetch");
+            .expect_err("a 5xx upstream must fail the streaming fetch");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
     }

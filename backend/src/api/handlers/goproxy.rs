@@ -607,7 +607,7 @@ async fn get_mod_file(
                 let upstream_path = format!("{}/@v/{}.mod", encoded, version);
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -627,15 +627,11 @@ async fn get_mod_file(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "text/plain; charset=utf-8",
+                    None,
+                );
             }
 
             return Err(not_found);
@@ -650,13 +646,16 @@ async fn get_mod_file(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -669,8 +668,8 @@ async fn get_mod_file(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 
@@ -748,7 +747,7 @@ async fn download_zip(
                 let upstream_path = format!("{}/@v/{}.zip", encoded, version);
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -768,15 +767,7 @@ async fn download_zip(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/zip".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(result, "application/zip", None);
             }
 
             return Err(not_found);
@@ -791,13 +782,16 @@ async fn download_zip(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -810,7 +804,6 @@ async fn download_zip(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/zip")
-        .header(CONTENT_LENGTH, content.len().to_string())
         .header(
             "Content-Disposition",
             format!(
@@ -819,7 +812,8 @@ async fn download_zip(
                 version
             ),
         )
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

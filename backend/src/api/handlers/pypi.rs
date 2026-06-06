@@ -19,6 +19,8 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -1025,8 +1027,19 @@ async fn serve_file(
                     )
                     .await
                     {
-                        Ok((content, _ct)) => {
-                            return Ok(build_file_response(filename, content));
+                        Ok(result) => {
+                            let content_type = pypi_content_type(filename);
+                            let mut builder = Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, content_type)
+                                .header(
+                                    "Content-Disposition",
+                                    format!("attachment; filename=\"{}\"", filename),
+                                );
+                            if let Some(size) = result.content_length {
+                                builder = builder.header(CONTENT_LENGTH, size.to_string());
+                            }
+                            return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                         }
                         Err(e) => {
                             debug!(
@@ -1113,13 +1126,11 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = if repo.repo_type == RepositoryType::Remote {
+    let stream = if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            get_remote_cached_or_refetch(
-                &state.db,
-                artifact.id,
+            get_remote_cached_or_refetch_stream(
                 storage.as_ref(),
                 &artifact.storage_key,
                 || async move {
@@ -1137,15 +1148,19 @@ async fn serve_file(
             .await?
         } else {
             storage
-                .get(&artifact.storage_key)
+                .get_stream(&artifact.storage_key)
                 .await
                 .map_err(map_storage_err)?
+                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+                .boxed()
         }
     } else {
         storage
-            .get(&artifact.storage_key)
+            .get_stream(&artifact.storage_key)
             .await
             .map_err(map_storage_err)?
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .boxed()
     };
 
     // Record download statistics for locally-stored artifacts only.
@@ -1165,24 +1180,54 @@ async fn serve_file(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 
-async fn get_remote_cached_or_refetch<F, Fut>(
-    db: &PgPool,
-    artifact_id: uuid::Uuid,
+/// Streaming variant of the PyPI proxy cache read. Streams a cache hit
+/// straight from storage; on a miss it re-fetches the wheel from upstream
+/// (buffered, since the recovery payload must also be written back to the
+/// cache to avoid a thundering herd) and re-wraps the recovered bytes as a
+/// one-shot stream so the caller always receives a `BoxStream`.
+async fn get_remote_cached_or_refetch_stream<F, Fut>(
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
     refetch: F,
-) -> Result<Bytes, Response>
+) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Response>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    proxy_helpers::get_cached_or_refetch(db, artifact_id, storage, storage_key, refetch).await
+    match storage.get_stream(storage_key).await {
+        Ok(stream) => Ok(stream
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .boxed()),
+        Err(AppError::NotFound(_)) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
+            );
+            let bytes = refetch().await?;
+            // Best-effort write-back: persist the refetched payload so the
+            // next request hits the cache instead of re-traversing the
+            // simple index and re-downloading from upstream. Without this,
+            // N concurrent `uv` clients each issue a fresh upstream fetch
+            // for the same wheel (thundering herd; see PR #1283 review).
+            // We swallow write errors to keep serving the current request,
+            // but log them so operators can spot a broken backend.
+            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
+                tracing::warn!(
+                    storage_key = %storage_key,
+                    error = %e,
+                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
+                );
+            }
+            Ok(futures::stream::once(async { Ok(bytes) }).boxed())
+        }
+        Err(e) => Err(map_storage_err(e)),
+    }
 }
 
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
@@ -1806,16 +1851,6 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn try_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .acquire_timeout(std::time::Duration::from_secs(3))
-            .connect(&url)
-            .await
-            .ok()
-    }
 
     // -----------------------------------------------------------------------
     // pypi_upstream_url_and_path (#1130)
@@ -2784,6 +2819,18 @@ mod tests {
     // get_remote_cached_or_refetch
     // -----------------------------------------------------------------------
 
+    /// Drain a `get_remote_cached_or_refetch_stream` body into a single `Bytes`
+    /// so the existing buffered-semantics assertions still hold against the
+    /// streaming implementation.
+    async fn collect_stream(stream: BoxStream<'static, Result<Bytes, std::io::Error>>) -> Bytes {
+        let mut s = stream;
+        let mut buf = Vec::new();
+        while let Some(chunk) = s.next().await {
+            buf.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        Bytes::from(buf)
+    }
+
     /// Storage double that reports the entry as missing on every `get`, and
     /// records every `put` so tests can assert the write-back path persists
     /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
@@ -2873,30 +2920,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
+        // Streaming refetch path is DB-free (storage doubles only), so this runs
+        // in Tier-1 `cargo test --lib` without a live Postgres.
         let storage = MissingStorage::new();
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let content = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
-            &storage,
-            storage_key,
-            move || {
-                let refetch_calls_clone = refetch_calls_clone.clone();
-                async move {
-                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"refetched-bytes"))
-                }
-            },
-        )
+        let stream = super::get_remote_cached_or_refetch_stream(&storage, storage_key, move || {
+            let refetch_calls_clone = refetch_calls_clone.clone();
+            async move {
+                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::from_static(b"refetched-bytes"))
+            }
+        })
         .await
         .expect("refetch should succeed");
+        let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
         assert_eq!(
@@ -2946,32 +2987,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_serves_payload_even_if_writeback_fails() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
         // A best-effort write-back must NOT fail the current request. If the
         // disk is full or read-only the user still gets their wheel; the
         // next request will simply re-fetch from upstream until the backend
         // recovers.
         let storage = WriteFailingStorage;
-        let content = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
+        let stream = super::get_remote_cached_or_refetch_stream(
             &storage,
             "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
             move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
         )
         .await
         .expect("write-back failures must not fail the current request");
+        let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"refetched-when-disk-full"));
     }
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
         // Happy path: cache hits should return the stored bytes verbatim and
         // must NEVER invoke the upstream refetch closure.
         let storage = PresentStorage {
@@ -2980,9 +3014,7 @@ mod tests {
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let content = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
+        let stream = super::get_remote_cached_or_refetch_stream(
             &storage,
             "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
             move || {
@@ -2995,6 +3027,7 @@ mod tests {
         )
         .await
         .expect("cached read should succeed");
+        let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"cached-wheel-bytes"));
         assert_eq!(
@@ -3006,9 +3039,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_propagates_non_notfound_storage_error() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
         // A storage backend error that is NOT `NotFound` (e.g. permission
         // denied, I/O error) must be surfaced as a 500 instead of silently
         // re-fetching, otherwise we mask infra issues from operators.
@@ -3016,9 +3046,7 @@ mod tests {
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let result = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
+        let result = super::get_remote_cached_or_refetch_stream(
             &storage,
             "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
             move || {
@@ -3031,7 +3059,12 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("non-NotFound storage errors must propagate");
+        // The Ok arm carries a BoxStream (not Debug), so match instead of
+        // `expect_err` to extract the error Response.
+        let response = match result {
+            Ok(_) => panic!("non-NotFound storage errors must propagate"),
+            Err(resp) => resp,
+        };
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3042,9 +3075,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_surfaces_refetch_failure() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
         // When the cache is stale AND the upstream refetch also fails, the
         // upstream error response must reach the caller untouched so the
         // client sees the correct upstream status (e.g. 502).
@@ -3052,9 +3082,7 @@ mod tests {
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let result = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
+        let result = super::get_remote_cached_or_refetch_stream(
             &storage,
             "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
             move || {
@@ -3067,7 +3095,12 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("refetch failures must propagate to caller");
+        // The Ok arm carries a BoxStream (not Debug), so match instead of
+        // `expect_err` to extract the error Response.
+        let response = match result {
+            Ok(_) => panic!("refetch failures must propagate to caller"),
+            Err(resp) => resp,
+        };
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3078,9 +3111,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
-        let Some(pool) = try_pool().await else {
-            return;
-        };
         // Edge case: a legitimately empty cached payload (zero bytes) is
         // still a cache hit and must be returned without triggering a
         // refetch. This guards against accidentally treating empty bodies
@@ -3091,9 +3121,7 @@ mod tests {
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let content = super::get_remote_cached_or_refetch(
-            &pool,
-            uuid::Uuid::new_v4(),
+        let stream = super::get_remote_cached_or_refetch_stream(
             &storage,
             "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
             move || {
@@ -3106,6 +3134,7 @@ mod tests {
         )
         .await
         .expect("empty cached payload should still be a hit");
+        let content = collect_stream(stream).await;
 
         assert!(content.is_empty());
         assert_eq!(
