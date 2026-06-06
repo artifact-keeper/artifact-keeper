@@ -1752,6 +1752,124 @@ pub async fn record_manifest_blob_refs(
     Ok(res.rows_affected() as usize)
 }
 
+/// Atomically upsert the `oci_tags` row for a pushed/cached manifest AND
+/// record its blob/child references in a SINGLE database transaction
+/// (#1409, review finding 3).
+///
+/// Why a transaction: previously the tag upsert and the ref recording ran
+/// as two separate, non-transactional statements, with ref recording
+/// best-effort (warn-on-error, the push/cache still succeeded). That could
+/// leave a live tag whose `manifest_blob_refs` / `oci_manifest_refs` rows
+/// were missing, which pins the blob-GC readiness gate
+/// (`any_live_manifest_missing_refs`) on indefinitely. Wrapping both writes
+/// in one transaction makes the invariant atomic: either the tag AND its
+/// refs are committed together, or neither is. If the ref insert fails the
+/// whole transaction rolls back and the caller fails the push/cache, so a
+/// live tag can NEVER be acked without its references.
+///
+/// Scope of the transaction is deliberately narrow — it wraps ONLY the two
+/// DB writes (the `oci_tags` upsert and the single batched ref insert).
+/// Manifest classification, blob/manifest storage I/O, and any network I/O
+/// happen entirely outside `tx`, so this never holds a transaction open
+/// across slow I/O and keeps lock-ordering identical to the rest of the
+/// push path (the only rows touched are `oci_tags` for `(repo, name, tag)`
+/// and the `*_refs` rows for the new `manifest_digest`).
+///
+/// On the success path the resulting database state is byte-identical to
+/// the previous two-statement form (same upsert SQL, same `UNNEST` ref
+/// insert with the same `ON CONFLICT DO NOTHING`). The only behavioural
+/// change is in the failure direction: a ref-write error now rolls the tag
+/// back and propagates instead of being swallowed by a `warn!`.
+///
+/// `class` must already be the CONTENT-based classification
+/// ([`classify_manifest`]); `Malformed` records no refs (callers reject it
+/// before reaching here, but the arm is harmless if hit). `Index` bodies
+/// record `oci_manifest_refs` (parent→child edges); `Image` bodies record
+/// `manifest_blob_refs` (config + layer edges).
+///
+/// TODO(#1610): the residual sub-grace-period TOCTOU between a concurrent
+/// re-push of an already-existing >24h-old blob and `run_blob_gc` is NOT
+/// closed here — it is bounded by the grace window + readiness gate +
+/// opt-in `BLOB_GC_ENABLED` and tracked as a follow-up. The push-side
+/// `SELECT ... FOR UPDATE` on `oci_blobs` that would close it would go
+/// inside this transaction, before the ref insert.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_tag_and_refs(
+    pool: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    tag: &str,
+    manifest_digest: &str,
+    manifest_content_type: &str,
+    class: &ManifestClass,
+    manifest_body: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // 1. Tag upsert (identical SQL/semantics to the previous standalone form).
+    sqlx::query(
+        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+             manifest_digest = EXCLUDED.manifest_digest,
+             manifest_content_type = EXCLUDED.manifest_content_type,
+             updated_at = NOW()"#,
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(tag)
+    .bind(manifest_digest)
+    .bind(manifest_content_type)
+    .execute(&mut *tx)
+    .await?;
+
+    // 2. Reference recording, in the SAME transaction. A failure here rolls
+    //    the tag back when `tx` is dropped without a commit.
+    match class {
+        ManifestClass::Index => {
+            let children = extract_child_digests(manifest_body);
+            if !children.is_empty() {
+                sqlx::query(
+                    r#"
+                    INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
+                    SELECT $1, child, $3
+                    FROM UNNEST($2::text[]) AS t(child)
+                    ON CONFLICT (parent_digest, child_digest, repository_id) DO NOTHING
+                    "#,
+                )
+                .bind(manifest_digest)
+                .bind(&children)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        ManifestClass::Image => {
+            let refs = extract_blob_refs(manifest_body);
+            if let Some((blob_digests, kinds)) = blob_refs_to_columns(&refs) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+                    SELECT $1, blob, $4, knd
+                    FROM UNNEST($2::text[], $3::text[]) AS t(blob, knd)
+                    ON CONFLICT (manifest_digest, blob_digest, repository_id) DO NOTHING
+                    "#,
+                )
+                .bind(manifest_digest)
+                .bind(&blob_digests)
+                .bind(&kinds)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        ManifestClass::Malformed => {}
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tags/list and catalog response types
 // ---------------------------------------------------------------------------
@@ -2589,20 +2707,32 @@ async fn cache_manifest_reference_locally(
     );
     let cached_reference = cached_manifest_reference_key(&repo.repo_type, reference, &digest);
 
-    sqlx::query(
-        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-             manifest_digest = EXCLUDED.manifest_digest,
-             manifest_content_type = EXCLUDED.manifest_content_type,
-             updated_at = NOW()"#,
+    // Atomically upsert the digest-keyed tag AND record this manifest's
+    // references in one transaction (#1409 finding 2 + 3). Previously the tag
+    // upsert and the ref recording (the `match` block that used to live near
+    // the end of this fn) were separate statements with ref recording
+    // best-effort. A proxy-cached IMAGE manifest could therefore land as a
+    // live tag with zero `manifest_blob_refs`, which keeps
+    // `any_live_manifest_missing_refs` permanently true and disables blob GC
+    // for the whole deployment. `persist_tag_and_refs` makes the two writes
+    // atomic and propagates a ref-write failure (the caller falls back to a
+    // digest-only pull), so a cached live tag can never exist without its refs.
+    //
+    // Routing is CONTENT-classified inside the helper: an index records
+    // `oci_manifest_refs`, an image records `manifest_blob_refs`. `Malformed`
+    // returned early above without a tag. The secondary tag-keyed `oci_tags`
+    // row and the `artifacts` rows below stay best-effort — they are UI/listing
+    // conveniences, not GC-correctness inputs.
+    persist_tag_and_refs(
+        &state.db,
+        repo.id,
+        &repo.image,
+        &cached_reference,
+        &digest,
+        &manifest_content_type,
+        &class,
+        content,
     )
-    .bind(repo.id)
-    .bind(&repo.image)
-    .bind(&cached_reference)
-    .bind(&digest)
-    .bind(&manifest_content_type)
-    .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -2752,56 +2882,6 @@ async fn cache_manifest_reference_locally(
                  proxy refresh succeeds"
             );
         }
-    }
-
-    // #1357 (review feedback): for multi-arch image-index manifests, record
-    // the (parent_digest -> child_digest) edges so:
-    //   1. The storage GC can protect per-architecture children for as long
-    //      as the index is still tagged (mirrors the push path #1179 guard).
-    //   2. The UI size accounting can walk the index children and report the
-    //      true multi-platform total, rather than just the index body size
-    //      (which is only a few KB for an image whose children sum to GBs).
-    //
-    // Best-effort, warn-on-error: matches the push-path semantics in
-    // `handle_put_manifest`. The manifest body and oci_tags rows are already
-    // persisted; failure here only affects GC/UI accounting until the
-    // startup backfill in main.rs runs again.
-    // Route on the CONTENT classification (not a re-derived string): an
-    // image needs its blob refs recorded too, or a proxy-cached image is a
-    // live tag with zero refs that pins the blob-GC gate (#1409). Best-effort
-    // + warn (the startup backfill reconciles any gap); `Malformed` returned
-    // early above without a tag.
-    match &class {
-        ManifestClass::Index => {
-            if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
-                tracing::warn!(
-                    repo = %repo.key,
-                    image = %repo.image,
-                    reference = %reference,
-                    parent_digest = %digest,
-                    error = %e,
-                    "Failed to record oci_manifest_refs for proxied index manifest; \
-                     storage GC may treat child manifests as orphaned and the UI \
-                     size accounting will under-report multi-arch totals until the \
-                     next backfill pass runs"
-                );
-            }
-        }
-        ManifestClass::Image => {
-            if let Err(e) = record_manifest_blob_refs(&state.db, repo.id, &digest, content).await {
-                tracing::warn!(
-                    repo = %repo.key,
-                    image = %repo.image,
-                    reference = %reference,
-                    manifest_digest = %digest,
-                    error = %e,
-                    "Failed to record manifest_blob_refs for proxied image manifest; \
-                     blob GC stays gated deployment-wide until the refs are recorded \
-                     (next proxy refresh or startup backfill), but no blob is at risk"
-                );
-            }
-        }
-        ManifestClass::Malformed => {}
     }
 
     Ok(digest)
@@ -5477,21 +5557,30 @@ async fn handle_put_manifest(
         );
     }
 
-    // Upsert tag mapping
-    if let Err(e) = sqlx::query!(
-        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-             manifest_digest = EXCLUDED.manifest_digest,
-             manifest_content_type = EXCLUDED.manifest_content_type,
-             updated_at = NOW()"#,
+    // Atomically upsert the tag AND record this manifest's references in one
+    // transaction (#1409 finding 3). Previously the tag upsert and the ref
+    // recording were two separate statements with ref recording best-effort
+    // (warn-on-error, push still 201). That could ack a live tag whose refs
+    // were missing, pinning the blob-GC readiness gate. `persist_tag_and_refs`
+    // makes the two writes atomic: a ref-write failure rolls the tag back and
+    // fails the push, so a live tag can never exist without its references.
+    //
+    // Routing stays CONTENT-classified inside the helper: an image body pushed
+    // with an index Content-Type still records `manifest_blob_refs`, never
+    // `oci_manifest_refs` with 0 children (#1409 C1). `Malformed` was rejected
+    // with 400 above. The startup backfill in main.rs remains a safety net for
+    // rows that pre-date this code, but is no longer needed to repair a push
+    // that returned 201.
+    if let Err(e) = persist_tag_and_refs(
+        &state.db,
         repo_id,
-        image,
+        &image,
         reference,
-        digest,
-        content_type
+        &digest,
+        &content_type,
+        &class,
+        &body,
     )
-    .execute(&state.db)
     .await
     {
         return oci_error(
@@ -5499,53 +5588,6 @@ async fn handle_put_manifest(
             "INTERNAL_ERROR",
             &e.to_string(),
         );
-    }
-
-    // For multi-arch image indexes, record the (parent_digest -> child_digest)
-    // edges so the storage GC can protect per-architecture children for as
-    // long as the index is still tagged (#1179). The storage GC's NOT EXISTS
-    // guards in `storage_gc_service.rs` only protect digests that appear in
-    // `oci_tags` directly; children of an index never appear there.
-    //
-    // Best-effort: a failure to write the refs is logged but does not fail
-    // the push, since the manifest itself has been persisted and the tag
-    // upsert succeeded. The startup backfill in main.rs will fill in any
-    // gaps on the next restart.
-    // Route ref-recording on the CONTENT classification, not a re-derived
-    // media-type string: an image body pushed with an index Content-Type
-    // would otherwise record `oci_manifest_refs` (0 children) and skip its
-    // blob refs, leaving a live image's layers unreferenced — blob GC would
-    // delete them after the grace period (#1409 C1). `Malformed` was
-    // rejected with 400 above.
-    match class {
-        ManifestClass::Index => {
-            if let Err(e) = record_oci_manifest_refs(&state.db, repo_id, &digest, &body).await {
-                warn!(
-                    image = image_name,
-                    reference = reference,
-                    parent_digest = digest.as_str(),
-                    error = %e,
-                    "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
-                     child manifests as orphaned until the next backfill pass runs"
-                );
-            }
-        }
-        ManifestClass::Image => {
-            // (manifest_digest -> blob_digest) edges (config + layers) so a
-            // future blob GC can safely judge `oci_blobs` orphanhood (#1635).
-            // Best-effort: the startup backfill reconstructs any gap.
-            if let Err(e) = record_manifest_blob_refs(&state.db, repo_id, &digest, &body).await {
-                warn!(
-                    image = image_name,
-                    reference = reference,
-                    manifest_digest = digest.as_str(),
-                    error = %e,
-                    "Failed to record manifest_blob_refs for image manifest; blob references will \
-                     be reconstructed by the startup backfill on the next restart"
-                );
-            }
-        }
-        ManifestClass::Malformed => {}
     }
 
     // Calculate total image size from manifest (config + layers)
@@ -16162,6 +16204,255 @@ mod proxy_manifest_artifact_indexing_tests {
             refs.iter().any(|(_, c)| c
                 == "sha256:2222222222222222222222222222222222222222222222222222222222222222"),
             "arm64 child digest must be recorded"
+        );
+    }
+
+    /// #1409 finding 2 (headline test): a proxy-cached IMAGE manifest must
+    /// record the COMPLETE set of its blob references (config + every layer)
+    /// in `manifest_blob_refs`, so the blob-GC readiness gate
+    /// (`any_live_manifest_missing_refs`) clears for it. Before this PR the
+    /// proxy path wrote only the `oci_tags` row and `oci_manifest_refs` for
+    /// indexes, leaving cached image manifests as ref-less live tags that
+    /// pinned the gate true forever — disabling blob GC across the whole
+    /// deployment wherever proxy repos cache new images.
+    #[tokio::test]
+    async fn cache_manifest_records_blob_refs_for_image_manifest() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/nginx";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // A regular OCI image manifest: one config blob + two layer blobs.
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let l0 = format!("sha256:{}", "0".repeat(64));
+        let l1 = format!("sha256:{}", "1".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{cfg}","size":7023}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{l0}","size":100}},{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{l1}","size":200}}]}}"#
+        );
+        let body = Bytes::from(body_str);
+
+        let manifest_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // Collect the recorded refs for this manifest.
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT blob_digest, kind
+             FROM manifest_blob_refs
+             WHERE repository_id = $1 AND manifest_digest = $2
+             ORDER BY blob_digest",
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_all(&pool)
+        .await
+        .expect("query manifest_blob_refs");
+
+        // The gate must no longer flag THIS manifest as unbackfilled. Mirror
+        // the `select_unbackfilled_manifests` predicate (tagged non-index
+        // manifest with zero manifest_blob_refs rows) scoped to this repo +
+        // digest, so the assertion is deterministic on a shared test DB.
+        let this_manifest_still_unbackfilled: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM oci_tags ot
+                WHERE ot.repository_id = $1
+                  AND ot.manifest_digest = $2
+                  AND NOT EXISTS (
+                        SELECT 1 FROM oci_manifest_refs omr
+                        WHERE omr.repository_id = ot.repository_id
+                          AND omr.parent_digest = ot.manifest_digest
+                    )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM manifest_blob_refs mbr
+                        WHERE mbr.repository_id = ot.repository_id
+                          AND mbr.manifest_digest = ot.manifest_digest
+                    )
+            )
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("scoped unbackfilled check");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM manifest_blob_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs.len(),
+            3,
+            "a proxy-cached image manifest must record one manifest_blob_refs \
+             row per config+layer blob (1 config + 2 layers). Got: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &cfg && k == "config"),
+            "config blob ref must be recorded with kind=config"
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &l0 && k == "layer"),
+            "first layer blob ref must be recorded with kind=layer"
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &l1 && k == "layer"),
+            "second layer blob ref must be recorded with kind=layer"
+        );
+        assert!(
+            !this_manifest_still_unbackfilled,
+            "after caching an image manifest with its complete blob refs, the \
+             readiness gate must no longer flag it as missing refs"
+        );
+    }
+
+    /// #1409 finding 3 (atomicity): `persist_tag_and_refs` writes the
+    /// `oci_tags` upsert and the `manifest_blob_refs` insert in ONE
+    /// transaction. If the ref insert fails, the whole transaction rolls
+    /// back — the tag must NOT be left committed, otherwise a live tag could
+    /// exist without its blob refs (the readiness gate would be pinned and
+    /// blob GC disabled, or worse, GC could later delete the live blobs).
+    ///
+    /// Forces the ref insert to fail with a scoped `AFTER INSERT` trigger on
+    /// `manifest_blob_refs` that raises only for this repo's rows, mirroring
+    /// the existing forced-failure trigger pattern used by the upload tests.
+    #[tokio::test]
+    async fn persist_tag_and_refs_rolls_back_tag_on_ref_failure() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Scoped failure trigger: any INSERT into manifest_blob_refs for THIS
+        // repository raises, so the ref insert inside the transaction fails
+        // while the tag upsert before it would otherwise have succeeded.
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
+        let trigger_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 RAISE EXCEPTION 'forced manifest_blob_refs insert failure for atomicity test';
+             END;
+             $$"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON manifest_blob_refs
+             FOR EACH ROW
+             WHEN (NEW.repository_id = '{repo_id}'::uuid)
+             EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create failure trigger");
+
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let l0 = format!("sha256:{}", "0".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{l0}","size":2}}]}}"#
+        );
+        let body = body_str.as_bytes();
+
+        let result = persist_tag_and_refs(
+            &pool,
+            repo_id,
+            "app",
+            "v1",
+            "sha256:deadbeef",
+            "application/vnd.oci.image.manifest.v1+json",
+            &ManifestClass::Image,
+            body,
+        )
+        .await;
+
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count tags");
+        let ref_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count refs");
+
+        // Cleanup (trigger first, so the cascade delete on repositories works).
+        let _ = sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
+        ))
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_err(),
+            "persist_tag_and_refs must propagate the ref-insert failure"
+        );
+        assert_eq!(
+            tag_count, 0,
+            "the oci_tags upsert must be rolled back when the ref insert fails: \
+             a live tag may never be committed without its blob refs"
+        );
+        assert_eq!(
+            ref_count, 0,
+            "no manifest_blob_refs row may survive the rollback"
         );
     }
 
