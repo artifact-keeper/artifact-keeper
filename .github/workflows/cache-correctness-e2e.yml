@@ -1,0 +1,82 @@
+name: Cache-Correctness E2E
+
+# Cache-correctness + virtual-resolution E2E suite (issue #1625, acceptance gate
+# for #1611). These tests are RED on `main` BY DESIGN — they reproduce the open
+# wrong-result bugs #1600 / #1595 / #1562 and the immutable-vs-mutable
+# mis-caching. They must therefore NEVER run on `pull_request` (they would block
+# every PR). Run manually via workflow_dispatch, plus a weekly schedule so the
+# reproduction does not silently rot. When #1611 lands, flip this green and turn
+# it into the regression gate (and only then consider gating PRs on it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Which suite to run'
+        type: choice
+        options:
+          - both
+          - virtual-resolution
+          - cache-correctness
+        default: both
+  schedule:
+    # Weekly, Mondays 04:00 UTC. Non-blocking; surfaces drift in the repros.
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-correctness-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cache-correctness-e2e:
+    name: 🧊 Cache-correctness + virtual-resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Do NOT fail the workflow run if the suite is red on `main`: a red result is
+    # the EXPECTED outcome until #1611 lands (it proves the bugs reproduce). The
+    # per-step logs carry the PASS/FAIL detail. Once #1611 lands, remove this
+    # `continue-on-error` so regressions hard-fail.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Run virtual-resolution regression suite (#1600/#1595/#1562)
+        if: ${{ github.event.inputs.suite == 'both' || github.event.inputs.suite == 'virtual-resolution' || github.event_name == 'schedule' }}
+        run: |
+          docker compose -f docker-compose.test.yml --profile cache-correctness up \
+            --build --exit-code-from virtual-resolution-test \
+            backend postgres trivy setup cache-mock-upstream virtual-resolution-test \
+            || echo "::warning::virtual-resolution suite reported failures (EXPECTED on main — reproduces #1600/#1595/#1562)"
+
+      - name: Tear down between suites
+        if: always()
+        run: docker compose -f docker-compose.test.yml --profile cache-correctness down -v --remove-orphans
+
+      - name: Run cache-correctness suite (immutable vs mutable, negative cache)
+        if: ${{ github.event.inputs.suite == 'both' || github.event.inputs.suite == 'cache-correctness' || github.event_name == 'schedule' }}
+        run: |
+          docker compose -f docker-compose.test.yml --profile cache-correctness up \
+            --build --exit-code-from cache-correctness-test \
+            backend postgres trivy setup cache-mock-upstream cache-correctness-test \
+            || echo "::warning::cache-correctness suite reported failures (EXPECTED on main — reproduces immutable-vs-mutable mis-caching)"
+
+      - name: Dump failure diagnostics
+        if: always()
+        run: |
+          echo "::group::backend container logs"
+          docker compose -f docker-compose.test.yml logs backend || true
+          echo "::endgroup::"
+          echo "::group::mock-upstream container logs"
+          docker compose -f docker-compose.test.yml logs cache-mock-upstream || true
+          echo "::endgroup::"
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml --profile cache-correctness down -v --remove-orphans

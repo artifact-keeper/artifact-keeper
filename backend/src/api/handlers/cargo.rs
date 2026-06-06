@@ -876,7 +876,7 @@ async fn download(
                     state.proxy_service.as_deref()
                 };
 
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     proxy_for_virtual,
                     repo.id,
@@ -898,20 +898,23 @@ async fn download(
 
                 let filename = format!("{}-{}.crate", name_lower, version);
 
-                return Ok(Response::builder()
+                let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(
                         CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/x-tar".to_string()),
+                        result
+                            .content_type
+                            .unwrap_or_else(|| "application/x-tar".to_string()),
                     )
                     .header(
                         "Content-Disposition",
                         format!("attachment; filename=\"{}\"", filename),
                     )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header("cache-control", "public, max-age=31536000, immutable")
-                    .body(Body::from(content))
-                    .unwrap());
+                    .header("cache-control", "public, max-age=31536000, immutable");
+                if let Some(size) = result.content_length {
+                    builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
             return Err(AppError::NotFound("Crate not found".to_string()).into_response());
         }
@@ -925,8 +928,8 @@ async fn download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
+    let stream = storage
+        .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
 
@@ -947,11 +950,11 @@ async fn download(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         // .crate files are content-addressed and immutable: same name+version
         // always has the same bytes.  Cargo can cache them indefinitely.
         .header("cache-control", "public, max-age=31536000, immutable")
-        .body(Body::from(content))
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

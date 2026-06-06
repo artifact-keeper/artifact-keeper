@@ -1,9 +1,9 @@
 //! Repository management handlers.
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Extension, Multipart, Path, Query, State},
-    http::{header, HeaderMap},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -41,6 +41,14 @@ use crate::services::upload_service;
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
+
+fn is_replication_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-artifact-keeper-replication")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Coerce the requested `is_public` value against the server-wide guest-access
@@ -2854,7 +2862,7 @@ pub async fn get_artifact_metadata(
         let db = state.db.clone();
         let path_clone = path.clone();
         let state_clone = state.clone();
-        let (content, content_type) = proxy_helpers::resolve_virtual_download(
+        let result = proxy_helpers::resolve_virtual_download(
             &state.db,
             proxy_for_virtual,
             repo.id,
@@ -2873,25 +2881,29 @@ pub async fn get_artifact_metadata(
             AppError::NotFound("Artifact not found in any member repository".to_string())
         })?;
 
-        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        let ct = result
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string());
         let filename = path.rsplit('/').next().unwrap_or(&path);
 
-        return Ok((
-            [
-                (header::CONTENT_TYPE, ct),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
-                ),
-                (header::CONTENT_LENGTH, content.len().to_string()),
-                (
-                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                    "virtual".to_string(),
-                ),
-            ],
-            content,
-        )
-            .into_response());
+        // Stream the member's artifact body straight through instead of
+        // buffering it; Content-Length comes from the resolved member's
+        // size_bytes when known.
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, ct)
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(
+                header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                "virtual",
+            );
+        if let Some(size) = result.content_length {
+            builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+        }
+        return Ok(builder.body(Body::from_stream(result.body)).unwrap());
     }
 
     Err(AppError::NotFound("Artifact not found".to_string()))
@@ -3014,7 +3026,7 @@ pub async fn upload_artifact(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
 
     let artifact = artifact_service
-        .upload(
+        .upload_with_sync_options(
             repo.id,
             &path,
             &name,
@@ -3022,6 +3034,7 @@ pub async fn upload_artifact(
             &content_type,
             body,
             Some(auth.user_id),
+            !is_replication_request(&headers),
         )
         .await?;
 
@@ -3405,7 +3418,7 @@ pub async fn download_artifact(
             };
             let db = state.db.clone();
             let path_clone = path.clone();
-            let (content, content_type) = proxy_helpers::resolve_virtual_download(
+            let result = proxy_helpers::resolve_virtual_download(
                 &state.db,
                 proxy_for_virtual,
                 repo.id,
@@ -3425,25 +3438,26 @@ pub async fn download_artifact(
                 AppError::NotFound("Artifact not found in any member repository".to_string())
             })?;
 
-            let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let ct = result
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string());
             let filename = path.rsplit('/').next().unwrap_or(&path);
 
-            Ok((
-                [
-                    (header::CONTENT_TYPE, ct),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{}\"", filename),
-                    ),
-                    (header::CONTENT_LENGTH, content.len().to_string()),
-                    (
-                        header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                        "virtual".to_string(),
-                    ),
-                ],
-                content,
-            )
-                .into_response())
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ct)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "virtual",
+                );
+            if let Some(size) = result.content_length {
+                builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+            }
+            Ok(builder.body(Body::from_stream(result.body)).unwrap())
         }
         Err(e) => Err(e),
     }
@@ -3470,6 +3484,7 @@ pub async fn delete_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
@@ -3491,7 +3506,9 @@ pub async fn delete_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-    artifact_service.delete(artifact).await?;
+    artifact_service
+        .delete_with_sync_options(artifact, !is_replication_request(&headers))
+        .await?;
 
     Ok(())
 }
@@ -4368,6 +4385,46 @@ mod tests {
     // -----------------------------------------------------------------------
     // Remote proxy-cache listing (#1548, web #424)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Peer replication request detection (#1565) — incoming peer writes must be
+    // detected so the local delete/sync path does not re-replicate back to the
+    // origin peer (delete-loop prevention).
+    // -----------------------------------------------------------------------
+
+    fn headers_with_replication(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_is_replication_request_missing_header_is_false() {
+        assert!(!is_replication_request(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn test_is_replication_request_accepts_truthy_values() {
+        for value in ["true", "TRUE", "True", "1", "yes", "YES"] {
+            assert!(
+                is_replication_request(&headers_with_replication(value)),
+                "expected {value:?} to be treated as a replication request"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_replication_request_rejects_falsey_values() {
+        for value in ["false", "0", "no", "", "maybe", "truthy"] {
+            assert!(
+                !is_replication_request(&headers_with_replication(value)),
+                "expected {value:?} to NOT be treated as a replication request"
+            );
+        }
+    }
 
     fn make_cached_entry(path: &str) -> crate::services::proxy_service::CachedArtifactEntry {
         crate::services::proxy_service::CachedArtifactEntry {

@@ -283,7 +283,7 @@ async fn maven_local_fetch_snapshot(
     repo_id: uuid::Uuid,
     location: &crate::storage::StorageLocation,
     path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<proxy_helpers::StreamingFetchResult, Response> {
     if !path.contains("-SNAPSHOT") {
         return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
     }
@@ -293,13 +293,17 @@ async fn maven_local_fetch_snapshot(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&resolved.storage_key)
+    let stream = storage
+        .get_stream(&resolved.storage_key)
         .await
         .map_err(map_storage_err)?;
 
     let ct = content_type_for_path(path).to_string();
-    Ok((content, Some(ct)))
+    Ok(proxy_helpers::StreamingFetchResult {
+        body: stream,
+        content_type: Some(ct),
+        content_length: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,7 +1244,7 @@ async fn serve_artifact(
                     state.proxy_service.as_deref()
                 };
 
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     proxy_for_virtual,
                     repo.id,
@@ -1331,14 +1335,11 @@ async fn serve_artifact(
                 )
                 .await?;
 
-                let ct = content_type.unwrap_or_else(|| content_type_for_path(path).to_string());
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    content_type_for_path(path),
+                    None,
+                );
             }
 
             // For hosted repos, fall back to serving from storage directly.
@@ -1351,13 +1352,12 @@ async fn serve_artifact(
                     .storage_for_repo(&repo.storage_location())
                     .map_err(|e| e.into_response())?;
                 let storage_key = format!("maven/{}", path);
-                if let Ok(content) = storage.get(&storage_key).await {
+                if let Ok(stream) = storage.get_stream(&storage_key).await {
                     let ct = content_type_for_path(path);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, ct)
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .body(Body::from(content))
+                        .body(Body::from_stream(stream))
                         .unwrap());
                 }
             }
@@ -1374,8 +1374,8 @@ async fn serve_artifact(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
+    let stream = storage
+        .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
 
@@ -1388,11 +1388,10 @@ async fn serve_artifact(
     .await;
 
     let ct = content_type_for_path(path);
-
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-Checksum-SHA256", &artifact.checksum_sha256);
 
     if let Some(ref md5) = artifact.checksum_md5 {
@@ -1402,7 +1401,7 @@ async fn serve_artifact(
         builder = builder.header("X-Checksum-SHA1", sha1);
     }
 
-    Ok(builder.body(Body::from(content)).unwrap())
+    Ok(builder.body(Body::from_stream(stream)).unwrap())
 }
 
 async fn serve_computed_checksum(

@@ -63,13 +63,34 @@ pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Collect a case-insensitive (upper-cased) set of CVE identifiers from a
-/// slice of curated `CveHistoryEntry` rows.
+/// Find the `(artifact_id, cve_id)` pair in `pairs` whose synthetic id
+/// (see [`synth_cve_id`]) equals `target`.
 ///
-/// Pulled out of the read paths so the dedupe-by-cve normalization is
-/// covered by unit tests without needing a database. The CVE-history
-/// pipeline calls this once per query to build the `known` set passed to
-/// `build_cve_entries_from_scan_findings`.
+/// The synthetic id is a one-way SHA-256 hash of `(artifact_id, cve_id)`, so
+/// it cannot be reversed arithmetically. To resolve a synth id back to its
+/// originating pair we recompute the hash for every candidate pair and look
+/// for the match. `pairs` is the set of distinct `(artifact_id, cve_id)`
+/// tuples drawn from `scan_findings` (already repo-scoped by the caller).
+///
+/// Pure: no DB, no I/O. Extracted from [`SbomService::resolve_synth_cve_id`]
+/// so the round-trip (`synth_cve_id` -> `match_synth_cve_id`) is unit-testable
+/// without a Postgres pool. (#1561)
+pub(crate) fn match_synth_cve_id(target: Uuid, pairs: &[(Uuid, String)]) -> Option<(Uuid, String)> {
+    pairs
+        .iter()
+        .find(|(artifact_id, cve_id)| synth_cve_id(*artifact_id, cve_id) == target)
+        .cloned()
+}
+
+/// Collect a case-insensitive (upper-cased) set of CVE identifiers from a
+/// slice of `CveHistoryEntry` rows.
+///
+/// Pulled out so the dedupe-by-cve normalization is covered by unit tests
+/// without needing a database. As of #1616/#1620 the read paths source CVE
+/// data solely from `scan_findings` (the `cve_history` reads were dead), so
+/// the production `known` set is always empty; this helper is retained for
+/// the dedupe-contract unit tests of `scan_row_passes_known_filter`.
+#[cfg(test)]
 pub(crate) fn build_known_cve_set(entries: &[CveHistoryEntry]) -> HashSet<String> {
     entries
         .iter()
@@ -557,20 +578,12 @@ FROM (
 ) inner_ranked
 "#;
 
-/// `fixed_cves` count: union of curated `cve_history` rows with status='fixed'
-/// and "fell off on rescan" CVEs, deduped by (artifact_id, cve_id). Repo-
-/// scoped variant. (#1375)
+/// `fixed_cves` count: "fell off on rescan" CVEs, deduped by (artifact_id,
+/// cve_id). Repo-scoped variant. The legacy `curated_fixed` CTE (from the
+/// never-written `cve_history` table) was dropped (#1616/#1620); only the
+/// `disappeared`-from-`scan_findings` half ever contributed real data. (#1375)
 pub(crate) const FIXED_CVES_COUNT_REPO_SQL: &str = r#"
-WITH curated_fixed AS (
-    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
-    FROM cve_history ch
-    JOIN artifacts a ON ch.artifact_id = a.id
-    WHERE ch.status = 'fixed'
-      AND ch.cve_id IS NOT NULL
-      AND a.repository_id = $1
-      AND NOT a.is_deleted
-),
-latest_scans AS (
+WITH latest_scans AS (
     SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
         sr.id, sr.artifact_id, sr.scan_type
     FROM scan_results sr
@@ -598,26 +611,15 @@ disappeared AS (
     SELECT e.artifact_id, e.cve_id FROM ever_seen e
     EXCEPT
     SELECT s.artifact_id, s.cve_id FROM still_present s
-),
-unioned AS (
-    SELECT artifact_id, cve_id FROM curated_fixed
-    UNION
-    SELECT artifact_id, cve_id FROM disappeared
 )
-SELECT COUNT(*) FROM unioned
+SELECT COUNT(*) FROM disappeared
 "#;
 
-/// `fixed_cves` count, all-repos variant.
+/// `fixed_cves` count, all-repos variant. The legacy `curated_fixed` CTE
+/// (from the never-written `cve_history` table) was dropped (#1616/#1620);
+/// only the `disappeared`-from-`scan_findings` half ever contributed data.
 pub(crate) const FIXED_CVES_COUNT_ALL_SQL: &str = r#"
-WITH curated_fixed AS (
-    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
-    FROM cve_history ch
-    JOIN artifacts a ON ch.artifact_id = a.id
-    WHERE ch.status = 'fixed'
-      AND ch.cve_id IS NOT NULL
-      AND NOT a.is_deleted
-),
-latest_scans AS (
+WITH latest_scans AS (
     SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
         sr.id, sr.artifact_id, sr.scan_type
     FROM scan_results sr
@@ -643,13 +645,8 @@ disappeared AS (
     SELECT e.artifact_id, e.cve_id FROM ever_seen e
     EXCEPT
     SELECT s.artifact_id, s.cve_id FROM still_present s
-),
-unioned AS (
-    SELECT artifact_id, cve_id FROM curated_fixed
-    UNION
-    SELECT artifact_id, cve_id FROM disappeared
 )
-SELECT COUNT(*) FROM unioned
+SELECT COUNT(*) FROM disappeared
 "#;
 
 /// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
@@ -1006,40 +1003,30 @@ impl SbomService {
     }
 
     /// Get CVE history for an artifact.
+    ///
+    /// Sourced entirely from `scan_findings`, the populated source of truth.
+    /// The legacy `cve_history` SELECT was dropped (#1616/#1620): the table is
+    /// never written, so it only ever returned empty rows. We still de-dupe by
+    /// `cve_id` (case-insensitive) for safety. The `cve_history` table itself
+    /// is retained per migration 112 (v1.3.0 owns the drop).
     pub async fn get_cve_history(&self, artifact_id: Uuid) -> Result<Vec<CveHistoryEntry>> {
-        // Primary source: legacy `cve_history` table (manual / promoted entries).
-        let mut entries = sqlx::query_as::<_, CveHistoryEntry>(
-            r#"
-            SELECT * FROM cve_history
-            WHERE artifact_id = $1
-            ORDER BY first_detected_at DESC
-            "#,
-        )
-        .bind(artifact_id)
-        .fetch_all(&self.db)
-        .await?;
-
-        // Fallback / supplement: derive CVE-shaped entries from `scan_findings`
-        // for findings the scanner produced but never wrote into `cve_history`
-        // (see #1375: `record_cve` is presently dead code, so the scan-derived
-        // path is the only source of real CVE data). De-dupe by `cve_id` so a
-        // CVE that exists in both tables surfaces once with the curated row.
-        // Normalize to upper-case so the dedupe is case-insensitive (schema
-        // does not constrain `cve_id` case in either table).
-        let known = build_known_cve_set(&entries);
-        let scan_entries = self
+        // Derive CVE-shaped entries from `scan_findings` -- the only source of
+        // real CVE data (see #1375: `record_cve` is dead code, `cve_history`
+        // has zero writers). Empty known-set: no curated rows to dedupe against.
+        let known = HashSet::new();
+        let mut entries = self
             .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
             .await?;
-        entries.extend(scan_entries);
         sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
 
     /// Get CVE history for a single CVE identifier across artifacts.
     ///
-    /// Reads from both `cve_history` (curated rows) and `scan_findings` (live
-    /// scanner output) so that callers see the full set of artifacts where
-    /// this CVE has ever been detected.
+    /// Reads from `scan_findings` (live scanner output) so that callers see
+    /// the full set of artifacts where this CVE has ever been detected. The
+    /// legacy `cve_history` read was dropped (#1616/#1620): that table is never
+    /// written, so it only ever returned empty rows.
     ///
     /// # `allowed_repo_ids` contract (ADMIN-ONLY when `None`)
     ///
@@ -1078,60 +1065,23 @@ impl SbomService {
         // upper-cased form for display/known-set dedupe below.
         let cve_id_upper = cve_id.to_ascii_uppercase();
 
-        // 1. Curated rows from cve_history. We join through artifacts so we
-        //    can filter by allowed_repo_ids without a second round-trip.
-        //    LOWER(...)=LOWER(...) so a scanner that wrote lower-case still
-        //    matches an upper-case query (and vice versa).
-        let mut entries: Vec<CveHistoryEntry> = if let Some(repo_ids) = allowed_repo_ids {
-            sqlx::query_as::<_, CveHistoryEntry>(
-                r#"
-                SELECT ch.*
-                FROM cve_history ch
-                JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE LOWER(ch.cve_id) = LOWER($1)
-                  AND a.repository_id = ANY($2)
-                  AND NOT a.is_deleted
-                ORDER BY ch.first_detected_at DESC
-                "#,
-            )
-            .bind(&cve_id_upper)
-            .bind(repo_ids)
-            .fetch_all(&self.db)
-            .await?
-        } else {
-            sqlx::query_as::<_, CveHistoryEntry>(
-                r#"
-                SELECT ch.*
-                FROM cve_history ch
-                JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE LOWER(ch.cve_id) = LOWER($1)
-                  AND NOT a.is_deleted
-                ORDER BY ch.first_detected_at DESC
-                "#,
-            )
-            .bind(&cve_id_upper)
-            .fetch_all(&self.db)
-            .await?
-        };
-
-        // 2. Live findings from scan_findings, skipping cve_ids we already
-        //    surfaced via the curated path. `known` is normalized so the
-        //    dedupe is case-insensitive too.
-        let known = build_known_cve_set(&entries);
+        // Live findings from `scan_findings`, the only populated source. The
+        // legacy `cve_history` SELECT was dropped (#1616/#1620): the table is
+        // never written, so it only ever contributed empty rows. Empty
+        // known-set: no curated rows to dedupe against.
+        let known = HashSet::new();
         let scan_entries = self
             .build_cve_entries_from_scan_findings(None, Some(&cve_id_upper), &known)
             .await?;
-        // For scan-derived entries we additionally enforce the repo filter
-        // (artifact-level lookup already enforced it inside the helper, so
-        // here we only need to re-scope by allowed_repo_ids).
-        let scan_entries = match allowed_repo_ids {
+        // Enforce the repo filter on scan-derived entries (they are synthesized
+        // on the fly, so the filter cannot live in the SQL `WHERE`).
+        let mut entries = match allowed_repo_ids {
             None => scan_entries,
             Some(repo_ids) => {
                 let allowed: HashSet<Uuid> = repo_ids.iter().copied().collect();
                 self.filter_entries_by_repo(scan_entries, &allowed).await?
             }
         };
-        entries.extend(scan_entries);
         sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
@@ -1213,15 +1163,42 @@ impl SbomService {
         Ok(project_scan_rows_to_entries(rows, known))
     }
 
-    /// Update CVE status.
+    /// Update CVE status by legacy `cve_history` id, falling back to the
+    /// `scan_findings` acknowledge path for synthetic ids.
+    ///
+    /// History (#1561): this endpoint (`POST /sbom/cve/status/{id}`) used to
+    /// only `UPDATE cve_history WHERE id = $1`. Because the scanner pipeline
+    /// never writes `cve_history` and the *read* paths now project synthetic
+    /// ids out of `scan_findings` (#1616/#1620, [`synth_cve_id`]), every ack
+    /// against an id the read path actually emits returned 404 -- the table
+    /// has no such row. We now:
+    ///
+    ///   1. Try the legacy `cve_history` UPDATE first. If a real curated row
+    ///      exists (rare admin/promotion-policy data), it wins and behaviour
+    ///      is unchanged.
+    ///   2. On `RowNotFound`, attempt to resolve `id` as a synthetic id back
+    ///      to its `(artifact_id, cve_id)` pair (scoped to `allowed_repo_ids`)
+    ///      and delegate to [`Self::update_cve_status_by_artifact_cve`], which
+    ///      mutates `scan_findings`. This is the path the read side emits, so
+    ///      the ack now persists and returns the synth aggregate instead of
+    ///      404.
+    ///   3. If neither matches, surface the original `RowNotFound` so the
+    ///      handler still maps a genuinely-unknown id to 404.
+    ///
+    /// `allowed_repo_ids` follows the same admin-when-`None` contract as
+    /// [`Self::get_cve_history_by_cve_id`]: `None` means no repo restriction
+    /// (admin/system callers); `Some(&[...])` scopes the synth-id resolution
+    /// to those repositories so a non-admin caller cannot acknowledge a CVE on
+    /// an artifact they cannot see.
     pub async fn update_cve_status(
         &self,
         id: Uuid,
         status: CveStatus,
         user_id: Option<Uuid>,
         reason: Option<&str>,
+        allowed_repo_ids: Option<&[Uuid]>,
     ) -> Result<CveHistoryEntry> {
-        let entry = sqlx::query_as::<_, CveHistoryEntry>(
+        let curated = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
             UPDATE cve_history SET
                 status = $2,
@@ -1237,10 +1214,73 @@ impl SbomService {
         .bind(status.as_str())
         .bind(user_id)
         .bind(reason)
-        .fetch_one(&self.db)
+        .fetch_optional(&self.db)
         .await?;
 
-        Ok(entry)
+        if let Some(entry) = curated {
+            return Ok(entry);
+        }
+
+        // No curated `cve_history` row: treat `id` as a synthetic id derived
+        // from `scan_findings` and resolve it back to (artifact_id, cve_id).
+        if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, allowed_repo_ids).await?
+        {
+            return self
+                .update_cve_status_by_artifact_cve(artifact_id, &cve_id, status, user_id, reason)
+                .await;
+        }
+
+        // Neither a curated row nor a resolvable synth id: genuinely unknown.
+        // Preserve the legacy 404 contract (handler maps RowNotFound -> 404).
+        Err(AppError::Sqlx(sqlx::Error::RowNotFound))
+    }
+
+    /// Resolve a synthetic CVE id (see [`synth_cve_id`]) back to the
+    /// `(artifact_id, cve_id)` pair it was derived from, by recomputing the
+    /// hash for every distinct `scan_findings` pair and matching `id`.
+    ///
+    /// The synth id is a one-way hash, so reversal is by recomputation, not
+    /// arithmetic. `allowed_repo_ids` scopes the candidate set to artifacts in
+    /// the listed repositories (`None` = no restriction; admin-only, same
+    /// contract as [`Self::get_cve_history_by_cve_id`]). Returns `None` when
+    /// no `scan_findings` pair hashes to `id`. (#1561)
+    pub(crate) async fn resolve_synth_cve_id(
+        &self,
+        id: Uuid,
+        allowed_repo_ids: Option<&[Uuid]>,
+    ) -> Result<Option<(Uuid, String)>> {
+        let pairs: Vec<(Uuid, String)> = match allowed_repo_ids {
+            None => {
+                sqlx::query_as(
+                    r#"
+                SELECT DISTINCT sf.artifact_id, sf.cve_id
+                FROM scan_findings sf
+                JOIN artifacts a ON sf.artifact_id = a.id
+                WHERE sf.cve_id IS NOT NULL
+                  AND NOT a.is_deleted
+                "#,
+                )
+                .fetch_all(&self.db)
+                .await?
+            }
+            Some(repo_ids) => {
+                sqlx::query_as(
+                    r#"
+                SELECT DISTINCT sf.artifact_id, sf.cve_id
+                FROM scan_findings sf
+                JOIN artifacts a ON sf.artifact_id = a.id
+                WHERE sf.cve_id IS NOT NULL
+                  AND NOT a.is_deleted
+                  AND a.repository_id = ANY($1)
+                "#,
+                )
+                .bind(repo_ids)
+                .fetch_all(&self.db)
+                .await?
+            }
+        };
+
+        Ok(match_synth_cve_id(id, &pairs))
     }
 
     /// Update CVE status for an (artifact, cve) pair by mutating the
@@ -1376,15 +1416,12 @@ impl SbomService {
     /// direct equivalent in `scan_findings`. We approximate:
     ///   - open: findings where `NOT is_acknowledged`
     ///   - acknowledged: findings where `is_acknowledged`
-    ///   - fixed: union of two sources, deduped by (artifact_id, cve_id):
-    ///     (a) curated `cve_history` rows with `status='fixed'` (preserves
-    ///     the legacy admin/promotion-policy semantic for the rare callers
-    ///     that write to that table); plus
-    ///     (b) CVEs that appeared in an earlier `scan_findings` row for an
+    ///   - fixed: CVEs that appeared in an earlier `scan_findings` row for an
     ///     artifact but are absent from that artifact's most recent
     ///     `scan_results` (per `scan_type`). "Disappeared on rescan" is the
     ///     closest signal we have to a fixed CVE without a real fixed-at
-    ///     timestamp.
+    ///     timestamp. (#1616/#1620 dropped the dead `cve_history` curated half,
+    ///     which always contributed zero.)
     ///
     /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
     /// double-count a single vulnerability.
@@ -1428,13 +1465,10 @@ impl SbomService {
 
         let timeline = project_timeline_rows(&timeline_rows, Utc::now());
 
-        // fixed_cves: union of two definitions, deduped by (artifact_id, cve_id):
-        //   (a) curated `cve_history` rows with status='fixed'
-        //   (b) CVEs present in an earlier scan_findings row for an artifact
-        //       but absent from that artifact's most recent scan_result per
-        //       scan_type (i.e. they "fell off" on rescan)
-        // This avoids the silent-zero regression while still being correct
-        // when no curated rows exist.
+        // fixed_cves: CVEs present in an earlier scan_findings row for an
+        // artifact but absent from that artifact's most recent scan_result per
+        // scan_type (i.e. they "fell off" on rescan). #1616/#1620 dropped the
+        // dead `cve_history` curated-fixed half, which was always empty.
         let fixed_cves: i64 = if let Some(repo_id) = repository_id {
             sqlx::query_scalar(FIXED_CVES_COUNT_REPO_SQL)
                 .bind(repo_id)
@@ -3095,6 +3129,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // match_synth_cve_id: reverse-resolve a synthetic id to its (artifact,
+    // cve) pair by recomputing the hash. This is the pure half of the #1561
+    // fix -- it proves the read-side `synth_cve_id` round-trips back to the
+    // pair the legacy ack path needs, the exact thing whose absence made
+    // `POST /sbom/cve/status/{synth_id}` 404.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_match_synth_cve_id_round_trips_from_synth_cve_id() {
+        // The read path emits `synth_cve_id(artifact, cve)`. Feeding that id
+        // back through `match_synth_cve_id` against the candidate pair set
+        // (what `resolve_synth_cve_id` pulls from `scan_findings`) must
+        // recover the original pair -- otherwise the ack falls back to 404.
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let pairs = vec![
+            (a1, "CVE-2019-10744".to_string()),
+            (a2, "CVE-2024-12345".to_string()),
+            (a1, "CVE-2024-12345".to_string()),
+        ];
+        let target = synth_cve_id(a1, "CVE-2024-12345");
+        let resolved = match_synth_cve_id(target, &pairs);
+        assert_eq!(resolved, Some((a1, "CVE-2024-12345".to_string())));
+    }
+
+    #[test]
+    fn test_match_synth_cve_id_returns_none_when_no_pair_matches() {
+        // A genuinely unknown id (no scan_findings pair hashes to it) must
+        // resolve to None so the service can preserve the legacy 404.
+        let pairs = vec![(Uuid::new_v4(), "CVE-2019-10744".to_string())];
+        assert_eq!(match_synth_cve_id(Uuid::new_v4(), &pairs), None);
+        assert_eq!(match_synth_cve_id(Uuid::nil(), &[]), None);
+    }
+
+    #[test]
+    fn test_match_synth_cve_id_distinguishes_pairs_sharing_a_field() {
+        // Two pairs differing only by artifact (same CVE) must resolve to the
+        // correct artifact, and two differing only by CVE (same artifact) to
+        // the correct CVE -- the hash binds both fields.
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let pairs = vec![
+            (a1, "CVE-2019-10744".to_string()),
+            (a2, "CVE-2019-10744".to_string()),
+        ];
+        assert_eq!(
+            match_synth_cve_id(synth_cve_id(a2, "CVE-2019-10744"), &pairs),
+            Some((a2, "CVE-2019-10744".to_string()))
+        );
+
+        let pairs2 = vec![
+            (a1, "CVE-2019-10744".to_string()),
+            (a1, "CVE-2024-12345".to_string()),
+        ];
+        assert_eq!(
+            match_synth_cve_id(synth_cve_id(a1, "CVE-2024-12345"), &pairs2),
+            Some((a1, "CVE-2024-12345".to_string()))
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Pure-logic helpers extracted from the DB-coupled CVE history paths.
     // These are the cases the inline coverage gate counts; the SQL queries
     // they wrap are unreachable without a live PostgreSQL, so we exercise
@@ -4075,18 +4170,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_cves_count_repo_sql_unions_curated_and_disappeared() {
-        // fixed = curated_fixed UNION disappeared (dedup by artifact_id +
-        // cve_id). Losing either CTE would silently zero one of the two
-        // signals.
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("WITH curated_fixed AS"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("latest_scans AS"));
+    fn test_fixed_cves_count_repo_sql_counts_disappeared_from_scan_findings() {
+        // fixed = disappeared (ever_seen EXCEPT still_present, from
+        // scan_findings). The legacy `curated_fixed` CTE was dropped
+        // (#1616/#1620): `cve_history` is never written, so it always added
+        // zero. The scan-derived CTE chain must survive.
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("WITH latest_scans AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ever_seen AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("still_present AS"));
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("disappeared AS"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM curated_fixed"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("UNION"));
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT artifact_id, cve_id FROM disappeared"));
+        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("SELECT COUNT(*) FROM disappeared"));
+        // The dead curated path must be gone, not merely unused.
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("curated_fixed"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("UNION"));
     }
 
     #[test]
@@ -4115,11 +4212,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_cves_count_repo_sql_curated_fixed_uses_status_fixed() {
-        // Curated fixed rows must filter by status='fixed', not by the
-        // acknowledged column (a different semantic).
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("ch.status = 'fixed'"));
-        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("ch.status = 'fixed'"));
+    fn test_fixed_cves_count_sql_drops_dead_cve_history_curated_path() {
+        // #1616/#1620: the `curated_fixed` CTE read from the never-written
+        // `cve_history` table and always contributed zero. Both variants must
+        // count fixed CVEs solely from the scan-derived `disappeared` CTE.
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.contains("cve_history"));
+        assert!(!FIXED_CVES_COUNT_REPO_SQL.contains("curated_fixed"));
+        assert!(!FIXED_CVES_COUNT_ALL_SQL.contains("curated_fixed"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("SELECT COUNT(*) FROM disappeared"));
     }
 
     #[test]
@@ -4131,10 +4232,10 @@ mod tests {
 
     #[test]
     fn test_fixed_cves_count_repo_sql_lowercases_cve_id() {
-        // The dedupe is on LOWER(cve_id) so the curated and scan paths
-        // collide regardless of how each side cased the id.
-        assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(ch.cve_id)"));
+        // The scan-derived CTEs normalize on LOWER(cve_id) so the ever_seen /
+        // still_present EXCEPT collides regardless of how the scanner cased id.
         assert!(FIXED_CVES_COUNT_REPO_SQL.contains("LOWER(sf.cve_id)"));
+        assert!(FIXED_CVES_COUNT_ALL_SQL.contains("LOWER(sf.cve_id)"));
     }
 
     #[test]
@@ -4651,5 +4752,146 @@ mod tests {
         assert_eq!(acked.0, 2, "both scan_findings rows must be acknowledged");
 
         teardown(&pool, repo_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // update_cve_status synth-id fallback (#1561)
+    //
+    // The reported bug: `POST /sbom/cve/status/{id}` -> `update_cve_status`
+    // ran `UPDATE cve_history WHERE id = $1`, but `cve_history` is never
+    // written in production and the read path emits SHA-256 synth ids derived
+    // from `scan_findings`. Every ack against an id the read side actually
+    // returns 404'd. These DB-backed tests prove the fallback: the same synth
+    // id now resolves and persists the ack on `scan_findings`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_update_cve_status_synth_id_falls_back_to_scan_findings() {
+        // Regression for #1561: the EXACT reported flow. Take the synth id the
+        // read path emits for a scan-derived CVE, call the legacy
+        // `update_cve_status` with it, and assert it now succeeds (was 404).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-8888", "high").await;
+
+        let service = SbomService::new(pool.clone());
+
+        // The id the read path hands clients for this (artifact, cve) pair.
+        let synth_id = synth_cve_id(artifact_id, "CVE-2024-8888");
+
+        // Before the fix this returned AppError::Sqlx(RowNotFound) -> 404.
+        let entry = service
+            .update_cve_status(
+                synth_id,
+                CveStatus::Acknowledged,
+                None,
+                Some("ack via legacy synth-id endpoint"),
+                None,
+            )
+            .await
+            .expect("synth-id ack must succeed via scan_findings fallback");
+
+        assert_eq!(entry.cve_id.to_ascii_uppercase(), "CVE-2024-8888");
+        assert_eq!(entry.status, "acknowledged");
+        // The synth aggregate the response carries must keep the same id.
+        assert_eq!(entry.id, synth_id);
+
+        // And the ack must actually be persisted on the source table.
+        let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-8888")
+            .await
+            .expect("finding row present");
+        assert!(ack, "scan_findings.is_acknowledged must be persisted");
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_unknown_id_still_returns_not_found() {
+        // The fallback must NOT mask genuinely-unknown ids: an id that is
+        // neither a curated cve_history row nor a resolvable synth id must
+        // still surface RowNotFound (handler -> 404).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan_result(&pool, artifact_id, repo_id).await;
+        seed_finding(&pool, scan_id, artifact_id, "CVE-2024-9090", "low").await;
+
+        let service = SbomService::new(pool.clone());
+        let err = service
+            .update_cve_status(
+                Uuid::new_v4(), // random id: no cve_history row, no synth match
+                CveStatus::Acknowledged,
+                None,
+                Some("nope"),
+                None,
+            )
+            .await
+            .expect_err("unknown id must 404");
+
+        assert!(
+            matches!(err, AppError::Sqlx(sqlx::Error::RowNotFound)),
+            "unknown id must surface RowNotFound (handler maps to 404), got {err:?}"
+        );
+
+        teardown(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_synth_id_respects_repo_scope() {
+        // Resolution must honour allowed_repo_ids: a synth id for an artifact
+        // in repo A must NOT resolve when the caller is scoped to repo B
+        // (returns 404 rather than acknowledging an unauthorized CVE).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_a = seed_repo(&pool).await;
+        let repo_b = seed_repo(&pool).await;
+        let artifact_a = seed_artifact(&pool, repo_a).await;
+        let scan_a = seed_scan_result(&pool, artifact_a, repo_a).await;
+        seed_finding(&pool, scan_a, artifact_a, "CVE-2024-7001", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let synth_id = synth_cve_id(artifact_a, "CVE-2024-7001");
+
+        // Scoped to repo_b only: the artifact lives in repo_a, so no match.
+        let err = service
+            .update_cve_status(
+                synth_id,
+                CveStatus::Acknowledged,
+                None,
+                Some("cross-repo attempt"),
+                Some(&[repo_b]),
+            )
+            .await
+            .expect_err("synth id outside repo scope must 404");
+        assert!(matches!(err, AppError::Sqlx(sqlx::Error::RowNotFound)));
+
+        // The finding must remain unacknowledged.
+        let (ack, _, _, _) = read_ack(&pool, artifact_a, "CVE-2024-7001")
+            .await
+            .expect("finding present");
+        assert!(!ack, "ack must not persist for out-of-scope caller");
+
+        // Scoped to repo_a: now it resolves and persists.
+        let entry = service
+            .update_cve_status(
+                synth_id,
+                CveStatus::Acknowledged,
+                None,
+                Some("in-scope ack"),
+                Some(&[repo_a]),
+            )
+            .await
+            .expect("in-scope synth id must resolve");
+        assert_eq!(entry.status, "acknowledged");
+
+        teardown(&pool, repo_a).await;
+        teardown(&pool, repo_b).await;
     }
 }
