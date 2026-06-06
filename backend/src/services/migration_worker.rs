@@ -2467,6 +2467,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_staging_dir_errors_when_base_uncreatable() {
+        // If a path component is a regular file, create_dir_all fails and the
+        // resolver must surface a StorageError rather than silently falling
+        // back to /tmp (which would reintroduce the eviction bug).
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a-file");
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        // Treat the file as if it were a directory parent.
+        let bad_base = file_path.join("staging");
+
+        let err = resolve_migration_staging_dir(bad_base.to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        match err {
+            MigrationError::StorageError(msg) => {
+                assert!(
+                    msg.contains("Failed to create migration staging dir"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_resolve_staging_dir_creates_missing_dir() {
         // The resolver must create the base if it does not yet exist, so the
         // subsequent NamedTempFile::new_in succeeds on a fresh volume.
