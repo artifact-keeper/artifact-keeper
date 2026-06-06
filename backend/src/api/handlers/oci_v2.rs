@@ -379,13 +379,14 @@ async fn authenticate_oci_with_scopes(
 
 /// Verify that the resolved OCI credential scopes (if any) grant the given
 /// permission. Returns `false` if an API token is present but lacks the
-/// requested scope. Implements the same logic as
-/// `AuthExtension::has_scope`: `*` and `admin` count as wildcards, and a
+/// requested scope. Defers to the single canonical wildcard-aware decision
+/// in `token_service::scopes_grant_access` (the same helper backing
+/// `AuthExtension::has_scope`): `*` and `admin` count as wildcards, and a
 /// `None` scopes set (JWT / password) passes through.
 fn oci_scopes_grant(scopes: &Option<Vec<String>>, required: &str) -> bool {
     match scopes {
         None => true,
-        Some(s) => s.iter().any(|x| x == required || x == "*" || x == "admin"),
+        Some(s) => crate::services::token_service::scopes_grant_access(s, required),
     }
 }
 
@@ -6934,6 +6935,31 @@ mod tests {
     fn test_oci_scopes_grant_empty_scopes_rejected() {
         let scopes = Some(vec![]);
         assert!(!oci_scopes_grant(&scopes, "write"));
+    }
+
+    // #1316: `oci_scopes_grant` now delegates the wildcard decision to the
+    // canonical `token_service::scopes_grant_access` helper instead of an
+    // inline `== "admin"` string match. Behavior must be identical: an
+    // `admin`-scoped token authorizes write/delete, and a non-admin token
+    // without the required scope (or a wildcard) is denied.
+    #[test]
+    fn test_oci_scopes_grant_matches_canonical_helper_for_admin_and_denial() {
+        let admin = vec!["admin".to_string()];
+        let read_only = vec!["read".to_string()];
+        for required in ["write", "delete"] {
+            // Admin token: granted, and identical to the canonical decision.
+            assert!(oci_scopes_grant(&Some(admin.clone()), required));
+            assert_eq!(
+                oci_scopes_grant(&Some(admin.clone()), required),
+                crate::services::token_service::scopes_grant_access(&admin, required),
+            );
+            // Read-only (non-admin) token: denied on write/delete.
+            assert!(!oci_scopes_grant(&Some(read_only.clone()), required));
+            assert_eq!(
+                oci_scopes_grant(&Some(read_only.clone()), required),
+                crate::services::token_service::scopes_grant_access(&read_only, required),
+            );
+        }
     }
 
     #[tokio::test]
