@@ -36,6 +36,14 @@ pub struct WorkerConfig {
     pub verify_checksums: bool,
     /// Dry-run mode - preview changes without making them
     pub dry_run: bool,
+    /// Filesystem base under which streamed artifact bodies are spilled while
+    /// checksums are computed and before the storage put. This MUST live on
+    /// the same durable volume as `STORAGE_PATH` (not the pod's ephemeral
+    /// `/tmp`); otherwise a multi-GiB Maven JAR fills `/tmp` and triggers
+    /// Kubernetes pod eviction (issue #1608, same class as the incus upload
+    /// fix #1622). When empty, the OS temp dir is used as a fallback so unit
+    /// tests and `WorkerConfig::default()` callers keep working.
+    pub staging_path: String,
 }
 
 impl Default for WorkerConfig {
@@ -51,8 +59,40 @@ impl Default for WorkerConfig {
             batch_size: 1000,
             verify_checksums: true,
             dry_run: false,
+            // Empty => fall back to the OS temp dir. Production call sites
+            // override this with `STORAGE_PATH` so spills land on the durable
+            // storage volume rather than the pod's ephemeral `/tmp`.
+            staging_path: String::new(),
         }
     }
+}
+
+/// Resolve the directory under which streamed artifact bodies are spilled and
+/// ensure it exists.
+///
+/// When `staging_path` is non-empty it is used verbatim as the spill base and
+/// created (recursively) if missing — mirroring the scanner's
+/// `create_dir_all` + `NamedTempFile::new_in` convention so multi-GiB
+/// artifacts spill onto the durable `STORAGE_PATH` volume instead of the pod's
+/// ephemeral `/tmp` (issue #1608, cf. incus fix #1622). When it is empty
+/// (e.g. `WorkerConfig::default()` in unit tests) the OS temp dir is returned
+/// unchanged, preserving the historical `NamedTempFile::new()` behavior.
+///
+/// Returns the base directory in which a `NamedTempFile` should be created.
+async fn resolve_migration_staging_dir(
+    staging_path: &str,
+) -> Result<std::path::PathBuf, MigrationError> {
+    if staging_path.is_empty() {
+        return Ok(std::env::temp_dir());
+    }
+    let base = std::path::PathBuf::from(staging_path);
+    tokio::fs::create_dir_all(&base).await.map_err(|e| {
+        MigrationError::StorageError(format!(
+            "Failed to create migration staging dir {}: {e}",
+            base.display()
+        ))
+    })?;
+    Ok(base)
 }
 
 /// Maximum number of AQL pages a single repository migration is allowed to
@@ -865,8 +905,18 @@ impl MigrationWorker {
         // through the async executor without per-chunk blocking-thread
         // hops. Each chunk is hashed (sha256 + sha1) and dropped as soon
         // as it lands on disk so peak memory is O(chunk_size).
-        let temp = tempfile::NamedTempFile::new().map_err(|e| {
-            MigrationError::StorageError(format!("Failed to create temp file: {e}"))
+        //
+        // The spill base is the configured staging dir (STORAGE_PATH-backed),
+        // NOT the default `NamedTempFile::new()` location (`$TMPDIR`/`/tmp`).
+        // On Kubernetes `/tmp` is the pod's ephemeral overlay and a multi-GiB
+        // Maven JAR would fill it and trigger eviction (issue #1608, same
+        // class as the incus upload fix #1622).
+        let staging_dir = resolve_migration_staging_dir(&self.config.staging_path).await?;
+        let temp = tempfile::NamedTempFile::new_in(&staging_dir).map_err(|e| {
+            MigrationError::StorageError(format!(
+                "Failed to create temp file in {}: {e}",
+                staging_dir.display()
+            ))
         })?;
         let temp_path = temp.path().to_path_buf();
         let mut writer = tokio::fs::OpenOptions::new()
@@ -2370,6 +2420,7 @@ mod tests {
             batch_size: 500,
             verify_checksums: false,
             dry_run: true,
+            staging_path: "/var/lib/artifact-keeper/artifacts".to_string(),
         };
         assert_eq!(config.concurrency, 8);
         assert_eq!(config.throttle_delay_ms, 0);
@@ -2377,6 +2428,86 @@ mod tests {
         assert_eq!(config.batch_size, 500);
         assert!(!config.verify_checksums);
         assert!(config.dry_run);
+        assert_eq!(config.staging_path, "/var/lib/artifact-keeper/artifacts");
+    }
+
+    #[test]
+    fn test_worker_config_default_staging_path_is_empty() {
+        // Default leaves staging_path empty so the helper falls back to the
+        // OS temp dir, preserving the historical NamedTempFile::new() behavior
+        // for tests and non-HTTP callers.
+        let config = WorkerConfig::default();
+        assert!(config.staging_path.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging_dir_empty_falls_back_to_os_temp() {
+        // Empty staging_path => OS temp dir, never an error.
+        let resolved = resolve_migration_staging_dir("").await.unwrap();
+        assert_eq!(resolved, std::env::temp_dir());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging_dir_uses_configured_base_not_tmp() {
+        // A configured base (simulating STORAGE_PATH) is returned verbatim and
+        // is NOT the OS temp dir — this is the core invariant of #1608.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("staging-base");
+        let base_str = base.to_str().unwrap();
+
+        let resolved = resolve_migration_staging_dir(base_str).await.unwrap();
+
+        assert_eq!(resolved, base);
+        assert_ne!(
+            resolved,
+            std::env::temp_dir(),
+            "spill base must be the configured STORAGE_PATH-backed dir, not /tmp"
+        );
+        assert!(resolved.starts_with(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging_dir_errors_when_base_uncreatable() {
+        // If a path component is a regular file, create_dir_all fails and the
+        // resolver must surface a StorageError rather than silently falling
+        // back to /tmp (which would reintroduce the eviction bug).
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a-file");
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        // Treat the file as if it were a directory parent.
+        let bad_base = file_path.join("staging");
+
+        let err = resolve_migration_staging_dir(bad_base.to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        match err {
+            MigrationError::StorageError(msg) => {
+                assert!(
+                    msg.contains("Failed to create migration staging dir"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging_dir_creates_missing_dir() {
+        // The resolver must create the base if it does not yet exist, so the
+        // subsequent NamedTempFile::new_in succeeds on a fresh volume.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("nested").join("does-not-exist-yet");
+        assert!(!base.exists());
+
+        let resolved = resolve_migration_staging_dir(base.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(resolved.is_dir(), "resolver must create the staging dir");
+        // And a NamedTempFile can actually be created under it.
+        let f = tempfile::NamedTempFile::new_in(&resolved).unwrap();
+        assert!(f.path().starts_with(&base));
     }
 
     #[test]

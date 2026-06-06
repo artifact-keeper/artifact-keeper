@@ -1108,6 +1108,9 @@ async fn start_migration(
         // so the documented API flag actually disables verification
         // (issue #856).
         verify_checksums: config.verify_checksums,
+        // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
+        // rather than the pod's ephemeral `/tmp` (issue #1608).
+        staging_path: state.config.storage_path.clone(),
         ..Default::default()
     };
 
@@ -1240,6 +1243,9 @@ async fn resume_migration(
         // so the documented API flag actually disables verification
         // (issue #856).
         verify_checksums: config.verify_checksums,
+        // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
+        // rather than the pod's ephemeral `/tmp` (issue #1608).
+        staging_path: state.config.storage_path.clone(),
         ..Default::default()
     };
 
