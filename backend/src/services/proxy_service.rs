@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::services::cache_classifier;
 use crate::services::proxy_hydration::{
     BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
 };
@@ -37,6 +38,9 @@ struct UpstreamResponse {
     content: Bytes,
     content_type: Option<String>,
     etag: Option<String>,
+    /// `Last-Modified` header from upstream, persisted into the cache sidecar
+    /// so a later conditional revalidation can send `If-Modified-Since` (#1611).
+    last_modified: Option<String>,
     effective_url: String,
     link: Option<String>,
 }
@@ -117,6 +121,9 @@ impl StreamingFetchResult {
 struct CacheMetadataTemplate {
     content_type: Option<String>,
     etag: Option<String>,
+    /// `Last-Modified` from upstream (#1611). `None` on the streaming path,
+    /// which does not currently surface the header into the tee template.
+    last_modified: Option<String>,
     ttl_secs: i64,
 }
 
@@ -402,6 +409,19 @@ pub struct CacheMetadata {
     /// natural hardening if that threat model becomes relevant.
     #[serde(default)]
     pub storage_etag: Option<String>,
+    /// `Last-Modified` value from upstream, used to send `If-Modified-Since`
+    /// on conditional revalidation of a mutable entry past its TTL (#1611).
+    /// `None` for entries written before this field existed (`#[serde(default)]`
+    /// preserves wire-compat) or when upstream sent no `Last-Modified`.
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    /// When set and in the future, this entry is a *negative cache* of an
+    /// upstream 404 (#1611): it holds no usable body and a read must respond
+    /// 404 without contacting upstream until this instant passes. `None` for a
+    /// normal positive cache entry. `#[serde(default)]` keeps pre-#1611
+    /// sidecars deserializing.
+    #[serde(default)]
+    pub negative_cached_until: Option<DateTime<Utc>>,
     /// When the cache entry expires
     pub expires_at: DateTime<Utc>,
     /// Content type from upstream
@@ -410,6 +430,37 @@ pub struct CacheMetadata {
     pub size_bytes: i64,
     /// SHA-256 checksum of cached content
     pub checksum_sha256: String,
+}
+
+impl CacheMetadata {
+    /// Project this sidecar into the pure [`cache_classifier::CacheEntry`] the
+    /// freshness evaluator consumes, given the path's classified mutability.
+    /// Keeps the storage type and the pure evaluator decoupled (#1611).
+    pub(crate) fn as_cache_entry(
+        &self,
+        mutability: crate::services::cache_classifier::Mutability,
+    ) -> crate::services::cache_classifier::CacheEntry {
+        crate::services::cache_classifier::CacheEntry {
+            mutability,
+            expires_at: self.expires_at,
+            negative_cached_until: self.negative_cached_until,
+        }
+    }
+}
+
+/// Outcome of the up-front cache read on the buffered proxy path (#1611).
+///
+/// Lets [`ProxyService::read_cached_with_revalidation`] resolve all four
+/// freshness states (Fresh hit, NegativeHit, Stale→revalidated hit, Miss) into
+/// the three actions the caller cares about: serve a body, return 404, or fetch
+/// upstream.
+enum CacheReadOutcome {
+    /// Serve this cached (or freshly revalidated) body + content type.
+    Hit(Bytes, Option<String>),
+    /// A negative-cached upstream 404 is still within its TTL: respond 404.
+    NegativeHit,
+    /// No usable entry; the caller must fetch from upstream.
+    Miss,
 }
 
 /// Default bearer token TTL when the token endpoint omits `expires_in` (5 minutes).
@@ -760,6 +811,7 @@ impl CachePersister {
         content: &Bytes,
         content_type: Option<String>,
         etag: Option<String>,
+        last_modified: Option<String>,
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
@@ -801,6 +853,8 @@ impl CachePersister {
             cached_at: now,
             upstream_etag: etag,
             storage_etag,
+            last_modified,
+            negative_cached_until: None,
             expires_at: now + chrono::Duration::seconds(ttl_secs),
             content_type,
             size_bytes: content.len() as i64,
@@ -959,6 +1013,8 @@ impl CachePersister {
                         cached_at: now,
                         upstream_etag: template.etag,
                         storage_etag,
+                        last_modified: template.last_modified,
+                        negative_cached_until: None,
                         expires_at: now + chrono::Duration::seconds(template.ttl_secs),
                         content_type: template.content_type,
                         size_bytes: result.bytes_written as i64,
@@ -1199,6 +1255,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         let link = response
             .headers()
             .get("link")
@@ -1222,6 +1284,7 @@ impl UpstreamClient {
             content,
             content_type,
             etag,
+            last_modified,
             effective_url,
             link,
         })
@@ -1818,11 +1881,24 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
-        // Check if we have a valid cached copy
-        if let Some((content, content_type)) =
-            self.get_cached_artifact(&cache_key, &metadata_key).await?
+        // #1611: classify the path and evaluate cache freshness up front.
+        //   * Immutable Fresh hit  -> serve directly, NEVER contact upstream.
+        //   * Mutable   Fresh hit  -> serve directly (within TTL).
+        //   * NegativeHit           -> short-circuit a cached upstream 404.
+        //   * Stale (mutable, past TTL) -> conditional revalidation below.
+        //   * Miss                  -> single-flight upstream fetch below.
+        match self
+            .read_cached_with_revalidation(repo, fetch_path, cache_path, &cache_key, &metadata_key)
+            .await?
         {
-            return Ok((content, content_type));
+            CacheReadOutcome::Hit(content, content_type) => return Ok((content, content_type)),
+            CacheReadOutcome::NegativeHit => {
+                return Err(AppError::NotFound(format!(
+                    "Upstream returned 404 (negative-cached) for {}",
+                    fetch_path
+                )));
+            }
+            CacheReadOutcome::Miss => { /* fall through to single-flight upstream fetch */ }
         }
 
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
@@ -1840,7 +1916,8 @@ impl ProxyService {
 
                 match upstream_result {
                     Ok(resp) => {
-                        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                        // #1611: mutability-aware TTL (immutable -> forever).
+                        let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
                         // already SUCCEEDED -- `resp.content` is in hand. A failure to
                         // persist the cache entry must NOT fail the client request.
@@ -1862,6 +1939,7 @@ impl ProxyService {
                                 &resp.content,
                                 resp.content_type.clone(),
                                 resp.etag,
+                                resp.last_modified,
                                 cache_ttl,
                                 repo.id,
                                 cache_path,
@@ -1885,6 +1963,18 @@ impl ProxyService {
                         Ok((resp.content, resp.content_type))
                     }
                     Err(upstream_err) => {
+                        // #1611 negative caching: a definitive upstream 404 is
+                        // recorded with a short TTL so a hot loop of misses on a
+                        // not-yet-published artifact does not hammer upstream.
+                        // We do NOT serve stale for a 404 (the object is gone /
+                        // never existed); propagate the 404.
+                        if matches!(upstream_err, AppError::NotFound(_)) {
+                            self.write_negative_cache(&cache_key, &metadata_key, cache_path)
+                                .await;
+                            return Err(upstream_err);
+                        }
+                        // Transient error (5xx / timeout / transport): RFC 5861
+                        // stale-if-error — serve the stale body we already hold.
                         if let Ok(Some((stale_content, stale_content_type))) = self
                             .get_stale_cached_artifact(&cache_key, &metadata_key)
                             .await
@@ -2051,7 +2141,10 @@ impl ProxyService {
             .fetch_from_upstream_streaming(&full_url, repo.id)
             .await?;
 
-        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+        // #1611: classify the path. Immutable paths (versioned artifacts, OCI
+        // blobs) cache effectively forever; mutable indexes get the short
+        // conservative TTL (or the repo-configured override).
+        let cache_ttl = self.cache_ttl_for_path(repo, path).await;
 
         // Cache miss + successful upstream fetch: a new artifact is being
         // cached. Surface the scan-on-proxy gap (#1274) before teeing to
@@ -2071,6 +2164,7 @@ impl ProxyService {
             CacheMetadataTemplate {
                 content_type: upstream.content_type,
                 etag: upstream.etag,
+                last_modified: None,
                 ttl_secs: cache_ttl,
             },
         );
@@ -2463,12 +2557,38 @@ impl ProxyService {
         }
     }
 
-    /// Get cache TTL configuration for a repository.
-    /// Returns TTL in seconds.
-    async fn get_cache_ttl_for_repo(&self, repo_id: Uuid) -> i64 {
-        // Try to get repository-specific TTL from config table
-        // For now, use default TTL. This can be extended to read from
-        // a repository_config table or the repository record itself.
+    /// Mutability-aware cache TTL for a specific proxied path (#1611).
+    ///
+    /// * **Immutable** paths (versioned Maven artifacts, OCI digest blobs, PyPI
+    ///   wheels, npm tarballs, `.crate` files) get an effectively-infinite TTL;
+    ///   [`cache_classifier::evaluate`] short-circuits them as `Fresh` on every
+    ///   hit so upstream is never contacted again.
+    /// * **Mutable** paths (indexes, packuments, tag manifests) use the
+    ///   repo-configured `cache_ttl_secs` override if present, else the
+    ///   conservative [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`]. They are
+    ///   conditionally revalidated once past TTL.
+    ///
+    /// Centralising the decision here keeps the write-time TTL and the
+    /// read-time freshness evaluation consistent: both classify the same way.
+    async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
+        match cache_classifier::classify(&repo.format, path) {
+            cache_classifier::Mutability::Immutable => {
+                cache_classifier::Mutability::Immutable.write_ttl_secs()
+            }
+            cache_classifier::Mutability::Mutable { default_ttl_secs } => {
+                // A repo-level override still applies to mutable paths; fall
+                // back to the conservative classifier default otherwise.
+                self.get_cache_ttl_override(repo.id)
+                    .await
+                    .unwrap_or(default_ttl_secs)
+            }
+        }
+    }
+
+    /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
+    /// when unset/unparseable so callers can apply a context-appropriate
+    /// default (the mutable classifier default, or [`DEFAULT_CACHE_TTL_SECS`]).
+    async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
         let result = sqlx::query_scalar!(
             r#"
             SELECT value FROM repository_config
@@ -2477,18 +2597,9 @@ impl ProxyService {
             repo_id
         )
         .fetch_optional(&self.db)
-        .await;
-
-        match result {
-            Ok(Some(value)) => {
-                if let Some(v) = value {
-                    v.parse().unwrap_or(DEFAULT_CACHE_TTL_SECS)
-                } else {
-                    DEFAULT_CACHE_TTL_SECS
-                }
-            }
-            _ => DEFAULT_CACHE_TTL_SECS,
-        }
+        .await
+        .ok()??;
+        result.and_then(|v| v.parse().ok())
     }
 
     /// Validate that `repo` is a remote proxy and return its upstream URL.
@@ -2656,6 +2767,197 @@ impl ProxyService {
         self.get_cached(cache_key, metadata_key, false).await
     }
 
+    /// Up-front cache read with #1611 classification + conditional
+    /// revalidation. Drives the [`cache_classifier::Freshness`] state machine:
+    ///
+    /// * **Miss / no metadata** -> [`CacheReadOutcome::Miss`] (fetch upstream).
+    /// * **NegativeHit** -> [`CacheReadOutcome::NegativeHit`] (cached 404).
+    /// * **Fresh** -> serve the cached body. Immutable paths land here on every
+    ///   hit and therefore NEVER contact upstream (the load-bearing invariant).
+    /// * **Stale** (mutable, past TTL) -> conditional revalidation via
+    ///   [`Self::revalidate_stale`]; a 304 extends the entry and serves it, any
+    ///   other outcome degrades to `Miss` so the single-flight refill runs.
+    ///
+    /// B6 is preserved: a transient body/metadata read error surfaces as a
+    /// cache `Miss` (via `get_cached_artifact`), never a propagated 502.
+    async fn read_cached_with_revalidation(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Result<CacheReadOutcome> {
+        let mutability = cache_classifier::classify(&repo.format, cache_path);
+
+        // Load the sidecar to evaluate freshness. A read/parse error is treated
+        // as "no entry" (Miss) — same B6-safe stance as the fresh read path.
+        let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
+        let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
+
+        match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
+            cache_classifier::Freshness::Miss => Ok(CacheReadOutcome::Miss),
+            cache_classifier::Freshness::NegativeHit => Ok(CacheReadOutcome::NegativeHit),
+            cache_classifier::Freshness::Fresh => {
+                // Serve the body. Immutable hits reach here and never touch
+                // upstream. `get_cached_artifact` re-verifies checksum + body
+                // presence; a missing/poisoned body degrades to Miss (B6).
+                match self.get_cached_artifact(cache_key, metadata_key).await? {
+                    Some((content, content_type)) => {
+                        Ok(CacheReadOutcome::Hit(content, content_type))
+                    }
+                    None => Ok(CacheReadOutcome::Miss),
+                }
+            }
+            cache_classifier::Freshness::Stale => {
+                self.revalidate_stale(
+                    repo,
+                    fetch_path,
+                    cache_key,
+                    metadata_key,
+                    // Safe: Stale only arises when metadata is present.
+                    metadata.as_ref().expect("stale implies metadata present"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Conditionally revalidate a stale (mutable, past-TTL) cache entry (#1611
+    /// §2.2). Sends `If-None-Match` (and `If-Modified-Since` when available)
+    /// derived from the cached validators:
+    ///
+    /// * **304 Not Modified** -> extend `expires_at` in place and serve the
+    ///   cached body (cheap; no body transfer).
+    /// * **changed (200 / different ETag)** -> [`CacheReadOutcome::Miss`] so the
+    ///   caller's existing single-flight coordinator refills the entry once.
+    /// * **upstream error (5xx / timeout)** -> stale-if-error: serve the stale
+    ///   body within [`cache_classifier::STALE_IF_ERROR_GRACE_SECS`] of expiry,
+    ///   else `Miss`.
+    /// * **no validators** -> `Miss` (cannot revalidate cheaply; refill).
+    async fn revalidate_stale(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+    ) -> Result<CacheReadOutcome> {
+        let Some(etag) = metadata.upstream_etag.clone() else {
+            // No ETag validator: a cheap conditional request is impossible.
+            // Fall back to a full single-flight refill.
+            return Ok(CacheReadOutcome::Miss);
+        };
+
+        let upstream_url = Self::remote_target(repo)?;
+        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+
+        match self.check_etag_changed(&full_url, &etag, repo.id).await {
+            Ok(false) => {
+                // 304 Not Modified: extend the TTL and serve the cached body.
+                let new_ttl = self.cache_ttl_for_path(repo, fetch_path).await;
+                self.extend_cache_expiry(metadata_key, metadata, new_ttl)
+                    .await;
+                match self
+                    .get_stale_cached_artifact(cache_key, metadata_key)
+                    .await
+                {
+                    Ok(Some((content, content_type))) => {
+                        tracing::debug!(cache_key = %cache_key, "304 revalidation: extended TTL, serving cached body");
+                        Ok(CacheReadOutcome::Hit(content, content_type))
+                    }
+                    // Body vanished between probe and read: refill.
+                    _ => Ok(CacheReadOutcome::Miss),
+                }
+            }
+            // Changed upstream: let the single-flight coordinator refill once.
+            Ok(true) => Ok(CacheReadOutcome::Miss),
+            Err(err) => {
+                // Upstream unreachable mid-revalidation: stale-if-error within
+                // the grace window, else fall through to a refill attempt.
+                let within_grace = Utc::now()
+                    < metadata.expires_at
+                        + chrono::Duration::seconds(cache_classifier::STALE_IF_ERROR_GRACE_SECS);
+                if within_grace {
+                    if let Ok(Some((content, content_type))) = self
+                        .get_stale_cached_artifact(cache_key, metadata_key)
+                        .await
+                    {
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            error = %err,
+                            "revalidation failed; serving stale within stale-if-error grace"
+                        );
+                        return Ok(CacheReadOutcome::Hit(content, content_type));
+                    }
+                }
+                Ok(CacheReadOutcome::Miss)
+            }
+        }
+    }
+
+    /// Re-stamp a cache entry's `expires_at` after a successful 304
+    /// revalidation, preserving every other sidecar field (#1611). Best-effort:
+    /// a write failure only means the entry revalidates again sooner.
+    async fn extend_cache_expiry(
+        &self,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+        ttl_secs: i64,
+    ) {
+        let mut extended = metadata.clone();
+        extended.expires_at = Utc::now() + chrono::Duration::seconds(ttl_secs);
+        match serde_json::to_vec(&extended) {
+            Ok(json) => {
+                if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
+                    tracing::warn!(metadata_key = %metadata_key, error = %e, "failed to extend cache TTL after 304");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(metadata_key = %metadata_key, error = %e, "failed to serialize extended cache metadata");
+            }
+        }
+    }
+
+    /// Write a negative-cache sidecar recording an upstream 404 (#1611). The
+    /// entry holds no body; [`cache_classifier::evaluate`] returns
+    /// `NegativeHit` until `negative_cached_until` passes, after which it is a
+    /// `Miss`. Best-effort: a write failure simply means the next request
+    /// re-asks upstream.
+    async fn write_negative_cache(&self, cache_key: &str, metadata_key: &str, cache_path: &str) {
+        // Drop any stale positive body so a future read can never serve it
+        // alongside the negative marker.
+        let _ = self.storage.delete(cache_key).await;
+
+        let now = Utc::now();
+        let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: Some(now + neg_ttl),
+            // expires_at mirrors the negative window so any expiry-only reader
+            // also treats it as expired once the window passes.
+            expires_at: now + neg_ttl,
+            content_type: None,
+            size_bytes: 0,
+            checksum_sha256: String::new(),
+        };
+        match serde_json::to_vec(&metadata) {
+            Ok(json) => {
+                if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
+                    tracing::debug!(metadata_key = %metadata_key, error = %e, "failed to write negative-cache entry");
+                } else {
+                    tracing::debug!(cache_path = %cache_path, "negative-cached upstream 404");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to serialize negative-cache metadata");
+            }
+        }
+    }
+
     /// Shared cache-read path behind [`Self::get_cached_artifact`] (fresh) and
     /// [`Self::get_stale_cached_artifact`] (stale fallback). The two callers
     /// were near-duplicates; `allow_stale` reproduces every divergence exactly:
@@ -2759,6 +3061,7 @@ impl ProxyService {
         content: &Bytes,
         content_type: Option<String>,
         etag: Option<String>,
+        last_modified: Option<String>,
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
@@ -2770,6 +3073,7 @@ impl ProxyService {
                 content,
                 content_type,
                 etag,
+                last_modified,
                 ttl_secs,
                 repository_id,
                 artifact_path,
@@ -3607,6 +3911,8 @@ mod tests {
             cached_at: Utc::now(),
             upstream_etag: Some("\"abc123\"".to_string()),
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(24),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 1024,
@@ -3628,6 +3934,8 @@ mod tests {
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now + chrono::Duration::seconds(3600),
             content_type: None,
             size_bytes: 0,
@@ -3650,6 +3958,8 @@ mod tests {
             cached_at: now,
             upstream_etag: Some("\"etag-value\"".to_string()),
             storage_etag: Some("\"storage-etag\"".to_string()),
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: expires,
             content_type: Some("application/json".to_string()),
             size_bytes: 4096,
@@ -3669,6 +3979,8 @@ mod tests {
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: i64::MAX,
@@ -3709,6 +4021,8 @@ mod tests {
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: None,
             size_bytes: 100,
@@ -3724,6 +4038,8 @@ mod tests {
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: None,
             size_bytes: 100,
@@ -4047,6 +4363,8 @@ SHA256:
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: Some("\"old-etag\"".to_string()),
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: Some("application/java-archive".to_string()),
             size_bytes: 2048,
@@ -4068,6 +4386,8 @@ SHA256:
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 512,
@@ -4085,6 +4405,8 @@ SHA256:
             cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: now - chrono::Duration::seconds(1),
             content_type: Some("application/gzip".to_string()),
             size_bytes: 4096,
@@ -4687,6 +5009,8 @@ SHA256:
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
@@ -4700,6 +5024,8 @@ SHA256:
             cached_at: Utc::now() - chrono::Duration::hours(2),
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: Utc::now() - chrono::Duration::seconds(1),
             content_type: None,
             size_bytes: 0,
@@ -5387,6 +5713,7 @@ SHA256:
         CacheMetadataTemplate {
             content_type: Some("application/octet-stream".to_string()),
             etag: None,
+            last_modified: None,
             ttl_secs: 60,
         }
     }
@@ -5605,6 +5932,7 @@ SHA256:
         let template = CacheMetadataTemplate {
             content_type: Some("application/x-deb".to_string()),
             etag: Some("\"abc123\"".to_string()),
+            last_modified: None,
             ttl_secs: 7200,
         };
         let mut client = tee_upstream_to_cache(
@@ -5825,6 +6153,7 @@ SHA256:
                 content,
                 Some("application/octet-stream".to_string()),
                 etag,
+                None,
                 3600,
                 Uuid::nil(),
                 "repo/path",
@@ -6263,6 +6592,8 @@ SHA256:
             cached_at,
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at: cached_at + chrono::Duration::hours(1),
             content_type: content_type.map(|s| s.to_string()),
             size_bytes: size,
@@ -7133,6 +7464,7 @@ SHA256:
                 &content,
                 Some("application/gzip".to_string()),
                 None,
+                None,
                 DEFAULT_CACHE_TTL_SECS,
                 Uuid::new_v4(),
                 cache_path,
@@ -7556,6 +7888,8 @@ SHA256:
             cached_at: now - chrono::Duration::hours(2),
             upstream_etag: None,
             storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
             expires_at,
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
@@ -8600,5 +8934,281 @@ SHA256:
             UpstreamClient::parse_bearer_challenge("Bearer realm=\"https://r/\",service=svc");
         assert_eq!(params.get("realm").map(String::as_str), Some("https://r/"));
         assert_eq!(params.get("service").map(String::as_str), Some("svc"));
+    }
+
+    // -- #1611 conditional revalidation matrix + negative caching ------------
+    //
+    // These tests prime a *stale* mutable cache entry directly on disk (a body
+    // + a sidecar whose `expires_at` is in the past) and then drive
+    // `fetch_artifact_with_cache_path`, asserting the §2.2 matrix:
+    //   * 304 -> serve cached body, extend TTL, no body re-download.
+    //   * 200/changed -> refill through the single-flight coordinator.
+    //   * 404 -> negative cache + NotFound.
+    //   * 5xx -> stale-if-error (serve the stale body).
+    // Immutable paths are proven to NEVER contact upstream on a hit.
+
+    /// Build a remote repo with a caller-chosen format so immutable-path
+    /// classification can be exercised (the default helper uses `Generic`,
+    /// which is always mutable).
+    fn wiremock_remote_repo_fmt(
+        key: &str,
+        upstream: &str,
+        storage_path: &str,
+        format: RepositoryFormat,
+    ) -> Repository {
+        let mut repo = wiremock_remote_repo(key, upstream, storage_path);
+        repo.format = format;
+        repo
+    }
+
+    /// Write a stale (already-expired) cache entry — body + sidecar — straight
+    /// to the filesystem backend under the keys `fetch_artifact_with_cache_path`
+    /// derives, so a subsequent fetch sees a `Stale` entry it must revalidate.
+    fn prime_stale_cache_entry(
+        storage_root: &str,
+        repo_key: &str,
+        cache_path: &str,
+        body: &[u8],
+        upstream_etag: Option<&str>,
+    ) {
+        let content_key = ProxyService::cache_storage_key(repo_key, cache_path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(repo_key, cache_path).unwrap();
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now - chrono::Duration::hours(2),
+            upstream_etag: upstream_etag.map(String::from),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            // Already expired -> Stale for a mutable path.
+            expires_at: now - chrono::Duration::seconds(1),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+        };
+        for (key, bytes) in [
+            (content_key, Bytes::copy_from_slice(body)),
+            (
+                meta_key,
+                Bytes::from(serde_json::to_vec(&metadata).unwrap()),
+            ),
+        ] {
+            let full = std::path::Path::new(storage_root).join(&key);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, &bytes).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_304_serves_cached_body_and_skips_download() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // The conditional revalidation is a HEAD; a 304 means "unchanged".
+        // No GET is mounted, so a body re-download would fail the test.
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s1611-304-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s1611-304", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s1611-304",
+            "meta.xml",
+            b"cached-index",
+            Some("\"v1\""),
+        );
+
+        let (body, _ct) = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .expect("304 revalidation must serve the cached body");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"cached-index", "304 must serve cached bytes");
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_changed_refills_from_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // HEAD returns 200 with a different ETag -> changed -> refill via GET.
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"new-index".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s1611-chg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s1611-chg", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s1611-chg",
+            "meta.xml",
+            b"old-index",
+            Some("\"v1\""),
+        );
+
+        let (body, _ct) = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .expect("changed upstream must refill");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            &body[..],
+            b"new-index",
+            "changed must serve refreshed bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_404_is_negative_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Upstream GET 404s exactly once; the negative cache must absorb the
+        // second request so upstream is never re-hit.
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s1611-neg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s1611-neg", &server.uri(), tmp.to_str().unwrap());
+
+        let first = proxy
+            .fetch_artifact_with_cache_path(&repo, "missing", "missing")
+            .await;
+        assert!(
+            matches!(first, Err(AppError::NotFound(_))),
+            "first miss 404s"
+        );
+
+        let second = proxy
+            .fetch_artifact_with_cache_path(&repo, "missing", "missing")
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(second, Err(AppError::NotFound(_))),
+            "second request must be served from the negative cache (upstream expect(1))"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_transport_error_serves_stale_within_grace() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Point upstream at a dead port so the revalidation HEAD fails with a
+        // transport error -> stale-if-error must serve the stale body.
+        let dead_upstream = "http://127.0.0.1:1";
+        let tmp = std::env::temp_dir().join(format!("s1611-sie-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s1611-sie", dead_upstream, tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s1611-sie",
+            "meta.xml",
+            b"stale-but-served",
+            Some("\"v1\""),
+        );
+
+        let (body, _ct) = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .expect("stale-if-error must serve the stale body when upstream is down");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    #[tokio::test]
+    async fn test_immutable_hit_never_contacts_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Upstream serves the jar exactly ONCE. Any second contact (GET/HEAD)
+        // would exceed expect(1) and fail the test, proving the immutable hit
+        // is served purely from cache with no revalidation.
+        Mock::given(method("GET"))
+            .and(path("/com/example/app/1.0.0/app-1.0.0.jar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(b"jar-bytes".as_ref()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s1611-imm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        // Maven + a versioned .jar path classifies Immutable -> forever TTL.
+        let repo = wiremock_remote_repo_fmt(
+            "s1611-imm",
+            &server.uri(),
+            tmp.to_str().unwrap(),
+            RepositoryFormat::Maven,
+        );
+        let jar = "com/example/app/1.0.0/app-1.0.0.jar";
+
+        // First fetch hits upstream once and caches with the immutable TTL.
+        let (b1, _) = proxy
+            .fetch_artifact_with_cache_path(&repo, jar, jar)
+            .await
+            .expect("first immutable fetch hits upstream and caches forever");
+        assert_eq!(&b1[..], b"jar-bytes");
+
+        // Second fetch must be served from cache with ZERO upstream contact.
+        let (b2, _) = proxy
+            .fetch_artifact_with_cache_path(&repo, jar, jar)
+            .await
+            .expect("immutable hit must serve from cache without upstream");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&b2[..], b"jar-bytes");
     }
 }
