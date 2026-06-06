@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::warn;
@@ -661,15 +662,19 @@ impl ArtifactService {
         Ok(artifact)
     }
 
-    /// Download an artifact
-    pub async fn download(
+    /// Shared download preamble: look up the artifact row, enforce quarantine,
+    /// and run BeforeDownload hooks (which may reject the download). Returns the
+    /// resolved [`Artifact`] so both the buffered ([`download`]) and streaming
+    /// ([`download_stream`]) paths share one source of truth for the
+    /// NotFound/quarantine/hook contract.
+    ///
+    /// [`download`]: Self::download
+    /// [`download_stream`]: Self::download_stream
+    async fn prepare_download(
         &self,
         repository_id: Uuid,
         path: &str,
-        user_id: Option<Uuid>,
-        ip_address: Option<String>,
-        user_agent: Option<&str>,
-    ) -> Result<(Artifact, Bytes)> {
+    ) -> Result<(Artifact, ArtifactInfo)> {
         // Find artifact
         let artifact = sqlx::query_as!(
             Artifact,
@@ -703,18 +708,29 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDownload, &artifact_info)
             .await?;
 
-        // Get content from storage
-        let content = self.storage.get(&artifact.storage_key).await?;
+        Ok((artifact, artifact_info))
+    }
 
+    /// Shared download epilogue: record best-effort download statistics and fire
+    /// the (non-blocking) AfterDownload hooks. Used by both the buffered and
+    /// streaming download paths.
+    async fn finish_download(
+        &self,
+        artifact_id: Uuid,
+        artifact_info: &ArtifactInfo,
+        user_id: Option<Uuid>,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) {
         // Record download statistics
         sqlx::query!(
             r#"
             INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
             VALUES ($1, $2, $3, $4)
             "#,
-            artifact.id,
+            artifact_id,
             user_id,
-            ip_address.as_deref(),
+            ip_address,
             user_agent
         )
         .execute(&self.db)
@@ -722,10 +738,82 @@ impl ArtifactService {
         .ok(); // Ignore stats errors
 
         // Trigger AfterDownload hooks (non-blocking)
-        self.trigger_hook_non_blocking(PluginEventType::AfterDownload, &artifact_info)
+        self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
             .await;
+    }
+
+    /// Download an artifact, buffering the full body into memory.
+    ///
+    /// Prefer [`download_stream`] for serving artifact bodies over HTTP so large
+    /// artifacts are never fully resident in memory. This buffered variant is
+    /// retained for callers that genuinely need the bytes in hand.
+    ///
+    /// [`download_stream`]: Self::download_stream
+    pub async fn download(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        user_id: Option<Uuid>,
+        ip_address: Option<String>,
+        user_agent: Option<&str>,
+    ) -> Result<(Artifact, Bytes)> {
+        let (artifact, artifact_info) = self.prepare_download(repository_id, path).await?;
+
+        // Get content from storage
+        let content = self.storage.get(&artifact.storage_key).await?;
+
+        self.finish_download(
+            artifact.id,
+            &artifact_info,
+            user_id,
+            ip_address.as_deref(),
+            user_agent,
+        )
+        .await;
 
         Ok((artifact, content))
+    }
+
+    /// Stream an artifact body from storage without buffering it in memory.
+    ///
+    /// Behaviorally identical to [`download`] (same NotFound/quarantine/hook
+    /// contract, same best-effort stats and AfterDownload hooks) except the body
+    /// is returned as a [`BoxStream`] instead of an in-memory [`Bytes`]. This is
+    /// the streaming sibling that closes the last large-body buffer on the
+    /// generic local-serve path (Core Invariant ①, #1608) — mirroring what
+    /// #1393 did for the per-format handlers.
+    ///
+    /// The returned [`Artifact`] still carries `size_bytes` so callers can set
+    /// an accurate `Content-Length`. A storage miss surfaces as
+    /// [`AppError::NotFound`] exactly as the buffered path did, preserving the
+    /// handler's Remote/Virtual fallback contract.
+    ///
+    /// [`download`]: Self::download
+    pub async fn download_stream(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        user_id: Option<Uuid>,
+        ip_address: Option<String>,
+        user_agent: Option<&str>,
+    ) -> Result<(Artifact, BoxStream<'static, Result<Bytes>>)> {
+        let (artifact, artifact_info) = self.prepare_download(repository_id, path).await?;
+
+        // Open the body as a stream so large artifacts never buffer in memory.
+        // `get_stream` resolves a missing key eagerly to `AppError::NotFound`,
+        // matching the buffered `get` path's NotFound contract.
+        let body = self.storage.get_stream(&artifact.storage_key).await?;
+
+        self.finish_download(
+            artifact.id,
+            &artifact_info,
+            user_id,
+            ip_address.as_deref(),
+            user_agent,
+        )
+        .await;
+
+        Ok((artifact, body))
     }
 
     /// Get artifact by ID
