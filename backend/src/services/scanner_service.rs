@@ -2798,11 +2798,18 @@ impl ScannerService {
             // indistinguishable from a real clean scan and produces the
             // silent-success class behind #961 (scanners running on
             // unsupported formats) and #994 (lodash fixture marked clean in
-            // 2.8ms because ImageScanner short-circuited). If the trigger
-            // handler pre-allocated a row for this scan_type, mark it
-            // failed with a "not applicable" reason so the operator still
-            // sees a deterministic record of the decision rather than a
-            // ghost `pending` row that never transitions.
+            // 2.8ms because ImageScanner short-circuited).
+            //
+            // #1470: persist a distinct `not_applicable` terminal status rather
+            // than routing through fail_scan (which marked the row `failed` and
+            // rendered as a red ❌). On the Reuse path the trigger handler
+            // pre-allocated a row, so we UPDATE it in place. On the InsertFresh
+            // path (auto-scan-on-upload) there is no row yet; previously the
+            // scanner just `continue`d and wrote nothing, so under
+            // `block_unscanned=true` the artifact classified as NeverScanned and
+            // was falsely BLOCKED (#1648). We now INSERT a terminal
+            // `not_applicable` row so the artifact classifies as scanned-OK
+            // (not unscanned) and the operator sees a deterministic record.
             if !scanner.is_applicable_for_target(&target) {
                 info!(
                     "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
@@ -2811,20 +2818,43 @@ impl ScannerService {
                     artifact.content_type,
                     artifact.path,
                 );
-                if let PreparedScanAction::Reuse(target_id) = prepared_action {
-                    let reason = format!(
-                        "Scanner {} does not apply to this artifact format",
-                        scanner.name(),
-                    );
-                    if let Err(e) = self
-                        .scan_result_service
-                        .fail_scan(target_id, &reason, None, chrono::Utc::now())
-                        .await
-                    {
-                        warn!(
-                            "Failed to mark pre-allocated scan {} as not-applicable: {}",
-                            target_id, e
-                        );
+                let reason = format!(
+                    "Scanner {} does not apply to this artifact format",
+                    scanner.name(),
+                );
+                match prepared_action {
+                    PreparedScanAction::Reuse(target_id) => {
+                        if let Err(e) = self
+                            .scan_result_service
+                            .mark_not_applicable(target_id, &reason, chrono::Utc::now())
+                            .await
+                        {
+                            warn!(
+                                "Failed to mark pre-allocated scan {} as not-applicable: {}",
+                                target_id, e
+                            );
+                        }
+                    }
+                    PreparedScanAction::InsertFresh => {
+                        if let Err(e) = self
+                            .scan_result_service
+                            .create_not_applicable_scan(
+                                artifact_id,
+                                artifact.repository_id,
+                                scanner.scan_type(),
+                                &reason,
+                                Some(checksum),
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Failed to record not-applicable scan for artifact {} \
+                                 (scanner {}): {}",
+                                artifact_id,
+                                scanner.name(),
+                                e
+                            );
+                        }
                     }
                 }
                 continue;
@@ -11194,6 +11224,222 @@ mod tests {
             ));
             Ok(ScanOutput::default())
         }
+    }
+
+    /// A scanner that is never applicable to any artifact. Drives the #1470
+    /// not-applicable branch in `scan_artifact_inner` so the orchestration
+    /// records a `not_applicable` terminal row rather than `failed` (Reuse
+    /// path) or no row at all (InsertFresh path). `scan` / `scan_target` panic
+    /// because an inapplicable scanner must never be invoked.
+    struct NeverApplicableScanner;
+
+    #[async_trait]
+    impl Scanner for NeverApplicableScanner {
+        fn name(&self) -> &str {
+            "never-applicable"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Must satisfy scan_results_scan_type_check; "grype" is allowed and
+            // the orchestrator persists a row with this scan_type.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            false
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            false
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("an inapplicable scanner must never be invoked");
+        }
+    }
+
+    /// #1470 regression: on the InsertFresh path (auto-scan-on-upload, no
+    /// pre-allocated row), a scanner that does not apply must persist a single
+    /// terminal `not_applicable` scan_results row -- NOT `failed`, and NOT zero
+    /// rows. Before the fix the scanner `continue`d and wrote nothing, so the
+    /// artifact classified as NeverScanned and was falsely blocked under
+    /// `block_unscanned=true` (#1648).
+    #[tokio::test]
+    async fn test_scan_artifact_inner_records_not_applicable_on_insert_fresh() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("na-insert-fresh/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(NeverApplicableScanner)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        // prepared=None -> InsertFresh path.
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed even when nothing applies");
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error_message FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read scan rows");
+
+        assert_eq!(rows.len(), 1, "InsertFresh must record exactly one row");
+        assert_eq!(
+            rows[0].0, "not_applicable",
+            "inapplicable scanner must persist not_applicable, never failed"
+        );
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not apply"),
+            "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #1470 regression (Reuse path): when the trigger handler pre-allocated a
+    /// `running` scan_results row and the scanner turns out not to apply, the
+    /// orchestration must UPDATE that row to `not_applicable` in place -- never
+    /// `failed`, and never leave it wedged in `running`.
+    #[tokio::test]
+    async fn test_scan_artifact_inner_marks_prepared_row_not_applicable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("na-reuse/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+
+        let scan_result_service = Arc::new(ScanResultService::new(fx.pool.clone()));
+        // Pre-allocate the `running` row the trigger handler would have created.
+        let prepared_row = scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "grype")
+            .await
+            .expect("pre-allocate running scan");
+
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(NeverApplicableScanner)],
+            scan_result_service: scan_result_service.clone(),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        let mut prepared = HashMap::new();
+        prepared.insert("grype".to_string(), prepared_row.id);
+
+        scanner
+            .scan_artifact_with_prepared(artifact_id, prepared, true, true)
+            .await
+            .expect("scan orchestration must succeed for inapplicable scanner");
+
+        let updated = scan_result_service
+            .get_scan(prepared_row.id)
+            .await
+            .expect("pre-allocated row must still exist");
+        assert_eq!(
+            updated.status, "not_applicable",
+            "pre-allocated row must be updated to not_applicable, not failed/running"
+        );
+        assert!(updated.completed_at.is_some(), "row must be terminal");
+
+        // Exactly one row: the pre-allocated one was UPDATEd, not duplicated.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count rows");
+        assert_eq!(count, 1);
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 
     #[tokio::test]
