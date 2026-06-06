@@ -8736,6 +8736,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn purge_repo_artifact_objects_is_best_effort_when_backend_unresolvable() {
+        // The purge resolves the repository's OWN configured backend via
+        // `storage_for_repo` (StorageRegistry::backend_for), so a repo on an
+        // unregistered/cloud backend that cannot be resolved in this process
+        // must NOT panic or block the delete — it logs and returns. This pins
+        // the "never blocks the delete" contract and the backend-aware
+        // resolution path (an unknown backend name yields Err, not a silent
+        // fallback to the local/primary backend).
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+
+        // A location naming a backend that is not registered in this process.
+        // `backend_for` returns Err for any non-"filesystem" name absent from
+        // the registry, exercising the early-return best-effort branch.
+        let unresolved = crate::storage::StorageLocation {
+            backend: "s3-not-registered-in-this-process".to_string(),
+            path: "irrelevant".to_string(),
+        };
+        assert!(
+            state.storage_for_repo(&unresolved).is_err(),
+            "an unregistered backend must not resolve to a fallback backend"
+        );
+
+        // Must return cleanly without panicking even though storage cannot be
+        // resolved (best-effort: failures are logged and swallowed).
+        purge_repo_artifact_objects(&state, fx.repo_id, &unresolved).await;
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
     async fn test_download_artifact_remote_propagates_upstream_content_type() {
         // The handler passes "application/octet-stream" as the
         // `default_content_type` to `proxy_fetch_streaming`, but the
