@@ -120,6 +120,28 @@ impl AuthExtension {
             Err(AppError::Authorization("Admin access required".to_string()))
         }
     }
+
+    /// Self-or-admin gate: allow the call when the caller is acting on their
+    /// own resource (`self.user_id == target_user_id`) **or** the caller is an
+    /// admin. Otherwise return a 403 Forbidden carrying `deny_msg`.
+    ///
+    /// This is the single evaluation point for the recurring self-service
+    /// authorization pattern (`if auth.user_id != id && !auth.is_admin { 403 }`).
+    /// The deny message is supplied by the call site so each endpoint keeps its
+    /// existing, user-facing 403 body verbatim (e.g. "Cannot view other users'
+    /// tokens"). Deny-by-default: any caller who is neither self nor admin is
+    /// rejected.
+    pub fn require_self_or_admin(
+        &self,
+        target_user_id: Uuid,
+        deny_msg: &str,
+    ) -> crate::error::Result<()> {
+        if self.user_id == target_user_id || self.is_admin {
+            Ok(())
+        } else {
+            Err(AppError::Authorization(deny_msg.to_string()))
+        }
+    }
 }
 
 impl From<Claims> for AuthExtension {
@@ -2267,6 +2289,59 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(ext.require_admin().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // require_self_or_admin: self allowed, admin allowed, other-non-admin
+    // denied. Pins the deny-by-default self-service authorization policy.
+    // -----------------------------------------------------------------------
+
+    fn self_or_admin_fixture(user_id: Uuid, is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: "caller".to_string(),
+            email: "caller@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_require_self_or_admin_allows_self() {
+        let me = Uuid::new_v4();
+        let ext = self_or_admin_fixture(me, false);
+        // Acting on my own resource: allowed even though I am not an admin.
+        assert!(ext.require_self_or_admin(me, "denied").is_ok());
+    }
+
+    #[test]
+    fn test_require_self_or_admin_allows_admin_for_other() {
+        let ext = self_or_admin_fixture(Uuid::new_v4(), true);
+        // Admin acting on someone else's resource: allowed.
+        assert!(ext.require_self_or_admin(Uuid::new_v4(), "denied").is_ok());
+    }
+
+    #[test]
+    fn test_require_self_or_admin_denies_other_non_admin() {
+        let ext = self_or_admin_fixture(Uuid::new_v4(), false);
+        // Non-admin acting on someone else's resource: denied (403) and the
+        // caller-supplied message is preserved verbatim in the error body.
+        let err = ext
+            .require_self_or_admin(Uuid::new_v4(), "Cannot view other users' tokens")
+            .unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
+        assert!(err.to_string().contains("Cannot view other users' tokens"));
+    }
+
+    #[test]
+    fn test_require_self_or_admin_admin_acting_on_self() {
+        let me = Uuid::new_v4();
+        let ext = self_or_admin_fixture(me, true);
+        // Admin acting on their own resource: allowed (both conditions true).
+        assert!(ext.require_self_or_admin(me, "denied").is_ok());
     }
 
     // -----------------------------------------------------------------------
