@@ -731,10 +731,14 @@ pub async fn run_cleanup(
     }
 
     if request.cleanup_stale_uploads.unwrap_or(false) {
-        use crate::api::handlers::incus::cleanup_stale_sessions;
+        use crate::api::handlers::incus::{cleanup_stale_sessions, sweep_orphan_staging_files};
         result.stale_uploads_deleted = cleanup_stale_sessions(&state.db, 24)
             .await
             .map_err(AppError::Internal)?;
+        // #1573: also reap crash-orphaned staging files that never reached a
+        // DB session row, on the same max-age threshold as the reaper above.
+        result.stale_uploads_deleted +=
+            sweep_orphan_staging_files(&state.config.storage_path, 24).await;
     }
 
     Ok(Json(result))
