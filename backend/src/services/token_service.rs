@@ -1008,4 +1008,146 @@ mod tests {
         assert!(json["user_id"].is_null());
         assert_eq!(json["error"], "Token expired");
     }
+
+    // -----------------------------------------------------------------------
+    // Token-minting endpoint surface pin (issue #1315, epic #1617 -> #1615)
+    //
+    // WHY THIS CONSTANT PIN IS LOAD-BEARING
+    // -------------------------------------
+    // Every token-minting HTTP handler ultimately calls the single mint
+    // primitive `AuthService::generate_api_token`. Each such handler MUST,
+    // before minting, refuse admin-class scopes from a non-admin caller --
+    // either by funnelling the requested scopes through
+    // `enforce_admin_only_scopes` (self-or-admin endpoints), or by gating the
+    // whole handler behind `require_admin` (admin-only endpoints).
+    //
+    // PRs #1261 and #1306 patched the scope-content policy on each existing
+    // endpoint individually. The structural risk #1315 guards against is that
+    // a future, additional token-minting endpoint silently re-opens the
+    // privilege-escalation hole because the author forgot the reject rule.
+    //
+    // This test re-derives the set of production token-minting handlers
+    // straight from source (every `generate_api_token` call site in
+    // `api/handlers`, excluding `#[cfg(test)]` modules) and asserts it equals
+    // the reviewed `EXPECTED` set below. Adding a new token-minting endpoint
+    // fails this test until `EXPECTED` is updated -- forcing a deliberate,
+    // reviewed change. It also asserts each pinned handler still references its
+    // required reject rule, so the guard cannot be quietly removed.
+    //
+    // This runs in `cargo test --lib` (no database needed) and is the Rust-side
+    // companion to the CI grep gate at
+    // `scripts/ci/check-token-mint-surface.sh`.
+    // -----------------------------------------------------------------------
+
+    /// Strip `#[cfg(test)]` module bodies so only production source remains.
+    /// Mirrors the cfg(test)-skipping logic in the CI gate.
+    fn strip_test_modules(src: &str) -> String {
+        let mut out = String::new();
+        let mut in_test = false;
+        let mut test_depth: i32 = 0;
+        let mut depth: i32 = 0;
+        let mut pending_cfg_test = false;
+        for line in src.lines() {
+            let stripped = line.trim();
+            let braces =
+                |s: &str| -> i32 { s.matches('{').count() as i32 - s.matches('}').count() as i32 };
+            if !in_test {
+                if stripped.starts_with("#[cfg(test)]") {
+                    pending_cfg_test = true;
+                } else if pending_cfg_test && stripped.contains("mod ") {
+                    if line.contains('{') {
+                        in_test = true;
+                        test_depth = depth;
+                        depth += braces(line);
+                        pending_cfg_test = false;
+                        continue;
+                    }
+                } else if !stripped.is_empty()
+                    && !stripped.starts_with("//")
+                    && pending_cfg_test
+                    && !stripped.contains("mod ")
+                {
+                    pending_cfg_test = false;
+                }
+            }
+            if in_test {
+                depth += braces(line);
+                if depth <= test_depth {
+                    in_test = false;
+                }
+                continue;
+            }
+            depth += braces(line);
+            // Drop trailing line comments so a `// generate_api_token` note
+            // never counts as a mint site.
+            let code = line.split("//").next().unwrap_or("");
+            out.push_str(code);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn token_mint_endpoint_surface_is_pinned() {
+        use std::collections::BTreeMap;
+
+        // The reviewed set: handler file -> required reject-rule marker.
+        //   enforce_admin_only_scopes => self-or-admin endpoint that screens
+        //                                requested scopes.
+        //   require_admin             => admin-only endpoint (mint unreachable
+        //                                by non-admins).
+        // To add a token-minting endpoint, add it here in the same PR that
+        // adds the route -- the deliberate review #1315 requires.
+        let expected: BTreeMap<&str, &str> = BTreeMap::from([
+            ("auth.rs", "enforce_admin_only_scopes"), // POST /api/v1/auth/tokens
+            ("profile.rs", "enforce_admin_only_scopes"), // POST /api/v1/profile/access-tokens
+            ("users.rs", "enforce_admin_only_scopes"), // POST /api/v1/users/:id/tokens
+            ("repo_tokens.rs", "enforce_admin_only_scopes"), // POST /api/v1/repositories/:key/tokens
+            ("service_accounts.rs", "require_admin"), // POST /api/v1/service-accounts/:id/tokens
+        ]);
+
+        let handlers_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+
+        // Derive production mint sites straight from source.
+        let mut found: BTreeMap<String, String> = BTreeMap::new();
+        for entry in std::fs::read_dir(&handlers_dir).expect("read handlers dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("file name")
+                .to_string();
+            let raw = std::fs::read_to_string(&path).expect("read handler");
+            let production = strip_test_modules(&raw);
+            if production.contains("generate_api_token") {
+                found.insert(name, raw);
+            }
+        }
+
+        let found_names: Vec<&str> = found.keys().map(String::as_str).collect();
+        let expected_names: Vec<&str> = expected.keys().copied().collect();
+        assert_eq!(
+            found_names, expected_names,
+            "token-minting endpoint surface drift (#1315): the set of handlers \
+             calling generate_api_token changed. If you added a new \
+             token-minting endpoint, add it to `expected` here AND to \
+             scripts/ci/check-token-mint-surface.sh, and ensure it enforces a \
+             reject rule. If you removed one, drop it from both."
+        );
+
+        // Each pinned handler must still carry its required reject rule.
+        for (name, raw) in &found {
+            let marker = expected[name.as_str()];
+            assert!(
+                raw.contains(marker),
+                "token-minting endpoint {name} is pinned to use `{marker}` but \
+                 that reject rule is absent -- the privilege-escalation guard \
+                 appears to have been removed or weakened (#1315)."
+            );
+        }
+    }
 }

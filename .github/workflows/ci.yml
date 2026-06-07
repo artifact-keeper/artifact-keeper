@@ -65,6 +65,15 @@ jobs:
       - name: No legacy admin scope check
         run: ./scripts/ci/check-no-legacy-admin-scope.sh
 
+      # Token-minting surface pin (#1315, epic #1617 -> #1615): every handler
+      # that calls AuthService::generate_api_token must be in the reviewed set
+      # and carry its reject rule (enforce_admin_only_scopes or require_admin).
+      # A new token-minting endpoint added without updating the pinned list
+      # fails the build, forcing a deliberate review of the privilege-escalation
+      # surface.
+      - name: Pin token-minting endpoint surface
+        run: ./scripts/ci/check-token-mint-surface.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
