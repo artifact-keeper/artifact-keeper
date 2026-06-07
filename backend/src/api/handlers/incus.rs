@@ -184,22 +184,93 @@ pub(crate) fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
     PathBuf::from(storage_base).join(prefix).join(key)
 }
 
+/// Prefix shared by every staged upload temp file. Used both to name new
+/// staging files and to recognise crash-orphans during the age-based sweep.
+const STAGING_FILE_PREFIX: &str = "ak-incus-upload-";
+
+/// Resolve the base directory used to stage in-progress uploads (#1573).
+///
+/// Resolution order:
+///   1. `$AK_UPLOAD_STAGING_DIR` — explicit operator override.
+///   2. `$AK_INCUS_UPLOAD_TMP_DIR` — legacy per-format override, kept for
+///      backward compatibility with existing deployments.
+///   3. `<storage_path>/.incoming` — the default.
+///
+/// The default deliberately lives under the configured `STORAGE_PATH`
+/// rather than `std::env::temp_dir()` (`/tmp`). On Kubernetes `/tmp` is
+/// typically a small `emptyDir`, so multi-GiB uploads overrun it and the
+/// kubelet evicts the pod mid-receive. `STORAGE_PATH` is a real, writable,
+/// deployment-sized local mount on every backend (it already holds
+/// filesystem artifacts, plugins, and backups), so staging inherits the
+/// same sizing as the artifacts it stages — even when the repo's storage
+/// backend is S3/GCS, since `STORAGE_PATH` is still a local disk path.
+///
+/// The `.incoming` subdir is dot-prefixed so it can never collide with a
+/// repository key prefix in the filesystem backend's `<base>/<prefix>/<key>`
+/// layout.
+pub(crate) fn staging_root(storage_path: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var("AK_UPLOAD_STAGING_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("AK_INCUS_UPLOAD_TMP_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(storage_path).join(".incoming")
+}
+
 /// Temp file path for an upload session.
 ///
 /// Uploads stage to this on-disk path so PATCH continuations can append
 /// without re-downloading the in-progress object from the storage backend.
 /// The final, durable copy is written via `StorageBackend::put_stream` at
-/// completion time. The base directory is `$AK_INCUS_UPLOAD_TMP_DIR` if
-/// set, otherwise `std::env::temp_dir()`. This is intentionally NOT the
-/// repository's configured storage path: when the backend is S3/GCS, the
-/// repo's `storage_path` is a bucket-relative key prefix, not a local
-/// filesystem path, so staging there would either fail (the path isn't
-/// writable on disk) or land bytes in a location nothing reads back.
-pub(crate) fn temp_upload_path(session_id: &Uuid) -> PathBuf {
-    let root = std::env::var("AK_INCUS_UPLOAD_TMP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    root.join(format!("ak-incus-upload-{}", session_id))
+/// completion time. See [`staging_root`] for how the base directory is
+/// resolved.
+pub(crate) fn temp_upload_path(storage_path: &str, session_id: &Uuid) -> PathBuf {
+    staging_root(storage_path).join(format!("{STAGING_FILE_PREFIX}{session_id}"))
+}
+
+/// Whether `file_name` belongs to the upload staging scheme — used by the
+/// orphan sweep so it only ever reaps files this handler created, never
+/// anything else that may share the staging volume.
+pub(crate) fn is_staging_file(file_name: &str) -> bool {
+    file_name.starts_with(STAGING_FILE_PREFIX)
+}
+
+/// RAII guard that best-effort removes a staged temp file when dropped,
+/// unless [`disarm`](StagedTempFile::disarm)ed first (#1573).
+///
+/// Used by the monolithic upload path, where the staging file is scoped to a
+/// single request: it guarantees the file is deleted on *every* early return
+/// (`?` propagation, mid-receive stream error, storage failure) as well as on
+/// the happy path, so an interrupted handler can't leak an orphan. The
+/// chunked path deliberately does NOT use this — its staging file must
+/// survive between PATCH requests and is reaped instead by the session reaper
+/// / orphan sweep.
+struct StagedTempFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Stop the guard from removing the file (the caller has taken ownership
+    /// of cleanup, e.g. already removed it).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedTempFile {
+    fn drop(&mut self) {
+        if self.armed {
+            // Synchronous best-effort unlink: Drop can't await, and the file
+            // is local scratch so a blocking unlink is negligible.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Open the staged upload temp file as a `BoxStream<Result<Bytes>>` ready
@@ -763,7 +834,11 @@ async fn upload_image(
     // filesystem temp-and-rename), so peak memory per upload is bounded
     // to STREAM_CHUNK_BUDGET regardless of image size.
     let temp_id = Uuid::new_v4();
-    let temp_path = temp_upload_path(&temp_id);
+    let temp_path = temp_upload_path(&state.config.storage_path, &temp_id);
+    // Guard the staging file so an early return on ANY path below (a
+    // mid-receive stream error, a `?`-propagated failure, or storage failure)
+    // removes it instead of leaking an orphan (#1573).
+    let mut staged = StagedTempFile::new(temp_path.clone());
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
     // Extract metadata from the file on disk
@@ -772,11 +847,9 @@ async fn upload_image(
 
     // Push the staged temp file to the configured storage backend.
     let storage_key = build_storage_key(&repo.id, &artifact_path);
-    if let Err(e) = put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(e);
-    }
+    put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await?;
     let _ = tokio::fs::remove_file(&temp_path).await;
+    staged.disarm();
 
     let artifact_id = upsert_artifact(UpsertArtifactParams {
         db: &state.db,
@@ -963,7 +1036,7 @@ async fn start_chunked_upload(
     // The chosen path is persisted to `incus_upload_sessions.storage_temp_path`,
     // so subsequent chunk/complete/cancel calls read it back from the
     // session row and don't need to re-derive it.
-    let temp_path = temp_upload_path(&session_id);
+    let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
 
     // Stream initial body (may be empty) to temp file
     let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
@@ -1300,6 +1373,49 @@ pub async fn cleanup_stale_sessions(db: &PgPool, max_age_hours: i64) -> Result<i
     Ok(count)
 }
 
+/// Age-based sweep of crash-orphaned staging files (#1573).
+///
+/// The DB-tracked session reaper above only covers chunked uploads that
+/// reached the point of inserting a session row. A monolithic upload — or a
+/// chunked upload killed before its `INSERT` — stages bytes to a file with no
+/// DB row, so a receive cut short by OOM / eviction / restart leaves an
+/// orphan that nothing reaps. This walks the staging directory and deletes
+/// any [`is_staging_file`] entry older than `max_age_hours`, on the same
+/// threshold as the session reaper. Returns the number of files removed.
+pub async fn sweep_orphan_staging_files(storage_path: &str, max_age_hours: i64) -> i64 {
+    let dir = staging_root(storage_path);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(e) => e,
+        // Missing dir is normal before the first upload — nothing to sweep.
+        Err(_) => return 0,
+    };
+
+    let cutoff = std::time::Duration::from_secs((max_age_hours.max(0) as u64) * 3600);
+    let mut removed = 0_i64;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_staging_file(name) {
+            continue;
+        }
+        let is_old = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|age| age >= cutoff)
+            .unwrap_or(false);
+        if is_old && tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+            tracing::info!("Reaped orphan staging file {}", entry.path().display());
+        }
+    }
+
+    removed
+}
+
 // ---------------------------------------------------------------------------
 // Private error helpers — reduce duplicated .map_err() patterns
 // ---------------------------------------------------------------------------
@@ -1430,36 +1546,175 @@ mod tests {
     // temp_upload_path
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_temp_upload_path_uses_env_override() {
-        // SAFETY: tests in this crate are run serially per #[test] but
-        // env mutation can still race. Snapshot + restore around the
-        // assertion.
-        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
-        std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", "/var/tmp/ak-incus");
-        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let path = temp_upload_path(&id);
-        assert_eq!(
-            path,
-            PathBuf::from("/var/tmp/ak-incus/ak-incus-upload-550e8400-e29b-41d4-a716-446655440000")
-        );
-        match prev {
-            Some(v) => std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v),
-            None => std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR"),
+    /// Serialises every test that reads or mutates the staging env overrides.
+    /// The process-global environment is shared across the test runner's
+    /// threads, so without this lock parallel tests race each other's
+    /// `set_var`/`remove_var` (#1573).
+    static STAGING_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that takes [`STAGING_ENV_LOCK`], snapshots the two staging
+    /// env overrides, clears them, and restores them (releasing the lock) on
+    /// drop. Holding the guard for the whole test body guarantees no other
+    /// env-touching test runs concurrently. Works for both sync and async
+    /// bodies — the guard simply lives for the scope under test.
+    struct StagingEnvCleared {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl StagingEnvCleared {
+        fn new() -> Self {
+            // Recover from a poisoned lock: a panicking test still leaves the
+            // env in a known state once its guard drops, so the data is fine.
+            let lock = STAGING_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let vars = ["AK_UPLOAD_STAGING_DIR", "AK_INCUS_UPLOAD_TMP_DIR"];
+            let prev = vars
+                .iter()
+                .map(|&k| {
+                    let v = std::env::var(k).ok();
+                    std::env::remove_var(k);
+                    (k, v)
+                })
+                .collect();
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for StagingEnvCleared {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
         }
     }
 
     #[test]
-    fn test_temp_upload_path_falls_back_to_temp_dir() {
-        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
-        std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR");
-        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let path = temp_upload_path(&id);
-        let expected =
-            std::env::temp_dir().join("ak-incus-upload-00000000-0000-0000-0000-000000000001");
-        assert_eq!(path, expected);
-        if let Some(v) = prev {
-            std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v);
+    fn test_staging_root_defaults_under_storage_path_not_tmp() {
+        // #1573: with no override set, staging must live under STORAGE_PATH
+        // (`<storage_path>/.incoming`), NOT the OS temp dir. The dot-prefixed
+        // subdir can't collide with a repo key prefix.
+        let _guard = StagingEnvCleared::new();
+        let root = staging_root("/var/lib/artifact-keeper/artifacts");
+        assert_eq!(
+            root,
+            PathBuf::from("/var/lib/artifact-keeper/artifacts/.incoming")
+        );
+        assert_ne!(root, std::env::temp_dir());
+        assert!(!root.starts_with("/tmp"));
+    }
+
+    #[test]
+    fn test_staging_root_uses_ak_upload_staging_dir_override() {
+        let _guard = StagingEnvCleared::new();
+        std::env::set_var("AK_UPLOAD_STAGING_DIR", "/data/staging");
+        // The new override wins even over both the legacy var and the default.
+        std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", "/legacy/tmp");
+        assert_eq!(
+            staging_root("/var/lib/artifact-keeper/artifacts"),
+            PathBuf::from("/data/staging")
+        );
+    }
+
+    #[test]
+    fn test_staging_root_falls_back_to_legacy_override() {
+        let _guard = StagingEnvCleared::new();
+        // Legacy per-format var still honoured when the new one is unset.
+        std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", "/var/tmp/ak-incus");
+        assert_eq!(
+            staging_root("/var/lib/artifact-keeper/artifacts"),
+            PathBuf::from("/var/tmp/ak-incus")
+        );
+    }
+
+    #[test]
+    fn test_temp_upload_path_joins_session_id_onto_staging_root() {
+        let _guard = StagingEnvCleared::new();
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let path = temp_upload_path("/srv/data", &id);
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/srv/data/.incoming/ak-incus-upload-550e8400-e29b-41d4-a716-446655440000"
+            )
+        );
+    }
+
+    #[test]
+    fn test_is_staging_file_matches_only_upload_temp_files() {
+        // The orphan sweep must only ever reap files this handler created.
+        assert!(is_staging_file(
+            "ak-incus-upload-550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!is_staging_file("img.tar.xz"));
+        assert!(!is_staging_file(".keep"));
+        assert!(!is_staging_file("ak-other-upload-123"));
+    }
+
+    #[test]
+    fn test_staged_temp_file_guard_removes_on_drop_unless_disarmed() {
+        // #1573: an armed guard unlinks the file when it goes out of scope;
+        // a disarmed guard leaves it (the caller took over cleanup).
+        let base = std::env::temp_dir().join(format!("ak-1573-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let armed_path = base.join("armed");
+        std::fs::write(&armed_path, b"x").unwrap();
+        {
+            let _g = StagedTempFile::new(armed_path.clone());
+        }
+        assert!(!armed_path.exists(), "armed guard must remove file on drop");
+
+        let kept_path = base.join("kept");
+        std::fs::write(&kept_path, b"x").unwrap();
+        {
+            let mut g = StagedTempFile::new(kept_path.clone());
+            g.disarm();
+        }
+        assert!(
+            kept_path.exists(),
+            "disarmed guard must leave file in place"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_orphan_staging_files_age_and_selectivity() {
+        // #1573: the orphan sweep must (a) tolerate a missing staging dir,
+        // (b) reap aged staging files, (c) leave non-staging files alone,
+        // and (d) leave fresh staging files alone.
+        let _guard = StagingEnvCleared::new();
+        {
+            let base = std::env::temp_dir().join(format!("ak-1573-sweep-{}", Uuid::new_v4()));
+            let storage_path = base.to_str().unwrap().to_string();
+
+            // (a) staging dir does not exist yet → no-op, no panic.
+            assert_eq!(sweep_orphan_staging_files(&storage_path, 24).await, 0);
+
+            let dir = staging_root(&storage_path);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            let session = Uuid::nil();
+            let orphan = dir.join(format!("{STAGING_FILE_PREFIX}{session}"));
+            let unrelated = dir.join("img.tar.xz");
+            tokio::fs::write(&orphan, b"staged bytes").await.unwrap();
+            tokio::fs::write(&unrelated, b"not ours").await.unwrap();
+
+            // (d) with a positive max-age the just-written orphan is too fresh.
+            assert_eq!(sweep_orphan_staging_files(&storage_path, 24).await, 0);
+            assert!(orphan.exists());
+
+            // (b)+(c) max_age 0 → cutoff 0 → the staging file is reaped but the
+            // unrelated file is untouched.
+            assert_eq!(sweep_orphan_staging_files(&storage_path, 0).await, 1);
+            assert!(!orphan.exists());
+            assert!(unrelated.exists());
+
+            let _ = tokio::fs::remove_dir_all(&base).await;
         }
     }
 
@@ -3129,7 +3384,7 @@ mod streaming_pipeline_regression_tests {
         );
 
         // Staging temp file MUST be gone after complete.
-        let temp_path = temp_upload_path(&session_id);
+        let temp_path = temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id);
         assert!(
             !temp_path.exists(),
             "staged temp file must be removed after complete_chunked_upload (path: {})",

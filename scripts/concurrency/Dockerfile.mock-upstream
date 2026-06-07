@@ -1,0 +1,20 @@
+# Mock upstream registry for the multi-replica single-flight race harness (#1624).
+# Dependency-light: stock python slim image, single stdlib script, no pip install.
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY mock_upstream.py /app/mock_upstream.py
+
+# Defaults (overridable via compose `environment:`).
+ENV ARTIFACT_SIZE_BYTES=268435456 \
+    ARTIFACT_NAME=big-artifact.bin \
+    LATENCY_MS=1500 \
+    PORT=9999 \
+    SEED=1624
+
+EXPOSE 9999
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=20 \
+    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9999/healthz',timeout=2).read()==b'ok' else 1)"
+
+CMD ["python3", "/app/mock_upstream.py"]

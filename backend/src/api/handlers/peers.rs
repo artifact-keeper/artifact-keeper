@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::services::peer_instance_service::{
     InstanceStatus, PeerInstanceService, RegisterPeerInstanceRequest as ServiceRegisterReq,
     ReplicationMode, SyncStatus,
@@ -190,10 +190,6 @@ pub struct IdentityResponse {
     pub endpoint_url: String,
     #[serde(skip_serializing)]
     pub api_key: String,
-}
-
-fn require_admin(auth: &AuthExtension) -> Result<()> {
-    auth.require_admin()
 }
 
 /// Map a `SyncStatus` to its wire label (snake_case, matching the DB enum).
@@ -438,7 +434,7 @@ pub async fn heartbeat(
     Path(id): Path<Uuid>,
     Json(payload): Json<HeartbeatRequest>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     let status = payload.status.as_ref().and_then(|s| parse_status(s));
     let service = PeerInstanceService::new(state.db.clone());
@@ -716,7 +712,7 @@ async fn announce_peer(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<AnnouncePeerRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     let peer_svc = PeerService::new(state.db.clone());
     let instance_svc = PeerInstanceService::new(state.db.clone());
@@ -753,9 +749,7 @@ async fn get_identity(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<IdentityResponse>> {
-    if !auth.is_admin {
-        return Err(AppError::Authorization("Admin access required".to_string()));
-    }
+    auth.require_admin()?;
     let svc = PeerInstanceService::new(state.db.clone());
     let local = svc.get_local_instance().await?;
 
@@ -803,6 +797,7 @@ pub struct PeersApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use serde_json::json;
 
     // -----------------------------------------------------------------------
@@ -1305,7 +1300,7 @@ mod tests {
             scopes: None,
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_ok());
+        assert!(auth.require_admin().is_ok());
     }
 
     #[test]
@@ -1320,7 +1315,7 @@ mod tests {
             scopes: None,
             allowed_repo_ids: None,
         };
-        let err = require_admin(&auth).unwrap_err();
+        let err = auth.require_admin().unwrap_err();
         assert!(
             format!("{}", err).contains("Admin access required"),
             "Expected 'Admin access required' in error: {}",
@@ -1340,7 +1335,7 @@ mod tests {
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_err());
+        assert!(auth.require_admin().is_err());
     }
 
     #[test]
@@ -1355,7 +1350,7 @@ mod tests {
             scopes: Some(vec!["admin".to_string()]),
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_ok());
+        assert!(auth.require_admin().is_ok());
     }
 
     #[test]
@@ -1370,7 +1365,7 @@ mod tests {
             scopes: None,
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_err());
+        assert!(auth.require_admin().is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1390,11 +1385,8 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(!auth.is_admin);
-        let result: std::result::Result<(), AppError> = if !auth.is_admin {
-            Err(AppError::Authorization("Admin access required".to_string()))
-        } else {
-            Ok(())
-        };
+        // Exercises the real guard used by `get_identity` (auth.require_admin()).
+        let result = auth.require_admin();
         assert!(result.is_err());
         match result.unwrap_err() {
             AppError::Authorization(msg) => {
@@ -1417,12 +1409,8 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(auth.is_admin);
-        let result: std::result::Result<(), AppError> = if !auth.is_admin {
-            Err(AppError::Authorization("Admin access required".to_string()))
-        } else {
-            Ok(())
-        };
-        assert!(result.is_ok());
+        // Exercises the real guard used by `get_identity` (auth.require_admin()).
+        assert!(auth.require_admin().is_ok());
     }
 
     // -----------------------------------------------------------------------

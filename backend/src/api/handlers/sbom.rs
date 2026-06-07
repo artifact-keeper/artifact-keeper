@@ -1007,8 +1007,21 @@ async fn update_cve_status(
     // sqlx::Error::RowNotFound as 500 DATABASE_ERROR. Map it explicitly to
     // 404 so the client can distinguish bad input from server failure. All
     // other sqlx errors continue to flow through the default mapping.
+    //
+    // #1561: the read paths now project synthetic ids out of `scan_findings`
+    // (the never-written `cve_history` table is empty in production), so a
+    // plain `cve_history` UPDATE 404'd for every id the read side emits. The
+    // service now falls back to resolving the synth id and acknowledging the
+    // underlying `scan_findings` rows. We pass `auth.allowed_repo_ids` so the
+    // synth-id resolution is scoped to repositories this caller can access.
     let entry = service
-        .update_cve_status(id, status, Some(auth.user_id), body.reason.as_deref())
+        .update_cve_status(
+            id,
+            status,
+            Some(auth.user_id),
+            body.reason.as_deref(),
+            auth.allowed_repo_ids.as_deref(),
+        )
         .await
         .map_err(|e| match e {
             AppError::Sqlx(sqlx::Error::RowNotFound) => {

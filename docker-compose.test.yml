@@ -105,7 +105,7 @@ services:
       retries: 30
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness"]
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
@@ -139,7 +139,7 @@ services:
       retries: 20
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness"]
 
   # ==========================================================================
   # SMOKE TEST SERVICES (pypi, npm, cargo)
@@ -551,6 +551,79 @@ services:
     volumes:
       - ./scripts/native-tests:/scripts:ro
     entrypoint: ["sh", "-c", "apk add --no-cache curl jq postgresql-client bash > /dev/null 2>&1 && bash /scripts/test-curation.sh"]
+    networks:
+      - e2e-test-network
+
+  # ==========================================================================
+  # CACHE-CORRECTNESS + VIRTUAL-RESOLUTION TESTS (#1625, gate for #1611)
+  #
+  # RED on `main` by design: these reproduce open bugs #1600/#1595/#1562 and the
+  # immutable-vs-mutable mis-caching. Do NOT add the `cache-correctness` profile
+  # to any per-PR gate. Run via the cache-correctness-e2e.yml workflow_dispatch.
+  #
+  # NOTE (consolidation, re #1624): `cache-mock-upstream` is an ETag/counter/
+  # mutation-aware Python server. The #1624 concurrency harness needs a similar
+  # counter+latency mock. Once both land, consolidate into one mock-upstream
+  # image with both knob-sets (this one already exposes a /__mock__/latency
+  # control endpoint toward that goal).
+  # ==========================================================================
+
+  cache-mock-upstream:
+    build:
+      context: ./scripts/native-tests/mock-upstream
+      dockerfile: Dockerfile
+    image: artifact-keeper-mock-upstream:test
+    container_name: e2e-test-cache-mock-upstream
+    profiles: ["cache-correctness"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9101/__mock__/health').read()==b'ok' else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - e2e-test-network
+
+  virtual-resolution-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
+    container_name: e2e-test-virtual-resolution
+    profiles: ["cache-correctness"]
+    depends_on:
+      setup:
+        condition: service_healthy
+      cache-mock-upstream:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      ADMIN_PASS: TestRunner!2026secure
+      MOCK_UPSTREAM_URL: http://cache-mock-upstream:9101
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    command: ["bash", "-c", "apt-get update -qq && apt-get install -y -qq curl jq >/dev/null 2>&1 && bash /scripts/test-virtual-resolution.sh"]
+    networks:
+      - e2e-test-network
+
+  cache-correctness-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    container_name: e2e-test-cache-correctness
+    profiles: ["cache-correctness"]
+    depends_on:
+      setup:
+        condition: service_healthy
+      cache-mock-upstream:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      ADMIN_PASS: TestRunner!2026secure
+      MOCK_UPSTREAM_URL: http://cache-mock-upstream:9101
+      # TTL waits are env-overridable so the workflow can match the backend's
+      # configured metadata/negative TTLs once #1611 makes them explicit.
+      CACHE_TTL_SECONDS: "30"
+      NEG_TTL_SECONDS: "15"
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-proxy-cache-correctness.sh"]
     networks:
       - e2e-test-network
 

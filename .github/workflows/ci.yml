@@ -57,13 +57,35 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Forbidden-pattern gate (#1316): authorization on API-token scopes must
+      # use the canonical `token_service::scopes_grant_access` helper, never an
+      # inline `== "admin"` / `.any(|s| s == "admin")` raw-string scope match.
+      # This grep gate fails the build if the legacy idiom reappears in
+      # backend/src (test modules and the canonical helper are excluded).
+      - name: No legacy admin scope check
+        run: ./scripts/ci/check-no-legacy-admin-scope.sh
+
+      # Token-minting surface pin (#1315, epic #1617 -> #1615): every handler
+      # that calls AuthService::generate_api_token must be in the reviewed set
+      # and carry its reject rule (enforce_admin_only_scopes or require_admin).
+      # A new token-minting endpoint added without updating the pinned list
+      # fails the build, forcing a deliberate review of the privilege-escalation
+      # surface.
+      - name: Pin token-minting endpoint surface
+        run: ./scripts/ci/check-token-mint-surface.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
-        # the ARC runner pod ("sccache: Compile terminated by signal 9", #1515).
-        # 4 is conservative for the runner's memory budget while still keeping
-        # the step under the Tier-1 < 5min target.
+        # the ARC runner pod ("sccache: Compile terminated by signal 9",
+        # #1515/#1594). Lowered 4 → 2 (#1679): under concurrent PR load the
+        # lib-test target still OOM-killed at 4, so fewer parallel codegen
+        # units cut peak RSS further. CARGO_INCREMENTAL=0 disables incremental
+        # codegen (`-C incremental=...`), which was observed ON during the
+        # failing compile and inflates peak memory — incremental is useless in
+        # CI's clean checkout anyway. Lint set is unchanged.
         env:
-          CARGO_BUILD_JOBS: "4"
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test-backend-unit:
@@ -77,6 +99,28 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "4"
+      # Disable incremental codegen (#1679): this job compiles the same
+      # lib-test crate that OOM-killed check-rust, and incremental is useless
+      # in CI's clean checkout while inflating peak RSS.
+      CARGO_INCREMENTAL: "0"
+    services:
+      # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
+      # readiness gate) that silently no-op via `Fixture::setup` when
+      # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
+      # so they actually run (#1409 review).
+      postgres:
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -105,10 +149,40 @@ jobs:
             exit 1
           fi
 
+      - name: Wait for Postgres
+        run: |
+          set -euo pipefail
+          # The service --health-cmd already runs pg_isready, but the step can
+          # start before health flips to "healthy" on slower runners. A short
+          # TCP readiness loop avoids a flaky first connect.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              echo "Postgres reachable on attempt $i"
+              exit 0
+            fi
+            echo "  waiting for postgres... ($i/30)"
+            sleep 1
+          done
+          echo "ERROR: Postgres did not become reachable within 30s"
+          exit 1
+
+      - name: Run database migrations
+        run: sqlx migrate run --source backend/migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
       - name: Run unit tests
         env:
+          # SQLX_OFFLINE keeps the build using the committed .sqlx cache;
+          # DATABASE_URL lets the DB-backed lib tests run for real against the
+          # Postgres service above instead of no-op'ing.
           SQLX_OFFLINE: true
-        run: cargo test --workspace --lib --verbose
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        # --test-threads=1: these DB-backed suites share global tables and the
+        # blob-GC readiness gate is a cluster-wide query, so a concurrent
+        # cross-module test's transient rows can make gate/GC assertions flaky.
+        run: cargo test --workspace --lib --verbose -- --test-threads=1
 
   shell-tests:
     name: 🐚 Shell Tests
@@ -130,6 +204,20 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
+    # Memory guards for the instrumented lib-test compile (#1679/#1680,
+    # extended here to the coverage job). This job builds the same lib-test
+    # crate that OOM-killed check-rust, but under `-C instrument-coverage`
+    # *and* `-C debuginfo=2` — the heaviest compile in CI, which got SIGKILL'd
+    # (OOM) on larger PRs. CARGO_INCREMENTAL=0 drops incremental codegen
+    # (useless in a clean checkout), CARGO_BUILD_JOBS caps parallel rustc, and
+    # dropping debuginfo cuts peak RSS the most. Coverage mapping comes from
+    # the instrumentation (`__llvm_covmap`), not DWARF, so debuginfo=0 does
+    # not affect line-coverage accuracy.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       postgres:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
@@ -206,13 +294,39 @@ jobs:
       - name: New code coverage gate
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
         run: |
-          # Fetch base branch so we can diff against it (checkout is shallow by default)
-          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+          # Fetch base branch so we can diff against it (checkout is shallow by default).
+          # Deepen BOTH the base branch AND the PR head: the head is checked out
+          # shallow (fetch-depth: 1), so without head-side history `git merge-base`
+          # has nothing to walk on the head side and finds no common ancestor.
+          # Deepening only the base (the original #1671 behavior) is not enough.
+          git fetch --no-tags --depth=200 origin ${{ github.base_ref }}
+          git fetch --no-tags --deepen=200 origin || true
+
+          # Diff against the MERGE-BASE between the PR head and the base branch tip,
+          # NOT the raw base tip (FETCH_HEAD). Diffing against the tip counts changes
+          # from OTHER PRs that merged after this branch was cut as a phantom delta,
+          # producing false coverage failures on stale branches (see issue #1646).
+          # The merge-base is where this branch actually diverged, so the diff
+          # reflects only the lines THIS branch changed.
+          #
+          # `git merge-base` exits non-zero when it cannot find a common ancestor
+          # (e.g. the shallow clone is still missing it). This step runs under the
+          # default `bash -e`, so an unguarded command substitution would ABORT the
+          # whole step here, before the `if [ -z ]` fallback could run — a false
+          # coverage failure rather than a graceful degrade (regression #1689 from
+          # #1671). `2>/dev/null || true` keeps the step alive so the fallback runs.
+          MERGE_BASE=$(git merge-base FETCH_HEAD HEAD 2>/dev/null || true)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::warning::Could not compute merge-base on shallow clone; falling back to base tip (issue #1646 trade-off)"
+            MERGE_BASE=$(git rev-parse FETCH_HEAD)
+          fi
+          echo "Diffing new code against merge-base: $MERGE_BASE"
+          export MERGE_BASE
 
           # Check coverage on new/changed lines only (not the entire file).
           # Uses unified diff to extract exact line numbers that were added or modified,
           # then cross-references with lcov to measure coverage of those specific lines.
-          CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
+          CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null || true)
           if [ -z "$CHANGED_FILES" ]; then
             echo "No .rs files changed, skipping new code coverage check"
             echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
@@ -222,11 +336,14 @@ jobs:
           # Parse the unified diff to find which lines were added/changed in each file,
           # then cross-reference with lcov.info to compute coverage on those lines only.
           RESULT=$(python3 -c "
-          import subprocess, re
+          import subprocess, re, os
 
-          # Step 1: Parse unified diff to find added line numbers per file
+          # Step 1: Parse unified diff to find added line numbers per file.
+          # Diff against the merge-base (passed in via env) so intervening merges
+          # from other PRs do not show up as a phantom delta (issue #1646).
+          merge_base = os.environ.get('MERGE_BASE', 'FETCH_HEAD')
           diff = subprocess.run(
-              ['git', 'diff', '-U0', 'FETCH_HEAD', '--', '*.rs'],
+              ['git', 'diff', '-U0', merge_base, '--', '*.rs'],
               capture_output=True, text=True
           ).stdout
 
@@ -322,16 +439,38 @@ jobs:
           git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
           CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
+          # Exclude the per-ecosystem package-format handlers
+          # (backend/src/api/handlers/<format>.rs). These are inherent structural
+          # near-duplicates of one another (~18% cross-file duplication on main,
+          # dominant clones are whole-file matches like sbt.rs <-> vscode.rs incl.
+          # the shared import block). Without this exclusion ANY PR that legitimately
+          # edits the download/upload path across several formats trips the 3% gate
+          # regardless of code quality (#1704). The exclusion list is the single
+          # source of truth in .jscpd.json; we filter the changed-file list here
+          # rather than relying on jscpd's own ignore globs so the behavior is
+          # deterministic regardless of jscpd version. The gate stays STRICT on all
+          # other code (services, storage, middleware, non-format handlers, ...)
+          # where duplication is a real smell.
+          IGNORE_RE=$(python3 -c "
+          import json, re
+          cfg = json.load(open('.jscpd.json'))
+          pats = [p for p in cfg.get('ignore', []) if p.startswith('backend/src/api/handlers/')]
+          print('|'.join(re.escape(p) for p in pats))
+          ")
+          if [ -n "$IGNORE_RE" ]; then
+            CHANGED_RS=$(printf '%s\n' "$CHANGED_RS" | grep -Ev "^(${IGNORE_RE})$" || true)
+          fi
+
           if [ -z "$CHANGED_RS" ]; then
-            echo "No .rs source files changed, skipping duplication check"
-            echo "### Code Duplication: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            echo "No measurable .rs source files changed (none, or only ignored format handlers), skipping duplication check"
+            echo "### Code Duplication: N/A (no measurable Rust changes)" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
 
           # Write changed files to a list for jscpd
           echo "$CHANGED_RS" > /tmp/changed-files.txt
 
-          # Run jscpd on changed files only (min 10 lines, threshold 3%)
+          # Run jscpd on the filtered changed files (min 10 lines, threshold 3%).
           RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
             --format rust --output /tmp/jscpd-report \
             $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
@@ -394,6 +533,11 @@ jobs:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
     if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Disable incremental codegen (#1679): consistent with check-rust and the
+    # other heavy Rust compile jobs. Useless in CI's clean checkout, inflates
+    # peak RSS.
+    env:
+      CARGO_INCREMENTAL: "0"
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.

@@ -270,6 +270,13 @@ pub fn spawn_all(
         let gc_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
+            // Kept for the blob-GC readiness gate below; the pool itself is
+            // moved into the GC service on the next line.
+            let gate_db = db.clone();
+            // Blob deletion is opt-in (#1408). When BLOB_GC_ENABLED is unset
+            // the scheduled pass runs DRY-RUN: it logs what it would reclaim
+            // but deletes nothing. Bias to leaking storage over losing data.
+            let blob_gc_dry_run = !config_clone.blob_gc_enabled;
             let service =
                 crate::services::storage_gc_service::StorageGcService::new(db, gc_registry);
 
@@ -325,6 +332,93 @@ pub fn spawn_all(
                     }
                     Err(e) => {
                         tracing::warn!("Storage garbage collection failed: {}", e);
+                    }
+                }
+
+                // Blob layer GC runs in the same tick: the manifest GC pass
+                // above frees `oci-manifests/...` storage keys, this pass
+                // frees `oci-blobs/...` ones that no live manifest references
+                // (via `manifest_blob_refs`). Both passes are independent —
+                // blob GC reads its own snapshot from `oci_blobs` and does
+                // not depend on the artifact-level GC having run first.
+                //
+                // SAFETY (#1408): blob deletion is irreversible, so two
+                // safeguards gate the destructive path here, in addition to
+                // the grace window and locked per-row re-check inside
+                // `run_blob_gc`:
+                //
+                //  1. Readiness gate (design from #1409 review, finding 3):
+                //     blob GC trusts `manifest_blob_refs` as the live blob
+                //     set, so it must not delete until a successful backfill
+                //     has populated refs for every live image manifest.
+                //     Otherwise a partial or failed startup backfill (e.g.
+                //     object storage briefly unreachable when bodies were
+                //     read) would make live layers look orphaned and GC would
+                //     delete them. We skip the *live* pass while refs are
+                //     incomplete or the readiness query itself fails; the
+                //     next tick re-checks and resumes once refs are complete.
+                //
+                //  2. Dry-run default: unless BLOB_GC_ENABLED is set, the
+                //     pass runs in dry-run mode and never deletes. A dry-run
+                //     pass is always safe to run, even when the readiness
+                //     gate is not yet satisfied, so we only enforce the gate
+                //     when about to delete for real.
+                let mut blob_gc_dry_run_this_tick = blob_gc_dry_run;
+                if !blob_gc_dry_run_this_tick {
+                    match crate::services::manifest_blob_refs_backfill::any_live_manifest_missing_refs(
+                        &gate_db,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            tracing::warn!(
+                                "Blob GC: manifest_blob_refs is incomplete for one or more live \
+                                 image manifests (startup backfill unfinished or partially \
+                                 failed); forcing dry-run this tick and retrying next tick"
+                            );
+                            blob_gc_dry_run_this_tick = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Blob GC: could not verify manifest_blob_refs readiness ({}); \
+                                 forcing dry-run this tick",
+                                e
+                            );
+                            blob_gc_dry_run_this_tick = true;
+                        }
+                        Ok(false) => {}
+                    }
+                }
+
+                match service.run_blob_gc(blob_gc_dry_run_this_tick).await {
+                    Ok(result) => {
+                        if result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC (dry-run): would reclaim {} blob objects, {} bytes \
+                                 (set BLOB_GC_ENABLED=true to delete)",
+                                result.storage_keys_deleted,
+                                result.bytes_freed
+                            );
+                        } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC: deleted {} blob objects, freed {} bytes",
+                                result.storage_keys_deleted,
+                                result.bytes_freed
+                            );
+                            metrics_service::record_cleanup(
+                                "blob_gc",
+                                result.storage_keys_deleted as u64,
+                            );
+                        }
+                        if !result.errors.is_empty() {
+                            tracing::warn!("Blob GC completed with {} errors", result.errors.len());
+                            for err in &result.errors {
+                                tracing::warn!(gc_error = %err, "Blob GC error");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Blob garbage collection failed: {}", e);
                     }
                 }
             }

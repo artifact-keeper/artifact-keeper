@@ -164,12 +164,59 @@ pub async fn oidc_login(
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct OidcCallbackQuery {
-    code: String,
-    state: String,
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+    error_uri: Option<String>,
 }
 
-/// Validate the shape of an OIDC callback's `code` and `state` query
-/// parameters before any session lookup or IdP exchange.
+/// Classification of an OIDC authorization callback (RFC 6749 4.1.2 / 4.1.2.1).
+#[derive(Debug, PartialEq, Eq)]
+enum OidcCallbackOutcome {
+    Proceed {
+        code: String,
+        state: String,
+    },
+    IdpError {
+        error: String,
+        description: Option<String>,
+    },
+    Malformed,
+}
+
+/// Pure classifier for an OIDC callback's query parameters.
+///
+/// An IdP error response (RFC 6749 4.1.2.1) carries `error` and no `code`, so
+/// it MUST be checked first; otherwise the missing `code` would be misread as
+/// a malformed callback. A well-formed success carries non-empty `code` and
+/// `state`; anything else is malformed.
+fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
+    if let Some(error) = params.error.as_deref().filter(|s| !s.is_empty()) {
+        return OidcCallbackOutcome::IdpError {
+            error: error.to_string(),
+            description: params
+                .error_description
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+    }
+
+    match (
+        params.code.as_deref().filter(|s| !s.is_empty()),
+        params.state.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(code), Some(state)) => OidcCallbackOutcome::Proceed {
+            code: code.to_string(),
+            state: state.to_string(),
+        },
+        _ => OidcCallbackOutcome::Malformed,
+    }
+}
+
+/// Resolve an OIDC callback's `code` and `state` before any session lookup or
+/// IdP exchange.
 ///
 /// Distinguishes "malformed callback" (the client sent us garbage) from
 /// "state mismatch / CSRF" (the client sent us well-formed but unrecognized
@@ -177,16 +224,28 @@ pub struct OidcCallbackQuery {
 /// misses, and returns 401, which leaks the ordering of our auth checks and
 /// confuses legitimate clients that crash mid-redirect.
 ///
-/// Returns `AppError::Validation` (400) for missing/empty parameters. The
-/// CSRF replay defense (401) still fires for non-empty state values that
-/// don't match a cached session.
-fn validate_oidc_callback_params(params: &OidcCallbackQuery) -> Result<()> {
-    if params.state.is_empty() || params.code.is_empty() {
-        return Err(AppError::Validation(
+/// Returns `AppError::Validation` (400) for missing/empty parameters and
+/// `AppError::Authentication` (401) when the IdP itself redirected back with
+/// an error (RFC 6749 4.1.2.1). The CSRF replay defense (401) still fires for
+/// non-empty state values that don't match a cached session.
+fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)> {
+    match classify_oidc_callback(params) {
+        OidcCallbackOutcome::Proceed { code, state } => Ok((code, state)),
+        OidcCallbackOutcome::IdpError { error, description } => {
+            tracing::warn!(
+                idp_error = %error,
+                idp_error_uri = ?params.error_uri,
+                "OIDC IdP returned an error on callback"
+            );
+            Err(AppError::Authentication(format!(
+                "SSO login failed: {}",
+                description.unwrap_or(error)
+            )))
+        }
+        OidcCallbackOutcome::Malformed => Err(AppError::Validation(
             "Invalid OIDC callback parameters: code and state are required".to_string(),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// Handle OIDC authorization callback
@@ -202,7 +261,7 @@ fn validate_oidc_callback_params(params: &OidcCallbackQuery) -> Result<()> {
     responses(
         (status = 307, description = "Redirect to frontend with exchange code"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
-        (status = 401, description = "Invalid or expired SSO state (CSRF)", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_callback(
@@ -211,10 +270,10 @@ pub async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    // Validate parameter shape BEFORE hitting the session store. Empty state
-    // or code is a malformed callback (400), not a CSRF failure (401). See
-    // `validate_oidc_callback_params` doc comment.
-    validate_oidc_callback_params(&params)?;
+    // Resolve parameter shape BEFORE hitting the session store. Empty state or
+    // code is a malformed callback (400), an IdP error redirect is a 401, not a
+    // CSRF failure. See `resolve_oidc_callback` doc comment.
+    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
 
     // Validate SSO session (CSRF check), then delegate to shared logic.
     //
@@ -224,7 +283,7 @@ pub async fn oidc_callback(
     // /oidc/{B}/callback so the PKCE code_verifier and code travel to
     // provider B's token endpoint. We derive provider_id from the session
     // (the authoritative side) and reject if the URL path disagrees.
-    let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
     if session.provider_id != id {
         return Err(AppError::Authentication(
             "SSO state does not match provider".to_string(),
@@ -233,7 +292,7 @@ pub async fn oidc_callback(
     oidc_callback_inner(
         state,
         session.provider_id,
-        params.code,
+        auth_code,
         session.nonce,
         session.pkce_code_verifier,
         headers,
@@ -252,16 +311,16 @@ pub async fn oidc_callback_generic(
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    // Validate parameter shape BEFORE hitting the session store. See
-    // `validate_oidc_callback_params` doc comment.
-    validate_oidc_callback_params(&params)?;
+    // Resolve parameter shape BEFORE hitting the session store. See
+    // `resolve_oidc_callback` doc comment.
+    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
 
     // Validate SSO session and resolve the provider from the stored state
-    let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
     oidc_callback_inner(
         state,
         session.provider_id,
-        params.code,
+        auth_code,
         session.nonce,
         session.pkce_code_verifier,
         headers,
@@ -1213,8 +1272,8 @@ mod tests {
     fn test_oidc_callback_query_deserialize() {
         let json = r#"{"code":"auth_code_123","state":"csrf_state_456"}"#;
         let q: OidcCallbackQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.code, "auth_code_123");
-        assert_eq!(q.state, "csrf_state_456");
+        assert_eq!(q.code, Some("auth_code_123".to_string()));
+        assert_eq!(q.state, Some("csrf_state_456".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1244,13 +1303,26 @@ mod tests {
         );
     }
 
+    /// Build an `OidcCallbackQuery` from optional fields for terse test setup.
+    fn query(
+        code: Option<&str>,
+        state: Option<&str>,
+        error: Option<&str>,
+        error_description: Option<&str>,
+    ) -> OidcCallbackQuery {
+        OidcCallbackQuery {
+            code: code.map(str::to_string),
+            state: state.map(str::to_string),
+            error: error.map(str::to_string),
+            error_description: error_description.map(str::to_string),
+            error_uri: None,
+        }
+    }
+
     #[test]
-    fn test_validate_oidc_callback_params_empty_state_returns_400() {
-        let params = OidcCallbackQuery {
-            code: "valid_code".to_string(),
-            state: String::new(),
-        };
-        let err = validate_oidc_callback_params(&params).expect_err("empty state must reject");
+    fn test_resolve_oidc_callback_empty_state_returns_400() {
+        let params = query(Some("valid_code"), Some(""), None, None);
+        let err = resolve_oidc_callback(&params).expect_err("empty state must reject");
         assert!(
             matches!(err, AppError::Validation(_)),
             "empty state should map to Validation (400), got {err:?}"
@@ -1259,12 +1331,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_oidc_callback_params_empty_code_returns_400() {
-        let params = OidcCallbackQuery {
-            code: String::new(),
-            state: "valid_state".to_string(),
-        };
-        let err = validate_oidc_callback_params(&params).expect_err("empty code must reject");
+    fn test_resolve_oidc_callback_empty_code_returns_400() {
+        let params = query(Some(""), Some("valid_state"), None, None);
+        let err = resolve_oidc_callback(&params).expect_err("empty code must reject");
         assert!(
             matches!(err, AppError::Validation(_)),
             "empty code should map to Validation (400), got {err:?}"
@@ -1273,40 +1342,32 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_oidc_callback_params_both_empty_returns_400() {
-        let params = OidcCallbackQuery {
-            code: String::new(),
-            state: String::new(),
-        };
-        let err =
-            validate_oidc_callback_params(&params).expect_err("empty code and state must reject");
+    fn test_resolve_oidc_callback_both_empty_returns_400() {
+        let params = query(Some(""), Some(""), None, None);
+        let err = resolve_oidc_callback(&params).expect_err("empty code and state must reject");
         assert!(matches!(err, AppError::Validation(_)));
         assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn test_validate_oidc_callback_params_well_formed_passes() {
+    fn test_resolve_oidc_callback_well_formed_passes() {
         // Well-formed values (any non-empty string) pass the shape check and
         // delegate the CSRF / cache-miss decision to validate_sso_session,
         // which keeps returning 401 (Authentication) on miss. We don't
-        // exercise the DB path here; the contract is that this validator
+        // exercise the DB path here; the contract is that this resolver
         // does NOT veto well-formed inputs.
-        let params = OidcCallbackQuery {
-            code: "ac_xyz".to_string(),
-            state: "st_xyz".to_string(),
-        };
-        validate_oidc_callback_params(&params).expect("well-formed params should pass");
+        let params = query(Some("ac_xyz"), Some("st_xyz"), None, None);
+        let (code, state) = resolve_oidc_callback(&params).expect("well-formed params should pass");
+        assert_eq!(code, "ac_xyz");
+        assert_eq!(state, "st_xyz");
     }
 
     #[test]
-    fn test_validate_oidc_callback_params_error_message_no_leak() {
+    fn test_resolve_oidc_callback_error_message_no_leak() {
         // The 400 message must not name internal subsystems (SSO sessions
         // table, SQL, etc.). It only states what the caller did wrong.
-        let params = OidcCallbackQuery {
-            code: "ac".to_string(),
-            state: String::new(),
-        };
-        let err = validate_oidc_callback_params(&params).expect_err("must reject");
+        let params = query(Some("ac"), Some(""), None, None);
+        let err = resolve_oidc_callback(&params).expect_err("must reject");
         let msg = match &err {
             AppError::Validation(m) => m.clone(),
             other => panic!("expected Validation, got {other:?}"),
@@ -1323,11 +1384,8 @@ mod tests {
         // Regression for #1369: an empty state must NOT collide with the
         // "session not found" 401 path. The two cases route to different
         // AppError variants with different status codes.
-        let empty = OidcCallbackQuery {
-            code: "ac".to_string(),
-            state: String::new(),
-        };
-        let empty_err = validate_oidc_callback_params(&empty).expect_err("must reject");
+        let empty = query(Some("ac"), Some(""), None, None);
+        let empty_err = resolve_oidc_callback(&empty).expect_err("must reject");
         // Empty -> 400 Validation
         assert!(matches!(empty_err, AppError::Validation(_)));
 
@@ -1338,6 +1396,98 @@ mod tests {
         let csrf_miss = AppError::Authentication("Invalid or expired SSO state".to_string());
         assert_status(&empty_err, axum::http::StatusCode::BAD_REQUEST);
         assert_status(&csrf_miss, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // OIDC IdP error redirects (#1657, RFC 6749 4.1.2.1)
+    //
+    // When the IdP redirects back with `?state=..&error=access_denied&..` and
+    // no `code`, the request used to fail deserialization with the raw serde
+    // message "missing field code". It now classifies as an IdP error and
+    // returns a clear 401.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_oidc_callback_idp_error_takes_precedence() {
+        let params = query(
+            None,
+            Some("csrf_state_456"),
+            Some("access_denied"),
+            Some("User is not assigned to the client application."),
+        );
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::IdpError {
+                error: "access_denied".to_string(),
+                description: Some("User is not assigned to the client application.".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_oidc_callback_idp_error_is_401_with_reason() {
+        let params = query(
+            None,
+            Some("csrf_state_456"),
+            Some("access_denied"),
+            Some("User is not assigned to the client application."),
+        );
+        let err = resolve_oidc_callback(&params).expect_err("IdP error must reject");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "IdP error should map to Authentication (401), got {err:?}"
+        );
+        assert_status(&err, axum::http::StatusCode::UNAUTHORIZED);
+        let msg = match &err {
+            AppError::Authentication(m) => m.clone(),
+            other => panic!("expected Authentication, got {other:?}"),
+        };
+        assert!(msg.contains("SSO login failed"), "message: {msg}");
+        assert!(msg.contains("User is not assigned"), "message: {msg}");
+    }
+
+    #[test]
+    fn test_classify_oidc_callback_proceeds_on_code_and_state() {
+        let params = query(Some("auth_code_123"), Some("csrf_state_456"), None, None);
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::Proceed {
+                code: "auth_code_123".to_string(),
+                state: "csrf_state_456".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_oidc_callback_malformed_when_no_code_no_error() {
+        let params = query(None, Some("csrf_state_456"), None, None);
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::Malformed
+        );
+        let err = resolve_oidc_callback(&params).expect_err("no code, no error must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_oidc_callback_query_idp_error_urlencoded_classifies() {
+        // Faithful repro of #1657: the IdP redirects back with state + error +
+        // error_description and NO code. On main this from_str returned
+        // Err("missing field code"), which is the exact bug. With code/state
+        // optional and the error fields present, it deserializes and
+        // classifies as an IdP error.
+        let q: OidcCallbackQuery = serde_urlencoded::from_str(
+            "state=abc&error=access_denied&error_description=User+is+not+assigned+to+the+client+application.",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_oidc_callback(&q),
+            OidcCallbackOutcome::IdpError {
+                error: "access_denied".to_string(),
+                description: Some("User is not assigned to the client application.".to_string()),
+            }
+        );
     }
 
     #[test]

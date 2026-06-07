@@ -379,13 +379,14 @@ async fn authenticate_oci_with_scopes(
 
 /// Verify that the resolved OCI credential scopes (if any) grant the given
 /// permission. Returns `false` if an API token is present but lacks the
-/// requested scope. Implements the same logic as
-/// `AuthExtension::has_scope`: `*` and `admin` count as wildcards, and a
+/// requested scope. Defers to the single canonical wildcard-aware decision
+/// in `token_service::scopes_grant_access` (the same helper backing
+/// `AuthExtension::has_scope`): `*` and `admin` count as wildcards, and a
 /// `None` scopes set (JWT / password) passes through.
 fn oci_scopes_grant(scopes: &Option<Vec<String>>, required: &str) -> bool {
     match scopes {
         None => true,
-        Some(s) => s.iter().any(|x| x == required || x == "*" || x == "admin"),
+        Some(s) => crate::services::token_service::scopes_grant_access(s, required),
     }
 }
 
@@ -764,6 +765,31 @@ async fn mark_oci_upload_cleanup_key_committed(
     }
 
     Ok(())
+}
+
+/// Remove a cleanup-journal row once the storage object it tracked is durably
+/// referenced (an `oci_blobs` row now points at it). Used on the blob-upload
+/// success path so a now-live `oci-blobs/<digest>` key does not leave a journal
+/// row behind forever. Best-effort: a failed delete only leaves a stale row,
+/// and the reaper's `oci_blobs` EXISTS guard still refuses to reclaim the live
+/// blob, so it is never data loss — just a row to be cleaned up later.
+async fn clear_oci_upload_cleanup_key_best_effort(db: &PgPool, storage_key: &str) {
+    if let Err(e) = sqlx::query(
+        r#"
+        DELETE FROM oci_upload_cleanup_keys
+        WHERE storage_key = $1
+        "#,
+    )
+    .bind(storage_key)
+    .execute(db)
+    .await
+    {
+        warn!(
+            storage_key = %storage_key,
+            error = %e,
+            "Failed to clear OCI upload cleanup-key row after blob became referenced"
+        );
+    }
 }
 
 async fn delete_storage_key_for_upload_cancel(
@@ -1499,6 +1525,69 @@ pub(crate) fn is_index_content_type(content_type: &str) -> bool {
     )
 }
 
+const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const OCI_IMAGE_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// Content-based classification of a manifest body, independent of the
+/// declared media type.
+///
+/// The blob-GC readiness gate keys on the stored `manifest_content_type`,
+/// which is the (absent/spoofable) request/upstream header. So an index
+/// pushed with an image/missing Content-Type — or a degenerate body with
+/// neither a `manifests` array nor a `config` descriptor — must be
+/// recognised by CONTENT, else it lands as a ref-less "live image" and pins
+/// the gate forever (#1409 C1). Classifying by content lets the push path
+/// reject the degenerate case and lets callers store a media type that
+/// matches the body.
+#[derive(Debug)]
+pub(crate) enum ManifestClass {
+    /// Has a `manifests` array: an image index / manifest list. Protected
+    /// through `oci_manifest_refs`, not `manifest_blob_refs`.
+    Index,
+    /// Has a `config` descriptor: a normal image manifest.
+    Image,
+    /// Unparseable, or neither an index nor an image. The push path rejects
+    /// these; nothing may create a live tag for one.
+    Malformed,
+}
+
+pub(crate) fn classify_manifest(body: &[u8]) -> ManifestClass {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ManifestClass::Malformed;
+    };
+    if json.get("manifests").and_then(|m| m.as_array()).is_some() {
+        return ManifestClass::Index;
+    }
+    if json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+        .is_some()
+    {
+        return ManifestClass::Image;
+    }
+    ManifestClass::Malformed
+}
+
+/// The media type to STORE in `oci_tags.manifest_content_type`, derived from
+/// the manifest's CONTENT rather than trusting the (absent/spoofable)
+/// header, so it can never disagree with the body (the blob-GC gate keys on
+/// it, #1409 C1):
+/// - `Index`  → keep the header if it is already an index media type
+///   (preserving the OCI-vs-Docker variant), else the canonical OCI index
+///   type, so the gate always excludes it (even an empty index).
+/// - `Image`  → keep the header if it is a non-index type, else the canonical
+///   OCI image type (an image must never be stored with an index media type,
+///   which the gate would wrongly exclude).
+/// - `Malformed` → header verbatim; callers must not persist a tag for one.
+pub(crate) fn stored_media_type_for(class: &ManifestClass, header: &str) -> String {
+    match class {
+        ManifestClass::Index if !is_index_content_type(header) => OCI_INDEX_MEDIA_TYPE.to_string(),
+        ManifestClass::Image if is_index_content_type(header) => OCI_IMAGE_MEDIA_TYPE.to_string(),
+        _ => header.to_string(),
+    }
+}
+
 /// Parse an OCI image index manifest body and return the list of child
 /// manifest digests. Used by both the push handler (to populate
 /// `oci_manifest_refs` synchronously) and the startup backfill (to fill
@@ -1566,6 +1655,245 @@ pub(crate) async fn record_oci_manifest_refs(
     .execute(db)
     .await?;
     Ok(res.rows_affected() as usize)
+}
+
+/// A single (blob_digest, kind) edge extracted from an image manifest.
+/// `kind` is `"config"` for the config blob and `"layer"` for each layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRef {
+    pub digest: String,
+    pub kind: &'static str,
+}
+
+/// Parse an OCI / Docker *image* manifest body and return the blob edges
+/// it pulls in: the single `config.digest` (kind `"config"`) plus every
+/// `layers[].digest` (kind `"layer"`). Used by both the push handler (to
+/// populate `manifest_blob_refs` synchronously) and the startup backfill
+/// (to reconstruct rows for manifests that pre-date this code) for #1635.
+///
+/// Returns an empty vec when the body is not parseable as JSON or carries
+/// no `config`/`layers` blobs. An image *index* (manifest list) has
+/// neither a `config` nor a `layers` array -- it lists child manifests
+/// under `manifests[]` -- so passing an index body here yields an empty
+/// vec. Callers are still expected to gate on [`is_index_content_type`]
+/// so index manifests never reach this path, but the empty-vec behaviour
+/// makes a stray call harmless.
+///
+/// Malformed entries (missing or non-string `digest`) are skipped rather
+/// than erroring, mirroring [`extract_child_digests`]: a single
+/// non-conformant manifest must not block blob-reference recording for
+/// the rest of the corpus.
+pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
+    let json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut refs = Vec::new();
+    if let Some(cfg) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+    {
+        refs.push(BlobRef {
+            digest: cfg.to_string(),
+            kind: "config",
+        });
+    }
+    if let Some(layers) = json.get("layers").and_then(|l| l.as_array()) {
+        for layer in layers {
+            if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
+                refs.push(BlobRef {
+                    digest: d.to_string(),
+                    kind: "layer",
+                });
+            }
+        }
+    }
+    refs
+}
+
+/// Split a slice of [`BlobRef`] into the two parallel column vectors the
+/// `UNNEST`-based insert in [`record_manifest_blob_refs`] binds: the blob
+/// digests (`$2::text[]`) and their kinds (`$3::text[]`), index-aligned so
+/// row `i` pairs `digests[i]` with `kinds[i]`. Returns `None` when there
+/// is nothing to insert (empty input), letting the caller short-circuit
+/// the DB round-trip.
+///
+/// Pure and DB-free so the array-pairing logic is unit-testable without a
+/// database (the raw `sqlx::query(...).execute()` is exercised only by the
+/// Tier-2 integration tests).
+fn blob_refs_to_columns(refs: &[BlobRef]) -> Option<(Vec<String>, Vec<String>)> {
+    if refs.is_empty() {
+        return None;
+    }
+    // Split into parallel arrays so a single UNNEST round-trip can pair
+    // each blob digest with its kind, all against the constant
+    // manifest_digest / repo_id.
+    let blob_digests: Vec<String> = refs.iter().map(|r| r.digest.clone()).collect();
+    let kinds: Vec<String> = refs.iter().map(|r| r.kind.to_string()).collect();
+    Some((blob_digests, kinds))
+}
+
+/// Insert (manifest_digest, blob_digest, repository_id, kind) rows into
+/// `manifest_blob_refs` for every config/layer blob of an image manifest.
+/// Idempotent: on conflict the existing row is kept.
+///
+/// Called inline from `handle_put_manifest` and from the startup backfill.
+/// The caller is responsible for verifying that `manifest_body` is a
+/// regular image manifest (NOT an image index -- use
+/// [`is_index_content_type`]); passing an index body just inserts zero
+/// rows because it has no config/layers.
+///
+/// ADDITIVE ONLY (#1635): this records references so a future GC can judge
+/// blob orphanhood safely. It performs no deletion.
+///
+/// Performance: the inserts run as a single round-trip via `UNNEST` so a
+/// manifest with N layers costs one DB call, not N. This matters because
+/// `handle_put_manifest` calls this synchronously on the request hot path.
+pub async fn record_manifest_blob_refs(
+    db: &PgPool,
+    repo_id: Uuid,
+    manifest_digest: &str,
+    manifest_body: &[u8],
+) -> Result<usize, sqlx::Error> {
+    let refs = extract_blob_refs(manifest_body);
+    let (blob_digests, kinds) = match blob_refs_to_columns(&refs) {
+        Some(cols) => cols,
+        None => return Ok(0),
+    };
+    let res = sqlx::query(
+        r#"
+        INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+        SELECT $1, blob, $4, knd
+        FROM UNNEST($2::text[], $3::text[]) AS t(blob, knd)
+        ON CONFLICT (manifest_digest, blob_digest, repository_id) DO NOTHING
+        "#,
+    )
+    .bind(manifest_digest)
+    .bind(&blob_digests)
+    .bind(&kinds)
+    .bind(repo_id)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
+/// Atomically upsert the `oci_tags` row for a pushed/cached manifest AND
+/// record its blob/child references in a SINGLE database transaction
+/// (#1409, review finding 3).
+///
+/// Why a transaction: previously the tag upsert and the ref recording ran
+/// as two separate, non-transactional statements, with ref recording
+/// best-effort (warn-on-error, the push/cache still succeeded). That could
+/// leave a live tag whose `manifest_blob_refs` / `oci_manifest_refs` rows
+/// were missing, which pins the blob-GC readiness gate
+/// (`any_live_manifest_missing_refs`) on indefinitely. Wrapping both writes
+/// in one transaction makes the invariant atomic: either the tag AND its
+/// refs are committed together, or neither is. If the ref insert fails the
+/// whole transaction rolls back and the caller fails the push/cache, so a
+/// live tag can NEVER be acked without its references.
+///
+/// Scope of the transaction is deliberately narrow — it wraps ONLY the two
+/// DB writes (the `oci_tags` upsert and the single batched ref insert).
+/// Manifest classification, blob/manifest storage I/O, and any network I/O
+/// happen entirely outside `tx`, so this never holds a transaction open
+/// across slow I/O and keeps lock-ordering identical to the rest of the
+/// push path (the only rows touched are `oci_tags` for `(repo, name, tag)`
+/// and the `*_refs` rows for the new `manifest_digest`).
+///
+/// On the success path the resulting database state is byte-identical to
+/// the previous two-statement form (same upsert SQL, same `UNNEST` ref
+/// insert with the same `ON CONFLICT DO NOTHING`). The only behavioural
+/// change is in the failure direction: a ref-write error now rolls the tag
+/// back and propagates instead of being swallowed by a `warn!`.
+///
+/// `class` must already be the CONTENT-based classification
+/// ([`classify_manifest`]); `Malformed` records no refs (callers reject it
+/// before reaching here, but the arm is harmless if hit). `Index` bodies
+/// record `oci_manifest_refs` (parent→child edges); `Image` bodies record
+/// `manifest_blob_refs` (config + layer edges).
+///
+/// TODO(#1610): the residual sub-grace-period TOCTOU between a concurrent
+/// re-push of an already-existing >24h-old blob and `run_blob_gc` is NOT
+/// closed here — it is bounded by the grace window + readiness gate +
+/// opt-in `BLOB_GC_ENABLED` and tracked as a follow-up. The push-side
+/// `SELECT ... FOR UPDATE` on `oci_blobs` that would close it would go
+/// inside this transaction, before the ref insert.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_tag_and_refs(
+    pool: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    tag: &str,
+    manifest_digest: &str,
+    manifest_content_type: &str,
+    class: &ManifestClass,
+    manifest_body: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // 1. Tag upsert (identical SQL/semantics to the previous standalone form).
+    sqlx::query(
+        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+             manifest_digest = EXCLUDED.manifest_digest,
+             manifest_content_type = EXCLUDED.manifest_content_type,
+             updated_at = NOW()"#,
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(tag)
+    .bind(manifest_digest)
+    .bind(manifest_content_type)
+    .execute(&mut *tx)
+    .await?;
+
+    // 2. Reference recording, in the SAME transaction. A failure here rolls
+    //    the tag back when `tx` is dropped without a commit.
+    match class {
+        ManifestClass::Index => {
+            let children = extract_child_digests(manifest_body);
+            if !children.is_empty() {
+                sqlx::query(
+                    r#"
+                    INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id)
+                    SELECT $1, child, $3
+                    FROM UNNEST($2::text[]) AS t(child)
+                    ON CONFLICT (parent_digest, child_digest, repository_id) DO NOTHING
+                    "#,
+                )
+                .bind(manifest_digest)
+                .bind(&children)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        ManifestClass::Image => {
+            let refs = extract_blob_refs(manifest_body);
+            if let Some((blob_digests, kinds)) = blob_refs_to_columns(&refs) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+                    SELECT $1, blob, $4, knd
+                    FROM UNNEST($2::text[], $3::text[]) AS t(blob, knd)
+                    ON CONFLICT (manifest_digest, blob_digest, repository_id) DO NOTHING
+                    "#,
+                )
+                .bind(manifest_digest)
+                .bind(&blob_digests)
+                .bind(&kinds)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        ManifestClass::Malformed => {}
+    }
+
+    tx.commit().await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,25 +2708,57 @@ async fn cache_manifest_reference_locally(
         .await
         .map_err(|e| e.to_string())?;
 
-    let manifest_content_type = content_type
-        .unwrap_or("application/vnd.oci.image.manifest.v1+json")
-        .to_string();
+    // Classify by CONTENT — the upstream Content-Type is advisory. A body we
+    // cannot classify as an image or an index is not a real manifest: keep
+    // the cached body for the client, but do NOT create an `oci_tags` row, or
+    // a ref-less live tag would pin the blob-GC gate deployment-wide
+    // (#1409 C1).
+    let class = classify_manifest(content);
+    if matches!(class, ManifestClass::Malformed) {
+        tracing::warn!(
+            repo = %repo.key,
+            image = %repo.image,
+            reference = %reference,
+            manifest_digest = %digest,
+            "Proxied manifest is neither an index nor an image; cached the body \
+             but recorded no oci_tags row or refs (would otherwise pin blob GC)"
+        );
+        return Ok(digest);
+    }
+    // Store a media type derived from content, not the upstream header, so the
+    // gate can't be misled by a mislabeled index.
+    let manifest_content_type = stored_media_type_for(
+        &class,
+        content_type.unwrap_or("application/vnd.oci.image.manifest.v1+json"),
+    );
     let cached_reference = cached_manifest_reference_key(&repo.repo_type, reference, &digest);
 
-    sqlx::query(
-        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-             manifest_digest = EXCLUDED.manifest_digest,
-             manifest_content_type = EXCLUDED.manifest_content_type,
-             updated_at = NOW()"#,
+    // Atomically upsert the digest-keyed tag AND record this manifest's
+    // references in one transaction (#1409 finding 2 + 3). Previously the tag
+    // upsert and the ref recording (the `match` block that used to live near
+    // the end of this fn) were separate statements with ref recording
+    // best-effort. A proxy-cached IMAGE manifest could therefore land as a
+    // live tag with zero `manifest_blob_refs`, which keeps
+    // `any_live_manifest_missing_refs` permanently true and disables blob GC
+    // for the whole deployment. `persist_tag_and_refs` makes the two writes
+    // atomic and propagates a ref-write failure (the caller falls back to a
+    // digest-only pull), so a cached live tag can never exist without its refs.
+    //
+    // Routing is CONTENT-classified inside the helper: an index records
+    // `oci_manifest_refs`, an image records `manifest_blob_refs`. `Malformed`
+    // returned early above without a tag. The secondary tag-keyed `oci_tags`
+    // row and the `artifacts` rows below stay best-effort — they are UI/listing
+    // conveniences, not GC-correctness inputs.
+    persist_tag_and_refs(
+        &state.db,
+        repo.id,
+        &repo.image,
+        &cached_reference,
+        &digest,
+        &manifest_content_type,
+        &class,
+        content,
     )
-    .bind(repo.id)
-    .bind(&repo.image)
-    .bind(&cached_reference)
-    .bind(&digest)
-    .bind(&manifest_content_type)
-    .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -2546,34 +2906,6 @@ async fn cache_manifest_reference_locally(
                  body and oci_tags row are still persisted, but the repository \
                  artifact listing will not include this tag until the next \
                  proxy refresh succeeds"
-            );
-        }
-    }
-
-    // #1357 (review feedback): for multi-arch image-index manifests, record
-    // the (parent_digest -> child_digest) edges so:
-    //   1. The storage GC can protect per-architecture children for as long
-    //      as the index is still tagged (mirrors the push path #1179 guard).
-    //   2. The UI size accounting can walk the index children and report the
-    //      true multi-platform total, rather than just the index body size
-    //      (which is only a few KB for an image whose children sum to GBs).
-    //
-    // Best-effort, warn-on-error: matches the push-path semantics in
-    // `handle_put_manifest`. The manifest body and oci_tags rows are already
-    // persisted; failure here only affects GC/UI accounting until the
-    // startup backfill in main.rs runs again.
-    if is_index_content_type(&manifest_content_type) {
-        if let Err(e) = record_oci_manifest_refs(&state.db, repo.id, &digest, content).await {
-            tracing::warn!(
-                repo = %repo.key,
-                image = %repo.image,
-                reference = %reference,
-                parent_digest = %digest,
-                error = %e,
-                "Failed to record oci_manifest_refs for proxied index manifest; \
-                 storage GC may treat child manifests as orphaned and the UI \
-                 size accounting will under-report multi-arch totals until the \
-                 next backfill pass runs"
             );
         }
     }
@@ -3509,6 +3841,23 @@ async fn handle_start_upload(
         let canonical_digest = computed.as_prefixed();
         let key = blob_storage_key(&canonical_digest);
 
+        // The final `oci-blobs/<digest>` object is written before the
+        // `oci_blobs` row is committed. If the INSERT then fails, the object
+        // would otherwise be orphaned (no row references it, and the
+        // abandoned-session sweep only walks temp/part keys). Journal the final
+        // key first so the cleanup-key reaper can reclaim it on DB failure; the
+        // reaper treats a blob key as referenced once an `oci_blobs` row for the
+        // digest exists, so a committed/referenced blob is never reclaimed.
+        if let Err(resp) = register_oci_upload_cleanup_key(&state.db, repo_id, None, &key).await {
+            delete_storage_key_best_effort(
+                &storage,
+                &temp_key,
+                "monolithic blob cleanup registration failed",
+            )
+            .await;
+            return resp;
+        }
+
         if let Err(e) = storage.copy(&temp_key, &key).await {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob copy failed")
                 .await;
@@ -3527,6 +3876,12 @@ async fn handle_start_upload(
         .execute(&state.db)
         .await
         {
+            // Leave the (still NULL-marked) journal entry for the blob key in
+            // place: the pending reaper reclaims the orphaned
+            // `oci-blobs/<digest>` object since no `oci_blobs` row references it.
+            // Do NOT delete the blob object here — a concurrent push of the same
+            // digest may be committing it (the reaper's `oci_blobs` EXISTS guard
+            // protects that live blob).
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob row insert failed")
                 .await;
             return oci_error(
@@ -3536,6 +3891,10 @@ async fn handle_start_upload(
             );
         }
 
+        // The blob row is durable, so the blob key is now referenced. Drop its
+        // journal entry; the reaper would in any case refuse to reclaim it via
+        // the `oci_blobs` EXISTS guard.
+        clear_oci_upload_cleanup_key_best_effort(&state.db, &key).await;
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
 
         return Response::builder()
@@ -4406,6 +4765,32 @@ async fn handle_complete_upload(
             )
             .await;
         }
+        // Journal the final blob key before promoting the part to it. If the
+        // `oci_blobs` commit below fails, the copied `oci-blobs/<digest>` object
+        // would otherwise be an unreclaimable orphan. The reaper treats the key
+        // as referenced once an `oci_blobs` row exists, so a committed blob is
+        // never reclaimed; see `clear_oci_upload_cleanup_key_best_effort` after
+        // the transaction commits.
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &blob_key,
+        )
+        .await
+        {
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
         if let Err(e) = storage.copy(&parts[0].storage_key, &blob_key).await {
             if let Err(reset_resp) = reset_oci_upload_session_state(
                 &state.db,
@@ -4653,6 +5038,44 @@ async fn handle_complete_upload(
                 ),
             );
         }
+        // Journal the final blob key before promoting the concatenated object to
+        // it, mirroring the single-part branch above. On `oci_blobs` commit
+        // failure the reaper reclaims the orphaned `oci-blobs/<digest>` object;
+        // once the row commits the reaper treats the key as referenced.
+        if let Err(resp) = register_oci_upload_cleanup_key(
+            &state.db,
+            session.repository_id,
+            Some(session_id),
+            &blob_key,
+        )
+        .await
+        {
+            delete_storage_key_best_effort(
+                &storage,
+                &completion_temp_key,
+                "completion blob cleanup registration failed",
+            )
+            .await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion blob cleanup registration failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return resp;
+        }
         if let Err(e) = storage.copy(&completion_temp_key, &blob_key).await {
             delete_storage_key_best_effort(
                 &storage,
@@ -4839,6 +5262,10 @@ async fn handle_complete_upload(
         .await
         {
             Ok(true) => {
+                // The `oci_blobs` row is durable, so the blob key is now
+                // referenced. Drop its journal entry (the reaper's `oci_blobs`
+                // guard would refuse to reclaim it regardless).
+                clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
                 let mut cleanup_keys: Vec<String> =
                     parts.iter().map(|part| part.storage_key.clone()).collect();
                 cleanup_keys.push(session.storage_temp_key.clone());
@@ -4888,6 +5315,12 @@ async fn handle_complete_upload(
             &e.to_string(),
         );
     }
+
+    // The `oci_blobs` row committed durably, so the blob key is now referenced.
+    // Drop its journal entry. (The reaper independently refuses to reclaim it via
+    // the `oci_blobs` EXISTS guard, so a committed blob is never reclaimed even
+    // if this best-effort clear is lost.)
+    clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
 
     let mut cleanup_keys: Vec<String> = parts.iter().map(|part| part.storage_key.clone()).collect();
     cleanup_keys.push(session.storage_temp_key.clone());
@@ -5101,6 +5534,11 @@ async fn handle_get_manifest(
         };
         let manifest_key = manifest_storage_key(&manifest_digest);
 
+        // Manifests are small metadata, not large artifact bodies: keep this
+        // path buffered so we can emit an accurate Content-Length. Container
+        // clients (docker, podman, containerd) require Content-Length on
+        // manifest responses, and the oci_tags row carries no size column to
+        // set it from a stream. Only large blob BODIES are streamed (above).
         if let Ok(data) = storage.get(&manifest_key).await {
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: serving from migrated oci_tags (local hit)");
             return Response::builder()
@@ -5209,6 +5647,27 @@ async fn handle_put_manifest(
     let digest = compute_sha256(&body);
     let manifest_key = manifest_storage_key(&digest);
 
+    // Classify by content BEFORE storing or tagging. The Content-Type header
+    // is unreliable (defaults to the image type when absent), so a degenerate
+    // body — neither an index (`manifests[]`) nor an image (`config.digest`),
+    // or unparseable — must be rejected here; accepting it would create a
+    // live tag with zero `manifest_blob_refs` and pin the blob-GC gate
+    // deployment-wide (#1409 C1).
+    let class = classify_manifest(&body);
+    if matches!(class, ManifestClass::Malformed) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "manifest is neither an image index (no `manifests`) nor an image \
+             (no `config` descriptor), or is not valid JSON",
+        );
+    }
+    // Store a media type derived from content, not the header, so the gate
+    // (which keys on it) treats an index as an index even when pushed with an
+    // image/missing Content-Type. The index/image ref-routing below then
+    // stays correct because it reads this canonicalized value.
+    let content_type = stored_media_type_for(&class, &content_type);
+
     // Store manifest
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -5220,31 +5679,9 @@ async fn handle_put_manifest(
             )
         }
     };
+    // A storage write failure is a server/storage fault, not an invalid
+    // manifest (the body already passed classification) — surface 500.
     if let Err(e) = storage.put(&manifest_key, body.clone()).await {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MANIFEST_INVALID",
-            &e.to_string(),
-        );
-    }
-
-    // Upsert tag mapping
-    if let Err(e) = sqlx::query!(
-        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-             manifest_digest = EXCLUDED.manifest_digest,
-             manifest_content_type = EXCLUDED.manifest_content_type,
-             updated_at = NOW()"#,
-        repo_id,
-        image,
-        reference,
-        digest,
-        content_type
-    )
-    .execute(&state.db)
-    .await
-    {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -5252,27 +5689,37 @@ async fn handle_put_manifest(
         );
     }
 
-    // For multi-arch image indexes, record the (parent_digest -> child_digest)
-    // edges so the storage GC can protect per-architecture children for as
-    // long as the index is still tagged (#1179). The storage GC's NOT EXISTS
-    // guards in `storage_gc_service.rs` only protect digests that appear in
-    // `oci_tags` directly; children of an index never appear there.
+    // Atomically upsert the tag AND record this manifest's references in one
+    // transaction (#1409 finding 3). Previously the tag upsert and the ref
+    // recording were two separate statements with ref recording best-effort
+    // (warn-on-error, push still 201). That could ack a live tag whose refs
+    // were missing, pinning the blob-GC readiness gate. `persist_tag_and_refs`
+    // makes the two writes atomic: a ref-write failure rolls the tag back and
+    // fails the push, so a live tag can never exist without its references.
     //
-    // Best-effort: a failure to write the refs is logged but does not fail
-    // the push, since the manifest itself has been persisted and the tag
-    // upsert succeeded. The startup backfill in main.rs will fill in any
-    // gaps on the next restart.
-    if is_index_content_type(&content_type) {
-        if let Err(e) = record_oci_manifest_refs(&state.db, repo_id, &digest, &body).await {
-            warn!(
-                image = image_name,
-                reference = reference,
-                parent_digest = digest.as_str(),
-                error = %e,
-                "Failed to record oci_manifest_refs for index manifest; storage GC may treat \
-                 child manifests as orphaned until the next backfill pass runs"
-            );
-        }
+    // Routing stays CONTENT-classified inside the helper: an image body pushed
+    // with an index Content-Type still records `manifest_blob_refs`, never
+    // `oci_manifest_refs` with 0 children (#1409 C1). `Malformed` was rejected
+    // with 400 above. The startup backfill in main.rs remains a safety net for
+    // rows that pre-date this code, but is no longer needed to repair a push
+    // that returned 201.
+    if let Err(e) = persist_tag_and_refs(
+        &state.db,
+        repo_id,
+        &image,
+        reference,
+        &digest,
+        &content_type,
+        &class,
+        &body,
+    )
+    .await
+    {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
     }
 
     // Calculate total image size from manifest (config + layers)
@@ -6089,6 +6536,45 @@ async fn catalog_local_entries(
     Ok((entries, has_more))
 }
 
+/// Remove the `manifest_blob_refs` rows for a manifest being deleted, so its
+/// config + layer blobs become reclaimable by blob GC once nothing else
+/// references them (#1409). Without this, refs live forever and a blob stays
+/// pinned even after every referencing manifest is gone.
+///
+/// Scoped to NOT delete refs for a digest that is still a live
+/// per-architecture child of a tagged image index: such a child's blobs are
+/// protected ONLY by these rows (the blob-orphan predicate has no
+/// `oci_manifest_refs` join), so deleting them while the index still serves
+/// the child would strip a live image's protection. The caller deletes the
+/// manifest's `oci_tags` rows first; this then runs in the same delete path.
+async fn delete_manifest_blob_refs(
+    db: &PgPool,
+    repo_id: Uuid,
+    manifest_digest: &str,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        r#"
+        DELETE FROM manifest_blob_refs
+        WHERE repository_id = $1
+          AND manifest_digest = $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM oci_manifest_refs omr
+            JOIN oci_tags ot
+              ON ot.repository_id = omr.repository_id
+             AND ot.manifest_digest = omr.parent_digest
+            WHERE omr.repository_id = $1
+              AND omr.child_digest = $2
+          )
+        "#,
+    )
+    .bind(repo_id)
+    .bind(manifest_digest)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 async fn handle_delete_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6114,9 +6600,12 @@ async fn handle_delete_manifest(
         Err(e) => return e,
     };
 
-    // Resolve the manifest digest. The reference may be a tag name or a digest.
-    let manifest_digest: Option<String> = if reference.starts_with("sha256:") {
-        // Verify the digest actually exists in our tag table
+    // Resolve the manifest digest. The reference may be a tag name or a
+    // digest. A query error must surface as 500, never be flattened into a
+    // 404: an OCI client treats 404 as "already deleted" and stops retrying,
+    // so masking a transient DB outage as MANIFEST_UNKNOWN would silently
+    // abandon the delete and hide the outage in the logs as not-founds.
+    let manifest_digest: Result<Option<String>, sqlx::Error> = if reference.starts_with("sha256:") {
         sqlx::query_scalar!(
             "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id,
@@ -6124,8 +6613,6 @@ async fn handle_delete_manifest(
         )
         .fetch_optional(&state.db)
         .await
-        .ok()
-        .flatten()
     } else {
         sqlx::query_scalar!(
             "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
@@ -6135,17 +6622,22 @@ async fn handle_delete_manifest(
         )
         .fetch_optional(&state.db)
         .await
-        .ok()
-        .flatten()
     };
 
     let digest = match manifest_digest {
-        Some(d) => d,
-        None => {
+        Ok(Some(d)) => d,
+        Ok(None) => {
             return oci_error(
                 StatusCode::NOT_FOUND,
                 "MANIFEST_UNKNOWN",
                 "manifest not found",
+            )
+        }
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
             )
         }
     };
@@ -6163,6 +6655,21 @@ async fn handle_delete_manifest(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             &e.to_string(),
+        );
+    }
+
+    // #1409: drop the manifest's blob refs so its config + layer blobs become
+    // reclaimable once nothing else references them. Scoped to skip a digest
+    // still referenced as a live per-architecture child of a tagged index
+    // (its blobs are protected ONLY by these rows). Best-effort: leaving refs
+    // only over-protects (a leak), never deletes a live blob.
+    if let Err(e) = delete_manifest_blob_refs(&state.db, repo.id, &digest).await {
+        warn!(
+            image = image_name,
+            digest = %digest,
+            error = %e,
+            "Failed to delete manifest_blob_refs on manifest deletion; the \
+             manifest's blobs stay GC-protected until this is retried"
         );
     }
 
@@ -6791,6 +7298,31 @@ mod tests {
     fn test_oci_scopes_grant_empty_scopes_rejected() {
         let scopes = Some(vec![]);
         assert!(!oci_scopes_grant(&scopes, "write"));
+    }
+
+    // #1316: `oci_scopes_grant` now delegates the wildcard decision to the
+    // canonical `token_service::scopes_grant_access` helper instead of an
+    // inline `== "admin"` string match. Behavior must be identical: an
+    // `admin`-scoped token authorizes write/delete, and a non-admin token
+    // without the required scope (or a wildcard) is denied.
+    #[test]
+    fn test_oci_scopes_grant_matches_canonical_helper_for_admin_and_denial() {
+        let admin = vec!["admin".to_string()];
+        let read_only = vec!["read".to_string()];
+        for required in ["write", "delete"] {
+            // Admin token: granted, and identical to the canonical decision.
+            assert!(oci_scopes_grant(&Some(admin.clone()), required));
+            assert_eq!(
+                oci_scopes_grant(&Some(admin.clone()), required),
+                crate::services::token_service::scopes_grant_access(&admin, required),
+            );
+            // Read-only (non-admin) token: denied on write/delete.
+            assert!(!oci_scopes_grant(&Some(read_only.clone()), required));
+            assert_eq!(
+                oci_scopes_grant(&Some(read_only.clone()), required),
+                crate::services::token_service::scopes_grant_access(&read_only, required),
+            );
+        }
     }
 
     #[tokio::test]
@@ -10272,6 +10804,111 @@ mod oci_manifest_refs_tests {
     use super::*;
 
     #[test]
+    fn classify_manifest_detects_index_image_and_malformed() {
+        assert!(matches!(
+            classify_manifest(br#"{"manifests":[{"digest":"sha256:c"}]}"#),
+            ManifestClass::Index
+        ));
+        assert!(matches!(
+            classify_manifest(br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#),
+            ManifestClass::Image
+        ));
+        // Neither manifests[] nor config.digest, and unparseable.
+        assert!(matches!(
+            classify_manifest(br#"{"schemaVersion":2}"#),
+            ManifestClass::Malformed
+        ));
+        assert!(matches!(
+            classify_manifest(b"not json"),
+            ManifestClass::Malformed
+        ));
+        // An index wins even when a config is also present.
+        assert!(matches!(
+            classify_manifest(br#"{"manifests":[],"config":{"digest":"sha256:x"}}"#),
+            ManifestClass::Index
+        ));
+    }
+
+    /// #1409 C1: the STORED media type is derived from content, so the gate
+    /// can't be misled. An index body (even empty) stores an index media type
+    /// even when pushed with an image/missing Content-Type; images keep their
+    /// non-index header.
+    #[test]
+    fn stored_media_type_is_derived_from_content() {
+        let img = "application/vnd.oci.image.manifest.v1+json";
+        let docker_list = "application/vnd.docker.distribution.manifest.list.v2+json";
+        let idx = classify_manifest(br#"{"manifests":[{"digest":"sha256:c"}]}"#);
+        assert!(is_index_content_type(&stored_media_type_for(&idx, img)));
+        let empty_idx = classify_manifest(br#"{"manifests":[]}"#);
+        assert!(is_index_content_type(&stored_media_type_for(
+            &empty_idx, img
+        )));
+        // Docker manifest-list variant preserved.
+        assert_eq!(stored_media_type_for(&idx, docker_list), docker_list);
+        // Image keeps its (non-index) header.
+        let image = classify_manifest(br#"{"config":{"digest":"sha256:cfg"}}"#);
+        assert_eq!(stored_media_type_for(&image, img), img);
+        assert!(!is_index_content_type(&stored_media_type_for(&image, img)));
+        // #1409 C1: an image body pushed with an INDEX Content-Type must NOT
+        // be stored as an index type (the gate would wrongly exclude it).
+        assert!(!is_index_content_type(&stored_media_type_for(
+            &image,
+            docker_list
+        )));
+    }
+
+    /// #1409: delete_manifest_blob_refs removes a deleted manifest's refs but
+    /// preserves a digest still live as a tagged index's child.
+    #[tokio::test]
+    async fn delete_manifest_blob_refs_preserves_live_index_child() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let standalone = format!("sha256:{}", "1".repeat(64));
+        let index = format!("sha256:{}", "2".repeat(64));
+        let child = format!("sha256:{}", "3".repeat(64));
+        for m in [&standalone, &child] {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+                 VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+            )
+            .bind(m)
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .expect("seed refs");
+        }
+        sqlx::query("INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) VALUES ($1,$2,$3)")
+            .bind(&index).bind(&child).bind(repo).execute(&fixture.pool).await.expect("seed edge");
+        sqlx::query("INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) VALUES ($1,'i/x','latest',$2,'application/vnd.oci.image.index.v1+json')")
+            .bind(repo).bind(&index).execute(&fixture.pool).await.expect("seed index tag");
+
+        let removed = delete_manifest_blob_refs(&fixture.pool, repo, &standalone)
+            .await
+            .expect("delete standalone");
+        let child_removed = delete_manifest_blob_refs(&fixture.pool, repo, &child)
+            .await
+            .expect("delete child (guarded)");
+        let child_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id=$1 AND manifest_digest=$2",
+        )
+        .bind(repo)
+        .bind(&child)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count");
+        fixture.teardown().await;
+        assert_eq!(removed, 2, "standalone manifest's refs removed");
+        assert_eq!(
+            child_removed, 0,
+            "live index child's refs must be preserved"
+        );
+        assert_eq!(child_rows, 2, "child refs still present");
+    }
+
+    #[test]
     fn is_index_content_type_matches_oci_and_docker_index() {
         assert!(is_index_content_type(
             "application/vnd.oci.image.index.v1+json"
@@ -10364,6 +11001,190 @@ mod oci_manifest_refs_tests {
         }"#;
         let children = extract_child_digests(body);
         assert_eq!(children, vec!["sha256:aaaa", "sha256:bbbb"]);
+    }
+
+    // -- manifest_blob_refs (#1635) blob-edge extraction --------------------
+
+    #[test]
+    fn extract_blob_refs_parses_config_and_layers() {
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 7023,
+                "digest": "sha256:config0"
+            },
+            "layers": [
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 32654, "digest": "sha256:layer1"},
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 16724, "digest": "sha256:layer2"}
+            ]
+        }"#;
+        let refs = extract_blob_refs(body);
+        assert_eq!(
+            refs,
+            vec![
+                BlobRef {
+                    digest: "sha256:config0".to_string(),
+                    kind: "config"
+                },
+                BlobRef {
+                    digest: "sha256:layer1".to_string(),
+                    kind: "layer"
+                },
+                BlobRef {
+                    digest: "sha256:layer2".to_string(),
+                    kind: "layer"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_empty_for_image_index() {
+        // An image index references child manifests, not blobs: it has no
+        // `config` and no `layers`, so it must produce zero blob edges.
+        let body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"digest": "sha256:childamd64", "platform": {"architecture": "amd64", "os": "linux"}},
+                {"digest": "sha256:childarm64", "platform": {"architecture": "arm64", "os": "linux"}}
+            ]
+        }"#;
+        assert!(
+            extract_blob_refs(body).is_empty(),
+            "image index has no config/layers blobs"
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_handles_missing_config_or_layers() {
+        // Config present, no layers array.
+        let cfg_only = br#"{"config": {"digest": "sha256:cfg"}}"#;
+        assert_eq!(
+            extract_blob_refs(cfg_only),
+            vec![BlobRef {
+                digest: "sha256:cfg".to_string(),
+                kind: "config"
+            }]
+        );
+        // Layers present, no config.
+        let layers_only = br#"{"layers": [{"digest": "sha256:l1"}]}"#;
+        assert_eq!(
+            extract_blob_refs(layers_only),
+            vec![BlobRef {
+                digest: "sha256:l1".to_string(),
+                kind: "layer"
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_blob_refs_empty_for_malformed_json() {
+        assert!(extract_blob_refs(b"not json").is_empty());
+        assert!(extract_blob_refs(b"").is_empty());
+        assert!(extract_blob_refs(b"{").is_empty());
+        assert!(extract_blob_refs(b"{}").is_empty());
+    }
+
+    #[test]
+    fn extract_blob_refs_skips_layers_missing_digest() {
+        let body = br#"{
+            "config": {"size": 1},
+            "layers": [
+                {"digest": "sha256:l1"},
+                {"size": 5},
+                {"digest": null},
+                {"digest": "sha256:l2"}
+            ]
+        }"#;
+        // Config has no digest -> skipped. Two valid layer digests remain.
+        let refs = extract_blob_refs(body);
+        assert_eq!(
+            refs,
+            vec![
+                BlobRef {
+                    digest: "sha256:l1".to_string(),
+                    kind: "layer"
+                },
+                BlobRef {
+                    digest: "sha256:l2".to_string(),
+                    kind: "layer"
+                },
+            ]
+        );
+    }
+
+    // -- blob_refs_to_columns (#1635) UNNEST column-pairing -----------------
+
+    #[test]
+    fn blob_refs_to_columns_none_for_empty() {
+        // No refs -> no insert; caller short-circuits the DB round-trip.
+        assert!(blob_refs_to_columns(&[]).is_none());
+    }
+
+    #[test]
+    fn blob_refs_to_columns_pairs_digests_and_kinds_in_order() {
+        let refs = vec![
+            BlobRef {
+                digest: "sha256:config0".to_string(),
+                kind: "config",
+            },
+            BlobRef {
+                digest: "sha256:layer1".to_string(),
+                kind: "layer",
+            },
+            BlobRef {
+                digest: "sha256:layer2".to_string(),
+                kind: "layer",
+            },
+        ];
+        let (digests, kinds) =
+            blob_refs_to_columns(&refs).expect("non-empty refs yield Some columns");
+        // The two arrays must be index-aligned: digests[i] pairs kinds[i]
+        // for the UNNEST($2, $3) insert.
+        assert_eq!(
+            digests,
+            vec![
+                "sha256:config0".to_string(),
+                "sha256:layer1".to_string(),
+                "sha256:layer2".to_string(),
+            ]
+        );
+        assert_eq!(
+            kinds,
+            vec![
+                "config".to_string(),
+                "layer".to_string(),
+                "layer".to_string(),
+            ]
+        );
+        assert_eq!(digests.len(), kinds.len());
+    }
+
+    #[test]
+    fn blob_refs_to_columns_round_trips_extracted_refs() {
+        // End-to-end of the pure pipeline: parse a manifest body, then map
+        // it to the two insert columns the UNNEST query binds.
+        let body = br#"{
+            "config": {"digest": "sha256:cfg"},
+            "layers": [{"digest": "sha256:l1"}, {"digest": "sha256:l2"}]
+        }"#;
+        let refs = extract_blob_refs(body);
+        let (digests, kinds) =
+            blob_refs_to_columns(&refs).expect("manifest with blobs yields columns");
+        assert_eq!(digests, vec!["sha256:cfg", "sha256:l1", "sha256:l2"]);
+        assert_eq!(kinds, vec!["config", "layer", "layer"]);
+    }
+
+    #[test]
+    fn blob_refs_to_columns_none_for_blobless_manifest_body() {
+        // An image index has no config/layers -> extract yields nothing ->
+        // columns are None so record_manifest_blob_refs inserts zero rows.
+        let index = br#"{"manifests": [{"digest": "sha256:child"}]}"#;
+        let refs = extract_blob_refs(index);
+        assert!(blob_refs_to_columns(&refs).is_none());
     }
 }
 
@@ -10537,6 +11358,148 @@ mod oci_blob_upload_streaming_tests {
             .await
             .expect("response body");
         (status, headers, body)
+    }
+
+    async fn count_manifest_blob_refs(f: &OciUploadFixture, digest: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count manifest_blob_refs")
+    }
+
+    /// #1409 C1: a non-index PUT that is neither an image nor an index (here
+    /// valid JSON with neither, no Content-Type so the header defaults to the
+    /// image type) must be rejected (400) and create NO live tag.
+    #[tokio::test]
+    async fn put_degenerate_manifest_is_rejected_and_creates_no_tag() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let body = Bytes::from_static(br#"{"schemaVersion":2,"layers":[]}"#);
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::PUT,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "degenerate manifest must be rejected"
+        );
+        let tags: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count tags");
+        f.teardown().await;
+        assert_eq!(
+            tags, 0,
+            "a rejected degenerate manifest must not create a live tag"
+        );
+    }
+
+    /// #1409: a manifest DELETE removes its blob refs (so the blobs become
+    /// reclaimable) end-to-end through the router.
+    #[tokio::test]
+    async fn delete_manifest_removes_blob_refs() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+             VALUES ($1, 'app', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed tag");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&digest)
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed refs");
+
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "delete must return 202");
+        let remaining = count_manifest_blob_refs(&f, &digest).await;
+        f.teardown().await;
+        assert_eq!(remaining, 0, "manifest delete must remove its blob refs");
+    }
+
+    /// #1409: deleting a child by digest while its index is still tagged must
+    /// NOT strip the child's blob refs.
+    #[tokio::test]
+    async fn delete_manifest_preserves_live_index_child_blob_refs() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let index = format!("sha256:{}", "1".repeat(64));
+        let child = format!("sha256:{}", "2".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+             VALUES ($1, 'app', 'latest', $2, 'application/vnd.oci.image.index.v1+json'),
+                    ($1, 'app', $3, $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&index)
+        .bind(&child)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed tags");
+        sqlx::query("INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) VALUES ($1,$2,$3)")
+            .bind(&index).bind(&child).bind(f.inner.repo_id).execute(&f.inner.pool).await.expect("seed edge");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&child)
+        .bind(f.inner.repo_id)
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed child refs");
+
+        let (status, _h, _b) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/{}", f.inner.repo_key, child),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "child delete must return 202");
+        let child_refs = count_manifest_blob_refs(&f, &child).await;
+        f.teardown().await;
+        assert_eq!(
+            child_refs, 2,
+            "a live index child's refs must survive its by-digest delete"
+        );
     }
 
     async fn oci_blob_count(f: &OciUploadFixture, digest: &str) -> i64 {
@@ -11195,6 +12158,111 @@ mod oci_blob_upload_streaming_tests {
                 .execute(&self.pool)
                 .await
                 .map_err(AppError::from)?;
+
+            Ok(())
+        }
+    }
+
+    /// Storage backend whose `copy` succeeds (so the `oci-blobs/<digest>`
+    /// object is written) but installs a temporary trigger that makes the
+    /// subsequent `oci_blobs` INSERT raise, *without* deleting the repository
+    /// (so the cleanup-journal row survives, unlike `DeleteRepoOnCopyStorage`).
+    /// Used to prove the orphan is journaled for GC reclamation (#1527).
+    struct RejectBlobInsertStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        pool: PgPool,
+        repository_id: Uuid,
+        digest: String,
+        trigger_name: String,
+    }
+
+    impl RejectBlobInsertStorage {
+        fn new(pool: PgPool, repository_id: Uuid, digest: String) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                pool,
+                repository_id,
+                digest,
+                trigger_name: format!("reject_blob_{}", Uuid::new_v4().simple()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for RejectBlobInsertStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let content = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(source)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", source)))?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(dest.to_string(), content);
+
+            // Install a trigger that raises only for this repo+digest, so the
+            // handler's `oci_blobs` INSERT fails like a real DB constraint
+            // error while every other row (and the journal) is untouched.
+            let fn_name = format!("{}_fn", self.trigger_name);
+            sqlx::query(&format!(
+                r#"
+                CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
+                BEGIN
+                    IF NEW.repository_id = '{repo}'::uuid AND NEW.digest = '{digest}' THEN
+                        RAISE EXCEPTION 'injected oci_blobs insert failure';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                "#,
+                fn_name = fn_name,
+                repo = self.repository_id,
+                digest = self.digest,
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::from)?;
+            sqlx::query(&format!(
+                r#"
+                CREATE TRIGGER {trig}
+                    BEFORE INSERT ON oci_blobs
+                    FOR EACH ROW EXECUTE FUNCTION {fn_name}()
+                "#,
+                trig = self.trigger_name,
+                fn_name = fn_name,
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::from)?;
 
             Ok(())
         }
@@ -11897,6 +12965,173 @@ mod oci_blob_upload_streaming_tests {
             keys.iter().any(|key| key == &blob_storage_key(&digest)),
             "digest-global blob object must not be deleted on DB failure because another same-digest upload may be committing it: {:?}",
             keys
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_journals_orphaned_blob_when_insert_fails() {
+        // Regression for #1527: when the `oci_blobs` INSERT fails AFTER the blob
+        // object was copied to `oci-blobs/<digest>`, the surviving object must be
+        // recorded in the cleanup journal so storage GC can reclaim the orphan.
+        // The INSERT here is failed by a poisoned `oci_blobs` row (a duplicate
+        // (repository_id, digest) with a deferred-conflicting state) — see
+        // `RejectBlobInsertStorage`, which leaves the repository (and thus the
+        // journal row) intact, unlike the repo-deleting failure path above.
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"monolithic orphan journal");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let storage = Arc::new(RejectBlobInsertStorage::new(
+            f.inner.pool.clone(),
+            f.inner.repo_id,
+            digest.clone(),
+        ));
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("reject-blob-insert".to_string(), storage_backend);
+        sqlx::query("UPDATE repositories SET storage_backend = 'reject-blob-insert' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry =
+            Arc::new(StorageRegistry::new(backends, "reject-blob-insert".into()));
+        let app = router().with_state(Arc::new(state));
+
+        let (status, _headers, body) = send(
+            app,
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload must fail when the oci_blobs insert is rejected: {:?}",
+            body
+        );
+
+        // The orphaned blob object survives (no naive delete) AND is journaled.
+        assert!(
+            storage.exists(&blob_key).await.expect("blob exists check"),
+            "orphaned blob object must survive a DB insert failure"
+        );
+        let journal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup journal rows for orphaned blob key");
+        assert_eq!(
+            journal_count, 1,
+            "orphaned blob key must have a cleanup-journal entry so GC can reclaim it"
+        );
+        // The orphan is journaled NULL-marked (write never confirmed via the
+        // post-commit clear), so the pending reaper — not the unreferenced one —
+        // reclaims it once aged.
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1 AND storage_write_completed_at IS NULL",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count pending journal rows");
+        assert_eq!(
+            pending_count, 1,
+            "orphaned blob journal entry must be NULL-marked for the pending reaper"
+        );
+
+        // Drop the injected trigger so it cannot affect other tests sharing the
+        // `oci_blobs` table.
+        sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
+            trig = storage.trigger_name
+        ))
+        .execute(&f.inner.pool)
+        .await
+        .expect("drop injected trigger");
+        sqlx::query(&format!(
+            "DROP FUNCTION IF EXISTS {trig}_fn()",
+            trig = storage.trigger_name
+        ))
+        .execute(&f.inner.pool)
+        .await
+        .expect("drop injected trigger function");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn monolithic_upload_clears_blob_cleanup_journal_on_success() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"monolithic success clears journal");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+
+        let (status, _headers, body) = send(
+            f.app(),
+            request(
+                Method::POST,
+                format!(
+                    "/{}/image/blobs/uploads/?digest={}",
+                    f.inner.repo_key, digest
+                ),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "monolithic upload should succeed: {:?}",
+            body
+        );
+
+        // Happy path: the blob row is committed and references the key, so no
+        // cleanup-journal entry should remain that could cause GC to reclaim the
+        // live blob (the reaper's `oci_blobs` guard backstops this, but the row
+        // is also explicitly cleared to avoid unbounded table growth).
+        let journal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup journal rows for committed blob key");
+        assert_eq!(
+            journal_count, 0,
+            "committed blob key must not leave a spurious cleanup-journal entry"
+        );
+
+        let blob_row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count oci_blobs rows");
+        assert_eq!(
+            blob_row_count, 1,
+            "successful upload must leave exactly one referencing oci_blobs row"
         );
 
         f.teardown().await;
@@ -15062,7 +16297,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
 
         // First and second proxy fetches both call cache_manifest_reference_locally.
@@ -15250,6 +16485,60 @@ mod proxy_manifest_artifact_indexing_tests {
         );
     }
 
+    /// #1409 C1: a proxied body that is neither an index nor an image
+    /// (malformed) is cached for the client but must NOT create an `oci_tags`
+    /// row — a ref-less live tag would pin the blob-GC gate deployment-wide.
+    #[tokio::test]
+    async fn cache_manifest_malformed_body_writes_no_tag() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: "library/redis".to_string(),
+        };
+        let body = Bytes::from_static(br#"{"schemaVersion":2}"#);
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache must succeed — body is still stored");
+
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count tags");
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert_eq!(
+            tag_count, 0,
+            "a malformed proxied body must NOT create an oci_tags row"
+        );
+    }
+
     /// For multi-arch image-index manifests the proxy path must also
     /// populate `oci_manifest_refs`, mirroring the push-path behaviour in
     /// `handle_put_manifest`. Without these rows the storage GC over-
@@ -15347,6 +16636,255 @@ mod proxy_manifest_artifact_indexing_tests {
         );
     }
 
+    /// #1409 finding 2 (headline test): a proxy-cached IMAGE manifest must
+    /// record the COMPLETE set of its blob references (config + every layer)
+    /// in `manifest_blob_refs`, so the blob-GC readiness gate
+    /// (`any_live_manifest_missing_refs`) clears for it. Before this PR the
+    /// proxy path wrote only the `oci_tags` row and `oci_manifest_refs` for
+    /// indexes, leaving cached image manifests as ref-less live tags that
+    /// pinned the gate true forever — disabling blob GC across the whole
+    /// deployment wherever proxy repos cache new images.
+    #[tokio::test]
+    async fn cache_manifest_records_blob_refs_for_image_manifest() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/nginx";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // A regular OCI image manifest: one config blob + two layer blobs.
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let l0 = format!("sha256:{}", "0".repeat(64));
+        let l1 = format!("sha256:{}", "1".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{cfg}","size":7023}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{l0}","size":100}},{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{l1}","size":200}}]}}"#
+        );
+        let body = Bytes::from(body_str);
+
+        let manifest_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "latest",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed");
+
+        // Collect the recorded refs for this manifest.
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT blob_digest, kind
+             FROM manifest_blob_refs
+             WHERE repository_id = $1 AND manifest_digest = $2
+             ORDER BY blob_digest",
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_all(&pool)
+        .await
+        .expect("query manifest_blob_refs");
+
+        // The gate must no longer flag THIS manifest as unbackfilled. Mirror
+        // the `select_unbackfilled_manifests` predicate (tagged non-index
+        // manifest with zero manifest_blob_refs rows) scoped to this repo +
+        // digest, so the assertion is deterministic on a shared test DB.
+        let this_manifest_still_unbackfilled: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM oci_tags ot
+                WHERE ot.repository_id = $1
+                  AND ot.manifest_digest = $2
+                  AND NOT EXISTS (
+                        SELECT 1 FROM oci_manifest_refs omr
+                        WHERE omr.repository_id = ot.repository_id
+                          AND omr.parent_digest = ot.manifest_digest
+                    )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM manifest_blob_refs mbr
+                        WHERE mbr.repository_id = ot.repository_id
+                          AND mbr.manifest_digest = ot.manifest_digest
+                    )
+            )
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("scoped unbackfilled check");
+
+        // Clean up before assertions so cleanup runs even on failure.
+        let _ = sqlx::query("DELETE FROM manifest_blob_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs.len(),
+            3,
+            "a proxy-cached image manifest must record one manifest_blob_refs \
+             row per config+layer blob (1 config + 2 layers). Got: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &cfg && k == "config"),
+            "config blob ref must be recorded with kind=config"
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &l0 && k == "layer"),
+            "first layer blob ref must be recorded with kind=layer"
+        );
+        assert!(
+            refs.iter().any(|(b, k)| b == &l1 && k == "layer"),
+            "second layer blob ref must be recorded with kind=layer"
+        );
+        assert!(
+            !this_manifest_still_unbackfilled,
+            "after caching an image manifest with its complete blob refs, the \
+             readiness gate must no longer flag it as missing refs"
+        );
+    }
+
+    /// #1409 finding 3 (atomicity): `persist_tag_and_refs` writes the
+    /// `oci_tags` upsert and the `manifest_blob_refs` insert in ONE
+    /// transaction. If the ref insert fails, the whole transaction rolls
+    /// back — the tag must NOT be left committed, otherwise a live tag could
+    /// exist without its blob refs (the readiness gate would be pinned and
+    /// blob GC disabled, or worse, GC could later delete the live blobs).
+    ///
+    /// Forces the ref insert to fail with a scoped `AFTER INSERT` trigger on
+    /// `manifest_blob_refs` that raises only for this repo's rows, mirroring
+    /// the existing forced-failure trigger pattern used by the upload tests.
+    #[tokio::test]
+    async fn persist_tag_and_refs_rolls_back_tag_on_ref_failure() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Scoped failure trigger: any INSERT into manifest_blob_refs for THIS
+        // repository raises, so the ref insert inside the transaction fails
+        // while the tag upsert before it would otherwise have succeeded.
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
+        let trigger_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 RAISE EXCEPTION 'forced manifest_blob_refs insert failure for atomicity test';
+             END;
+             $$"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON manifest_blob_refs
+             FOR EACH ROW
+             WHEN (NEW.repository_id = '{repo_id}'::uuid)
+             EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create failure trigger");
+
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let l0 = format!("sha256:{}", "0".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{l0}","size":2}}]}}"#
+        );
+        let body = body_str.as_bytes();
+
+        let result = persist_tag_and_refs(
+            &pool,
+            repo_id,
+            "app",
+            "v1",
+            "sha256:deadbeef",
+            "application/vnd.oci.image.manifest.v1+json",
+            &ManifestClass::Image,
+            body,
+        )
+        .await;
+
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count tags");
+        let ref_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count refs");
+
+        // Cleanup (trigger first, so the cascade delete on repositories works).
+        let _ = sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
+        ))
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_err(),
+            "persist_tag_and_refs must propagate the ref-insert failure"
+        );
+        assert_eq!(
+            tag_count, 0,
+            "the oci_tags upsert must be rolled back when the ref insert fails: \
+             a live tag may never be committed without its blob refs"
+        );
+        assert_eq!(
+            ref_count, 0,
+            "no manifest_blob_refs row may survive the rollback"
+        );
+    }
+
     /// Local repos do not get the parallel tag-keyed oci_tags row -- the
     /// `cached_reference == reference` branch in `cached_manifest_reference_key`
     /// returns the original reference, so the digest-keyed insert IS the
@@ -15378,7 +16916,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
         let _ = cache_manifest_reference_locally(
             &state,
@@ -15471,7 +17009,7 @@ mod proxy_manifest_artifact_indexing_tests {
         };
 
         let body = Bytes::from_static(
-            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":7,"digest":"sha256:00"},"layers":[]}"#,
         );
         // Caller supplies a digest reference, NOT a human-readable tag.
         let digest_ref = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";

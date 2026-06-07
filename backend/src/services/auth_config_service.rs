@@ -1540,6 +1540,69 @@ impl AuthConfigService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Env-managed provider reconciliation (issue #1656)
+// ---------------------------------------------------------------------------
+
+/// Outcome of reconciling an env-managed provider against the DB on boot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReconcileAction {
+    Create,
+    Update(Uuid),
+}
+
+/// Select the env-managed provider by name; UI-created providers with other
+/// names are ignored.
+pub fn plan_provider_reconcile(desired_name: &str, existing: &[(Uuid, String)]) -> ReconcileAction {
+    match existing.iter().find(|(_, name)| name == desired_name) {
+        Some((id, _)) => ReconcileAction::Update(*id),
+        None => ReconcileAction::Create,
+    }
+}
+
+impl From<CreateOidcConfigRequest> for UpdateOidcConfigRequest {
+    fn from(c: CreateOidcConfigRequest) -> Self {
+        UpdateOidcConfigRequest {
+            name: Some(c.name),
+            issuer_url: Some(c.issuer_url),
+            client_id: Some(c.client_id),
+            client_secret: Some(c.client_secret),
+            scopes: c.scopes,
+            attribute_mapping: c.attribute_mapping,
+            // Env is definitive: replace the whole mapping so a key removed
+            // from the environment is cleared from the stored config.
+            attribute_mapping_replace: Some(true),
+            is_enabled: c.is_enabled,
+            auto_create_users: c.auto_create_users,
+            pkce_enabled: c.pkce_enabled,
+            map_groups_to_groups: c.map_groups_to_groups,
+        }
+    }
+}
+
+impl From<CreateLdapConfigRequest> for UpdateLdapConfigRequest {
+    fn from(c: CreateLdapConfigRequest) -> Self {
+        UpdateLdapConfigRequest {
+            name: Some(c.name),
+            server_url: Some(c.server_url),
+            bind_dn: c.bind_dn,
+            bind_password: c.bind_password,
+            user_base_dn: Some(c.user_base_dn),
+            user_filter: c.user_filter,
+            group_base_dn: c.group_base_dn,
+            group_filter: c.group_filter,
+            email_attribute: c.email_attribute,
+            display_name_attribute: c.display_name_attribute,
+            username_attribute: c.username_attribute,
+            groups_attribute: c.groups_attribute,
+            admin_group_dn: c.admin_group_dn,
+            use_starttls: c.use_starttls,
+            is_enabled: c.is_enabled,
+            priority: c.priority,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2234,6 +2297,88 @@ mod tests {
         let patch = serde_json::json!("scalar");
         let out = merge_attribute_mapping(&base, &patch);
         assert_eq!(out, serde_json::json!("scalar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Env-managed provider reconciliation (issue #1656)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_reconcile_create_when_absent() {
+        let existing: Vec<(Uuid, String)> = vec![];
+        assert_eq!(
+            plan_provider_reconcile("default", &existing),
+            ReconcileAction::Create
+        );
+    }
+
+    #[test]
+    fn test_plan_reconcile_update_when_name_matches() {
+        let id = Uuid::new_v4();
+        let existing = vec![(id, "default".to_string())];
+        assert_eq!(
+            plan_provider_reconcile("default", &existing),
+            ReconcileAction::Update(id)
+        );
+    }
+
+    #[test]
+    fn test_plan_reconcile_create_ignores_other_named_providers() {
+        let other = Uuid::new_v4();
+        let existing = vec![(other, "Corporate SSO".to_string())];
+        assert_eq!(
+            plan_provider_reconcile("default", &existing),
+            ReconcileAction::Create
+        );
+    }
+
+    #[test]
+    fn test_oidc_create_to_update_carries_secret_and_replaces_mapping() {
+        let c = CreateOidcConfigRequest {
+            name: "default".into(),
+            issuer_url: "https://idp".into(),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            scopes: None,
+            attribute_mapping: None,
+            is_enabled: None,
+            auto_create_users: None,
+            pkce_enabled: None,
+            map_groups_to_groups: None,
+        };
+        let u: UpdateOidcConfigRequest = c.into();
+        assert_eq!(u.issuer_url, Some("https://idp".to_string()));
+        assert_eq!(u.client_id, Some("c".to_string()));
+        assert_eq!(u.client_secret, Some("s".to_string()));
+        assert_eq!(u.attribute_mapping_replace, Some(true));
+    }
+
+    #[test]
+    fn test_ldap_create_to_update_maps_required_fields() {
+        let c = CreateLdapConfigRequest {
+            name: "default".into(),
+            server_url: "ldap://host:389".into(),
+            bind_dn: Some("cn=admin".into()),
+            bind_password: Some("pw".into()),
+            user_base_dn: "ou=users".into(),
+            user_filter: None,
+            group_base_dn: None,
+            group_filter: None,
+            email_attribute: None,
+            display_name_attribute: None,
+            username_attribute: None,
+            groups_attribute: None,
+            admin_group_dn: None,
+            use_starttls: Some(true),
+            is_enabled: Some(true),
+            priority: Some(0),
+        };
+        let u: UpdateLdapConfigRequest = c.into();
+        assert_eq!(u.name, Some("default".to_string()));
+        assert_eq!(u.server_url, Some("ldap://host:389".to_string()));
+        assert_eq!(u.user_base_dn, Some("ou=users".to_string()));
+        assert_eq!(u.bind_dn, Some("cn=admin".to_string()));
+        assert_eq!(u.use_starttls, Some(true));
     }
 
     // =======================================================================
