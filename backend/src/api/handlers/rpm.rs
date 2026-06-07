@@ -123,6 +123,33 @@ async fn try_proxy_repodata(
     ))
 }
 
+/// Build the HTTP 200 response for serving an RPM package body.
+///
+/// Shared by the `/packages/*` download path and the upstream-proxy local
+/// cache-hit path so both emit identical headers. The `body` is supplied by the
+/// caller — always a streaming [`Body::from_stream`] over `get_stream` so the
+/// whole `.rpm` is never buffered in memory (#1608, Core Invariant ①) — and
+/// `size_bytes` is the stored artifact size used for the `Content-Length`
+/// header (we must not read the object to learn its length).
+fn build_rpm_package_response(
+    body: Body,
+    filename: &str,
+    size_bytes: i64,
+    checksum_sha256: &str,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-rpm")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, size_bytes.to_string())
+        .header("X-Checksum-SHA256", checksum_sha256)
+        .body(body)
+        .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // RPM filename parsing
 // ---------------------------------------------------------------------------
@@ -590,25 +617,28 @@ async fn upstream_proxy(
         crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
             .await
             .map_err(|e| e.into_response())?;
-        let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        // Stream the local cache hit instead of buffering the whole .rpm in
+        // memory (#1608, Core Invariant ①). Content-Length comes from the
+        // stored `size_bytes` so we keep the exact byte count without reading
+        // the object first. A missing storage key surfaces as AppError::NotFound
+        // from `get_stream`, matching the storage NotFound contract (#1016).
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Storage error: {}", e),
+                )
+                    .into_response()
+            })?;
 
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/x-rpm")
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{}\"", filename),
-            )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-            .body(Body::from(content))
-            .unwrap());
+        return Ok(build_rpm_package_response(
+            Body::from_stream(stream),
+            filename,
+            artifact.size_bytes,
+            &artifact.checksum_sha256,
+        ));
     }
 
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
@@ -706,17 +736,12 @@ async fn download_package(
     .execute(&state.db)
     .await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/x-rpm")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(build_rpm_package_response(
+        Body::from_stream(stream),
+        filename,
+        artifact.size_bytes,
+        &artifact.checksum_sha256,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2264,5 +2289,144 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "expected 404 for {}", suffix);
         }
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_package_response (#1608 streaming response builder)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_build_rpm_package_response_headers_and_streamed_body() {
+        // The Content-Length MUST come from the supplied `size_bytes`
+        // (the stored artifact size), NOT from re-reading the streamed body.
+        // This pins the #1608 contract: the body is streamed via
+        // `Body::from_stream`, yet the length header is exact.
+        let payload: &[u8] = b"fake-rpm-payload-bytes";
+        let stream = futures::stream::iter(vec![
+            Ok::<bytes::Bytes, crate::error::AppError>(Bytes::from_static(b"fake-rpm-")),
+            Ok(Bytes::from_static(b"payload-bytes")),
+        ]);
+        let body = Body::from_stream(stream);
+
+        let resp = build_rpm_package_response(
+            body,
+            "gitlab-runner-1.0.0-1.x86_64.rpm",
+            payload.len() as i64,
+            "abc123checksum",
+        );
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("application/x-rpm")
+        );
+        assert_eq!(
+            headers.get(CONTENT_LENGTH).unwrap(),
+            HeaderValue::from_str(&payload.len().to_string()).unwrap()
+        );
+        assert_eq!(
+            headers.get("Content-Disposition").unwrap(),
+            HeaderValue::from_static("attachment; filename=\"gitlab-runner-1.0.0-1.x86_64.rpm\"")
+        );
+        assert_eq!(
+            headers.get("X-Checksum-SHA256").unwrap(),
+            HeaderValue::from_static("abc123checksum")
+        );
+
+        // The streamed body must reassemble to the exact original bytes.
+        let collected = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("collect streamed rpm body");
+        assert_eq!(&collected[..], payload);
+    }
+
+    #[tokio::test]
+    async fn test_build_rpm_package_response_content_length_independent_of_body() {
+        // Even when the body is empty, Content-Length reflects the stored
+        // size_bytes argument — the builder never inspects the stream.
+        let resp =
+            build_rpm_package_response(Body::empty(), "pkg-2.0-1.noarch.rpm", 4096, "deadbeef");
+        assert_eq!(
+            resp.headers().get(CONTENT_LENGTH).unwrap(),
+            HeaderValue::from_static("4096")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // upstream_proxy local cache-hit streams the cached .rpm (#1608)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_upstream_proxy_local_cache_hit_streams_bytes() {
+        // A remote repo with a previously-cached .rpm must serve the local
+        // copy by STREAMING it (get_stream + Body::from_stream) rather than
+        // buffering, while emitting the right bytes and a Content-Length
+        // taken from the stored size_bytes.
+        use tower::ServiceExt;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        let rpm_bytes = Bytes::from_static(b"cached-rpm-binary-contents-1234567890");
+        let filename = "cached-pkg-1.2.3-1.x86_64.rpm";
+        let storage_key = format!("rpm/{}/{}", fx.repo_id, filename);
+        let repo = fx.repo_info("remote", Some("http://upstream.invalid"));
+
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            &format!("packages/{}", filename),
+            "cached-pkg",
+            "1.2.3-1",
+            "application/x-rpm",
+            rpm_bytes.clone(),
+            fx.user_id,
+        )
+        .await;
+
+        let app = fx.router_anon(super::router());
+        let req = tdh::get(format!("/{}/{}", fx.repo_key, filename));
+        let resp = app.oneshot(req).await.expect("send cache-hit request");
+
+        let teardown = || async { fx.teardown().await };
+        if resp.status() != StatusCode::OK {
+            let status = resp.status();
+            teardown().await;
+            panic!("cache-hit returned {}", status);
+        }
+
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let checksum_header = resp
+            .headers()
+            .get("X-Checksum-SHA256")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect cache-hit body");
+
+        teardown().await;
+
+        assert_eq!(
+            &body[..],
+            &rpm_bytes[..],
+            "cache-hit body must match stored bytes"
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some(rpm_bytes.len().to_string().as_str()),
+            "Content-Length must equal stored size_bytes"
+        );
+        // seed_artifact stores checksum "test-seed"; verify it is surfaced.
+        assert_eq!(checksum_header.as_deref(), Some("test-seed"));
     }
 }
