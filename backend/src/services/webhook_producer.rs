@@ -48,6 +48,9 @@ pub fn map_event_type(event_type: &str) -> Option<&'static str> {
         "build.started" => Some("build_started"),
         "build.completed" => Some("build_completed"),
         "build.failed" => Some("build_failed"),
+        "age_gate.queued" => Some("age_gate_queued"),
+        "age_gate.approved" => Some("age_gate_approved"),
+        "age_gate.rejected" => Some("age_gate_rejected"),
         _ => None,
     }
 }
@@ -411,6 +414,9 @@ mod tests {
                 WebhookEvent::BuildStarted => ("build.started", "build_started"),
                 WebhookEvent::BuildCompleted => ("build.completed", "build_completed"),
                 WebhookEvent::BuildFailed => ("build.failed", "build_failed"),
+                WebhookEvent::AgeGateQueued => ("age_gate.queued", "age_gate_queued"),
+                WebhookEvent::AgeGateApproved => ("age_gate.approved", "age_gate_approved"),
+                WebhookEvent::AgeGateRejected => ("age_gate.rejected", "age_gate_rejected"),
             }
         }
 
@@ -428,6 +434,9 @@ mod tests {
             WebhookEvent::BuildStarted,
             WebhookEvent::BuildCompleted,
             WebhookEvent::BuildFailed,
+            WebhookEvent::AgeGateQueued,
+            WebhookEvent::AgeGateApproved,
+            WebhookEvent::AgeGateRejected,
         ];
 
         for variant in &all_variants {

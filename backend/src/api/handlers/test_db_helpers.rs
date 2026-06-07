@@ -269,7 +269,10 @@ pub fn make_repo_info(
         storage_path: storage_dir.to_string_lossy().into_owned(),
         storage_backend: "filesystem".to_string(),
         repo_type: repo_type.to_string(),
+        format: "generic".to_string(),
         upstream_url: upstream_url.map(|s| s.to_string()),
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     }
 }
 

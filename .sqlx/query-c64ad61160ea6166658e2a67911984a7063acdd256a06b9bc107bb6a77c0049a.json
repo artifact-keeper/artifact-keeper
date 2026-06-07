@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            r.id, r.key, r.name, r.description,\n            r.format as \"format: RepositoryFormat\",\n            r.repo_type as \"repo_type: RepositoryType\",\n            r.storage_backend, r.storage_path, r.upstream_url,\n            r.is_public, r.quota_bytes,\n            r.replication_priority as \"replication_priority: ReplicationPriority\",\n            r.promotion_target_id, r.promotion_policy_id,\n            r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n            r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n            r.created_at, r.updated_at\n        FROM repositories r\n        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n        WHERE vrm.virtual_repo_id = $1\n        ORDER BY vrm.priority\n        ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days,\n                created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -189,11 +189,21 @@
       },
       {
         "ordinal": 20,
+        "name": "age_gate_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 21,
+        "name": "age_gate_min_age_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -225,8 +235,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "f9399deb6620a262b99ccae7e053b331e0da32de4eabbb7b80c4f79e5dfe3ddb"
+  "hash": "c64ad61160ea6166658e2a67911984a7063acdd256a06b9bc107bb6a77c0049a"
 }

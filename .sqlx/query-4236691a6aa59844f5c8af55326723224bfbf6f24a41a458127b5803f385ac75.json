@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days,\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -189,18 +189,34 @@
       },
       {
         "ordinal": 20,
+        "name": "age_gate_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 21,
+        "name": "age_gate_min_age_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bool",
+        "Int8",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -225,8 +241,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "032ae57acb0d1a03b3f0aec2c686dd4bf108fe25f5d0b7999c1d6ae4583be5dc"
+  "hash": "4236691a6aa59844f5c8af55326723224bfbf6f24a41a458127b5803f385ac75"
 }

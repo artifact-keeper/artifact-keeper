@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                created_at, updated_at\n            ",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.promotion_target_id, r.promotion_policy_id,\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.age_gate_enabled, r.age_gate_min_age_days,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
   "describe": {
     "columns": [
       {
@@ -189,99 +189,28 @@
       },
       {
         "ordinal": 20,
+        "name": "age_gate_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 21,
+        "name": "age_gate_min_age_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Varchar",
-        "Text",
-        {
-          "Custom": {
-            "name": "repository_format",
-            "kind": {
-              "Enum": [
-                "maven",
-                "gradle",
-                "npm",
-                "pypi",
-                "nuget",
-                "go",
-                "rubygems",
-                "docker",
-                "helm",
-                "rpm",
-                "debian",
-                "conan",
-                "cargo",
-                "generic",
-                "podman",
-                "buildx",
-                "oras",
-                "wasm_oci",
-                "helm_oci",
-                "poetry",
-                "conda",
-                "yarn",
-                "bower",
-                "pnpm",
-                "chocolatey",
-                "powershell",
-                "terraform",
-                "opentofu",
-                "alpine",
-                "conda_native",
-                "composer",
-                "hex",
-                "cocoapods",
-                "swift",
-                "pub",
-                "sbt",
-                "chef",
-                "puppet",
-                "ansible",
-                "gitlfs",
-                "vscode",
-                "jetbrains",
-                "huggingface",
-                "mlmodel",
-                "cran",
-                "vagrant",
-                "opkg",
-                "p2",
-                "bazel",
-                "protobuf",
-                "incus",
-                "lxc"
-              ]
-            }
-          }
-        },
-        {
-          "Custom": {
-            "name": "repository_type",
-            "kind": {
-              "Enum": [
-                "local",
-                "remote",
-                "virtual",
-                "staging"
-              ]
-            }
-          }
-        },
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -306,8 +235,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "69c96cd8cf060401f6642ab17bc547c2d7578d91eb3761440cdd899f907fa896"
+  "hash": "5f7a05189c3721f3622bfb4fab165355d73b9c4bd6b9058302e4978642725ab8"
 }

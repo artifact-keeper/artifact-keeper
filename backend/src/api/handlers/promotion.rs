@@ -518,7 +518,6 @@ pub async fn promote_artifact(
         }));
     }
 
-    let mut policy_violations: Vec<PolicyViolation> = vec![];
     let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
 
     if !req.skip_policy_check {
@@ -527,7 +526,7 @@ pub async fn promote_artifact(
             .evaluate_artifact(artifact_id, source_repo.id)
             .await?;
 
-        policy_violations = eval_result
+        let mut policy_violations: Vec<PolicyViolation> = eval_result
             .violations
             .iter()
             .map(|v| PolicyViolation {
@@ -1420,6 +1419,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
