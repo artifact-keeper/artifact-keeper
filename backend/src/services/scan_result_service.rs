@@ -1046,6 +1046,77 @@ impl ScanResultService {
         Ok(())
     }
 
+    /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
+    /// this artifact's format, so it never ran. This is a distinct terminal
+    /// status from `failed` (which is reserved for a scanner that started and
+    /// crashed/errored). The human-readable `reason` is stored in
+    /// `error_message` for display, but consumers must classify the row off the
+    /// `not_applicable` status rather than the message text. No findings or
+    /// counts are written; this row is benign and must not be treated as a
+    /// failure or as a pass-with-findings.
+    pub async fn mark_not_applicable(
+        &self,
+        scan_id: Uuid,
+        reason: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE scan_results
+            SET status = 'not_applicable', error_message = $2, completed_at = NOW(),
+                started_at = $3
+            WHERE id = $1
+            "#,
+            scan_id,
+            reason,
+            started_at,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Create a terminal `not_applicable` scan row for the InsertFresh path
+    /// (#1470, #1648): the auto-scan-on-upload flow has no pre-allocated row, so
+    /// a non-applicable scanner previously wrote nothing and the artifact
+    /// classified as `NeverScanned` (falsely BLOCKED under `block_unscanned`).
+    /// Recording the row here gives a deterministic, benign terminal record
+    /// that promotion gating treats as scanned-OK rather than unscanned.
+    pub async fn create_not_applicable_scan(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        reason: &str,
+        checksum_sha256: Option<&str>,
+    ) -> Result<ScanResult> {
+        let result = sqlx::query_as!(
+            ScanResult,
+            r#"
+            INSERT INTO scan_results
+                (artifact_id, repository_id, scan_type, status, error_message,
+                 started_at, completed_at, checksum_sha256)
+            VALUES ($1, $2, $3, 'not_applicable', $4, NOW(), NOW(), $5)
+            RETURNING id, artifact_id, repository_id, scan_type, status,
+                      findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                      scanner_version, error_message, started_at, completed_at, created_at,
+                      is_reused, source_scan_id
+            "#,
+            artifact_id,
+            repository_id,
+            scan_type,
+            reason,
+            checksum_sha256,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
     /// Get a scan result by ID.
     pub async fn get_scan(&self, scan_id: Uuid) -> Result<ScanResult> {
         sqlx::query_as!(
@@ -3660,6 +3731,82 @@ mod tests {
                 .bind(&stuck_ids)
                 .execute(&pool)
                 .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        // ===================================================================
+        // #1470: not-applicable terminal status.
+        // ===================================================================
+
+        /// `mark_not_applicable` transitions a pre-allocated (Reuse-path) row
+        /// to the dedicated `not_applicable` terminal status -- NOT `failed` --
+        /// and records the reason in `error_message` for display. This is the
+        /// regression test for "a scanner that does not apply no longer shows
+        /// as failed."
+        #[tokio::test]
+        async fn mark_not_applicable_persists_not_applicable_status() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "na-reuse").await;
+
+            // Pre-allocated `running` row, as the trigger handler would create.
+            let prepared = svc
+                .create_scan_result(aid, repo_id, "image")
+                .await
+                .expect("create pre-allocated scan");
+
+            let reason = "Scanner ImageScanner does not apply to this artifact format";
+            svc.mark_not_applicable(prepared.id, reason, chrono::Utc::now())
+                .await
+                .expect("mark not applicable");
+
+            let row = svc.get_scan(prepared.id).await.expect("get scan");
+            assert_eq!(
+                row.status, "not_applicable",
+                "not-applicable scan must persist the dedicated status, not 'failed'"
+            );
+            assert_ne!(row.status, "failed");
+            assert_eq!(row.error_message.as_deref(), Some(reason));
+            assert!(
+                row.completed_at.is_some(),
+                "a not-applicable scan is terminal and must be completed"
+            );
+            assert_eq!(row.findings_count, 0);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// `create_not_applicable_scan` is the InsertFresh-path counterpart:
+        /// the auto-scan-on-upload flow has no pre-allocated row, so this
+        /// INSERTs a terminal `not_applicable` row directly. Previously the
+        /// scanner wrote nothing and the artifact classified as NeverScanned
+        /// (falsely blocked under block_unscanned). The row must be terminal,
+        /// benign (no findings), and serialize the status verbatim.
+        #[tokio::test]
+        async fn create_not_applicable_scan_inserts_terminal_row() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, checksum) = insert_test_artifact(&pool, repo_id, "na-fresh").await;
+
+            let reason = "Scanner Grype does not apply to this artifact format";
+            let created = svc
+                .create_not_applicable_scan(aid, repo_id, "dependency", reason, Some(&checksum))
+                .await
+                .expect("create not-applicable scan");
+
+            assert_eq!(created.status, "not_applicable");
+            assert_eq!(created.artifact_id, aid);
+            assert_eq!(created.error_message.as_deref(), Some(reason));
+            assert!(created.completed_at.is_some());
+            assert_eq!(created.findings_count, 0);
+            assert!(!created.is_reused);
+
             cleanup_repo(&pool, repo_id).await;
         }
     }

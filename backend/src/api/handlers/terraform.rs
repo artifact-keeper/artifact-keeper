@@ -22,7 +22,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -263,7 +263,7 @@ async fn download_module(
                 );
                 let vname = module_name.clone();
                 let vversion = version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -283,15 +283,11 @@ async fn download_module(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    None,
+                );
             }
             return Err(not_found);
         }
@@ -821,7 +817,7 @@ async fn download_provider(
                 );
                 let vname = provider_name.clone();
                 let vversion = version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -841,15 +837,11 @@ async fn download_provider(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    None,
+                );
             }
             return Err(not_found);
         }

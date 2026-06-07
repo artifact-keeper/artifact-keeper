@@ -250,3 +250,130 @@ fn regression_ghsa_m597_h769_6qgp_gitlfs_list_locks_auth() {
         "challenge must echo the realm passed by the caller; got {challenge}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bug — Credential-change session invalidation on the gRPC plane (#1636,
+//        original #505; gRPC gap tracked as #549/#551).
+// Class:  Session/JWT not invalidated after credential change.
+// Seam:   `grpc::auth_interceptor::AuthInterceptor::intercept` — the single
+//         token-validation entry point every gRPC request traverses.
+// What:   A password change calls
+//         `auth_service::invalidate_user_tokens(user_id)`, which bumps the
+//         per-user invalidation watermark consulted by BOTH transports: the
+//         HTTP middleware (via `validate_access_token_async`) and the gRPC
+//         interceptor here (via `is_token_invalidated[_replica_safe]`). Before
+//         the watermark existed, a JWT minted before the change kept
+//         authenticating on the gRPC plane until it expired.
+// Asserts: (1) a pre-change admin token is accepted by the interceptor;
+//          (2) after `invalidate_user_tokens`, the SAME token is rejected with
+//              `Unauthenticated` ("revoked"); and (3) a token minted after the
+//              change is accepted again. The HTTP-plane counterpart of this
+//              invariant is pinned by the lib unit tests
+//              `test_http_token_minted_before_password_change_is_rejected` /
+//              `..._after_..._is_accepted` in `services::auth_service`.
+//
+// The interceptor is constructed with `db = None`, which exercises the
+// in-memory fast-path (`is_token_invalidated`). That is the same map
+// `invalidate_user_tokens` writes and the same map the replica-safe DB path
+// serves as its cache, so this no-DB seam faithfully pins the cross-transport
+// invariant without requiring a live database (matching this file's
+// pure-helper testing contract).
+// ---------------------------------------------------------------------------
+mod credential_change_grpc {
+    use artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor;
+    use artifact_keeper_backend::services::auth_service::{invalidate_user_tokens, Claims};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use tonic::Request;
+    use uuid::Uuid;
+
+    const SECRET: &str = "grpc-credential-change-regression-secret";
+
+    /// Mint an admin access JWT for `user_id` with an explicit `iat` (seconds),
+    /// signed with `SECRET` — the exact shape the interceptor decodes.
+    fn admin_token_at(user_id: Uuid, iat: i64) -> String {
+        let claims = Claims {
+            sub: user_id,
+            username: "grpc-user".to_string(),
+            email: "grpc-user@test.local".to_string(),
+            is_admin: true,
+            iat,
+            exp: iat + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("encode admin access token")
+    }
+
+    fn request_with(token: &str) -> Request<()> {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        req
+    }
+
+    #[test]
+    fn regression_1636_grpc_token_rejected_after_credential_change() {
+        // A distinct user per test run so the process-wide invalidation map
+        // never collides with a parallel test.
+        let user_id = Uuid::new_v4();
+        // Backdate `iat` 10 s so the invalidation watermark (now / now+1)
+        // lands strictly after the token regardless of sub-second timing.
+        let pre_change_iat = chrono::Utc::now().timestamp() - 10;
+        let pre_change_token = admin_token_at(user_id, pre_change_iat);
+
+        let interceptor = AuthInterceptor::new(SECRET, None);
+
+        // 1) Before the credential change the gRPC interceptor accepts it.
+        assert!(
+            interceptor
+                .intercept(request_with(&pre_change_token))
+                .is_ok(),
+            "pre-change admin token must be accepted before invalidation"
+        );
+
+        // 2) Password change fires `invalidate_user_tokens(user_id)`.
+        invalidate_user_tokens(user_id);
+
+        // 3) The SAME token is now rejected on the gRPC plane (#505/#549/#551).
+        let err = interceptor
+            .intercept(request_with(&pre_change_token))
+            .expect_err("pre-change token MUST be rejected after credential change");
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unauthenticated,
+            "revoked token must surface as Unauthenticated, got {err:?}"
+        );
+        assert!(
+            err.message().contains("revoked"),
+            "rejection message must indicate revocation; got {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn regression_1636_grpc_token_minted_after_change_is_accepted() {
+        let user_id = Uuid::new_v4();
+
+        // Credential change happens first.
+        invalidate_user_tokens(user_id);
+
+        // The watermark is `now + 1` (#1436); a token minted at `now + 2` is
+        // strictly newer and must be honoured.
+        let post_change_iat = chrono::Utc::now().timestamp() + 2;
+        let post_change_token = admin_token_at(user_id, post_change_iat);
+
+        let interceptor = AuthInterceptor::new(SECRET, None);
+        assert!(
+            interceptor
+                .intercept(request_with(&post_change_token))
+                .is_ok(),
+            "a token minted after the credential change MUST be accepted on gRPC"
+        );
+    }
+}

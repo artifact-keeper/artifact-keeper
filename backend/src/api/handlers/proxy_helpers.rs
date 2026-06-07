@@ -18,6 +18,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_hydration::coordinate_proxy_hydration;
 use crate::services::proxy_service::ProxyService;
+pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::storage::StorageLocation;
 use std::future::Future;
 use std::time::Duration;
@@ -365,6 +366,41 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
     }
 }
 
+/// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
+///
+/// Every buffered/uncached wrapper follows the same three-step shape:
+/// build a minimal [`Repository`] via [`build_remote_repo`], invoke one
+/// `ProxyService` method against it, and translate any [`AppError`] into an
+/// HTTP error [`Response`] via [`map_proxy_error`]. This helper performs the
+/// build and the error mapping once; the caller supplies the middle step as a
+/// closure that receives the constructed `&Repository`.
+///
+/// The closure is generic over its success type `T` so wrappers returning
+/// `(Bytes, Option<String>)`, `(Bytes, Option<String>, String)`, etc. all route
+/// through the same code path without behaviour change.
+///
+/// `error_path` is the value forwarded to [`map_proxy_error`]; callers pass
+/// whatever path their original wrapper logged (e.g. `proxy_fetch_with_cache_key`
+/// passes its `fetch_path`, not the cache path).
+async fn with_proxy_repo<T, F, Fut>(
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    error_path: &str,
+    fetch: F,
+) -> Result<T, Response>
+where
+    F: FnOnce(Repository) -> Fut,
+    Fut: Future<Output = Result<T, AppError>>,
+{
+    // Construct a minimal Repository that satisfies the ProxyService methods.
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    fetch(repo)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, error_path, e))
+}
+
 /// Attempt to fetch an artifact from the upstream via the proxy service.
 /// Constructs a minimal `Repository` model from handler-level repo info.
 /// Returns `(content_bytes, content_type)` on success.
@@ -383,13 +419,10 @@ pub async fn proxy_fetch(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    // Construct a minimal Repository that satisfies ProxyService::fetch_artifact
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_artifact(&repo, path).await
+    })
+    .await
 }
 
 /// Variant of [`proxy_fetch`] that forwards an `Accept` header to the upstream.
@@ -406,12 +439,12 @@ pub async fn proxy_fetch_with_accept(
     path: &str,
     accept: Option<&str>,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact_with_accept(&repo, path, accept)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_with_accept(&repo, path, accept)
+            .await
+    })
+    .await
 }
 
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
@@ -548,6 +581,22 @@ pub(crate) fn build_streaming_response_with_disposition(
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
     );
     builder.body(body)
+}
+
+/// Handler-facing convenience over [`build_streaming_response_with_disposition`]
+/// that maps the rare malformed-header [`axum::http::Error`] into a `500`
+/// [`Response`], so format handlers can serve a resolved
+/// [`StreamingFetchResult`] (e.g. from [`resolve_virtual_download`]) in a single
+/// line instead of re-inlining the same header-building block. Pass a
+/// `filename` to emit `Content-Disposition: attachment`; pass `None` to omit it.
+#[allow(clippy::result_large_err)]
+pub fn stream_fetch_result(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+    filename: Option<&str>,
+) -> std::result::Result<Response, Response> {
+    build_streaming_response_with_disposition(result, default_content_type, filename)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
 /// Fetch from upstream via the proxy service, returning a presigned redirect
@@ -815,12 +864,18 @@ pub async fn proxy_fetch_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
+                .await
+        },
+    )
+    .await
 }
 
 /// Fetch from upstream directly, bypassing the proxy cache.
@@ -838,12 +893,10 @@ pub async fn proxy_fetch_uncached(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>, String), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_upstream_direct(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_upstream_direct(&repo, path).await
+    })
+    .await
 }
 
 /// Fetch from upstream directly, preserving the upstream `Link` header.
@@ -854,12 +907,12 @@ pub async fn proxy_fetch_uncached_with_link(
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
-
-    proxy_service
-        .fetch_upstream_direct_with_link(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_with_link(&repo, path)
+            .await
+    })
+    .await
 }
 
 /// Strategy for fetching an artifact from a single virtual member.
@@ -953,10 +1006,10 @@ pub async fn resolve_virtual_download<F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     local_fetch: F,
-) -> Result<(Bytes, Option<String>), Response>
+) -> Result<StreamingFetchResult, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -978,9 +1031,8 @@ where
                 if let (Some(proxy), Some(upstream_url)) =
                     (proxy_service, member.upstream_url.as_deref())
                 {
-                    if let Ok(result) =
-                        proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
-                    {
+                    let repo = build_remote_repo(member.id, &member.key, upstream_url);
+                    if let Ok(result) = proxy.fetch_artifact_streaming(&repo, path).await {
                         return Ok(result);
                     }
                 }
@@ -1037,7 +1089,7 @@ pub async fn resolve_virtual_download_streaming<F, Fut>(
 ) -> Result<Response, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -1073,15 +1125,15 @@ where
                 }
             }
             VirtualMemberFetchStrategy::Local => {
-                if let Ok((content, content_type)) =
-                    local_fetch(member.id, member.storage_location()).await
-                {
-                    return Ok(build_download_response(
-                        content,
-                        content_type,
+                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
+                    return build_streaming_response_with_disposition(
+                        result,
                         default_content_type,
                         content_disposition_filename,
-                    ));
+                    )
+                    .map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    });
                 }
             }
             VirtualMemberFetchStrategy::Skip => {}
@@ -1263,6 +1315,7 @@ pub(crate) struct LocalArtifactRow {
     pub id: Uuid,
     pub storage_key: String,
     pub content_type: String,
+    pub size_bytes: i64,
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1278,6 +1331,125 @@ pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Respons
     .map_err(|e| e.into_response())
 }
 
+/// Selector for the canonical local-artifact lookup. Each variant maps to a
+/// single `WHERE` shape over the `artifacts` table; the surrounding skeleton
+/// (quarantine check → storage resolution → `storage.get` → coordinated retry)
+/// is identical and lives in [`local_lookup_artifact`] / [`read_local_content`].
+pub(crate) enum LocalLookup<'a> {
+    /// Match on the exact stored `path`.
+    Path(&'a str),
+    /// Match on `name` + `version`.
+    NameVersion(&'a str, &'a str),
+}
+
+impl LocalLookup<'_> {
+    /// The full `SELECT` for this selector. Pure (no I/O) so the per-variant
+    /// `WHERE` shape has at-rest unit coverage. The two queries differ only in
+    /// the `WHERE` clause and are byte-identical to the original inlined SQL.
+    pub(crate) fn select_sql(&self) -> &'static str {
+        match self {
+            LocalLookup::Path(_) => {
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+                 LIMIT 1"
+            }
+            LocalLookup::NameVersion(_, _) => {
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
+                 LIMIT 1"
+            }
+        }
+    }
+
+    /// Run the shared row lookup for this selector, mapping a miss to 404 and a
+    /// DB error to 500. Behavior is identical across selectors apart from the
+    /// `WHERE` clause and its bound parameters.
+    async fn fetch_row(&self, db: &PgPool, repo_id: Uuid) -> Result<LocalArtifactRow, Response> {
+        let query = sqlx::query_as::<_, LocalArtifactRow>(self.select_sql()).bind(repo_id);
+        let query = match self {
+            LocalLookup::Path(path) => query.bind(*path),
+            LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
+        };
+
+        query
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("Database", e))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())
+    }
+}
+
+/// Shared skeleton step 1: resolve the artifact row for `lookup`, enforce the
+/// quarantine policy, and resolve the repo's storage backend. Returns the row
+/// and storage so callers can either read bytes or short-circuit (e.g. the
+/// presigned redirect in [`local_fetch_or_redirect`]) before reading.
+async fn local_lookup_artifact(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    lookup: LocalLookup<'_>,
+) -> Result<
+    (
+        LocalArtifactRow,
+        std::sync::Arc<dyn crate::storage::StorageBackend>,
+    ),
+    Response,
+> {
+    let artifact = lookup.fetch_row(db, repo_id).await?;
+    check_quarantine_row(&artifact)?;
+    let storage = state.storage_for_repo_or_500(location)?;
+    Ok((artifact, storage))
+}
+
+/// Shared skeleton step 2: read the artifact's content from storage, falling
+/// back to the coordinated retry path on a `NotFound` miss.
+async fn read_local_content(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<Bytes, Response> {
+    match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => Ok(bytes),
+        Err(crate::error::AppError::NotFound(_)) => {
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await
+        }
+        Err(e) => Err(map_storage_err(e)),
+    }
+}
+
+/// Streaming sibling of [`read_local_content`]: open the artifact body as a
+/// byte stream (so large artifact bodies never buffer in memory) while keeping
+/// the exact same `NotFound` → coordinated-retry hydration fallback used by the
+/// buffered path. On a storage miss we still funnel through
+/// [`coordinated_retry_get`] (which buffers the small recovery read) and wrap
+/// the recovered `Bytes` back into a one-shot stream so callers see a uniform
+/// [`StreamingFetchResult`]. Returns the full [`StreamingFetchResult`] with the
+/// row's `content_type` and `size_bytes` (for an accurate `Content-Length`).
+async fn read_local_stream(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<StreamingFetchResult, Response> {
+    let body = match storage.get_stream(&artifact.storage_key).await {
+        Ok(stream) => stream,
+        Err(crate::error::AppError::NotFound(_)) => {
+            // Hydration recovery is a small buffered read; re-wrap as a stream.
+            let bytes =
+                coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await?;
+            Box::pin(futures::stream::once(async move { Ok(bytes) }))
+        }
+        Err(e) => return Err(map_storage_err(e)),
+    };
+    Ok(StreamingFetchResult {
+        body,
+        content_type: Some(artifact.content_type.clone()),
+        content_length: Some(artifact.size_bytes as u64),
+    })
+}
+
 /// Generic local artifact fetch by exact path match.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
@@ -1286,32 +1458,16 @@ pub async fn local_fetch_by_path(
     repo_id: Uuid,
     location: &StorageLocation,
     artifact_path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-         LIMIT 1",
+) -> Result<StreamingFetchResult, Response> {
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::Path(artifact_path),
     )
-    .bind(repo_id)
-    .bind(artifact_path)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
-
-    Ok((content, Some(artifact.content_type)))
+    .await?;
+    read_local_stream(db, &artifact, &*storage).await
 }
 
 /// Generic local artifact fetch by name and version.
@@ -1323,33 +1479,16 @@ pub async fn local_fetch_by_name_version(
     location: &StorageLocation,
     name: &str,
     version: &str,
-) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
-         LIMIT 1",
+) -> Result<StreamingFetchResult, Response> {
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::NameVersion(name, version),
     )
-    .bind(repo_id)
-    .bind(name)
-    .bind(version)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
-
-    Ok((content, Some(artifact.content_type)))
+    .await?;
+    read_local_stream(db, &artifact, &*storage).await
 }
 
 /// Generic local artifact fetch by trailing path-suffix (LIKE match).
@@ -1374,7 +1513,7 @@ pub async fn local_fetch_by_path_suffix(
     repo_id: Uuid,
     location: &StorageLocation,
     path_suffix: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let path: String = sqlx::query_scalar(
         "SELECT path FROM artifacts \
@@ -1428,22 +1567,14 @@ pub async fn local_fetch_or_redirect(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<Response, Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-         LIMIT 1",
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::Path(artifact_path),
     )
-    .bind(repo_id)
-    .bind(artifact_path)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
-
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
+    .await?;
 
     // Try presigned redirect before reading content into memory
     if state.config.presigned_downloads_enabled {
@@ -1455,13 +1586,7 @@ pub async fn local_fetch_or_redirect(
         }
     }
 
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
+    let content = read_local_content(db, &artifact, &*storage).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2437,6 +2562,41 @@ mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
 
+    // ── LocalLookup dispatch tests ──────────────────────────────────
+
+    #[test]
+    fn test_local_lookup_path_select_sql() {
+        // Path variant matches on `path = $2` and never references name/version.
+        let sql = LocalLookup::Path("a/b/c.tgz").select_sql();
+        assert!(sql.contains("WHERE repository_id = $1 AND path = $2 AND is_deleted = false"));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(!sql.contains("name = $2"));
+        assert!(!sql.contains("version = $3"));
+    }
+
+    #[test]
+    fn test_local_lookup_name_version_select_sql() {
+        // NameVersion variant matches on `name = $2 AND version = $3`.
+        let sql = LocalLookup::NameVersion("pkg", "1.0.0").select_sql();
+        assert!(sql.contains(
+            "WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false"
+        ));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(!sql.contains("path = $2"));
+    }
+
+    #[test]
+    fn test_local_lookup_select_columns_identical() {
+        // Both variants select the same LocalArtifactRow columns; only the
+        // WHERE clause differs (the whole point of the S6 collapse).
+        let cols =
+            "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until";
+        assert!(LocalLookup::Path("x").select_sql().starts_with(cols));
+        assert!(LocalLookup::NameVersion("n", "v")
+            .select_sql()
+            .starts_with(cols));
+    }
+
     // ── pypi_version_owned (shadowing guard) tests ──────────────────
 
     #[test]
@@ -2812,6 +2972,87 @@ mod tests {
         let after = Utc::now();
         assert!(repo.created_at >= before && repo.created_at <= after);
         assert!(repo.updated_at >= before && repo.updated_at <= after);
+    }
+
+    // ── with_proxy_repo tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_passes_through_ok_value() {
+        // On success the helper forwards the closure's value unchanged and
+        // hands the constructed Repository (built from the supplied args) to
+        // the closure.
+        let id = Uuid::new_v4();
+        let result: Result<(Bytes, Option<String>), Response> = with_proxy_repo(
+            id,
+            "ok-repo",
+            "https://upstream.example.com",
+            "some/path",
+            |repo| async move {
+                assert_eq!(repo.id, id);
+                assert_eq!(repo.key, "ok-repo");
+                assert_eq!(
+                    repo.upstream_url.as_deref(),
+                    Some("https://upstream.example.com")
+                );
+                Ok((
+                    Bytes::from_static(b"payload"),
+                    Some("text/plain".to_string()),
+                ))
+            },
+        )
+        .await;
+
+        let (bytes, content_type) = result.expect("expected Ok result");
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert_eq!(content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_not_found_to_404() {
+        // An upstream NotFound is mapped via map_proxy_error to a 404.
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "missing-repo",
+            "https://upstream.example.com",
+            "missing/path",
+            |_repo| async move { Err(AppError::NotFound("nope".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_validation_to_400() {
+        // A Validation error is mapped to a 400 (path-traversal guard).
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "bad-path-repo",
+            "https://upstream.example.com",
+            "../escape",
+            |_repo| async move { Err(AppError::Validation("bad".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_with_proxy_repo_maps_other_error_to_502() {
+        // Anything else (timeouts, TLS, body read) folds into 502.
+        let result: Result<Bytes, Response> = with_proxy_repo(
+            Uuid::new_v4(),
+            "flaky-repo",
+            "https://upstream.example.com",
+            "p",
+            |_repo| async move { Err(AppError::Internal("boom".to_string())) },
+        )
+        .await;
+
+        let response = result.expect_err("expected error response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     // ── reject_write_if_not_hosted tests ─────────────────────────────
@@ -3965,6 +4206,7 @@ mod tests {
                 otel_exporter_otlp_endpoint: None,
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
+                blob_gc_enabled: false,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
@@ -4697,18 +4939,19 @@ mod tests {
         .expect("insert");
 
         let location = repo.storage_location();
-        let (content, ct) =
-            local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
-                .await
-                .expect("fetch");
+        let result = local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
+            .await
+            .expect("fetch");
+        let ct = result.content_type.clone();
+        let content = result.collect().await.unwrap();
         assert_eq!(&content[..], b"abc123");
         assert_eq!(ct.as_deref(), Some("application/zip"));
 
         // Also exercise the suffix variant.
-        let (content2, _) =
-            local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
-                .await
-                .expect("fetch suffix");
+        let result2 = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
+            .await
+            .expect("fetch suffix");
+        let content2 = result2.collect().await.unwrap();
         assert_eq!(&content2[..], b"abc123");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -4925,6 +5168,54 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(weird)
         );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_sets_headers_and_disposition() {
+        // The handler-facing convenience must emit the same headers as the
+        // underlying builder: upstream content-type wins, content-length is set
+        // when known, and a filename produces a Content-Disposition.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(1234),
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
+            .expect("stream_fetch_result must build a response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/zip")
+        );
+        assert_eq!(
+            h.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("1234")
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg.whl\"")
+        );
+    }
+
+    #[test]
+    fn test_stream_fetch_result_falls_back_to_default_and_omits_optionals() {
+        // No upstream content-type, no length, no filename: default type is
+        // used and neither content-length nor content-disposition is emitted.
+        let result = StreamingFetchResult {
+            body: empty_body(),
+            content_type: None,
+            content_length: None,
+        };
+        let response = stream_fetch_result(result, "application/octet-stream", None)
+            .expect("stream_fetch_result must build a response");
+        let h = response.headers();
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert!(h.get("content-length").is_none());
+        assert!(h.get("content-disposition").is_none());
     }
 
     // -------------------------------------------------------------------

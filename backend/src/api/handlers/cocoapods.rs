@@ -212,7 +212,7 @@ async fn download_pod(
                 let upstream_path = format!("pods/{}", filename);
                 let vname = path_info.name.clone();
                 let vversion = path_info.version.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -232,15 +232,11 @@ async fn download_pod(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    None,
+                );
             }
             return Err(not_found);
         }
@@ -255,13 +251,16 @@ async fn download_pod(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
 
     // Record download
     let _ = sqlx::query!(
@@ -278,8 +277,8 @@ async fn download_pod(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

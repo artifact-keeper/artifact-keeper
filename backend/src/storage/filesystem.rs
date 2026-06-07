@@ -5,9 +5,10 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -263,9 +264,17 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to open {}: {}", key, e)))?;
+        let file = fs::File::open(&path).await.map_err(|e| {
+            // #1016: a missing key MUST map to AppError::NotFound so callers
+            // (e.g. maven_proxy sibling fall-through, local hydration retry)
+            // see a 404, not a 500. Mirror the buffered `get`/`get_range`
+            // mapping; anything that is not a NotFound stays a Storage error.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
 
         let reader = BufReader::new(file);
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
@@ -275,6 +284,44 @@ impl StorageBackend for FilesystemStorage {
             .map(|result| result.map_err(|e| AppError::Storage(format!("Read error: {}", e))));
 
         Ok(Box::pin(mapped))
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let path = self.key_to_path(key);
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
+
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to seek {}: {}", key, e)))?;
+
+        let mut remaining = length;
+        let mut out = Vec::with_capacity(length);
+
+        while remaining > 0 {
+            let mut buf = vec![0u8; remaining.min(STREAM_CHUNK_SIZE)];
+            let read = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+            if read == 0 {
+                break;
+            }
+            buf.truncate(read);
+            out.extend_from_slice(&buf);
+            remaining -= read;
+        }
+
+        Ok(Bytes::from(out))
     }
 
     async fn put_stream(
@@ -518,6 +565,60 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, content);
+    }
+
+    #[tokio::test]
+    async fn test_get_range_reads_requested_window() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "range-key";
+        storage
+            .put(key, Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"))
+            .await
+            .unwrap();
+
+        let range = storage.get_range(key, 5, 8).await.unwrap();
+
+        assert_eq!(range, Bytes::from_static(b"fghijklm"));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_past_eof_returns_empty() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "short-range-key";
+        storage.put(key, Bytes::from_static(b"abc")).await.unwrap();
+
+        let range = storage.get_range(key, 10, 4).await.unwrap();
+
+        assert!(range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_range_zero_length_returns_empty_without_opening() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // Zero length short-circuits before touching the filesystem, so even a
+        // missing key returns empty rather than NotFound.
+        let range = storage.get_range("never-written", 0, 0).await.unwrap();
+
+        assert!(range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_range_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let err = storage.get_range("does-not-exist", 0, 4).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +
@@ -794,6 +895,32 @@ mod tests {
 
         let result = storage.get_stream("nonexistent-key1234").await;
         assert!(result.is_err());
+    }
+
+    /// #1016 contract (streaming half): a missing key passed to `get_stream`
+    /// MUST surface as `AppError::NotFound`, exactly like the buffered `get`
+    /// and `get_range`. Callers such as `maven_proxy.rs` sibling fall-through
+    /// and the local hydration retry distinguish NotFound (→ 404 / coordinated
+    /// retry) from a real I/O error (→ 500); lumping a missing file into
+    /// `AppError::Storage` would turn a legitimate 404 into a 500. This test
+    /// guards the regression introduced when the local download path migrated
+    /// to streaming (PR #1393 / #1608 download invariant).
+    #[tokio::test]
+    async fn test_get_stream_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // The Ok arm holds a BoxStream (not Debug), so match rather than
+        // `unwrap_err` to extract the error.
+        let err = match storage.get_stream("does-not-exist-stream").await {
+            Ok(_) => panic!("expected an error for a missing key"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for a missing key, got {err:?}"
+        );
     }
 
     // --- put_stream tests ---
