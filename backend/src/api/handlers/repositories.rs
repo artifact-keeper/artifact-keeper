@@ -3449,7 +3449,11 @@ pub async fn download_artifact(
                 .header(header::CONTENT_LENGTH, artifact.size_bytes.to_string())
                 .header(
                     header::HeaderName::from_static("x-checksum-sha256"),
-                    artifact.checksum_sha256,
+                    // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
+                    // blank-pads shorter values on read. Trim before emitting so the
+                    // header carries the bare checksum (a real sha256 is exactly 64
+                    // hex chars and is unaffected by the trim).
+                    artifact.checksum_sha256.trim().to_string(),
                 )
                 .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy")
                 .body(Body::from_stream(body))
