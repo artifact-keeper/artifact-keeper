@@ -253,15 +253,18 @@ fn classify_pypi(lower: &str) -> Mutability {
 
 /// npm §2.1: packument metadata is mutable; tarballs are immutable.
 fn classify_npm(lower: &str) -> Mutability {
-    // Tarballs live under a `/-/` segment and end in `.tgz`.
+    // Only a *real package tarball* is immutable. In the canonical npm registry
+    // layout that is `…/<pkg>/-/<pkg>-<ver>.tgz` (scoped: `@scope/<pkg>/-/…`),
+    // i.e. a `.tgz` under the package's `/-/` segment. A bare `.tgz` anywhere
+    // else is NOT a guaranteed-immutable tarball — it could be a mutable
+    // pointer or attachment — so it must fall through to the conservative
+    // mutable default rather than being cached forever.
     if lower.contains("/-/") && lower.ends_with(".tgz") {
         return Mutability::Immutable;
     }
-    if lower.ends_with(".tgz") {
-        return Mutability::Immutable;
-    }
-    // `<pkg>`, `@scope/<pkg>`, `@scope%2f<pkg>`, dist-tags, and the registry
-    // root are all packument/metadata: mutable.
+    // `<pkg>`, `@scope/<pkg>`, `@scope%2f<pkg>`, dist-tags, the registry root,
+    // and any `.tgz` NOT under `/-/` are all packument/metadata/unknown:
+    // mutable (revalidate).
     Mutability::mutable_default()
 }
 
@@ -284,11 +287,20 @@ fn classify_oci(lower: &str) -> Mutability {
 
 /// Cargo §2.1: the registry index is mutable; `.crate` downloads are immutable.
 fn classify_cargo(lower: &str) -> Mutability {
-    if lower.ends_with(".crate") {
+    // Only a version-pinned `.crate` file served from the registry's crate
+    // store is immutable. In the canonical layout that file lives under a
+    // `crates/` path segment (`…/crates/<name>/<name>-<ver>.crate`). Requiring
+    // that structural context means a bare `.crate` suffix in some other,
+    // possibly mutable, position no longer gets cached forever — it falls
+    // through to revalidation. Match `crates/` on a path-segment boundary so a
+    // segment that merely *ends* in `crates` (e.g. `mycrates/…`) is not
+    // mistaken for the crate store.
+    if (lower.starts_with("crates/") || lower.contains("/crates/")) && lower.ends_with(".crate") {
         return Mutability::Immutable;
     }
-    // `config.json`, the sparse index files (`<a>/<b>/<crate>`), and
-    // `/api/v1/crates/<name>/<version>/download` redirects are mutable / index.
+    // `config.json`, the sparse index files (`<a>/<b>/<crate>`),
+    // `/api/v1/crates/<name>/<version>/download` redirects, and any stray
+    // `.crate` outside the crate store are mutable / index.
     Mutability::mutable_default()
 }
 
@@ -366,6 +378,11 @@ mod tests {
             (Npm, "@types/node", false),
             (Npm, "lodash/-/lodash-4.17.21.tgz", true),
             (Npm, "@babel/core/-/core-7.0.0.tgz", true),
+            // A `.tgz` NOT under a `/-/` segment is NOT a canonical package
+            // tarball: it must fall through to mutable, never cached forever.
+            (Npm, "lodash/lodash-4.17.21.tgz", false),
+            (Npm, "some/weird/attachment.tgz", false),
+            (Yarn, "react/-/react-18.2.0.tgz", true),
             (Yarn, "react", false),
             // OCI: digest immutable, tag mutable.
             (Docker, "v2/library/nginx/blobs/sha256:abc123def456", true),
@@ -383,6 +400,14 @@ mod tests {
             (Cargo, "lo/da/lodash", false),
             (Cargo, "api/v1/crates/serde/1.0.0/download", false),
             (Cargo, "crates/serde/serde-1.0.0.crate", true),
+            (Cargo, "registry/crates/tokio/tokio-1.0.0.crate", true),
+            // A `.crate` suffix outside the crate store (no `crates/` segment)
+            // is no longer blindly immutable: revalidate instead.
+            (Cargo, "weird/path/something.crate", false),
+            (Cargo, "serde-1.0.0.crate", false),
+            // A segment that merely ends in `crates` must not be mistaken for
+            // the crate store via a loose substring match: revalidate.
+            (Cargo, "mycrates/serde-1.0.0.crate", false),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
