@@ -2467,37 +2467,60 @@ impl ProxyService {
         };
 
         let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
-        let mut entries = Vec::with_capacity(logical_paths.len());
-        for path in logical_paths {
-            let Ok(metadata_key) = Self::cache_metadata_key(repo_key, &path) else {
-                continue;
-            };
-            let metadata = match self.load_cache_metadata(&metadata_key).await {
-                Ok(Some(m)) => m,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::debug!(
-                        repo_key = %repo_key,
-                        path = %path,
-                        error = %e,
-                        "reading proxy cache sidecar failed; skipping entry"
-                    );
-                    continue;
+
+        // Load every sidecar concurrently with bounded parallelism instead of
+        // one sequential storage round-trip per path (#1608). `cached_artifact_paths`
+        // already returns paths sorted+deduped, but `buffer_unordered` yields
+        // results out of order, so the collected entries are re-sorted by path
+        // to keep the output deterministic and identical to the sequential path.
+        let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(logical_paths)
+            .map(|path| async move {
+                let metadata_key = Self::cache_metadata_key(repo_key, &path).ok()?;
+                match self.load_cache_metadata(&metadata_key).await {
+                    Ok(Some(m)) => Some(Self::build_cached_entry(path, m)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::debug!(
+                            repo_key = %repo_key,
+                            path = %path,
+                            error = %e,
+                            "reading proxy cache sidecar failed; skipping entry"
+                        );
+                        None
+                    }
                 }
-            };
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            entries.push(CachedArtifactEntry {
-                path,
-                name,
-                size_bytes: metadata.size_bytes,
-                checksum_sha256: metadata.checksum_sha256,
-                content_type: metadata
-                    .content_type
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                cached_at: metadata.cached_at,
-            });
-        }
+            })
+            .buffer_unordered(Self::LIST_CACHED_SIDECAR_CONCURRENCY)
+            .filter_map(|entry| async move { entry })
+            .collect()
+            .await;
+
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         entries
+    }
+
+    /// Bounded concurrency for the per-path sidecar reads in
+    /// [`Self::list_cached_artifacts`] (#1608). Keeps the storage backend from
+    /// being hit with one in-flight request per cached path on large repos
+    /// while still collapsing the previously sequential O(N) round-trips.
+    const LIST_CACHED_SIDECAR_CONCURRENCY: usize = 32;
+
+    /// Assemble a [`CachedArtifactEntry`] from a logical path and its loaded
+    /// sidecar metadata. Pure (no I/O) so the field mapping — name extraction
+    /// and the `application/octet-stream` content-type default — is unit-testable
+    /// without a storage backend.
+    fn build_cached_entry(path: String, metadata: CacheMetadata) -> CachedArtifactEntry {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        CachedArtifactEntry {
+            path,
+            name,
+            size_bytes: metadata.size_bytes,
+            checksum_sha256: metadata.checksum_sha256,
+            content_type: metadata
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            cached_at: metadata.cached_at,
+        }
     }
 
     /// Recover the distinct logical artifact paths from a set of proxy-cache
@@ -6609,6 +6632,56 @@ SHA256:
         format!("proxy-cache/{}/{}/__cache_meta__.json", repo, path)
     }
 
+    #[test]
+    fn test_build_cached_entry_maps_fields_and_extracts_name() {
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            expires_at: now + chrono::Duration::hours(1),
+            content_type: Some("application/gzip".to_string()),
+            size_bytes: 789,
+            checksum_sha256: "d".repeat(64),
+        };
+        let entry =
+            ProxyService::build_cached_entry("scope/-/scope-1.2.3.tgz".to_string(), metadata);
+        assert_eq!(entry.path, "scope/-/scope-1.2.3.tgz");
+        assert_eq!(
+            entry.name, "scope-1.2.3.tgz",
+            "name is the trailing segment"
+        );
+        assert_eq!(entry.size_bytes, 789);
+        assert_eq!(entry.checksum_sha256, "d".repeat(64));
+        assert_eq!(entry.content_type, "application/gzip");
+        assert_eq!(entry.cached_at, now);
+    }
+
+    #[test]
+    fn test_build_cached_entry_defaults_missing_content_type() {
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            expires_at: now + chrono::Duration::hours(1),
+            content_type: None,
+            size_bytes: 1,
+            checksum_sha256: "e".repeat(64),
+        };
+        // A path with no '/' must still produce a name equal to the whole path.
+        let entry = ProxyService::build_cached_entry("flat-file.bin".to_string(), metadata);
+        assert_eq!(entry.name, "flat-file.bin");
+        assert_eq!(
+            entry.content_type, "application/octet-stream",
+            "missing content_type must default to application/octet-stream"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_cached_artifacts_returns_entries_from_sidecars() {
         let repo = "npm-remote";
@@ -6655,6 +6728,96 @@ SHA256:
             b.content_type, "application/octet-stream",
             "missing content_type must default to application/octet-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_output_is_sorted_by_path() {
+        // The batched (buffer_unordered) load yields sidecars out of order;
+        // list_cached_artifacts must re-sort so callers get deterministic output.
+        let repo = "npm-remote";
+        let now = Utc::now();
+        let paths = [
+            "z/-/z-1.0.0.tgz",
+            "a/-/a-1.0.0.tgz",
+            "m/-/m-1.0.0.tgz",
+            "b/-/b-1.0.0.tgz",
+        ];
+        let mut sidecars = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for (i, p) in paths.iter().enumerate() {
+            sidecars.insert(
+                meta_key(repo, p),
+                sidecar_bytes(
+                    i as i64,
+                    &"f".repeat(64),
+                    Some("application/octet-stream"),
+                    now,
+                ),
+            );
+            keys.push(content_key(repo, p));
+            keys.push(meta_key(repo, p));
+        }
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let entries = service.list_cached_artifacts(repo).await;
+        let got: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "a/-/a-1.0.0.tgz",
+                "b/-/b-1.0.0.tgz",
+                "m/-/m-1.0.0.tgz",
+                "z/-/z-1.0.0.tgz",
+            ],
+            "entries must be sorted by path regardless of sidecar load order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_artifacts_skips_entry_with_corrupt_sidecar() {
+        // A sidecar that is present but unparseable makes load_cache_metadata
+        // return Err; that single bad path must be skipped (logged) without
+        // failing the whole listing. Guards the error-tolerance of the batched
+        // load (#1608).
+        let repo = "npm-remote";
+        let good = "ok/-/ok-1.0.0.tgz";
+        let corrupt = "bad/-/bad-1.0.0.tgz";
+        let now = Utc::now();
+        let mut sidecars = std::collections::HashMap::new();
+        sidecars.insert(
+            meta_key(repo, good),
+            sidecar_bytes(10, &"c".repeat(64), Some("application/octet-stream"), now),
+        );
+        // Present but invalid JSON -> serde parse error -> Err arm.
+        sidecars.insert(
+            meta_key(repo, corrupt),
+            Bytes::from_static(b"{not valid json"),
+        );
+        let keys = vec![
+            content_key(repo, good),
+            meta_key(repo, good),
+            content_key(repo, corrupt),
+            meta_key(repo, corrupt),
+        ];
+        let mock = Arc::new(CachedListingMock {
+            keys,
+            sidecars,
+            list_fails: false,
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let entries = service.list_cached_artifacts(repo).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an entry whose sidecar is corrupt must be skipped, not fail the listing"
+        );
+        assert_eq!(entries[0].path, good);
     }
 
     #[tokio::test]
