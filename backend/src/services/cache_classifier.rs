@@ -292,8 +292,10 @@ fn classify_cargo(lower: &str) -> Mutability {
     // `crates/` path segment (`…/crates/<name>/<name>-<ver>.crate`). Requiring
     // that structural context means a bare `.crate` suffix in some other,
     // possibly mutable, position no longer gets cached forever — it falls
-    // through to revalidation.
-    if lower.contains("crates/") && lower.ends_with(".crate") {
+    // through to revalidation. Match `crates/` on a path-segment boundary so a
+    // segment that merely *ends* in `crates` (e.g. `mycrates/…`) is not
+    // mistaken for the crate store.
+    if (lower.starts_with("crates/") || lower.contains("/crates/")) && lower.ends_with(".crate") {
         return Mutability::Immutable;
     }
     // `config.json`, the sparse index files (`<a>/<b>/<crate>`),
@@ -403,6 +405,9 @@ mod tests {
             // is no longer blindly immutable: revalidate instead.
             (Cargo, "weird/path/something.crate", false),
             (Cargo, "serde-1.0.0.crate", false),
+            // A segment that merely ends in `crates` must not be mistaken for
+            // the crate store via a loose substring match: revalidate.
+            (Cargo, "mycrates/serde-1.0.0.crate", false),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
