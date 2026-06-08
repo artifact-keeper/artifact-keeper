@@ -1,0 +1,24 @@
+# cargo-nextest configuration.
+#
+# The coverage CI job runs the suite via `cargo llvm-cov nextest`, which
+# executes each test in its OWN PROCESS. That breaks the in-process
+# `CLEANUP_TEST_LOCK` (`backend/src/services/scan_result_service.rs`) that the
+# `cleanup_stuck_scans_*` DB tests use to serialize: under nextest they run
+# concurrently across processes and contend on the GLOBAL
+# `pg_try_advisory_xact_lock(STUCK_SCAN_LOCK_ID)` and the global stuck-scan reap
+# query. One tick then observes the lock held by a sibling test and reaps 0,
+# failing `assert!(reaped >= 1)` and aborting the whole instrumented run so no
+# `lcov.info` is produced (#1753). The plain `cargo test --workspace --lib`
+# unit-test job runs them in a single process, so the in-process mutex still
+# works there — which is why that gate stays green while coverage fails.
+#
+# Pin these tests to a single-threaded test group so nextest never runs two of
+# them at once, restoring the cross-process serialization the in-process mutex
+# cannot provide. Add new tests that take STUCK_SCAN_LOCK_ID to the same group.
+
+[test-groups]
+stuck-scan-cleanup = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(cleanup_stuck_scans)'
+test-group = 'stuck-scan-cleanup'

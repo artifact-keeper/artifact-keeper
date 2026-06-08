@@ -2462,6 +2462,7 @@ mod tests {
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             auth_max_concurrency: 8,
+            rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 5000,
             rate_limit_search_per_window: 300,

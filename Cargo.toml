@@ -125,7 +125,7 @@ url = "2.5"
 # which fails to cross-compile on Windows because it does u64.into() on
 # `cryptoki::types::Ulong`, but `Ulong: From<u32>` only on Windows targets
 # where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
-bergshamra = "=0.3.1"
+bergshamra = "=0.5.1"
 
 # SMTP email delivery
 lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }

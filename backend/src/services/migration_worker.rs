@@ -951,6 +951,7 @@ impl MigrationWorker {
     /// detection happened in `finalize_transfer` AFTER the bytes were
     /// committed, leaving corrupt blobs in storage on failure (#1512
     /// review).
+    #[allow(clippy::too_many_arguments)]
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
@@ -1119,7 +1120,7 @@ impl MigrationWorker {
                         ))
                     })
                 });
-                self.storage
+                repo_storage
                     .put_stream(&storage_key, Box::pin(mapped))
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
@@ -1681,35 +1682,6 @@ struct TransferResult {
     metadata: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
-/// Guard to ensure temporary files are cleaned up on drop.
-/// Prevents accumulation of temp files from interrupted or failed migrations.
-struct TempFileGuard {
-    path: std::path::PathBuf,
-}
-
-impl TempFileGuard {
-    fn new(path: &std::path::Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-        }
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        // Attempt cleanup on drop, but don't fail the migration if removal fails
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = ?self.path,
-                    error = %e,
-                    "Failed to delete temporary migration file"
-                );
-            }
-        }
-    }
-}
-
 /// Digests that the source registry declared for an artifact.
 ///
 /// Both fields are optional because sources vary in what they report.
@@ -2078,32 +2050,6 @@ pub(crate) fn decide_duplicate_match(
                 true
             }
         }
-    }
-}
-
-/// Compute the canonical artifact path written to the `artifacts.path`
-/// column for a migrated artifact.
-///
-/// Per-format publish handlers in Artifact Keeper store artifacts under
-/// `<name>/<version>/<filename>`. Migration must use the same shape so
-/// download lookups (npm `serve_tarball`, PyPI simple/, Helm index.yaml,
-/// etc.) find the migrated rows.
-///
-/// Falls back to the legacy `<repo_key>/<artifact_path>` shape when the
-/// format-aware parser produced no usable version. That happens for
-/// unknown formats and for parseable formats whose filename did not yield
-/// a version (e.g. raw blobs). The legacy shape keeps the row insertable
-/// without losing the source-side path context.
-pub(crate) fn canonical_artifact_path(
-    parsed_name: &str,
-    parsed_version: Option<&str>,
-    filename: &str,
-    repo_key: &str,
-    artifact_path: &str,
-) -> String {
-    match parsed_version {
-        Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
-        _ => format!("{}/{}", repo_key, artifact_path),
     }
 }
 
@@ -2690,17 +2636,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // canonical_artifact_path - pure path-shape helper extracted from
-    // transfer_artifact so the per-format / fallback branches are testable
-    // without standing up storage + Postgres.
+    // migration_artifact_path - pure path-shape helper. Migration must write
+    // the same `<name>/<version>/<filename>` shape AK's publish handlers use
+    // (with a fallback) so download lookups find the migrated rows. These
+    // exercise the non-maven (name/version) and fallback branches.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_canonical_artifact_path_uses_name_version_filename_when_parsed() {
+    fn test_migration_artifact_path_uses_name_version_filename_when_parsed() {
         // Happy path: a parseable filename (e.g. npm tarball) yields the
         // canonical `<name>/<version>/<filename>` shape that AK's publish
         // handlers already use.
-        let path = canonical_artifact_path(
+        let path = migration_artifact_path(
+            "npm",
             "lodash",
             Some("4.17.21"),
             "lodash-4.17.21.tgz",
@@ -2711,10 +2659,11 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_artifact_path_falls_back_when_version_missing() {
+    fn test_migration_artifact_path_falls_back_when_version_missing() {
         // No version recovered (unknown format / unparseable filename):
         // legacy `<repo>/<source-path>` shape.
-        let path = canonical_artifact_path(
+        let path = migration_artifact_path(
+            "generic",
             "raw-blob",
             None,
             "blob.bin",
@@ -2725,10 +2674,11 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_artifact_path_falls_back_when_version_is_empty() {
+    fn test_migration_artifact_path_falls_back_when_version_is_empty() {
         // Defensive: empty-string version must also trigger the fallback so
         // we never write `<name>//<filename>` to the artifacts table.
-        let path = canonical_artifact_path(
+        let path = migration_artifact_path(
+            "generic",
             "weird-pkg",
             Some(""),
             "weird-pkg.tar",
@@ -2739,11 +2689,12 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_artifact_path_preserves_filename_independent_of_source_layout() {
+    fn test_migration_artifact_path_preserves_filename_independent_of_source_layout() {
         // The canonical shape ignores the source-side layout entirely once a
         // version was recovered. A PyPI wheel migrated from a deeply nested
         // hash-prefixed cache path still lands under <name>/<version>/<file>.
-        let path = canonical_artifact_path(
+        let path = migration_artifact_path(
+            "pypi",
             "wheel",
             Some("0.46.2"),
             "wheel-0.46.2-py3-none-any.whl",
@@ -2751,6 +2702,24 @@ mod tests {
             "13/2c/5e07/wheel-0.46.2-py3-none-any.whl",
         );
         assert_eq!(path, "wheel/0.46.2/wheel-0.46.2-py3-none-any.whl");
+    }
+
+    #[test]
+    fn test_migration_artifact_path_maven_uses_group_prefixed_source_path() {
+        // Maven-family formats keep the full group-prefixed source path
+        // verbatim (clients resolve `com/example/.../file.jar` directly).
+        let path = migration_artifact_path(
+            "maven",
+            "commons-lang3",
+            Some("3.12.0"),
+            "commons-lang3-3.12.0.jar",
+            "maven-cache",
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+        );
+        assert_eq!(
+            path,
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+        );
     }
 
     #[test]
@@ -4041,9 +4010,18 @@ mod tests {
             put_calls: put_calls.clone(),
         });
 
+        // transfer_artifact takes the per-repo storage directly (#1420); the
+        // worker's registry is unused on this path, so wrap the counting mock
+        // in a single-backend registry just to satisfy the constructor.
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "filesystem".to_string(),
+            storage.clone() as Arc<dyn StorageBackend>,
+        );
+        let registry = Arc::new(StorageRegistry::new(backends, "filesystem".to_string()));
         let worker = MigrationWorker::new(
             pool.clone(),
-            storage,
+            registry,
             WorkerConfig {
                 verify_checksums: true,
                 dry_run: false,
@@ -4064,6 +4042,7 @@ mod tests {
         let result = worker
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
+                storage.clone(),
                 "irrelevant-repo",
                 "generic",
                 "irrelevant/path",
@@ -4231,9 +4210,17 @@ mod tests {
             put_file_calls: put_file_calls.clone(),
         });
 
+        // transfer_artifact takes the per-repo storage directly (#1420); wrap
+        // the counting mock in a single-backend registry for the constructor.
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "filesystem".to_string(),
+            storage.clone() as Arc<dyn StorageBackend>,
+        );
+        let registry = Arc::new(StorageRegistry::new(backends, "filesystem".to_string()));
         let worker = MigrationWorker::new(
             pool.clone(),
-            storage,
+            registry,
             WorkerConfig {
                 verify_checksums: true,
                 dry_run: false,
@@ -4252,6 +4239,7 @@ mod tests {
         let _ = worker
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
+                storage.clone(),
                 "irrelevant-repo",
                 "generic",
                 "irrelevant/path",

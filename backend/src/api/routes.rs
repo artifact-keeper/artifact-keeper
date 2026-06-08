@@ -232,25 +232,39 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_password_change_window_secs,
     ));
 
+    // Master on/off switch (#1602). When disabled, every rate-limit layer
+    // short-circuits before touching its limiter so no request is limited.
+    let rate_limit_enabled = state.config.rate_limit_enabled;
+    if !rate_limit_enabled {
+        tracing::warn!(
+            "Rate limiting is DISABLED (RATE_LIMIT_ENABLED=false); no requests will be rate limited"
+        );
+    }
+
     let auth_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&auth_rate_limiter),
         exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
     };
     let api_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&api_rate_limiter),
         exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
     };
     let search_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&search_rate_limiter),
         exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
     };
     let presign_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&presign_rate_limiter),
         exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
     };
     let password_change_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&password_change_rate_limiter),
         exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
     };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent

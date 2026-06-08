@@ -886,11 +886,12 @@ jobs:
           }
 
           # Tags this workflow promises to publish on a tag push. Mirror the
-          # metadata-action `tags:` blocks above. Alpine variant gets the
-          # `-alpine` suffix from the metadata-action `flavor` setting.
+          # metadata-action `tags:` blocks above. The `-alpine` variant is
+          # currently suspended (its build/merge jobs are gated `if: false`),
+          # so it is intentionally absent here — re-add the
+          # `${BACKEND_IMAGE}:${VERSION}-alpine` entry when those jobs return.
           EXPECTED=(
             "${BACKEND_IMAGE}:${VERSION}"
-            "${BACKEND_IMAGE}:${VERSION}-alpine"
             "${OPENSCAP_IMAGE}:${VERSION}"
           )
 
@@ -917,7 +918,7 @@ jobs:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-backend, merge-openscap, merge-backend-alpine]
+    needs: [merge-backend, merge-openscap]
     if: always()
     steps:
       - name: Summary
@@ -927,10 +928,6 @@ jobs:
           echo "### Backend" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Backend (Alpine)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest-alpine\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest-alpine\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY

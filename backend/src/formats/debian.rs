@@ -5,11 +5,14 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use tar::Archive;
+use xz2::read::XzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
@@ -112,22 +115,27 @@ impl DebianHandler {
 
     /// Parse .deb filename
     /// Format: <name>_<version>_<arch>.deb
-    fn parse_deb_filename(filename: &str) -> Result<(String, String, String)> {
-        let name = filename.trim_end_matches(".deb").trim_end_matches(".udeb");
-        let parts: Vec<&str> = name.split('_').collect();
+    pub fn parse_deb_filename(filename: &str) -> Result<(String, String, String)> {
+        let name = filename
+            .strip_suffix(".deb")
+            .or_else(|| filename.strip_suffix(".udeb"))
+            .ok_or_else(|| {
+                AppError::Validation(format!("Invalid Debian package filename: {}", filename))
+            })?;
 
-        if parts.len() < 3 {
+        let parts: Vec<&str> = name.splitn(3, '_').collect();
+        if parts.len() != 3 {
             return Err(AppError::Validation(format!(
                 "Invalid Debian package filename: {}",
                 filename
             )));
         }
 
-        let package = parts[0].to_string();
-        let version = parts[1].to_string();
-        let arch = parts[2..].join("_"); // Handle arch like amd64 or all
-
-        Ok((package, version, arch))
+        Ok((
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        ))
     }
 
     /// Get pool path for a package
@@ -178,8 +186,13 @@ impl DebianHandler {
 
             // Check if this is the control archive
             if name.starts_with("control.tar") {
+                if offset + size > content.len() {
+                    return Err(AppError::Validation(
+                        "Invalid .deb file: truncated ar member".to_string(),
+                    ));
+                }
                 let data = &content[offset..offset + size];
-                return Self::parse_control_tar(data, name.contains(".gz"), name.contains(".xz"));
+                return Self::parse_control_tar(data, name);
             }
 
             // Move to next file (aligned to 2 bytes)
@@ -195,9 +208,17 @@ impl DebianHandler {
     }
 
     /// Parse control.tar(.gz) to extract control file
-    fn parse_control_tar(data: &[u8], is_gzip: bool, _is_xz: bool) -> Result<DebControl> {
-        let reader: Box<dyn Read> = if is_gzip {
+    fn parse_control_tar(data: &[u8], member_name: &str) -> Result<DebControl> {
+        let reader: Box<dyn Read + '_> = if member_name.ends_with(".gz") {
             Box::new(GzDecoder::new(data))
+        } else if member_name.ends_with(".xz") {
+            Box::new(XzDecoder::new(data))
+        } else if member_name.ends_with(".bz2") {
+            Box::new(BzDecoder::new(data))
+        } else if member_name.ends_with(".zst") || member_name.ends_with(".zstd") {
+            Box::new(ZstdDecoder::new(data).map_err(|e| {
+                AppError::Validation(format!("Invalid control.tar zstd stream: {}", e))
+            })?)
         } else {
             Box::new(data)
         };
@@ -264,6 +285,16 @@ impl DebianHandler {
         if control.package.is_empty() {
             return Err(AppError::Validation(
                 "Control file missing Package field".to_string(),
+            ));
+        }
+        if control.version.is_empty() {
+            return Err(AppError::Validation(
+                "Control file missing Version field".to_string(),
+            ));
+        }
+        if control.architecture.is_empty() {
+            return Err(AppError::Validation(
+                "Control file missing Architecture field".to_string(),
             ));
         }
 
@@ -380,6 +411,16 @@ impl FormatHandler for DebianHandler {
                     )));
                 }
             }
+
+            // Verify architecture matches.
+            if let Some(path_arch) = &info.arch {
+                if &control.architecture != path_arch {
+                    return Err(AppError::Validation(format!(
+                        "Architecture mismatch: path says '{}' but control says '{}'",
+                        path_arch, control.architecture
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -411,7 +452,7 @@ pub enum DebianOperation {
 }
 
 /// Debian control file structure
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DebControl {
     pub package: String,
     pub version: String,
@@ -823,6 +864,20 @@ Description: High performance web server
     }
 
     #[test]
+    fn test_parse_control_missing_version() {
+        let content = "Package: pkg\nArchitecture: amd64\n";
+        let result = DebianHandler::parse_control(content);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_control_missing_architecture() {
+        let content = "Package: pkg\nVersion: 1.0\n";
+        let result = DebianHandler::parse_control(content);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_control_empty() {
         let result = DebianHandler::parse_control("");
         assert!(result.is_err());
@@ -994,6 +1049,62 @@ Source: full-pkg-src
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("control.tar not found"));
+    }
+
+    fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+        let header = format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            name,
+            0,
+            0,
+            0,
+            "100644",
+            content.len()
+        );
+        assert_eq!(header.len(), 60);
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(content);
+        if content.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+
+    fn control_tar(control: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(control.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "./control", control.as_bytes())
+            .expect("append control");
+        builder.finish().expect("finish tar");
+        builder.into_inner().expect("tar bytes")
+    }
+
+    fn deb_with_control_member(member_name: &str, control_member: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"!<arch>\n");
+        append_ar_member(&mut data, "debian-binary", b"2.0\n");
+        append_ar_member(&mut data, member_name, control_member);
+        data
+    }
+
+    #[test]
+    fn test_extract_control_xz() {
+        use std::io::Write;
+
+        let control = "Package: xz-pkg\nVersion: 1.0-1\nArchitecture: amd64\n";
+        let tar_bytes = control_tar(control);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar_bytes).expect("write xz");
+        let control_tar_xz = encoder.finish().expect("finish xz");
+        let deb = deb_with_control_member("control.tar.xz", &control_tar_xz);
+
+        let control = DebianHandler::extract_control(&deb).expect("extract xz control");
+        assert_eq!(control.package, "xz-pkg");
+        assert_eq!(control.version, "1.0-1");
+        assert_eq!(control.architecture, "amd64");
     }
 
     // ========================================================================

@@ -86,6 +86,7 @@ RUN mkdir -p /mnt/rootfs && \
         jq \
         tar \
         gzip \
+        zstd \
     && dnf --installroot /mnt/rootfs --releasever 9 \
         --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
     && dnf --installroot /mnt/rootfs clean all \

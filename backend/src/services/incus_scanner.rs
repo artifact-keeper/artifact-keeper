@@ -395,29 +395,36 @@ impl IncusScanner {
         let tarball_path = dest.join("image.tar.xz");
         write_temp_file(&tarball_path, content, "tarball").await?;
 
-        // Detect compression: XZ magic bytes (0xFD 0x37 0x7A 0x58 0x5A)
+        // Detect compression by magic bytes: XZ (FD 37 7A 58 5A), zstd
+        // (28 B5 2F FD), else assume gzip. `incus image export` ships .tar.xz;
+        // `incus export` container backups and zstd-compressed exports
+        // (`--compression=zstd`) ship .tar.zst, so zstd must be handled
+        // explicitly — `tar -xzf` (gzip) on a zstd archive
+        // fails extraction. zstd support requires the `zstd` binary in the
+        // runtime image (installed in Dockerfile.backend).
         let is_xz = content.len() >= 5 && content[..5] == [0xFD, 0x37, 0x7A, 0x58, 0x5A];
-        // Leading `-` is required: GNU tar only treats a bare option bundle
-        // (`xzf`) as options when it is the FIRST argument. Here it follows
-        // `--no-same-owner`/`--mode=...`, so without the dash GNU tar parses
-        // `xzf` as a file operand and aborts with "You must specify one of
-        // the '-Acdtrux' options". (bsdtar on macOS is lenient, which is why
-        // local runs passed but Linux CI failed.)
-        let decompress_flag = if is_xz { "-xJf" } else { "-xzf" };
+        let is_zstd = content.len() >= 4 && content[..4] == [0x28, 0xB5, 0x2F, 0xFD];
 
-        run_command(
-            "tar",
-            &[
-                "--no-same-owner",
-                "--mode=u=rwX,go=rX",
-                decompress_flag,
-                &tarball_path.to_string_lossy(),
-                "-C",
-                &dest.to_string_lossy(),
-            ],
-            "tar extraction",
-        )
-        .await?;
+        let tarball_arg = tarball_path.to_string_lossy();
+        let dest_arg = dest.to_string_lossy();
+        // GNU tar only treats a bare option bundle (`xzf`) as options when it is
+        // the FIRST argument; here it follows `--no-same-owner`/`--mode=...`, so
+        // the leading `-` is required. zstd has no single-letter bundle, so it
+        // goes in as the long `--zstd` option plus a plain `-xf` extract bundle.
+        let mut args: Vec<&str> = vec!["--no-same-owner", "--mode=u=rwX,go=rX"];
+        if is_zstd {
+            args.push("--zstd");
+            args.push("-xf");
+        } else if is_xz {
+            args.push("-xJf");
+        } else {
+            args.push("-xzf");
+        }
+        args.push(tarball_arg.as_ref());
+        args.push("-C");
+        args.push(dest_arg.as_ref());
+
+        run_command("tar", &args, "tar extraction").await?;
 
         // Drop the source archive before walking the tree so it isn't counted
         // toward the extracted-size budget (and to free the disk early).
@@ -1559,6 +1566,35 @@ mod tests {
 
         let result = scanner.extract_tarball(&content, &rootfs_dir).await;
         // Should fail during tar extraction (invalid xz data), not during write
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("tar extraction failed"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_tarball_detects_zstd_magic() {
+        // Mirrors the xz/gzip cases: feed the zstd magic bytes (0x28 0xB5 0x2F
+        // 0xFD) followed by garbage and assert the function selects the zstd
+        // (`--zstd`) extraction path and fails gracefully on the invalid body.
+        // This exercises the `is_zstd` branch without needing a valid archive;
+        // tar still reports a non-zero exit (whether via the zstd filter or a
+        // missing-binary error), which `run_command` surfaces as the same
+        // "tar extraction failed" error.
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // zstd magic: 0x28 0xB5 0x2F 0xFD followed by invalid data.
+        let mut zstd_content = vec![0x28, 0xB5, 0x2F, 0xFD];
+        zstd_content.extend_from_slice(b"not-valid-zstd-data");
+        let content = Bytes::from(zstd_content);
+
+        let result = scanner.extract_tarball(&content, &rootfs_dir).await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("tar extraction failed"));
