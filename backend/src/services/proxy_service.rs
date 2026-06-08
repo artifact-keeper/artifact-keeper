@@ -7979,7 +7979,8 @@ SHA256:
         let tmp = std::env::temp_dir().join(format!("ak-1365-ok-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create tmp dir");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
-        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+        let repo_key = format!("maven-central-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
 
         // First request: cache miss, streamed from upstream and tee'd to cache.
         let first = proxy
@@ -7999,7 +8000,7 @@ SHA256:
 
         // The cache must now be fresh with the correct length.
         assert!(
-            proxy.is_cache_fresh("maven-central", pom_path).await,
+            proxy.is_cache_fresh(&repo_key, pom_path).await,
             "a non-empty POM must produce a fresh cache entry"
         );
 
@@ -8069,7 +8070,8 @@ SHA256:
         let tmp = std::env::temp_dir().join(format!("ak-1365-empty-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create tmp dir");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
-        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+        let repo_key = format!("maven-central-empty-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
 
         // First request: empty upstream body. Client gets the empty body
         // for THIS request, but nothing must be cached.
@@ -8086,7 +8088,7 @@ SHA256:
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !proxy.is_cache_fresh("maven-central", pom_path).await,
+            !proxy.is_cache_fresh(&repo_key, pom_path).await,
             "an empty upstream body MUST NOT create a fresh cache entry (#1365)"
         );
 
