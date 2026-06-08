@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **PyPI virtual repositories now isolate locally-owned project names by default (PEP 708 dependency-confusion mitigation)** (#1600). Previously, when a local member owned a project name, a virtual repo could union an unrelated upstream package of the same name into its `/simple/` index and serve it on download, so an unpinned `pip install <name>` could resolve to the higher public version (a supply-chain hole). A PyPI virtual now serves only the owning member's distributions for a locally-owned name, in both the simple index and the download, unless an operator declares a PEP 708 `tracks` relationship for that project. The Simple API now advertises v1.2 and emits `meta.tracks` / `pypi:tracks` where declared.
+
+  **Behavior change (action may be required):** if you intentionally relied on a mixed virtual unioning a local project's versions with the same project upstream (e.g. split version ranges of the *same* package), declare it via the new endpoint so the union is restored:
+
+  ```
+  PUT /api/v1/repositories/{local_repo_key}/pypi-tracks/{project}
+  { "tracks_url": "https://pypi.org/simple/{project}/" }
+  ```
+
+  Names a local member does not own are unaffected and continue to proxy normally.
+
 ### Pre-upgrade check
 
 - **Stuck-scan janitor will reap accumulated `running` rows on first tick** (#1015, #1062) -- this release introduces a background janitor that transitions `scan_results` rows wedged in `status='running'` past the configured `STUCK_SCAN_THRESHOLD_SECS` (default 1800s / 30 min) to `status='failed'`. On long-running installs predating this release, previously-stuck rows from crashed scan workers (OOM, pod evicted, deploy mid-scan) will flip to `failed` in batches of up to 1000 rows per janitor tick (the per-tick cap bounds memory and audit-log write volume). With the default `STUCK_SCAN_CHECK_INTERVAL_SECS=600`, a backlog of N stuck rows therefore takes roughly `ceil(N / 1000) * (STUCK_SCAN_CHECK_INTERVAL_SECS / 60)` minutes per replica to fully drain. Multiple janitor-running replicas drain proportionally faster (the cap is per-replica, per-tick). Operators with a large backlog who want to accelerate the drain can lower `STUCK_SCAN_CHECK_INTERVAL_SECS` for one or two ticks after deploy and revert. Alerting on `status='failed'` deltas should expect this drain (one or many ticks depending on backlog size) at upgrade and tune accordingly.
