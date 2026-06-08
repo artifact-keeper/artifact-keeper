@@ -7844,6 +7844,7 @@ SHA256:
                     .insert_header("content-type", "text/xml")
                     .set_body_bytes(b"".as_ref()),
             )
+            .with_priority(1)
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -7854,6 +7855,7 @@ SHA256:
                     .insert_header("content-type", "text/xml")
                     .set_body_bytes(pom.as_ref()),
             )
+            .with_priority(2)
             .mount(&server)
             .await;
 
