@@ -25,6 +25,19 @@ fn parse_opt_in_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// Parse an opt-OUT boolean env flag: defaults to `true` (enabled) when
+/// unset or unrecognized, and only an explicit, recognized negative
+/// (`false`/`0`, case/whitespace-insensitive) turns it off. Used for
+/// features that are ON by default and must stay on unless the operator
+/// deliberately disables them — e.g. `RATE_LIMIT_ENABLED` (#1602). Pure so
+/// the truth table is unit-testable without touching the environment.
+fn parse_opt_out_flag(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("false" | "0")
+    )
+}
+
 /// Minimum reap-threshold for the stuck-scan janitor.
 ///
 /// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
@@ -310,6 +323,15 @@ pub struct Config {
     /// idle disconnect.
     pub database_max_lifetime_secs: u64,
 
+    /// Master on/off switch for HTTP rate limiting. When `false`, none of
+    /// the per-IP / per-user rate-limit middleware layers are installed, so
+    /// no request is ever limited (the limiter is bypassed entirely, not
+    /// merely set very high). Intended for internal-only / VPN-gated
+    /// deployments where the per-IP limiter provides little value but trips
+    /// build tools that fan out many small requests (e.g. sbt/Coursier
+    /// resolving plugins against the presign limiter). See #1602.
+    /// Env var: `RATE_LIMIT_ENABLED` (opt-out). Default: `true` (enabled).
+    pub rate_limit_enabled: bool,
     pub rate_limit_auth_per_window: u32,
     pub rate_limit_api_per_window: u32,
     pub rate_limit_search_per_window: u32,
@@ -487,6 +509,7 @@ redacted_debug!(Config {
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show auth_max_concurrency,
+    show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
@@ -573,6 +596,7 @@ impl Default for Config {
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             auth_max_concurrency: default_auth_max_concurrency(),
+            rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
             rate_limit_search_per_window: 300,
@@ -744,6 +768,7 @@ impl Config {
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
+            rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
@@ -932,6 +957,54 @@ mod tests {
         assert!(!parse_opt_in_flag(Some("on")));
         assert!(!parse_opt_in_flag(Some("2")));
         assert!(!parse_opt_in_flag(Some("garbage")));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_opt_out_flag (pure; RATE_LIMIT_ENABLED opt-out, #1602)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_opt_out_flag_truth_table() {
+        // Default ON: unset, empty, or any unrecognized value stays enabled.
+        assert!(parse_opt_out_flag(None));
+        assert!(parse_opt_out_flag(Some("")));
+        assert!(parse_opt_out_flag(Some("true")));
+        assert!(parse_opt_out_flag(Some("1")));
+        assert!(parse_opt_out_flag(Some("yes")));
+        assert!(parse_opt_out_flag(Some("garbage")));
+        // Only explicit, recognized negatives (case/whitespace-insensitive)
+        // turn it off.
+        assert!(!parse_opt_out_flag(Some("false")));
+        assert!(!parse_opt_out_flag(Some("FALSE")));
+        assert!(!parse_opt_out_flag(Some("  False  ")));
+        assert!(!parse_opt_out_flag(Some("0")));
+    }
+
+    #[test]
+    fn test_config_rate_limit_enabled_by_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::remove_var("RATE_LIMIT_ENABLED");
+        let config = Config::from_env().expect("config should load");
+        assert!(
+            config.rate_limit_enabled,
+            "rate limiting must be ON by default (#1602)"
+        );
+    }
+
+    #[test]
+    fn test_config_rate_limit_disabled_via_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("RATE_LIMIT_ENABLED", "false");
+        let config = Config::from_env().expect("config should load");
+        env::remove_var("RATE_LIMIT_ENABLED");
+        assert!(
+            !config.rate_limit_enabled,
+            "RATE_LIMIT_ENABLED=false must disable rate limiting"
+        );
     }
 
     #[test]
