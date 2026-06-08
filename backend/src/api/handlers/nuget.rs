@@ -530,7 +530,7 @@ async fn flatcontainer_download(
                     "v3/flatcontainer/{}/{}/{}",
                     package_id_lower, version, filename
                 );
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
                     repo.id,
@@ -550,19 +550,11 @@ async fn flatcontainer_download(
                 )
                 .await?;
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    Some(&filename),
+                );
             }
             return Err(not_found);
         }
@@ -577,60 +569,73 @@ async fn flatcontainer_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = if repo.repo_type == RepositoryType::Remote {
-        if let (Some(ref upstream_url), Some(ref proxy)) =
-            (&repo.upstream_url, &state.proxy_service)
-        {
-            let package_id_lower = package_id_lower.clone();
-            let version = version.clone();
-            let filename = filename.clone();
-            let repo_key = repo_key.clone();
-            proxy_helpers::get_cached_or_refetch(
-                &state.db,
-                artifact.id,
-                storage.as_ref(),
-                &artifact.storage_key,
-                || {
-                    let package_id_lower = package_id_lower.clone();
-                    let version = version.clone();
-                    let filename = filename.clone();
-                    let repo_key = repo_key.clone();
-                    async move {
-                        let upstream_path = format!(
-                            "v3/flatcontainer/{}/{}/{}",
-                            package_id_lower, version, filename
-                        );
-                        let (bytes, _content_type) = proxy_helpers::proxy_fetch(
-                            proxy,
-                            repo.id,
-                            &repo_key,
-                            upstream_url,
-                            &upstream_path,
-                        )
-                        .await?;
-                        Ok(bytes)
-                    }
-                },
-            )
-            .await?
-        } else {
-            storage.get(&artifact.storage_key).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
+    // Remote repos must keep the buffered cache-or-refetch path: a cache miss
+    // re-pulls the package from upstream and writes it back. That recovery
+    // read is small relative to the artifact and is re-wrapped as a one-shot
+    // stream below. Local/cached hits stream the body straight from storage so
+    // large `.nupkg` bodies never buffer in heap.
+    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let package_id_lower = package_id_lower.clone();
+                let version = version.clone();
+                let filename = filename.clone();
+                let repo_key = repo_key.clone();
+                let content = proxy_helpers::get_cached_or_refetch(
+                    &state.db,
+                    artifact.id,
+                    storage.as_ref(),
+                    &artifact.storage_key,
+                    || {
+                        let package_id_lower = package_id_lower.clone();
+                        let version = version.clone();
+                        let filename = filename.clone();
+                        let repo_key = repo_key.clone();
+                        async move {
+                            let upstream_path = format!(
+                                "v3/flatcontainer/{}/{}/{}",
+                                package_id_lower, version, filename
+                            );
+                            let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                repo.id,
+                                &repo_key,
+                                upstream_url,
+                                &upstream_path,
+                            )
+                            .await?;
+                            Ok(bytes)
+                        }
+                    },
                 )
-                    .into_response()
-            })?
-        }
-    } else {
-        storage.get(&artifact.storage_key).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?
-    };
+                .await?;
+                Box::pin(futures::stream::once(async move { Ok(content) }))
+            } else {
+                storage
+                    .get_stream(&artifact.storage_key)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Storage error: {}", e),
+                        )
+                            .into_response()
+                    })?
+            }
+        } else {
+            storage
+                .get_stream(&artifact.storage_key)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Storage error: {}", e),
+                    )
+                        .into_response()
+                })?
+        };
 
     // Record download.
     let _ = sqlx::query!(
@@ -640,6 +645,7 @@ async fn flatcontainer_download(
     .execute(&state.db)
     .await;
 
+    use futures::StreamExt as _;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/octet-stream")
@@ -647,8 +653,10 @@ async fn flatcontainer_download(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::from_stream(
+            body.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+        ))
         .unwrap())
 }
 

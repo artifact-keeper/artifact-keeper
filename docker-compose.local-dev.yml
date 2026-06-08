@@ -144,6 +144,27 @@ services:
     healthcheck:
       disable: true
 
+  # Make the shared scan_workspace volume writable by the non-root dev backend
+  # user before it starts. The dev backend runs as a system `appuser` with a
+  # runtime-assigned UID, so we make the volume world-writable rather than
+  # chown to a fixed UID. See docker-compose.yml's scan-workspace-init and
+  # issue #1563 for the production equivalent.
+  scan-workspace-init:
+    image: alpine:3.23
+    container_name: artifact-keeper-dev-scan-ws-init
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /scan-workspace
+        chmod 0777 /scan-workspace
+        echo "scan-workspace-init: dev volume made writable"
+    volumes:
+      - dev_scan_workspace:/scan-workspace
+    restart: "no"
+    healthcheck:
+      disable: true
+
   # Backend with hot-reload using cargo-watch
   backend:
     build:
@@ -155,6 +176,8 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      scan-workspace-init:
+        condition: service_completed_successfully
     entrypoint:
       - /bin/sh
       - -c

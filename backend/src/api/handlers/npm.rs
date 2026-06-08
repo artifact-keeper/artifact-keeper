@@ -964,6 +964,29 @@ fn build_tarball_response(
         .unwrap()
 }
 
+/// Build a streaming tarball response from a storage stream.
+fn build_tarball_response_stream(
+    stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    filename: &str,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        );
+    if let Some(len) = content_length {
+        builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
+}
+
 /// Build an OK response with a given content type and body.
 fn build_ok_response(content_type: &str, body: impl Into<Body>) -> Response {
     Response::builder()
@@ -1043,7 +1066,7 @@ async fn npm_local_fetch(
     upstream_path: &str,
     package_name: &str,
     filename: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<proxy_helpers::StreamingFetchResult, Response> {
     // Try exact path match first (proxy-cached artifacts use the upstream
     // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
     // separator stays un-encoded for tarballs; see
@@ -1065,7 +1088,7 @@ async fn npm_local_fetch(
     let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
     let filename_escaped = super::escape_like_literal(filename);
     let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
@@ -1088,16 +1111,30 @@ async fn npm_local_fetch(
     let storage = state
         .storage_for_repo(location)
         .map_err(|e| e.into_response())?;
-    let content = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            proxy_helpers::coordinated_retry_get(db, artifact.id, &artifact.storage_key, &*storage)
-                .await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
+    // Stream the body for the common case, but preserve the #1016 / hydration
+    // contract: a storage miss falls back to the coordinated buffered retry and
+    // is re-wrapped as a one-shot stream so the caller sees a uniform result.
+    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
+        match storage.get_stream(&artifact.storage_key).await {
+            Ok(stream) => stream,
+            Err(crate::error::AppError::NotFound(_)) => {
+                let bytes = proxy_helpers::coordinated_retry_get(
+                    db,
+                    artifact.id,
+                    &artifact.storage_key,
+                    &*storage,
+                )
+                .await?;
+                Box::pin(futures::stream::once(async move { Ok(bytes) }))
+            }
+            Err(e) => return Err(map_storage_err(e)),
+        };
 
-    Ok((content, Some(artifact.content_type.clone())))
+    Ok(proxy_helpers::StreamingFetchResult {
+        body,
+        content_type: Some(artifact.content_type.clone()),
+        content_length: Some(artifact.size_bytes as u64),
+    })
 }
 
 async fn serve_tarball(
@@ -1171,7 +1208,7 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
-        let (content, content_type) = proxy_helpers::resolve_virtual_download(
+        let result = proxy_helpers::resolve_virtual_download(
             &state.db,
             proxy_for_virtual,
             repo.id,
@@ -1189,7 +1226,12 @@ async fn serve_tarball(
         )
         .await?;
 
-        return Ok(build_tarball_response(content, filename, content_type));
+        return Ok(build_tarball_response_stream(
+            result.body,
+            filename,
+            result.content_type,
+            result.content_length,
+        ));
     }
 
     // For local/staged repos, find artifact by filename. Include the package
@@ -1236,8 +1278,8 @@ async fn serve_tarball(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
+    let stream = storage
+        .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
 
@@ -1249,7 +1291,12 @@ async fn serve_tarball(
     .execute(&state.db)
     .await;
 
-    Ok(build_tarball_response(content, filename, None))
+    Ok(build_tarball_response_stream(
+        stream,
+        filename,
+        None,
+        Some(artifact.size_bytes as u64),
+    ))
 }
 
 /// Update the content_type of a cached proxy artifact from the incorrect
@@ -3174,6 +3221,63 @@ mod tests {
         // column (see store_npm_version). Verify the constant matches.
         let publish_content_type = "application/gzip";
         assert_eq!(NPM_TARBALL_CONTENT_TYPE, publish_content_type);
+    }
+
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_sets_headers() {
+        // The streaming tarball response (used for the get_stream download path)
+        // must emit the gzip content-type (or the supplied upstream type), a
+        // Content-Disposition with the filename, and Content-Length when known.
+        use futures::StreamExt as _;
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tgz-bytes"))
+            }));
+        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(9));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some(NPM_TARBALL_CONTENT_TYPE)
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg-1.0.0.tgz\"")
+        );
+        assert_eq!(
+            h.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            Some("9")
+        );
+        // Body must stream the supplied bytes verbatim.
+        let collected = resp
+            .into_body()
+            .into_data_stream()
+            .fold(Vec::new(), |mut acc, c| async move {
+                acc.extend_from_slice(&c.unwrap());
+                acc
+            })
+            .await;
+        assert_eq!(&collected[..], b"tgz-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_uses_upstream_ct_and_omits_length() {
+        // An upstream-provided content-type wins over the default, and Content-
+        // Length is omitted when unknown (chunked transfer).
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::iter(Vec::new()));
+        let resp = build_tarball_response_stream(
+            body,
+            "x.tgz",
+            Some("application/x-custom".to_string()),
+            None,
+        );
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/x-custom")
+        );
+        assert!(h.get(CONTENT_LENGTH).is_none());
     }
 
     // -----------------------------------------------------------------------

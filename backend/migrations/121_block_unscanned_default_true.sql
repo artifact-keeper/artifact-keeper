@@ -1,0 +1,13 @@
+-- #1643: make NEW scan policies block unscanned artifacts by default.
+--
+-- migration 022 created scan_policies.block_unscanned with DEFAULT false, which
+-- combined with the promotion gate never reading the column meant unscanned
+-- artifacts failed open. The promotion gate now enforces block_unscanned; this
+-- flips the column default so policies created from here on are secure by
+-- default.
+--
+-- IMPORTANT: this ONLY changes the default for rows inserted in the future. It
+-- deliberately does NOT UPDATE existing rows -- operators who explicitly chose
+-- block_unscanned = false keep that value, and the block/allow decision for any
+-- existing policy is unchanged.
+ALTER TABLE scan_policies ALTER COLUMN block_unscanned SET DEFAULT true;
