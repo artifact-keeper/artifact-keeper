@@ -9,14 +9,27 @@ RUN ARCH=$(uname -m) && \
 # Install OpenSCAP, SCAP content, and Python into a clean rootfs.
 # Then remove pip/setuptools wheel packages from RPM database (not needed
 # at runtime) and strip the bundled ensurepip module to eliminate pip CVEs.
+#
+# --refresh forces fresh repo metadata and the follow-up upgrade pulls
+# z-stream errata (e.g. el9_8 security fixes for glibc, openssl-libs, krb5,
+# python3, systemd, glib2, libcap, p11-kit) that the install step alone may
+# miss when the cache is stale or the base image tag lags the latest
+# z-stream. The reposdir override is required on the upgrade step because
+# once the installroot has a populated /etc, dnf reads repos from inside it
+# (which is empty) instead of falling back to the host's /etc/yum.repos.d.
+# Mirrors the rootfs-builder upgrade step in Dockerfile.backend. See
+# artifact-keeper#1544 (weekly container scan findings).
 RUN mkdir -p /mnt/rootfs && \
-    dnf install --installroot /mnt/rootfs --releasever 9 \
+    dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
+        --setopt=reposdir=/etc/yum.repos.d/ \
         --setopt install_weak_deps=0 --nodocs --nogpgcheck -y \
         glibc-minimal-langpack \
         ca-certificates \
         openscap-scanner \
         scap-security-guide \
         python3 \
+    && dnf --installroot /mnt/rootfs --releasever 9 \
+        --setopt=reposdir=/etc/yum.repos.d/ --nogpgcheck upgrade -y \
     && rpm --root /mnt/rootfs -e --nodeps python3-pip-wheel python3-setuptools-wheel \
     && rm -rf /mnt/rootfs/usr/lib/python3.9/ensurepip \
     && dnf --installroot /mnt/rootfs clean all \
