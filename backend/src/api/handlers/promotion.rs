@@ -207,6 +207,30 @@ pub fn validate_promotion_target_and_format(
     Ok(())
 }
 
+/// Copy an artifact body from `source` storage to `target` storage by streaming
+/// rather than buffering the whole object in memory (#1608, Core Invariant ①).
+///
+/// Promotion resolves the source and target backends independently, so the two
+/// `StorageBackend` handles can be different backends (e.g. a filesystem staging
+/// repo promoted to an S3 release repo). [`StorageBackend::copy`] only operates
+/// within a single backend, so it cannot be used here; instead we tee the
+/// `get_stream` from the source directly into `put_stream` on the target. Peak
+/// memory therefore stays O(chunk) regardless of artifact size, which is what
+/// prevents an OOM on multi-GB cross-backend promotions.
+///
+/// A missing source key surfaces as [`AppError::NotFound`] from `get_stream`,
+/// matching the storage NotFound contract (#1016). Returns the
+/// [`PutStreamResult`](crate::storage::PutStreamResult) so callers can verify
+/// the streamed digest/byte count if desired.
+pub async fn stream_copy_artifact(
+    source: &dyn crate::storage::StorageBackend,
+    target: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+) -> Result<crate::storage::PutStreamResult> {
+    let stream = source.get_stream(storage_key).await?;
+    target.put_stream(storage_key, stream).await
+}
+
 /// Outcome of a single quality-gate evaluation, used by `promote_artifact` to
 /// drive both the block (409) and warn (attach-to-response) branches from one
 /// underlying DB query.
@@ -574,14 +598,12 @@ pub async fn promote_artifact(
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
 
-    let content = source_storage
-        .get(&artifact.storage_key)
+    // Stream the artifact body across (possibly distinct) storage backends
+    // instead of buffering it in memory (#1608, Core Invariant ①). Shares the
+    // same tee helper as the bulk path.
+    stream_copy_artifact(&*source_storage, &*target_storage, &artifact.storage_key)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to read source artifact: {}", e)))?;
-    target_storage
-        .put(&artifact.storage_key, content)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to write promoted artifact: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
 
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
@@ -746,25 +768,18 @@ pub async fn promote_artifacts_bulk(
         let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
         let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
 
-        let content = match source_storage.get(&artifact.storage_key).await {
-            Ok(c) => c,
-            Err(e) => {
-                failed += 1;
-                results.push(failed_response(
-                    source_display,
-                    target_display,
-                    format!("Failed to read source artifact: {}", e),
-                ));
-                continue;
-            }
-        };
-
-        if let Err(e) = target_storage.put(&artifact.storage_key, content).await {
+        // Stream the artifact body from source to target instead of buffering
+        // the whole object in memory (#1608, Core Invariant ①). See
+        // `stream_copy_artifact` for why `StorageBackend::copy` cannot be used
+        // when source and target are distinct backends.
+        if let Err(e) =
+            stream_copy_artifact(&*source_storage, &*target_storage, &artifact.storage_key).await
+        {
             failed += 1;
             results.push(failed_response(
                 source_display,
                 target_display,
-                format!("Failed to write promoted artifact: {}", e),
+                format!("Failed to copy artifact: {}", e),
             ));
             continue;
         }
@@ -2501,5 +2516,155 @@ mod tests {
         let json = serde_json::json!({});
         let req: SetReleaseTargetRequest = serde_json::from_value(json).unwrap();
         assert!(req.release_repository_key.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // stream_copy_artifact (#1608 cross-backend streaming promotion)
+    // -----------------------------------------------------------------------
+
+    use crate::error::AppError;
+    use crate::storage::{PutStreamResult, StorageBackend};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// A source backend that emits its payload over `get_stream` in several
+    /// chunks, so the test proves we tee a multi-chunk stream rather than
+    /// buffering. `get()` panics to guarantee the streaming path is used.
+    struct ChunkedSource {
+        payload: Bytes,
+        missing: bool,
+    }
+
+    #[async_trait]
+    impl StorageBackend for ChunkedSource {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            panic!("source put must not be called");
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            panic!("stream_copy_artifact must use get_stream, not get");
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(!self.missing)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get_stream(
+            &self,
+            key: &str,
+        ) -> crate::error::Result<BoxStream<'static, crate::error::Result<Bytes>>> {
+            if self.missing {
+                return Err(AppError::NotFound(format!("missing: {}", key)));
+            }
+            // Split the payload into two chunks to exercise multi-chunk teeing.
+            let mid = self.payload.len() / 2;
+            let first = self.payload.slice(0..mid);
+            let second = self.payload.slice(mid..);
+            let chunks: Vec<crate::error::Result<Bytes>> = vec![Ok(first), Ok(second)];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// A target backend that captures whatever was streamed into it via
+    /// `put_stream`, plus the computed checksum/byte count, so the test can
+    /// assert the copied object is byte-identical to the source.
+    #[derive(Default)]
+    struct CapturingTarget {
+        received: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl StorageBackend for CapturingTarget {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            panic!("target put must not be called; put_stream is the streaming path");
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::from(self.received.lock().unwrap().clone()))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            stream: BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<PutStreamResult> {
+            use futures::StreamExt;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            let mut buf = Vec::new();
+            let mut total: u64 = 0;
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+                buf.extend_from_slice(&chunk);
+            }
+            *self.received.lock().unwrap() = buf;
+            Ok(PutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_copy_artifact_copies_bytes_across_backends() {
+        // Source and target are DISTINCT backend types — the exact scenario
+        // where StorageBackend::copy cannot be used and tee streaming is
+        // required (#1608).
+        let payload = Bytes::from_static(b"multi-gb-artifact-stand-in-payload-bytes");
+        let source = ChunkedSource {
+            payload: payload.clone(),
+            missing: false,
+        };
+        let target = CapturingTarget::default();
+
+        let result = stream_copy_artifact(&source, &target, "rpm/repo/pkg.rpm")
+            .await
+            .expect("stream copy should succeed");
+
+        // The target received the exact source bytes.
+        assert_eq!(
+            &target.received.lock().unwrap()[..],
+            &payload[..],
+            "copied bytes must match the source artifact exactly"
+        );
+        // Byte count and digest are propagated from put_stream, preserving
+        // integrity verification capability.
+        assert_eq!(result.bytes_written, payload.len() as u64);
+        let expected_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&payload);
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(result.checksum_sha256, expected_digest);
+    }
+
+    #[tokio::test]
+    async fn test_stream_copy_artifact_propagates_source_not_found() {
+        // A missing source object must surface as AppError::NotFound from
+        // get_stream (the storage NotFound contract, #1016) and never reach
+        // the target backend.
+        let source = ChunkedSource {
+            payload: Bytes::new(),
+            missing: true,
+        };
+        let target = CapturingTarget::default();
+
+        let err = stream_copy_artifact(&source, &target, "rpm/repo/missing.rpm")
+            .await
+            .expect_err("missing source must error");
+        assert!(matches!(err, AppError::NotFound(_)), "got {:?}", err);
+        // Target must remain untouched.
+        assert!(target.received.lock().unwrap().is_empty());
     }
 }
