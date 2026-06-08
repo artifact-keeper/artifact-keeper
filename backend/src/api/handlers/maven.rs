@@ -1007,17 +1007,21 @@ async fn download(
             }
         }
 
-        // Otherwise try to compute from a locally-stored artifact
-        if let Ok(response) = serve_computed_checksum(
-            &state,
-            repo.id,
-            &repo.storage_location(),
-            base_path,
-            checksum_type,
-        )
-        .await
-        {
-            return Ok(response);
+        // Compute checksum from locally-stored artifact (Local/Staging only).
+        // Remote repos cache artifacts in the proxy cache, not the `artifacts`
+        // table, so the DB lookup inside serve_computed_checksum always fails.
+        if checksum_compute_eligible(&repo.repo_type) {
+            if let Ok(response) = serve_computed_checksum(
+                &state,
+                repo.id,
+                &repo.storage_location(),
+                base_path,
+                checksum_type,
+            )
+            .await
+            {
+                return Ok(response);
+            }
         }
 
         // Fallback: proxy the checksum file from upstream for remote repos
@@ -1041,21 +1045,10 @@ async fn download(
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
             for member in &members {
-                // Try computing the checksum from the member's stored artifact
-                if let Ok(response) = serve_computed_checksum(
-                    &state,
-                    member.id,
-                    &member.storage_location(),
-                    base_path,
-                    checksum_type,
-                )
-                .await
-                {
-                    return Ok(response);
-                }
-
-                // If member is remote, try proxying the checksum file from upstream
                 if member.repo_type == RepositoryType::Remote {
+                    // Remote member: proxy checksum from upstream directly.
+                    // serve_computed_checksum always fails — proxy-cached
+                    // artifacts are NOT in the `artifacts` table (#1280).
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
@@ -1074,6 +1067,19 @@ async fn download(
                                 .body(Body::from(content))
                                 .unwrap());
                         }
+                    }
+                } else if member.repo_type.is_hosted() {
+                    // Local/Staging member: compute checksum from stored artifact.
+                    if let Ok(response) = serve_computed_checksum(
+                        &state,
+                        member.id,
+                        &member.storage_location(),
+                        base_path,
+                        checksum_type,
+                    )
+                    .await
+                    {
+                        return Ok(response);
                     }
                 }
             }
@@ -1402,6 +1408,22 @@ async fn serve_artifact(
     }
 
     Ok(builder.body(Body::from_stream(stream)).unwrap())
+}
+
+/// Whether a Maven checksum (`*.md5` / `*.sha1`) for an artifact should be
+/// computed from a locally-stored artifact via [`serve_computed_checksum`]
+/// (i.e. a DB lookup in the `artifacts` table).
+///
+/// Only hosted repositories (`Local` / `Staging`) store artifacts in the
+/// `artifacts` table. `Remote` repos cache artifacts in the proxy cache, so the
+/// DB lookup always fails and the request must be proxied upstream instead
+/// (#1599). `Virtual` repos are resolved per-member, so this returns `false`
+/// for the virtual itself.
+///
+/// Takes the raw `repo_type` string (as stored on `RepoInfo`) so it can be
+/// unit-tested without constructing a full repository row.
+fn checksum_compute_eligible(repo_type: &str) -> bool {
+    repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
 }
 
 async fn serve_computed_checksum(
@@ -2029,6 +2051,52 @@ mod tests {
     // -----------------------------------------------------------------------
     // build_updated_secondary_metadata (#1092)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // checksum_compute_eligible (#1599): which repo types do a DB checksum
+    // lookup vs proxy/resolve-per-member.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksum_compute_eligible_local_and_staging() {
+        // Hosted repos store artifacts in the `artifacts` table, so the DB
+        // checksum lookup is valid for them.
+        assert!(checksum_compute_eligible(RepositoryType::Local.as_str()));
+        assert!(checksum_compute_eligible(RepositoryType::Staging.as_str()));
+    }
+
+    #[test]
+    fn test_checksum_compute_eligible_remote_skips_db_lookup() {
+        // Remote repos are pull-through caches; their artifacts are not in the
+        // `artifacts` table, so the DB lookup must be skipped (it always fails)
+        // and the request proxied upstream instead. Regression guard for #1599.
+        assert!(!checksum_compute_eligible(RepositoryType::Remote.as_str()));
+    }
+
+    #[test]
+    fn test_checksum_compute_eligible_virtual_resolved_per_member() {
+        // A virtual repo itself owns no artifacts; it is resolved per-member,
+        // so the top-level DB lookup must be skipped.
+        assert!(!checksum_compute_eligible(RepositoryType::Virtual.as_str()));
+    }
+
+    #[test]
+    fn test_checksum_compute_eligible_unknown_type_skips_lookup() {
+        // Defensive: an unrecognized repo_type string must not trigger a DB
+        // checksum lookup.
+        assert!(!checksum_compute_eligible("bogus"));
+    }
+
+    #[test]
+    fn test_virtual_member_compute_branch_matches_hosted() {
+        // The virtual-member loop computes checksums only for hosted members
+        // (Local/Staging) and proxies for Remote members (#1599). This mirrors
+        // the branch condition used in `download`.
+        assert!(RepositoryType::Local.is_hosted());
+        assert!(RepositoryType::Staging.is_hosted());
+        assert!(!RepositoryType::Remote.is_hosted());
+        assert!(!RepositoryType::Virtual.is_hosted());
+    }
 
     fn sample_coords() -> MavenCoordinates {
         MavenCoordinates {

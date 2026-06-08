@@ -86,6 +86,31 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v1/providers/:namespace/:type_name/:version/:os/:arch",
             put(upload_provider),
         )
+        // Provider Network Mirror Protocol (#1566).
+        //
+        // Configured by the client via `.terraformrc`/`.tofurc`:
+        //   provider_installation {
+        //     network_mirror { url = "https://host/terraform/<repo_key>/" }
+        //   }
+        // Terraform/OpenTofu then appends `<hostname>/<namespace>/<type>/...`
+        // to that base, which lands on the routes below.
+        //
+        // List available versions of a provider.
+        .route(
+            "/:repo_key/:hostname/:namespace/:type_name/index.json",
+            get(mirror_index),
+        )
+        // List the installation packages for one version (e.g. `2.0.0.json`).
+        .route(
+            "/:repo_key/:hostname/:namespace/:type_name/:version_file",
+            get(mirror_version),
+        )
+        // Stream the actual provider archive for a platform (referenced by the
+        // `url` field that `mirror_version` emits).
+        .route(
+            "/:repo_key/:hostname/:namespace/:type_name/:version/download/:os/:arch",
+            get(mirror_download),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,13 +1071,388 @@ async fn upload_provider(
 }
 
 // ---------------------------------------------------------------------------
-// PUT /v1/modules/{namespace}/{name}/{provider}/{version} — Upload module
-// (handled above)
+// Provider Network Mirror Protocol (#1566)
+//
+// Terraform/OpenTofu can be pointed at a "network mirror" via
+// `provider_installation { network_mirror { url = "…" } }`. The mirror
+// protocol is distinct from the registry protocol the registry handlers
+// above implement: it has its own endpoints and JSON shapes.
+//
+//   GET <base>/:hostname/:namespace/:type/index.json
+//       -> { "versions": { "<version>": {}, … } }
+//   GET <base>/:hostname/:namespace/:type/<version>.json
+//       -> { "archives": { "<os>_<arch>": { "url": "…", "hashes": [...] } } }
+//
+// The AK UI documents configuring a remote Terraform repository as a network
+// mirror, so for a remote repo we translate these mirror requests into
+// registry-protocol calls against the configured upstream (e.g.
+// registry.opentofu.org) and rewrite the package URLs to flow the actual
+// archive download back through AK (so it is cached/auth-gated like any other
+// proxied artifact).
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// PUT /v1/providers/{namespace}/{type}/{version}/{os}/{arch} — Upload provider
-// ---------------------------------------------------------------------------
+/// Strip the trailing `.json` from a mirror version filename (`2.0.0.json` ->
+/// `2.0.0`). Returns `None` when the segment is not a `.json` document.
+fn parse_mirror_version_file(version_file: &str) -> Option<&str> {
+    version_file.strip_suffix(".json")
+}
+
+/// Build the upstream registry path that lists available versions of a
+/// provider (Provider Registry Protocol).
+fn build_registry_versions_path(namespace: &str, type_name: &str) -> String {
+    format!("v1/providers/{}/{}/versions", namespace, type_name)
+}
+
+/// Build the upstream registry path that returns the download metadata for one
+/// provider package (Provider Registry Protocol).
+fn build_registry_download_path(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> String {
+    format!(
+        "v1/providers/{}/{}/{}/download/{}/{}",
+        namespace, type_name, version, os, arch
+    )
+}
+
+/// Build the AK-local mirror download URL emitted in `<version>.json` so the
+/// archive is fetched back through this server (relative to the mirror base,
+/// per the network-mirror spec).
+fn build_mirror_archive_url(version: &str, os: &str, arch: &str) -> String {
+    // The mirror base the client configured already ends at
+    // `<base>/:hostname/:namespace/:type/`, so a relative URL keeps the path
+    // anchored there. Terraform resolves it against the request URL.
+    format!("{}/download/{}/{}", version, os, arch)
+}
+
+/// Transform a registry-protocol `versions` document into a mirror-protocol
+/// `index.json` document.
+///
+/// Registry shape: `{ "versions": [ { "version": "2.0.0", … }, … ] }`
+/// Mirror shape:   `{ "versions": { "2.0.0": {}, … } }`
+fn registry_versions_to_mirror_index(registry: &serde_json::Value) -> serde_json::Value {
+    let mut versions = serde_json::Map::new();
+    if let Some(arr) = registry.get("versions").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
+                versions.insert(v.to_string(), serde_json::json!({}));
+            }
+        }
+    }
+    serde_json::json!({ "versions": serde_json::Value::Object(versions) })
+}
+
+/// Collect the `(os, arch)` platform pairs advertised for a specific version
+/// from a registry-protocol `versions` document.
+fn platforms_for_version(registry: &serde_json::Value, version: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(arr) = registry.get("versions").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if entry.get("version").and_then(|v| v.as_str()) != Some(version) {
+                continue;
+            }
+            if let Some(platforms) = entry.get("platforms").and_then(|v| v.as_array()) {
+                for p in platforms {
+                    let os = p.get("os").and_then(|v| v.as_str());
+                    let arch = p.get("arch").and_then(|v| v.as_str());
+                    if let (Some(os), Some(arch)) = (os, arch) {
+                        out.push((os.to_string(), arch.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convert a registry-protocol download document's `shasum` (hex SHA-256) into
+/// the `zh:` hash form Terraform expects in a mirror archive entry. Returns
+/// `None` when no usable shasum is present.
+fn registry_shasum_to_mirror_hash(download: &serde_json::Value) -> Option<String> {
+    download
+        .get("shasum")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("zh:{}", s))
+}
+
+/// Build one mirror archive entry from the AK-local archive URL plus an
+/// optional hash list.
+fn build_mirror_archive_entry(url: &str, hashes: Vec<String>) -> serde_json::Value {
+    if hashes.is_empty() {
+        serde_json::json!({ "url": url })
+    } else {
+        serde_json::json!({ "url": url, "hashes": hashes })
+    }
+}
+
+/// Outcome of validating a repo for the network-mirror protocol. Kept as a
+/// pure enum so the (otherwise async) guard's branching is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorGuard {
+    Ok,
+    /// Repo exists but is not a remote/proxy repo.
+    NotRemote,
+    /// Remote repo missing an upstream URL or with proxying disabled.
+    NotProxyable,
+}
+
+/// Decide whether a resolved repo can serve network-mirror requests, given its
+/// type and whether an upstream URL and a proxy service are available.
+fn classify_mirror_repo(is_remote: bool, has_upstream: bool, has_proxy: bool) -> MirrorGuard {
+    if !is_remote {
+        MirrorGuard::NotRemote
+    } else if has_upstream && has_proxy {
+        MirrorGuard::Ok
+    } else {
+        MirrorGuard::NotProxyable
+    }
+}
+
+/// Map a non-`Ok` [`MirrorGuard`] to the client-facing error response.
+fn mirror_guard_error(guard: MirrorGuard) -> Response {
+    let msg = match guard {
+        MirrorGuard::NotRemote => {
+            "Provider network mirror is only available on remote Terraform repositories"
+        }
+        MirrorGuard::NotProxyable => "Remote repository is not configured for proxying",
+        MirrorGuard::Ok => "", // unreachable; callers only map error variants
+    };
+    (StatusCode::NOT_FOUND, msg.to_string()).into_response()
+}
+
+/// Assemble the mirror `<version>.json` `archives` object from the discovered
+/// platforms and a (possibly partial) per-platform shasum lookup. Pure so the
+/// archive shaping is exercised without any network I/O.
+fn assemble_mirror_archives(
+    version: &str,
+    platforms: &[(String, String)],
+    shasums: &std::collections::HashMap<(String, String), String>,
+) -> serde_json::Value {
+    let mut archives = serde_json::Map::new();
+    for (os, arch) in platforms {
+        let url = build_mirror_archive_url(version, os, arch);
+        let hashes = shasums
+            .get(&(os.clone(), arch.clone()))
+            .cloned()
+            .map(|h| vec![h])
+            .unwrap_or_default();
+        archives.insert(
+            format!("{}_{}", os, arch),
+            build_mirror_archive_entry(&url, hashes),
+        );
+    }
+    serde_json::json!({ "archives": serde_json::Value::Object(archives) })
+}
+
+/// Extract the upstream `download_url` from a registry download document.
+fn extract_download_url(download: &serde_json::Value) -> Option<&str> {
+    download
+        .get("download_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// 404 response for an unknown provider/version on the mirror.
+fn mirror_not_found(namespace: &str, type_name: &str, version: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!("Provider {}/{} {} not found", namespace, type_name, version),
+    )
+        .into_response()
+}
+
+/// Parse the version from a mirror `<version>.json` filename, returning the
+/// `404` error response when the document name is not recognized.
+#[allow(clippy::result_large_err)] // Response-as-error matches the handler convention in this module.
+fn version_from_mirror_file(version_file: &str) -> Result<&str, Response> {
+    parse_mirror_version_file(version_file).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Unrecognized mirror document: {}", version_file),
+        )
+            .into_response()
+    })
+}
+
+/// Resolve the upstream archive URL from a registry download document, mapping
+/// a missing/empty `download_url` to the appropriate `502` response.
+#[allow(clippy::result_large_err)] // Response-as-error matches the handler convention in this module.
+fn resolve_archive_url(download: &serde_json::Value) -> Result<&str, Response> {
+    extract_download_url(download).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream registry did not provide a download_url".to_string(),
+        )
+            .into_response()
+    })
+}
+
+/// Validated context for serving a network-mirror request against a remote
+/// Terraform repository: the resolved repo plus its upstream registry URL.
+struct MirrorRemote<'a> {
+    repo: RepoInfo,
+    upstream_url: String,
+    proxy: &'a crate::services::proxy_service::ProxyService,
+}
+
+/// Resolve a Terraform repo for the network-mirror protocol, asserting it is a
+/// remote repo configured for proxying. Centralizes the guard shared by all
+/// three mirror handlers so the logic exists once (#1566).
+async fn resolve_mirror_remote<'a>(
+    state: &'a SharedState,
+    repo_key: &str,
+) -> Result<MirrorRemote<'a>, Response> {
+    let repo = resolve_terraform_repo(&state.db, repo_key).await?;
+
+    let guard = classify_mirror_repo(
+        repo.repo_type == RepositoryType::Remote,
+        repo.upstream_url.is_some(),
+        state.proxy_service.is_some(),
+    );
+    if guard != MirrorGuard::Ok {
+        return Err(mirror_guard_error(guard));
+    }
+
+    // Both unwraps are guaranteed by the guard above.
+    let upstream_url = repo.upstream_url.clone().unwrap();
+    let proxy = state.proxy_service.as_ref().unwrap();
+    Ok(MirrorRemote {
+        repo,
+        upstream_url,
+        proxy,
+    })
+}
+
+/// Fetch a registry-protocol document from the upstream and parse it as JSON,
+/// mapping any failure to the appropriate client response.
+async fn fetch_upstream_json(
+    remote: &MirrorRemote<'_>,
+    repo_key: &str,
+    path: &str,
+) -> Result<serde_json::Value, Response> {
+    let (content, _ct) = proxy_helpers::proxy_fetch(
+        remote.proxy,
+        remote.repo.id,
+        repo_key,
+        &remote.upstream_url,
+        path,
+    )
+    .await?;
+    serde_json::from_slice(&content).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Invalid upstream registry response: {}", e),
+        )
+            .into_response()
+    })
+}
+
+/// Wrap a serialized JSON value in a 200 `application/json` response.
+fn json_ok_response(value: &serde_json::Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(value).unwrap()))
+        .unwrap()
+}
+
+/// GET /:repo_key/:hostname/:namespace/:type/index.json — mirror version list.
+async fn mirror_index(
+    State(state): State<SharedState>,
+    Path((repo_key, _hostname, namespace, type_name)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let remote = resolve_mirror_remote(&state, &repo_key).await?;
+    let path = build_registry_versions_path(&namespace, &type_name);
+    let registry = fetch_upstream_json(&remote, &repo_key, &path).await?;
+    Ok(json_ok_response(&registry_versions_to_mirror_index(
+        &registry,
+    )))
+}
+
+/// GET /:repo_key/:hostname/:namespace/:type/<version>.json — mirror packages.
+async fn mirror_version(
+    State(state): State<SharedState>,
+    Path((repo_key, _hostname, namespace, type_name, version_file)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let version = version_from_mirror_file(&version_file)?;
+    let remote = resolve_mirror_remote(&state, &repo_key).await?;
+
+    // Discover the platforms this version ships for via the registry's
+    // `versions` document.
+    let versions_path = build_registry_versions_path(&namespace, &type_name);
+    let registry = fetch_upstream_json(&remote, &repo_key, &versions_path).await?;
+
+    let platforms = platforms_for_version(&registry, version);
+    if platforms.is_empty() {
+        return Err(mirror_not_found(&namespace, &type_name, version));
+    }
+
+    // Best-effort: pull each per-platform download doc to obtain the shasum.
+    // A failed/absent shasum just omits the hash (Terraform downloads without
+    // pinning) rather than failing the whole request.
+    let mut shasums = std::collections::HashMap::new();
+    for (os, arch) in &platforms {
+        let dl_path = build_registry_download_path(&namespace, &type_name, version, os, arch);
+        if let Some(hash) = fetch_upstream_json(&remote, &repo_key, &dl_path)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(registry_shasum_to_mirror_hash)
+        {
+            shasums.insert((os.clone(), arch.clone()), hash);
+        }
+    }
+
+    Ok(json_ok_response(&assemble_mirror_archives(
+        version, &platforms, &shasums,
+    )))
+}
+
+/// GET /:repo_key/:hostname/:namespace/:type/:version/download/:os/:arch —
+/// stream the provider archive for a platform (referenced by `mirror_version`).
+async fn mirror_download(
+    State(state): State<SharedState>,
+    Path((repo_key, _hostname, namespace, type_name, version, os, arch)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let remote = resolve_mirror_remote(&state, &repo_key).await?;
+
+    // Resolve the upstream registry download document to learn the real
+    // archive URL, then stream that archive back through the proxy (cached).
+    let dl_path = build_registry_download_path(&namespace, &type_name, &version, &os, &arch);
+    let download = fetch_upstream_json(&remote, &repo_key, &dl_path).await?;
+
+    let archive_url = resolve_archive_url(&download)?;
+
+    // `proxy_fetch_streaming` passes absolute URLs through unchanged, so the
+    // archive is streamed (and cached) directly from the registry-provided URL.
+    proxy_helpers::proxy_fetch_streaming(
+        remote.proxy,
+        remote.repo.id,
+        &repo_key,
+        &remote.upstream_url,
+        archive_url,
+        "application/zip",
+    )
+    .await
+}
 
 #[cfg(test)]
 mod tests {
@@ -1852,5 +2252,334 @@ mod tests {
     #[test]
     fn test_build_search_pattern_special_chars() {
         assert_eq!(build_search_pattern("my-module"), "%my-module%");
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider Network Mirror Protocol (#1566)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mirror_version_file_valid() {
+        assert_eq!(parse_mirror_version_file("2.0.0.json"), Some("2.0.0"));
+        assert_eq!(
+            parse_mirror_version_file("1.2.3-rc.1.json"),
+            Some("1.2.3-rc.1")
+        );
+    }
+
+    #[test]
+    fn test_parse_mirror_version_file_invalid() {
+        assert_eq!(parse_mirror_version_file("index.json"), Some("index"));
+        assert_eq!(parse_mirror_version_file("2.0.0"), None);
+        assert_eq!(parse_mirror_version_file("foo.txt"), None);
+    }
+
+    #[test]
+    fn test_build_registry_versions_path() {
+        assert_eq!(
+            build_registry_versions_path("carlpett", "sops"),
+            "v1/providers/carlpett/sops/versions"
+        );
+    }
+
+    #[test]
+    fn test_build_registry_download_path() {
+        assert_eq!(
+            build_registry_download_path("carlpett", "sops", "1.0.0", "linux", "amd64"),
+            "v1/providers/carlpett/sops/1.0.0/download/linux/amd64"
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_archive_url() {
+        assert_eq!(
+            build_mirror_archive_url("1.0.0", "linux", "amd64"),
+            "1.0.0/download/linux/amd64"
+        );
+    }
+
+    #[test]
+    fn test_registry_versions_to_mirror_index() {
+        let registry = serde_json::json!({
+            "versions": [
+                { "version": "0.7.2", "protocols": ["5.0"], "platforms": [] },
+                { "version": "1.0.0", "protocols": ["5.0"], "platforms": [] },
+            ]
+        });
+        let mirror = registry_versions_to_mirror_index(&registry);
+        let versions = mirror["versions"].as_object().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.contains_key("0.7.2"));
+        assert!(versions.contains_key("1.0.0"));
+        // Each value must be an (empty) object per the mirror spec.
+        assert!(versions["1.0.0"].is_object());
+    }
+
+    #[test]
+    fn test_registry_versions_to_mirror_index_empty() {
+        let mirror = registry_versions_to_mirror_index(&serde_json::json!({}));
+        assert!(mirror["versions"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_platforms_for_version() {
+        let registry = serde_json::json!({
+            "versions": [
+                {
+                    "version": "1.0.0",
+                    "platforms": [
+                        { "os": "linux", "arch": "amd64" },
+                        { "os": "darwin", "arch": "arm64" }
+                    ]
+                },
+                {
+                    "version": "2.0.0",
+                    "platforms": [ { "os": "windows", "arch": "amd64" } ]
+                }
+            ]
+        });
+        let p = platforms_for_version(&registry, "1.0.0");
+        assert_eq!(
+            p,
+            vec![
+                ("linux".to_string(), "amd64".to_string()),
+                ("darwin".to_string(), "arm64".to_string()),
+            ]
+        );
+        let p2 = platforms_for_version(&registry, "2.0.0");
+        assert_eq!(p2, vec![("windows".to_string(), "amd64".to_string())]);
+        assert!(platforms_for_version(&registry, "9.9.9").is_empty());
+    }
+
+    #[test]
+    fn test_platforms_for_version_edge_branches() {
+        // Version entry without a `platforms` key, malformed entries, and a
+        // platform missing `arch` are all skipped without panicking.
+        let registry = serde_json::json!({
+            "versions": [
+                { "version": "1.0.0" },
+                { "version": "1.0.0", "platforms": "not-an-array" },
+                { "version": "1.0.0", "platforms": [
+                    { "os": "linux" },
+                    { "arch": "amd64" },
+                    { "os": "linux", "arch": "amd64" }
+                ] }
+            ]
+        });
+        assert_eq!(
+            platforms_for_version(&registry, "1.0.0"),
+            vec![("linux".to_string(), "amd64".to_string())]
+        );
+        // No `versions` array at all.
+        assert!(platforms_for_version(&serde_json::json!({}), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn test_registry_shasum_to_mirror_hash() {
+        let dl = serde_json::json!({ "shasum": "abc123" });
+        assert_eq!(
+            registry_shasum_to_mirror_hash(&dl),
+            Some("zh:abc123".to_string())
+        );
+        assert_eq!(
+            registry_shasum_to_mirror_hash(&serde_json::json!({ "shasum": "" })),
+            None
+        );
+        assert_eq!(registry_shasum_to_mirror_hash(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn test_build_mirror_archive_entry() {
+        let with_hash =
+            build_mirror_archive_entry("1.0.0/download/linux/amd64", vec!["zh:abc".to_string()]);
+        assert_eq!(with_hash["url"], "1.0.0/download/linux/amd64");
+        assert_eq!(with_hash["hashes"][0], "zh:abc");
+
+        let no_hash = build_mirror_archive_entry("u", vec![]);
+        assert_eq!(no_hash["url"], "u");
+        assert!(no_hash.get("hashes").is_none());
+    }
+
+    #[test]
+    fn test_classify_mirror_repo() {
+        assert_eq!(classify_mirror_repo(true, true, true), MirrorGuard::Ok);
+        assert_eq!(
+            classify_mirror_repo(false, true, true),
+            MirrorGuard::NotRemote
+        );
+        // Type guard takes precedence over proxyability.
+        assert_eq!(
+            classify_mirror_repo(false, false, false),
+            MirrorGuard::NotRemote
+        );
+        assert_eq!(
+            classify_mirror_repo(true, false, true),
+            MirrorGuard::NotProxyable
+        );
+        assert_eq!(
+            classify_mirror_repo(true, true, false),
+            MirrorGuard::NotProxyable
+        );
+    }
+
+    #[test]
+    fn test_mirror_guard_error_status() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            mirror_guard_error(MirrorGuard::NotRemote).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            mirror_guard_error(MirrorGuard::NotProxyable).status(),
+            StatusCode::NOT_FOUND
+        );
+        // Ok variant maps to a (degenerate) 404 too; callers never hit it.
+        assert_eq!(
+            mirror_guard_error(MirrorGuard::Ok).status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_extract_download_url() {
+        let dl = serde_json::json!({ "download_url": "https://example/p.zip" });
+        assert_eq!(extract_download_url(&dl), Some("https://example/p.zip"));
+        assert_eq!(
+            extract_download_url(&serde_json::json!({ "download_url": "" })),
+            None
+        );
+        assert_eq!(extract_download_url(&serde_json::json!({})), None);
+        assert_eq!(
+            extract_download_url(&serde_json::json!({ "download_url": 5 })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_mirror_not_found_status() {
+        use axum::http::StatusCode;
+        let resp = mirror_not_found("carlpett", "sops", "1.0.0");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_version_from_mirror_file() {
+        assert_eq!(version_from_mirror_file("2.0.0.json").unwrap(), "2.0.0");
+        let err = version_from_mirror_file("nope").unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_resolve_archive_url() {
+        let ok = serde_json::json!({ "download_url": "https://x/p.zip" });
+        assert_eq!(resolve_archive_url(&ok).unwrap(), "https://x/p.zip");
+
+        let err = resolve_archive_url(&serde_json::json!({})).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+
+        let err2 = resolve_archive_url(&serde_json::json!({ "download_url": "" })).unwrap_err();
+        assert_eq!(err2.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_json_ok_response_status_and_type() {
+        let resp = json_ok_response(&serde_json::json!({ "a": 1 }));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_assemble_mirror_archives_with_and_without_hashes() {
+        let platforms = vec![
+            ("linux".to_string(), "amd64".to_string()),
+            ("darwin".to_string(), "arm64".to_string()),
+        ];
+        let mut shasums = std::collections::HashMap::new();
+        shasums.insert(
+            ("linux".to_string(), "amd64".to_string()),
+            "zh:abc".to_string(),
+        );
+        // darwin/arm64 intentionally has no shasum.
+        let out = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let archives = out["archives"].as_object().unwrap();
+        assert_eq!(archives.len(), 2);
+
+        let lin = &archives["linux_amd64"];
+        assert_eq!(lin["url"], "1.0.0/download/linux/amd64");
+        assert_eq!(lin["hashes"][0], "zh:abc");
+
+        let dar = &archives["darwin_arm64"];
+        assert_eq!(dar["url"], "1.0.0/download/darwin/arm64");
+        assert!(dar.get("hashes").is_none());
+    }
+
+    #[test]
+    fn test_assemble_mirror_archives_empty() {
+        let out = assemble_mirror_archives("1.0.0", &[], &std::collections::HashMap::new());
+        assert!(out["archives"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_full_mirror_version_assembly_for_sops() {
+        // Mirrors the carlpett/sops flow from #1566 end to end (pure parts):
+        // registry versions -> platforms -> archives doc.
+        let registry = serde_json::json!({
+            "versions": [
+                { "version": "1.0.0", "protocols": ["5.0"],
+                  "platforms": [ { "os": "linux", "arch": "amd64" } ] }
+            ]
+        });
+        let platforms = platforms_for_version(&registry, "1.0.0");
+        assert_eq!(platforms, vec![("linux".to_string(), "amd64".to_string())]);
+
+        let download = serde_json::json!({
+            "download_url": "https://github.com/carlpett/terraform-provider-sops/.../sops_1.0.0_linux_amd64.zip",
+            "shasum": "deadbeef"
+        });
+        let mut shasums = std::collections::HashMap::new();
+        if let Some(h) = registry_shasum_to_mirror_hash(&download) {
+            shasums.insert(("linux".to_string(), "amd64".to_string()), h);
+        }
+        let archives = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        assert_eq!(
+            archives["archives"]["linux_amd64"]["url"],
+            "1.0.0/download/linux/amd64"
+        );
+        assert_eq!(
+            archives["archives"]["linux_amd64"]["hashes"][0],
+            "zh:deadbeef"
+        );
+        assert_eq!(
+            extract_download_url(&download),
+            Some("https://github.com/carlpett/terraform-provider-sops/.../sops_1.0.0_linux_amd64.zip")
+        );
+    }
+
+    #[test]
+    fn test_router_builds_without_route_conflicts() {
+        // axum panics at construction time on overlapping routes. Building the
+        // router proves the network-mirror routes (#1566) coexist with the
+        // existing registry routes.
+        let _router: Router<SharedState> = router();
+    }
+
+    #[test]
+    fn test_full_mirror_index_translation_roundtrip() {
+        // End-to-end shape check mirroring what the upstream registry returns
+        // for carlpett/sops (the provider from issue #1566).
+        let registry = serde_json::json!({
+            "versions": [
+                { "version": "0.7.2", "protocols": ["5.0"],
+                  "platforms": [ { "os": "linux", "arch": "amd64" } ] }
+            ]
+        });
+        let index = registry_versions_to_mirror_index(&registry);
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            serde_json::json!({ "versions": { "0.7.2": {} } })
+        );
     }
 }

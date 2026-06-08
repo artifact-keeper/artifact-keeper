@@ -161,6 +161,7 @@ pub fn request_base_url(headers: &HeaderMap) -> String {
 /// Every format handler needs the same handful of fields after looking up a
 /// repository by its key. This struct avoids duplicating the definition in
 /// each handler module.
+#[derive(Clone)]
 pub struct RepoInfo {
     pub id: Uuid,
     pub key: String,
