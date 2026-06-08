@@ -5342,6 +5342,247 @@ async fn handle_complete_upload(
 // Manifest handlers
 // ---------------------------------------------------------------------------
 
+/// True for hosted repositories that store their own manifests/blobs
+/// (`Local` or `Staging`); false for `Remote` (proxy) and `Virtual`
+/// (federated) repos, which resolve manifests by proxying/federating rather
+/// than from their own content-addressable storage.
+fn stores_own_manifests(repo_type: &str) -> bool {
+    repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
+}
+
+/// Whether a string is safe to emit verbatim as an HTTP header value. A
+/// manifest `mediaType` sniffed from the (attacker-controlled) body must pass
+/// this before it becomes the `Content-Type` header, or building the response
+/// would panic on an invalid header byte (e.g. an embedded newline).
+fn is_header_safe(value: &str) -> bool {
+    axum::http::HeaderValue::from_str(value).is_ok()
+}
+
+/// Sniff the `mediaType` of a manifest out of its JSON body, if present and
+/// usable as a header value. Returns `None` for non-JSON bodies, a
+/// missing/blank `mediaType`, or a value that is not a valid header.
+fn sniff_manifest_media_type(body: &[u8]) -> Option<String> {
+    crate::formats::oci::OciHandler::parse_manifest(body)
+        .ok()
+        .and_then(|manifest| manifest.media_type)
+        .map(|media_type| media_type.trim().to_string())
+        .filter(|media_type| !media_type.is_empty() && is_header_safe(media_type))
+}
+
+/// Decide the media type to serve for a manifest body. Prefers an explicit
+/// stored value (`oci_tags.manifest_content_type`), falls back to sniffing the
+/// body's `mediaType`, and finally to the OCI image-manifest default. An
+/// untagged manifest served content-addressably has no stored content type, so
+/// the body sniff is what gives it a correct media type.
+fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -> String {
+    if let Some(stored) = stored {
+        let stored = stored.trim();
+        if !stored.is_empty() && is_header_safe(stored) {
+            return stored.to_string();
+        }
+    }
+    sniff_manifest_media_type(body)
+        .unwrap_or_else(|| crate::formats::oci::media_types::OCI_MANIFEST.to_string())
+}
+
+/// Whether THIS repository has committed metadata referencing `digest` beyond a
+/// tag. This gates the content-addressable fallback (#1681).
+///
+/// On shared cloud backends the `oci-manifests/<digest>` object is NOT
+/// namespaced per repository — `StorageRegistry::backend_for` returns a single
+/// shared backend instance for s3/azure/gcs and ignores the per-repo path. So
+/// the mere existence of the object must not authorize a pull: otherwise a
+/// manifest pushed to repo A could be read through repo B on the same backend
+/// by digest. `manifest_blob_refs` (image manifests) and `oci_manifest_refs`
+/// parent rows (image indexes) are written per repository at push time and
+/// persist across tag overwrite/deletion, so they are the durable, repo-scoped
+/// proof that this repo actually holds the manifest. A child edge alone is not
+/// proof of ownership: an index body can reference a digest whose manifest body
+/// was never uploaded to this repo.
+async fn manifest_known_to_repo(
+    state: &SharedState,
+    repository_id: Uuid,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT (
+          EXISTS (
+            SELECT 1
+            FROM manifest_blob_refs
+            WHERE repository_id = $1
+              AND manifest_digest = $2
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM oci_manifest_refs
+            WHERE repository_id = $1
+              AND parent_digest = $2
+          )
+        )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(digest)
+    .fetch_one(&state.db)
+    .await
+}
+
+/// Look up the `oci_tags` row for a manifest reference (digest or tag name)
+/// within a repository, returning `(manifest_digest, manifest_content_type)`.
+async fn lookup_manifest_tag_row(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    // Each `sqlx::query!` produces its own anonymous record type, so map to a
+    // tuple inside each branch before merging.
+    if is_digest_reference(reference) {
+        let row = sqlx::query!(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+            repo.id, reference
+        )
+        .fetch_optional(&state.db)
+        .await?;
+        Ok(row.map(|t| (t.manifest_digest, t.manifest_content_type)))
+    } else {
+        let row = sqlx::query!(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            repo.id, repo.image, reference
+        )
+        .fetch_optional(&state.db)
+        .await?;
+        Ok(row.map(|t| (t.manifest_digest, t.manifest_content_type)))
+    }
+}
+
+/// Resolve a manifest from this repository's own storage.
+///
+/// When a tag row resolved, the manifest is served from its digest-addressed
+/// object (any repo type, preserving existing tagged-pull behavior). When no
+/// tag row resolved, a digest reference on a hosted repo is served
+/// content-addressably from `oci-manifests/<digest>` ONLY when
+/// `repo_known_digest` is true — i.e. this repo has committed metadata for the
+/// digest (see [`manifest_known_to_repo`]). Without that gate a shared cloud
+/// backend would let one repo read another's manifest by digest (#1681 review).
+/// The stored bytes are verified to hash to the requested digest before being
+/// served. Returns `(digest, content_type, bytes)`, or `None` to fall through
+/// to the proxy paths.
+async fn resolve_local_manifest_from_storage(
+    storage: &dyn crate::storage::StorageBackend,
+    repo_type: &str,
+    reference: &str,
+    tag_row: Option<(String, String)>,
+    repo_known_digest: bool,
+) -> Option<(String, String, Bytes)> {
+    if let Some((digest, stored_content_type)) = tag_row {
+        let data = storage.get(&manifest_storage_key(&digest)).await.ok()?;
+        let content_type = resolve_manifest_content_type(Some(&stored_content_type), &data);
+        Some((digest, content_type, data))
+    } else if repo_known_digest && is_digest_reference(reference) && stores_own_manifests(repo_type)
+    {
+        let data = storage.get(&manifest_storage_key(reference)).await.ok()?;
+        // The reference asserts content-addressable identity; refuse to serve a
+        // corrupted object whose bytes do not hash to the requested digest.
+        if !verify_digest_or_fall_through(&data, reference) {
+            return None;
+        }
+        let content_type = resolve_manifest_content_type(None, &data);
+        Some((reference.to_string(), content_type, data))
+    } else {
+        None
+    }
+}
+
+/// Build the `200 OK` response for a manifest served from local storage. HEAD
+/// requests mirror the GET headers (including `Content-Length`) without a body.
+fn build_local_manifest_response(
+    digest: &str,
+    content_type: &str,
+    data: Bytes,
+    include_body: bool,
+) -> Response {
+    let content_length = data.len();
+    let body = if include_body {
+        Body::from(data)
+    } else {
+        Body::empty()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Docker-Content-Digest", digest)
+        .header(CONTENT_LENGTH, content_length.to_string())
+        .header(CONTENT_TYPE, content_type)
+        .body(body)
+        .unwrap()
+}
+
+/// Resolve the manifest digest a DELETE targets within this repository.
+///
+/// `tag_digest` is the digest resolved from `oci_tags` (via tag name or digest
+/// lookup). For a hosted repo a digest reference with no tag row is still
+/// deletable when this repo has committed metadata for it ([`manifest_known_to_repo`]);
+/// remote/virtual repos resolve via tags only. Returns the digest whose
+/// per-repo rows the caller should clear, or `None` => 404. The physical object
+/// is intentionally NOT removed here: on a shared cloud backend it is not
+/// namespaced per repo, so deleting it would break other repos that still tag
+/// the same digest; reclamation is left to the backend-aware storage GC
+/// (#1681 review).
+async fn resolve_manifest_delete_target(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    tag_digest: Option<String>,
+) -> Result<Option<String>, sqlx::Error> {
+    match tag_digest {
+        Some(digest) => Ok(Some(digest)),
+        None if is_digest_reference(reference) && stores_own_manifests(&repo.repo_type) => {
+            Ok(manifest_known_to_repo(state, repo.id, reference)
+                .await?
+                .then(|| reference.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Remove this repository's index relationship metadata for a deleted manifest
+/// digest when that relationship is no longer live. Edges from still-tagged
+/// parent indexes to this digest are intentionally preserved: those rows prove
+/// the tagged parent still depends on this child and keep its blobs protected
+/// (see [`delete_manifest_blob_refs`]).
+async fn clear_repo_manifest_refs<'e, E>(
+    executor: E,
+    repository_id: Uuid,
+    digest: &str,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let res = sqlx::query(
+        r#"
+        DELETE FROM oci_manifest_refs omr
+        WHERE omr.repository_id = $1
+          AND (
+            omr.parent_digest = $2
+            OR (
+              omr.child_digest = $2
+              AND NOT EXISTS (
+                SELECT 1
+                FROM oci_tags ot
+                WHERE ot.repository_id = omr.repository_id
+                  AND ot.manifest_digest = omr.parent_digest
+              )
+            )
+          )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(digest)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 async fn handle_head_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -5369,30 +5610,40 @@ async fn handle_head_manifest(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
-    // Reference can be a tag or a digest. Look up locally first.
-    let local_result: Option<(String, String)> = if is_digest_reference(reference) {
-        sqlx::query!(
-            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
-            repo.id, reference
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| (t.manifest_digest, t.manifest_content_type))
-    } else {
-        sqlx::query!(
-            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id, repo.image, reference
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| (t.manifest_digest, t.manifest_content_type))
+    // Reference can be a tag or a digest. Resolve locally first: a surviving
+    // tag row, or — for a digest this hosted repo proves it owns via committed
+    // metadata — the content-addressable object itself, so a manifest stays
+    // retrievable by digest after its tags are gone (#1681). The metadata gate
+    // stops a shared cloud backend from leaking another repo's digest. HEAD
+    // mirrors GET headers without a body.
+    let tag_row = match lookup_manifest_tag_row(state, &repo, reference).await {
+        Ok(row) => row,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
     };
-
-    if let Some((manifest_digest, content_type)) = local_result {
+    let repo_known_digest = if tag_row.is_none()
+        && is_digest_reference(reference)
+        && stores_own_manifests(&repo.repo_type)
+    {
+        match manifest_known_to_repo(state, repo.id, reference).await {
+            Ok(known) => known,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        }
+    } else {
+        false
+    };
+    if tag_row.is_some() || repo_known_digest {
         let storage = match state.storage_for_repo(&repo.location) {
             Ok(s) => s,
             Err(e) => {
@@ -5403,16 +5654,16 @@ async fn handle_head_manifest(
                 )
             }
         };
-        let manifest_key = manifest_storage_key(&manifest_digest);
-
-        if let Ok(data) = storage.get(&manifest_key).await {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("Docker-Content-Digest", &manifest_digest)
-                .header(CONTENT_LENGTH, data.len().to_string())
-                .header(CONTENT_TYPE, &content_type)
-                .body(Body::empty())
-                .unwrap();
+        if let Some((manifest_digest, content_type, data)) = resolve_local_manifest_from_storage(
+            storage.as_ref(),
+            &repo.repo_type,
+            reference,
+            tag_row,
+            repo_known_digest,
+        )
+        .await
+        {
+            return build_local_manifest_response(&manifest_digest, &content_type, data, false);
         }
     }
 
@@ -5499,29 +5750,39 @@ async fn handle_get_manifest(
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
-    let local_result: Option<(String, String)> = if is_digest_reference(reference) {
-        sqlx::query!(
-            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
-            repo.id, reference
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| (t.manifest_digest, t.manifest_content_type))
-    } else {
-        sqlx::query!(
-            "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id, repo.image, reference
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| (t.manifest_digest, t.manifest_content_type))
+    // Resolve locally first: a surviving tag row, or — for a digest this hosted
+    // repo proves it owns via committed metadata — the content-addressable
+    // object itself, so a manifest stays retrievable by digest after its tags
+    // are gone (#1681). The metadata gate stops a shared cloud backend from
+    // leaking another repo's digest.
+    let tag_row = match lookup_manifest_tag_row(state, &repo, reference).await {
+        Ok(row) => row,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
     };
-
-    if let Some((manifest_digest, content_type)) = local_result {
+    let repo_known_digest = if tag_row.is_none()
+        && is_digest_reference(reference)
+        && stores_own_manifests(&repo.repo_type)
+    {
+        match manifest_known_to_repo(state, repo.id, reference).await {
+            Ok(known) => known,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        }
+    } else {
+        false
+    };
+    if tag_row.is_some() || repo_known_digest {
         let storage = match state.storage_for_repo(&repo.location) {
             Ok(s) => s,
             Err(e) => {
@@ -5532,26 +5793,25 @@ async fn handle_get_manifest(
                 )
             }
         };
-        let manifest_key = manifest_storage_key(&manifest_digest);
-
-        // Manifests are small metadata, not large artifact bodies: keep this
-        // path buffered so we can emit an accurate Content-Length. Container
-        // clients (docker, podman, containerd) require Content-Length on
-        // manifest responses, and the oci_tags row carries no size column to
-        // set it from a stream. Only large blob BODIES are streamed (above).
-        if let Ok(data) = storage.get(&manifest_key).await {
-            tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: serving from migrated oci_tags (local hit)");
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("Docker-Content-Digest", &manifest_digest)
-                .header(CONTENT_LENGTH, data.len().to_string())
-                .header(CONTENT_TYPE, &content_type)
-                .body(Body::from(data))
-                .unwrap();
+        let tag_row_digest = tag_row.as_ref().map(|(digest, _)| digest.clone());
+        if let Some((manifest_digest, content_type, data)) = resolve_local_manifest_from_storage(
+            storage.as_ref(),
+            &repo.repo_type,
+            reference,
+            tag_row,
+            repo_known_digest,
+        )
+        .await
+        {
+            tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: served from local storage (tag row or content-addressable digest)");
+            return build_local_manifest_response(&manifest_digest, &content_type, data, true);
         }
-        tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, manifest_key = %manifest_key, "GET manifest: oci_tags row found but storage file missing - will proxy from upstream");
-    } else {
-        tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, "GET manifest: no oci_tags row - will proxy from upstream");
+        if let Some(manifest_digest) = tag_row_digest {
+            let manifest_key = manifest_storage_key(&manifest_digest);
+            tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, manifest_key = %manifest_key, "GET manifest: oci_tags row found but storage file missing - will proxy from upstream");
+        } else {
+            tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, "GET manifest: not resolvable from local storage - will proxy from upstream");
+        }
     }
 
     // For remote repos, try fetching manifest from upstream. Forward the
@@ -6548,7 +6808,7 @@ async fn catalog_local_entries(
 /// the child would strip a live image's protection. The caller deletes the
 /// manifest's `oci_tags` rows first; this then runs in the same delete path.
 async fn delete_manifest_blob_refs(
-    db: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     repo_id: Uuid,
     manifest_digest: &str,
 ) -> Result<u64, sqlx::Error> {
@@ -6570,7 +6830,7 @@ async fn delete_manifest_blob_refs(
     )
     .bind(repo_id)
     .bind(manifest_digest)
-    .execute(db)
+    .execute(executor)
     .await?;
     Ok(res.rows_affected())
 }
@@ -6600,12 +6860,17 @@ async fn handle_delete_manifest(
         Err(e) => return e,
     };
 
-    // Resolve the manifest digest. The reference may be a tag name or a
-    // digest. A query error must surface as 500, never be flattened into a
-    // 404: an OCI client treats 404 as "already deleted" and stops retrying,
-    // so masking a transient DB outage as MANIFEST_UNKNOWN would silently
-    // abandon the delete and hide the outage in the logs as not-founds.
-    let manifest_digest: Result<Option<String>, sqlx::Error> = if reference.starts_with("sha256:") {
+    // Resolve the digest the reference (tag name or digest) maps to. For a
+    // hosted repo a digest reference is deletable even with no surviving tag
+    // row, as long as this repo has committed metadata for it (#1681); the
+    // physical object is left for the GC because a shared cloud backend may
+    // still serve it to other repos. Remote/Virtual keep tag-only behavior.
+    //
+    // A query error must surface as 500, never be flattened into a 404: an OCI
+    // client treats 404 as "already deleted" and stops retrying, so masking a
+    // transient DB outage as MANIFEST_UNKNOWN would silently abandon the
+    // delete and hide the outage in the logs as not-founds.
+    let tag_digest: Result<Option<String>, sqlx::Error> = if is_digest_reference(reference) {
         sqlx::query_scalar!(
             "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id,
@@ -6624,15 +6889,37 @@ async fn handle_delete_manifest(
         .await
     };
 
-    let digest = match manifest_digest {
-        Ok(Some(d)) => d,
-        Ok(None) => {
+    let digest = match tag_digest {
+        Ok(maybe_digest) => {
+            match resolve_manifest_delete_target(state, &repo, reference, maybe_digest).await {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    return oci_error(
+                        StatusCode::NOT_FOUND,
+                        "MANIFEST_UNKNOWN",
+                        "manifest not found",
+                    )
+                }
+                Err(e) => {
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        &e.to_string(),
+                    )
+                }
+            }
+        }
+        Err(e) => {
             return oci_error(
-                StatusCode::NOT_FOUND,
-                "MANIFEST_UNKNOWN",
-                "manifest not found",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
             )
         }
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
         Err(e) => {
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6648,9 +6935,20 @@ async fn handle_delete_manifest(
         repo.id,
         digest
     )
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    // Drop stale index relationships for this digest. Live child edges are
+    // preserved so a still-tagged parent index keeps the child relationship
+    // live and the child's blobs protected.
+    if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -6661,15 +6959,21 @@ async fn handle_delete_manifest(
     // #1409: drop the manifest's blob refs so its config + layer blobs become
     // reclaimable once nothing else references them. Scoped to skip a digest
     // still referenced as a live per-architecture child of a tagged index
-    // (its blobs are protected ONLY by these rows). Best-effort: leaving refs
-    // only over-protects (a leak), never deletes a live blob.
-    if let Err(e) = delete_manifest_blob_refs(&state.db, repo.id, &digest).await {
-        warn!(
-            image = image_name,
-            digest = %digest,
-            error = %e,
-            "Failed to delete manifest_blob_refs on manifest deletion; the \
-             manifest's blobs stay GC-protected until this is retried"
+    // (its blobs are protected ONLY by these rows). After #1681 these rows
+    // also gate digest fallback, so a cleanup error must abort the delete.
+    if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    if let Err(e) = tx.commit().await {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
         );
     }
 
@@ -11189,6 +11493,798 @@ mod oci_manifest_refs_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Content-addressable manifest retrieval (#1681)
+//
+// A hosted manifest must be pullable/deletable by its digest for as long as
+// the object lives in storage, independent of any surviving tag. The decision
+// logic is factored into pure / `&dyn StorageBackend` helpers so it is covered
+// without a live database (mirrors verify_digest_or_fall_through tests).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod manifest_digest_fallback_tests {
+    use super::*;
+    use crate::formats::oci::media_types;
+    use crate::storage::filesystem::FilesystemStorage;
+    use crate::storage::StorageBackend;
+
+    const OCI_IMAGE_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:c0ffee","size":2},"layers":[]}"#;
+    const OCI_INDEX: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aa","size":2}]}"#;
+    const DOCKER_V2_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:cf","size":2},"layers":[]}"#;
+    const MANIFEST_WITHOUT_MEDIA_TYPE: &[u8] = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:c0","size":2},"layers":[]}"#;
+
+    fn fs_storage() -> (tempfile::TempDir, FilesystemStorage) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        (dir, storage)
+    }
+
+    async fn put_manifest(storage: &dyn StorageBackend, body: &[u8]) -> String {
+        let digest = compute_sha256(body);
+        storage
+            .put(&manifest_storage_key(&digest), Bytes::from(body.to_vec()))
+            .await
+            .unwrap();
+        digest
+    }
+
+    // -- stores_own_manifests --------------------------------------------------
+
+    #[test]
+    fn stores_own_manifests_true_for_local_and_staging() {
+        assert!(stores_own_manifests("local"));
+        assert!(stores_own_manifests("staging"));
+    }
+
+    #[test]
+    fn stores_own_manifests_false_for_remote_and_virtual() {
+        assert!(!stores_own_manifests("remote"));
+        assert!(!stores_own_manifests("virtual"));
+    }
+
+    // -- sniff_manifest_media_type --------------------------------------------
+
+    #[test]
+    fn sniff_media_type_reads_index_media_type() {
+        assert_eq!(
+            sniff_manifest_media_type(OCI_INDEX).as_deref(),
+            Some(media_types::OCI_INDEX)
+        );
+    }
+
+    #[test]
+    fn sniff_media_type_reads_docker_v2_media_type() {
+        assert_eq!(
+            sniff_manifest_media_type(DOCKER_V2_MANIFEST).as_deref(),
+            Some(media_types::MANIFEST_V2)
+        );
+    }
+
+    #[test]
+    fn sniff_media_type_none_when_field_absent() {
+        assert_eq!(sniff_manifest_media_type(MANIFEST_WITHOUT_MEDIA_TYPE), None);
+    }
+
+    #[test]
+    fn sniff_media_type_none_for_non_json() {
+        assert_eq!(sniff_manifest_media_type(b"not a manifest"), None);
+    }
+
+    // -- resolve_manifest_content_type ----------------------------------------
+
+    #[test]
+    fn content_type_prefers_non_empty_stored_value() {
+        assert_eq!(
+            resolve_manifest_content_type(Some(media_types::MANIFEST_V2), OCI_INDEX),
+            media_types::MANIFEST_V2
+        );
+    }
+
+    #[test]
+    fn content_type_sniffs_body_when_stored_missing_or_blank() {
+        assert_eq!(
+            resolve_manifest_content_type(None, OCI_INDEX),
+            media_types::OCI_INDEX
+        );
+        assert_eq!(
+            resolve_manifest_content_type(Some("   "), OCI_INDEX),
+            media_types::OCI_INDEX
+        );
+    }
+
+    #[test]
+    fn content_type_defaults_to_oci_manifest_when_unknown() {
+        assert_eq!(
+            resolve_manifest_content_type(None, MANIFEST_WITHOUT_MEDIA_TYPE),
+            media_types::OCI_MANIFEST
+        );
+        assert_eq!(
+            resolve_manifest_content_type(None, b"not json"),
+            media_types::OCI_MANIFEST
+        );
+    }
+
+    // -- header-safe media type (P2) ------------------------------------------
+
+    #[test]
+    fn content_type_rejects_header_unsafe_values() {
+        // A pushed manifest whose mediaType carries a control / header-injection
+        // byte must not become a raw Content-Type header (that panics the
+        // response builder); both the sniffed and the stored paths fall back to
+        // a safe value.
+        let evil = b"{\"schemaVersion\":2,\"mediaType\":\"evil/type\r\nX-Injected: 1\"}";
+        assert_eq!(sniff_manifest_media_type(evil), None);
+        assert_eq!(
+            resolve_manifest_content_type(None, evil),
+            media_types::OCI_MANIFEST
+        );
+        assert_eq!(
+            resolve_manifest_content_type(Some("bad\nvalue"), OCI_INDEX),
+            media_types::OCI_INDEX
+        );
+    }
+
+    // -- build_local_manifest_response ----------------------------------------
+
+    #[test]
+    fn build_response_get_includes_body_and_headers() {
+        let data = Bytes::from_static(b"manifest-bytes");
+        let resp = build_local_manifest_response(
+            "sha256:deadbeef",
+            media_types::OCI_INDEX,
+            data.clone(),
+            true,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Docker-Content-Digest").unwrap(),
+            "sha256:deadbeef"
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            media_types::OCI_INDEX
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_LENGTH).unwrap(),
+            data.len().to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn build_response_head_sets_length_without_body() {
+        let data = Bytes::from_static(b"manifest-bytes");
+        let resp = build_local_manifest_response(
+            "sha256:deadbeef",
+            media_types::OCI_MANIFEST,
+            data.clone(),
+            false,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        // HEAD mirrors GET headers, including the real Content-Length...
+        assert_eq!(
+            resp.headers().get(CONTENT_LENGTH).unwrap(),
+            data.len().to_string().as_str()
+        );
+        // ...but carries no body.
+        assert_eq!(resp.body().size_hint().exact(), Some(0));
+    }
+
+    // -- resolve_local_manifest_from_storage (FilesystemStorage, no DB) -------
+
+    #[tokio::test]
+    async fn resolve_serves_untagged_digest_when_repo_known() {
+        let (_dir, storage) = fs_storage();
+        let digest = put_manifest(&storage, OCI_INDEX).await;
+        // repo_known_digest = true: this repo proved ownership via committed metadata.
+        let got = resolve_local_manifest_from_storage(&storage, "local", &digest, None, true).await;
+        let (out_digest, ct, data) = got.expect("untagged digest must resolve when repo-known");
+        assert_eq!(out_digest, digest);
+        assert_eq!(ct, media_types::OCI_INDEX);
+        assert_eq!(data.as_ref(), OCI_INDEX);
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_untagged_digest_when_not_repo_known() {
+        let (_dir, storage) = fs_storage();
+        let digest = put_manifest(&storage, OCI_INDEX).await;
+        // Object exists, but this repo has no committed metadata for it: must NOT
+        // serve it — on a shared cloud backend that would leak another repo's
+        // manifest by digest (#1681 review).
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "local", &digest, None, false)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_fallback_for_remote_repo() {
+        let (_dir, storage) = fs_storage();
+        let digest = put_manifest(&storage, OCI_IMAGE_MANIFEST).await;
+        // Even repo-known, a remote repo must not serve via the fallback
+        // (it proxies/caches instead).
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "remote", &digest, None, true)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_fallback_for_tag_reference() {
+        let (_dir, storage) = fs_storage();
+        put_manifest(&storage, OCI_IMAGE_MANIFEST).await;
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "local", "latest", None, true)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_none_when_object_absent() {
+        let (_dir, storage) = fs_storage();
+        let missing = compute_sha256(OCI_IMAGE_MANIFEST);
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "local", &missing, None, true)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_object_that_does_not_match_its_digest() {
+        let (_dir, storage) = fs_storage();
+        let claimed = compute_sha256(OCI_IMAGE_MANIFEST);
+        // Store DIFFERENT bytes under the key for `claimed`'s digest.
+        storage
+            .put(
+                &manifest_storage_key(&claimed),
+                Bytes::from_static(b"tampered"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "local", &claimed, None, true)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_serves_tagged_manifest_with_stored_content_type() {
+        let (_dir, storage) = fs_storage();
+        let digest = put_manifest(&storage, DOCKER_V2_MANIFEST).await;
+        let tag_row = Some((digest.clone(), media_types::MANIFEST_V2.to_string()));
+        // A surviving tag row serves regardless of repo_known_digest.
+        let (out_digest, ct, data) =
+            resolve_local_manifest_from_storage(&storage, "local", &digest, tag_row, false)
+                .await
+                .expect("tagged manifest must resolve");
+        assert_eq!(out_digest, digest);
+        assert_eq!(ct, media_types::MANIFEST_V2);
+        assert_eq!(data.as_ref(), DOCKER_V2_MANIFEST);
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_through_when_tagged_object_missing() {
+        let (_dir, storage) = fs_storage();
+        // tag row points at a digest whose object was never written.
+        let digest = compute_sha256(OCI_IMAGE_MANIFEST);
+        let tag_row = Some((digest.clone(), media_types::OCI_MANIFEST.to_string()));
+        assert!(
+            resolve_local_manifest_from_storage(&storage, "local", &digest, tag_row, false)
+                .await
+                .is_none()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content-addressable manifest retrieval through the router (#1681).
+//
+// DB-backed: drives PUT (tag overwrite) -> GET/HEAD/DELETE by digest through
+// the real OCI router so the coverage gate sees handle_get/head/delete_manifest
+// and lookup_manifest_tag_row exercised. DATABASE_URL is required so CI cannot
+// report vacuous success; skips cleanly when no database is available locally.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod manifest_digest_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn require_db_under_coverage() -> bool {
+        std::env::var_os("LLVM_PROFILE_FILE").is_some()
+            || std::env::var_os("CARGO_LLVM_COV").is_some()
+    }
+
+    /// Mint a Bearer JWT for the fixture user so the header-authenticated OCI
+    /// handlers accept the request (mirrors a real `docker login` session).
+    async fn bearer(fx: &tdh::Fixture) -> String {
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let user = sqlx::query_as::<_, crate::models::user::User>(
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider,
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            FROM users
+            WHERE id = $1
+            "#,
+        )
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("fetch test user");
+        let tokens = auth_service
+            .generate_tokens(&user)
+            .expect("generate Bearer token");
+        format!("Bearer {}", tokens.access_token)
+    }
+
+    fn req(
+        method: Method,
+        uri: String,
+        auth: &str,
+        content_type: Option<&str>,
+        body: Bytes,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, auth);
+        if let Some(ct) = content_type {
+            builder = builder.header(CONTENT_TYPE, ct);
+        }
+        builder.body(Body::from(body)).expect("build request")
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
+        let resp = app.oneshot(request).await.expect("oneshot");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, headers, body)
+    }
+
+    async fn cleanup(fx: &tdh::Fixture) {
+        for table in [
+            "oci_manifest_refs",
+            "manifest_blob_refs",
+            "oci_tags",
+            "oci_blobs",
+        ] {
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
+    /// The core #1681 scenario end to end: a manifest pushed under a tag stays
+    /// retrievable (and deletable) by its digest after the tag is overwritten.
+    #[tokio::test]
+    async fn digest_pull_and_delete_survive_tag_overwrite() {
+        if std::env::var("DATABASE_URL").is_err() {
+            if require_db_under_coverage() {
+                panic!("DATABASE_URL must be set for OCI manifest digest tests");
+            }
+            eprintln!("skipping OCI manifest digest tests; DATABASE_URL not set");
+            return;
+        }
+        let fx = tdh::Fixture::setup("local", "docker")
+            .await
+            .expect("fixture setup");
+        let auth = bearer(&fx).await;
+        let name = format!("{}/image", fx.repo_key);
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+        let manifest_uri = |reference: &str| format!("/{}/manifests/{}", name, reference);
+
+        let body_a = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":1},"layers":[],"annotations":{"build":"a"}}"#,
+        );
+        let body_b = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":2},"layers":[],"annotations":{"build":"b"}}"#,
+        );
+
+        // 1. Push body A under tag v1, then overwrite v1 with body B.
+        let (st, h, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::PUT,
+                manifest_uri("v1"),
+                &auth,
+                Some(ct),
+                body_a.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "PUT manifest A");
+        let digest_a = h
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .expect("digest header")
+            .to_string();
+
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::PUT,
+                manifest_uri("v1"),
+                &auth,
+                Some(ct),
+                body_b.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "PUT manifest B overwrites tag v1");
+
+        // 1a. Tagged pull still works through the refactored resolver: the tag
+        //     now serves B with its stored content type.
+        let (st, h, b) = send(
+            router().with_state(fx.state.clone()),
+            req(Method::GET, manifest_uri("v1"), &auth, None, Bytes::new()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "GET by tag v1");
+        assert_eq!(b, body_b, "tag v1 resolves to manifest B");
+        assert_eq!(h.get(CONTENT_TYPE).unwrap(), ct);
+
+        // 2. The tag now resolves to B, but A must still be pullable by digest
+        //    (previously 404 MANIFEST_UNKNOWN — the bug).
+        let (st, h, b) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::GET,
+                manifest_uri(&digest_a),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "GET A by digest after tag overwrite");
+        assert_eq!(b, body_a, "served bytes must be manifest A");
+        assert_eq!(h.get("Docker-Content-Digest").unwrap(), digest_a.as_str());
+        assert_eq!(h.get(CONTENT_TYPE).unwrap(), ct);
+
+        // 3. HEAD mirrors GET: same Content-Length, no body.
+        let (st, h, b) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::HEAD,
+                manifest_uri(&digest_a),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "HEAD A by digest");
+        assert_eq!(
+            h.get(CONTENT_LENGTH).unwrap(),
+            body_a.len().to_string().as_str()
+        );
+        assert!(b.is_empty(), "HEAD carries no body");
+
+        // 4. A genuinely-absent digest is still 404.
+        let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(Method::GET, manifest_uri(absent), &auth, None, Bytes::new()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "absent digest still 404s");
+
+        // 5. DELETE by digest removes the object; the digest then 404s.
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::DELETE,
+                manifest_uri(&digest_a),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "DELETE A by digest");
+
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::GET,
+                manifest_uri(&digest_a),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "GET A by digest after delete -> 404"
+        );
+
+        cleanup(&fx).await;
+    }
+
+    /// Repo-scoped content addressing: on a shared storage backend a digest
+    /// pushed to one repo must NOT be pullable by digest through another repo
+    /// that never received it (#1681 review P1).
+    #[tokio::test]
+    async fn untagged_digest_is_repo_scoped_on_shared_backend() {
+        if std::env::var("DATABASE_URL").is_err() {
+            if require_db_under_coverage() {
+                panic!("DATABASE_URL must be set for OCI manifest digest tests");
+            }
+            return;
+        }
+        let fx = tdh::Fixture::setup("local", "docker")
+            .await
+            .expect("fixture setup");
+        let auth = bearer(&fx).await;
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+
+        // A second repo sharing the SAME filesystem storage path as `fx` — this
+        // is what one shared S3/Azure/GCS backend looks like to the handlers
+        // (StorageRegistry::backend_for ignores the per-repo path for them).
+        let other_id = Uuid::new_v4();
+        let other_key = format!("ph-test-shared-{}", other_id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'docker'::repository_format)",
+        )
+        .bind(other_id)
+        .bind(&other_key)
+        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("create shared-backend repo");
+
+        // Push a manifest into repo A only.
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:abababababababababababababababababababababababababababababababab","size":1},"layers":[]}"#,
+        );
+        let (st, h, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::PUT,
+                format!("/{}/image/manifests/v1", fx.repo_key),
+                &auth,
+                Some(ct),
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "PUT into repo A");
+        let digest = h
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .expect("digest header")
+            .to_string();
+
+        // The object is physically present on the shared path, but repo B has no
+        // committed metadata for the digest: pulling through repo B must 404
+        // rather than leak repo A's manifest.
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::GET,
+                format!("/{}/image/manifests/{}", other_key, digest),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "repo B must not serve repo A's digest from a shared backend"
+        );
+
+        // A child edge from an index is not enough ownership proof: repo B can
+        // submit an index body that references repo A's digest without ever
+        // uploading that child manifest into repo B. On a shared backend,
+        // treating `oci_manifest_refs.child_digest` alone as proof would leak
+        // repo A's stored manifest through repo B.
+        let index_body = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{digest}","size":1}}]}}"#
+        ));
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::PUT,
+                format!("/{}/image/manifests/latest", other_key),
+                &auth,
+                Some("application/vnd.oci.image.index.v1+json"),
+                index_body,
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "PUT index into repo B");
+
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::GET,
+                format!("/{}/image/manifests/{}", other_key, digest),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "repo B index child edge must not authorize repo A's child digest"
+        );
+
+        // Sanity: repo A still serves its own digest.
+        let (st, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::GET,
+                format!("/{}/image/manifests/{}", fx.repo_key, digest),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "repo A serves its own digest");
+
+        for table in [
+            "oci_manifest_refs",
+            "manifest_blob_refs",
+            "oci_tags",
+            "oci_blobs",
+            "artifacts",
+        ] {
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
+                .bind(other_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup(&fx).await;
+    }
+
+    /// If digest-ownership cleanup fails, DELETE must not return 202 or leave
+    /// the tag half-deleted: after #1681 the ref rows are authorization
+    /// metadata for digest fallback, not just best-effort GC hints.
+    #[tokio::test]
+    async fn delete_manifest_cleanup_failure_rolls_back_tag_delete() {
+        if std::env::var("DATABASE_URL").is_err() {
+            if require_db_under_coverage() {
+                panic!("DATABASE_URL must be set for OCI manifest digest tests");
+            }
+            return;
+        }
+        let fx = tdh::Fixture::setup("local", "docker")
+            .await
+            .expect("fixture setup");
+        let auth = bearer(&fx).await;
+        let digest = format!("sha256:{}", "c".repeat(64));
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+             VALUES ($1, 'image', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("seed tag");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&digest)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed refs");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("ak_test_fail_mbr_delete_{}", suffix);
+        let trigger_name = format!("ak_test_fail_mbr_delete_{}", suffix);
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 RAISE EXCEPTION 'forced manifest_blob_refs delete failure';
+             END;
+             $$"
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE DELETE ON manifest_blob_refs
+             FOR EACH ROW
+             WHEN (OLD.repository_id = '{}'::uuid)
+             EXECUTE FUNCTION {function_name}()",
+            fx.repo_id
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create failure trigger");
+
+        let (status, _, _) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::DELETE,
+                format!("/{}/image/manifests/v1", fx.repo_key),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+
+        let tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count tags");
+        let ref_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count refs");
+
+        let _ = sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
+        ))
+        .execute(&fx.pool)
+        .await;
+        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
+            .execute(&fx.pool)
+            .await;
+        cleanup(&fx).await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cleanup failure must abort DELETE"
+        );
+        assert_eq!(
+            tag_count, 1,
+            "tag delete must roll back when digest-ownership cleanup fails"
+        );
+        assert_eq!(
+            ref_count, 2,
+            "manifest_blob_refs must remain when cleanup failed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Streaming OCI blob upload coverage.
 //
 // The hot path for Docker/Podman push is:
@@ -11511,6 +12607,23 @@ mod oci_blob_upload_streaming_tests {
         .fetch_one(&f.inner.pool)
         .await
         .expect("count oci_blobs")
+    }
+
+    fn filesystem_has_exact_file_name(path: &std::path::Path) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        std::fs::read_dir(parent)
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry.file_name() == name
+                        && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
     }
 
     // RecordingStorage implements only put/get/exists/delete/copy and inherits
@@ -15839,11 +16952,14 @@ mod oci_blob_upload_streaming_tests {
             "blob object must live under the canonical storage key"
         );
         assert!(
-            !storage
-                .exists(&blob_storage_key(&upper_digest))
-                .await
-                .unwrap(),
-            "no object may be stored under the upper-case storage key"
+            filesystem_has_exact_file_name(&f.inner.storage_dir.join(blob_storage_key(&canonical))),
+            "filesystem entry must use the canonical lowercase storage key"
+        );
+        assert!(
+            !filesystem_has_exact_file_name(
+                &f.inner.storage_dir.join(blob_storage_key(&upper_digest))
+            ),
+            "no filesystem entry may be stored under the upper-case storage key"
         );
         assert_eq!(
             headers
