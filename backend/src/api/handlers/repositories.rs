@@ -1380,8 +1380,21 @@ async fn purge_repo_oci_upload_temp_objects(
 /// `storage_key` still referenced by another repository's artifact row
 /// (content-addressed dedup can share a key across repos on a shared backend)
 /// is left in place, so deleting one repository never destroys another's data.
-/// OCI blob objects (`oci_blobs`) are intentionally out of scope here; their
-/// cross-repo, content-addressed lifecycle is handled by blob GC.
+///
+/// OCI objects (`oci-manifests/<digest>` and `oci-blobs/<digest>`) are
+/// intentionally OUT of scope here and are excluded from the purge SELECT.
+/// They are content-addressed and shared cross-repo through their own
+/// reference tables (`oci_tags`, `oci_blobs`, `oci_manifest_refs`), and a
+/// manifest object can be referenced by another repository WITHOUT a matching
+/// `artifacts` row — so the `artifacts`-only `NOT EXISTS` guard above cannot
+/// prove an OCI key is unreferenced. On cloud backends (S3/GCS/Azure) every
+/// repository shares one flat global keyspace (no per-repo path isolation),
+/// so deleting an OCI key here would destroy a manifest/blob another repo is
+/// still serving (regression from #1598; filesystem hid it via per-repo path
+/// isolation). OCI reclamation is owned by blob GC, which applies the
+/// authoritative `ORPHAN_PREDICATE_SQL` test; once this repository's
+/// `oci_tags`/`oci_manifest_refs`/`oci_blobs` rows CASCADE away, any object
+/// they alone referenced becomes orphaned and is reclaimed on the next GC pass.
 ///
 /// Never blocks the delete: storage-resolution and per-object failures are
 /// logged and swallowed.
@@ -1405,6 +1418,8 @@ async fn purge_repo_artifact_objects(
     let keys: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
+           AND a.storage_key NOT LIKE 'oci-manifests/%' \
+           AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
                SELECT 1 FROM artifacts b \
                WHERE b.storage_key = a.storage_key AND b.repository_id <> $1 \
@@ -8727,6 +8742,145 @@ mod tests {
         );
 
         // Clean up the second repo (its artifacts CASCADE).
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other_repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete other repo");
+        fx.teardown().await;
+    }
+
+    /// Regression for the #1598 data-loss bug: on cloud backends (S3/GCS/Azure)
+    /// every repository shares ONE flat global keyspace (no per-repo path
+    /// isolation), so an OCI manifest object `oci-manifests/<digest>` can be
+    /// referenced by a SECOND repository via `oci_tags`/`oci_manifest_refs`
+    /// WITHOUT any matching `artifacts` row. The original purge SELECT guarded
+    /// over-deletion only with `NOT EXISTS (artifacts b ...)`, which cannot see
+    /// such an OCI-table-only reference, so deleting repo A purged a manifest
+    /// repo B was still serving.
+    ///
+    /// This test deliberately defeats path isolation: both repos resolve to the
+    /// SAME `location` (one shared root, mimicking a flat cloud keyspace) and
+    /// repo B references the manifest ONLY through `oci_tags` +
+    /// `oci_manifest_refs` (no `artifacts` row). The fix excludes
+    /// `oci-manifests/%` / `oci-blobs/%` from the purge, so the shared manifest
+    /// MUST survive repo A's deletion.
+    #[tokio::test]
+    async fn delete_repository_keeps_oci_manifest_shared_via_oci_tables_on_flat_backend() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        // A single shared root for BOTH repos == flat global keyspace, no
+        // per-repo path isolation (the property that hid the bug on filesystem).
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // Helper: write an OCI manifest object to the shared root AND give repo A
+        // (the repo being deleted) an `artifacts` row pointing at it. Returns the
+        // storage key so the assertions can probe it afterwards.
+        let put_repo_a_manifest = |digest: &str, content_type: &'static str| {
+            let pool = fx.pool.clone();
+            let repo_id = fx.repo_id;
+            let storage = storage.clone();
+            let key = format!("oci-manifests/{digest}");
+            async move {
+                storage
+                    .put(&key, bytes::Bytes::from(format!("bytes for {key}")))
+                    .await
+                    .expect("put manifest object");
+                sqlx::query(
+                    "INSERT INTO artifacts \
+                     (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(repo_id)
+                .bind(format!("app/{}", &key))
+                .bind("manifest")
+                .bind(16_i64)
+                .bind("f".repeat(64))
+                .bind(content_type)
+                .bind(&key)
+                .execute(&pool)
+                .await
+                .expect("insert repo A artifact row for manifest");
+                key
+            }
+        };
+
+        // Repo A owns an index manifest (referenced cross-repo by repo B via an
+        // oci_tags row) and a child manifest (referenced via oci_manifest_refs).
+        // Digests are randomized per run so they never collide with rows left by
+        // other tests in the shared test DB (a fixed digest could be referenced
+        // by an unrelated repo's leftover artifacts row, which would mask the bug
+        // by satisfying the artifacts-only NOT EXISTS guard for the wrong reason).
+        let index_digest = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let child_digest = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let manifest_key =
+            put_repo_a_manifest(&index_digest, "application/vnd.oci.image.index.v1+json").await;
+        let child_key =
+            put_repo_a_manifest(&child_digest, "application/vnd.oci.image.manifest.v1+json").await;
+
+        // Repo B references BOTH manifest objects WITHOUT any artifacts row:
+        //   - the index via an oci_tags row (digest reference), and
+        //   - the child via an oci_manifest_refs row (index -> child).
+        // This is exactly what the artifacts-only NOT EXISTS guard cannot see.
+        let (other_repo_id, _key, _dir) = tdh::create_repo(&fx.pool, "local", "docker").await;
+        sqlx::query(
+            "INSERT INTO oci_tags \
+             (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(other_repo_id)
+        .bind("app")
+        .bind("v1")
+        .bind(&index_digest)
+        .bind("application/vnd.oci.image.index.v1+json")
+        .execute(&fx.pool)
+        .await
+        .expect("insert repo B oci_tags row");
+        sqlx::query(
+            "INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&index_digest)
+        .bind(&child_digest)
+        .bind(other_repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert repo B oci_manifest_refs row");
+
+        assert!(storage
+            .exists(&manifest_key)
+            .await
+            .expect("manifest exists"));
+        assert!(storage.exists(&child_key).await.expect("child exists"));
+
+        // Delete repo A's objects. The shared OCI manifest objects MUST survive
+        // because repo B still serves them (via oci_tags / oci_manifest_refs).
+        purge_repo_artifact_objects(&state, fx.repo_id, &location).await;
+
+        assert!(
+            storage
+                .exists(&manifest_key)
+                .await
+                .expect("manifest exists after purge"),
+            "OCI manifest referenced by another repo via oci_tags must NOT be purged \
+             on a flat (no path isolation) backend"
+        );
+        assert!(
+            storage
+                .exists(&child_key)
+                .await
+                .expect("child exists after purge"),
+            "OCI child manifest referenced by another repo via oci_manifest_refs must \
+             NOT be purged on a flat (no path isolation) backend"
+        );
+
+        // Clean up the second repo (its oci_tags / oci_manifest_refs CASCADE).
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(other_repo_id)
             .execute(&fx.pool)
