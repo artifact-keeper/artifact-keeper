@@ -22,6 +22,8 @@ pub struct UploadSession {
     pub repository_id: Uuid,
     pub repository_key: String,
     pub artifact_path: String,
+    pub artifact_name: Option<String>,
+    pub artifact_version: Option<String>,
     pub content_type: String,
     pub total_size: i64,
     pub chunk_size: i32,
@@ -167,6 +169,8 @@ pub struct CreateSessionParams<'a> {
     pub repo_id: Uuid,
     pub repo_key: &'a str,
     pub artifact_path: &'a str,
+    pub artifact_name: Option<&'a str>,
+    pub artifact_version: Option<&'a str>,
     pub total_size: i64,
     pub chunk_size: Option<i32>,
     pub checksum_sha256: &'a str,
@@ -195,6 +199,8 @@ impl UploadService {
 
         let total_chunks = ((p.total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
         let content_type = p.content_type.unwrap_or("application/octet-stream");
+        let artifact_name = normalize_optional_metadata(p.artifact_name);
+        let artifact_version = normalize_optional_metadata(p.artifact_version);
 
         let session_id = Uuid::new_v4();
         let temp_dir = PathBuf::from(p.storage_path).join(".uploads");
@@ -218,9 +224,9 @@ impl UploadService {
             r#"
             INSERT INTO upload_sessions
                 (id, user_id, repository_id, repository_key, artifact_path,
-                 content_type, total_size, chunk_size, total_chunks,
-                 checksum_sha256, temp_file_path)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 artifact_name, artifact_version, content_type, total_size,
+                 chunk_size, total_chunks, checksum_sha256, temp_file_path)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *
             "#,
         )
@@ -229,6 +235,8 @@ impl UploadService {
         .bind(p.repo_id)
         .bind(p.repo_key)
         .bind(p.artifact_path)
+        .bind(artifact_name)
+        .bind(artifact_version)
         .bind(content_type)
         .bind(p.total_size)
         .bind(chunk_size)
@@ -615,6 +623,13 @@ async fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Normalize an optional artifact metadata field for persistence: treat an
+/// empty string the same as an absent value so peer replication and regular
+/// uploads store `NULL` instead of `''` for unset name/version.
+fn normalize_optional_metadata(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
 /// Parse a Content-Range header value like `bytes 0-8388607/21474836480`.
 /// Returns `(start, end, total)`.
 pub fn parse_content_range(header: &str) -> Result<(i64, i64, i64), String> {
@@ -659,6 +674,22 @@ pub fn parse_content_range(header: &str) -> Result<(i64, i64, i64), String> {
 mod tests {
     #![allow(clippy::unnecessary_literal_unwrap, clippy::assertions_on_constants)]
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // normalize_optional_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_optional_metadata_drops_empty_and_none() {
+        assert_eq!(normalize_optional_metadata(None), None);
+        assert_eq!(normalize_optional_metadata(Some("")), None);
+    }
+
+    #[test]
+    fn test_normalize_optional_metadata_keeps_non_empty() {
+        assert_eq!(normalize_optional_metadata(Some("pkg")), Some("pkg"));
+        assert_eq!(normalize_optional_metadata(Some(" ")), Some(" "));
+    }
 
     // -----------------------------------------------------------------------
     // parse_content_range: existing tests
@@ -1307,6 +1338,8 @@ mod tests {
             repository_id: Uuid::nil(),
             repository_key: "test-repo".into(),
             artifact_path: "path/to/file.bin".into(),
+            artifact_name: Some("source-name".into()),
+            artifact_version: Some("1.0.0".into()),
             content_type: "application/octet-stream".into(),
             total_size: 1024,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -1334,6 +1367,8 @@ mod tests {
             repository_id: Uuid::nil(),
             repository_key: "repo".into(),
             artifact_path: "file.bin".into(),
+            artifact_name: None,
+            artifact_version: None,
             content_type: "application/octet-stream".into(),
             total_size: 100,
             chunk_size: DEFAULT_CHUNK_SIZE,

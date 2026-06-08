@@ -1,24 +1,37 @@
 //! Storage garbage collection API handler.
 
-use axum::extract::Extension;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::extract::{Extension, Query};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Deserialize;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::storage_gc_service::{StorageGcResult, StorageGcService};
+use crate::services::storage_gc_service::{
+    OciBlobFootprintReport, OciBlobRepoFootprint, StorageGcResult, StorageGcService,
+};
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(run_storage_gc),
-    components(schemas(StorageGcRequest, StorageGcResult))
+    paths(run_storage_gc, oci_blob_report),
+    components(schemas(
+        StorageGcRequest,
+        StorageGcResult,
+        OciBlobFootprintReport,
+        OciBlobRepoFootprint,
+    ))
 )]
 pub struct StorageGcApiDoc;
 
 pub fn router() -> Router<SharedState> {
-    Router::new().route("/", post(run_storage_gc))
+    Router::new()
+        .route("/", post(run_storage_gc))
+        .route("/oci-blob-report", get(oci_blob_report))
 }
 
 /// Request body for storage GC.
@@ -47,15 +60,79 @@ pub async fn run_storage_gc(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<StorageGcRequest>,
 ) -> Result<Json<StorageGcResult>> {
-    if !auth.is_admin {
-        return Err(AppError::Unauthorized(
-            "Admin privileges required".to_string(),
-        ));
-    }
+    require_admin(auth.is_admin)?;
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
     let result = service.run_gc(payload.dry_run).await?;
     Ok(Json(result))
+}
+
+/// Gate an admin-only endpoint.
+///
+/// Returns `Ok(())` when the caller is an admin and an
+/// [`AppError::Unauthorized`] otherwise. Extracted from the handlers so the
+/// authorization branch is unit-testable without constructing a full axum
+/// request (the handlers themselves require a live DB-backed `SharedState`).
+fn require_admin(is_admin: bool) -> Result<()> {
+    if is_admin {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ))
+    }
+}
+
+/// Resolve the effective grace-window argument for the blob report from the
+/// optional `grace_hours` query parameter.
+///
+/// An absent parameter resolves to `0`, which the service layer then clamps
+/// to [`crate::services::storage_gc_service::BLOB_REPORT_GRACE_HOURS_DEFAULT`].
+/// Keeping this mapping in a pure helper makes the query-param handling
+/// coverable without standing up the HTTP stack.
+fn resolve_report_grace_hours(grace_hours: Option<i64>) -> i64 {
+    grace_hours.unwrap_or_default()
+}
+
+/// Query parameters for the read-only OCI blob footprint report.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct OciBlobReportQuery {
+    /// Grace window in hours used to compute the `aged_*` figures. Defaults
+    /// to 24h; non-positive or out-of-range values are clamped server-side.
+    pub grace_hours: Option<i64>,
+}
+
+/// GET /api/v1/admin/storage-gc/oci-blob-report
+///
+/// Read-only report of the OCI blob (`oci_blobs`) storage footprint
+/// (issue #1408). Performs no deletion and takes no locks — it only runs
+/// aggregate `SELECT`s. Surfaces logical vs dedup-aware physical bytes so
+/// operators can see how much un-reclaimed blob storage exists before any
+/// garbage-collection sweep is enabled.
+#[utoipa::path(
+    get,
+    path = "/oci-blob-report",
+    context_path = "/api/v1/admin/storage-gc",
+    tag = "admin",
+    operation_id = "oci_blob_report",
+    params(OciBlobReportQuery),
+    responses(
+        (status = 200, description = "OCI blob footprint report", body = OciBlobFootprintReport),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn oci_blob_report(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<OciBlobReportQuery>,
+) -> Result<Json<OciBlobFootprintReport>> {
+    require_admin(auth.is_admin)?;
+
+    let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
+    let report = service
+        .oci_blob_footprint_report(resolve_report_grace_hours(query.grace_hours))
+        .await?;
+    Ok(Json(report))
 }
 
 #[cfg(test)]
@@ -215,11 +292,42 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_doc_path_has_post_method() {
+    fn test_openapi_doc_every_path_has_an_operation() {
+        // The router mixes a POST (run GC) and a GET (blob report); each
+        // documented path must carry at least one of the two so the spec is
+        // never missing a method.
         let doc = StorageGcApiDoc::openapi();
-        for item in doc.paths.paths.values() {
-            assert!(item.post.is_some(), "Path should have POST method");
+        for (path, item) in &doc.paths.paths {
+            assert!(
+                item.post.is_some() || item.get.is_some(),
+                "Path {path} should have a GET or POST method"
+            );
         }
+    }
+
+    #[test]
+    fn test_openapi_doc_has_post_run_and_get_report() {
+        // The merged doc keys paths by their full context path, so match by
+        // suffix: there must be exactly one POST-bearing path (run GC) and
+        // exactly one GET-bearing path ending in /oci-blob-report.
+        let doc = StorageGcApiDoc::openapi();
+        let post_paths = doc
+            .paths
+            .paths
+            .values()
+            .filter(|item| item.post.is_some())
+            .count();
+        let report_get = doc
+            .paths
+            .paths
+            .iter()
+            .filter(|(path, item)| path.ends_with("/oci-blob-report") && item.get.is_some())
+            .count();
+        assert_eq!(post_paths, 1, "exactly one POST path (run GC) expected");
+        assert_eq!(
+            report_get, 1,
+            "exactly one GET /oci-blob-report path expected"
+        );
     }
 
     // -- Router test --
@@ -227,5 +335,106 @@ mod tests {
     #[test]
     fn test_router_returns_valid_router() {
         let _router = router();
+    }
+
+    // -- OciBlobReportQuery deserialization (issue #1408) --
+
+    #[test]
+    fn test_oci_blob_report_query_absent_grace_hours() {
+        let q: OciBlobReportQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.grace_hours, None);
+    }
+
+    #[test]
+    fn test_oci_blob_report_query_explicit_grace_hours() {
+        let q: OciBlobReportQuery = serde_json::from_str(r#"{"grace_hours": 48}"#).unwrap();
+        assert_eq!(q.grace_hours, Some(48));
+    }
+
+    #[test]
+    fn test_oci_blob_report_query_negative_grace_hours_parses() {
+        // Negative values parse here; the service clamps them. The endpoint
+        // must not reject a bad query param with a 4xx.
+        let q: OciBlobReportQuery = serde_json::from_str(r#"{"grace_hours": -3}"#).unwrap();
+        assert_eq!(q.grace_hours, Some(-3));
+    }
+
+    #[test]
+    fn test_oci_blob_report_query_invalid_type_errors() {
+        let result = serde_json::from_str::<OciBlobReportQuery>(r#"{"grace_hours": "soon"}"#);
+        assert!(result.is_err());
+    }
+
+    // -- OpenAPI registration for the new report endpoint --
+
+    #[test]
+    fn test_openapi_doc_includes_blob_report_operation() {
+        let doc = StorageGcApiDoc::openapi();
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(
+            json.contains("oci_blob_report"),
+            "OpenAPI doc should contain operation ID 'oci_blob_report'"
+        );
+    }
+
+    // -- require_admin authorization gate --
+
+    #[test]
+    fn test_require_admin_allows_admin() {
+        assert!(require_admin(true).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_rejects_non_admin() {
+        let err = require_admin(false).unwrap_err();
+        match err {
+            AppError::Unauthorized(msg) => {
+                assert!(
+                    msg.contains("Admin privileges required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    // -- resolve_report_grace_hours query-param mapping --
+
+    #[test]
+    fn test_resolve_report_grace_hours_absent_is_zero() {
+        // Absent resolves to 0, which the service clamps to the default
+        // window; the handler must not itself substitute a default.
+        assert_eq!(resolve_report_grace_hours(None), 0);
+    }
+
+    #[test]
+    fn test_resolve_report_grace_hours_passes_through_value() {
+        assert_eq!(resolve_report_grace_hours(Some(48)), 48);
+        assert_eq!(resolve_report_grace_hours(Some(0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_report_grace_hours_passes_through_negative() {
+        // Negative values are forwarded unchanged; clamping is the service's
+        // responsibility, not the handler's.
+        assert_eq!(resolve_report_grace_hours(Some(-7)), -7);
+    }
+
+    #[test]
+    fn test_openapi_doc_includes_blob_report_schemas() {
+        let doc = StorageGcApiDoc::openapi();
+        let schemas = &doc
+            .components
+            .as_ref()
+            .expect("components should exist")
+            .schemas;
+        assert!(
+            schemas.contains_key("OciBlobFootprintReport"),
+            "Schema should contain OciBlobFootprintReport"
+        );
+        assert!(
+            schemas.contains_key("OciBlobRepoFootprint"),
+            "Schema should contain OciBlobRepoFootprint"
+        );
     }
 }

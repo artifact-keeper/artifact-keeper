@@ -83,11 +83,11 @@ impl AuthExtension {
         }
         match &self.scopes {
             None => true,
-            Some(scopes) => {
-                scopes.iter().any(|s| s == scope)
-                    || scopes.iter().any(|s| s == "*")
-                    || scopes.iter().any(|s| s == "admin")
-            }
+            // Delegate the wildcard-aware scope decision to the single
+            // canonical helper (`*` / `admin` short-circuit) instead of
+            // re-inlining a brittle string match here. Keeping the wildcard
+            // policy in one place is what the #1316 grep gate enforces.
+            Some(scopes) => crate::services::token_service::scopes_grant_access(scopes, scope),
         }
     }
 
@@ -118,6 +118,28 @@ impl AuthExtension {
             Ok(())
         } else {
             Err(AppError::Authorization("Admin access required".to_string()))
+        }
+    }
+
+    /// Self-or-admin gate: allow the call when the caller is acting on their
+    /// own resource (`self.user_id == target_user_id`) **or** the caller is an
+    /// admin. Otherwise return a 403 Forbidden carrying `deny_msg`.
+    ///
+    /// This is the single evaluation point for the recurring self-service
+    /// authorization pattern (`if auth.user_id != id && !auth.is_admin { 403 }`).
+    /// The deny message is supplied by the call site so each endpoint keeps its
+    /// existing, user-facing 403 body verbatim (e.g. "Cannot view other users'
+    /// tokens"). Deny-by-default: any caller who is neither self nor admin is
+    /// rejected.
+    pub fn require_self_or_admin(
+        &self,
+        target_user_id: Uuid,
+        deny_msg: &str,
+    ) -> crate::error::Result<()> {
+        if self.user_id == target_user_id || self.is_admin {
+            Ok(())
+        } else {
+            Err(AppError::Authorization(deny_msg.to_string()))
         }
     }
 }
@@ -1625,6 +1647,36 @@ mod tests {
         assert!(ext.has_scope("delete:artifacts"));
     }
 
+    // #1316: pin the authorization decision now that `has_scope` delegates to
+    // the canonical `token_service::scopes_grant_access` helper instead of an
+    // inline `== "admin"` string match. Behavior must be identical: an
+    // `admin`-scoped API token authorizes any required scope, and a token
+    // lacking the required scope (and any wildcard) is rejected.
+    #[test]
+    fn test_has_scope_admin_token_authorizes_every_scope_via_canonical_helper() {
+        let ext = make_api_token_ext(vec!["admin".to_string()], None);
+        // Same decision as the canonical helper for several distinct scopes.
+        for scope in ["read:artifacts", "write:users", "delete:repositories"] {
+            assert!(ext.has_scope(scope), "admin token should grant {scope}");
+            assert_eq!(
+                ext.has_scope(scope),
+                crate::services::token_service::scopes_grant_access(&["admin".to_string()], scope),
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_scope_non_admin_token_rejected_when_scope_absent() {
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(!ext.has_scope("write:users"));
+        assert!(!ext.has_scope("delete:artifacts"));
+        // The canonical helper agrees: no wildcard / admin present.
+        assert!(!crate::services::token_service::scopes_grant_access(
+            &["read:artifacts".to_string()],
+            "write:users",
+        ));
+    }
+
     #[test]
     fn test_has_scope_jwt_always_passes() {
         let ext = AuthExtension {
@@ -2237,6 +2289,59 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(ext.require_admin().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // require_self_or_admin: self allowed, admin allowed, other-non-admin
+    // denied. Pins the deny-by-default self-service authorization policy.
+    // -----------------------------------------------------------------------
+
+    fn self_or_admin_fixture(user_id: Uuid, is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: "caller".to_string(),
+            email: "caller@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_require_self_or_admin_allows_self() {
+        let me = Uuid::new_v4();
+        let ext = self_or_admin_fixture(me, false);
+        // Acting on my own resource: allowed even though I am not an admin.
+        assert!(ext.require_self_or_admin(me, "denied").is_ok());
+    }
+
+    #[test]
+    fn test_require_self_or_admin_allows_admin_for_other() {
+        let ext = self_or_admin_fixture(Uuid::new_v4(), true);
+        // Admin acting on someone else's resource: allowed.
+        assert!(ext.require_self_or_admin(Uuid::new_v4(), "denied").is_ok());
+    }
+
+    #[test]
+    fn test_require_self_or_admin_denies_other_non_admin() {
+        let ext = self_or_admin_fixture(Uuid::new_v4(), false);
+        // Non-admin acting on someone else's resource: denied (403) and the
+        // caller-supplied message is preserved verbatim in the error body.
+        let err = ext
+            .require_self_or_admin(Uuid::new_v4(), "Cannot view other users' tokens")
+            .unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
+        assert!(err.to_string().contains("Cannot view other users' tokens"));
+    }
+
+    #[test]
+    fn test_require_self_or_admin_admin_acting_on_self() {
+        let me = Uuid::new_v4();
+        let ext = self_or_admin_fixture(me, true);
+        // Admin acting on their own resource: allowed (both conditions true).
+        assert!(ext.require_self_or_admin(me, "denied").is_ok());
     }
 
     // -----------------------------------------------------------------------
