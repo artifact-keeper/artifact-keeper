@@ -3440,7 +3440,7 @@ pub async fn download_artifact(
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
     let download_result = artifact_service
-        .download(
+        .download_stream(
             repo.id,
             &path,
             auth.map(|a| a.user_id),
@@ -3450,26 +3450,31 @@ pub async fn download_artifact(
         .await;
 
     match download_result {
-        Ok((artifact, content)) => Ok((
-            [
-                (header::CONTENT_TYPE, artifact.content_type),
-                (
+        Ok((artifact, body)) => {
+            // Stream the body from storage instead of buffering it in memory
+            // (#1608, Core Invariant ①). Headers and status are identical to the
+            // prior buffered path; `size_bytes` gives an accurate Content-Length.
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, artifact.content_type)
+                .header(
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", artifact.name),
-                ),
-                (header::CONTENT_LENGTH, artifact.size_bytes.to_string()),
-                (
+                )
+                .header(header::CONTENT_LENGTH, artifact.size_bytes.to_string())
+                .header(
                     header::HeaderName::from_static("x-checksum-sha256"),
-                    artifact.checksum_sha256,
-                ),
-                (
-                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                    "proxy".to_string(),
-                ),
-            ],
-            content,
-        )
-            .into_response()),
+                    // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
+                    // blank-pads shorter values on read. Trim before emitting so the
+                    // header carries the bare checksum (a real sha256 is exactly 64
+                    // hex chars and is unaffected by the trim).
+                    artifact.checksum_sha256.trim().to_string(),
+                )
+                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy")
+                .body(Body::from_stream(body))
+                .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?;
+            Ok(response)
+        }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
@@ -8546,6 +8551,142 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // download_artifact: local-serve streaming happy path (#1608, epic #1607).
+    //
+    // The generic `/:key/download/*path` handler used to buffer the WHOLE
+    // local artifact body into memory (`ArtifactService::download` ->
+    // `storage.get()` -> `Bytes`) before responding, an OOM/pod-eviction
+    // risk for large artifacts -- the same class #1393 fixed for the
+    // per-format handlers. #1608 converts this path to
+    // `ArtifactService::download_stream` + `Body::from_stream`. These tests
+    // pin the new contract end-to-end:
+    //
+    //   1. seed a local artifact and download it -> 200 with the exact
+    //      bytes, Content-Type, Content-Length (from `size_bytes`),
+    //      x-checksum-sha256, and x-artifact-storage: proxy headers
+    //   2. a missing path on a Local repo still maps to 404 (the
+    //      NotFound contract the Remote/Virtual fallback arms key on)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_artifact_local_streams_body_with_headers() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let body_bytes: &[u8] = b"the-streamed-local-artifact-body-bytes";
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "foo/bar.bin",
+            "bar",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        let router = fx.router_with_auth(download_router());
+        let req = tdh::get(format!("/{}/download/foo/bar.bin", fx.repo_key));
+
+        // Send manually so we can inspect headers before draining the body.
+        use tower::ServiceExt;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("download_artifact local-serve must respond");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect streamed body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "local-serve happy path must stream a 200"
+        );
+        assert_eq!(
+            &collected[..],
+            body_bytes,
+            "streamed body bytes must round-trip identically to the stored object"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-test"),
+            "Content-Type must come from the artifact row"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(body_bytes.len().to_string().as_str()),
+            "Content-Length must be the artifact's size_bytes (#1608 streamed path)"
+        );
+        assert_eq!(
+            headers
+                .get("x-checksum-sha256")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-seed"),
+            "x-checksum-sha256 header must be preserved"
+        );
+        assert_eq!(
+            headers
+                .get(X_ARTIFACT_STORAGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("proxy"),
+            "x-artifact-storage must remain `proxy` for the local-serve path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_local_missing_path_returns_404() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        // No proxy_service wired and no upstream: a Local repo with a missing
+        // path must surface the NotFound contract as a 404, not a 500.
+        let router = fx.router_with_auth(download_router());
+        let req = tdh::get(format!("/{}/download/does/not/exist.bin", fx.repo_key));
+        let (status, _body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "missing local artifact must map to 404 (NotFound contract preserved by #1608)"
+        );
+    }
+
+    // Source-level pin (#1608, epic #1607): the local-serve happy path in
+    // `download_artifact` MUST stream via `ArtifactService::download_stream`
+    // and `Body::from_stream`, never the buffered `.download(` -> `Bytes`
+    // path. A silent revert would re-introduce the OOM regression this fix
+    // closes (same class as #1393 for the per-format handlers).
+    #[test]
+    fn test_repositories_download_artifact_local_streams_1608() {
+        let src = include_str!("repositories.rs");
+        assert!(
+            src.contains(".download_stream("),
+            "`repositories::download_artifact` MUST call \
+             `ArtifactService::download_stream(` for the local-serve download \
+             (#1608). A revert to the buffered `.download(` helper would \
+             re-introduce the large-body OOM regression."
+        );
     }
 
     #[tokio::test]

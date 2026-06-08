@@ -608,12 +608,18 @@ async fn simple_project(
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
 
+            // First pass: collect distributions from every local (hosted /
+            // staging) member. We must know whether a local member owns the
+            // name BEFORE deciding to fetch any remote index, because members
+            // are iterated in priority order and a remote can precede a local.
             for member in &members {
-                if member.repo_type == RepositoryType::Local
-                    || member.repo_type == RepositoryType::Staging
+                if member.repo_type != RepositoryType::Local
+                    && member.repo_type != RepositoryType::Staging
                 {
-                    let member_rows = sqlx::query!(
-                        r#"
+                    continue;
+                }
+                let member_rows = sqlx::query!(
+                    r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
                am.metadata as "metadata?"
         FROM artifacts a
@@ -623,25 +629,39 @@ async fn simple_project(
           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2
         ORDER BY a.created_at DESC
         "#,
-                        member.id,
-                        normalized
-                    )
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(map_db_err)?;
+                    member.id,
+                    normalized
+                )
+                .fetch_all(&state.db)
+                .await
+                .map_err(map_db_err)?;
 
-                    local_artifacts.extend(member_rows.into_iter().map(|a| {
-                        SimpleProjectArtifact {
-                            path: a.path,
-                            version: a.version,
-                            size_bytes: a.size_bytes,
-                            checksum_sha256: a.checksum_sha256,
-                            metadata: a.metadata,
-                        }
-                    }));
-                    continue;
+                local_artifacts.extend(member_rows.into_iter().map(|a| SimpleProjectArtifact {
+                    path: a.path,
+                    version: a.version,
+                    size_bytes: a.size_bytes,
+                    checksum_sha256: a.checksum_sha256,
+                    metadata: a.metadata,
+                }));
+            }
+
+            // Ownership / dependency-confusion guard (#1600). When a local
+            // member owns this PEP 503 name, the virtual serves ONLY that
+            // member's distributions for the name — in both the simple index
+            // and the download — rather than unioning the remote's versions for
+            // it. Unioning an unrelated public package that merely shares the
+            // name is a supply-chain hole (`pip` prefers the higher public
+            // version) AND makes the index inconsistent with the download path,
+            // which is also local-precedence-by-name and 404s for any version
+            // only the remote has. Local precedence is the PEP 708-aligned
+            // default for a locally-owned name. Second pass: fetch a remote
+            // index only when no local member owns the name.
+            let suppress_remote = virtual_simple_suppress_remote(local_artifacts.len());
+
+            for member in &members {
+                if suppress_remote {
+                    break;
                 }
-
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
@@ -838,6 +858,23 @@ fn build_simple_project_response(
         .unwrap())
 }
 
+/// Ownership / dependency-confusion policy for a virtual PyPI simple index
+/// (#1600). Returns `true` when a local (hosted/staging) member owns the
+/// requested PEP 503 name — in which case the virtual must serve ONLY that
+/// member's distributions and must NOT union or proxy a remote member's
+/// versions for the name.
+///
+/// `local_artifact_count` is the number of distributions the virtual's local
+/// members hold for the normalized name. A non-zero count means the name is
+/// locally owned. Unioning an unrelated public package that merely shares the
+/// name is a supply-chain hole (`pip` would prefer the higher public version)
+/// and makes the simple index inconsistent with the download path — which is
+/// also local-precedence-by-name and 404s for any version only the remote has.
+/// Local precedence is the PEP 708-aligned default for a locally-owned name.
+fn virtual_simple_suppress_remote(local_artifact_count: usize) -> bool {
+    local_artifact_count > 0
+}
+
 /// Splice local-member entries into a remote-member PEP 503 HTML response so
 /// the union is visible through the virtual repo. Entries already present in
 /// the remote response (matched by filename, the anchor's inner text per
@@ -1002,16 +1039,21 @@ async fn serve_file(
                     .into_response());
                 }
 
-                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // Version-aware: suppress the proxy only when a local member
-                // owns the requested version, not any version of the name (#1582).
+                // Supply-chain shadowing / ownership guard (#1217, #1600).
+                // Local-precedence-by-name: when a local (hosted/staging) member
+                // owns the PEP 503 name, suppress every remote member for this
+                // download regardless of the requested version. This keeps the
+                // download consistent with the simple index, which is also
+                // local-precedence-by-name (#1600): if the index won't list an
+                // unrelated public version for a locally-owned name, the
+                // download must not serve it either. It also closes the
+                // dependency-confusion hole where a higher public version of an
+                // internally-owned name would resolve through the virtual.
                 let normalized_project = PypiHandler::normalize_name(project);
-                let requested_version = PypiHandler::version_from_filename(filename);
-                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name_version(
+                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name(
                     &state.db,
                     repo.id,
                     &normalized_project,
-                    requested_version.as_deref(),
                 )
                 .await?;
 
@@ -4014,6 +4056,27 @@ mod tests {
         let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[]);
         assert_eq!(merged, remote);
+    }
+
+    // -----------------------------------------------------------------------
+    // virtual_simple_suppress_remote — #1600 ownership / dependency-confusion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_virtual_simple_suppress_remote_local_owns_name() {
+        // #1600: when a local member holds any distribution for the name, the
+        // virtual must NOT union/proxy the remote's versions — local precedence.
+        // This keeps the simple index consistent with the local-precedence
+        // download path and closes the dependency-confusion hole.
+        assert!(virtual_simple_suppress_remote(1));
+        assert!(virtual_simple_suppress_remote(5));
+    }
+
+    #[test]
+    fn test_virtual_simple_suppress_remote_name_not_owned_locally() {
+        // No local distributions for the name: the virtual falls through to the
+        // remote member (general proxy behavior for names a local doesn't own).
+        assert!(!virtual_simple_suppress_remote(0));
     }
 
     #[test]
