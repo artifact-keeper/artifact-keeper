@@ -202,7 +202,53 @@ async fn list_releases(
 
     let package_id = format!("{}.{}", scope, name);
 
-    let artifacts = sqlx::query!(
+    // Virtual repos own no artifacts: fan out across members (issue #1554).
+    let versions = if repo.repo_type == RepositoryType::Virtual {
+        query_release_versions_virtual(&state.db, repo.id, &package_id).await?
+    } else {
+        query_release_versions(&state.db, repo.id, &package_id).await?
+    };
+
+    if versions.is_empty() {
+        return Err(swift_error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Package {}.{} not found", scope, name),
+        ));
+    }
+
+    Ok(swift_json_response(
+        StatusCode::OK,
+        build_releases_body(&repo_key, &scope, &name, &versions),
+    ))
+}
+
+/// Build the `{ "releases": { version: { url } } }` body for `list_releases`.
+/// Pure (no I/O) so the response shape has at-rest unit coverage.
+fn build_releases_body(
+    repo_key: &str,
+    scope: &str,
+    name: &str,
+    versions: &[String],
+) -> serde_json::Value {
+    let mut releases = serde_json::Map::new();
+    for version in versions {
+        let url = format!("/swift/{}/{}/{}/{}", repo_key, scope, name, version);
+        releases.insert(version.clone(), serde_json::json!({ "url": url }));
+    }
+    serde_json::json!({ "releases": releases })
+}
+
+/// Query the release versions of a Swift package in a single (non-virtual)
+/// repository, newest first.
+async fn query_release_versions(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package_id: &str,
+) -> Result<Vec<String>, Response> {
+    // NOTE: the SELECT list is kept byte-identical to the pre-#1554 query so
+    // the committed `.sqlx` offline cache entry still matches; `checksum_sha256`
+    // is selected but unused.
+    let rows = sqlx::query!(
         r#"
         SELECT a.version, a.checksum_sha256
         FROM artifacts a
@@ -211,10 +257,10 @@ async fn list_releases(
           AND LOWER(a.name) = LOWER($2)
         ORDER BY a.created_at DESC
         "#,
-        repo.id,
+        repo_id,
         package_id
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .map_err(|e| {
         swift_error_response(
@@ -223,31 +269,34 @@ async fn list_releases(
         )
     })?;
 
-    if artifacts.is_empty() {
-        return Err(swift_error_response(
-            StatusCode::NOT_FOUND,
-            &format!("Package {}.{} not found", scope, name),
-        ));
+    Ok(rows
+        .into_iter()
+        .map(|r| r.version.unwrap_or_default())
+        .collect())
+}
+
+/// Fan out a `list_releases` lookup across the members of a virtual repo,
+/// returning the versions from the first member that owns the package
+/// (members are returned in priority order). Remote members are not consulted
+/// for listing because their upstream listing shape is format-specific; the
+/// `.zip`/metadata endpoints proxy them on demand.
+pub async fn query_release_versions_virtual(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_id: &str,
+) -> Result<Vec<String>, Response> {
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    for member in &members {
+        if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
+        {
+            continue;
+        }
+        let versions = query_release_versions(db, member.id, package_id).await?;
+        if !versions.is_empty() {
+            return Ok(versions);
+        }
     }
-
-    // Build releases object: version -> { url }
-    let mut releases = serde_json::Map::new();
-    for artifact in &artifacts {
-        let version = artifact.version.clone().unwrap_or_default();
-        let url = format!("/swift/{}/{}/{}/{}", repo_key, scope, name, version);
-        releases.insert(
-            version,
-            serde_json::json!({
-                "url": url,
-            }),
-        );
-    }
-
-    let body = serde_json::json!({
-        "releases": releases,
-    });
-
-    Ok(swift_json_response(StatusCode::OK, body))
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -280,17 +329,23 @@ async fn version_path_handler(
 // GET /swift/:repo_key/:scope/:name/:version -- Get release metadata
 // ---------------------------------------------------------------------------
 
-async fn get_release_metadata(
-    state: SharedState,
-    repo_key: &str,
-    scope: &str,
-    name: &str,
-    version: &str,
-) -> Result<Response, Response> {
-    let repo = resolve_swift_repo(&state.db, repo_key).await?;
-    let package_id = format!("{}.{}", scope, name);
+/// Minimal release row used to build the metadata response.
+pub struct ReleaseRow {
+    pub checksum_sha256: String,
+    pub metadata: Option<serde_json::Value>,
+}
 
-    let artifact = sqlx::query!(
+/// Query a single Swift release's metadata row from one (non-virtual) repo.
+async fn query_release_metadata(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package_id: &str,
+    version: &str,
+) -> Result<Option<ReleaseRow>, Response> {
+    // NOTE: the SELECT list is kept byte-identical to the pre-#1554 query so
+    // the committed `.sqlx` offline cache entry still matches; only
+    // `checksum_sha256` and `metadata` are consumed here.
+    let row = sqlx::query!(
         r#"
         SELECT a.id, a.version, a.size_bytes, a.checksum_sha256,
                am.metadata as "metadata?"
@@ -302,30 +357,61 @@ async fn get_release_metadata(
           AND a.version = $3
         LIMIT 1
         "#,
-        repo.id,
+        repo_id,
         package_id,
         version
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
     .map_err(|e| {
         swift_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Database error: {}", e),
         )
-    })?
-    .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+    })?;
 
-    let archive_url = format!("/swift/{}/{}/{}/{}.zip", repo_key, scope, name, version);
+    Ok(row.map(|r| ReleaseRow {
+        checksum_sha256: r.checksum_sha256,
+        metadata: r.metadata,
+    }))
+}
 
+/// Fan out a release-metadata lookup across the Local/Staging members of a
+/// virtual repo, returning the first hit in priority order (issue #1554).
+pub async fn query_release_metadata_virtual(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    package_id: &str,
+    version: &str,
+) -> Result<Option<ReleaseRow>, Response> {
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    for member in &members {
+        if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
+        {
+            continue;
+        }
+        if let Some(row) = query_release_metadata(db, member.id, package_id, version).await? {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// Build the release-metadata JSON body. Pure (no I/O) so the response shape
+/// (resources list, manifest presence, embedded swift metadata) is unit-tested.
+fn build_release_metadata_body(
+    scope: &str,
+    name: &str,
+    version: &str,
+    row: &ReleaseRow,
+) -> serde_json::Value {
     let mut resources = vec![serde_json::json!({
         "name": "source-archive",
         "type": "application/zip",
-        "checksum": artifact.checksum_sha256.clone(),
+        "checksum": row.checksum_sha256.clone(),
     })];
 
-    // Check if a manifest exists in metadata
-    let has_manifest = artifact
+    let has_manifest = row
         .metadata
         .as_ref()
         .and_then(|m| m.get("manifest"))
@@ -338,12 +424,38 @@ async fn get_release_metadata(
         }));
     }
 
-    let body = serde_json::json!({
+    serde_json::json!({
         "id": format!("{}.{}", scope, name),
         "version": version,
         "resources": resources,
-        "metadata": artifact.metadata.clone().and_then(|m| m.get("swift_metadata").cloned()).unwrap_or(serde_json::json!({})),
-    });
+        "metadata": row
+            .metadata
+            .clone()
+            .and_then(|m| m.get("swift_metadata").cloned())
+            .unwrap_or(serde_json::json!({})),
+    })
+}
+
+async fn get_release_metadata(
+    state: SharedState,
+    repo_key: &str,
+    scope: &str,
+    name: &str,
+    version: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_swift_repo(&state.db, repo_key).await?;
+    let package_id = format!("{}.{}", scope, name);
+
+    // Virtual repos own no artifacts: fan out across members (issue #1554).
+    let row = if repo.repo_type == RepositoryType::Virtual {
+        query_release_metadata_virtual(&state.db, repo.id, &package_id, version).await?
+    } else {
+        query_release_metadata(&state.db, repo.id, &package_id, version).await?
+    }
+    .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+
+    let archive_url = format!("/swift/{}/{}/{}/{}.zip", repo_key, scope, name, version);
+    let body = build_release_metadata_body(scope, name, version, &row);
 
     let mut response = swift_json_response(StatusCode::OK, body);
     response.headers_mut().insert(
@@ -503,17 +615,16 @@ async fn download_archive(
 // GET /swift/:repo_key/:scope/:name/:version/Package.swift -- Fetch manifest
 // ---------------------------------------------------------------------------
 
-async fn fetch_manifest(
-    state: SharedState,
-    repo_key: &str,
-    scope: &str,
-    name: &str,
+/// Look up the cached manifest text (if any) for a release in one repo.
+/// Returns `Ok(None)` when the release does not exist in this repo, and
+/// `Ok(Some(None))` when the release exists but has no cached manifest.
+async fn query_manifest(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package_id: &str,
     version: &str,
-) -> Result<Response, Response> {
-    let repo = resolve_swift_repo(&state.db, repo_key).await?;
-    let package_id = format!("{}.{}", scope, name);
-
-    let artifact = sqlx::query!(
+) -> Result<Option<Option<String>>, Response> {
+    let row = sqlx::query!(
         r#"
         SELECT am.metadata as "metadata?"
         FROM artifacts a
@@ -524,31 +635,81 @@ async fn fetch_manifest(
           AND a.version = $3
         LIMIT 1
         "#,
-        repo.id,
+        repo_id,
         package_id,
         version
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
     .map_err(|e| {
         swift_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Database error: {}", e),
         )
-    })?
-    .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+    })?;
 
-    // Prefer the cached manifest from artifact_metadata. When that is missing
-    // (legacy uploads predating issue #1100, or publishes that bypassed the
-    // header path), parse the source archive on demand so SwiftPM dependency
-    // resolution still succeeds.
-    let cached_manifest = artifact
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("manifest"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    Ok(row.map(|r| {
+        r.metadata
+            .as_ref()
+            .and_then(|m| m.get("manifest"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }))
+}
 
+/// Resolve which repo owns a Swift release for manifest fetching. For a
+/// virtual repo this fans out across Local/Staging members in priority order
+/// and returns the first that owns the release (issue #1554); for any other
+/// repo type it returns the repo itself. The returned tuple carries the
+/// owning repo's id, its storage location, and the cached manifest (if any).
+async fn resolve_manifest_owner(
+    db: &PgPool,
+    repo: &RepoInfo,
+    package_id: &str,
+    version: &str,
+) -> Result<(uuid::Uuid, crate::storage::StorageLocation, Option<String>), Response> {
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+        for member in &members {
+            if member.repo_type != RepositoryType::Local
+                && member.repo_type != RepositoryType::Staging
+            {
+                continue;
+            }
+            if let Some(cached) = query_manifest(db, member.id, package_id, version).await? {
+                return Ok((member.id, member.storage_location(), cached));
+            }
+        }
+        return Err(swift_error_response(
+            StatusCode::NOT_FOUND,
+            "Release not found",
+        ));
+    }
+
+    let cached = query_manifest(db, repo.id, package_id, version)
+        .await?
+        .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+    Ok((repo.id, repo.storage_location(), cached))
+}
+
+async fn fetch_manifest(
+    state: SharedState,
+    repo_key: &str,
+    scope: &str,
+    name: &str,
+    version: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_swift_repo(&state.db, repo_key).await?;
+    let package_id = format!("{}.{}", scope, name);
+
+    // Resolve the owning repo (handles virtual fan-out), preferring the cached
+    // manifest from artifact_metadata.
+    let (owner_id, owner_location, cached_manifest) =
+        resolve_manifest_owner(&state.db, &repo, &package_id, version).await?;
+
+    // When the cache is missing (legacy uploads predating issue #1100, or
+    // publishes that bypassed the header path), parse the source archive on
+    // demand so SwiftPM dependency resolution still succeeds.
     let manifest = match cached_manifest {
         Some(m) => m,
         None => {
@@ -559,7 +720,7 @@ async fn fetch_manifest(
                  WHERE repository_id = $1 AND is_deleted = false \
                  AND LOWER(name) = LOWER($2) AND version = $3 LIMIT 1",
             )
-            .bind(repo.id)
+            .bind(owner_id)
             .bind(&package_id)
             .bind(version)
             .fetch_one(&state.db)
@@ -571,7 +732,7 @@ async fn fetch_manifest(
                 )
             })?;
             let storage = state
-                .storage_for_repo(&repo.storage_location())
+                .storage_for_repo(&owner_location)
                 .map_err(|e| e.into_response())?;
             let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
                 swift_error_response(
@@ -1033,6 +1194,86 @@ mod tests {
             writer.finish().unwrap();
         }
         buf
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1554 -- virtual repo response builders
+    //
+    // These cover the pure response-shape logic for the three read endpoints
+    // (list_releases / get_release_metadata / fetch_manifest). The DB fan-out
+    // across virtual members is exercised by the `--ignored` integration tests
+    // in tests/swift_virtual_tests.rs; here we lock the JSON shapes that the
+    // virtual path feeds the same builders so the contract stays stable.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_releases_body_maps_versions_to_member_urls() {
+        let versions = vec!["1.0.0".to_string(), "1.2.0".to_string()];
+        let body = build_releases_body("swift-virtual", "macos", "lib", &versions);
+        let releases = body.get("releases").unwrap().as_object().unwrap();
+        assert_eq!(releases.len(), 2);
+        // URLs must point at the *virtual* repo key, not a member key, so the
+        // client keeps talking to the virtual repo on follow-up requests.
+        assert_eq!(
+            releases
+                .get("1.2.0")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str()),
+            Some("/swift/swift-virtual/macos/lib/1.2.0")
+        );
+        assert!(releases.contains_key("1.0.0"));
+    }
+
+    #[test]
+    fn build_releases_body_empty_when_no_versions() {
+        let body = build_releases_body("v", "s", "n", &[]);
+        assert!(body
+            .get("releases")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn build_release_metadata_body_without_manifest_has_only_archive() {
+        let row = ReleaseRow {
+            checksum_sha256: "abc123".to_string(),
+            metadata: None,
+        };
+        let body = build_release_metadata_body("apple", "swift-log", "1.5.0", &row);
+        assert_eq!(body.get("id").unwrap(), "apple.swift-log");
+        assert_eq!(body.get("version").unwrap(), "1.5.0");
+        let resources = body.get("resources").unwrap().as_array().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].get("name").unwrap(), "source-archive");
+        assert_eq!(resources[0].get("checksum").unwrap(), "abc123");
+        // No swift_metadata -> empty object, not null.
+        assert_eq!(body.get("metadata").unwrap(), &serde_json::json!({}));
+    }
+
+    #[test]
+    fn build_release_metadata_body_with_manifest_adds_package_swift_resource() {
+        let row = ReleaseRow {
+            checksum_sha256: "deadbeef".to_string(),
+            metadata: Some(serde_json::json!({
+                "manifest": "// swift-tools-version:5.9",
+                "swift_metadata": { "scope": "apple", "name": "swift-nio" },
+            })),
+        };
+        let body = build_release_metadata_body("apple", "swift-nio", "2.40.0", &row);
+        let resources = body.get("resources").unwrap().as_array().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert!(resources
+            .iter()
+            .any(|r| r.get("name").and_then(|n| n.as_str()) == Some("Package.swift")));
+        // Embedded swift_metadata is surfaced under "metadata".
+        assert_eq!(
+            body.get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("swift-nio")
+        );
     }
 
     #[test]

@@ -18915,4 +18915,134 @@ mod cross_repo_session_regression_tests {
 
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
+
+    /// Regression test for #1705: OCI uploads must survive being load-balanced
+    /// across multiple backend replicas.
+    ///
+    /// v1.2.0 streamed each POST/PATCH chunk into a per-session local
+    /// `NamedTempFile` on the receiving pod's disk and rehashed that file on
+    /// PUT complete. Behind a load balancer (the reporter's k8s/Istio setup),
+    /// the finalizing PUT could land on a *different* pod whose temp file was
+    /// empty, so the server hashed zero bytes and rejected the upload with
+    /// "digest mismatch: computed sha256:e3b0c442...b7852b855 (empty) !=
+    /// provided <real digest>". Single-pod deployments were unaffected, which
+    /// matches the issue report exactly.
+    ///
+    /// The fix (#1448) moved all upload state into the shared storage backend
+    /// (`oci_upload_parts` + `storage.put_stream`) and the database, so no
+    /// per-upload state lives on a pod's local disk. This test pins that
+    /// invariant by driving POST + PATCH through one `SharedState` and the
+    /// finalizing PUT through a *second*, independently constructed
+    /// `SharedState` that shares only the same database pool and the same
+    /// storage directory — the test analogue of two pods over one object store.
+    /// Against the v1.2.0 temp-file path this PUT returns 400 DIGEST_INVALID;
+    /// on the shared-storage path it returns 201 and writes the correct blob.
+    #[tokio::test]
+    async fn complete_upload_on_a_different_replica_succeeds_1705() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "x1705").await;
+        let auth = basic_auth(&username, &password);
+
+        // Two independent states over the SAME pool and SAME storage dir model
+        // two backend replicas sharing one database and one object store. They
+        // share NO in-process state (no shared local disk, no shared caches).
+        let storage_path = storage_dir.to_str().unwrap();
+        let state_post_patch = tdh::build_state(pool.clone(), storage_path);
+        let state_complete = tdh::build_state(pool.clone(), storage_path);
+
+        // POST start on replica A.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router()
+            .with_state(state_post_patch.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Two PATCH chunks, also on replica A.
+        let chunk_a = b"replica-a-chunk-one-".to_vec();
+        let chunk_b = b"replica-a-chunk-two".to_vec();
+        for chunk in &[&chunk_a, &chunk_b] {
+            let req = Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}",
+                    repo_key, session_id
+                ))
+                .header("Authorization", &auth)
+                .body(Body::from((*chunk).clone()))
+                .unwrap();
+            let resp = router()
+                .with_state(state_post_patch.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        let mut full = chunk_a.clone();
+        full.extend_from_slice(&chunk_b);
+        let digest = format!("sha256:{}", sha256_hex(&full));
+
+        // PUT complete on replica B with an EMPTY body (chunks already uploaded
+        // via PATCH). This is the exact path #1705 broke: the completing pod
+        // never saw the chunk bytes in process memory or on its local disk, so
+        // it must reassemble them from shared storage. Pre-#1448 this returned
+        // 400 DIGEST_INVALID with the empty-input hash.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router()
+            .with_state(state_complete.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "completing an upload on a different replica than the one that \
+             received the chunks must succeed (regression #1705)"
+        );
+
+        // The persisted blob must be the full concatenation, not an empty or
+        // truncated object. Read it back through a freshly constructed backend
+        // over the shared storage dir to confirm the bytes landed in the shared
+        // object store (not on either replica's private local disk).
+        let shared_storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        let blob = shared_storage
+            .get(&blob_storage_key(&digest))
+            .await
+            .expect("blob persisted at canonical digest key");
+        assert_eq!(
+            blob.as_ref(),
+            full.as_slice(),
+            "the reassembled blob must equal the concatenated PATCH chunks"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
 }
