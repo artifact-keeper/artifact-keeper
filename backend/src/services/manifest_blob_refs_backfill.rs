@@ -6,19 +6,28 @@
 //! push that lands after the upgrade to a release containing migration
 //! 120, but it does not cover image manifests that were pushed before the
 //! upgrade and are still reachable: those manifests exist in storage (and
-//! are referenced from `oci_tags` and/or `oci_manifest_refs.child_digest`)
-//! with no corresponding rows in `manifest_blob_refs`.
+//! are referenced from `oci_tags`) with no corresponding rows in
+//! `manifest_blob_refs`.
 //!
-//! This module walks the image manifests reachable via `oci_tags`
-//! (directly tagged manifests whose content-type is NOT an image index)
-//! and via `oci_manifest_refs.child_digest` (the per-architecture child
-//! manifests of multi-arch image indexes, which are always image
-//! manifests) that have zero `manifest_blob_refs` rows, loads each
-//! manifest body from storage, parses the JSON, and inserts the
+//! This module walks the image manifests safely backfillable from `oci_tags`
+//! (directly tagged manifests whose content-type is NOT an image index) that
+//! have zero `manifest_blob_refs` rows, loads each manifest body from storage,
+//! parses the JSON, and inserts the
 //! (manifest, blob, repo, kind) edges. The backfill is idempotent
 //! (`ON CONFLICT DO NOTHING`) and best-effort: a missing storage file or
 //! a malformed manifest is logged at WARN and skipped; it does not stop
 //! the backfill or fail startup.
+//!
+//! A bare `oci_manifest_refs.child_digest` is intentionally not a backfill
+//! source: an index body can reference a digest whose manifest body was never
+//! uploaded to this repository. On shared cloud backends, loading that digest
+//! from `oci-manifests/<digest>` would import another repository's manifest
+//! metadata and later authorize digest fallback through the wrong repository.
+//! Child manifests that were actually pushed to this repository are still
+//! covered through their `oci_tags` rows. The blob-GC readiness gate still
+//! treats live child edges as missing refs, so destructive blob GC stays off
+//! rather than collecting legacy child blobs that could not be backfilled
+//! safely.
 //!
 //! Called once from `main.rs` after migrations run. On the next restart
 //! the same query returns zero rows and the backfill is effectively a
@@ -201,26 +210,27 @@ fn insert_rows_error(e: impl std::fmt::Display) -> String {
     format!("insert manifest_blob_refs rows: {}", e)
 }
 
-/// Select the distinct (manifest_digest, repository_id) tuples for image
-/// manifests that have zero rows in `manifest_blob_refs`. Two reachability
-/// sources are unioned:
+/// Select the distinct (manifest_digest, repository_id) tuples for tagged image
+/// manifests that have zero rows in `manifest_blob_refs` and are safe to
+/// backfill from storage.
 ///
-///   1. `oci_tags` rows whose content-type is NOT an image index AND which
-///      are not structurally an index (no children in `oci_manifest_refs`)
-///      -- these are directly tagged image manifests. The structural guard
-///      (#1409 C1) keeps an index pushed with a wrong/absent Content-Type
-///      out of the image-candidate set, since it has no blobs of its own and
-///      would otherwise pin the readiness gate forever.
-///   2. `oci_manifest_refs.child_digest` -- the per-architecture child
-///      manifests of multi-arch image indexes. These never appear in
-///      `oci_tags` directly but are image manifests with their own blobs.
+/// `oci_tags` rows whose content-type is NOT an image index AND which are not
+/// structurally an index (no children in `oci_manifest_refs`) are directly
+/// tagged image manifests. The structural guard (#1409 C1) keeps an index
+/// pushed with a wrong/absent Content-Type out of the image-candidate set,
+/// since it has no blobs of its own and would otherwise pin the readiness gate
+/// forever.
+///
+/// `oci_manifest_refs.child_digest` rows are deliberately not selected on
+/// their own. The edge proves a parent index references that digest, not that
+/// the child manifest body was pushed into the same repository.
 ///
 /// We pull `storage_backend` / `storage_path` from the repositories table
 /// along the way so the per-candidate work can resolve the correct backend
-/// without a second query. `DISTINCT ON` deduplicates a digest that is
-/// tagged under multiple names (or is both tagged and an index child) in
-/// the same repository; the first row wins, and since all rows for the
-/// same (digest, repo) point at the same manifest body, that is fine.
+/// without a second query. `DISTINCT ON` deduplicates a digest that is tagged
+/// under multiple names in the same repository; the first row wins, and since
+/// all rows for the same (digest, repo) point at the same manifest body, that
+/// is fine.
 async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<BackfillCandidate>> {
     let rows = sqlx::query(
         r#"
@@ -250,10 +260,6 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
                     WHERE omr_parent.repository_id = ot.repository_id
                       AND omr_parent.parent_digest = ot.manifest_digest
                 )
-            UNION
-            SELECT omr.child_digest AS manifest_digest,
-                   omr.repository_id AS repository_id
-            FROM oci_manifest_refs omr
         ) AS c
         JOIN repositories r ON r.id = c.repository_id
         WHERE NOT EXISTS (
@@ -296,10 +302,47 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
 /// through the push handler) it returns `false` and GC resumes on the
 /// next scheduler tick.
 ///
-/// Reuses [`select_unbackfilled_manifests`] so the gate and the backfill
-/// can never disagree on what counts as a live manifest missing refs.
+/// This is deliberately broader than [`select_unbackfilled_manifests`]:
+/// backfill cannot safely import bare `oci_manifest_refs.child_digest` bodies
+/// from shared storage, but blob GC must still treat those live children as
+/// incomplete and force dry-run until refs are established by a re-push or the
+/// parent index is untagged.
 pub async fn any_live_manifest_missing_refs(db: &PgPool) -> sqlx::Result<bool> {
-    Ok(!select_unbackfilled_manifests(db).await?.is_empty())
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM (
+                SELECT ot.manifest_digest AS manifest_digest,
+                       ot.repository_id AS repository_id
+                FROM oci_tags ot
+                WHERE ot.manifest_content_type NOT IN (
+                        'application/vnd.oci.image.index.v1+json',
+                        'application/vnd.docker.distribution.manifest.list.v2+json'
+                    )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM oci_manifest_refs omr_parent
+                        WHERE omr_parent.repository_id = ot.repository_id
+                          AND omr_parent.parent_digest = ot.manifest_digest
+                    )
+                UNION
+                SELECT omr.child_digest AS manifest_digest,
+                       omr.repository_id AS repository_id
+                FROM oci_manifest_refs omr
+                JOIN oci_tags ot_parent
+                  ON ot_parent.repository_id = omr.repository_id
+                 AND ot_parent.manifest_digest = omr.parent_digest
+            ) AS live
+            WHERE NOT EXISTS (
+                SELECT 1 FROM manifest_blob_refs mbr
+                WHERE mbr.manifest_digest = live.manifest_digest
+                  AND mbr.repository_id = live.repository_id
+            )
+        )
+        "#,
+    )
+    .fetch_one(db)
+    .await
 }
 
 /// Hard cap on the manifest body size we are willing to load and parse
@@ -579,8 +622,7 @@ mod tests {
     /// Content-Type must NOT appear as an unbackfilled image candidate. An
     /// index carries no blobs of its own, so it can never gain
     /// `manifest_blob_refs` rows; if it stayed in the candidate set it would
-    /// pin `any_live_manifest_missing_refs` true forever and disable blob GC
-    /// for the whole deployment. The structural guard in
+    /// be retried forever as an image manifest. The structural guard in
     /// [`select_unbackfilled_manifests`] excludes it regardless of its stored
     /// content-type.
     #[tokio::test]
@@ -624,8 +666,9 @@ mod tests {
         let candidates = select_unbackfilled_manifests(&fixture.pool)
             .await
             .expect("candidate query runs");
-
-        fixture.teardown().await;
+        let gate_missing = any_live_manifest_missing_refs(&fixture.pool)
+            .await
+            .expect("gate query runs");
 
         assert!(
             !candidates
@@ -635,10 +678,39 @@ mod tests {
              otherwise it would pin the readiness gate forever and disable blob GC"
         );
         assert!(
+            !candidates
+                .iter()
+                .any(|c| c.manifest_digest == child_digest && c.repository_id == fixture.repo_id),
+            "a bare child edge must not authorize backfilling that child from shared storage"
+        );
+        assert!(
+            gate_missing,
+            "a live child edge without manifest_blob_refs must still keep destructive blob GC gated"
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+            VALUES ($1, 'c1/index', $2, $2, 'application/vnd.oci.image.manifest.v1+json')
+            "#,
+        )
+        .bind(fixture.repo_id)
+        .bind(&child_digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert child tag");
+
+        let candidates = select_unbackfilled_manifests(&fixture.pool)
+            .await
+            .expect("candidate query runs after child tag");
+
+        fixture.teardown().await;
+
+        assert!(
             candidates
                 .iter()
                 .any(|c| c.manifest_digest == child_digest && c.repository_id == fixture.repo_id),
-            "the index's per-architecture child (a real image manifest with no refs) must still be \
+            "a child manifest that was actually pushed/tagged in this repo must still be \
              enumerated as an unbackfilled candidate"
         );
     }
