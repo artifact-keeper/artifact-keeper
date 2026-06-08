@@ -145,7 +145,10 @@ fn build_rpm_package_response(
             format!("attachment; filename=\"{}\"", filename),
         )
         .header(CONTENT_LENGTH, size_bytes.to_string())
-        .header("X-Checksum-SHA256", checksum_sha256)
+        // `artifacts.checksum_sha256` is a fixed-width `CHAR(64)` column, so a
+        // value shorter than 64 chars (e.g. test seeds) comes back space-padded.
+        // Trim it so the header never carries trailing whitespace.
+        .header("X-Checksum-SHA256", checksum_sha256.trim())
         .body(body)
         .unwrap()
 }
