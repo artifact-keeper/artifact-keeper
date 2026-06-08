@@ -175,7 +175,7 @@ fn push_packages_entry(text: &mut String, entry: &PackageEntry) {
     push_optional_control_field(text, "Source", control.source.as_deref());
 
     let mut extra_fields: Vec<_> = control.extra.iter().collect();
-    extra_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+    extra_fields.sort_by_key(|(key, _)| *key);
     for (key, value) in extra_fields {
         push_control_field(text, key, value);
     }
@@ -2906,7 +2906,8 @@ mod upload_db_tests {
              Priority: optional\n\
              Homepage: https://example.local/{package}\n\
              Description: {description}\n\
-              extended description line\n"
+             {description_continuation}",
+            description_continuation = " extended description line\n",
         );
 
         let mut deb = Vec::new();
@@ -3013,6 +3014,8 @@ mod upload_db_tests {
         assert!(packages_text.contains(&format!("Package: {package}\n")));
         assert!(packages_text.contains("Architecture: amd64\n"));
         assert!(packages_text.contains("Depends: libc6 (>= 2.36)\n"));
+        assert!(packages_text
+            .contains("Description: indexed Debian package\n extended description line\n"));
         assert!(packages_text.contains("SHA256: "));
 
         let (status, all_body) = tdh::send(
