@@ -16,6 +16,7 @@
 //!   PUT  /debian/{repo_key}/pool/{component}/*path                                  - Upload .deb
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use axum::body::Body;
@@ -27,8 +28,8 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::GzBuilder;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -36,9 +37,14 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
+use crate::formats::debian::{DebControl, DebianHandler};
 use crate::models::repository::RepositoryType;
 use crate::models::signing_key::SigningKey;
+use crate::services::artifact_service::ArtifactService;
+use crate::services::package_service::PackageService;
 use crate::services::signing_service::SigningService;
+
+const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router
@@ -93,19 +99,22 @@ struct DebInfo {
     name: String,
     version: String,
     arch: String,
+    package_type: String,
 }
 
-/// Parse `{name}_{version}_{arch}.deb` from a filename.
+/// Parse `{name}_{version}_{arch}.deb` or `.udeb` from a filename.
 fn parse_deb_filename(filename: &str) -> Option<DebInfo> {
-    let stem = filename.strip_suffix(".deb")?;
-    let parts: Vec<&str> = stem.splitn(3, '_').collect();
-    if parts.len() != 3 {
-        return None;
-    }
+    let package_type = if filename.ends_with(".udeb") {
+        "udeb"
+    } else {
+        "deb"
+    };
+    let (name, version, arch) = DebianHandler::parse_deb_filename(filename).ok()?;
     Some(DebInfo {
-        name: parts[0].to_string(),
-        version: parts[1].to_string(),
-        arch: parts[2].to_string(),
+        name,
+        version,
+        arch,
+        package_type: package_type.to_string(),
     })
 }
 
@@ -113,15 +122,24 @@ fn parse_deb_filename(filename: &str) -> Option<DebInfo> {
 // Packages index generation
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
 struct PackageEntry {
-    name: String,
-    version: String,
-    arch: String,
+    control: DebControl,
     filename: String,
     size: i64,
     sha256: String,
-    description: String,
+    sha1: Option<String>,
+    md5: Option<String>,
 }
+
+type DebianArtifactRow = (
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+);
 
 /// Build the text for a Packages index from a list of entries.
 fn build_packages_text(entries: &[PackageEntry]) -> String {
@@ -130,15 +148,138 @@ fn build_packages_text(entries: &[PackageEntry]) -> String {
         if i > 0 {
             text.push('\n');
         }
-        text.push_str(&format!("Package: {}\n", entry.name));
-        text.push_str(&format!("Version: {}\n", entry.version));
-        text.push_str(&format!("Architecture: {}\n", entry.arch));
-        text.push_str(&format!("Filename: {}\n", entry.filename));
-        text.push_str(&format!("Size: {}\n", entry.size));
-        text.push_str(&format!("SHA256: {}\n", entry.sha256));
-        text.push_str(&format!("Description: {}\n", entry.description));
+        push_packages_entry(&mut text, entry);
     }
     text
+}
+
+fn push_packages_entry(text: &mut String, entry: &PackageEntry) {
+    let control = &entry.control;
+    push_control_field(text, "Package", &control.package);
+    push_control_field(text, "Version", &control.version);
+    push_control_field(text, "Architecture", &control.architecture);
+    push_optional_control_field(text, "Maintainer", control.maintainer.as_deref());
+    if let Some(size) = control.installed_size {
+        push_control_field(text, "Installed-Size", &size.to_string());
+    }
+    push_dependency_field(text, "Depends", control.depends.as_ref());
+    push_dependency_field(text, "Pre-Depends", control.pre_depends.as_ref());
+    push_dependency_field(text, "Recommends", control.recommends.as_ref());
+    push_dependency_field(text, "Suggests", control.suggests.as_ref());
+    push_dependency_field(text, "Conflicts", control.conflicts.as_ref());
+    push_dependency_field(text, "Provides", control.provides.as_ref());
+    push_dependency_field(text, "Replaces", control.replaces.as_ref());
+    push_optional_control_field(text, "Section", control.section.as_deref());
+    push_optional_control_field(text, "Priority", control.priority.as_deref());
+    push_optional_control_field(text, "Homepage", control.homepage.as_deref());
+    push_optional_control_field(text, "Source", control.source.as_deref());
+
+    let mut extra_fields: Vec<_> = control.extra.iter().collect();
+    extra_fields.sort_by_key(|(key, _)| *key);
+    for (key, value) in extra_fields {
+        push_control_field(text, key, value);
+    }
+
+    push_optional_control_field(text, "Description", control.description.as_deref());
+    push_control_field(text, "Filename", &entry.filename);
+    push_control_field(text, "Size", &entry.size.to_string());
+    push_optional_control_field(text, "MD5sum", entry.md5.as_deref());
+    push_optional_control_field(text, "SHA1", entry.sha1.as_deref());
+    push_control_field(text, "SHA256", &entry.sha256);
+}
+
+fn push_optional_control_field(text: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
+        push_control_field(text, key, value);
+    }
+}
+
+fn push_dependency_field(text: &mut String, key: &str, values: Option<&Vec<String>>) {
+    let Some(values) = values else {
+        return;
+    };
+    if values.is_empty() {
+        return;
+    }
+    push_control_field(text, key, &values.join(", "));
+}
+
+fn push_control_field(text: &mut String, key: &str, value: &str) {
+    let mut lines = value.lines();
+    let Some(first) = lines.next() else {
+        return;
+    };
+    text.push_str(key);
+    text.push_str(": ");
+    text.push_str(first);
+    text.push('\n');
+    for line in lines {
+        text.push(' ');
+        text.push_str(if line.is_empty() { "." } else { line });
+        text.push('\n');
+    }
+}
+
+fn json_string<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    metadata.get(key).and_then(|v| v.as_str())
+}
+
+fn control_from_metadata_or_filename(
+    metadata: Option<&serde_json::Value>,
+    fallback: &DebInfo,
+) -> DebControl {
+    if let Some(meta) = metadata {
+        if let Some(control_value) = meta.get("control") {
+            if let Ok(control) = serde_json::from_value::<DebControl>(control_value.clone()) {
+                if !control.package.is_empty()
+                    && !control.version.is_empty()
+                    && !control.architecture.is_empty()
+                {
+                    return control;
+                }
+            }
+        }
+
+        let mut control = DebControl {
+            package: json_string(meta, "package")
+                .or_else(|| json_string(meta, "name"))
+                .unwrap_or(&fallback.name)
+                .to_string(),
+            version: json_string(meta, "version")
+                .unwrap_or(&fallback.version)
+                .to_string(),
+            architecture: json_string(meta, "architecture")
+                .unwrap_or(&fallback.arch)
+                .to_string(),
+            description: json_string(meta, "description").map(str::to_string),
+            maintainer: json_string(meta, "maintainer").map(str::to_string),
+            section: json_string(meta, "section").map(str::to_string),
+            priority: json_string(meta, "priority").map(str::to_string),
+            homepage: json_string(meta, "homepage").map(str::to_string),
+            source: json_string(meta, "source").map(str::to_string),
+            ..DebControl::default()
+        };
+        if control.description.is_none() {
+            control.description = Some("No description available".to_string());
+        }
+        return control;
+    }
+
+    DebControl {
+        package: fallback.name.clone(),
+        version: fallback.version.clone(),
+        architecture: fallback.arch.clone(),
+        description: Some("No description available".to_string()),
+        ..DebControl::default()
+    }
+}
+
+fn package_matches_requested_arch(package_arch: &str, requested_arch: &str) -> bool {
+    if requested_arch == "all" {
+        package_arch == "all"
+    } else {
+        package_arch == requested_arch || package_arch == "all"
+    }
 }
 
 /// Fetch all package entries for a given repo, component, and architecture.
@@ -148,20 +289,20 @@ async fn fetch_package_entries(
     component: &str,
     arch: &str,
 ) -> Result<Vec<PackageEntry>, Response> {
-    let artifacts = sqlx::query!(
+    let artifacts: Vec<DebianArtifactRow> = sqlx::query_as(
         r#"
-        SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
+        SELECT a.path, a.size_bytes, a.checksum_sha256,
+               a.checksum_sha1, a.checksum_md5, am.metadata
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND a.path LIKE 'pool/' || $2 || '/%' ESCAPE '\'
-        ORDER BY a.name, a.created_at DESC
+        ORDER BY a.name, a.version, a.path
         "#,
-        repo_id,
-        super::escape_like_literal(component)
     )
+    .bind(repo_id)
+    .bind(super::escape_like_literal(component))
     .fetch_all(db)
     .await
     .map_err(|e| {
@@ -174,35 +315,26 @@ async fn fetch_package_entries(
 
     let mut entries = Vec::new();
     for a in &artifacts {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        let (path, size_bytes, checksum_sha256, checksum_sha1, checksum_md5, metadata) = a;
+        let filename = path.rsplit('/').next().unwrap_or(path);
         let deb_info = match parse_deb_filename(filename) {
             Some(info) => info,
             None => continue,
         };
 
-        // Filter by architecture
-        if arch != "all" && deb_info.arch != arch && deb_info.arch != "all" {
+        let control = control_from_metadata_or_filename(metadata.as_ref(), &deb_info);
+
+        if !package_matches_requested_arch(&control.architecture, arch) {
             continue;
         }
 
-        let description = a
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("description"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("No description available")
-            .to_string();
-
-        let version = a.version.clone().unwrap_or(deb_info.version.clone());
-
         entries.push(PackageEntry {
-            name: deb_info.name,
-            version,
-            arch: deb_info.arch,
-            filename: a.path.clone(),
-            size: a.size_bytes,
-            sha256: a.checksum_sha256.clone(),
-            description,
+            control,
+            filename: path.clone(),
+            size: *size_bytes,
+            sha256: checksum_sha256.clone(),
+            sha1: checksum_sha1.clone(),
+            md5: checksum_md5.clone(),
         });
     }
 
@@ -218,17 +350,85 @@ async fn generate_release_content(
     repo_id: uuid::Uuid,
     distribution: &str,
 ) -> Result<String, Response> {
-    // Gather all architectures from uploaded packages
-    let mut architectures = std::collections::BTreeSet::new();
-    let artifacts = sqlx::query_scalar!(
+    let (components, architectures) = discover_release_layout(&state.db, repo_id).await?;
+    let component_str = components.iter().cloned().collect::<Vec<_>>().join(" ");
+    let arch_str = architectures.iter().cloned().collect::<Vec<_>>().join(" ");
+
+    let mut release_files = Vec::new();
+    for component in &components {
+        for arch in &architectures {
+            let entries = fetch_package_entries(&state.db, repo_id, component, arch).await?;
+            let packages_text = build_packages_text(&entries);
+            let packages_bytes = packages_text.into_bytes();
+            let packages_path = format!("{}/binary-{}/Packages", component, arch);
+            release_files.push((packages_path, packages_bytes.clone()));
+
+            let gz_bytes = gzip_compress(&packages_bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Compression error: {}", e),
+                )
+                    .into_response()
+            })?;
+            release_files.push((
+                format!("{}/binary-{}/Packages.gz", component, arch),
+                gz_bytes,
+            ));
+
+            let xz_bytes = xz_compress(&packages_bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("XZ compression error: {}", e),
+                )
+                    .into_response()
+            })?;
+            release_files.push((
+                format!("{}/binary-{}/Packages.xz", component, arch),
+                xz_bytes,
+            ));
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
+
+    let mut release = String::new();
+    release.push_str("Origin: artifact-keeper\n");
+    release.push_str("Label: artifact-keeper\n");
+    release.push_str(&format!("Suite: {}\n", distribution));
+    release.push_str(&format!("Codename: {}\n", distribution));
+    release.push_str(&format!("Date: {}\n", date_str));
+    release.push_str(&format!("Architectures: {}\n", arch_str));
+    release.push_str(&format!("Components: {}\n", component_str));
+    push_release_hash_section(&mut release, "MD5Sum", &release_files, |bytes| {
+        ArtifactService::calculate_md5(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA1", &release_files, |bytes| {
+        ArtifactService::calculate_sha1(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA256", &release_files, |bytes| {
+        ArtifactService::calculate_sha256(bytes)
+    });
+
+    Ok(release)
+}
+
+async fn discover_release_layout(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), Response> {
+    let artifacts: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
         r#"
-        SELECT path
-        FROM artifacts
-        WHERE repository_id = $1 AND is_deleted = false AND path LIKE 'pool/%'
+        SELECT a.path, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.path LIKE 'pool/%'
         "#,
-        repo_id,
     )
-    .fetch_all(&state.db)
+    .bind(repo_id)
+    .fetch_all(db)
     .await
     .map_err(|e| {
         (
@@ -238,83 +438,69 @@ async fn generate_release_content(
             .into_response()
     })?;
 
-    for path in &artifacts {
+    let mut components = BTreeSet::new();
+    let mut architectures = BTreeSet::new();
+
+    for artifact in &artifacts {
+        let (path, metadata) = artifact;
+        if let Some(component) = metadata
+            .as_ref()
+            .and_then(|m| json_string(m, "component"))
+            .map(str::to_string)
+            .or_else(|| component_from_pool_path(path).map(str::to_string))
+        {
+            components.insert(component);
+        }
+
         if let Some(filename) = path.rsplit('/').next() {
             if let Some(info) = parse_deb_filename(filename) {
-                architectures.insert(info.arch);
+                let control = control_from_metadata_or_filename(metadata.as_ref(), &info);
+                architectures.insert(control.architecture);
             }
         }
     }
 
+    if components.is_empty() {
+        components.insert("main".to_string());
+    }
+
     if architectures.is_empty() {
+        architectures.insert("all".to_string());
         architectures.insert("amd64".to_string());
         architectures.insert("arm64".to_string());
     }
 
-    let arch_list: Vec<&str> = architectures.iter().map(|s| s.as_str()).collect();
-    let arch_str = arch_list.join(" ");
+    Ok((components, architectures))
+}
 
-    // Generate Packages text for SHA256 hashes in Release
-    let component = "main";
-    let packages_text = {
-        let mut all_entries = Vec::new();
-        for arch in &architectures {
-            let entries = fetch_package_entries(&state.db, repo_id, component, arch).await?;
-            all_entries.extend(entries);
-        }
-        build_packages_text(&all_entries)
-    };
-    let packages_bytes = packages_text.as_bytes();
+fn component_from_pool_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("pool/")?;
+    rest.split('/')
+        .next()
+        .filter(|component| !component.is_empty())
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(packages_bytes);
-    let packages_sha256 = format!("{:x}", hasher.finalize());
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut encoder = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
 
-    let mut gz_encoder = GzEncoder::new(Vec::new(), Compression::default());
-    gz_encoder.write_all(packages_bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Compression error: {}", e),
-        )
-            .into_response()
-    })?;
-    let gz_bytes = gz_encoder.finish().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Compression error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let mut gz_hasher = Sha256::new();
-    gz_hasher.update(&gz_bytes);
-    let gz_sha256 = format!("{:x}", gz_hasher.finalize());
-
-    let now = chrono::Utc::now();
-    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
-
-    let release = format!(
-        "Origin: artifact-keeper\n\
-         Label: artifact-keeper\n\
-         Suite: {distribution}\n\
-         Codename: {distribution}\n\
-         Architectures: {arch_str}\n\
-         Components: {component}\n\
-         Date: {date_str}\n\
-         SHA256:\n \
-         {packages_sha256} {packages_size} {component}/binary-all/Packages\n \
-         {gz_sha256} {gz_size} {component}/binary-all/Packages.gz\n",
-        distribution = distribution,
-        arch_str = arch_str,
-        component = component,
-        date_str = date_str,
-        packages_sha256 = packages_sha256,
-        packages_size = packages_bytes.len(),
-        gz_sha256 = gz_sha256,
-        gz_size = gz_bytes.len(),
-    );
-
-    Ok(release)
+fn push_release_hash_section<F>(
+    release: &mut String,
+    section: &str,
+    files: &[(String, Vec<u8>)],
+    hash: F,
+) where
+    F: Fn(&[u8]) -> String,
+{
+    release.push_str(section);
+    release.push_str(":\n");
+    for (path, bytes) in files {
+        release.push_str(&format!(" {} {} {}\n", hash(bytes), bytes.len(), path));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -965,15 +1151,7 @@ async fn packages_index_gz(
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
     let text = build_packages_text(&entries);
 
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(text.as_bytes()).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Compression error: {}", e),
-        )
-            .into_response()
-    })?;
-    let compressed = encoder.finish().map_err(|e| {
+    let compressed = gzip_compress(text.as_bytes()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Compression error: {}", e),
@@ -1218,7 +1396,7 @@ async fn pool_download(
                         &repo_key,
                         upstream_url,
                         &upstream_path,
-                        "application/vnd.debian.binary-package",
+                        DEBIAN_BINARY_CONTENT_TYPE,
                     )
                     .await;
                 }
@@ -1251,7 +1429,7 @@ async fn pool_download(
                 let filename = path.rsplit('/').next().unwrap_or(&path);
                 return proxy_helpers::stream_fetch_result(
                     result,
-                    "application/vnd.debian.binary-package",
+                    DEBIAN_BINARY_CONTENT_TYPE,
                     Some(filename),
                 );
             }
@@ -1291,7 +1469,7 @@ async fn pool_download(
 
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
+        .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
@@ -1300,6 +1478,228 @@ async fn pool_download(
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+struct DebianPackageUpload {
+    artifact_path: String,
+    component: String,
+    deb_info: DebInfo,
+    control: DebControl,
+    metadata: serde_json::Value,
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_debian_upload(
+    component: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<DebianPackageUpload, Response> {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let deb_info = parse_deb_filename(filename).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb",
+        )
+            .into_response()
+    })?;
+    let control = DebianHandler::extract_control(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid Debian package metadata: {}", e),
+        )
+            .into_response()
+    })?;
+    validate_debian_control_matches_filename(&deb_info, &control)?;
+
+    let artifact_path = format!("pool/{}/{}", component, path);
+    let metadata = build_debian_artifact_metadata(
+        component,
+        &artifact_path,
+        filename,
+        &deb_info.package_type,
+        &control,
+    );
+
+    Ok(DebianPackageUpload {
+        artifact_path,
+        component: component.to_string(),
+        deb_info,
+        control,
+        metadata,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_debian_control_matches_filename(
+    deb_info: &DebInfo,
+    control: &DebControl,
+) -> Result<(), Response> {
+    if control.package != deb_info.name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Package name mismatch: filename says '{}' but control says '{}'",
+                deb_info.name, control.package
+            ),
+        )
+            .into_response());
+    }
+    if control.version != deb_info.version {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Version mismatch: filename says '{}' but control says '{}'",
+                deb_info.version, control.version
+            ),
+        )
+            .into_response());
+    }
+    if control.architecture != deb_info.arch {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Architecture mismatch: filename says '{}' but control says '{}'",
+                deb_info.arch, control.architecture
+            ),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+fn build_debian_artifact_metadata(
+    component: &str,
+    artifact_path: &str,
+    filename: &str,
+    package_type: &str,
+    control: &DebControl,
+) -> serde_json::Value {
+    serde_json::json!({
+        "format": "debian",
+        "package": &control.package,
+        "name": &control.package,
+        "version": &control.version,
+        "architecture": &control.architecture,
+        "component": component,
+        "filename": filename,
+        "path": artifact_path,
+        "package_type": package_type,
+        "description": &control.description,
+        "maintainer": &control.maintainer,
+        "installed_size": control.installed_size,
+        "depends": &control.depends,
+        "pre_depends": &control.pre_depends,
+        "recommends": &control.recommends,
+        "suggests": &control.suggests,
+        "conflicts": &control.conflicts,
+        "provides": &control.provides,
+        "replaces": &control.replaces,
+        "section": &control.section,
+        "priority": &control.priority,
+        "homepage": &control.homepage,
+        "source": &control.source,
+        "control": control,
+    })
+}
+
+fn build_debian_package_catalog_metadata(upload: &DebianPackageUpload) -> serde_json::Value {
+    serde_json::json!({
+        "format": "debian",
+        "architecture": &upload.control.architecture,
+        "component": &upload.component,
+        "package_type": &upload.deb_info.package_type,
+        "section": &upload.control.section,
+        "priority": &upload.control.priority,
+        "maintainer": &upload.control.maintainer,
+        "homepage": &upload.control.homepage,
+        "source": &upload.control.source,
+    })
+}
+
+fn package_description(control: &DebControl) -> Option<&str> {
+    control
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+}
+
+async fn persist_debian_upload(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upload: &DebianPackageUpload,
+    body: Bytes,
+    user_id: Option<uuid::Uuid>,
+    enqueue_sync_tasks: bool,
+) -> Result<crate::models::artifact::Artifact, Response> {
+    let existing = sqlx::query_scalar!(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        repo.id,
+        upload.artifact_path
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    if existing.is_some() {
+        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+    }
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &upload.artifact_path).await;
+
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let artifact_service = state.create_artifact_service(storage);
+    let artifact = artifact_service
+        .upload_with_sync_options(
+            repo.id,
+            &upload.artifact_path,
+            &upload.control.package,
+            Some(&upload.control.version),
+            DEBIAN_BINARY_CONTENT_TYPE,
+            body,
+            user_id,
+            enqueue_sync_tasks,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
+    artifact_service
+        .set_metadata(
+            artifact.id,
+            "debian",
+            upload.metadata.clone(),
+            serde_json::json!({}),
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
+    PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &upload.control.package,
+            &upload.control.version,
+            artifact.size_bytes,
+            &artifact.checksum_sha256,
+            package_description(&upload.control),
+            Some(build_debian_package_catalog_metadata(upload)),
+        )
+        .await;
+
+    let _ = sqlx::query!(
+        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
+        repo.id,
+    )
+    .execute(&state.db)
+    .await;
+
+    Ok(artifact)
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,121 +1717,16 @@ async fn pool_upload(
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
-    let filename = path.rsplit('/').next().unwrap_or(&path);
-    let deb_info = parse_deb_filename(filename).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid .deb filename. Expected format: {name}_{version}_{arch}.deb",
-        )
-            .into_response()
-    })?;
-
-    let artifact_path = format!("pool/{}/{}", component, path);
-
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        repo.id,
-        artifact_path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let sha256 = format!("{:x}", hasher.finalize());
-
-    let size_bytes = body.len() as i64;
-
-    // Store the file
-    let storage_key = format!("debian/{}", artifact_path);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        deb_info.name,
-        deb_info.version,
-        size_bytes,
-        sha256,
-        "application/vnd.debian.binary-package",
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Store metadata
-    let metadata = serde_json::json!({
-        "name": deb_info.name,
-        "version": deb_info.version,
-        "architecture": deb_info.arch,
-        "component": component,
-        "description": "No description available",
-    });
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'debian', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    let upload = prepare_debian_upload(&component, &path, &body)?;
+    persist_debian_upload(&state, &repo, &upload, body, Some(user_id), false).await?;
 
     info!(
         "Debian upload: {} {} {} to repo {} (component: {})",
-        deb_info.name, deb_info.version, deb_info.arch, repo_key, component
+        upload.control.package,
+        upload.control.version,
+        upload.control.architecture,
+        repo_key,
+        component
     );
 
     Ok(Response::builder()
@@ -1482,125 +1777,24 @@ async fn upload_raw(
     let deb_info = parse_deb_filename(&filename).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            "Invalid .deb filename. Expected format: {name}_{version}_{arch}.deb",
+            "Invalid Debian package filename. Expected {name}_{version}_{arch}.deb",
         )
             .into_response()
     })?;
 
     let component = "main";
-    let first_char = deb_info
-        .name
-        .chars()
-        .next()
-        .unwrap_or('_')
-        .to_ascii_lowercase();
-    let pool_path = format!("{}/{}/{}", first_char, deb_info.name, filename);
-    let artifact_path = format!("pool/{}/{}", component, pool_path);
-
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        repo.id,
-        artifact_path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let sha256 = format!("{:x}", hasher.finalize());
-
-    let size_bytes = body.len() as i64;
-
-    // Store the file
-    let storage_key = format!("debian/{}", artifact_path);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        deb_info.name,
-        deb_info.version,
-        size_bytes,
-        sha256,
-        "application/vnd.debian.binary-package",
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Store metadata
-    let metadata = serde_json::json!({
-        "name": deb_info.name,
-        "version": deb_info.version,
-        "architecture": deb_info.arch,
-        "component": component,
-        "description": "No description available",
-    });
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'debian', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    let artifact_path = DebianHandler::get_pool_path(component, &deb_info.name, &filename);
+    let path = artifact_path
+        .strip_prefix("pool/main/")
+        .unwrap_or(&artifact_path)
+        .to_string();
+    let upload = prepare_debian_upload(component, &path, &body)?;
+    let artifact =
+        persist_debian_upload(&state, &repo, &upload, body, Some(user_id), false).await?;
 
     info!(
         "Debian upload (raw): {} {} {} to repo {}",
-        deb_info.name, deb_info.version, deb_info.arch, repo_key
+        upload.control.package, upload.control.version, upload.control.architecture, repo_key
     );
 
     Ok(Response::builder()
@@ -1609,12 +1803,12 @@ async fn upload_raw(
         .body(Body::from(
             serde_json::json!({
                 "status": "created",
-                "package": deb_info.name,
-                "version": deb_info.version,
-                "architecture": deb_info.arch,
-                "path": artifact_path,
-                "sha256": sha256,
-                "size": size_bytes,
+                "package": &upload.control.package,
+                "version": &upload.control.version,
+                "architecture": &upload.control.architecture,
+                "path": &upload.artifact_path,
+                "sha256": &artifact.checksum_sha256,
+                "size": artifact.size_bytes,
             })
             .to_string(),
         ))
@@ -1624,6 +1818,31 @@ async fn upload_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn package_entry(
+        name: &str,
+        version: &str,
+        arch: &str,
+        filename: &str,
+        size: i64,
+        sha256: &str,
+        description: &str,
+    ) -> PackageEntry {
+        PackageEntry {
+            control: DebControl {
+                package: name.to_string(),
+                version: version.to_string(),
+                architecture: arch.to_string(),
+                description: Some(description.to_string()),
+                ..DebControl::default()
+            },
+            filename: filename.to_string(),
+            size,
+            sha256: sha256.to_string(),
+            sha1: None,
+            md5: None,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // proxy_err_status_and_message (#1147)
@@ -1912,6 +2131,7 @@ mod tests {
         assert_eq!(info.name, "nginx");
         assert_eq!(info.version, "1.24.0");
         assert_eq!(info.arch, "amd64");
+        assert_eq!(info.package_type, "deb");
     }
 
     #[test]
@@ -1928,6 +2148,15 @@ mod tests {
         assert_eq!(info.name, "python3-pip");
         assert_eq!(info.version, "23.0");
         assert_eq!(info.arch, "all");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_udeb() {
+        let info = parse_deb_filename("base-installer_1.200_amd64.udeb").unwrap();
+        assert_eq!(info.name, "base-installer");
+        assert_eq!(info.version, "1.200");
+        assert_eq!(info.arch, "amd64");
+        assert_eq!(info.package_type, "udeb");
     }
 
     #[test]
@@ -1969,15 +2198,15 @@ mod tests {
 
     #[test]
     fn test_build_packages_text_single_entry() {
-        let entries = vec![PackageEntry {
-            name: "nginx".to_string(),
-            version: "1.24.0".to_string(),
-            arch: "amd64".to_string(),
-            filename: "pool/main/n/nginx/nginx_1.24.0_amd64.deb".to_string(),
-            size: 1024,
-            sha256: "abc123".to_string(),
-            description: "HTTP server".to_string(),
-        }];
+        let entries = vec![package_entry(
+            "nginx",
+            "1.24.0",
+            "amd64",
+            "pool/main/n/nginx/nginx_1.24.0_amd64.deb",
+            1024,
+            "abc123",
+            "HTTP server",
+        )];
         let text = build_packages_text(&entries);
         assert!(text.contains("Package: nginx\n"));
         assert!(text.contains("Version: 1.24.0\n"));
@@ -1991,24 +2220,24 @@ mod tests {
     #[test]
     fn test_build_packages_text_multiple_entries() {
         let entries = vec![
-            PackageEntry {
-                name: "pkg1".to_string(),
-                version: "1.0".to_string(),
-                arch: "amd64".to_string(),
-                filename: "pool/main/p/pkg1/pkg1_1.0_amd64.deb".to_string(),
-                size: 100,
-                sha256: "hash1".to_string(),
-                description: "Package 1".to_string(),
-            },
-            PackageEntry {
-                name: "pkg2".to_string(),
-                version: "2.0".to_string(),
-                arch: "arm64".to_string(),
-                filename: "pool/main/p/pkg2/pkg2_2.0_arm64.deb".to_string(),
-                size: 200,
-                sha256: "hash2".to_string(),
-                description: "Package 2".to_string(),
-            },
+            package_entry(
+                "pkg1",
+                "1.0",
+                "amd64",
+                "pool/main/p/pkg1/pkg1_1.0_amd64.deb",
+                100,
+                "hash1",
+                "Package 1",
+            ),
+            package_entry(
+                "pkg2",
+                "2.0",
+                "arm64",
+                "pool/main/p/pkg2/pkg2_2.0_arm64.deb",
+                200,
+                "hash2",
+                "Package 2",
+            ),
         ];
         let text = build_packages_text(&entries);
         assert!(text.contains("Package: pkg1\n"));
@@ -2022,6 +2251,75 @@ mod tests {
         let entries: Vec<PackageEntry> = vec![];
         let text = build_packages_text(&entries);
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_build_packages_text_preserves_debian_control_fields() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("Multi-Arch".to_string(), "same".to_string());
+        let entries = vec![PackageEntry {
+            control: DebControl {
+                package: "libdemo".to_string(),
+                version: "1.2.3-1".to_string(),
+                architecture: "amd64".to_string(),
+                maintainer: Some("Maintainer <m@example.test>".to_string()),
+                installed_size: Some(42),
+                depends: Some(vec!["libc6 (>= 2.36)".to_string(), "zlib1g".to_string()]),
+                section: Some("libs".to_string()),
+                priority: Some("optional".to_string()),
+                homepage: Some("https://example.test/libdemo".to_string()),
+                source: Some("demo-src".to_string()),
+                description: Some("short description\nlong line\n.\nsecond paragraph".to_string()),
+                extra,
+                ..DebControl::default()
+            },
+            filename: "pool/main/libd/libdemo/libdemo_1.2.3-1_amd64.deb".to_string(),
+            size: 4096,
+            sha256: "sha256".to_string(),
+            sha1: Some("sha1".to_string()),
+            md5: Some("md5".to_string()),
+        }];
+
+        let text = build_packages_text(&entries);
+        assert!(text.contains("Maintainer: Maintainer <m@example.test>\n"));
+        assert!(text.contains("Installed-Size: 42\n"));
+        assert!(text.contains("Depends: libc6 (>= 2.36), zlib1g\n"));
+        assert!(text.contains("Section: libs\n"));
+        assert!(text.contains("Priority: optional\n"));
+        assert!(text.contains("Homepage: https://example.test/libdemo\n"));
+        assert!(text.contains("Source: demo-src\n"));
+        assert!(text.contains("Multi-Arch: same\n"));
+        assert!(
+            text.contains("Description: short description\n long line\n .\n second paragraph\n")
+        );
+        assert!(text.contains("MD5sum: md5\n"));
+        assert!(text.contains("SHA1: sha1\n"));
+        assert!(text.contains("SHA256: sha256\n"));
+    }
+
+    #[test]
+    fn test_package_matches_requested_arch() {
+        assert!(package_matches_requested_arch("amd64", "amd64"));
+        assert!(package_matches_requested_arch("all", "amd64"));
+        assert!(package_matches_requested_arch("all", "all"));
+        assert!(!package_matches_requested_arch("amd64", "all"));
+        assert!(!package_matches_requested_arch("arm64", "amd64"));
+    }
+
+    #[test]
+    fn test_component_from_pool_path() {
+        assert_eq!(
+            component_from_pool_path("pool/non-free/n/nvidia/pkg_1_amd64.deb"),
+            Some("non-free")
+        );
+        assert_eq!(component_from_pool_path("not-pool/pkg.deb"), None);
+    }
+
+    #[test]
+    fn test_gzip_compress_is_deterministic() {
+        let first = gzip_compress(b"Package: demo\n").unwrap();
+        let second = gzip_compress(b"Package: demo\n").unwrap();
+        assert_eq!(first, second);
     }
 
     // -----------------------------------------------------------------------
@@ -2286,15 +2584,15 @@ mod tests {
 
     #[test]
     fn test_build_packages_xz_single_entry() {
-        let entries = vec![PackageEntry {
-            name: "curl".to_string(),
-            version: "7.88.1-10".to_string(),
-            arch: "amd64".to_string(),
-            filename: "pool/main/c/curl/curl_7.88.1-10_amd64.deb".to_string(),
-            size: 311296,
-            sha256: "abcdef1234567890".to_string(),
-            description: "command line tool for transferring data with URL syntax".to_string(),
-        }];
+        let entries = vec![package_entry(
+            "curl",
+            "7.88.1-10",
+            "amd64",
+            "pool/main/c/curl/curl_7.88.1-10_amd64.deb",
+            311296,
+            "abcdef1234567890",
+            "command line tool for transferring data with URL syntax",
+        )];
         let compressed = build_packages_xz(&entries).expect("xz compression should succeed");
         // Verify XZ magic bytes
         assert_eq!(&compressed[..6], &[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
@@ -2311,24 +2609,24 @@ mod tests {
     #[test]
     fn test_build_packages_xz_multiple_entries() {
         let entries = vec![
-            PackageEntry {
-                name: "nginx".to_string(),
-                version: "1.24.0".to_string(),
-                arch: "amd64".to_string(),
-                filename: "pool/main/n/nginx/nginx_1.24.0_amd64.deb".to_string(),
-                size: 1024,
-                sha256: "aaa".to_string(),
-                description: "HTTP server".to_string(),
-            },
-            PackageEntry {
-                name: "curl".to_string(),
-                version: "8.0.0".to_string(),
-                arch: "amd64".to_string(),
-                filename: "pool/main/c/curl/curl_8.0.0_amd64.deb".to_string(),
-                size: 2048,
-                sha256: "bbb".to_string(),
-                description: "URL transfer tool".to_string(),
-            },
+            package_entry(
+                "nginx",
+                "1.24.0",
+                "amd64",
+                "pool/main/n/nginx/nginx_1.24.0_amd64.deb",
+                1024,
+                "aaa",
+                "HTTP server",
+            ),
+            package_entry(
+                "curl",
+                "8.0.0",
+                "amd64",
+                "pool/main/c/curl/curl_8.0.0_amd64.deb",
+                2048,
+                "bbb",
+                "URL transfer tool",
+            ),
         ];
         let compressed = build_packages_xz(&entries).expect("xz compression should succeed");
         use std::io::Read;
@@ -2549,5 +2847,208 @@ mod tests {
         let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
         let b = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "ef01");
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod upload_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+        let header = format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            name,
+            0,
+            0,
+            0,
+            "100644",
+            content.len()
+        );
+        assert_eq!(header.len(), 60, "ar header must be exactly 60 bytes");
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(content);
+        if content.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+
+    fn control_tar_gz(control: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(control.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "./control", control.as_bytes())
+            .expect("append control file");
+        builder.finish().expect("finish control.tar");
+        let tar_bytes = builder.into_inner().expect("control.tar bytes");
+        gzip_compress(&tar_bytes).expect("gzip control.tar")
+    }
+
+    fn empty_data_tar_gz() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.finish().expect("finish data.tar");
+        let tar_bytes = builder.into_inner().expect("data.tar bytes");
+        gzip_compress(&tar_bytes).expect("gzip data.tar")
+    }
+
+    fn minimal_deb(package: &str, version: &str, architecture: &str, description: &str) -> Vec<u8> {
+        let control = format!(
+            "Package: {package}\n\
+             Version: {version}\n\
+             Architecture: {architecture}\n\
+             Maintainer: Test Maintainer <test@example.local>\n\
+             Installed-Size: 7\n\
+             Depends: libc6 (>= 2.36)\n\
+             Section: utils\n\
+             Priority: optional\n\
+             Homepage: https://example.local/{package}\n\
+             Description: {description}\n\
+             {description_continuation}",
+            description_continuation = " extended description line\n",
+        );
+
+        let mut deb = Vec::new();
+        deb.extend_from_slice(b"!<arch>\n");
+        append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+        append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
+        append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
+        deb
+    }
+
+    #[tokio::test]
+    async fn pool_upload_populates_debian_metadata_packages_and_indexes() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+
+        let package = "ak-debian-indexed";
+        let version = "1.2.3-1";
+        let arch = "amd64";
+        let deb = minimal_deb(package, version, arch, "indexed Debian package");
+        let app = f.router_with_auth(super::router());
+        let path = format!("a/{package}/{package}_{version}_{arch}.deb");
+        let uri = format!("/{}/pool/main/{}", f.repo_key, path);
+        let (status, body) = tdh::send(app.clone(), tdh::put(uri, Bytes::from(deb))).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "upload failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let artifact: (uuid::Uuid, String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT id, path, name, version, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind(package)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query uploaded artifact");
+        assert_eq!(
+            artifact.1,
+            format!("pool/main/a/{package}/{package}_{version}_{arch}.deb")
+        );
+        assert_eq!(artifact.2, package);
+        assert_eq!(artifact.3.as_deref(), Some(version));
+        assert_eq!(artifact.4.len(), 64);
+
+        let metadata: (serde_json::Value,) =
+            sqlx::query_as("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact.0)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query Debian artifact metadata");
+        assert_eq!(metadata.0["format"], "debian");
+        assert_eq!(metadata.0["component"], "main");
+        assert_eq!(metadata.0["architecture"], arch);
+        assert_eq!(metadata.0["control"]["package"], package);
+        assert_eq!(metadata.0["control"]["version"], version);
+        assert_eq!(metadata.0["control"]["depends"][0], "libc6 (>= 2.36)");
+
+        let pkg: (String, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT version, description, metadata FROM packages \
+             WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind(package)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package catalog");
+        assert_eq!(pkg.0, version);
+        assert_eq!(
+            pkg.1.as_deref(),
+            Some("indexed Debian package\nextended description line")
+        );
+        let pkg_meta = pkg.2.expect("package metadata should be set");
+        assert_eq!(pkg_meta["format"], "debian");
+        assert_eq!(pkg_meta["architecture"], arch);
+        assert_eq!(pkg_meta["component"], "main");
+
+        let version_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind(package)
+        .bind(version)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(version_rows.0, 1);
+
+        let (status, packages_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!(
+                "/{}/dists/bookworm/main/binary-amd64/Packages",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let packages_text = String::from_utf8(packages_body.to_vec()).unwrap();
+        assert!(packages_text.contains(&format!("Package: {package}\n")));
+        assert!(packages_text.contains("Architecture: amd64\n"));
+        assert!(packages_text.contains("Depends: libc6 (>= 2.36)\n"));
+        assert!(packages_text
+            .contains("Description: indexed Debian package\n extended description line\n"));
+        assert!(packages_text.contains("SHA256: "));
+
+        let (status, all_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!(
+                "/{}/dists/bookworm/main/binary-all/Packages",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let all_text = String::from_utf8(all_body.to_vec()).unwrap();
+        assert!(
+            !all_text.contains(&format!("Package: {package}\n")),
+            "binary-all must not contain arch-specific packages"
+        );
+
+        let (status, release_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/dists/bookworm/Release", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let release = String::from_utf8(release_body.to_vec()).unwrap();
+        assert!(release.contains("Architectures: amd64\n"));
+        assert!(release.contains("Components: main\n"));
+        assert!(release.contains("MD5Sum:\n"));
+        assert!(release.contains("SHA1:\n"));
+        assert!(release.contains("SHA256:\n"));
+        assert!(release.contains("main/binary-amd64/Packages\n"));
+        assert!(release.contains("main/binary-amd64/Packages.gz\n"));
+        assert!(release.contains("main/binary-amd64/Packages.xz\n"));
+
+        f.teardown().await;
     }
 }

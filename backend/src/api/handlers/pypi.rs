@@ -74,7 +74,7 @@ pub fn router() -> Router<SharedState> {
 /// through `decode_html_entities_minimal` and land in our own simple-index
 /// HTML response (#1377 review, defense-in-depth layer 1). See also the
 /// HTML-escape applied at render time in `build_simple_root_response`.
-fn normalize_pep503(name: &str) -> String {
+pub(crate) fn normalize_pep503(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut last_was_sep = true;
 
@@ -476,7 +476,7 @@ fn build_simple_root_response(
 
     if accept.contains("application/vnd.pypi.simple.v1+json") {
         let json = serde_json::json!({
-            "meta": { "api-version": "1.1" },
+            "meta": { "api-version": "1.2" },
             "projects": packages.iter().map(|p| {
                 serde_json::json!({ "name": p })
             }).collect::<Vec<_>>()
@@ -517,6 +517,28 @@ fn build_simple_root_response(
 // ---------------------------------------------------------------------------
 // GET /pypi/{repo_key}/simple/{project}/ — PEP 503 package index
 // ---------------------------------------------------------------------------
+
+/// Fetch the PEP 708 `tracks` URLs declared for `normalized` on any of the
+/// project-owning `repo_ids`. Best-effort: a DB error yields an empty list,
+/// since this metadata is non-essential and must never fail a listing (#1600).
+async fn pypi_project_tracks_for(
+    db: &sqlx::PgPool,
+    repo_ids: &[uuid::Uuid],
+    normalized: &str,
+) -> Vec<String> {
+    if repo_ids.is_empty() {
+        return Vec::new();
+    }
+    sqlx::query_scalar::<_, String>(
+        "SELECT tracks_url FROM pypi_project_tracks \
+         WHERE repository_id = ANY($1) AND normalized_name = $2 ORDER BY tracks_url",
+    )
+    .bind(repo_ids)
+    .bind(normalized)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
 
 async fn simple_project(
     State(state): State<SharedState>,
@@ -605,15 +627,29 @@ async fn simple_project(
                 );
             }
 
+            // PEP 708 (#1600): when a local member owns this name and no
+            // operator `tracks` declaration permits merging, isolate the name to
+            // its local owner. We then skip every Remote member below, so the
+            // index lists only the local distributions (and the download path
+            // makes the same decision, keeping index and download consistent).
+            let isolate =
+                proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, &normalized).await?;
+
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
 
+            // First pass: collect distributions from every local (hosted /
+            // staging) member. We must know whether a local member owns the
+            // name BEFORE deciding to fetch any remote index, because members
+            // are iterated in priority order and a remote can precede a local.
             for member in &members {
-                if member.repo_type == RepositoryType::Local
-                    || member.repo_type == RepositoryType::Staging
+                if member.repo_type != RepositoryType::Local
+                    && member.repo_type != RepositoryType::Staging
                 {
-                    let member_rows = sqlx::query!(
-                        r#"
+                    continue;
+                }
+                let member_rows = sqlx::query!(
+                    r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
                am.metadata as "metadata?"
         FROM artifacts a
@@ -623,25 +659,40 @@ async fn simple_project(
           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2
         ORDER BY a.created_at DESC
         "#,
-                        member.id,
-                        normalized
-                    )
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(map_db_err)?;
+                    member.id,
+                    normalized
+                )
+                .fetch_all(&state.db)
+                .await
+                .map_err(map_db_err)?;
 
-                    local_artifacts.extend(member_rows.into_iter().map(|a| {
-                        SimpleProjectArtifact {
-                            path: a.path,
-                            version: a.version,
-                            size_bytes: a.size_bytes,
-                            checksum_sha256: a.checksum_sha256,
-                            metadata: a.metadata,
-                        }
-                    }));
-                    continue;
+                local_artifacts.extend(member_rows.into_iter().map(|a| SimpleProjectArtifact {
+                    path: a.path,
+                    version: a.version,
+                    size_bytes: a.size_bytes,
+                    checksum_sha256: a.checksum_sha256,
+                    metadata: a.metadata,
+                }));
+            }
+
+            // Ownership / dependency-confusion guard (#1600), superseding the
+            // name-only suppression from #1738. When a local member owns this
+            // PEP 503 name and no operator `tracks` declaration permits merging,
+            // `isolate` is true and the virtual serves ONLY that member's
+            // distributions for the name — in both the simple index and the
+            // download — rather than unioning the remote's versions for it.
+            // Unioning an unrelated public package that merely shares the name
+            // is a supply-chain hole (`pip` prefers the higher public version)
+            // AND makes the index inconsistent with the download path, which is
+            // also tracks-aware and 404s for any version only the remote has.
+            // Local precedence is the PEP 708-aligned default for a locally-
+            // owned name; a `tracks` declaration re-enables the union (#1582).
+            // Second pass: fetch a remote index only when the name is not
+            // isolated.
+            for member in &members {
+                if isolate {
+                    break;
                 }
-
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
@@ -683,6 +734,15 @@ async fn simple_project(
                 }
             }
 
+            // PEP 708 `tracks` declared by this virtual's local owners for the
+            // project, for metadata emission (#1600). Empty in the isolate case.
+            let local_member_ids: Vec<uuid::Uuid> = members
+                .iter()
+                .filter(|m| matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging))
+                .map(|m| m.id)
+                .collect();
+            let tracks = pypi_project_tracks_for(&state.db, &local_member_ids, &normalized).await;
+
             // Render the union.
             match (local_artifacts.is_empty(), remote_response) {
                 (true, None) => {
@@ -697,6 +757,7 @@ async fn simple_project(
                         &repo_key,
                         &normalized,
                         &local_artifacts,
+                        &tracks,
                     );
                 }
                 (_, Some((content, content_type))) => {
@@ -709,6 +770,7 @@ async fn simple_project(
                             &repo_key,
                             &normalized,
                             &local_artifacts,
+                            &tracks,
                         );
                         Body::from(merged)
                     } else {
@@ -727,7 +789,8 @@ async fn simple_project(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    build_simple_project_response(&headers, &repo_key, &normalized, &simple_artifacts)
+    let tracks = pypi_project_tracks_for(&state.db, &[repo.id], &normalized).await;
+    build_simple_project_response(&headers, &repo_key, &normalized, &simple_artifacts, &tracks)
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +807,7 @@ fn build_simple_project_response(
     repo_key: &str,
     normalized: &str,
     artifacts: &[SimpleProjectArtifact],
+    tracks: &[String],
 ) -> Result<Response, Response> {
     let accept = headers
         .get("accept")
@@ -784,8 +848,20 @@ fn build_simple_project_response(
             .into_iter()
             .collect();
 
+        // PEP 708 / Simple API v1.2: advertise v1.2 and, when the project has
+        // operator `tracks` declarations, emit them under meta.tracks so
+        // PEP-708-aware installers can validate the server-side merge (#1600).
+        let mut meta = serde_json::json!({ "api-version": "1.2" });
+        if !tracks.is_empty() {
+            meta["tracks"] = serde_json::Value::Array(
+                tracks
+                    .iter()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .collect(),
+            );
+        }
         let json = serde_json::json!({
-            "meta": { "api-version": "1.1" },
+            "meta": meta,
             "name": normalized,
             "versions": versions,
             "files": files,
@@ -801,6 +877,13 @@ fn build_simple_project_response(
     // HTML response
     let mut html = String::from("<!DOCTYPE html>\n<html>\n<head>\n");
     html.push_str("<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n");
+    // PEP 708: surface operator `tracks` declarations on the project page (#1600).
+    for t in tracks {
+        html.push_str(&format!(
+            "<meta name=\"pypi:tracks\" content=\"{}\"/>\n",
+            html_escape(t)
+        ));
+    }
     html.push_str(&format!("<title>Links for {}</title>\n", normalized));
     html.push_str("</head>\n<body>\n");
     html.push_str(&format!("<h1>Links for {}</h1>\n", normalized));
@@ -848,8 +931,9 @@ fn merge_local_into_remote_simple_html(
     repo_key: &str,
     normalized: &str,
     local: &[SimpleProjectArtifact],
+    tracks: &[String],
 ) -> String {
-    if local.is_empty() {
+    if local.is_empty() && tracks.is_empty() {
         return remote_html.to_string();
     }
 
@@ -885,19 +969,40 @@ fn merge_local_into_remote_simple_html(
         ));
     }
 
-    if local_lines.is_empty() {
+    if local_lines.is_empty() && tracks.is_empty() {
         return remote_html.to_string();
     }
 
-    if let Some(idx) = remote_html.rfind("</body>") {
-        let mut out = String::with_capacity(remote_html.len() + local_lines.len());
-        out.push_str(&remote_html[..idx]);
-        out.push_str(&local_lines);
-        out.push_str(&remote_html[idx..]);
-        out
-    } else {
-        format!("{}{}", remote_html, local_lines)
+    let mut out = remote_html.to_string();
+
+    // PEP 708: inject operator `tracks` declarations into the project page head
+    // so the union the virtual performs is validatable downstream (#1600).
+    if !tracks.is_empty() {
+        let metas: String = tracks
+            .iter()
+            .map(|t| {
+                format!(
+                    "<meta name=\"pypi:tracks\" content=\"{}\"/>\n",
+                    html_escape(t)
+                )
+            })
+            .collect();
+        if let Some(h) = out.find("</head>") {
+            out.insert_str(h, &metas);
+        } else {
+            out = format!("{}{}", metas, out);
+        }
     }
+
+    if !local_lines.is_empty() {
+        if let Some(idx) = out.rfind("</body>") {
+            out.insert_str(idx, &local_lines);
+        } else {
+            out.push_str(&local_lines);
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,16 +1107,23 @@ async fn serve_file(
                     .into_response());
                 }
 
-                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // Version-aware: suppress the proxy only when a local member
-                // owns the requested version, not any version of the name (#1582).
-                let normalized_project = PypiHandler::normalize_name(project);
-                let requested_version = PypiHandler::version_from_filename(filename);
-                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name_version(
+                // PEP 708 dependency-confusion guard (#1600), superseding the
+                // version-aware shadowing guard (#1217, #1582) and the
+                // name-only local-precedence suppression (#1738). Isolate to the
+                // local owner when a local member owns the name and no operator
+                // `tracks` declaration permits merging with upstream. When
+                // isolated, every Remote member is skipped so an unrelated
+                // public package of the same name is never served through the
+                // virtual; the download then 404s for a version the local owner
+                // lacks, which matches what the simple index lists (consistent).
+                // When a `tracks` declaration exists (same project, split version
+                // ranges, #1582) this returns false and the proxy fallthrough
+                // below applies.
+                let normalized_project = normalize_pep503(project);
+                let suppress_remote_members = proxy_helpers::pypi_virtual_isolates_name(
                     &state.db,
                     repo.id,
                     &normalized_project,
-                    requested_version.as_deref(),
                 )
                 .await?;
 
@@ -3384,7 +3496,7 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result =
-            build_simple_project_response(&headers, "my-virtual", "my-package", &artifacts);
+            build_simple_project_response(&headers, "my-virtual", "my-package", &artifacts, &[]);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -3413,7 +3525,7 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result =
-            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts);
+            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts, &[]);
         let response = result.unwrap();
 
         // Read the body to verify URLs point through the virtual repo
@@ -3456,7 +3568,7 @@ mod tests {
         }];
 
         let headers = HeaderMap::new();
-        let result = build_simple_project_response(&headers, "virt", "pkg", &artifacts);
+        let result = build_simple_project_response(&headers, "virt", "pkg", &artifacts, &[]);
         let response = result.unwrap();
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
@@ -3492,7 +3604,7 @@ mod tests {
         ];
 
         let headers = HeaderMap::new();
-        let result = build_simple_project_response(&headers, "vrepo", "pkg", &artifacts);
+        let result = build_simple_project_response(&headers, "vrepo", "pkg", &artifacts, &[]);
         let response = result.unwrap();
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
@@ -3529,7 +3641,7 @@ mod tests {
         );
 
         let result =
-            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts);
+            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts, &[]);
         let response = result.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -3549,7 +3661,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["name"], "my-package");
-        assert_eq!(json["meta"]["api-version"], "1.1");
+        assert_eq!(json["meta"]["api-version"], "1.2");
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files.len(), 1);
@@ -3591,7 +3703,7 @@ mod tests {
             "application/vnd.pypi.simple.v1+json".parse().unwrap(),
         );
 
-        let result = build_simple_project_response(&headers, "repo", "pkg", &artifacts);
+        let result = build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]);
         let response = result.unwrap();
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
@@ -3671,7 +3783,7 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["meta"]["api-version"], "1.1");
+        assert_eq!(json["meta"]["api-version"], "1.2");
         let projects = json["projects"].as_array().unwrap();
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0]["name"], "flask");
@@ -3963,7 +4075,7 @@ mod tests {
             metadata: None,
         }];
 
-        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
 
         assert!(
             merged.contains("pkg-1.0.0.tar.gz"),
@@ -3997,7 +4109,7 @@ mod tests {
             metadata: None,
         }];
 
-        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
         let count = merged.matches("pkg-1.0.0.tar.gz</a>").count();
         assert_eq!(count, 1, "filename present exactly once after dedupe");
         // The local sha256 must NOT appear — the remote entry is canonical.
@@ -4012,7 +4124,7 @@ mod tests {
     #[test]
     fn test_merge_empty_local_returns_remote_unchanged() {
         let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
-        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[]);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[], &[]);
         assert_eq!(merged, remote);
     }
 
@@ -4030,7 +4142,7 @@ mod tests {
             metadata: Some(metadata),
         }];
 
-        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
         assert!(
             merged.contains("data-requires-python=\"&gt;=3.10,&lt;3.14\""),
             "requires_python is HTML-escaped: {}",
@@ -4055,7 +4167,7 @@ mod tests {
             metadata: None,
         }];
 
-        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
         assert!(merged.contains("pkg-1.0.0.tar.gz"));
         assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
     }

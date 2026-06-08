@@ -86,6 +86,7 @@ RUN mkdir -p /mnt/rootfs && \
         jq \
         tar \
         gzip \
+        zstd \
     && dnf --installroot /mnt/rootfs --releasever 9 \
         --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
     && dnf --installroot /mnt/rootfs clean all \
@@ -146,7 +147,7 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
 FROM ghcr.io/aquasecurity/trivy:0.71.0 AS trivy-bin
-FROM ghcr.io/anchore/grype:v0.112.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.113.0 AS grype-bin
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

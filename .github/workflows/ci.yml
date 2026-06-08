@@ -54,6 +54,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # Cache the dependency build so only the workspace crate recompiles.
+      # ~635 deps are byte-identical run-to-run; cold compile was ~9m.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: clippy
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -123,6 +129,12 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Separate cache key from check-rust: same target dir but a different
+      # build profile (test vs clippy), so they must not share a cache.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: unit
 
       # Catch migration-slot collisions before they reach the e2e/nightly job.
       # The nightly run on 2026-05-09 (#1128) crashed at startup with
@@ -258,6 +270,22 @@ jobs:
             echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Distinct cache key: the instrumented coverage build is incompatible
+      # with the clippy/unit profiles, and cargo-llvm-cov builds into
+      # target/llvm-cov-target, so point rust-cache there or it caches an
+      # empty target/ and silently no-ops.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.detect.outputs.rust_changed == 'true'
+        with:
+          shared-key: coverage
+          workspaces: ". -> target/llvm-cov-target"
+
+      - name: Install cargo-nextest
+        if: steps.detect.outputs.rust_changed == 'true'
+        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: nextest
+
       - name: Run database migrations
         if: steps.detect.outputs.rust_changed == 'true'
         run: sqlx migrate run --source backend/migrations
@@ -277,7 +305,10 @@ jobs:
           # paths in coverage. The encryption_key panic-when-unset test
           # explicitly skips when this is set.
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+        # nextest runs each test in its own process for faster scheduling.
+        # Cap test concurrency to 4 so parallel test processes don't OOM the
+        # memory-limited ARC runner (cf. the #1515 compile OOM).
+        run: cargo llvm-cov nextest --workspace --lib --lcov --output-path lcov.info --test-threads 4
 
       - name: Coverage summary and gate
         if: steps.detect.outputs.rust_changed == 'true'
@@ -804,10 +835,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
 
       - name: Build backend image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend
@@ -855,10 +886,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
 
       - name: Build openscap image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
         with:
           context: .
           file: ./docker/Dockerfile.openscap

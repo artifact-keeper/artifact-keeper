@@ -142,6 +142,21 @@ impl RateLimitExemptions {
 pub struct RateLimitState {
     pub limiter: Arc<RateLimiter>,
     pub exemptions: Arc<RateLimitExemptions>,
+    /// Master on/off switch (driven by `Config::rate_limit_enabled`,
+    /// env `RATE_LIMIT_ENABLED`). When `false`, the middleware short-
+    /// circuits before touching the limiter so no request is ever limited.
+    /// Intended for internal-only / VPN-gated deployments. See #1602.
+    pub enabled: bool,
+}
+
+/// Whether a request should be limited at all, given the master switch.
+///
+/// Extracted as a pure function so the enable/disable decision is unit-
+/// testable without constructing an Axum request. Returns `true` when the
+/// limiter should run, `false` when it must be bypassed entirely (#1602).
+#[inline]
+pub fn rate_limiting_active(enabled: bool) -> bool {
+    enabled
 }
 
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
@@ -232,6 +247,12 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Master off switch (#1602): bypass the limiter entirely so no request
+    // is limited. Used by internal-only / VPN-gated deployments.
+    if !rate_limiting_active(state.enabled) {
+        return next.run(request).await;
+    }
+
     // Extract auth from extensions (required or optional middleware)
     let auth = request
         .extensions()
@@ -340,6 +361,13 @@ pub async fn rate_limit_by_ip_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Master off switch (#1602): bypass the per-IP limiter entirely. This
+    // is the limiter most likely to bite internal callers (e.g. sbt /
+    // Coursier hammering the presigned-download path).
+    if !rate_limiting_active(state.enabled) {
+        return next.run(request).await;
+    }
+
     // Username / service-account exemption: legitimate batch downloads
     // by admin / CI bots should not be throttled even when they
     // originate from a single egress IP.
@@ -919,6 +947,113 @@ mod tests {
             .unwrap();
         assert_eq!(extract_client_ip(&req1), extract_client_ip(&req2));
         assert_eq!(extract_client_ip(&req1), "ip:203.0.113.42");
+    }
+
+    // --- Master enable/disable switch (#1602) ---
+
+    #[test]
+    fn test_rate_limiting_active_reflects_flag() {
+        // Pure decision helper: enabled => active, disabled => bypass.
+        assert!(rate_limiting_active(true));
+        assert!(!rate_limiting_active(false));
+    }
+
+    fn state_with(enabled: bool) -> RateLimitState {
+        // Capacity-1 limiter: with the limiter active, the 2nd+ request from
+        // the same key would 429. With enabled=false the layer must bypass.
+        RateLimitState {
+            limiter: Arc::new(RateLimiter::new(1, 60)),
+            exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+            enabled,
+        }
+    }
+
+    /// Drive `n` sequential requests (same X-Forwarded-For) through a one-route
+    /// router carrying `app` and return how many returned 429.
+    async fn count_429s(app: axum::Router, n: usize) -> usize {
+        use tower::ServiceExt;
+        let mut limited = 0;
+        for _ in 0..n {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("X-Forwarded-For", "203.0.113.99")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited += 1;
+            }
+        }
+        limited
+    }
+
+    #[tokio::test]
+    async fn test_disabled_user_middleware_never_limits() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(false),
+                rate_limit_middleware,
+            ));
+        assert_eq!(
+            count_429s(app, 5).await,
+            0,
+            "disabled limiter must not 429 any request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_user_middleware_still_limits() {
+        // Sanity: enabled=true with the same tiny limiter DOES 429, proving
+        // the bypass above is the flag's doing, not an inert layer.
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true),
+                rate_limit_middleware,
+            ));
+        assert!(
+            count_429s(app, 5).await > 0,
+            "enabled limiter must 429 once capacity exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_by_ip_middleware_never_limits() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(false),
+                rate_limit_by_ip_middleware,
+            ));
+        assert_eq!(
+            count_429s(app, 5).await,
+            0,
+            "disabled per-IP limiter must not 429 any request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_by_ip_middleware_still_limits() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true),
+                rate_limit_by_ip_middleware,
+            ));
+        assert!(
+            count_429s(app, 5).await > 0,
+            "enabled per-IP limiter must 429 once capacity exceeded"
+        );
     }
 
     #[test]

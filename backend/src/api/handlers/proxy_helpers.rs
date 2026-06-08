@@ -161,6 +161,7 @@ pub fn request_base_url(headers: &HeaderMap) -> String {
 /// Every format handler needs the same handful of fields after looking up a
 /// repository by its key. This struct avoids duplicating the definition in
 /// each handler module.
+#[derive(Clone)]
 pub struct RepoInfo {
     pub id: Uuid,
     pub key: String,
@@ -1821,6 +1822,75 @@ fn shadowing_guard_db_err(virtual_repo_id: Uuid, e: sqlx::Error) -> Response {
         "cross-format shadowing-guard DB query failed; failing closed to 500",
     );
     (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+}
+
+/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600).
+///
+/// Returns `true` when the virtual must ISOLATE this project name to its local
+/// owner: a local/staging member owns the PEP 503 normalized `normalized_name`
+/// AND no `pypi_project_tracks` declaration exists on an owning member for it.
+/// When `true`, the caller MUST serve only the owning member's distributions in
+/// both the simple index and the file download (no cross-member union, no
+/// proxy fallthrough), which is PEP 708's "refuse to implicitly assume merging
+/// is safe" default and keeps the index and download consistent.
+///
+/// Returns `false` when the name is not locally owned (proxy normally) or when
+/// an operator `tracks` declaration permits merging the same project across
+/// members (the #1267 union / #1584 version fallthrough then apply).
+///
+/// `normalized_name` must already be PEP 503 normalized; the ownership query
+/// uses the same normalization the simple index uses so the two agree.
+/// Fails closed (Err 500) on DB error.
+#[allow(clippy::result_large_err)]
+pub async fn pypi_virtual_isolates_name(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    normalized_name: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let local_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Local || m.repo_type == RepositoryType::Staging)
+        .map(|m| m.id)
+        .collect();
+    if local_ids.is_empty() {
+        return Ok(false);
+    }
+
+    // Which local/staging members actually own (hold artifacts for) this name?
+    // Uses the same PEP 503 normalization as simple_project so isolation agrees
+    // with what the index lists.
+    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT repository_id FROM artifacts \
+         WHERE repository_id = ANY($1) \
+           AND is_deleted = false \
+           AND LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-')) = $2",
+    )
+    .bind(&local_ids)
+    .bind(normalized_name)
+    .fetch_all(db)
+    .await
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+
+    if owning_ids.is_empty() {
+        // Name is not owned by any local member: no confusion risk, proxy normally.
+        return Ok(false);
+    }
+
+    // A `tracks` declaration on any owning member means the operator has
+    // asserted the local project is the same project as upstream, so merging is
+    // safe and we do NOT isolate.
+    let tracked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pypi_project_tracks \
+         WHERE repository_id = ANY($1) AND normalized_name = $2",
+    )
+    .bind(&owning_ids)
+    .bind(normalized_name)
+    .fetch_one(db)
+    .await
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+
+    Ok(tracked == 0)
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -4220,6 +4290,7 @@ mod tests {
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
                 auth_max_concurrency: 8,
+                rate_limit_enabled: true,
                 rate_limit_auth_per_window: 120,
                 rate_limit_api_per_window: 5000,
                 rate_limit_search_per_window: 300,

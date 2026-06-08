@@ -79,6 +79,7 @@ fn test_config(storage_path: &str) -> Config {
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
         auth_max_concurrency: 8,
+        rate_limit_enabled: true,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
         rate_limit_search_per_window: 300,
@@ -245,6 +246,31 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Poll `GET /{key}/uploads/{id}` until the async finalize reaches a terminal
+/// status, returning the final progress JSON. Panics on timeout. Monolithic
+/// PUT and chunked `complete` now return 202 and finalize on a background
+/// task, so artifact-row / download assertions must wait for this first.
+async fn await_finalize(state: &SharedState, key: &str, session_id: &str) -> serde_json::Value {
+    for _ in 0..400 {
+        let app = incus::router().with_state(state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/uploads/{}", key, session_id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        match json["status"].as_str() {
+            Some("completed") | Some("failed") => return json,
+            _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    }
+    panic!("finalize did not reach a terminal status in time");
+}
+
 // ===========================================================================
 // 1. Monolithic streaming upload — PUT a file, verify artifact + checksum
 // ===========================================================================
@@ -274,7 +300,7 @@ async fn test_monolithic_streaming_upload() {
         .await
         .unwrap();
 
-    let app = incus::router().with_state(state);
+    let app = incus::router().with_state(state.clone());
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/{}/images/ubuntu/24.04/rootfs.tar.xz", key))
@@ -290,8 +316,8 @@ async fn test_monolithic_streaming_upload() {
     let body_str = String::from_utf8_lossy(&body);
     assert_eq!(
         status,
-        StatusCode::CREATED,
-        "monolithic upload should return 201, got: {}",
+        StatusCode::ACCEPTED,
+        "monolithic upload should return 202 (async finalize), got: {}",
         body_str
     );
 
@@ -299,6 +325,11 @@ async fn test_monolithic_streaming_upload() {
 
     assert_eq!(json["sha256"].as_str().unwrap(), expected_sha);
     assert_eq!(json["size"].as_i64().unwrap(), 1024 * 100);
+    let session_id = json["session_id"].as_str().unwrap().to_string();
+
+    // Wait for the background finalize before asserting durable state.
+    let progress = await_finalize(&state, &key, &session_id).await;
+    assert_eq!(progress["status"].as_str(), Some("completed"));
 
     // Verify artifact in DB
     let artifact = sqlx::query("SELECT size_bytes, checksum_sha256, content_type FROM artifacts WHERE repository_id = $1 AND path = 'ubuntu/24.04/rootfs.tar.xz'")
@@ -407,8 +438,8 @@ async fn test_chunked_upload_happy_path() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::CREATED,
-        "PUT complete should return 201"
+        StatusCode::ACCEPTED,
+        "PUT complete should return 202 (async finalize)"
     );
 
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -417,6 +448,10 @@ async fn test_chunked_upload_happy_path() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["sha256"].as_str().unwrap(), expected_sha);
     assert_eq!(json["size"].as_i64().unwrap(), 1024 * 300);
+
+    // Wait for the background finalize.
+    let progress = await_finalize(&state, &key, &session_id).await;
+    assert_eq!(progress["status"].as_str(), Some("completed"));
 
     // Verify artifact in DB
     let artifact = sqlx::query("SELECT size_bytes, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = 'debian/12/rootfs.tar.gz'")
@@ -427,16 +462,17 @@ async fn test_chunked_upload_happy_path() {
     assert_eq!(artifact.get::<i64, _>("size_bytes"), 1024 * 300);
     assert_eq!(artifact.get::<String, _>("checksum_sha256"), expected_sha);
 
-    // Verify session is cleaned up
-    let session_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1::uuid")
+    // The session row is now retained (status='completed') for polling, not
+    // deleted on completion; the stale-session reaper removes it later.
+    let session_status: String =
+        sqlx::query_scalar("SELECT status FROM incus_upload_sessions WHERE id = $1::uuid")
             .bind(&session_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        session_count, 0,
-        "session should be deleted after completion"
+        session_status, "completed",
+        "session should be retained as completed after finalize"
     );
 
     // Cleanup
@@ -762,8 +798,8 @@ async fn test_resume_after_partial_upload() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::CREATED,
-        "resume + complete should return 201"
+        StatusCode::ACCEPTED,
+        "resume + complete should return 202 (async finalize)"
     );
 
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -772,6 +808,9 @@ async fn test_resume_after_partial_upload() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["size"].as_i64().unwrap(), 1024 * 200);
     assert_eq!(json["sha256"].as_str().unwrap(), expected_sha);
+
+    let progress = await_finalize(&state, &key, &session_id).await;
+    assert_eq!(progress["status"].as_str(), Some("completed"));
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&storage_path);
@@ -806,7 +845,16 @@ async fn test_duplicate_upload_upserts() {
         .body(Body::from(data1))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let session1 = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let progress = await_finalize(&state, &key, &session1).await;
+    assert_eq!(progress["status"].as_str(), Some("completed"));
 
     // Second upload — 75 KB to same path (different content)
     let data2: Vec<u8> = (0..1024 * 75).map(|i| ((i + 7) % 251) as u8).collect();
@@ -819,7 +867,16 @@ async fn test_duplicate_upload_upserts() {
         .body(Body::from(data2))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let session2 = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let progress = await_finalize(&state, &key, &session2).await;
+    assert_eq!(progress["status"].as_str(), Some("completed"));
 
     // Verify only one artifact record exists
     let count: i64 = sqlx::query_scalar(

@@ -205,13 +205,15 @@ jobs:
           # ghcr.io uses the artifact-keeper org / hyphenated names.
           # docker.io uses the artifactkeeper namespace / shorter names.
           # Missing on EITHER registry blocks the release.
+          # The `-alpine` backend variant is currently suspended (its
+          # build/merge jobs in docker-publish.yml are gated `if: false`), so
+          # it is intentionally omitted — re-add the two `${VERSION}-alpine`
+          # entries when that variant is published again.
           IMAGES=(
             "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
-            "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}-alpine"
             "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
             "docker.io|artifactkeeper/backend:${VERSION}"
-            "docker.io|artifactkeeper/backend:${VERSION}-alpine"
             "docker.io|artifactkeeper/openscap:${VERSION}"
             "docker.io|artifactkeeper/web:${VERSION}"
           )
