@@ -131,6 +131,207 @@ fn merge_composer_metadata(
     }
 }
 
+/// Row shape shared by the v1/v2 metadata queries. Holds just the fields
+/// needed to render a composer version entry. Extracted so the per-member
+/// fan-out in virtual repos can reuse one query + one renderer (#1715).
+struct ComposerArtifactRow {
+    version: Option<String>,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Look up all (non-deleted) artifacts named `full_name` in a single repository.
+///
+/// Used by `metadata_v2` / `metadata_v1` for the repo's own artifacts and,
+/// for virtual repos, by the per-member fan-out (#1715). Returning the rows
+/// (rather than a built response) lets callers decide between the v1 and v2
+/// wire shapes from the same query.
+async fn fetch_composer_artifacts(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    full_name: &str,
+) -> Result<Vec<ComposerArtifactRow>, Response> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT a.version, a.checksum_sha256,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.name = $2
+        ORDER BY a.created_at ASC
+        "#,
+        repo_id,
+        full_name
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ComposerArtifactRow {
+            version: r.version,
+            checksum_sha256: r.checksum_sha256,
+            metadata: r.metadata,
+        })
+        .collect())
+}
+
+/// Render the Composer v2 "minified" metadata document from a member's
+/// artifact rows. The `dist.url` is rewritten to point at the *virtual*
+/// repo_key so the composer client routes a locally-served package's download
+/// back through us rather than to an upstream host (#1715).
+fn build_metadata_v2_response(
+    repo_key: &str,
+    full_name: &str,
+    artifacts: &[ComposerArtifactRow],
+) -> Response {
+    let versions: Vec<serde_json::Value> = artifacts
+        .iter()
+        .map(|a| {
+            let version = a.version.as_deref().unwrap_or("dev-main");
+            build_version_entry(
+                repo_key,
+                full_name,
+                version,
+                &a.checksum_sha256,
+                a.metadata.as_ref(),
+            )
+        })
+        .collect();
+
+    let mut packages_map = serde_json::Map::new();
+    packages_map.insert(full_name.to_string(), serde_json::Value::Array(versions));
+
+    let response = serde_json::json!({
+        "packages": packages_map,
+        "minified": "composer/2.0",
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .unwrap()
+}
+
+/// Render the Composer v1 metadata document from a member's artifact rows.
+fn build_metadata_v1_response(
+    repo_key: &str,
+    full_name: &str,
+    artifacts: &[ComposerArtifactRow],
+) -> Response {
+    let mut version_map = serde_json::Map::new();
+    for a in artifacts {
+        let version = a.version.as_deref().unwrap_or("dev-main");
+        let entry = build_version_entry(
+            repo_key,
+            full_name,
+            version,
+            &a.checksum_sha256,
+            a.metadata.as_ref(),
+        );
+        version_map.insert(version.to_string(), entry);
+    }
+
+    let mut packages_map = serde_json::Map::new();
+    packages_map.insert(
+        full_name.to_string(),
+        serde_json::Value::Object(version_map),
+    );
+
+    let response = serde_json::json!({
+        "packages": packages_map,
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .unwrap()
+}
+
+/// Resolve composer package metadata for a VIRTUAL repository by fanning out
+/// across member repos in priority order (#1715).
+///
+/// Mirrors the npm virtual-metadata pattern: Local/Staging members are served
+/// from the local DB (rendered into the requested wire shape), then Remote
+/// members are proxied from upstream (and proxy-cached). First member that has
+/// the package wins. Returns 404 only when no member can satisfy the request.
+///
+/// `render_local` builds the response from a member's DB rows; `upstream_path`
+/// is the v1 or v2 path proxied from remote members. The virtual `repo_key` is
+/// threaded through so locally-rendered `dist.url`s route back through us.
+async fn resolve_virtual_composer_metadata<R>(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    full_name: &str,
+    upstream_path: &str,
+    render_local: R,
+) -> Result<Response, Response>
+where
+    R: Fn(&str, &str, &[ComposerArtifactRow]) -> Response,
+{
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+
+    if members.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+    }
+
+    for member in &members {
+        // Local/Staging members: serve from the local DB.
+        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
+        {
+            let artifacts = fetch_composer_artifacts(&state.db, member.id, full_name).await?;
+            if !artifacts.is_empty() {
+                return Ok(render_local(virtual_repo_key, full_name, &artifacts));
+            }
+            continue;
+        }
+
+        // Remote members: proxy (and cache) metadata from upstream.
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(ref upstream_url) = member.upstream_url else {
+            continue;
+        };
+        let Some(ref proxy) = state.proxy_service else {
+            continue;
+        };
+
+        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
+            .await
+        {
+            Ok((content, content_type)) => {
+                return Ok(build_composer_proxy_response(content, content_type));
+            }
+            Err(_e) => {
+                tracing::debug!(
+                    member_key = %member.key,
+                    path = %upstream_path,
+                    "composer metadata proxy fetch missed for virtual member"
+                );
+            }
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        "Package not found in any member repository",
+    )
+        .into_response())
+}
+
 /// Build a version entry JSON for a composer package.
 fn build_version_entry(
     repo_key: &str,
@@ -236,29 +437,23 @@ async fn metadata_v2(
     let package = package_file.trim_end_matches(".json");
     let full_name = format!("{}/{}", vendor, package);
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND a.name = $2
-        ORDER BY a.created_at ASC
-        "#,
-        repo.id,
-        full_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
+    // #1715: Virtual repos resolve p2 metadata across member repos (local
+    // first, then remote upstream) in priority order. Without this branch a
+    // virtual repo always returned 404 even when a member had the package.
+    if repo.repo_type == RepositoryType::Virtual {
+        let upstream_path = composer_v2_upstream_path(&full_name);
+        return resolve_virtual_composer_metadata(
+            &state,
+            repo.id,
+            &repo_key,
+            &full_name,
+            &upstream_path,
+            build_metadata_v2_response,
         )
-            .into_response()
-    })?;
+        .await;
+    }
+
+    let artifacts = fetch_composer_artifacts(&state.db, repo.id, &full_name).await?;
 
     if artifacts.is_empty() {
         // #1096: For remote repos, proxy the v2 metadata document from
@@ -288,33 +483,9 @@ async fn metadata_v2(
     }
 
     // Build the v2 "minified" format: {"packages": {"vendor/package": [...]}}
-    let mut versions: Vec<serde_json::Value> = Vec::new();
-
-    for artifact in &artifacts {
-        let version = artifact.version.as_deref().unwrap_or("dev-main");
-        let entry = build_version_entry(
-            &repo_key,
-            &full_name,
-            version,
-            &artifact.checksum_sha256,
-            artifact.metadata.as_ref(),
-        );
-        versions.push(entry);
-    }
-
-    let mut packages_map = serde_json::Map::new();
-    packages_map.insert(full_name, serde_json::Value::Array(versions));
-
-    let response = serde_json::json!({
-        "packages": packages_map,
-        "minified": "composer/2.0",
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
-        .unwrap())
+    Ok(build_metadata_v2_response(
+        &repo_key, &full_name, &artifacts,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -332,29 +503,21 @@ async fn metadata_v1(
     let package = raw.split('$').next().unwrap_or(raw);
     let full_name = format!("{}/{}", vendor, package);
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND a.name = $2
-        ORDER BY a.created_at ASC
-        "#,
-        repo.id,
-        full_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
+    // #1715: Virtual repos resolve legacy p (v1) metadata across members too.
+    if repo.repo_type == RepositoryType::Virtual {
+        let upstream_path = composer_v1_upstream_path(&full_name);
+        return resolve_virtual_composer_metadata(
+            &state,
+            repo.id,
+            &repo_key,
+            &full_name,
+            &upstream_path,
+            build_metadata_v1_response,
         )
-            .into_response()
-    })?;
+        .await;
+    }
+
+    let artifacts = fetch_composer_artifacts(&state.db, repo.id, &full_name).await?;
 
     if artifacts.is_empty() {
         // #1096: Also proxy the v1 metadata format for older composer
@@ -379,32 +542,9 @@ async fn metadata_v1(
     }
 
     // Build v1 format: {"packages": {"vendor/package": {"version": {...}}}}
-    let mut version_map = serde_json::Map::new();
-
-    for artifact in &artifacts {
-        let version = artifact.version.as_deref().unwrap_or("dev-main");
-        let entry = build_version_entry(
-            &repo_key,
-            &full_name,
-            version,
-            &artifact.checksum_sha256,
-            artifact.metadata.as_ref(),
-        );
-        version_map.insert(version.to_string(), entry);
-    }
-
-    let mut packages_map = serde_json::Map::new();
-    packages_map.insert(full_name, serde_json::Value::Object(version_map));
-
-    let response = serde_json::json!({
-        "packages": packages_map,
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
-        .unwrap())
+    Ok(build_metadata_v1_response(
+        &repo_key, &full_name, &artifacts,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,6 +1704,113 @@ mod tests {
             "p/aws/aws-sdk-php-v2.json"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Virtual metadata rendering (#1715)
+    //
+    // The render functions are the local-member half of the virtual fan-out:
+    // for a Local/Staging member they build the v1/v2 wire shape directly from
+    // DB rows. They are pure, so we can assert the document shape without a DB.
+    // -----------------------------------------------------------------------
+
+    fn sample_rows() -> Vec<ComposerArtifactRow> {
+        vec![
+            ComposerArtifactRow {
+                version: Some("3.0.0".to_string()),
+                checksum_sha256: "aaa111".to_string(),
+                metadata: Some(serde_json::json!({
+                    "composer": {
+                        "description": "Logging library",
+                        "type": "library",
+                        "require": {"php": ">=8.1"}
+                    }
+                })),
+            },
+            ComposerArtifactRow {
+                version: Some("3.1.0".to_string()),
+                checksum_sha256: "bbb222".to_string(),
+                metadata: None,
+            },
+        ]
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_build_metadata_v2_response_shape() {
+        let resp = build_metadata_v2_response("virt", "monolog/monolog", &sample_rows());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        assert_eq!(json["minified"], "composer/2.0");
+        let versions = json["packages"]["monolog/monolog"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["version"], "3.0.0");
+        // composer.json metadata is merged into the entry.
+        assert_eq!(versions[0]["description"], "Logging library");
+        assert_eq!(versions[0]["type"], "library");
+    }
+
+    #[tokio::test]
+    async fn test_build_metadata_v2_response_dist_url_uses_virtual_repo_key() {
+        // #1715: locally-rendered dist URLs must point back at the
+        // *virtual* repo key so the composer client routes downloads through us.
+        let resp = build_metadata_v2_response("virt", "monolog/monolog", &sample_rows());
+        let json = body_json(resp).await;
+        let url = json["packages"]["monolog/monolog"][0]["dist"]["url"]
+            .as_str()
+            .unwrap();
+        assert_eq!(url, "/composer/virt/dist/monolog/monolog/3.0.0/aaa111.zip");
+    }
+
+    #[tokio::test]
+    async fn test_build_metadata_v1_response_shape() {
+        let resp = build_metadata_v1_response("virt", "monolog/monolog", &sample_rows());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        // v1 keys versions by version string (object, not array).
+        let pkg = &json["packages"]["monolog/monolog"];
+        assert!(pkg.is_object());
+        assert_eq!(pkg["3.0.0"]["version"], "3.0.0");
+        assert_eq!(pkg["3.1.0"]["version"], "3.1.0");
+        // v1 must not carry the v2-only "minified" marker.
+        assert!(json.get("minified").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_metadata_v2_response_empty_rows_is_empty_array() {
+        // A member with no matching artifacts renders an empty version list,
+        // not an error — the fan-out treats this as "miss, try next member".
+        let resp = build_metadata_v2_response("virt", "monolog/monolog", &[]);
+        let json = body_json(resp).await;
+        let versions = json["packages"]["monolog/monolog"].as_array().unwrap();
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn test_composer_artifact_row_version_fallback() {
+        // Rows with a NULL version fall back to dev-main in the rendered entry,
+        // matching the legacy inline behaviour.
+        let rows = [ComposerArtifactRow {
+            version: None,
+            checksum_sha256: "ccc333".to_string(),
+            metadata: None,
+        }];
+        let entry = build_version_entry(
+            "virt",
+            "vendor/pkg",
+            rows[0].version.as_deref().unwrap_or("dev-main"),
+            &rows[0].checksum_sha256,
+            rows[0].metadata.as_ref(),
+        );
+        assert_eq!(entry["version"], "dev-main");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,5 +2145,310 @@ mod upload_db_tests {
         );
 
         f.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-backed metadata resolution tests for the p2/p endpoints (#1715).
+//
+// These exercise the local-repo lookup path (`fetch_composer_artifacts` +
+// `build_metadata_v{1,2}_response`) and the virtual fan-out
+// (`resolve_virtual_composer_metadata`) against a real Postgres. They no-op
+// gracefully when `DATABASE_URL` is unset (CI provides one).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod metadata_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+
+    /// Insert a composer artifact row (+ optional metadata) directly so the
+    /// metadata endpoints have something to resolve without a full upload.
+    async fn insert_artifact(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        name: &str,
+        version: &str,
+        sha256: &str,
+        metadata: Option<serde_json::Value>,
+    ) {
+        let artifact_id = Uuid::new_v4();
+        let path = format!("{}/{}/{}.zip", name, version, sha256);
+        let storage_key = format!("composer/{}", path);
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (id, repository_id, name, version, path, storage_key, size_bytes, \
+              checksum_sha256, content_type, is_deleted) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'application/zip',false)",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(name)
+        .bind(version)
+        .bind(&path)
+        .bind(&storage_key)
+        .bind(10_i64)
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .expect("insert artifact");
+
+        if let Some(meta) = metadata {
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'composer', $2)",
+            )
+            .bind(artifact_id)
+            .bind(meta)
+            .execute(pool)
+            .await
+            .expect("insert artifact_metadata");
+        }
+    }
+
+    /// Link `member_repo_id` into `virtual_repo_id` at the given priority.
+    async fn add_member(
+        pool: &sqlx::PgPool,
+        virtual_repo_id: Uuid,
+        member_repo_id: Uuid,
+        priority: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_repo_id)
+        .bind(member_repo_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("add virtual member");
+    }
+
+    async fn body_json(body: &bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice(body).expect("parse json body")
+    }
+
+    // -- Local repo: p2 returns the package when present -------------------
+
+    #[tokio::test]
+    async fn local_p2_returns_package_with_versions() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        insert_artifact(
+            &f.pool,
+            f.repo_id,
+            "monolog/monolog",
+            "3.0.0",
+            "deadbeef",
+            Some(serde_json::json!({"composer": {"description": "Logging"}})),
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/monolog/monolog.json", f.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        assert_eq!(json["minified"], "composer/2.0");
+        let versions = json["packages"]["monolog/monolog"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["version"], "3.0.0");
+        assert_eq!(versions[0]["description"], "Logging");
+
+        f.teardown().await;
+    }
+
+    // -- Local repo: p1 (legacy) returns version-keyed object -------------
+
+    #[tokio::test]
+    async fn local_p1_returns_version_keyed_object() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        insert_artifact(&f.pool, f.repo_id, "psr/log", "3.0.0", "cafe01", None).await;
+
+        let app = f.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p/psr/log.json", f.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        let pkg = &json["packages"]["psr/log"];
+        assert!(pkg.is_object());
+        assert_eq!(pkg["3.0.0"]["version"], "3.0.0");
+        assert!(json.get("minified").is_none());
+
+        f.teardown().await;
+    }
+
+    // -- Local repo: missing package is 404 ------------------------------
+
+    #[tokio::test]
+    async fn local_p2_missing_package_is_404() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/no/such.json", f.repo_key));
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    // -- Virtual repo: p2 resolves from a local member (#1715) -----------
+
+    #[tokio::test]
+    async fn virtual_p2_resolves_from_local_member() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        // A local member that actually holds the package.
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        insert_artifact(
+            &vf.pool,
+            member_id,
+            "symfony/serializer-pack",
+            "1.2.0",
+            "abc123",
+            Some(serde_json::json!({"composer": {"type": "metapackage"}})),
+        )
+        .await;
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/symfony/serializer-pack.json", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "virtual repo must resolve p2 from its local member (#1715)"
+        );
+        let json = body_json(&body).await;
+        let versions = json["packages"]["symfony/serializer-pack"]
+            .as_array()
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["version"], "1.2.0");
+        // dist.url is rewritten to the virtual repo key so downloads route back.
+        let url = versions[0]["dist"]["url"].as_str().unwrap();
+        assert!(
+            url.starts_with(&format!("/composer/{}/dist/", vf.repo_key)),
+            "dist url must point at virtual repo, got {}",
+            url
+        );
+
+        // cleanup member rows + repo
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
+
+    // -- Virtual repo: p1 (legacy) also resolves from a local member -----
+
+    #[tokio::test]
+    async fn virtual_p1_resolves_from_local_member() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        insert_artifact(
+            &vf.pool,
+            member_id,
+            "vendor/legacy",
+            "1.0.0",
+            "ff00ff",
+            None,
+        )
+        .await;
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p/vendor/legacy.json", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        assert_eq!(
+            json["packages"]["vendor/legacy"]["1.0.0"]["version"],
+            "1.0.0"
+        );
+
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
+
+    // -- Virtual repo: 404 only when no member has the package -----------
+
+    #[tokio::test]
+    async fn virtual_p2_404_when_no_member_has_package() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        // member exists but holds a DIFFERENT package
+        insert_artifact(&vf.pool, member_id, "other/pkg", "1.0.0", "0011", None).await;
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/missing/pkg.json", vf.repo_key));
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
+
+    // -- Virtual repo: no members at all is 404 --------------------------
+
+    #[tokio::test]
+    async fn virtual_p2_no_members_is_404() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/any/pkg.json", vf.repo_key));
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        vf.teardown().await;
+    }
+
+    // -- Virtual repo: priority order — first member with the package wins -
+
+    #[tokio::test]
+    async fn virtual_p2_respects_member_priority() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (m1, _k1, d1) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let (m2, _k2, d2) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        // Both members hold the same package at different versions.
+        insert_artifact(&vf.pool, m1, "dup/pkg", "1.0.0", "v1hash", None).await;
+        insert_artifact(&vf.pool, m2, "dup/pkg", "2.0.0", "v2hash", None).await;
+        // m2 has higher priority (lower number) so it should win.
+        add_member(&vf.pool, vf.repo_id, m1, 10).await;
+        add_member(&vf.pool, vf.repo_id, m2, 0).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/p2/dup/pkg.json", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        let versions = json["packages"]["dup/pkg"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0]["version"], "2.0.0",
+            "higher-priority member (priority 0) must win the first-hit resolution"
+        );
+
+        tdh::cleanup(&vf.pool, m1, Uuid::new_v4()).await;
+        tdh::cleanup(&vf.pool, m2, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(d1);
+        let _ = std::fs::remove_dir_all(d2);
+        vf.teardown().await;
     }
 }
