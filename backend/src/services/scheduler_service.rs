@@ -514,9 +514,17 @@ pub fn spawn_all(
         });
     }
 
-    // Chunked upload session cleanup (every hour)
+    // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();
+        // #1654: the DB-tracked session reaper below only covers uploads that
+        // inserted a session row. A monolithic incus upload — or a chunked one
+        // killed before its INSERT — stages bytes to a file with no DB row, so
+        // a receive cut short by OOM / eviction / restart leaves an orphan that
+        // nothing reaps. `sweep_orphan_staging_files` exists but was only wired
+        // to the manual admin /cleanup endpoint (gap in merged #1622). Run it on
+        // the same hourly cadence and 24h threshold as the session reaper.
+        let storage_path = config.storage_path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
@@ -533,6 +541,13 @@ pub fn spawn_all(
                         tracing::warn!("Upload session cleanup failed: {}", e);
                     }
                     _ => {}
+                }
+
+                let swept =
+                    crate::api::handlers::incus::sweep_orphan_staging_files(&storage_path, 24)
+                        .await;
+                if swept > 0 {
+                    tracing::info!("Swept {} orphaned incus staging file(s)", swept);
                 }
             }
         });
