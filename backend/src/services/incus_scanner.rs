@@ -1572,6 +1572,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extract_tarball_detects_zstd_magic() {
+        // Mirrors the xz/gzip cases: feed the zstd magic bytes (0x28 0xB5 0x2F
+        // 0xFD) followed by garbage and assert the function selects the zstd
+        // (`--zstd`) extraction path and fails gracefully on the invalid body.
+        // This exercises the `is_zstd` branch without needing a valid archive;
+        // tar still reports a non-zero exit (whether via the zstd filter or a
+        // missing-binary error), which `run_command` surfaces as the same
+        // "tar extraction failed" error.
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // zstd magic: 0x28 0xB5 0x2F 0xFD followed by invalid data.
+        let mut zstd_content = vec![0x28, 0xB5, 0x2F, 0xFD];
+        zstd_content.extend_from_slice(b"not-valid-zstd-data");
+        let content = Bytes::from(zstd_content);
+
+        let result = scanner.extract_tarball(&content, &rootfs_dir).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("tar extraction failed"));
+    }
+
+    #[tokio::test]
     async fn test_extract_tarball_detects_gzip_fallback() {
         // Content without XZ magic bytes should be treated as gzip
         let dir = tempfile::tempdir().unwrap();
