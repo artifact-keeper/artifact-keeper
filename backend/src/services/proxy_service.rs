@@ -2670,6 +2670,24 @@ impl ProxyService {
     /// `cached_at` come from the sidecar; entries whose sidecar is missing or
     /// unreadable are skipped (a half-written or legacy cache write).
     pub async fn list_cached_artifacts(&self, repo_key: &str) -> Vec<CachedArtifactEntry> {
+        let paths = self.list_cached_paths(repo_key).await;
+        self.load_cached_entries(repo_key, &paths).await
+    }
+
+    /// List the logical paths of every proxy-cached artifact for a repo
+    /// **without** loading any sidecar metadata.
+    ///
+    /// This is the cheap first half of a paginated cached listing (#1571):
+    /// the caller filters + slices these path strings down to the requested
+    /// page (both listing filters — path prefix and substring `q` — are
+    /// purely path-based) and then loads sidecars for just that page via
+    /// [`Self::load_cached_entries`]. That turns a cached listing from O(N)
+    /// sidecar reads on every request into O(page) reads, which is what
+    /// previously made large proxy caches expensive to page through.
+    ///
+    /// Returns paths sorted + deduped (see [`Self::cached_artifact_paths`]),
+    /// or an empty list when the storage backend cannot list the prefix.
+    pub async fn list_cached_paths(&self, repo_key: &str) -> Vec<String> {
         let prefix = format!("proxy-cache/{}/", repo_key);
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
@@ -2684,14 +2702,25 @@ impl ProxyService {
             }
         };
 
-        let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
+        Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str))
+    }
 
-        // Load every sidecar concurrently with bounded parallelism instead of
-        // one sequential storage round-trip per path (#1608). `cached_artifact_paths`
-        // already returns paths sorted+deduped, but `buffer_unordered` yields
-        // results out of order, so the collected entries are re-sorted by path
-        // to keep the output deterministic and identical to the sequential path.
-        let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(logical_paths)
+    /// Load sidecar metadata for a specific, already-paginated set of cached
+    /// `paths`, returning the assembled entries sorted by path.
+    ///
+    /// Pairs with [`Self::list_cached_paths`] so a cached listing only reads
+    /// the sidecars for the requested page rather than every object in the
+    /// cache (#1571). Sidecars are loaded concurrently with bounded
+    /// parallelism (#1608); `buffer_unordered` yields out of order, so the
+    /// collected entries are re-sorted by path to stay deterministic. Paths
+    /// whose sidecar is missing or unreadable are skipped, matching the
+    /// previous whole-cache load.
+    pub async fn load_cached_entries(
+        &self,
+        repo_key: &str,
+        paths: &[String],
+    ) -> Vec<CachedArtifactEntry> {
+        let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(paths.iter().cloned())
             .map(|path| async move {
                 let metadata_key = Self::cache_metadata_key(repo_key, &path).ok()?;
                 match self.load_cache_metadata(&metadata_key).await {
@@ -7123,6 +7152,126 @@ SHA256:
         assert!(
             service.list_cached_artifacts("npm-remote").await.is_empty(),
             "a storage listing error must yield no cached artifacts"
+        );
+    }
+
+    /// Storage mock that counts every `get` (sidecar read) so a test can
+    /// assert the two-phase cached listing only reads the requested page's
+    /// sidecars rather than every object in the cache (#1571).
+    struct CountingCacheMock {
+        keys: Vec<String>,
+        sidecars: std::collections::HashMap<String, Bytes>,
+        get_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CountingCacheMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.get_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.sidecars.get(key) {
+                Some(b) => Ok(b.clone()),
+                None => Err(AppError::NotFound(key.to_string())),
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_paths_reads_no_sidecars() {
+        // #1571: recovering the path set must not read a single sidecar, so the
+        // caller can filter + page the paths before paying for any metadata I/O.
+        let repo = "npm-remote";
+        let now = Utc::now();
+        let all = ["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"];
+        let mut sidecars = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for p in all {
+            sidecars.insert(
+                meta_key(repo, p),
+                sidecar_bytes(1, &"a".repeat(64), None, now),
+            );
+            keys.push(content_key(repo, p));
+            keys.push(meta_key(repo, p));
+        }
+        let get_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = std::sync::Arc::new(CountingCacheMock {
+            keys,
+            sidecars,
+            get_count: get_count.clone(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let paths = service.list_cached_paths(repo).await;
+        assert_eq!(paths, vec!["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"]);
+        assert_eq!(
+            get_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "listing cached paths must not read any sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_cached_entries_reads_only_requested_paths() {
+        // #1571: loading a single-path page out of a 3-object cache must read
+        // exactly one sidecar, not all three (the old O(N)-per-listing cost).
+        let repo = "npm-remote";
+        let now = Utc::now();
+        let all = ["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"];
+        let mut sidecars = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for p in all {
+            sidecars.insert(
+                meta_key(repo, p),
+                sidecar_bytes(7, &"b".repeat(64), None, now),
+            );
+            keys.push(content_key(repo, p));
+            keys.push(meta_key(repo, p));
+        }
+        let get_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = std::sync::Arc::new(CountingCacheMock {
+            keys,
+            sidecars,
+            get_count: get_count.clone(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let page = vec!["b/-/b-1.tgz".to_string()];
+        let entries = service.load_cached_entries(repo, &page).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "b/-/b-1.tgz");
+        assert_eq!(
+            get_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "loading a 1-path page must read exactly one sidecar, not the whole cache"
         );
     }
 

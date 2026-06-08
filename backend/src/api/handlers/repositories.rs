@@ -1892,7 +1892,12 @@ pub async fn list_artifacts(
     Query(query): Query<ListArtifactsQuery>,
 ) -> Result<Json<ArtifactListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
+    // Clamp per_page to [1, 100]: a `per_page=0` query previously slipped past
+    // the `.min(100)` upper bound and reached the `total_pages` divisions
+    // below as a divide-by-zero, saturating `total_pages` to u32::MAX for any
+    // non-empty repo (#1571). The lower bound makes both the DB and the
+    // proxy-cache listing branches well-defined.
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = ((page - 1) * per_page) as i64;
 
     let repo_service = RepositoryService::new(state.db.clone());
@@ -2085,18 +2090,33 @@ async fn list_remote_cached_artifacts(
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
-    let entries = match state.proxy_service.as_deref() {
-        Some(proxy) => proxy.list_cached_artifacts(&repo.key).await,
+    // Two-phase listing (#1571): first recover just the cached path strings
+    // (no sidecar reads), filter + slice them to the requested page, and only
+    // then load sidecars for that page. Both listing filters are path-based,
+    // so paging on the paths is exact and avoids the previous O(N) sidecar
+    // read on every request. The trade-off is that `total` counts paths whose
+    // sidecar may since have gone missing (a half-written / legacy cache
+    // write); such a path is still dropped from the returned page, matching
+    // the old per-entry skip, but is no longer pre-excluded from the count —
+    // an acceptable approximation in exchange for O(page) reads.
+    let proxy = state.proxy_service.as_deref();
+    let paths = match proxy {
+        Some(proxy) => proxy.list_cached_paths(&repo.key).await,
         // No proxy service configured (e.g. proxying disabled): nothing cached.
         None => Vec::new(),
     };
 
-    let (page_entries, total) = filter_and_paginate_cached(entries, path_prefix, q, page, per_page);
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let (page_paths, total) = filter_and_paginate_paths(paths, path_prefix, q, page, per_page);
+    let total_pages = cached_total_pages(total, per_page);
 
-    let items = page_entries
-        .into_iter()
-        .map(|entry| build_cached_artifact_response(&entry, key))
+    let entries = match proxy {
+        Some(proxy) => proxy.load_cached_entries(&repo.key, &page_paths).await,
+        None => Vec::new(),
+    };
+
+    let items = entries
+        .iter()
+        .map(|entry| build_cached_artifact_response(entry, key))
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -2113,50 +2133,59 @@ async fn list_remote_cached_artifacts(
 }
 
 /// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
-/// cache entries, then return the slice for the requested page along with the
-/// total match count.
+/// cache **paths**, then return the slice for the requested page along with
+/// the total match count.
 ///
 /// `path_prefix` matches against the start of the logical path; `q` is a
-/// case-insensitive substring match against the path. Pure so the
-/// filter/paginate logic is unit-testable without a storage backend.
-fn filter_and_paginate_cached(
-    entries: Vec<crate::services::proxy_service::CachedArtifactEntry>,
+/// case-insensitive substring match against the path. Both filters are
+/// purely path-based, so this runs on the path strings alone and the caller
+/// loads sidecars only for the returned page (#1571), instead of loading
+/// every sidecar before slicing. `per_page` is treated as at least 1 so a
+/// `per_page == 0` query cannot wedge pagination. Pure / unit-testable
+/// without a storage backend.
+fn filter_and_paginate_paths(
+    paths: Vec<String>,
     path_prefix: Option<&str>,
     q: Option<&str>,
     page: u32,
     per_page: u32,
-) -> (
-    Vec<crate::services::proxy_service::CachedArtifactEntry>,
-    usize,
-) {
+) -> (Vec<String>, usize) {
     let q_lower = q
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_lowercase);
 
-    let mut matched: Vec<_> = entries
+    let mut matched: Vec<String> = paths
         .into_iter()
-        .filter(|e| match path_prefix {
-            Some(prefix) if !prefix.is_empty() => e.path.starts_with(prefix),
+        .filter(|p| match path_prefix {
+            Some(prefix) if !prefix.is_empty() => p.starts_with(prefix),
             _ => true,
         })
-        .filter(|e| match &q_lower {
-            Some(needle) => e.path.to_lowercase().contains(needle),
+        .filter(|p| match &q_lower {
+            Some(needle) => p.to_lowercase().contains(needle),
             None => true,
         })
         .collect();
 
     // Stable ordering for deterministic pagination across requests.
-    matched.sort_by(|a, b| a.path.cmp(&b.path));
+    matched.sort();
 
     let total = matched.len();
-    let offset = ((page.saturating_sub(1)) as usize).saturating_mul(per_page as usize);
-    let page_items = matched
-        .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .collect();
+    let per_page = (per_page.max(1)) as usize;
+    let offset = (page.saturating_sub(1) as usize).saturating_mul(per_page);
+    let page_items = matched.into_iter().skip(offset).take(per_page).collect();
     (page_items, total)
+}
+
+/// Number of pages for a cached listing of `total` items at `per_page`.
+///
+/// Guards `per_page == 0` (a value a query can supply — the handler only caps
+/// the upper bound) so the count cannot saturate to `u32::MAX` the way the
+/// previous `((total as f64) / (per_page as f64)).ceil() as u32` did for any
+/// non-empty repo (#1571). Pure / unit-testable.
+fn cached_total_pages(total: usize, per_page: u32) -> u32 {
+    let per_page = (per_page.max(1)) as usize;
+    total.div_ceil(per_page) as u32
 }
 
 /// Deterministic artifact id for a proxy-cached object.
@@ -4743,55 +4772,69 @@ mod tests {
         }
     }
 
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn test_filter_and_paginate_cached_returns_all_sorted() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, None, None, 1, 20);
+    fn test_filter_and_paginate_paths_returns_all_sorted() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, None, None, 1, 20);
         assert_eq!(total, 2);
         assert_eq!(page.len(), 2);
         // Sorted by path.
-        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
-        assert_eq!(page[1].path, "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[1], "lodash/-/lodash-4.17.21.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_applies_path_prefix() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, Some("lodash/"), None, 1, 20);
+    fn test_filter_and_paginate_paths_applies_path_prefix() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, Some("lodash/"), None, 1, 20);
         assert_eq!(total, 1);
         assert_eq!(page.len(), 1);
-        assert_eq!(page[0].path, "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(page[0], "lodash/-/lodash-4.17.21.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_applies_case_insensitive_query() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, None, Some("IS-ODD"), 1, 20);
+    fn test_filter_and_paginate_paths_applies_case_insensitive_query() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, None, Some("IS-ODD"), 1, 20);
         assert_eq!(total, 1);
-        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_paginates() {
-        let entries = vec![
-            make_cached_entry("a"),
-            make_cached_entry("b"),
-            make_cached_entry("c"),
-        ];
-        let (page2, total) = filter_and_paginate_cached(entries, None, None, 2, 2);
+    fn test_filter_and_paginate_paths_paginates() {
+        let input = paths(&["a", "b", "c"]);
+        let (page2, total) = filter_and_paginate_paths(input, None, None, 2, 2);
         assert_eq!(total, 3);
         // page size 2, page 2 -> just "c"
         assert_eq!(page2.len(), 1);
-        assert_eq!(page2[0].path, "c");
+        assert_eq!(page2[0], "c");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_paths_per_page_zero_does_not_wedge() {
+        // Regression for #1571: a `per_page=0` query must not panic or produce
+        // a degenerate empty page; per_page is treated as at least 1.
+        let input = paths(&["a", "b", "c"]);
+        let (page1, total) = filter_and_paginate_paths(input, None, None, 1, 0);
+        assert_eq!(total, 3);
+        assert_eq!(page1, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_cached_total_pages_guards_per_page_zero() {
+        // Regression for #1571: the previous `(total as f64 / per_page as f64)
+        // .ceil() as u32` returned u32::MAX (saturated infinity) when per_page
+        // was 0 for a non-empty repo. The guarded version returns a sane count.
+        assert_eq!(cached_total_pages(5, 0), 5);
+        assert_eq!(cached_total_pages(0, 0), 0);
+        // Normal ceil-division behaviour is preserved.
+        assert_eq!(cached_total_pages(10, 3), 4);
+        assert_eq!(cached_total_pages(9, 3), 3);
+        assert_eq!(cached_total_pages(0, 20), 0);
     }
 
     #[test]
