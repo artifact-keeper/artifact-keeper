@@ -30,6 +30,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::curation_service::version_compare;
 
@@ -870,11 +871,21 @@ async fn push_package(
                 ("apikey".to_string(), api_key.to_string())
             };
             let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-            let (user, _) = auth_service
-                .authenticate(&username, &password)
-                .await
-                .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
-            user.id
+            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
+                user.id
+            } else if let Ok(validation) = auth_service.validate_api_token(&password).await {
+                validation.user.id
+            } else if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+                let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?
+                    .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
+                user.id
+            } else {
+                return Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response());
+            }
         }
     };
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
@@ -1121,12 +1132,137 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
     use bytes::Bytes;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    fn lazy_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    fn test_state_with_secret(secret: &str) -> SharedState {
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        let storage_root =
+            std::env::temp_dir().join(format!("ak-nuget-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
+
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                storage_root.to_str().expect("utf8 storage path"),
+            ));
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+
+        Arc::new(crate::api::AppState::new(
+            config,
+            lazy_pool(),
+            storage,
+            registry,
+        ))
+    }
+
+    fn mint_access_jwt(secret: &str, username: &str) -> String {
+        let now = Utc::now().timestamp();
+        let claims = crate::services::auth_service::Claims {
+            sub: uuid::Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: now,
+            iat_ms: Some(Utc::now().timestamp_millis()),
+            exp: now + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_push_package_requires_nuget_api_key_when_unauthenticated() {
+        let state = test_state_with_secret("test-secret-at-least-32-bytes-long-for-testing");
+        let headers = HeaderMap::new();
+
+        let resp = push_package(
+            State(state),
+            Extension(None),
+            Path("nuget-test".to_string()),
+            headers,
+            Body::from("dummy"),
+        )
+        .await
+        .expect_err("missing api key should fail before repo resolution");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "Authentication required"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_package_jwt_api_key_fallback_returns_invalid_key_on_db_error() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret(secret);
+        let jwt = mint_access_jwt(secret, "ci-user");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-NuGet-ApiKey",
+            HeaderValue::from_str(&format!("ci-user:{}", jwt)).expect("api key header"),
+        );
+
+        let resp = push_package(
+            State(state),
+            Extension(None),
+            Path("nuget-test".to_string()),
+            headers,
+            Body::from("dummy"),
+        )
+        .await
+        .expect_err("lazy pool should make JWT user lookup fail as invalid key");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Invalid API key");
+    }
 
     /// Build the base URL for NuGet service index resources.
     fn build_nuget_base_url(scheme: &str, host: &str, repo_key: &str) -> String {

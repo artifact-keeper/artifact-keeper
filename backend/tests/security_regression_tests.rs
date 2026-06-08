@@ -379,6 +379,7 @@ mod credential_change_grpc {
             username: "grpc-user".to_string(),
             email: "grpc-user@test.local".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat,
             // Legacy whole-second token shape (no ms claim); exercises the
             // effective_iat_ms() fallback to iat*1000.

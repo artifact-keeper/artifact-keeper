@@ -170,7 +170,7 @@ impl From<Claims> for AuthExtension {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: claims.allowed_repo_ids,
         }
     }
 }
@@ -328,7 +328,7 @@ pub async fn require_auth_with_bearer_fallback(
 }
 
 /// Token extraction result
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ExtractedToken<'a> {
     /// JWT or API token from Bearer scheme
     Bearer(&'a str),
@@ -563,7 +563,21 @@ pub async fn auth_middleware(
                     Err(ref e) if e.is_pool_timeout() => {
                         return service_unavailable_response();
                     }
-                    Err(_) => Err("Invalid credentials"),
+                    Err(_) => {
+                        // Try treating the password as a short-lived JWT access
+                        // token. This enables CI/CD keyless flows (e.g. OIDC
+                        // token exchange) where package managers like Maven,
+                        // pip/twine, and Helm send the AK access token as the
+                        // Basic-auth password. Carry the `iat` so credential
+                        // change invalidation can exempt the calling session.
+                        match auth_service.validate_access_token_async(&password).await {
+                            Ok(claims) => {
+                                let iat = TokenIat(claims.effective_iat_ms());
+                                Ok((AuthExtension::from(claims), Some(iat)))
+                            }
+                            Err(_) => Err("Invalid credentials"),
+                        }
+                    }
                 }
             }
         },
@@ -859,6 +873,13 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // `AuthOutcome::Overloaded`.
                 Err(ref e) if e.is_pool_timeout() => return AuthOutcome::Overloaded,
                 Err(_) => {}
+            }
+            // Try treating the password as a short-lived JWT access token.
+            // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
+            // package managers like Maven, pip/twine, and Helm send the AK access
+            // token as the Basic auth password.
+            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+                return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format
@@ -1167,63 +1188,28 @@ pub async fn admin_middleware(
 ) -> Response {
     let extracted = extract_token(&request);
 
-    let auth_ext = match extracted {
-        // Admin middleware uses the async (replica-safe) access-token validator
-        // for the same reason as the main auth middleware (#1173). An admin
-        // who has had their privileges revoked on replica A must lose access
-        // on replica B too, even if they're holding a Bearer token whose `iat`
-        // predates the revocation.
-        ExtractedToken::Bearer(token) => {
-            match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => AuthExtension::from(claims),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => ext,
-                    // A saturated bcrypt cap is a retryable 503, never a 401.
-                    // See `TokenAuthError::Overloaded`.
-                    Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                    Err(TokenAuthError::Invalid) => {
-                        return (StatusCode::UNAUTHORIZED, "Invalid or expired token")
-                            .into_response()
-                    }
-                },
-            }
-        }
-        ExtractedToken::ApiKey(token) => {
-            match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => ext,
-                Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                Err(TokenAuthError::Invalid) => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid or expired API token")
-                        .into_response()
-                }
-            }
-        }
-        ExtractedToken::Basic(encoded) => {
-            let Some((username, password)) = decode_basic_credentials(encoded) else {
-                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials")
-                    .into_response();
+    if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none())
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials").into_response();
+    }
+
+    // Shared credential resolution (same forms as the other authenticated
+    // routes, including CI/CD keyless flows where the AK access token is sent
+    // as the Basic-auth password). Use the tri-state outcome so a transient
+    // bcrypt-cap or pool-acquire shed surfaces as a retryable 503, never a
+    // spurious 401 (#2101/#2125). Admin privilege is enforced below.
+    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted).await {
+        AuthOutcome::Resolved(ext) => ext,
+        AuthOutcome::Overloaded => return service_unavailable_response(),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
+            let msg = match extracted {
+                ExtractedToken::Bearer(_) => "Invalid or expired token",
+                ExtractedToken::ApiKey(_) => "Invalid or expired API token",
+                ExtractedToken::Basic(_) => "Invalid credentials",
+                ExtractedToken::None => "Missing authorization header",
+                ExtractedToken::Invalid => "Invalid authorization header format",
             };
-            match auth_service.authenticate(&username, &password).await {
-                Ok((user, _token_pair)) => AuthExtension::from(user),
-                // A pool-acquire timeout during the credential DB lookup is a
-                // transient capacity problem (POOL_EXHAUSTED), not a bad
-                // password: surface a retryable 503 rather than flattening it
-                // to a spurious 401 (#2125).
-                Err(ref e) if e.is_pool_timeout() => return service_unavailable_response(),
-                Err(_) => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-                }
-            }
-        }
-        ExtractedToken::None => {
-            return (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response();
-        }
-        ExtractedToken::Invalid => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Invalid authorization header format",
-            )
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, msg).into_response();
         }
     };
 
@@ -1674,6 +1660,8 @@ pub async fn repo_visibility_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
 
     // -----------------------------------------------------------------------
     // extract_token_from_auth_header
@@ -1846,6 +1834,7 @@ mod tests {
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -1871,6 +1860,7 @@ mod tests {
             username: "regular".to_string(),
             email: "regular@example.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -3373,6 +3363,68 @@ mod tests {
         // exercising "auth fails, fall through" branches.
         let pool = lazy_pool();
         Arc::new(AuthService::new(pool, make_test_config_for_middleware()))
+    }
+
+    fn mint_access_jwt(secret: &str, sub: Uuid, username: &str) -> String {
+        // Real millisecond iat: minted strictly after the user row exists, so
+        // the credential-change watermark (strict `<`) accepts the token.
+        let now = Utc::now();
+        let claims = Claims {
+            sub,
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let cfg = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        let auth_service = AuthService::new(pool.clone(), Arc::new(cfg));
+        // The async validator re-derives is_admin from the live users row and
+        // rejects tokens whose subject has no active row, so the minted JWT
+        // must reference a real user.
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let jwt = mint_access_jwt(secret, user_id, "ci-user");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
+
+        let resolved = try_resolve_auth(&auth_service, ExtractedToken::Basic(&basic)).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup test user");
+
+        let ext = resolved.expect("expected jwt fallback to authenticate basic password");
+        assert_eq!(ext.username, "ci-user");
+        assert!(!ext.is_admin);
+        assert!(!ext.is_api_token);
     }
 
     async fn run_through_auth_middleware(

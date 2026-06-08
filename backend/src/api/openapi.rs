@@ -175,6 +175,8 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
     doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
     doc.merge(super::handlers::smtp::SmtpApiDoc::openapi());
+    doc.merge(super::handlers::ci_auth::CiAuthApiDoc::openapi());
+    doc.merge(super::handlers::ci_auth_admin::CiAuthAdminApiDoc::openapi());
 
     doc
 }
@@ -484,6 +486,10 @@ mod tests {
                 vec![include_str!("handlers/sso_admin.rs")],
             ),
             // --- Nested auth sub-modules ---
+            (
+                "/api/v1/auth/ci/",
+                vec![include_str!("handlers/ci_auth.rs")],
+            ),
             ("/api/v1/auth/sso/", vec![include_str!("handlers/sso.rs")]),
             ("/api/v1/auth/totp/", vec![include_str!("handlers/totp.rs")]),
             // --- Top-level API modules ---

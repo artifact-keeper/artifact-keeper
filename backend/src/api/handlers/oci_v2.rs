@@ -35,6 +35,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
+use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
@@ -374,6 +375,27 @@ async fn authenticate_oci_with_scopes(
                             .map_err(|_| ())
                     })?;
                 return Ok((claims, None));
+            }
+
+            // Final fallback: accept a valid AK access token (JWT) as the Docker
+            // password. Enables the CI/CD keyless push flow where the token from
+            // the OIDC exchange is used directly as the Docker credential.
+            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+                if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_one(db)
+                    .await
+                {
+                    return auth_service
+                        .generate_tokens(&user)
+                        .map_err(|_| ())
+                        .and_then(|tokens| {
+                            auth_service
+                                .validate_access_token(&tokens.access_token)
+                                .map_err(|_| ())
+                        })
+                        .map(|claims| (claims, None));
+                }
             }
 
             Err(())
@@ -3623,11 +3645,54 @@ async fn token(
             {
                 Ok((user, tokens)) => (user, tokens, false),
                 Err(_) => {
-                    return oci_error(
-                        StatusCode::UNAUTHORIZED,
-                        "UNAUTHORIZED",
-                        "invalid username or password",
-                    )
+                    // Final fallback: accept a valid AK access token (JWT) as the
+                    // Docker password. This enables the CI/CD keyless push flow:
+                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
+                    //   3. docker push ...
+                    // This mirrors how Artifactory handles its OIDC-issued tokens.
+                    match auth_service
+                        .validate_access_token_async(&credentials.1)
+                        .await
+                    {
+                        Ok(claims) => {
+                            let user = match sqlx::query_as::<_, User>(
+                                "SELECT * FROM users WHERE id = $1",
+                            )
+                            .bind(claims.sub)
+                            .fetch_one(&state.db)
+                            .await
+                            {
+                                Ok(u) => u,
+                                Err(_) => {
+                                    return oci_error(
+                                        StatusCode::UNAUTHORIZED,
+                                        "UNAUTHORIZED",
+                                        "user not found",
+                                    )
+                                }
+                            };
+                            let tokens = match auth_service.generate_tokens(&user) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return oci_error(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "INTERNAL_ERROR",
+                                        "failed to generate tokens",
+                                    )
+                                }
+                            };
+                            // Treat like an API token: bypass the TOTP guard below.
+                            (user, tokens, true)
+                        }
+                        Err(_) => {
+                            return oci_error(
+                                StatusCode::UNAUTHORIZED,
+                                "UNAUTHORIZED",
+                                "invalid username or password",
+                            )
+                        }
+                    }
                 }
             },
         };
@@ -3699,6 +3764,16 @@ async fn version_check(
 
         // Fall back to API token in the password field
         if auth_service.validate_api_token(&password).await.is_ok() {
+            return version_check_ok();
+        }
+
+        // Final fallback: accept AK JWT access token in the Basic password field.
+        // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
+        if auth_service
+            .validate_access_token_async(&password)
+            .await
+            .is_ok()
+        {
             return version_check_ok();
         }
     }
@@ -7763,6 +7838,9 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // enforce_scan_pull_scope (#2093)
@@ -7774,6 +7852,7 @@ mod tests {
             username: "_ak_scanner".to_string(),
             email: "scanner@artifact-keeper.internal".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: 0,
             iat_ms: None,
             exp: i64::MAX,
@@ -9301,6 +9380,81 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    fn lazy_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    fn test_state_with_secret(secret: &str) -> SharedState {
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        build_test_state(config, lazy_pool())
+    }
+
+    fn test_state_with_secret_and_pool(secret: &str, pool: sqlx::PgPool) -> SharedState {
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        build_test_state(config, pool)
+    }
+
+    fn build_test_state(config: crate::config::Config, pool: sqlx::PgPool) -> SharedState {
+        let storage_root = std::env::temp_dir().join(format!("ak-oci-v2-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
+
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                storage_root.to_str().expect("utf8 storage path"),
+            ));
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+
+        Arc::new(crate::api::AppState::new(config, pool, storage, registry))
+    }
+
+    fn mint_access_jwt(secret: &str, sub: Uuid, username: &str) -> String {
+        // Real millisecond iat: minted strictly after the user row exists, so
+        // the credential-change watermark (strict `<`) accepts the token.
+        let now = Utc::now();
+        let claims = crate::services::auth_service::Claims {
+            sub,
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
+
     // -----------------------------------------------------------------------
     // version_check_ok
     // -----------------------------------------------------------------------
@@ -9329,6 +9483,74 @@ mod tests {
             resp.headers().get(CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn test_version_check_accepts_basic_password_jwt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret_and_pool(secret, pool.clone());
+        // The async validator re-derives is_admin from the live users row and
+        // rejects tokens whose subject has no active row, so the minted JWT
+        // must reference a real user.
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let jwt = mint_access_jwt(secret, user_id, "ci-user");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
+        );
+
+        let resp = version_check(
+            State(state),
+            headers,
+            RequestBaseUrl("http://localhost:8080".to_string()),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup test user");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("Docker-Distribution-API-Version")
+                .expect("distribution header"),
+            "registry/2.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_check_rejects_basic_password_invalid_jwt() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret(secret);
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode("ci-user:not-a-valid-access-token");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
+        );
+
+        let resp = version_check(
+            State(state),
+            headers,
+            RequestBaseUrl("http://localhost:8080".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("WWW-Authenticate").is_some());
     }
 
     // -----------------------------------------------------------------------
