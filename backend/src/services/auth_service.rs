@@ -78,6 +78,11 @@ pub struct Claims {
     pub email: String,
     /// Is admin
     pub is_admin: bool,
+    /// Repository IDs this access token is restricted to (None = unrestricted).
+    ///
+    /// Access-token only. Refresh tokens leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
     pub iat: i64,
     /// Expiration time (Unix timestamp)
@@ -867,12 +872,33 @@ impl AuthService {
     /// here; callers persist it through
     /// [`AuthService::record_refresh_token_jti`] after generation.
     pub fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
-        self.generate_tokens_with_family(user, Uuid::new_v4())
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), None)
+    }
+
+    /// Generate access and refresh tokens for a user, restricting the access
+    /// token to a specific repository allow-list when provided.
+    pub fn generate_tokens_with_repo_scope(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<TokenPair> {
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids)
     }
 
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
+        self.generate_tokens_with_family_and_scope(user, family_id, None)
+    }
+
+    /// Generate tokens with a specific refresh-token family and optional
+    /// access-token repository allow-list.
+    fn generate_tokens_with_family_and_scope(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<TokenPair> {
         let now = Utc::now();
         let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
@@ -882,6 +908,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids,
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
@@ -895,6 +922,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
@@ -1600,6 +1628,13 @@ impl AuthService {
                         .to_string(),
                 ))
             }
+            Some(AuthProvider::Ci) => {
+                // CI authentication is handled via the CI OIDC token exchange endpoint.
+                Err(AppError::Authentication(
+                    "CI authentication requires a CI-issued OIDC JWT. Use /api/v1/auth/ci/token."
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -1669,6 +1704,18 @@ impl AuthService {
         provider: AuthProvider,
         credentials: FederatedCredentials,
     ) -> Result<(User, TokenPair)> {
+        self.authenticate_federated_with_scope(provider, credentials, None)
+            .await
+    }
+
+    /// Authenticate a federated user after successful SSO (OIDC/SAML), with
+    /// an optional repository allow-list embedded into the issued access token.
+    pub async fn authenticate_federated_with_scope(
+        &self,
+        provider: AuthProvider,
+        credentials: FederatedCredentials,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<(User, TokenPair)> {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
@@ -1681,7 +1728,7 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens_with_repo_scope(&user, allowed_repo_ids)?;
         self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
     }
@@ -2092,6 +2139,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
@@ -2547,6 +2595,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
@@ -2559,6 +2608,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
@@ -2592,6 +2642,63 @@ mod tests {
         assert_eq!(decoded.claims.token_type, "refresh");
     }
 
+    #[tokio::test]
+    async fn test_generate_tokens_with_repo_scope_embeds_access_restrictions() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let expected_scope = Some(vec![repo_a, repo_b]);
+
+        let tokens = service
+            .generate_tokens_with_repo_scope(&user, expected_scope.clone())
+            .expect("scoped token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, expected_scope);
+
+        let refresh_claims = decode::<Claims>(
+            &tokens.refresh_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("refresh token should decode")
+        .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_generate_tokens_with_repo_scope_none_stays_unrestricted() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+
+        let tokens = service
+            .generate_tokens_with_repo_scope(&user, None)
+            .expect("token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+
+        assert_eq!(access_claims.allowed_repo_ids, None);
+    }
+
     #[test]
     fn test_validate_access_token_rejects_refresh_token() {
         let config = make_test_config();
@@ -2605,6 +2712,7 @@ mod tests {
             username: "user".to_string(),
             email: "user@test.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: (now + Duration::days(7)).timestamp(),
             token_type: "refresh".to_string(),
@@ -2634,6 +2742,7 @@ mod tests {
             username: "expired".to_string(),
             email: "expired@test.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: (now - Duration::hours(2)).timestamp(),
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
             token_type: "access".to_string(),
@@ -2657,6 +2766,7 @@ mod tests {
             username: "user".to_string(),
             email: "u@t.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
@@ -2681,6 +2791,7 @@ mod tests {
             username: "test".to_string(),
             email: "test@x.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
@@ -2707,6 +2818,7 @@ mod tests {
             username: "u".to_string(),
             email: "u@x.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: 1000,
             exp: 2000,
             token_type: "refresh".to_string(),
@@ -3478,6 +3590,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat,
             exp: iat + 3600,
             token_type: "access".to_string(),
@@ -3820,6 +3933,7 @@ mod tests {
             username: "attacker".to_string(),
             email: "evil@test.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: Utc::now().timestamp(),
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
@@ -4015,6 +4129,108 @@ mod tests {
             "deactivate_missing_users with no targets must succeed, got: {result:?}"
         );
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_embeds_access_repo_scope() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-{suffix}"),
+            username: format!("ci_scope_{suffix}"),
+            email: format!("ci_scope_{suffix}@test.local"),
+            display_name: Some("CI Scoped User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+        };
+        let expected_scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, expected_scope.clone())
+            .await
+            .expect("federated scoped auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, expected_scope);
+
+        let refresh_claims = service
+            .decode_token(&tokens.refresh_token)
+            .expect("decode refresh")
+            .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_none_is_unrestricted() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-none-{suffix}"),
+            username: format!("ci_none_{suffix}"),
+            email: format!("ci_none_{suffix}@test.local"),
+            display_name: Some("CI Unrestricted User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+        };
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, None)
+            .await
+            .expect("federated auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------

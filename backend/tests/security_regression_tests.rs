@@ -296,6 +296,7 @@ mod credential_change_grpc {
             username: "grpc-user".to_string(),
             email: "grpc-user@test.local".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat,
             exp: iat + 3600,
             token_type: "access".to_string(),
