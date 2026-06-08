@@ -1671,23 +1671,31 @@ impl StorageBackend for GcsBackend {
     }
 
     async fn health_check(&self) -> Result<()> {
-        // GET the bucket metadata endpoint. A successful response proves that
-        // the bucket exists, credentials are valid, and the network path works.
-        let url = format!(
-            "{}/storage/v1/b/{}",
-            self.base_url,
-            urlencoding::encode(&self.config.bucket),
-        );
+        // GET the metadata of a sentinel object (`.health-probe`). This exercises
+        // the same object-level permission the backend actually uses at runtime
+        // (`storage.objects.get`), so a least-privilege object-scoped credential
+        // — e.g. GCS `roles/storage.objectUser` / `roles/storage.objectViewer`,
+        // or the S3/Azure equivalents — passes. The old probe hit the bucket
+        // metadata endpoint (`GET /storage/v1/b/{bucket}`), which demands
+        // `storage.buckets.get` (bucket-admin level), so object-only deployments
+        // got 403 and `/health` reported storage unhealthy even though all reads
+        // and writes worked (issue #1569).
+        //
+        // A 404 is healthy: it proves the bucket is reachable, credentials are
+        // valid, and object reads are authorized — the probe object simply does
+        // not exist. Only transport errors or auth failures indicate a genuinely
+        // broken backend.
+        let url = self.object_metadata_url(".health-probe");
         let response = self
             .authorized_get(&url)
             .await
             .map_err(|e| AppError::Storage(format!("GCS health check failed: {}", e)))?;
 
-        if response.status().is_success() {
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
         }
 
-        let status = response.status();
         let body = response.text().await.unwrap_or_default();
         Err(AppError::Storage(format!(
             "GCS health check failed (status {}): {}",
@@ -3495,5 +3503,98 @@ mod tests {
         let backend = mock_backend(&server.uri()).await;
         let result = backend.size("missing.bin").await;
         assert!(matches!(result.unwrap_err(), AppError::NotFound(_)));
+    }
+
+    // ---- health_check (issue #1569: object-level, not bucket-admin) ----
+
+    /// The probe must hit the OBJECT metadata endpoint
+    /// (`/storage/v1/b/<bucket>/o/.health-probe`), which only needs
+    /// `storage.objects.get`. It must NOT hit the bucket metadata endpoint
+    /// (`/storage/v1/b/<bucket>` with no `/o/...`), which needs the
+    /// bucket-admin `storage.buckets.get`. We assert this by mounting ONLY the
+    /// object endpoint with `expect(1)` and explicitly failing the bucket
+    /// endpoint; wiremock's `verify()` (on drop) confirms the expected call.
+    #[tokio::test]
+    async fn test_health_check_uses_object_endpoint_not_bucket() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Object-level metadata GET: this is the only call the probe is allowed
+        // to make. Respond 200 (object exists) -> healthy.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/storage/v1/b/[^/]+/o/\.health-probe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": ".health-probe",
+                "size": "0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Bucket-level metadata GET (the old over-privileged call): if the probe
+        // ever hits this, the test fails because we return 403, mimicking a
+        // least-privilege credential without storage.buckets.get.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/storage/v1/b/[^/]+$"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(
+                    "Caller does not have storage.buckets.get access to the bucket.",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let result = backend.health_check().await;
+        assert!(
+            result.is_ok(),
+            "health_check should pass via object endpoint: {:?}",
+            result
+        );
+        // verify() on drop asserts the object endpoint was hit exactly once.
+    }
+
+    /// A 404 on the probe object means the bucket is reachable, credentials are
+    /// valid, and object reads are authorized — the sentinel object just does
+    /// not exist. That is healthy.
+    #[tokio::test]
+    async fn test_health_check_object_not_found_is_healthy() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/storage/v1/b/[^/]+/o/\.health-probe$"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        assert!(backend.health_check().await.is_ok());
+    }
+
+    /// A 403 on the OBJECT endpoint is a genuinely broken/under-privileged
+    /// backend (the credential cannot even read objects), so the probe fails.
+    #[tokio::test]
+    async fn test_health_check_object_forbidden_is_unhealthy() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/storage/v1/b/[^/]+/o/\.health-probe$"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Access Denied"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let err = backend.health_check().await.unwrap_err();
+        assert!(
+            matches!(&err, AppError::Storage(m) if m.contains("403")),
+            "expected storage error mentioning 403, got: {:?}",
+            err
+        );
     }
 }
