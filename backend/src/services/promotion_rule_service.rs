@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::promotion::PromotionRule;
+use crate::services::scan_state::{classify_scan_state, ScanState, ScanStateRow, SCAN_STATE_SQL};
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -66,6 +67,28 @@ pub struct AutoPromotionResult {
 // ---------------------------------------------------------------------------
 // Pure evaluation helpers (no DB access, testable in isolation)
 // ---------------------------------------------------------------------------
+
+/// Decide whether a CVE-severity rule should block auto-promotion based purely
+/// on the artifact's [`ScanState`], when no completed scan exists.
+///
+/// A rule with `max_cve_severity` set requires the artifact to be scanned, so
+/// this fails CLOSED: a genuinely-unscanned artifact (never scanned, mid-scan,
+/// or a crashed scanner -- see [`ScanState::is_unscanned`]) is a VIOLATION and
+/// must not be auto-promoted. This mirrors `block_unscanned` on the manual
+/// (policy) path. `Completed` and `NotApplicable` never reach this function via
+/// the unscanned branch in practice, but are handled defensively as passes so
+/// the deny-by-default applies ONLY to genuinely-unscanned artifacts.
+pub(crate) fn check_scan_state_for_cve_rule(state: ScanState) -> Option<String> {
+    if state.is_unscanned() {
+        Some(format!(
+            "Artifact has no completed security scan (scan state: {}); \
+             a CVE severity rule requires a completed scan before auto-promotion",
+            state.reason_token()
+        ))
+    } else {
+        None
+    }
+}
 
 /// Check if the highest severity found in scan results exceeds the max allowed
 /// severity from the rule.
@@ -345,6 +368,20 @@ impl PromotionRuleService {
         let now = Utc::now();
 
         // 1. CVE severity check
+        //
+        // A rule that sets `max_cve_severity` REQUIRES the artifact to be
+        // scanned. Auto-promotion must fail CLOSED here: if there is no
+        // completed scan and the artifact is genuinely unscanned (never
+        // scanned, mid-scan, or a crashed scanner -- see
+        // [`ScanState::is_unscanned`]), record a violation instead of silently
+        // skipping the check. This mirrors the manual path's `block_unscanned`
+        // gate (`PromotionPolicyService::evaluate_block_unscanned`) so an
+        // unscanned artifact is never auto-promoted past a CVE rule (#1648
+        // fixed only the manual path; this closes the parallel auto path).
+        //
+        // A `not_applicable` scan state (scanning genuinely does not apply to
+        // this artifact's format) and a `completed` scan both pass through to
+        // the count-based check -- they must NOT be treated as unscanned.
         if let Some(ref max_severity) = rule.max_cve_severity {
             if let Some(scan) = self.get_latest_scan(artifact_id).await? {
                 if let Some(v) = check_cve_severity(
@@ -356,8 +393,14 @@ impl PromotionRuleService {
                 ) {
                     violations.push(v);
                 }
+            } else {
+                // No completed scan: classify the overall scan state and block
+                // only when the artifact is genuinely unscanned.
+                let state = self.get_scan_state(artifact_id).await?;
+                if let Some(v) = check_scan_state_for_cve_rule(state) {
+                    violations.push(v);
+                }
             }
-            // No scan results => skip CVE check (not a violation)
         }
 
         // 2. License check
@@ -460,6 +503,21 @@ impl PromotionRuleService {
     // -----------------------------------------------------------------------
     // Internal DB helpers
     // -----------------------------------------------------------------------
+
+    /// Fetch all `scan_results` rows for an artifact and classify the overall
+    /// scan state. Thin DB wrapper around the pure
+    /// [`classify_scan_state`](crate::services::scan_state::classify_scan_state),
+    /// shared with `PromotionPolicyService` so both promotion paths agree on
+    /// what counts as "unscanned".
+    async fn get_scan_state(&self, artifact_id: Uuid) -> Result<ScanState> {
+        let rows: Vec<ScanStateRow> = sqlx::query_as(SCAN_STATE_SQL)
+            .bind(artifact_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(classify_scan_state(&rows))
+    }
 
     async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
@@ -653,6 +711,68 @@ mod tests {
         // Unknown severity string defaults to level 2 (medium)
         let result = check_cve_severity("unknown-value", 0, 3, 0, 0);
         assert!(result.is_some()); // high > medium threshold
+    }
+
+    // =======================================================================
+    // check_scan_state_for_cve_rule (fail-closed on unscanned, #1648 follow-up)
+    // =======================================================================
+
+    #[test]
+    fn test_scan_state_never_scanned_blocks() {
+        // A CVE rule with no scan at all must BLOCK auto-promotion, not skip.
+        let v = check_scan_state_for_cve_rule(ScanState::NeverScanned);
+        assert!(v.is_some());
+        let msg = v.unwrap();
+        assert!(msg.contains("no completed security scan"));
+        assert!(msg.contains("never_scanned"));
+    }
+
+    #[test]
+    fn test_scan_state_in_progress_blocks() {
+        // Mid-vetting artifact must not be auto-promoted as if clean.
+        let v = check_scan_state_for_cve_rule(ScanState::InProgress);
+        assert!(v.is_some());
+        assert!(v.unwrap().contains("scan_in_progress"));
+    }
+
+    #[test]
+    fn test_scan_state_failed_blocks() {
+        // A crashed scanner means the artifact is NOT vetted -> block.
+        let v = check_scan_state_for_cve_rule(ScanState::Failed);
+        assert!(v.is_some());
+        assert!(v.unwrap().contains("scan_failed"));
+    }
+
+    #[test]
+    fn test_scan_state_completed_passes() {
+        // A completed scan is handled by the count-based check; the unscanned
+        // guard must not over-block it.
+        assert!(check_scan_state_for_cve_rule(ScanState::Completed).is_none());
+    }
+
+    #[test]
+    fn test_scan_state_not_applicable_passes() {
+        // Scanning genuinely does not apply to this format -> never block.
+        assert!(check_scan_state_for_cve_rule(ScanState::NotApplicable).is_none());
+    }
+
+    #[test]
+    fn test_scan_state_block_matches_is_unscanned_matrix() {
+        // The block decision must exactly track ScanState::is_unscanned so the
+        // auto-promotion path agrees with the manual block_unscanned gate.
+        for state in [
+            ScanState::Completed,
+            ScanState::InProgress,
+            ScanState::Failed,
+            ScanState::NeverScanned,
+            ScanState::NotApplicable,
+        ] {
+            assert_eq!(
+                check_scan_state_for_cve_rule(state).is_some(),
+                state.is_unscanned(),
+                "block decision diverged from is_unscanned for {state:?}"
+            );
+        }
     }
 
     // =======================================================================
