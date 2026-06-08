@@ -5,6 +5,20 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{PolicyResult, ScanPolicy, Severity};
+use crate::services::scan_state::ScanState;
+
+/// Whether the `block_unscanned` gate should fire for an artifact in the given
+/// aggregate scan state (#1649).
+///
+/// Fires when the policy enables it AND the artifact is "genuinely unscanned"
+/// per [`ScanState::is_unscanned`] — i.e. it has no completed scan and the
+/// reason is not "scanning does not apply". This deliberately fires on
+/// `Failed` / `InProgress` / `NeverScanned`, closing the gap where a `failed`
+/// or `pending` scan row used to satisfy the old `latest_scan.is_none()` check
+/// and let the artifact bypass the gate. Pure / unit-testable.
+fn block_unscanned_violated(block_unscanned: bool, scan_state: ScanState) -> bool {
+    block_unscanned && scan_state.is_unscanned()
+}
 
 pub struct PolicyService {
     db: PgPool,
@@ -78,12 +92,29 @@ impl PolicyService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #1649: classify the artifact's overall scan state from ALL its
+        // scan_results rows (the same precedence the promotion gate uses), not
+        // just whether the latest row exists. A `failed` / `pending` / `running`
+        // scan still means the artifact was never SUCCESSFULLY scanned, so the
+        // `block_unscanned` gate must treat it as unscanned. The old
+        // `latest_scan.is_none()` check let those slip through whenever any scan
+        // row existed, letting a crashed-scanner artifact bypass the gate when
+        // `block_on_fail` was off.
+        let scan_state_rows: Vec<crate::services::scan_state::ScanStateRow> =
+            sqlx::query_as(crate::services::scan_state::SCAN_STATE_SQL)
+                .bind(artifact_id)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        let scan_state = crate::services::scan_state::classify_scan_state(&scan_state_rows);
+
         for policy in &policies {
             // Check: block_unscanned
-            if policy.block_unscanned && latest_scan.is_none() {
+            if block_unscanned_violated(policy.block_unscanned, scan_state) {
                 violations.push(format!(
-                    "Policy '{}': artifact has not been scanned",
-                    policy.name
+                    "Policy '{}': artifact has not been scanned ({})",
+                    policy.name,
+                    scan_state.reason_token()
                 ));
                 continue;
             }
@@ -290,6 +321,56 @@ impl PolicyService {
 mod tests {
     use super::*;
     use crate::models::security::{PolicyResult, ScanPolicy, Severity};
+
+    // -----------------------------------------------------------------------
+    // block_unscanned gate (#1649)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_unscanned_fires_on_failed_or_in_progress_scan() {
+        // #1649 regression: the old `latest_scan.is_none()` check treated ANY
+        // scan row (including a crashed `failed` or still-`pending` one) as
+        // "scanned", so block_unscanned silently passed an un-vetted artifact
+        // whenever block_on_fail happened to be off. The aggregate scan-state
+        // classification must instead fire the gate on every non-completed,
+        // applicable state.
+        assert!(
+            block_unscanned_violated(true, ScanState::Failed),
+            "a crashed scan must trip block_unscanned"
+        );
+        assert!(
+            block_unscanned_violated(true, ScanState::InProgress),
+            "a pending/running scan must trip block_unscanned"
+        );
+        assert!(
+            block_unscanned_violated(true, ScanState::NeverScanned),
+            "no scan at all must trip block_unscanned"
+        );
+    }
+
+    #[test]
+    fn test_block_unscanned_passes_completed_and_not_applicable() {
+        // A completed scan, or a format to which scanning does not apply, must
+        // never be blocked by this gate.
+        assert!(!block_unscanned_violated(true, ScanState::Completed));
+        assert!(!block_unscanned_violated(true, ScanState::NotApplicable));
+    }
+
+    #[test]
+    fn test_block_unscanned_disabled_never_fires() {
+        for state in [
+            ScanState::Failed,
+            ScanState::InProgress,
+            ScanState::NeverScanned,
+            ScanState::Completed,
+            ScanState::NotApplicable,
+        ] {
+            assert!(
+                !block_unscanned_violated(false, state),
+                "gate disabled -> never a violation regardless of scan state"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // PolicyResult construction

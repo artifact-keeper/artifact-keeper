@@ -268,6 +268,15 @@ pub struct PermissionsResponse {
     pub permissions: Vec<PermissionTarget>,
 }
 
+/// Decide whether an Artifactory-supplied `downloadUri` is safe to follow
+/// (#1423). The storage-API `downloadUri` is attacker-influenceable, so it must
+/// pass the same outbound SSRF policy (`validate_outbound_url`) as any other
+/// upstream URL before we issue a request to it. Factored out as a free
+/// function so the guard is unit-testable without a live HTTP client.
+fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
+    crate::api::validation::validate_outbound_url(download_uri, "Artifactory downloadUri").is_ok()
+}
+
 impl ArtifactoryClient {
     /// Create a new Artifactory client with the given configuration
     pub fn new(config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
@@ -591,6 +600,25 @@ impl ArtifactoryClient {
             return Ok(response);
         }
 
+        // #1423: `download_uri` comes from the upstream Artifactory storage API
+        // response, which is attacker-influenceable (a hostile or compromised
+        // source instance can point it anywhere). It must pass the outbound
+        // SSRF policy before we issue a request to it. The `download_uri ==
+        // raw_url` check above is a migration-specific constraint, NOT an SSRF
+        // guard: any differing path or port (e.g. the cloud-metadata endpoint
+        // `http://169.254.169.254/...`) sails past it. The shared client's
+        // redirect policy only screens redirect *hops*, not this initial
+        // connection. On rejection, fall back to the original 404 response.
+        if !download_uri_is_safe_to_follow(&download_uri) {
+            tracing::warn!(
+                repo = %repo_key,
+                path = %path,
+                download_uri = %download_uri,
+                "Rejecting Artifactory downloadUri: failed outbound SSRF validation"
+            );
+            return Ok(response);
+        }
+
         tracing::debug!(
             repo = %repo_key,
             path = %path,
@@ -759,6 +787,37 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_download_uri_ssrf_guard_rejects_dangerous_targets() {
+        // #1423 regression: a malicious/compromised upstream Artifactory can put
+        // an internal or metadata address in the storage-API `downloadUri`. The
+        // guard must refuse to follow it. These targets are hard-blocked
+        // regardless of the private-IP allowlist toggle, so the assertions are
+        // deterministic and require no network/DNS.
+        assert!(
+            !download_uri_is_safe_to_follow("http://169.254.169.254/latest/meta-data/"),
+            "cloud-metadata link-local IP must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("http://metadata.google.internal/computeMetadata/v1/"),
+            "cloud-metadata hostname must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("http://127.0.0.1:8081/artifactory/x/a.jar"),
+            "loopback must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("file:///etc/passwd"),
+            "non-http(s) scheme must be rejected"
+        );
+        // A normal public upstream URL is still followed (no DNS lookup happens
+        // for a non-literal host, so this is offline-deterministic too).
+        assert!(
+            download_uri_is_safe_to_follow("https://repo.example.com/artifactory/libs/a-1.0.jar"),
+            "a public upstream downloadUri must still be allowed"
+        );
+    }
 
     #[test]
     fn test_config_default() {
