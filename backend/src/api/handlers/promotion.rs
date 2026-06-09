@@ -417,6 +417,25 @@ async fn enforce_release_target_link(
     Ok(())
 }
 
+/// Authorize a direct promotion request.
+///
+/// Promoting an artifact into a release repository is an admin-only action,
+/// matching the authorization on the approval workflow's
+/// `POST /api/v1/approval/{id}/approve` endpoint. Without this gate the
+/// approval/governance workflow could be bypassed by promoting directly via
+/// the `/promote` routes.
+///
+/// Split into a pure helper so the admin-gate decision is shared by the single
+/// and bulk promote handlers and can be unit tested without a DB or storage.
+fn ensure_promotion_authorized(is_admin: bool) -> Result<()> {
+    if !is_admin {
+        return Err(AppError::Authorization(
+            "Only admins can promote artifacts".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
         promoted: false,
@@ -452,6 +471,8 @@ pub async fn promote_artifact(
     Path((repo_key, artifact_id)): Path<(String, Uuid)>,
     Json(req): Json<PromoteArtifactRequest>,
 ) -> Result<Json<PromotionResponse>> {
+    ensure_promotion_authorized(auth.is_admin)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
 
     let source_repo = repo_service.get_by_key(&repo_key).await?;
@@ -703,6 +724,8 @@ pub async fn promote_artifacts_bulk(
     Path(repo_key): Path<String>,
     Json(req): Json<BulkPromoteRequest>,
 ) -> Result<Json<BulkPromotionResponse>> {
+    ensure_promotion_authorized(auth.is_admin)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
 
     let source_repo = repo_service.get_by_key(&repo_key).await?;
@@ -1327,6 +1350,29 @@ pub struct PromotionApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ensure_promotion_authorized (admin-only gate on /promote routes)
+    //
+    // Regression for the direct-promotion authorization bug: a non-admin
+    // caller could promote artifacts straight into a release repository via
+    // the `/promote` routes, bypassing the admin-gated approval workflow.
+    // The single and bulk promote handlers now both call this helper.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_promotion_authorized_admin_ok() {
+        assert!(ensure_promotion_authorized(true).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_promotion_authorized_non_admin_denied() {
+        let err = ensure_promotion_authorized(false).unwrap_err();
+        // Non-admin promotion is an authorization failure (HTTP 403), matching
+        // the approval workflow's approve/reject endpoints.
+        assert!(matches!(err, AppError::Authorization(_)));
+        assert!(err.to_string().contains("admin"));
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)
