@@ -8,8 +8,13 @@ use axum::{
     extract::{Extension, State},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
+    Router,
 };
+// Custom Json extractor: maps malformed/missing-field request bodies to
+// 400 VALIDATION_ERROR (structured envelope) instead of Axum's stock 422
+// + plain-text body. Drop-in for both request extraction and responses
+// (#1783 LOW: POST /auth/login returned 422 for missing `username`).
+use crate::api::extractors::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -714,6 +719,39 @@ mod tests {
         let json = r#"{"username": "admin"}"#;
         let result = serde_json::from_str::<LoginRequest>(json);
         assert!(result.is_err());
+    }
+
+    /// Regression (#1783 LOW): POST /auth/login with a missing required field
+    /// must surface as HTTP 400 + `{"code":"VALIDATION_ERROR"}`, not Axum's
+    /// stock 422 + plain-text body. The login handler now extracts via the
+    /// custom `crate::api::extractors::Json`; this exercises that exact path
+    /// for the `LoginRequest` shape (missing `username`).
+    #[tokio::test]
+    async fn test_login_missing_username_returns_400_validation_error() {
+        use axum::body::Body;
+        use axum::extract::FromRequest;
+        use axum::http::{header, Request, StatusCode};
+        use axum::response::IntoResponse;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"password": "Test123!"}"#))
+            .unwrap();
+
+        // `Json` here is the custom extractor (imported at module top).
+        let result = Json::<LoginRequest>::from_request(req, &()).await;
+        let err = result.expect_err("missing username must be rejected");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["code"], "VALIDATION_ERROR");
+        assert!(body["message"].is_string());
     }
 
     #[test]

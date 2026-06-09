@@ -524,6 +524,16 @@ fn validate_cache_ttl(secs: i64) -> bool {
     (1..=2_592_000).contains(&secs)
 }
 
+/// Clamp a caller-supplied `per_page` into the valid `[1, 100]` range.
+///
+/// `per_page = 0` (or any value below 1) must NOT pass through: it would reach
+/// the `total_pages = ceil(total / per_page)` division as a divide-by-zero and
+/// saturate `total_pages` to `u32::MAX` for any non-empty listing (#1783 LOW).
+/// `clamp(1, 100)` also caps the page size, matching `list_artifacts`.
+pub(crate) fn clamp_per_page(per_page: Option<u32>) -> u32 {
+    per_page.unwrap_or(20).clamp(1, 100)
+}
+
 /// Reject `POST /api/v1/repositories` requests that create a virtual repo
 /// with no members.
 ///
@@ -1091,7 +1101,7 @@ pub async fn list_repositories(
     Query(query): Query<ListRepositoriesQuery>,
 ) -> Result<Json<RepositoryListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
+    let per_page = clamp_per_page(query.per_page);
     let offset = ((page - 1) * per_page) as i64;
 
     let format_filter = query.format.as_ref().map(|f| parse_format(f)).transpose()?;
@@ -1104,6 +1114,13 @@ pub async fn list_repositories(
     let visibility = match &auth {
         None => RepoVisibility::PublicOnly,
         Some(a) if a.is_admin => RepoVisibility::All,
+        // Repo-scoped token: the listing must reflect ONLY the token's
+        // allowed repositories, not every repo the owning user can reach.
+        // Checked before the general `User` arm. Admin tokens are handled
+        // above and bypass scope restrictions.
+        Some(a) if a.allowed_repo_ids.is_some() => {
+            RepoVisibility::Ids(a.allowed_repo_ids.clone().unwrap_or_default())
+        }
         Some(a) => RepoVisibility::User(a.user_id),
     };
     let service = RepositoryService::new(state.db.clone());
@@ -7933,6 +7950,44 @@ mod tests {
     #[test]
     fn test_validate_cache_ttl_invalid_very_negative() {
         assert!(!validate_cache_ttl(-86400));
+    }
+
+    // -----------------------------------------------------------------------
+    // clamp_per_page (#1783 LOW: per_page=0 overflowed total_pages to u32::MAX)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_per_page_zero_becomes_one() {
+        // The core regression: 0 must never reach the total_pages division.
+        assert_eq!(clamp_per_page(Some(0)), 1);
+    }
+
+    #[test]
+    fn test_clamp_per_page_none_uses_default() {
+        assert_eq!(clamp_per_page(None), 20);
+    }
+
+    #[test]
+    fn test_clamp_per_page_within_range_unchanged() {
+        assert_eq!(clamp_per_page(Some(1)), 1);
+        assert_eq!(clamp_per_page(Some(50)), 50);
+        assert_eq!(clamp_per_page(Some(100)), 100);
+    }
+
+    #[test]
+    fn test_clamp_per_page_above_max_capped() {
+        assert_eq!(clamp_per_page(Some(101)), 100);
+        assert_eq!(clamp_per_page(Some(u32::MAX)), 100);
+    }
+
+    #[test]
+    fn test_clamp_per_page_zero_total_pages_is_finite() {
+        // Mirror the handler computation: total_pages = ceil(total / per_page).
+        // With the clamp in place this can never be u32::MAX for per_page=0.
+        let per_page = clamp_per_page(Some(0));
+        let total: i64 = 128;
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+        assert_eq!(total_pages, 128);
     }
 
     // -----------------------------------------------------------------------

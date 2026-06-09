@@ -63,6 +63,24 @@ pub enum RepoVisibility {
     /// Authenticated non-admin caller: public repositories plus any private
     /// repositories where the user holds a role assignment (direct or global).
     User(Uuid),
+    /// Repo-scoped API token: visibility is restricted to exactly the set of
+    /// repository IDs the token is allowed to access. Unlike [`Self::User`],
+    /// this does NOT widen to public repos or to all of the owner's grants —
+    /// the listing must reflect only the token's scope. The IDs were already
+    /// validated against the owner's access when the token was minted.
+    Ids(Vec<Uuid>),
+}
+
+/// Value bound at the visibility parameter (`$3`) of repository listing
+/// queries. The concrete type depends on the [`RepoVisibility`] variant:
+/// `PublicOnly`/`All` bind NULL, `User` binds a single `Uuid`, and `Ids`
+/// binds a `Uuid[]` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VisibilityBind {
+    /// Bind a single user id (or NULL when `None`).
+    User(Option<Uuid>),
+    /// Bind an array of repository ids.
+    Ids(Vec<Uuid>),
 }
 
 // ---------------------------------------------------------------------------
@@ -168,10 +186,11 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
 /// - `PublicOnly` -> only public repos, user_id bound as NULL.
 /// - `All`        -> no visibility restriction (always true), user_id bound as NULL.
 /// - `User(id)`   -> public repos OR repos the user has a role_assignment for.
-pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, Option<Uuid>) {
+/// - `Ids(ids)`   -> only repos whose id is in `ids` (repo-scoped token).
+pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, VisibilityBind) {
     match visibility {
-        RepoVisibility::PublicOnly => ("is_public = true".to_string(), None),
-        RepoVisibility::All => ("true".to_string(), None),
+        RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
+        RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
             let clause = r#"(
                 is_public = true
@@ -182,7 +201,16 @@ pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, O
                 )
             )"#
             .to_string();
-            (clause, Some(*user_id))
+            (clause, VisibilityBind::User(Some(*user_id)))
+        }
+        RepoVisibility::Ids(ids) => {
+            // Restrict strictly to the token's allowed set. An empty set must
+            // match no rows (not "all rows") — `id = ANY('{}')` is correctly
+            // false for every row in Postgres.
+            (
+                "repositories.id = ANY($3)".to_string(),
+                VisibilityBind::Ids(ids.clone()),
+            )
         }
     }
 }
@@ -568,15 +596,24 @@ impl RepositoryService {
                 repo
             }
             Err(e) if is_duplicate_key_error(&e.to_string()) => {
-                // Another request created this repo concurrently. Roll back
-                // our (failed) INSERT and return the existing row so callers
-                // see a successful, idempotent result instead of a 409.
+                // A repository with this key already exists. Roll back our
+                // (failed) INSERT and surface a 409 Conflict. Previously this
+                // path silently returned the existing row with HTTP 200, which
+                // masked the conflict: a second POST with a *different* payload
+                // (name/format/type) appeared to succeed while its payload was
+                // discarded. 409 is the correct semantics for both sequential
+                // duplicate requests and the concurrent-insert race (the unique
+                // constraint still serializes concurrent creators; the loser
+                // now gets a clean conflict instead of a phantom success).
                 tracing::debug!(
                     key = %req.key,
-                    "Concurrent insert detected, returning existing repository"
+                    "Duplicate repository key on create, returning 409 Conflict"
                 );
                 let _ = tx.rollback().await;
-                self.get_by_key(&req.key).await?
+                return Err(AppError::Conflict(format!(
+                    "Repository with key '{}' already exists",
+                    req.key
+                )));
             }
             Err(e) => {
                 let _ = tx.rollback().await;
@@ -701,7 +738,15 @@ impl RepositoryService {
         search_query: Option<&str>,
     ) -> Result<(Vec<Repository>, i64)> {
         let search_pattern = build_search_pattern(search_query);
-        let (visibility_clause, user_id) = build_visibility_clause(&visibility);
+        let (visibility_clause, visibility_bind) = build_visibility_clause(&visibility);
+
+        // Split the visibility bind into the two concrete `$3` shapes. Exactly
+        // one is `Some` per call; the unused one stays `None` and binds as a
+        // typed NULL, which the clause never references.
+        let (user_id_bind, ids_bind): (Option<Uuid>, Option<Vec<Uuid>>) = match visibility_bind {
+            VisibilityBind::User(uid) => (uid, None),
+            VisibilityBind::Ids(ids) => (None, Some(ids)),
+        };
 
         // -- fetch page --
         let select_sql = format!(
@@ -727,10 +772,15 @@ impl RepositoryService {
             "#
         );
 
-        let repos = sqlx::query_as::<_, Repository>(&select_sql)
+        let page_query = sqlx::query_as::<_, Repository>(&select_sql)
             .bind(format_filter.clone())
-            .bind(type_filter.clone())
-            .bind(user_id)
+            .bind(type_filter.clone());
+        // $3 shape depends on the visibility variant (single uuid vs uuid[]).
+        let page_query = match &ids_bind {
+            Some(ids) => page_query.bind(ids.clone()),
+            None => page_query.bind(user_id_bind),
+        };
+        let repos = page_query
             .bind(search_pattern.clone())
             .bind(offset)
             .bind(limit)
@@ -750,10 +800,14 @@ impl RepositoryService {
             "#
         );
 
-        let total: i64 = sqlx::query_scalar::<_, i64>(&count_sql)
+        let count_query = sqlx::query_scalar::<_, i64>(&count_sql)
             .bind(format_filter)
-            .bind(type_filter)
-            .bind(user_id)
+            .bind(type_filter);
+        let count_query = match &ids_bind {
+            Some(ids) => count_query.bind(ids.clone()),
+            None => count_query.bind(user_id_bind),
+        };
+        let total: i64 = count_query
             .bind(search_pattern)
             .fetch_one(&self.db)
             .await
@@ -1879,26 +1933,48 @@ mod tests {
 
     #[test]
     fn test_visibility_public_only_returns_is_public_clause() {
-        let (clause, user_id) = build_visibility_clause(&RepoVisibility::PublicOnly);
+        let (clause, bind) = build_visibility_clause(&RepoVisibility::PublicOnly);
         assert_eq!(clause, "is_public = true");
-        assert!(user_id.is_none());
+        assert_eq!(bind, VisibilityBind::User(None));
     }
 
     #[test]
     fn test_visibility_all_returns_true_clause() {
-        let (clause, user_id) = build_visibility_clause(&RepoVisibility::All);
+        let (clause, bind) = build_visibility_clause(&RepoVisibility::All);
         assert_eq!(clause, "true");
-        assert!(user_id.is_none());
+        assert_eq!(bind, VisibilityBind::User(None));
     }
 
     #[test]
     fn test_visibility_user_returns_subquery_and_user_id() {
         let uid = Uuid::new_v4();
-        let (clause, user_id) = build_visibility_clause(&RepoVisibility::User(uid));
+        let (clause, bind) = build_visibility_clause(&RepoVisibility::User(uid));
         assert!(clause.contains("is_public = true"));
         assert!(clause.contains("role_assignments"));
         assert!(clause.contains("$3"));
-        assert_eq!(user_id, Some(uid));
+        assert_eq!(bind, VisibilityBind::User(Some(uid)));
+    }
+
+    #[test]
+    fn test_visibility_ids_restricts_to_id_set_only() {
+        // Repo-scoped token: the clause must filter strictly on the allowed id
+        // set ($3 = uuid[]) and must NOT widen to public repos or role grants.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (clause, bind) = build_visibility_clause(&RepoVisibility::Ids(vec![a, b]));
+        assert_eq!(clause, "repositories.id = ANY($3)");
+        assert!(!clause.contains("is_public"));
+        assert!(!clause.contains("role_assignments"));
+        assert_eq!(bind, VisibilityBind::Ids(vec![a, b]));
+    }
+
+    #[test]
+    fn test_visibility_ids_empty_set_matches_no_rows() {
+        // An empty allowed set must not degrade to "all rows". The clause is
+        // `id = ANY('{}')`, which Postgres evaluates to false for every row.
+        let (clause, bind) = build_visibility_clause(&RepoVisibility::Ids(vec![]));
+        assert_eq!(clause, "repositories.id = ANY($3)");
+        assert_eq!(bind, VisibilityBind::Ids(vec![]));
     }
 
     #[test]
@@ -2436,10 +2512,12 @@ mod tests {
             cleanup_repo(&pool, repo.id).await;
         }
 
-        /// Duplicate key: the second `create` rolls back its own (failed)
-        /// INSERT and returns the row created by the first.
+        /// Regression (#1783 HIGH): a duplicate key on create must roll back the
+        /// failed INSERT and return `409 Conflict`, NOT a silent 200 echoing the
+        /// existing row. A second create with a DIFFERENT payload must not be
+        /// reported as success while its payload is discarded.
         #[tokio::test]
-        async fn test_create_duplicate_key_returns_existing_via_rollback() {
+        async fn test_create_duplicate_key_returns_conflict() {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -2450,14 +2528,25 @@ mod tests {
                 .await
                 .expect("first create");
 
+            // Second create with the same key but a deliberately different
+            // format — the old code returned 200 with the first row's payload.
             let second = service
-                .create(make_create_req(&suffix, RepositoryFormat::Generic))
-                .await
-                .expect("duplicate create should idempotently return existing");
-            assert_eq!(
-                second.id, first.id,
-                "duplicate-key path must return the row created by the first call"
-            );
+                .create(make_create_req(&suffix, RepositoryFormat::Pypi))
+                .await;
+            match second {
+                Err(AppError::Conflict(msg)) => {
+                    assert!(
+                        msg.contains(&suffix),
+                        "conflict message should name the duplicate key, got: {msg}"
+                    );
+                }
+                other => panic!("expected 409 Conflict on duplicate key, got: {other:?}"),
+            }
+
+            // The original row is untouched (payload not silently overwritten).
+            let fetched = service.get_by_key(&first.key).await.expect("fetch first");
+            assert_eq!(fetched.id, first.id);
+            assert_eq!(fetched.format, RepositoryFormat::Generic);
 
             cleanup_repo(&pool, first.id).await;
         }
@@ -2530,6 +2619,91 @@ mod tests {
                     .execute(&pool)
                     .await;
             }
+        }
+
+        /// Regression (#1783 MEDIUM): `list` with `RepoVisibility::Ids` (the
+        /// shape a repo-scoped token produces) must return ONLY the repos in
+        /// the allowed id set — not every repo the owning user can reach.
+        ///
+        /// Before the fix, the list handler mapped any authenticated principal
+        /// (including scoped tokens) to `RepoVisibility::User`, so a token
+        /// scoped to repo A still listed repo B when the owner had access to B.
+        #[tokio::test]
+        async fn test_list_ids_visibility_restricts_to_allowed_set() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+
+            // Two PRIVATE repos, both owned (granted) by the same user.
+            let tag = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req_a = make_create_req(&format!("{tag}a"), RepositoryFormat::Pypi);
+            req_a.created_by = Some(owner_id);
+            let repo_a = service.create(req_a).await.expect("create repo a");
+            let mut req_b = make_create_req(&format!("{tag}b"), RepositoryFormat::Npm);
+            req_b.created_by = Some(owner_id);
+            let repo_b = service.create(req_b).await.expect("create repo b");
+
+            let search = Some(format!("acs-repo-{tag}"));
+
+            // Sanity: as the owning user, BOTH repos are visible.
+            let (user_repos, user_total) = service
+                .list(
+                    0,
+                    50,
+                    None,
+                    None,
+                    RepoVisibility::User(owner_id),
+                    search.as_deref(),
+                )
+                .await
+                .expect("user list");
+            assert_eq!(user_total, 2, "owner should see both private repos");
+            assert_eq!(user_repos.len(), 2);
+
+            // Scoped to repo_a only: repo_b must NOT appear.
+            let (ids_repos, ids_total) = service
+                .list(
+                    0,
+                    50,
+                    None,
+                    None,
+                    RepoVisibility::Ids(vec![repo_a.id]),
+                    search.as_deref(),
+                )
+                .await
+                .expect("ids list");
+            assert_eq!(ids_total, 1, "scoped token must see only the allowed repo");
+            assert_eq!(ids_repos.len(), 1);
+            assert_eq!(ids_repos[0].id, repo_a.id);
+            assert!(
+                !ids_repos.iter().any(|r| r.id == repo_b.id),
+                "repo outside allowed_repo_ids must not leak into the listing"
+            );
+
+            // Empty allowed set: matches no rows (must not degrade to "all").
+            let (empty_repos, empty_total) = service
+                .list(
+                    0,
+                    50,
+                    None,
+                    None,
+                    RepoVisibility::Ids(vec![]),
+                    search.as_deref(),
+                )
+                .await
+                .expect("empty ids list");
+            assert_eq!(empty_total, 0);
+            assert!(empty_repos.is_empty());
+
+            cleanup_repo(&pool, repo_a.id).await;
+            cleanup_repo(&pool, repo_b.id).await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(owner_id)
+                .execute(&pool)
+                .await;
         }
     }
 }
