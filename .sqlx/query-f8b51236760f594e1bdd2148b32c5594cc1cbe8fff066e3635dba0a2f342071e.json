@@ -1,0 +1,238 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes, r.promotion_only,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.promotion_target_id, r.promotion_policy_id,\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "format: RepositoryFormat",
+        "type_info": {
+          "Custom": {
+            "name": "repository_format",
+            "kind": {
+              "Enum": [
+                "maven",
+                "gradle",
+                "npm",
+                "pypi",
+                "nuget",
+                "go",
+                "rubygems",
+                "docker",
+                "helm",
+                "rpm",
+                "debian",
+                "conan",
+                "cargo",
+                "generic",
+                "podman",
+                "buildx",
+                "oras",
+                "wasm_oci",
+                "helm_oci",
+                "poetry",
+                "conda",
+                "yarn",
+                "bower",
+                "pnpm",
+                "chocolatey",
+                "powershell",
+                "terraform",
+                "opentofu",
+                "alpine",
+                "conda_native",
+                "composer",
+                "hex",
+                "cocoapods",
+                "swift",
+                "pub",
+                "sbt",
+                "chef",
+                "puppet",
+                "ansible",
+                "gitlfs",
+                "vscode",
+                "jetbrains",
+                "huggingface",
+                "mlmodel",
+                "cran",
+                "vagrant",
+                "opkg",
+                "p2",
+                "bazel",
+                "protobuf",
+                "incus",
+                "lxc"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "repo_type: RepositoryType",
+        "type_info": {
+          "Custom": {
+            "name": "repository_type",
+            "kind": {
+              "Enum": [
+                "local",
+                "remote",
+                "virtual",
+                "staging"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "storage_backend",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "storage_path",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "upstream_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "is_public",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "quota_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "promotion_only",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "replication_priority: ReplicationPriority",
+        "type_info": {
+          "Custom": {
+            "name": "replication_priority",
+            "kind": {
+              "Enum": [
+                "immediate",
+                "scheduled",
+                "on_demand",
+                "local_only"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "promotion_policy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 15,
+        "name": "curation_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "curation_source_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 17,
+        "name": "curation_target_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 18,
+        "name": "curation_default_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "curation_sync_interval_secs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 20,
+        "name": "curation_auto_fetch",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 21,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 22,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f8b51236760f594e1bdd2148b32c5594cc1cbe8fff066e3635dba0a2f342071e"
+}

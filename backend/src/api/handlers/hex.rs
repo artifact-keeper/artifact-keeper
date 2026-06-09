@@ -1031,6 +1031,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::OnDemand,
             promotion_target_id: None,
             promotion_policy_id: None,

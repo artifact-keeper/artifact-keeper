@@ -1472,6 +1472,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: crate::models::repository::ReplicationPriority::LocalOnly,
             promotion_target_id: None,
             promotion_policy_id: None,

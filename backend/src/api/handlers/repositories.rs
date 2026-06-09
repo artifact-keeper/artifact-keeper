@@ -22,6 +22,7 @@ use crate::api::dto::Pagination;
 // `crate::api::extractors`. The wrapper also implements `IntoResponse` so it
 // is a drop-in replacement on response types too.
 use crate::api::extractors::Json;
+use crate::api::handlers::is_replication_request;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -42,14 +43,6 @@ use crate::services::upload_service;
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
-}
-
-fn is_replication_request(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-artifact-keeper-replication")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
 }
 
 /// Coerce the requested `is_public` value against the server-wide guest-access
@@ -345,6 +338,10 @@ pub struct CreateRepositoryRequest {
     pub allow_anonymous_access: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
+    /// When true, direct user uploads to this repository are rejected:
+    /// artifacts must arrive via the promotion path. Admin-only to set.
+    /// Defaults to false (no behavior change for existing repositories).
+    pub promotion_only: Option<bool>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -402,6 +399,9 @@ pub struct UpdateRepositoryRequest {
     /// `allow_anonymous_access` takes precedence.
     pub allow_anonymous_access: Option<bool>,
     pub quota_bytes: Option<i64>,
+    /// When provided, enables/disables the `promotion_only` policy for this
+    /// repository (admin-only). When omitted, the flag is left unchanged.
+    pub promotion_only: Option<bool>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -441,6 +441,8 @@ pub struct RepositoryResponse {
     /// always equal to `is_public` and provided as a convenience alias so
     /// the semantics are clear for remote (pull-through cache) repositories.
     pub allow_anonymous_access: bool,
+    /// When true, direct user uploads are rejected; artifacts must be promoted.
+    pub promotion_only: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     pub upstream_url: Option<String>,
@@ -470,6 +472,7 @@ fn repo_to_response(
         repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
+        promotion_only: repo.promotion_only,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         upstream_url: repo.upstream_url,
@@ -1288,6 +1291,7 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
+            promotion_only: payload.promotion_only.unwrap_or(false),
             // Plugin format key takes precedence over any explicit format_key
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
@@ -1482,6 +1486,7 @@ pub async fn update_repository(
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
+                promotion_only: payload.promotion_only,
             },
         )
         .await?;
@@ -3318,7 +3323,7 @@ pub async fn upload_artifact(
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
 
@@ -3334,6 +3339,19 @@ pub async fn upload_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+
+    // Reject direct uploads to promotion-only repositories (non-admins). Such
+    // repos accept artifacts only via the promotion path (staging -> promotion
+    // -> approval); the promotion service writes through its own path and is
+    // unaffected.
+    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_upload(
+        repo.promotion_only,
+        auth.is_admin,
+    ) {
+        return Err(AppError::Conflict(
+            "Direct uploads are disabled for this repository; publish via promotion".to_string(),
+        ));
+    }
 
     // Verify declared checksums against actual content before storing anything.
     let declared_sha256 = headers
@@ -3397,14 +3415,17 @@ pub async fn upload_artifact(
         }
     };
 
+    // Content-Type resolution priority:
+    //   1. WASM plugin metadata (format-aware)
+    //   2. the request's declared Content-Type header (honour the client)
+    //   3. mime_guess from the path extension
+    let declared_content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
     let content_type = wasm_metadata
         .as_ref()
         .map(|m| m.content_type.clone())
-        .unwrap_or_else(|| {
-            mime_guess::from_path(&path)
-                .first_or_octet_stream()
-                .to_string()
-        });
+        .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
 
     // Clean up any soft-deleted artifact at the same path so the
     // UNIQUE(repository_id, path) constraint doesn't block re-upload.
@@ -3426,23 +3447,51 @@ pub async fn upload_artifact(
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
-    Ok(Json(ArtifactResponse {
-        id: artifact.id,
-        repository_key: key,
-        path: artifact.path,
-        name: artifact.name,
-        version: artifact.version,
-        size_bytes: artifact.size_bytes,
-        checksum_sha256: artifact.checksum_sha256,
-        content_type: artifact.content_type,
-        download_count: downloads,
-        created_at: artifact.created_at,
-        metadata: metadata_json,
-        // Just-uploaded artifacts have no proxy cache state yet -- the
-        // cache is populated lazily on the first proxy fetch.
-        cache_cached_at: None,
-        cache_expires_at: None,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(ArtifactResponse {
+            id: artifact.id,
+            repository_key: key,
+            path: artifact.path,
+            name: artifact.name,
+            version: artifact.version,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256,
+            content_type: artifact.content_type,
+            download_count: downloads,
+            created_at: artifact.created_at,
+            metadata: metadata_json,
+            // Just-uploaded artifacts have no proxy cache state yet -- the
+            // cache is populated lazily on the first proxy fetch.
+            cache_cached_at: None,
+            cache_expires_at: None,
+        }),
+    ))
+}
+
+/// Resolve the Content-Type for a generic artifact upload.
+///
+/// Honours a client-declared `Content-Type` header when it is a valid,
+/// non-empty MIME type that is not a multipart wrapper (multipart only
+/// describes the request envelope, not the stored object). Otherwise falls
+/// back to guessing from the artifact path's file extension.
+fn resolve_upload_content_type(declared: Option<&str>, path: &str) -> String {
+    if let Some(raw) = declared {
+        let trimmed = raw.trim();
+        // Strip any `; charset=...` parameters for the multipart check, but
+        // preserve the full declared value when we accept it.
+        let base = trimmed.split(';').next().unwrap_or(trimmed).trim();
+        if !base.is_empty()
+            && base.contains('/')
+            && !base.eq_ignore_ascii_case("multipart/form-data")
+            && !base.to_ascii_lowercase().starts_with("multipart/")
+        {
+            return trimmed.to_string();
+        }
+    }
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
 }
 
 /// Upload artifact via multipart/form-data POST (with path in URL).
@@ -3455,7 +3504,7 @@ async fn upload_artifact_multipart_with_path(
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let (body, filename) = extract_multipart_file(multipart).await?;
     let artifact_path = if path.is_empty() || path == "/" {
         filename
@@ -3489,7 +3538,7 @@ async fn upload_artifact_multipart(
     Path(key): Path<String>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
     let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_artifact(
@@ -3596,6 +3645,158 @@ async fn extract_multipart_file_and_path(
     }
 }
 
+/// Derive the `Content-Disposition` filename for a downloaded artifact.
+///
+/// The browser-facing filename must be the basename of the requested artifact
+/// path (e.g. `testpkg-1.0.0.tar.gz`), not the artifact's package `name`
+/// (`testpkg`). This mirrors the virtual-repo download path, which already uses
+/// `path.rsplit('/').next()`.
+fn download_filename(path: &str) -> &str {
+    path.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+}
+
+/// Outcome of parsing an HTTP `Range` request header against a known total
+/// size. We only support a single `bytes=start-end` range (the common case for
+/// resumable downloads and media seeking); anything more exotic falls back to a
+/// full-body 200 response.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeOutcome {
+    /// No `Range` header, or a header we choose not to honour: serve full 200.
+    Full,
+    /// A satisfiable single range, as inclusive `(start, end)` byte offsets.
+    Satisfiable { start: u64, end: u64 },
+    /// A syntactically valid `bytes=` range that lies outside `[0, total)`:
+    /// the caller must answer 416 Range Not Satisfiable.
+    Unsatisfiable,
+}
+
+/// Parse a single-range HTTP `Range` header value against `total` bytes.
+///
+/// Supports the three RFC 7233 single-range forms:
+/// - `bytes=START-END`   (inclusive)
+/// - `bytes=START-`      (START to end of resource)
+/// - `bytes=-SUFFIX`     (final SUFFIX bytes)
+///
+/// Multi-range (`bytes=0-1,2-3`) and unparseable headers degrade to
+/// [`RangeOutcome::Full`] rather than erroring, which is a valid server choice
+/// per the spec. A `total` of 0 is always served as `Full`.
+fn parse_byte_range(header_value: Option<&str>, total: u64) -> RangeOutcome {
+    let value = match header_value {
+        Some(v) => v.trim(),
+        None => return RangeOutcome::Full,
+    };
+    if total == 0 {
+        return RangeOutcome::Full;
+    }
+    let spec = match value.strip_prefix("bytes=") {
+        Some(s) => s.trim(),
+        None => return RangeOutcome::Full,
+    };
+    // Reject multi-range; we only honour a single range.
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let (start_str, end_str) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return RangeOutcome::Full,
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
+
+    let last = total - 1;
+    match (start_str.is_empty(), end_str.is_empty()) {
+        // `bytes=-SUFFIX`: final SUFFIX bytes.
+        (true, false) => {
+            let suffix: u64 = match end_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if suffix == 0 {
+                return RangeOutcome::Unsatisfiable;
+            }
+            let len = suffix.min(total);
+            RangeOutcome::Satisfiable {
+                start: total - len,
+                end: last,
+            }
+        }
+        // `bytes=START-`: START to end.
+        (false, true) => {
+            let start: u64 = match start_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if start > last {
+                return RangeOutcome::Unsatisfiable;
+            }
+            RangeOutcome::Satisfiable { start, end: last }
+        }
+        // `bytes=START-END`: explicit inclusive range.
+        (false, false) => {
+            let start: u64 = match start_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            let end: u64 = match end_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if start > end || start > last {
+                return RangeOutcome::Unsatisfiable;
+            }
+            RangeOutcome::Satisfiable {
+                start,
+                end: end.min(last),
+            }
+        }
+        // `bytes=-` is malformed.
+        (true, true) => RangeOutcome::Full,
+    }
+}
+
+/// Adapt a byte stream so it yields only the inclusive `[start, end]` window,
+/// skipping leading bytes and truncating trailing ones at chunk boundaries.
+/// Used to satisfy a 206 Partial Content response without buffering the whole
+/// artifact in memory.
+fn slice_byte_stream(
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    start: u64,
+    end: u64,
+) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+    use futures::StreamExt;
+
+    // Number of bytes to emit (inclusive range).
+    let mut remaining = end - start + 1;
+    // Number of leading bytes still to discard before the window begins.
+    let mut to_skip = start;
+
+    let stream = body.filter_map(move |chunk| {
+        let out = match chunk {
+            Ok(mut bytes) => {
+                if to_skip > 0 {
+                    let skip = (to_skip as usize).min(bytes.len());
+                    let _ = bytes.split_to(skip);
+                    to_skip -= skip as u64;
+                }
+                if remaining == 0 || bytes.is_empty() {
+                    None
+                } else {
+                    let take = (remaining as usize).min(bytes.len());
+                    let slice = bytes.split_to(take);
+                    remaining -= take as u64;
+                    Some(Ok(slice))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        };
+        async move { out }
+    });
+    stream.boxed()
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -3618,6 +3819,13 @@ pub async fn download_artifact(
     Path((key, path)): Path<(String, String)>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse> {
+    // A HEAD request must return identical headers to GET but no body, and it
+    // must close the connection. Without this flag the handler builds a
+    // `Body::from_stream(..)` whose Content-Length advertises the full size
+    // while no bytes are written, so HTTP/1.1 keep-alive clients block waiting
+    // for a body that never arrives (the connection hangs).
+    let is_head = request.method() == axum::http::Method::HEAD;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -3738,27 +3946,68 @@ pub async fn download_artifact(
     match download_result {
         Ok((artifact, body)) => {
             // Stream the body from storage instead of buffering it in memory
-            // (#1608, Core Invariant ①). Headers and status are identical to the
-            // prior buffered path; `size_bytes` gives an accurate Content-Length.
-            let response = Response::builder()
-                .status(StatusCode::OK)
+            // (#1608, Core Invariant ①). `size_bytes` gives an accurate
+            // Content-Length.
+            //
+            // The `Content-Disposition` filename is the basename of the
+            // requested path (e.g. `testpkg-1.0.0.tar.gz`), not the artifact's
+            // package name — matching the virtual-repo download path.
+            let total = artifact.size_bytes.max(0) as u64;
+            let range_header = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok());
+            let checksum = artifact.checksum_sha256.trim().to_string();
+            // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
+            // blank-pads shorter values on read; trim before emitting so the
+            // header carries the bare checksum.
+
+            let base = Response::builder()
                 .header(header::CONTENT_TYPE, artifact.content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", artifact.name),
+                    format!("attachment; filename=\"{}\"", download_filename(&path)),
                 )
-                .header(header::CONTENT_LENGTH, artifact.size_bytes.to_string())
+                // Advertise byte-range support so clients (resumable downloads,
+                // media players) know they may issue `Range` requests.
+                .header(header::ACCEPT_RANGES, "bytes")
                 .header(
                     header::HeaderName::from_static("x-checksum-sha256"),
-                    // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
-                    // blank-pads shorter values on read. Trim before emitting so the
-                    // header carries the bare checksum (a real sha256 is exactly 64
-                    // hex chars and is unaffected by the trim).
-                    artifact.checksum_sha256.trim().to_string(),
+                    checksum,
                 )
-                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy")
-                .body(Body::from_stream(body))
-                .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?;
+                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy");
+
+            let response = match parse_byte_range(range_header, total) {
+                RangeOutcome::Satisfiable { start, end } => {
+                    let len = end - start + 1;
+                    base.status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_LENGTH, len.to_string())
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
+                        .body(Body::from_stream(slice_byte_stream(body, start, end)))
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                        })?
+                }
+                RangeOutcome::Unsatisfiable => {
+                    // 416 must carry the resource size via Content-Range and no body.
+                    Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+                        .body(Body::empty())
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                        })?
+                }
+                RangeOutcome::Full => base
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, total.to_string())
+                    .body(Body::from_stream(body))
+                    .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?,
+            };
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -3847,7 +4096,12 @@ pub async fn download_artifact(
             if let Some(size) = result.content_length {
                 builder = builder.header(header::CONTENT_LENGTH, size.to_string());
             }
-            Ok(builder.body(Body::from_stream(result.body)).unwrap())
+            let body = if is_head {
+                Body::empty()
+            } else {
+                Body::from_stream(result.body)
+            };
+            Ok(builder.body(body).unwrap())
         }
         Err(e) => Err(e),
     }
@@ -4816,6 +5070,157 @@ mod tests {
     use crate::error::AppError;
 
     // -----------------------------------------------------------------------
+    // Content-Disposition filename derivation (#1785) — the download filename
+    // must be the basename of the requested path, not the package name.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn download_filename_uses_path_basename() {
+        assert_eq!(
+            download_filename("testpkg/1.0.0/testpkg-1.0.0.tar.gz"),
+            "testpkg-1.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn download_filename_handles_flat_path() {
+        assert_eq!(download_filename("plainfile.bin"), "plainfile.bin");
+    }
+
+    #[test]
+    fn download_filename_handles_trailing_slash() {
+        // A trailing slash would otherwise yield an empty basename; fall back
+        // to the full path rather than emitting an empty filename.
+        assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP Range parsing (#1785) — `Range: bytes=...` must produce 206 with the
+    // correct window, 416 for out-of-bounds, and degrade to a full 200 for
+    // multi-range / unparseable headers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn range_none_is_full() {
+        assert_eq!(parse_byte_range(None, 100), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn range_explicit_inclusive() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-1023"), 102_624),
+            RangeOutcome::Satisfiable {
+                start: 0,
+                end: 1023
+            }
+        );
+    }
+
+    #[test]
+    fn range_open_ended_start() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=500-"), 1000),
+            RangeOutcome::Satisfiable {
+                start: 500,
+                end: 999
+            }
+        );
+    }
+
+    #[test]
+    fn range_suffix() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=-200"), 1000),
+            RangeOutcome::Satisfiable {
+                start: 800,
+                end: 999
+            }
+        );
+    }
+
+    #[test]
+    fn range_suffix_larger_than_total_clamps() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=-5000"), 1000),
+            RangeOutcome::Satisfiable { start: 0, end: 999 }
+        );
+    }
+
+    #[test]
+    fn range_end_clamped_to_last_byte() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-9999"), 1000),
+            RangeOutcome::Satisfiable { start: 0, end: 999 }
+        );
+    }
+
+    #[test]
+    fn range_start_past_end_is_unsatisfiable() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=2000-"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=2000-3000"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn range_inverted_is_unsatisfiable() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=500-100"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn range_multi_range_degrades_to_full() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-10,20-30"), 1000),
+            RangeOutcome::Full
+        );
+    }
+
+    #[test]
+    fn range_unparseable_degrades_to_full() {
+        assert_eq!(
+            parse_byte_range(Some("seconds=0-10"), 1000),
+            RangeOutcome::Full
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=abc-def"), 1000),
+            RangeOutcome::Full
+        );
+        assert_eq!(parse_byte_range(Some("bytes=-"), 1000), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn range_on_empty_resource_is_full() {
+        assert_eq!(parse_byte_range(Some("bytes=0-10"), 0), RangeOutcome::Full);
+    }
+
+    #[tokio::test]
+    async fn slice_byte_stream_yields_only_window() {
+        use futures::StreamExt;
+        // Three chunks spanning bytes 0..9: "ab" "cdef" "ghij".
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cdef")),
+            Ok(Bytes::from_static(b"ghij")),
+        ];
+        let body = futures::stream::iter(chunks).boxed();
+        // Request bytes 3..=6 inclusive => "defg".
+        let sliced = slice_byte_stream(body, 3, 6);
+        let collected: Vec<u8> = sliced
+            .filter_map(|r| async move { r.ok() })
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(collected, b"defg");
+    }
+
+    // -----------------------------------------------------------------------
     // Remote proxy-cache listing (#1548, web #424)
     // -----------------------------------------------------------------------
 
@@ -5708,6 +6113,7 @@ mod tests {
             repo_type: "local".to_string(),
             is_public: true,
             allow_anonymous_access: true,
+            promotion_only: false,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
             upstream_url: None,
@@ -5721,6 +6127,39 @@ mod tests {
         assert!(json.contains("\"storage_used_bytes\":1024"));
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
+        assert!(json.contains("\"promotion_only\":false"));
+    }
+
+    #[test]
+    fn test_create_repository_request_promotion_only_deserialization() {
+        let json = r#"{
+            "key": "maven-releases",
+            "name": "Maven Releases",
+            "format": "maven",
+            "repo_type": "local",
+            "promotion_only": true
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.promotion_only, Some(true));
+    }
+
+    #[test]
+    fn test_create_repository_request_promotion_only_defaults_none() {
+        let json = r#"{
+            "key": "k",
+            "name": "n",
+            "format": "npm",
+            "repo_type": "local"
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert!(req.promotion_only.is_none());
+    }
+
+    #[test]
+    fn test_update_repository_request_promotion_only_deserialization() {
+        let json = r#"{"promotion_only": true}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.promotion_only, Some(true));
     }
 
     #[test]
@@ -6902,6 +7341,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: Some(1073741824),
+            promotion_only: false,
             replication_priority: ReplicationPriority::Immediate,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -6943,6 +7383,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::OnDemand,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -6986,6 +7427,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -7024,6 +7466,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: Some(5_000_000_000),
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: Some(target_id),
             promotion_policy_id: Some(policy_id),
@@ -7137,6 +7580,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -7360,6 +7804,7 @@ mod tests {
             upstream_url: None,
             is_public,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -9099,6 +9544,171 @@ mod tests {
             Some("proxy"),
             "x-artifact-storage must remain `proxy` for the local-serve path"
         );
+        // #1785: the Content-Disposition filename must be the basename of the
+        // requested path (`bar.bin`), NOT the artifact's package name (`bar`).
+        assert_eq!(
+            headers
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"bar.bin\""),
+            "Content-Disposition filename must be the path basename, not the package name"
+        );
+        // #1785: byte-range support must be advertised on every download.
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "Accept-Ranges: bytes must be advertised on the local-serve path"
+        );
+    }
+
+    /// #1785: a `Range: bytes=START-END` request against the local-serve path
+    /// must return 206 Partial Content with the correct window, Content-Range,
+    /// and Content-Length — not a 200 with the full body.
+    #[tokio::test]
+    async fn test_download_artifact_local_honours_range_request() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let body_bytes: &[u8] = b"0123456789abcdef";
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "foo/ranged.bin",
+            "ranged",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        let router = fx.router_with_auth(download_router());
+        let mut req = tdh::get(format!("/{}/download/foo/ranged.bin", fx.repo_key));
+        req.headers_mut().insert(
+            header::RANGE,
+            axum::http::HeaderValue::from_static("bytes=4-7"),
+        );
+
+        use tower::ServiceExt;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("ranged download must respond");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect partial body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::PARTIAL_CONTENT,
+            "a satisfiable Range request must return 206"
+        );
+        assert_eq!(
+            &collected[..],
+            b"4567",
+            "the body must contain only the requested byte window"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 4-7/16"),
+            "Content-Range must report the served window and total size"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("4"),
+            "Content-Length must be the size of the partial window"
+        );
+    }
+
+    // Regression (#1782): a HEAD request on the generic download endpoint must
+    // return the GET headers (status, Content-Type, Content-Length) but an
+    // EMPTY body. Previously the handler always attached `Body::from_stream`,
+    // so HTTP/1.1 keep-alive clients blocked waiting for `Content-Length`
+    // bytes that were never written and the connection hung.
+    #[tokio::test]
+    async fn test_download_artifact_head_returns_headers_no_body() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let body_bytes: &[u8] = b"head-request-must-not-return-this-body";
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "head/probe.bin",
+            "probe",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        let router = fx.router_with_auth(download_router());
+        let req = axum::http::Request::builder()
+            .method("HEAD")
+            .uri(format!("/{}/download/head/probe.bin", fx.repo_key))
+            .body(Body::empty())
+            .expect("build HEAD request");
+
+        use tower::ServiceExt;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("HEAD download must respond");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect HEAD body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "HEAD on an existing artifact must return 200"
+        );
+        // Content-Length still advertises the full size (HEAD semantics) ...
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(body_bytes.len().to_string().as_str()),
+            "HEAD must still report the artifact size in Content-Length"
+        );
+        // ... but NO body bytes are written, so the connection can close.
+        assert!(
+            collected.is_empty(),
+            "HEAD must return an empty body, got {} bytes",
+            collected.len()
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-test"),
+            "HEAD must carry the same Content-Type as GET"
+        );
     }
 
     #[tokio::test]
@@ -9807,6 +10417,64 @@ mod tests {
                 "artifact_v1.2.3+linux.x86_64.bin"
             ),
             "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Generic upload Content-Type resolution (#1782)
+    //
+    // The handler must honour a client-declared `Content-Type` header instead
+    // of always guessing from the file extension. Multipart wrappers describe
+    // the request envelope, not the stored object, so they must NOT win.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_upload_content_type_honours_declared_header() {
+        // A valid declared MIME type wins over the mime_guess of `.bin`
+        // (which would be application/octet-stream).
+        assert_eq!(
+            resolve_upload_content_type(
+                Some("application/vnd.my-company.binary"),
+                "pkg/v1/binary.bin"
+            ),
+            "application/vnd.my-company.binary"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_preserves_charset_params() {
+        assert_eq!(
+            resolve_upload_content_type(Some("text/plain; charset=utf-8"), "x"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_ignores_multipart_wrapper() {
+        // multipart/form-data only describes the upload envelope. Fall back to
+        // mime_guess (here `.txt` -> text/plain).
+        let ct =
+            resolve_upload_content_type(Some("multipart/form-data; boundary=----abc"), "notes.txt");
+        assert!(ct.starts_with("text/plain"), "got {ct}");
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_falls_back_to_mime_guess() {
+        // No declared header -> guess from extension.
+        let ct = resolve_upload_content_type(None, "archive.json");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_ignores_empty_and_invalid() {
+        // Empty / malformed (no slash) declared values fall back to guess.
+        assert_eq!(
+            resolve_upload_content_type(Some("   "), "data.json"),
+            "application/json"
+        );
+        assert_eq!(
+            resolve_upload_content_type(Some("not-a-mime"), "data.json"),
+            "application/json"
         );
     }
 

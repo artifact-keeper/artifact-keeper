@@ -212,6 +212,7 @@ async fn revoke_key(
     Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     svc.revoke_key(key_id, Some(auth.user_id)).await?;
     Ok(Json(serde_json::json!({"revoked": true})))
@@ -484,6 +485,42 @@ mod tests {
             Err(AppError::Authorization(_)) => {}
             other => panic!("expected 403 Authorization for non-admin, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_revoking_signing_key() {
+        // Regression for #1784: revoke_key previously omitted the admin gate
+        // that create_key, delete_key, and update_repo_signing_config enforce,
+        // letting a non-admin JWT revoke (deactivate) any signing key via
+        // POST /api/v1/signing/keys/{id}/revoke and break the trust chain.
+        // revoke_key now calls require_signing_admin(&auth)? first.
+        // (1) sanity: the gate itself rejects a non-admin.
+        let ext = non_admin_jwt();
+        match require_signing_admin(&ext) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "expected 403 Authorization for non-admin revoke, got {:?}",
+                other
+            ),
+        }
+        // (2) the load-bearing assertion: pin that `revoke_key` ITSELF calls
+        // the gate. A direct `require_signing_admin` check (1) does NOT catch
+        // the gate being dropped from `revoke_key` — which is exactly the
+        // regression that shipped in edbe892d. Assert the gate appears inside
+        // revoke_key's body, so removing it fails the test suite.
+        let src = include_str!("signing.rs");
+        let start = src
+            .find("async fn revoke_key(")
+            .expect("revoke_key handler must exist");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        assert!(
+            rest[..end].contains("require_signing_admin"),
+            "revoke_key MUST call require_signing_admin (admin gate) — #1784 regression guard"
+        );
     }
 
     #[test]

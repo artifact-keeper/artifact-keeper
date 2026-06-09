@@ -152,6 +152,10 @@ pub struct Repository {
     pub upstream_url: Option<String>,
     pub is_public: bool,
     pub quota_bytes: Option<i64>,
+    /// When true, direct user uploads are rejected for this repository:
+    /// artifacts must arrive via the promotion path (staging -> promotion ->
+    /// approval). Defaults to false (no behavior change for existing repos).
+    pub promotion_only: bool,
     pub replication_priority: ReplicationPriority,
     /// For staging repos: default release repo to promote artifacts to
     pub promotion_target_id: Option<Uuid>,

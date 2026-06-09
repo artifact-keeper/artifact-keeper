@@ -3,12 +3,17 @@
 use axum::{
     extract::{Extension, Query, State},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+// Use the project's custom `Json` extractor so a malformed/incomplete request
+// body (e.g. missing `service_name`) surfaces as the standard 400 +
+// `VALIDATION_ERROR` JSON envelope rather than Axum's stock 422 + text/plain
+// body. Responses are still rendered via `axum::Json` (re-exported below).
+use crate::api::extractors::Json;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -37,6 +42,15 @@ pub struct HealthLogQuery {
     pub limit: Option<i64>,
 }
 
+/// Clamp a caller-supplied `limit` into the `[1, 500]` range.
+///
+/// `None` defaults to 100. Negative or zero values are floored to 1 so the
+/// value handed to `LIMIT` is always a positive integer (a negative `LIMIT`
+/// makes Postgres raise an error, which previously surfaced as a 500).
+fn clamp_health_log_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(100).clamp(1, 500)
+}
+
 /// GET /api/v1/admin/monitoring/health-log
 #[utoipa::path(
     get,
@@ -54,7 +68,11 @@ pub async fn get_health_log(
     Query(query): Query<HealthLogQuery>,
 ) -> Result<Json<Vec<ServiceHealthEntry>>> {
     let monitor = HealthMonitorService::new(state.db.clone(), MonitorConfig::default());
-    let limit = query.limit.unwrap_or(100).min(500);
+    // Clamp to a sane range: a non-positive limit (e.g. `?limit=-1` or `?limit=0`)
+    // must not reach the query, where it would either yield no rows or, for
+    // negative values, trigger a Postgres error (`LIMIT must not be negative`)
+    // that surfaced as a 500. Floor at 1 and cap at 500.
+    let limit = clamp_health_log_limit(query.limit);
     let entries = monitor
         .get_health_log(query.service.as_deref(), limit)
         .await?;
@@ -178,42 +196,35 @@ mod tests {
 
     #[test]
     fn test_limit_default_is_100() {
-        let query = HealthLogQuery {
-            service: None,
-            limit: None,
-        };
-        let limit = query.limit.unwrap_or(100).min(500);
-        assert_eq!(limit, 100);
+        assert_eq!(clamp_health_log_limit(None), 100);
     }
 
     #[test]
     fn test_limit_clamped_to_500() {
-        let query = HealthLogQuery {
-            service: None,
-            limit: Some(1000),
-        };
-        let limit = query.limit.unwrap_or(100).min(500);
-        assert_eq!(limit, 500);
+        assert_eq!(clamp_health_log_limit(Some(1000)), 500);
     }
 
     #[test]
     fn test_limit_below_max_preserved() {
-        let query = HealthLogQuery {
-            service: None,
-            limit: Some(250),
-        };
-        let limit = query.limit.unwrap_or(100).min(500);
-        assert_eq!(limit, 250);
+        assert_eq!(clamp_health_log_limit(Some(250)), 250);
     }
 
     #[test]
     fn test_limit_exactly_500() {
-        let query = HealthLogQuery {
-            service: None,
-            limit: Some(500),
-        };
-        let limit = query.limit.unwrap_or(100).min(500);
-        assert_eq!(limit, 500);
+        assert_eq!(clamp_health_log_limit(Some(500)), 500);
+    }
+
+    // Regression for the 500 returned by `?limit=-1`: a non-positive limit must
+    // be floored to 1 so it never reaches Postgres as a negative `LIMIT`.
+    #[test]
+    fn test_limit_negative_floored_to_1() {
+        assert_eq!(clamp_health_log_limit(Some(-1)), 1);
+        assert_eq!(clamp_health_log_limit(Some(i64::MIN)), 1);
+    }
+
+    #[test]
+    fn test_limit_zero_floored_to_1() {
+        assert_eq!(clamp_health_log_limit(Some(0)), 1);
     }
 
     // ── SuppressRequest deserialization tests ────────────────────────
