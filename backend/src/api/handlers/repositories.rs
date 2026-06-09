@@ -3604,6 +3604,158 @@ async fn extract_multipart_file_and_path(
     }
 }
 
+/// Derive the `Content-Disposition` filename for a downloaded artifact.
+///
+/// The browser-facing filename must be the basename of the requested artifact
+/// path (e.g. `testpkg-1.0.0.tar.gz`), not the artifact's package `name`
+/// (`testpkg`). This mirrors the virtual-repo download path, which already uses
+/// `path.rsplit('/').next()`.
+fn download_filename(path: &str) -> &str {
+    path.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+}
+
+/// Outcome of parsing an HTTP `Range` request header against a known total
+/// size. We only support a single `bytes=start-end` range (the common case for
+/// resumable downloads and media seeking); anything more exotic falls back to a
+/// full-body 200 response.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeOutcome {
+    /// No `Range` header, or a header we choose not to honour: serve full 200.
+    Full,
+    /// A satisfiable single range, as inclusive `(start, end)` byte offsets.
+    Satisfiable { start: u64, end: u64 },
+    /// A syntactically valid `bytes=` range that lies outside `[0, total)`:
+    /// the caller must answer 416 Range Not Satisfiable.
+    Unsatisfiable,
+}
+
+/// Parse a single-range HTTP `Range` header value against `total` bytes.
+///
+/// Supports the three RFC 7233 single-range forms:
+/// - `bytes=START-END`   (inclusive)
+/// - `bytes=START-`      (START to end of resource)
+/// - `bytes=-SUFFIX`     (final SUFFIX bytes)
+///
+/// Multi-range (`bytes=0-1,2-3`) and unparseable headers degrade to
+/// [`RangeOutcome::Full`] rather than erroring, which is a valid server choice
+/// per the spec. A `total` of 0 is always served as `Full`.
+fn parse_byte_range(header_value: Option<&str>, total: u64) -> RangeOutcome {
+    let value = match header_value {
+        Some(v) => v.trim(),
+        None => return RangeOutcome::Full,
+    };
+    if total == 0 {
+        return RangeOutcome::Full;
+    }
+    let spec = match value.strip_prefix("bytes=") {
+        Some(s) => s.trim(),
+        None => return RangeOutcome::Full,
+    };
+    // Reject multi-range; we only honour a single range.
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let (start_str, end_str) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return RangeOutcome::Full,
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
+
+    let last = total - 1;
+    match (start_str.is_empty(), end_str.is_empty()) {
+        // `bytes=-SUFFIX`: final SUFFIX bytes.
+        (true, false) => {
+            let suffix: u64 = match end_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if suffix == 0 {
+                return RangeOutcome::Unsatisfiable;
+            }
+            let len = suffix.min(total);
+            RangeOutcome::Satisfiable {
+                start: total - len,
+                end: last,
+            }
+        }
+        // `bytes=START-`: START to end.
+        (false, true) => {
+            let start: u64 = match start_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if start > last {
+                return RangeOutcome::Unsatisfiable;
+            }
+            RangeOutcome::Satisfiable { start, end: last }
+        }
+        // `bytes=START-END`: explicit inclusive range.
+        (false, false) => {
+            let start: u64 = match start_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            let end: u64 = match end_str.parse() {
+                Ok(n) => n,
+                Err(_) => return RangeOutcome::Full,
+            };
+            if start > end || start > last {
+                return RangeOutcome::Unsatisfiable;
+            }
+            RangeOutcome::Satisfiable {
+                start,
+                end: end.min(last),
+            }
+        }
+        // `bytes=-` is malformed.
+        (true, true) => RangeOutcome::Full,
+    }
+}
+
+/// Adapt a byte stream so it yields only the inclusive `[start, end]` window,
+/// skipping leading bytes and truncating trailing ones at chunk boundaries.
+/// Used to satisfy a 206 Partial Content response without buffering the whole
+/// artifact in memory.
+fn slice_byte_stream(
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    start: u64,
+    end: u64,
+) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+    use futures::StreamExt;
+
+    // Number of bytes to emit (inclusive range).
+    let mut remaining = end - start + 1;
+    // Number of leading bytes still to discard before the window begins.
+    let mut to_skip = start;
+
+    let stream = body.filter_map(move |chunk| {
+        let out = match chunk {
+            Ok(mut bytes) => {
+                if to_skip > 0 {
+                    let skip = (to_skip as usize).min(bytes.len());
+                    let _ = bytes.split_to(skip);
+                    to_skip -= skip as u64;
+                }
+                if remaining == 0 || bytes.is_empty() {
+                    None
+                } else {
+                    let take = (remaining as usize).min(bytes.len());
+                    let slice = bytes.split_to(take);
+                    remaining -= take as u64;
+                    Some(Ok(slice))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        };
+        async move { out }
+    });
+    stream.boxed()
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -3746,27 +3898,68 @@ pub async fn download_artifact(
     match download_result {
         Ok((artifact, body)) => {
             // Stream the body from storage instead of buffering it in memory
-            // (#1608, Core Invariant ①). Headers and status are identical to the
-            // prior buffered path; `size_bytes` gives an accurate Content-Length.
-            let response = Response::builder()
-                .status(StatusCode::OK)
+            // (#1608, Core Invariant ①). `size_bytes` gives an accurate
+            // Content-Length.
+            //
+            // The `Content-Disposition` filename is the basename of the
+            // requested path (e.g. `testpkg-1.0.0.tar.gz`), not the artifact's
+            // package name — matching the virtual-repo download path.
+            let total = artifact.size_bytes.max(0) as u64;
+            let range_header = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok());
+            let checksum = artifact.checksum_sha256.trim().to_string();
+            // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
+            // blank-pads shorter values on read; trim before emitting so the
+            // header carries the bare checksum.
+
+            let base = Response::builder()
                 .header(header::CONTENT_TYPE, artifact.content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", artifact.name),
+                    format!("attachment; filename=\"{}\"", download_filename(&path)),
                 )
-                .header(header::CONTENT_LENGTH, artifact.size_bytes.to_string())
+                // Advertise byte-range support so clients (resumable downloads,
+                // media players) know they may issue `Range` requests.
+                .header(header::ACCEPT_RANGES, "bytes")
                 .header(
                     header::HeaderName::from_static("x-checksum-sha256"),
-                    // `artifacts.checksum_sha256` is a CHAR(64) column, so Postgres
-                    // blank-pads shorter values on read. Trim before emitting so the
-                    // header carries the bare checksum (a real sha256 is exactly 64
-                    // hex chars and is unaffected by the trim).
-                    artifact.checksum_sha256.trim().to_string(),
+                    checksum,
                 )
-                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy")
-                .body(Body::from_stream(body))
-                .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?;
+                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy");
+
+            let response = match parse_byte_range(range_header, total) {
+                RangeOutcome::Satisfiable { start, end } => {
+                    let len = end - start + 1;
+                    base.status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_LENGTH, len.to_string())
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
+                        .body(Body::from_stream(slice_byte_stream(body, start, end)))
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                        })?
+                }
+                RangeOutcome::Unsatisfiable => {
+                    // 416 must carry the resource size via Content-Range and no body.
+                    Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+                        .body(Body::empty())
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                        })?
+                }
+                RangeOutcome::Full => base
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, total.to_string())
+                    .body(Body::from_stream(body))
+                    .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?,
+            };
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -4822,6 +5015,157 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // Content-Disposition filename derivation (#1785) — the download filename
+    // must be the basename of the requested path, not the package name.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn download_filename_uses_path_basename() {
+        assert_eq!(
+            download_filename("testpkg/1.0.0/testpkg-1.0.0.tar.gz"),
+            "testpkg-1.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn download_filename_handles_flat_path() {
+        assert_eq!(download_filename("plainfile.bin"), "plainfile.bin");
+    }
+
+    #[test]
+    fn download_filename_handles_trailing_slash() {
+        // A trailing slash would otherwise yield an empty basename; fall back
+        // to the full path rather than emitting an empty filename.
+        assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP Range parsing (#1785) — `Range: bytes=...` must produce 206 with the
+    // correct window, 416 for out-of-bounds, and degrade to a full 200 for
+    // multi-range / unparseable headers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn range_none_is_full() {
+        assert_eq!(parse_byte_range(None, 100), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn range_explicit_inclusive() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-1023"), 102_624),
+            RangeOutcome::Satisfiable {
+                start: 0,
+                end: 1023
+            }
+        );
+    }
+
+    #[test]
+    fn range_open_ended_start() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=500-"), 1000),
+            RangeOutcome::Satisfiable {
+                start: 500,
+                end: 999
+            }
+        );
+    }
+
+    #[test]
+    fn range_suffix() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=-200"), 1000),
+            RangeOutcome::Satisfiable {
+                start: 800,
+                end: 999
+            }
+        );
+    }
+
+    #[test]
+    fn range_suffix_larger_than_total_clamps() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=-5000"), 1000),
+            RangeOutcome::Satisfiable { start: 0, end: 999 }
+        );
+    }
+
+    #[test]
+    fn range_end_clamped_to_last_byte() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-9999"), 1000),
+            RangeOutcome::Satisfiable { start: 0, end: 999 }
+        );
+    }
+
+    #[test]
+    fn range_start_past_end_is_unsatisfiable() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=2000-"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=2000-3000"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn range_inverted_is_unsatisfiable() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=500-100"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn range_multi_range_degrades_to_full() {
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-10,20-30"), 1000),
+            RangeOutcome::Full
+        );
+    }
+
+    #[test]
+    fn range_unparseable_degrades_to_full() {
+        assert_eq!(
+            parse_byte_range(Some("seconds=0-10"), 1000),
+            RangeOutcome::Full
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=abc-def"), 1000),
+            RangeOutcome::Full
+        );
+        assert_eq!(parse_byte_range(Some("bytes=-"), 1000), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn range_on_empty_resource_is_full() {
+        assert_eq!(parse_byte_range(Some("bytes=0-10"), 0), RangeOutcome::Full);
+    }
+
+    #[tokio::test]
+    async fn slice_byte_stream_yields_only_window() {
+        use futures::StreamExt;
+        // Three chunks spanning bytes 0..9: "ab" "cdef" "ghij".
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cdef")),
+            Ok(Bytes::from_static(b"ghij")),
+        ];
+        let body = futures::stream::iter(chunks).boxed();
+        // Request bytes 3..=6 inclusive => "defg".
+        let sliced = slice_byte_stream(body, 3, 6);
+        let collected: Vec<u8> = sliced
+            .filter_map(|r| async move { r.ok() })
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(collected, b"defg");
+    }
 
     // -----------------------------------------------------------------------
     // Remote proxy-cache listing (#1548, web #424)
@@ -9108,6 +9452,95 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("proxy"),
             "x-artifact-storage must remain `proxy` for the local-serve path"
+        );
+        // #1785: the Content-Disposition filename must be the basename of the
+        // requested path (`bar.bin`), NOT the artifact's package name (`bar`).
+        assert_eq!(
+            headers
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"bar.bin\""),
+            "Content-Disposition filename must be the path basename, not the package name"
+        );
+        // #1785: byte-range support must be advertised on every download.
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "Accept-Ranges: bytes must be advertised on the local-serve path"
+        );
+    }
+
+    /// #1785: a `Range: bytes=START-END` request against the local-serve path
+    /// must return 206 Partial Content with the correct window, Content-Range,
+    /// and Content-Length — not a 200 with the full body.
+    #[tokio::test]
+    async fn test_download_artifact_local_honours_range_request() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let body_bytes: &[u8] = b"0123456789abcdef";
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "foo/ranged.bin",
+            "ranged",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        let router = fx.router_with_auth(download_router());
+        let mut req = tdh::get(format!("/{}/download/foo/ranged.bin", fx.repo_key));
+        req.headers_mut().insert(
+            header::RANGE,
+            axum::http::HeaderValue::from_static("bytes=4-7"),
+        );
+
+        use tower::ServiceExt;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("ranged download must respond");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect partial body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::PARTIAL_CONTENT,
+            "a satisfiable Range request must return 206"
+        );
+        assert_eq!(
+            &collected[..],
+            b"4567",
+            "the body must contain only the requested byte window"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 4-7/16"),
+            "Content-Range must report the served window and total size"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("4"),
+            "Content-Length must be the size of the partial window"
         );
     }
 
