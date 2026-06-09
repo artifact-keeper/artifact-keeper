@@ -1142,6 +1142,18 @@ fn forbidden_permission_response() -> Response {
         .unwrap()
 }
 
+/// Build a 404 response that hides the existence of a private repository the
+/// caller is not authorized to see. Mirrors the REST `require_visible` helper
+/// (which returns `NotFound`) so the native-protocol and REST paths give the
+/// same existence-hiding answer for an inaccessible private repo.
+fn not_found_response() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from("Repository not found"))
+        .unwrap()
+}
+
 /// Map an HTTP method to a permission action string.
 ///
 /// Used by [`repo_visibility_middleware`] to determine the required permission
@@ -1416,6 +1428,43 @@ pub async fn repo_visibility_middleware(
 
                 if !allowed {
                     return forbidden_permission_response();
+                }
+            } else if !is_public {
+                // A private repo with NO fine-grained permission rules must
+                // still not be readable by every authenticated user. Mirror
+                // the REST `require_visible` model: a non-admin needs a role
+                // assignment scoped to this repo (or a global assignment).
+                //
+                // Without this branch the native-protocol path default-ALLOWED
+                // rule-less private repos to any authenticated principal, while
+                // the REST download path denied the same caller (404) — a
+                // cross-tenant private-artifact leak (red-team round 2).
+                //
+                // Uses sqlx::query_scalar (not the macro) so no new entry in
+                // the sqlx offline-query cache is required, matching the rest
+                // of this middleware. Same predicate as
+                // RepositoryService::user_can_access_repo.
+                let granted = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM role_assignments ra \
+                         WHERE ra.user_id = $1 \
+                           AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                     )",
+                )
+                .bind(ext.user_id)
+                .bind(repo.id)
+                .fetch_one(&vis_state.db)
+                .await;
+
+                match granted {
+                    Ok(true) => {}
+                    // Existence-hiding 404, matching REST `require_visible`.
+                    Ok(false) => return not_found_response(),
+                    Err(_) => {
+                        // DB error on access check: fail closed.
+                        tracing::error!("repo access check failed: database unreachable");
+                        return service_unavailable_response();
+                    }
                 }
             }
         }
@@ -3764,5 +3813,139 @@ mod tests {
             .unwrap();
         let resp = run_through_visibility(state, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Regression (red-team round 2): a PRIVATE repo with NO fine-grained
+    /// permission rules must NOT be readable by an authenticated non-admin who
+    /// holds no role assignment for it. The native-protocol middleware must
+    /// match the REST `require_visible` model (existence-hiding 404), not
+    /// default-allow to any authenticated principal.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset; runs for real in the CI
+    /// coverage job (which seeds Postgres before `cargo llvm-cov --lib`).
+    #[tokio::test]
+    async fn test_private_repo_without_rules_denies_unassigned_nonadmin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::user::{AuthProvider, User};
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (user_id, username) = tdh::create_user(&pool).await; // non-admin
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await; // is_public defaults false
+
+        // Mint a real access JWT for this non-admin user. AuthService is built
+        // on the real pool so the replica-safe invalidation check succeeds.
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let now = chrono::Utc::now();
+        let user = User {
+            id: user_id,
+            username: username.clone(),
+            email: format!("{}@test.local", username),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth_service.generate_tokens(&user).unwrap().access_token
+        );
+
+        // Fresh state per request: a pre-populated cache so the middleware skips
+        // the DB repo lookup, with the private repo's real id so the
+        // role_assignments query resolves against it.
+        async fn mk_state(
+            pool: &sqlx::PgPool,
+            auth: Arc<AuthService>,
+            repo_key: &str,
+            repo_id: Uuid,
+            storage_path: String,
+        ) -> RepoVisibilityState {
+            let cache: RepoCache =
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "pypi".to_string(),
+                repo_type: "local".to_string(),
+                upstream_url: None,
+                storage_path,
+                storage_backend: "filesystem".to_string(),
+                is_public: false,
+                index_upstream_url: None,
+            };
+            cache
+                .write()
+                .await
+                .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
+            RepoVisibilityState {
+                auth_service: auth,
+                db: pool.clone(),
+                repo_cache: cache,
+                permission_service: Arc::new(PermissionService::new(pool.clone())),
+            }
+        }
+
+        let req = || {
+            axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!("/pypi/{}/simple/", repo_key))
+                .header("Authorization", &bearer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let storage = storage_dir.to_string_lossy().into_owned();
+
+        // 1) No role assignment -> existence-hiding 404 (the fix). Without the
+        //    fix this returned 200 and leaked the private repo's contents.
+        let state = mk_state(
+            &pool,
+            auth_service.clone(),
+            &repo_key,
+            repo_id,
+            storage.clone(),
+        )
+        .await;
+        let resp = run_through_visibility(state, req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "authenticated non-admin without a role assignment must NOT read a \
+             rule-less private repo via the native path"
+        );
+
+        // 2) Grant a role assignment -> access restored (parity with REST).
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = mk_state(&pool, auth_service, &repo_key, repo_id, storage).await;
+        let resp = run_through_visibility(state, req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a role assignment must restore native-path access to the private repo"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 }
