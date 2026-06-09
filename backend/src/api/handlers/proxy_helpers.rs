@@ -270,6 +270,39 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
     }
 }
 
+/// Decide whether a direct user upload must be rejected because the target
+/// repository is flagged `promotion_only`.
+///
+/// A `promotion_only` repository rejects direct artifact uploads so that
+/// artifacts can only arrive via the promotion path (staging -> promotion ->
+/// approval). The promotion service writes through its own RAW SQL INSERT path
+/// (handlers/promotion.rs), which does NOT go through the HTTP upload handlers,
+/// so promotions are unaffected by this check.
+///
+/// Admins are exempt: they can still publish directly (e.g. for break-glass /
+/// bootstrap), so the gate only constrains non-admin direct uploads.
+pub fn promotion_only_blocks_direct_upload(promotion_only: bool, is_admin: bool) -> bool {
+    promotion_only && !is_admin
+}
+
+/// 409 plain-text response for a rejected direct upload to a `promotion_only`
+/// repository. Used by format handlers that return `Response` (e.g. Maven).
+#[allow(clippy::result_large_err)]
+pub fn reject_direct_upload_if_promotion_only(
+    promotion_only: bool,
+    is_admin: bool,
+) -> Result<(), Response> {
+    if promotion_only_blocks_direct_upload(promotion_only, is_admin) {
+        Err((
+            StatusCode::CONFLICT,
+            "Direct uploads are disabled for this repository; publish via promotion",
+        )
+            .into_response())
+    } else {
+        Ok(())
+    }
+}
+
 /// Map a proxy service error to an HTTP error response.
 ///
 /// * `NotFound` → 404 (upstream definitively does not have the artifact)
@@ -1286,7 +1319,7 @@ pub async fn fetch_virtual_members(
             r.format as "format: RepositoryFormat",
             r.repo_type as "repo_type: RepositoryType",
             r.storage_backend, r.storage_path, r.upstream_url,
-            r.is_public, r.quota_bytes,
+            r.is_public, r.quota_bytes, r.promotion_only,
             r.replication_priority as "replication_priority: ReplicationPriority",
             r.promotion_target_id, r.promotion_policy_id,
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
@@ -2613,6 +2646,7 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         upstream_url: Some(upstream_url.to_string()),
         is_public: false,
         quota_bytes: None,
+        promotion_only: false,
         replication_priority: ReplicationPriority::OnDemand,
         promotion_target_id: None,
         promotion_policy_id: None,
@@ -2631,6 +2665,40 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
+
+    // ── promotion_only direct-upload gate ───────────────────────────
+
+    #[test]
+    fn test_promotion_only_blocks_non_admin_direct_upload() {
+        // Non-admin + promotion_only repo => blocked.
+        assert!(promotion_only_blocks_direct_upload(true, false));
+    }
+
+    #[test]
+    fn test_promotion_only_admin_is_exempt() {
+        // Admins may still publish directly to a promotion_only repo.
+        assert!(!promotion_only_blocks_direct_upload(true, true));
+    }
+
+    #[test]
+    fn test_promotion_only_normal_repo_not_blocked() {
+        // promotion_only = false => never blocked (no regression for normal repos).
+        assert!(!promotion_only_blocks_direct_upload(false, false));
+        assert!(!promotion_only_blocks_direct_upload(false, true));
+    }
+
+    #[test]
+    fn test_reject_direct_upload_if_promotion_only_returns_409() {
+        let err = reject_direct_upload_if_promotion_only(true, false)
+            .expect_err("non-admin direct upload to promotion_only repo must be rejected");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_reject_direct_upload_if_promotion_only_allows_admin_and_normal() {
+        assert!(reject_direct_upload_if_promotion_only(true, true).is_ok());
+        assert!(reject_direct_upload_if_promotion_only(false, false).is_ok());
+    }
 
     // ── LocalLookup dispatch tests ──────────────────────────────────
 

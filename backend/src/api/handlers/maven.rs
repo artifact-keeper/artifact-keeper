@@ -1702,11 +1702,24 @@ async fn upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // this push endpoint. Require the write scope before doing any work.
-    let user_id = require_auth_basic_scope(auth, "maven", "write")?.user_id;
+    let auth = require_auth_basic_scope(auth, "maven", "write")?;
+    let user_id = auth.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    // Reject direct uploads to promotion-only repositories (non-admins). Such
+    // repos accept artifacts only via the promotion path, not direct push.
+    let promotion_only = sqlx::query_scalar!(
+        "SELECT promotion_only FROM repositories WHERE id = $1",
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| proxy_helpers::internal_error("Database", e))?
+    .unwrap_or(false);
+    proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
     let storage_key = format!("maven/{}", path);
     let storage = state

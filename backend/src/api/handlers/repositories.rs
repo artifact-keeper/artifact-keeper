@@ -345,6 +345,10 @@ pub struct CreateRepositoryRequest {
     pub allow_anonymous_access: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
+    /// When true, direct user uploads to this repository are rejected:
+    /// artifacts must arrive via the promotion path. Admin-only to set.
+    /// Defaults to false (no behavior change for existing repositories).
+    pub promotion_only: Option<bool>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -402,6 +406,9 @@ pub struct UpdateRepositoryRequest {
     /// `allow_anonymous_access` takes precedence.
     pub allow_anonymous_access: Option<bool>,
     pub quota_bytes: Option<i64>,
+    /// When provided, enables/disables the `promotion_only` policy for this
+    /// repository (admin-only). When omitted, the flag is left unchanged.
+    pub promotion_only: Option<bool>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -441,6 +448,8 @@ pub struct RepositoryResponse {
     /// always equal to `is_public` and provided as a convenience alias so
     /// the semantics are clear for remote (pull-through cache) repositories.
     pub allow_anonymous_access: bool,
+    /// When true, direct user uploads are rejected; artifacts must be promoted.
+    pub promotion_only: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     pub upstream_url: Option<String>,
@@ -470,6 +479,7 @@ fn repo_to_response(
         repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
+        promotion_only: repo.promotion_only,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         upstream_url: repo.upstream_url,
@@ -1271,6 +1281,7 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public,
             quota_bytes: payload.quota_bytes,
+            promotion_only: payload.promotion_only.unwrap_or(false),
             // Plugin format key takes precedence over any explicit format_key
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
@@ -1465,6 +1476,7 @@ pub async fn update_repository(
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
+                promotion_only: payload.promotion_only,
             },
         )
         .await?;
@@ -3317,6 +3329,19 @@ pub async fn upload_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+
+    // Reject direct uploads to promotion-only repositories (non-admins). Such
+    // repos accept artifacts only via the promotion path (staging -> promotion
+    // -> approval); the promotion service writes through its own path and is
+    // unaffected.
+    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_upload(
+        repo.promotion_only,
+        auth.is_admin,
+    ) {
+        return Err(AppError::Conflict(
+            "Direct uploads are disabled for this repository; publish via promotion".to_string(),
+        ));
+    }
 
     // Verify declared checksums against actual content before storing anything.
     let declared_sha256 = headers
@@ -5691,6 +5716,7 @@ mod tests {
             repo_type: "local".to_string(),
             is_public: true,
             allow_anonymous_access: true,
+            promotion_only: false,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
             upstream_url: None,
@@ -5704,6 +5730,39 @@ mod tests {
         assert!(json.contains("\"storage_used_bytes\":1024"));
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
+        assert!(json.contains("\"promotion_only\":false"));
+    }
+
+    #[test]
+    fn test_create_repository_request_promotion_only_deserialization() {
+        let json = r#"{
+            "key": "maven-releases",
+            "name": "Maven Releases",
+            "format": "maven",
+            "repo_type": "local",
+            "promotion_only": true
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.promotion_only, Some(true));
+    }
+
+    #[test]
+    fn test_create_repository_request_promotion_only_defaults_none() {
+        let json = r#"{
+            "key": "k",
+            "name": "n",
+            "format": "npm",
+            "repo_type": "local"
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert!(req.promotion_only.is_none());
+    }
+
+    #[test]
+    fn test_update_repository_request_promotion_only_deserialization() {
+        let json = r#"{"promotion_only": true}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.promotion_only, Some(true));
     }
 
     #[test]
@@ -6885,6 +6944,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: Some(1073741824),
+            promotion_only: false,
             replication_priority: ReplicationPriority::Immediate,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -6926,6 +6986,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::OnDemand,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -6969,6 +7030,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -7007,6 +7069,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: Some(5_000_000_000),
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: Some(target_id),
             promotion_policy_id: Some(policy_id),
@@ -7120,6 +7183,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -7343,6 +7407,7 @@ mod tests {
             upstream_url: None,
             is_public,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
