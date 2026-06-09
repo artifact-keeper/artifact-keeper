@@ -536,12 +536,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 admin_middleware,
             )),
         )
-        // Plugin routes with auth middleware
+        // Plugin read-only routes with auth middleware
         .nest(
             "/plugins",
             handlers::plugins::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
+            )),
+        )
+        // Plugin install + lifecycle routes require admin (loads arbitrary WASM)
+        .nest(
+            "/plugins",
+            handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
             )),
         )
         // Format handler read-only routes (list, get) with optional auth
@@ -738,6 +746,29 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    #[test]
+    fn plugin_install_and_lifecycle_require_admin() {
+        // Installing a plugin loads arbitrary WASM, and enabling/disabling or
+        // uninstalling one changes the running plugin set. These routes must be
+        // mounted via `plugins::admin_router` under `admin_middleware`, not the
+        // plain `auth_middleware` (which any authenticated user passes). A
+        // regression here re-opens the supply-chain path where a non-admin can
+        // drive the WASM plugin installer.
+        let admin_nest = ROUTES_RS_SRC
+            .split("handlers::plugins::admin_router()")
+            .nth(1)
+            .expect("plugins::admin_router() must be nested under /plugins");
+        // The nest immediately following admin_router() must wire admin_middleware.
+        let next_middleware = admin_nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("admin_router() nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "plugin install + lifecycle routes must be gated by admin_middleware"
         );
     }
 }

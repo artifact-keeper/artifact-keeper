@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Extension, Multipart, Path, Query, State},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -23,18 +23,32 @@ fn wasm_service(state: &SharedState) -> Result<&WasmPluginService> {
         .ok_or_else(|| AppError::Internal("WASM plugin service not available".to_string()))
 }
 
-/// Create plugin routes
+/// Create plugin read-only routes (list, get, config, events).
+///
+/// These are mounted under the standard auth middleware so any authenticated
+/// user may inspect installed plugins.
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route("/", get(list_plugins).post(install_plugin))
-        .route("/:id", get(get_plugin).delete(uninstall_plugin))
-        .route("/:id/enable", post(enable_plugin))
-        .route("/:id/disable", post(disable_plugin))
+        .route("/", get(list_plugins))
+        .route("/:id", get(get_plugin))
         .route(
             "/:id/config",
             get(get_plugin_config).post(update_plugin_config),
         )
         .route("/:id/events", get(get_plugin_events))
+}
+
+/// Create plugin admin routes (install + lifecycle).
+///
+/// Installing a plugin loads arbitrary WASM code and enabling/disabling or
+/// uninstalling a plugin changes the running plugin set, so these routes are
+/// mounted under the admin middleware (requires `is_admin`).
+pub fn admin_router() -> Router<SharedState> {
+    Router::new()
+        .route("/", post(install_plugin))
+        .route("/:id", delete(uninstall_plugin))
+        .route("/:id/enable", post(enable_plugin))
+        .route("/:id/disable", post(disable_plugin))
         // WASM plugin endpoints
         .route("/install/git", post(install_from_git))
         .route("/install/zip", post(install_from_zip))
