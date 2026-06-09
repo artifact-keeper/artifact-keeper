@@ -729,6 +729,132 @@ impl AgeGateService {
             .emit_for_repo("age_gate.approved", review_id, repository_id, None);
         Ok(())
     }
+
+    /// Load all existing reviews for a package keyed by version, so a batch
+    /// evaluation can classify every version with a single read.
+    async fn get_reviews_for_package(
+        &self,
+        repository_id: Uuid,
+        package_name: &str,
+    ) -> Result<std::collections::HashMap<String, (Uuid, String)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, package_version, status
+            FROM age_gate_reviews
+            WHERE repository_id = $1 AND package_name = $2
+            "#,
+            repository_id,
+            package_name
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.package_version, (r.id, r.status)))
+            .collect())
+    }
+
+    /// Upsert pending review requests for many versions in a single statement.
+    ///
+    /// The per-version `request_count` / `last_requested_at` bump is *debounced*:
+    /// an existing row is only re-bumped when its last request predates the
+    /// [`REQUEST_COUNT_DEBOUNCE_SECS`] cutoff. This turns "write on every metadata
+    /// fetch" into "write at most once per version per window" — the bulk of the
+    /// age-gate write traffic, since popular packages are re-listed constantly —
+    /// while still keeping an approximate demand signal for reviewers. Rows whose
+    /// bump is debounced away are simply not returned by `RETURNING`.
+    ///
+    /// A freshly inserted row keeps the default `request_count = 1` (its INSERT is
+    /// never gated by the debounce `WHERE`, which only applies to the UPDATE
+    /// action); a bumped row is >= 2. So `request_count = 1` among the returned
+    /// rows reliably marks brand-new reviews for `age_gate.queued` emission.
+    async fn request_reviews_batch(
+        &self,
+        repository_id: Uuid,
+        package_name: &str,
+        versions: &[String],
+        published_ats: &[Option<DateTime<Utc>>],
+    ) -> Result<()> {
+        let stale_before = Utc::now() - chrono::Duration::seconds(REQUEST_COUNT_DEBOUNCE_SECS);
+        let rows = sqlx::query!(
+            r#"
+            INSERT INTO age_gate_reviews (
+                repository_id, package_name, package_version,
+                upstream_published_at, status
+            )
+            SELECT $1, $2, v, p, 'pending'
+            FROM UNNEST($3::text[], $4::timestamptz[]) AS t(v, p)
+            ON CONFLICT (repository_id, package_name, package_version)
+            DO UPDATE SET
+                request_count = age_gate_reviews.request_count + 1,
+                last_requested_at = NOW(),
+                upstream_published_at = COALESCE(EXCLUDED.upstream_published_at, age_gate_reviews.upstream_published_at)
+            WHERE age_gate_reviews.last_requested_at < $5
+            RETURNING id AS "id!", (request_count = 1) AS "is_new!"
+            "#,
+            repository_id,
+            package_name,
+            versions,
+            published_ats as &[Option<DateTime<Utc>>],
+            stale_before
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        for row in rows {
+            if row.is_new {
+                self.event_bus
+                    .emit_for_repo("age_gate.queued", row.id, repository_id, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Auto-approve every pending review whose version has crossed its
+    /// repository's age threshold. This runs on the background scheduler rather
+    /// than on the metadata/download fetch paths, keeping listing reads free of
+    /// the pending→approved UPDATE. A single statement transitions all eligible
+    /// rows across every age-gate-enabled repository, and an approval event is
+    /// emitted per row actually transitioned. Returns the number approved.
+    ///
+    /// The age predicate mirrors [`Self::meets_age_threshold`] exactly: for an
+    /// integer threshold `n`, `floor(age_days) >= n` is equivalent to
+    /// `age >= n days`, so the served-vs-blocked decision on the read path and
+    /// the row's persisted status never disagree once this sweep has run.
+    ///
+    /// Concurrency-safe across replicas: `WHERE status = 'pending'` plus row
+    /// locking means each row is transitioned (and returned) by exactly one
+    /// runner, so no duplicate `age_gate.approved` events are emitted.
+    pub async fn auto_approve_aged_reviews(&self) -> Result<u64> {
+        let rows = sqlx::query!(
+            r#"
+            UPDATE age_gate_reviews r
+            SET status = 'approved', reviewed_by = NULL, reviewed_at = NOW(),
+                review_reason = $1
+            FROM repositories repo
+            WHERE r.repository_id = repo.id
+              AND r.status = 'pending'
+              AND repo.age_gate_enabled = true
+              AND r.upstream_published_at IS NOT NULL
+              AND NOW() - r.upstream_published_at >= make_interval(days => repo.age_gate_min_age_days)
+            RETURNING r.id AS "id!", r.repository_id AS "repository_id!"
+            "#,
+            AUTO_APPROVE_REASON
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let approved = rows.len() as u64;
+        for row in rows {
+            self.event_bus
+                .emit_for_repo("age_gate.approved", row.id, row.repository_id, None);
+        }
+        Ok(approved)
+    }
 }
 
 fn extract_href_filename(anchor: &str) -> Option<String> {
@@ -737,6 +863,49 @@ fn extract_href_filename(anchor: &str) -> Option<String> {
     let href_end = rest.find('"')?;
     let href = &rest[..href_end];
     href.rsplit('/').next().map(|s| s.to_string())
+}
+
+/// Extract the package version a PyPI simple-index anchor links to, if any.
+fn pypi_anchor_version(anchor: &str) -> Option<String> {
+    extract_href_filename(anchor)
+        .as_deref()
+        .and_then(|f| crate::formats::pypi::PypiHandler::parse_filename(f).ok())
+        .and_then(|info| info.version)
+}
+
+/// Map a repository format to the bounded Prometheus label used on age-gate
+/// metrics. [`AgeGateService::is_applicable`] restricts the gate to npm/PyPI, so
+/// other formats are never expected here; they collapse to `"other"` rather than
+/// widening the label set.
+fn format_label(format: &RepositoryFormat) -> &'static str {
+    match format {
+        RepositoryFormat::Npm => "npm",
+        RepositoryFormat::Pypi => "pypi",
+        _ => "other",
+    }
+}
+
+/// Drop any `dist-tags` entry whose target version is no longer present in the
+/// filtered packument, then re-point `latest` to the newest surviving version.
+///
+/// `allowed` is the set of versions that survived age-gate filtering and must be
+/// sorted newest-first. When `allowed` is empty every tag is removed, leaving an
+/// empty (but consistent) `dist-tags` object.
+fn reconcile_dist_tags(packument: &mut serde_json::Value, allowed: &[String]) {
+    let allowed_set: std::collections::HashSet<&str> = allowed.iter().map(String::as_str).collect();
+    let Some(dist_tags) = packument
+        .get_mut("dist-tags")
+        .and_then(|d| d.as_object_mut())
+    else {
+        return;
+    };
+    dist_tags.retain(|_tag, target| target.as_str().is_some_and(|v| allowed_set.contains(v)));
+    if let Some(latest) = allowed.first() {
+        dist_tags.insert(
+            "latest".to_string(),
+            serde_json::Value::String(latest.clone()),
+        );
+    }
 }
 
 fn version_compare_desc(a: &str, b: &str) -> std::cmp::Ordering {
@@ -806,11 +975,56 @@ mod tests {
     }
 
     #[test]
+    fn format_label_maps_to_bounded_set() {
+        assert_eq!(format_label(&RepositoryFormat::Npm), "npm");
+        assert_eq!(format_label(&RepositoryFormat::Pypi), "pypi");
+        // Anything outside the gate's supported formats collapses to "other"
+        // so the metric label set stays bounded.
+        assert_eq!(format_label(&RepositoryFormat::Generic), "other");
+    }
+
+    #[test]
     fn extract_href_filename_parses_anchor() {
         let html = r#"<a href="/packages/requests/2.31.0/requests-2.31.0.tar.gz">link</a>"#;
         assert_eq!(
             extract_href_filename(html),
             Some("requests-2.31.0.tar.gz".to_string())
         );
+    }
+
+    #[test]
+    fn reconcile_dist_tags_repoints_latest_to_newest_allowed() {
+        // `latest` pointed at 3.0.0, which was blocked/removed.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0" },
+            "versions": { "1.0.0": {}, "2.0.0": {} },
+        });
+        reconcile_dist_tags(&mut packument, &["2.0.0".to_string(), "1.0.0".to_string()]);
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_removes_dangling_non_latest_tag() {
+        // A prerelease `beta` tag points at a blocked version; it must be dropped so
+        // `npm install pkg@beta` does not resolve to a missing manifest.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0", "beta": "2.0.0-beta.1" },
+            "versions": { "1.0.0": {} },
+        });
+        reconcile_dist_tags(&mut packument, &["1.0.0".to_string()]);
+        let tags = packument["dist-tags"].as_object().unwrap();
+        assert_eq!(tags.get("latest"), Some(&serde_json::json!("1.0.0")));
+        assert!(!tags.contains_key("beta"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_empties_when_all_versions_blocked() {
+        // Every version was blocked: dist-tags must end up empty rather than dangling.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0", "next": "1.1.0" },
+            "versions": {},
+        });
+        reconcile_dist_tags(&mut packument, &[]);
+        assert!(packument["dist-tags"].as_object().unwrap().is_empty());
     }
 }
