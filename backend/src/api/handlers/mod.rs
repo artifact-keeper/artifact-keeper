@@ -1,5 +1,17 @@
 //! HTTP request handlers.
 
+use axum::http::HeaderMap;
+
+/// Request marker set by peer replication writes. Receiving handlers use this
+/// to avoid queuing the replicated write back to the origin peer.
+pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-artifact-keeper-replication")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Remove any soft-deleted artifact at the given `(repository_id, path)` so
 /// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
 /// fire-and-forget cleanup: if the DELETE fails or finds nothing we just

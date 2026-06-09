@@ -22,6 +22,7 @@ use crate::api::dto::Pagination;
 // `crate::api::extractors`. The wrapper also implements `IntoResponse` so it
 // is a drop-in replacement on response types too.
 use crate::api::extractors::Json;
+use crate::api::handlers::is_replication_request;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -42,14 +43,6 @@ use crate::services::upload_service;
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
-}
-
-fn is_replication_request(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-artifact-keeper-replication")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
 }
 
 /// Coerce the requested `is_public` value against the server-wide guest-access

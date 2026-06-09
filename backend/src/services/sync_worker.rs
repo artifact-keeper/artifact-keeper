@@ -483,6 +483,11 @@ struct TaskRow {
     artifact_name: String,
     artifact_version: Option<String>,
     artifact_path: String,
+    artifact_metadata_format: Option<String>,
+    artifact_metadata: Option<serde_json::Value>,
+    artifact_metadata_properties: Option<serde_json::Value>,
+    package_description: Option<String>,
+    package_metadata: Option<serde_json::Value>,
     repository_key: String,
     repository_id: Uuid,
     repository_storage_backend: String,
@@ -695,6 +700,17 @@ async fn process_pending_tasks(
                 a.name AS artifact_name,
                 a.version AS artifact_version,
                 a.path AS artifact_path,
+                am.format AS artifact_metadata_format,
+                am.metadata AS artifact_metadata,
+                am.properties AS artifact_metadata_properties,
+                CASE
+                    WHEN p.version = a.version THEN p.description
+                    ELSE NULL
+                END AS package_description,
+                CASE
+                    WHEN p.version = a.version THEN p.metadata
+                    ELSE NULL
+                END AS package_metadata,
                 r.key AS repository_key,
                 r.id AS repository_id,
                 r.storage_backend AS repository_storage_backend,
@@ -708,6 +724,10 @@ async fn process_pending_tasks(
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
             JOIN repositories r ON r.id = a.repository_id
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            LEFT JOIN packages p
+                ON p.repository_id = r.id
+               AND p.name = a.name
             LEFT JOIN peer_repo_subscriptions prs
                 ON prs.peer_instance_id = st.peer_instance_id
                AND prs.repository_id = r.id
@@ -834,9 +854,9 @@ async fn execute_transfer(
     }
 
     // Push flow: decide between single-request upload and chunked transfer
-    // based on the artifact size.
+    // based on the artifact size or the need to preserve metadata.
     let threshold = chunked_threshold_bytes();
-    if should_use_chunked_transfer(task.artifact_size, threshold) {
+    if should_use_chunked_transfer_for_task(task, threshold) {
         return execute_chunked_transfer(
             db,
             client,
@@ -1466,6 +1486,11 @@ fn build_chunked_upload_session_body(task: &TaskRow, chunk_size: i32) -> serde_j
         "artifact_path": task.artifact_path,
         "artifact_name": task.artifact_name,
         "artifact_version": task.artifact_version,
+        "artifact_metadata_format": task.artifact_metadata_format,
+        "artifact_metadata": task.artifact_metadata,
+        "artifact_metadata_properties": task.artifact_metadata_properties,
+        "package_description": task.package_description,
+        "package_metadata": task.package_metadata,
         "total_size": task.artifact_size,
         "checksum_sha256": task.checksum_sha256,
         "chunk_size": chunk_size,
@@ -1602,6 +1627,17 @@ pub(crate) fn sync_chunk_size_bytes() -> i32 {
 /// Decide whether a given artifact size should use chunked transfer.
 pub(crate) fn should_use_chunked_transfer(artifact_size: i64, threshold: i64) -> bool {
     artifact_size >= threshold
+}
+
+fn task_has_replication_metadata(task: &TaskRow) -> bool {
+    (task.artifact_metadata_format.is_some() && task.artifact_metadata.is_some())
+        || task.package_description.is_some()
+        || task.package_metadata.is_some()
+}
+
+fn should_use_chunked_transfer_for_task(task: &TaskRow, threshold: i64) -> bool {
+    should_use_chunked_transfer(task.artifact_size, threshold)
+        || task_has_replication_metadata(task)
 }
 
 /// Compute the list of (chunk_index, byte_offset, byte_length) for a given
@@ -1893,6 +1929,11 @@ mod tests {
             artifact_name: "artifact.bin".to_string(),
             artifact_version: None,
             artifact_path: "path/artifact.bin".to_string(),
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
             repository_key: "repo".to_string(),
             repository_id: Uuid::new_v4(),
             repository_storage_backend: storage_backend.to_string(),
@@ -3487,6 +3528,41 @@ mod tests {
         assert!(should_use_chunked_transfer(1, 0));
     }
 
+    #[test]
+    fn test_should_use_chunked_transfer_for_task_uses_size_threshold() {
+        let mut task = test_task("filesystem");
+        task.artifact_size = 100 * 1024 * 1024;
+
+        assert!(should_use_chunked_transfer_for_task(
+            &task,
+            100 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn test_should_use_chunked_transfer_for_task_forces_metadata_tasks() {
+        let mut task = test_task("filesystem");
+        task.artifact_size = 1024;
+        task.artifact_metadata_format = Some("debian".to_string());
+        task.artifact_metadata = Some(serde_json::json!({"format": "debian"}));
+
+        assert!(should_use_chunked_transfer_for_task(
+            &task,
+            100 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn test_should_use_chunked_transfer_for_task_keeps_plain_small_fast_path() {
+        let mut task = test_task("filesystem");
+        task.artifact_size = 1024;
+
+        assert!(!should_use_chunked_transfer_for_task(
+            &task,
+            100 * 1024 * 1024
+        ));
+    }
+
     // ── compute_chunk_ranges ───────────────────────────────────────────
 
     #[test]
@@ -3603,6 +3679,31 @@ mod tests {
         assert_eq!(body["artifact_name"], "name-check");
         assert_eq!(body["artifact_version"], "20260603T072902Z");
         assert_eq!(body["chunk_size"], 52_428_800);
+    }
+
+    #[test]
+    fn test_build_chunked_upload_session_body_preserves_replication_metadata() {
+        let mut task = test_task("filesystem");
+        task.artifact_metadata_format = Some("debian".to_string());
+        task.artifact_metadata = Some(serde_json::json!({
+            "format": "debian",
+            "architecture": "amd64",
+            "component": "main"
+        }));
+        task.artifact_metadata_properties = Some(serde_json::json!({"source": "lux"}));
+        task.package_description = Some("replicated Debian package".to_string());
+        task.package_metadata = Some(serde_json::json!({
+            "format": "debian",
+            "component": "main"
+        }));
+
+        let body = build_chunked_upload_session_body(&task, 52_428_800);
+
+        assert_eq!(body["artifact_metadata_format"], "debian");
+        assert_eq!(body["artifact_metadata"]["architecture"], "amd64");
+        assert_eq!(body["artifact_metadata_properties"]["source"], "lux");
+        assert_eq!(body["package_description"], "replicated Debian package");
+        assert_eq!(body["package_metadata"]["component"], "main");
     }
 
     #[test]

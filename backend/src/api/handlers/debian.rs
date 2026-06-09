@@ -1623,6 +1623,10 @@ fn package_description(control: &DebControl) -> Option<&str> {
         .filter(|description| !description.trim().is_empty())
 }
 
+fn should_enqueue_debian_sync_tasks(headers: &HeaderMap) -> bool {
+    !super::is_replication_request(headers)
+}
+
 async fn persist_debian_upload(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1710,6 +1714,7 @@ async fn pool_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, component, path)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1718,7 +1723,15 @@ async fn pool_upload(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let upload = prepare_debian_upload(&component, &path, &body)?;
-    persist_debian_upload(&state, &repo, &upload, body, Some(user_id), false).await?;
+    persist_debian_upload(
+        &state,
+        &repo,
+        &upload,
+        body,
+        Some(user_id),
+        should_enqueue_debian_sync_tasks(&headers),
+    )
+    .await?;
 
     info!(
         "Debian upload: {} {} {} to repo {} (component: {})",
@@ -1789,8 +1802,15 @@ async fn upload_raw(
         .unwrap_or(&artifact_path)
         .to_string();
     let upload = prepare_debian_upload(component, &path, &body)?;
-    let artifact =
-        persist_debian_upload(&state, &repo, &upload, body, Some(user_id), false).await?;
+    let artifact = persist_debian_upload(
+        &state,
+        &repo,
+        &upload,
+        body,
+        Some(user_id),
+        should_enqueue_debian_sync_tasks(&headers),
+    )
+    .await?;
 
     info!(
         "Debian upload (raw): {} {} {} to repo {}",
@@ -2917,6 +2937,27 @@ mod upload_db_tests {
         append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
         append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
         deb
+    }
+
+    fn headers_with_replication(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_should_enqueue_debian_sync_tasks_for_direct_upload() {
+        assert!(should_enqueue_debian_sync_tasks(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn test_should_enqueue_debian_sync_tasks_skips_peer_replication() {
+        assert!(!should_enqueue_debian_sync_tasks(
+            &headers_with_replication("true")
+        ));
     }
 
     #[tokio::test]
