@@ -682,6 +682,7 @@ fn content_type_for_path(path: &str) -> &'static str {
 
 async fn download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
@@ -723,7 +724,17 @@ async fn download(
             // generation below only queries `repo.id` (which has no
             // artifact rows for a virtual). #1444.
             if repo.repo_type == RepositoryType::Virtual {
+                // #1804: gate the per-member stored-file probes so a public
+                // virtual repo cannot serve a PRIVATE member's stored checksum
+                // or metadata file to a caller who could not read that member
+                // directly.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.permission_service,
+                    auth.as_ref(),
+                    members,
+                )
+                .await;
                 for member in &members {
                     if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
                         if let Ok(content) = member_storage.get(&checksum_storage_key).await {
@@ -1042,7 +1053,17 @@ async fn download(
 
         // Virtual repo: try each member in priority order
         if repo.repo_type == RepositoryType::Virtual {
+            // #1804: only members the caller could read directly may serve a
+            // checksum. A private member's checksum reveals the existence and
+            // exact content hash of its artifact, so it must be gated the same
+            // way the artifact bytes are.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            let members = proxy_helpers::authorize_virtual_members(
+                &state.permission_service,
+                auth.as_ref(),
+                members,
+            )
+            .await;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
@@ -1089,7 +1110,7 @@ async fn download(
     }
 
     // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path).await
+    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
 }
 
 async fn generate_metadata_for_artifact(
@@ -1140,6 +1161,7 @@ async fn serve_artifact(
     repo: &RepoInfo,
     repo_key: &str,
     path: &str,
+    auth: Option<&AuthExtension>,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -1250,10 +1272,24 @@ async fn serve_artifact(
                     state.proxy_service.as_deref()
                 };
 
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
+                // #1804: authorize each member against the caller before any of
+                // its bytes can be served. A public virtual repo must not turn
+                // into a confused deputy that streams its PRIVATE members'
+                // artifacts to anonymous / unprivileged callers. Members the
+                // caller could not read directly are dropped, so a denied
+                // member behaves exactly as if it did not contain the artifact
+                // (404), never leaking its existence.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.permission_service,
+                    auth,
+                    members,
+                )
+                .await;
+
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    members,
                     proxy_for_virtual,
-                    repo.id,
                     path,
                     |member_id, location| {
                         let db = db.clone();
