@@ -1256,12 +1256,26 @@ pub async fn repo_visibility_middleware(
             return service_unavailable_response();
         }
         let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
+        // #1808: Close the anonymous repo-existence oracle. An existing
+        // *private* repo returns 401 to an anonymous caller (visibility check
+        // below), so a nonexistent repo must not return the handler's 404 to
+        // that same caller -- the differing status would leak which repo keys
+        // exist. Mirror the existing-private response: emit the identical
+        // 401 + `WWW-Authenticate` challenge whenever no credential is
+        // presented, so the status, body, and headers are byte-identical for
+        // existing-private and nonexistent keys. This also preserves
+        // package-manager 401-retry semantics (clients still see the
+        // challenge and can retry with credentials).
+        let no_credential = matches!(outcome, AuthOutcome::NoCredential);
         let auth_ext: Option<AuthExtension> = match outcome {
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
             AuthOutcome::Overloaded => None,
         };
         if credential_invalid && auth_ext.is_none() {
+            return unauthorized_response();
+        }
+        if no_credential {
             return unauthorized_response();
         }
         // Note: `credential_invalid` was captured before the match consumed
@@ -3642,6 +3656,62 @@ mod tests {
         let resp =
             run_through_visibility(state, empty_get("/pypi/myrepo/simple/?ticket=anything")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Drive an anonymous GET through the visibility middleware and return the
+    /// status plus the fully-buffered body. Shared by the existence-oracle
+    /// regression test so the existing-private and nonexistent probes go
+    /// through identical machinery (keeps the assertion honest and avoids
+    /// duplicated setup).
+    async fn anon_get_status_and_body(
+        state: RepoVisibilityState,
+        uri: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let resp = run_through_visibility(state, empty_get(uri)).await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_anon_existing_private_and_nonexistent_are_indistinguishable() {
+        // #1808: an anonymous caller must not be able to tell an existing
+        // *private* repo apart from a *nonexistent* one. Before the fix the
+        // existing-private key returned 401 (visibility check) while a missing
+        // key fell through to the handler's 404 — the differing status was an
+        // anonymous repo-name enumeration oracle. After the fix both must
+        // return the byte-identical 401 + `WWW-Authenticate` challenge.
+
+        // Existing PRIVATE repo: present in the cache, is_public = false.
+        let private_state = make_vis_state(Some((
+            "acme-internal-core".to_string(),
+            make_cached_repo(/* is_public */ false),
+        )))
+        .await;
+        let (private_status, private_body) =
+            anon_get_status_and_body(private_state, "/pypi/acme-internal-core/simple/").await;
+
+        // NONEXISTENT repo: nothing in the cache; the cache-miss DB lookup
+        // against the lazy pool finds no row, exercising the no-repo branch.
+        let missing_state = make_vis_state(None).await;
+        let (missing_status, missing_body) =
+            anon_get_status_and_body(missing_state, "/pypi/zzz-nonexistent-repo-9/simple/").await;
+
+        assert_eq!(
+            private_status,
+            StatusCode::UNAUTHORIZED,
+            "existing private repo must deny anonymous reads with 401"
+        );
+        assert_eq!(
+            missing_status, private_status,
+            "nonexistent repo must return the SAME status as an existing private repo (no oracle)"
+        );
+        assert_eq!(
+            missing_body, private_body,
+            "nonexistent repo must return the SAME body as an existing private repo (no oracle)"
+        );
     }
 
     #[tokio::test]
