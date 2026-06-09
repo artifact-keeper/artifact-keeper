@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Client;
 use uuid::Uuid;
 
@@ -157,10 +157,16 @@ fn parse_pypi_releases_json(body: &serde_json::Value) -> PublishTimeMap {
 
 fn parse_iso_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     let s = value.as_str()?;
-    DateTime::parse_from_rfc3339(s)
-        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Fallback for offset-less ISO 8601 timestamps such as PyPI's `upload_time`
+    // ("2024-07-01T12:00:00"): parse as naive and assume UTC. Parsing into a
+    // fixed-offset `DateTime` can never succeed without a zone in the format string,
+    // so a naive parse is required to avoid failing closed on these values.
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
         .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+        .map(|naive| naive.and_utc())
 }
 
 #[cfg(test)]
@@ -210,5 +216,18 @@ mod tests {
             pypi_json_url("https://pypi.org/simple/", "requests"),
             "https://pypi.org/pypi/requests/json"
         );
+    }
+
+    #[test]
+    fn parse_iso_timestamp_handles_rfc3339_and_offsetless() {
+        // RFC3339 with explicit zone.
+        assert!(parse_iso_timestamp(&json!("2024-07-01T12:00:00.000Z")).is_some());
+        // Offset-less ISO 8601 (PyPI `upload_time`) must parse as UTC, not fail closed.
+        let parsed = parse_iso_timestamp(&json!("2024-07-01T12:00:00"))
+            .expect("offset-less timestamp should parse");
+        assert_eq!(parsed.to_rfc3339(), "2024-07-01T12:00:00+00:00");
+        // Non-timestamps stay None.
+        assert!(parse_iso_timestamp(&json!("not-a-date")).is_none());
+        assert!(parse_iso_timestamp(&json!(12345)).is_none());
     }
 }

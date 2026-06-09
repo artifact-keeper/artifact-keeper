@@ -10,14 +10,22 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::event_bus::EventBus;
+use crate::services::metrics_service;
 use crate::services::upstream_metadata::UpstreamMetadataCache;
 
 pub const AUTO_APPROVE_REASON: &str = "auto-approved: crossed age threshold";
+
+/// Debounce window (seconds) for re-bumping a review's `request_count` /
+/// `last_requested_at` on the metadata listing path. Within this window, repeat
+/// listings of the same package skip the per-version write
+const REQUEST_COUNT_DEBOUNCE_SECS: i64 = 3600;
 
 /// Minimal repository view for age-gate decisions (avoids handler ↔ service coupling).
 #[derive(Debug, Clone)]
 pub struct AgeGateRepoParams {
     pub id: Uuid,
+    /// Repository key, used as the bounded `repository` label on age-gate metrics.
+    pub key: String,
     pub repo_type: RepositoryType,
     pub format: RepositoryFormat,
     pub age_gate_enabled: bool,
@@ -27,6 +35,7 @@ pub struct AgeGateRepoParams {
 impl AgeGateRepoParams {
     pub fn from_parts(
         id: Uuid,
+        key: impl Into<String>,
         repo_type: RepositoryType,
         format: RepositoryFormat,
         age_gate_enabled: bool,
@@ -34,6 +43,7 @@ impl AgeGateRepoParams {
     ) -> Self {
         Self {
             id,
+            key: key.into(),
             repo_type,
             format,
             age_gate_enabled,
@@ -44,6 +54,7 @@ impl AgeGateRepoParams {
     pub fn from_repository(repo: &crate::models::repository::Repository) -> Self {
         Self::from_parts(
             repo.id,
+            repo.key.clone(),
             repo.repo_type.clone(),
             repo.format.clone(),
             repo.age_gate_enabled,
@@ -168,6 +179,10 @@ impl AgeGateService {
                 let lkg = self
                     .find_last_known_good(repo.id, package_name, version)
                     .await?;
+                metrics_service::record_age_gate_blocked_request(
+                    &repo.key,
+                    format_label(&repo.format),
+                );
                 return Ok(AgeGateDecision::Block {
                     review_id: review.id,
                     last_known_good: lkg,
@@ -202,6 +217,7 @@ impl AgeGateService {
         let lkg = self
             .find_last_known_good(repo.id, package_name, version)
             .await?;
+        metrics_service::record_age_gate_blocked_request(&repo.key, format_label(&repo.format));
         Ok(AgeGateDecision::Block {
             review_id,
             last_known_good: lkg,
@@ -230,48 +246,47 @@ impl AgeGateService {
             return Ok(());
         }
 
+        let versions: Vec<(String, Option<DateTime<Utc>>)> = version_keys
+            .iter()
+            .map(|v| (v.clone(), publish_times.get(v).copied()))
+            .collect();
+
+        let blocked = self
+            .evaluate_versions_batch(repo, package_name, &versions)
+            .await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+        }
+
         let mut allowed: Vec<String> = Vec::new();
-        let mut blocked_versions: Vec<String> = Vec::new();
-
         for version in version_keys {
-            let published_at = publish_times.get(&version).copied();
-            match self
-                .check(repo, package_name, &version, published_at)
-                .await?
-            {
-                AgeGateDecision::Allow => allowed.push(version),
-                AgeGateDecision::Block { .. } => blocked_versions.push(version),
+            if blocked.contains(&version) {
+                if let Some(versions_obj) = packument
+                    .get_mut("versions")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    versions_obj.remove(&version);
+                }
+                if let Some(time_map) = packument.get_mut("time").and_then(|t| t.as_object_mut()) {
+                    time_map.remove(&version);
+                }
+            } else {
+                allowed.push(version);
             }
         }
 
-        for version in blocked_versions {
-            if let Some(versions_obj) = packument
-                .get_mut("versions")
-                .and_then(|v| v.as_object_mut())
-            {
-                versions_obj.remove(&version);
-            }
-            if let Some(time_map) = packument.get_mut("time").and_then(|t| t.as_object_mut()) {
-                time_map.remove(&version);
-            }
-        }
-
-        if allowed.is_empty() {
-            return Ok(());
-        }
-
+        // Reconcile dist-tags so none point at a version we just removed. A dangling
+        // tag (e.g. `latest`, `beta`, `next`) makes npm resolve the tag to a manifest
+        // that is absent from `versions`, breaking `npm install <pkg>` and
+        // `npm install <pkg>@<tag>`. When every version is blocked this empties
+        // dist-tags, yielding a consistent "no acceptable version" packument instead
+        // of a `latest` that points at nothing.
         allowed.sort_by(|a, b| version_compare_desc(a, b));
-        if let Some(latest) = allowed.first() {
-            if let Some(dist_tags) = packument
-                .get_mut("dist-tags")
-                .and_then(|d| d.as_object_mut())
-            {
-                dist_tags.insert(
-                    "latest".to_string(),
-                    serde_json::Value::String(latest.clone()),
-                );
-            }
-        }
+        reconcile_dist_tags(packument, &allowed);
 
         Ok(())
     }
@@ -288,37 +303,50 @@ impl AgeGateService {
             return Ok(html.to_string());
         }
 
-        let mut out = String::with_capacity(html.len());
+        // First pass: locate anchors and the distinct versions they reference, so the
+        // age gate is evaluated in a single batch rather than once per file link.
+        let mut spans: Vec<(usize, usize, Option<String>)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut versions: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
         let mut cursor = 0usize;
         while let Some(rel) = html[cursor..].find("<a ") {
             let start = cursor + rel;
             let Some(end_rel) = html[start..].find("</a>") else {
-                out.push_str(&html[cursor..]);
-                return Ok(out);
+                break;
             };
             let end = start + end_rel + 4;
+            let version = pypi_anchor_version(&html[start..end]);
+            if let Some(ref ver) = version {
+                if seen.insert(ver.clone()) {
+                    versions.push((ver.clone(), publish_times.get(ver).copied()));
+                }
+            }
+            spans.push((start, end, version));
+            cursor = end;
+        }
+
+        let blocked = self
+            .evaluate_versions_batch(repo, project, &versions)
+            .await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+        }
+
+        // Second pass: rebuild the document, dropping links for blocked versions.
+        let mut out = String::with_capacity(html.len());
+        let mut cursor = 0usize;
+        for (start, end, version) in spans {
             out.push_str(&html[cursor..start]);
-            let anchor = &html[start..end];
-
-            let filename = extract_href_filename(anchor);
-            let version = filename
-                .as_deref()
-                .and_then(|f| crate::formats::pypi::PypiHandler::parse_filename(f).ok())
-                .and_then(|info| info.version);
-
             let keep = match version {
                 None => true,
-                Some(ref ver) => {
-                    let published_at = publish_times.get(ver).copied();
-                    matches!(
-                        self.check(repo, project, ver, published_at).await?,
-                        AgeGateDecision::Allow
-                    )
-                }
+                Some(ref ver) => !blocked.contains(ver),
             };
-
             if keep {
-                out.push_str(anchor);
+                out.push_str(&html[start..end]);
             }
             cursor = end;
         }
@@ -326,10 +354,76 @@ impl AgeGateService {
         Ok(out)
     }
 
+    /// Batch age-gate evaluation for every version in a package metadata document.
+    /// Returns the set of versions to withhold from clients.
+    ///
+    /// This is the metadata *listing* path (npm packument / PyPI simple index),
+    /// where the client fetches the whole version list rather than asking for a
+    /// specific version. It is deliberately near read-only: a single
+    /// existing-review read, then at most one debounced review-request upsert for
+    /// versions that are newly withheld. It does NOT auto-approve aged versions —
+    /// that bookkeeping runs off the request path in the background sweep
+    /// [`Self::auto_approve_aged_reviews`]. A version that has crossed the
+    /// threshold is served immediately (decided from its timestamp here) even
+    /// before its review row is flipped to `approved`.
+    async fn evaluate_versions_batch(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_name: &str,
+        versions: &[(String, Option<DateTime<Utc>>)],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut blocked = std::collections::HashSet::new();
+        if !Self::is_applicable(repo) || versions.is_empty() {
+            return Ok(blocked);
+        }
+
+        let now = Utc::now();
+        let existing = self.get_reviews_for_package(repo.id, package_name).await?;
+
+        let mut request_versions: Vec<String> = Vec::new();
+        let mut request_times: Vec<Option<DateTime<Utc>>> = Vec::new();
+
+        for (version, published_at) in versions {
+            let existing_review = existing.get(version);
+
+            // A rejected version stays blocked regardless of age.
+            if let Some((_, status)) = existing_review {
+                if status == AgeGateReviewStatus::Rejected.as_str() {
+                    blocked.insert(version.clone());
+                    continue;
+                }
+            }
+
+            // Crossed the threshold: serve it. The pending→approved flip is left
+            // to the background sweep so this read path performs no UPDATE.
+            if Self::meets_age_threshold(*published_at, repo.age_gate_min_age_days, now) {
+                continue;
+            }
+
+            // Already approved versions are served even while young.
+            if let Some((_, status)) = existing_review {
+                if status == AgeGateReviewStatus::Approved.as_str() {
+                    continue;
+                }
+            }
+
+            blocked.insert(version.clone());
+            request_versions.push(version.clone());
+            request_times.push(*published_at);
+        }
+
+        if !request_versions.is_empty() {
+            self.request_reviews_batch(repo.id, package_name, &request_versions, &request_times)
+                .await?;
+        }
+
+        Ok(blocked)
+    }
+
     pub async fn list_reviews(
         &self,
         repository_key: Option<&str>,
-        status: Option<&str>,
+        statuses: Option<&[String]>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<AgeGateReview>, i64)> {
@@ -339,10 +433,10 @@ impl AgeGateService {
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             WHERE ($1::text IS NULL OR repo.key = $1)
-              AND ($2::text IS NULL OR r.status = $2)
+              AND ($2::text[] IS NULL OR r.status = ANY($2))
             "#,
             repository_key,
-            status
+            statuses
         )
         .fetch_one(&self.db)
         .await
@@ -361,12 +455,12 @@ impl AgeGateService {
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             WHERE ($1::text IS NULL OR repo.key = $1)
-              AND ($2::text IS NULL OR r.status = $2)
+              AND ($2::text[] IS NULL OR r.status = ANY($2))
             ORDER BY r.last_requested_at DESC
             OFFSET $3 LIMIT $4
             "#,
             repository_key,
-            status,
+            statuses,
             offset,
             limit
         )
