@@ -293,6 +293,14 @@ pub fn router() -> Router<SharedState> {
                 .put(update_virtual_members),
         )
         .route("/:key/members/:member_key", delete(remove_virtual_member))
+        // Per-repo access grants (admin-only): assign/revoke a user a role on a
+        // repository. Backs the per-repo authorization model so existing private
+        // repos can grant access to users other than the owner/admin.
+        .route(
+            "/:key/grants",
+            get(list_repo_grants).post(create_repo_grant),
+        )
+        .route("/:key/grants/:user_id", delete(revoke_repo_grant))
         // Artifact routes nested under repository
         .route(
             "/:key/artifacts",
@@ -1766,6 +1774,194 @@ pub async fn delete_repository(
         "repository.deleted",
         repo.id,
         Some(auth.username.clone()),
+    );
+    Ok(())
+}
+
+// Per-repo access grant handlers (admin-only)
+//
+// Back the per-repo authorization model: after private repos became
+// members-only, the owner auto-grant (on create) and the admin seed were the
+// only writers of `role_assignments`. These admin-only endpoints let an admin
+// assign or revoke a user a role on an existing repository so others can be
+// granted access.
+
+/// A single per-repo grant, as returned by the list endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepoGrantResponse {
+    pub user_id: Uuid,
+    pub username: String,
+    pub role_id: Uuid,
+    pub role: String,
+}
+
+/// Wrapper for the grants list response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepoGrantsListResponse {
+    pub grants: Vec<RepoGrantResponse>,
+}
+
+/// Request body for assigning a user a role on a repository.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateRepoGrantRequest {
+    /// User to grant access to.
+    pub user_id: Uuid,
+    /// Role to assign, scoped to this repository. Defaults to `developer`.
+    #[serde(default = "default_grant_role")]
+    pub role: String,
+}
+
+fn default_grant_role() -> String {
+    "developer".to_string()
+}
+
+/// Roles an admin may assign to a user on a repository via the grants endpoint.
+/// Mirrors the seeded non-admin system roles (`developer`, `reader`); `admin`
+/// is intentionally excluded — repo-scoped admin is not granted here.
+const ASSIGNABLE_GRANT_ROLES: [&str; 2] = ["developer", "reader"];
+
+/// List the per-repo access grants on a repository.
+#[utoipa::path(
+    get,
+    path = "/{key}/grants",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Grants listed", body = RepoGrantsListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn list_repo_grants(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<RepoGrantsListResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_admin()?;
+    let service = state.create_repository_service();
+    let repo = service.get_by_key(&key).await?;
+    let grants = service
+        .list_repo_grants(repo.id)
+        .await?
+        .into_iter()
+        .map(|g| RepoGrantResponse {
+            user_id: g.user_id,
+            username: g.username,
+            role_id: g.role_id,
+            role: g.role_name,
+        })
+        .collect();
+    Ok(Json(RepoGrantsListResponse { grants }))
+}
+
+/// Assign a user a role on a repository (admin-only).
+#[utoipa::path(
+    post,
+    path = "/{key}/grants",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = CreateRepoGrantRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Grant created", body = RepoGrantsListResponse),
+        (status = 400, description = "Invalid role"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Repository or user not found"),
+    )
+)]
+pub async fn create_repo_grant(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<CreateRepoGrantRequest>,
+) -> Result<Json<RepoGrantsListResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_admin()?;
+
+    if !ASSIGNABLE_GRANT_ROLES.contains(&payload.role.as_str()) {
+        return Err(AppError::Validation(format!(
+            "role must be one of: {}",
+            ASSIGNABLE_GRANT_ROLES.join(", ")
+        )));
+    }
+
+    let service = state.create_repository_service();
+    let repo = service.get_by_key(&key).await?;
+    service
+        .grant_repo_role(repo.id, payload.user_id, &payload.role)
+        .await?;
+
+    tracing::info!(
+        actor_user_id = %auth.user_id,
+        actor_username = %auth.username,
+        repo_id = %repo.id,
+        repo_key = %repo.key,
+        target_user_id = %payload.user_id,
+        role = %payload.role,
+        "granted per-repo role assignment"
+    );
+
+    let grants = service
+        .list_repo_grants(repo.id)
+        .await?
+        .into_iter()
+        .map(|g| RepoGrantResponse {
+            user_id: g.user_id,
+            username: g.username,
+            role_id: g.role_id,
+            role: g.role_name,
+        })
+        .collect();
+    Ok(Json(RepoGrantsListResponse { grants }))
+}
+
+/// Revoke a user's access grants on a repository (admin-only).
+#[utoipa::path(
+    delete,
+    path = "/{key}/grants/{user_id}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("user_id" = Uuid, Path, description = "User whose grants are revoked"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Grant revoked"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn revoke_repo_grant(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, user_id)): Path<(String, Uuid)>,
+) -> Result<()> {
+    let auth = require_auth(auth)?;
+    auth.require_admin()?;
+    let service = state.create_repository_service();
+    let repo = service.get_by_key(&key).await?;
+    let removed = service.revoke_repo_grants(repo.id, user_id).await?;
+
+    tracing::info!(
+        actor_user_id = %auth.user_id,
+        actor_username = %auth.username,
+        repo_id = %repo.id,
+        repo_key = %repo.key,
+        target_user_id = %user_id,
+        removed,
+        "revoked per-repo role assignment(s)"
     );
     Ok(())
 }
@@ -4631,6 +4827,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_repository,
         update_repository,
         delete_repository,
+        list_repo_grants,
+        create_repo_grant,
+        revoke_repo_grant,
         set_cache_ttl,
         list_pypi_tracks,
         put_pypi_track,
@@ -4658,6 +4857,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         UpdateRepositoryRequest,
         RepositoryResponse,
         RepositoryListResponse,
+        RepoGrantResponse,
+        RepoGrantsListResponse,
+        CreateRepoGrantRequest,
         SetCacheTtlRequest,
         CacheTtlResponse,
         InvalidateCacheQuery,
@@ -5611,6 +5813,34 @@ mod tests {
         assert!(req.is_public.is_none());
         assert!(req.upstream_url.is_none());
         assert!(req.quota_bytes.is_none());
+    }
+
+    #[test]
+    fn test_create_repo_grant_request_defaults_to_developer() {
+        // Omitting `role` falls back to the developer default.
+        let json = r#"{"user_id": "11111111-1111-1111-1111-111111111111"}"#;
+        let req: CreateRepoGrantRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.role, "developer");
+        assert_eq!(
+            req.user_id,
+            Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_create_repo_grant_request_explicit_role() {
+        let json = r#"{"user_id": "11111111-1111-1111-1111-111111111111", "role": "reader"}"#;
+        let req: CreateRepoGrantRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.role, "reader");
+    }
+
+    #[test]
+    fn test_assignable_grant_roles_accepts_developer_and_reader() {
+        assert!(ASSIGNABLE_GRANT_ROLES.contains(&"developer"));
+        assert!(ASSIGNABLE_GRANT_ROLES.contains(&"reader"));
+        // `admin` is intentionally not assignable via this endpoint.
+        assert!(!ASSIGNABLE_GRANT_ROLES.contains(&"admin"));
+        assert!(!ASSIGNABLE_GRANT_ROLES.contains(&"owner"));
     }
 
     #[test]
