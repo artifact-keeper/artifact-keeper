@@ -48,6 +48,19 @@ pub struct UpdateRepositoryRequest {
     pub upstream_url: Option<String>,
 }
 
+/// A per-repo role assignment (grant) resolved to human-readable names.
+///
+/// Returned by [`RepositoryService::list_repo_grants`] so the admin grants
+/// endpoint can report who holds which role on a repository without the caller
+/// having to resolve user/role ids separately.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RepoGrant {
+    pub user_id: Uuid,
+    pub username: String,
+    pub role_id: Uuid,
+    pub role_name: String,
+}
+
 /// Controls which repositories a caller can see in listing results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoVisibility {
@@ -619,6 +632,93 @@ impl RepositoryService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(granted)
+    }
+
+    /// List the per-repo role assignments (grants) scoped to a repository.
+    ///
+    /// Returns one row per `(user, role)` grant whose `repository_id` matches
+    /// `repo_id` exactly. Global (NULL-scoped) assignments are intentionally
+    /// excluded: they are not repo-scoped grants and are managed elsewhere.
+    /// Ordered by grant creation time for a stable response.
+    pub async fn list_repo_grants(&self, repo_id: Uuid) -> Result<Vec<RepoGrant>> {
+        let grants = sqlx::query_as::<_, RepoGrant>(
+            "SELECT ra.user_id, u.username, ra.role_id, r.name AS role_name \
+             FROM role_assignments ra \
+             JOIN users u ON u.id = ra.user_id \
+             JOIN roles r ON r.id = ra.role_id \
+             WHERE ra.repository_id = $1 \
+             ORDER BY ra.created_at",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(grants)
+    }
+
+    /// Grant a user a named role scoped to a repository.
+    ///
+    /// Inserts a `role_assignments` row binding `user_id` to the role named
+    /// `role_name`, scoped to `repo_id`. Idempotent: a duplicate grant is a
+    /// no-op (`ON CONFLICT DO NOTHING`). Validates that the user and the role
+    /// exist, returning `NotFound` otherwise.
+    pub async fn grant_repo_role(
+        &self,
+        repo_id: Uuid,
+        user_id: Uuid,
+        role_name: &str,
+    ) -> Result<()> {
+        // Validate the target user exists so a typo'd id surfaces as 404 rather
+        // than silently inserting nothing.
+        let user_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        if !user_exists {
+            return Err(AppError::NotFound(format!("User '{}' not found", user_id)));
+        }
+
+        let role_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM roles WHERE name = $1")
+            .bind(role_name)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let role_id =
+            role_id.ok_or_else(|| AppError::NotFound(format!("Role '{}' not found", role_name)))?;
+
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .bind(repo_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Revoke all repo-scoped grants for a user on a repository.
+    ///
+    /// Deletes every `role_assignments` row matching `(user_id, repo_id)` with a
+    /// non-NULL `repository_id`. Global (NULL-scoped) assignments are left
+    /// untouched. Returns the number of rows removed so callers can distinguish
+    /// "revoked" from "nothing to revoke".
+    pub async fn revoke_repo_grants(&self, repo_id: Uuid, user_id: Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM role_assignments \
+             WHERE user_id = $1 AND repository_id = $2",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 
     /// Get a repository by ID
@@ -2509,6 +2609,96 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             for uid in [owner_id, other_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// feat(repo-access-grants): the admin grant/list/revoke service path.
+        ///
+        /// A user with no grant is denied; granting `developer` lists the grant
+        /// and restores access; the grant is idempotent; revoking removes it and
+        /// access is denied again.
+        #[tokio::test]
+        async fn test_grant_list_revoke_repo_role() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (target_id, target_name) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            // Initially the target has no access.
+            assert!(!service
+                .user_can_access_repo(repo.id, target_id)
+                .await
+                .expect("pre-grant access check"));
+
+            // Grant developer -> access restored and listed.
+            service
+                .grant_repo_role(repo.id, target_id, "developer")
+                .await
+                .expect("grant developer");
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, target_id)
+                    .await
+                    .expect("post-grant access check"),
+                "granted user should have access"
+            );
+            let grants = service
+                .list_repo_grants(repo.id)
+                .await
+                .expect("list grants");
+            assert!(
+                grants.iter().any(|g| g.user_id == target_id
+                    && g.role_name == "developer"
+                    && g.username == target_name),
+                "grant should appear in the list with resolved names"
+            );
+
+            // Granting again is idempotent (no duplicate row, no error).
+            service
+                .grant_repo_role(repo.id, target_id, "developer")
+                .await
+                .expect("re-grant is idempotent");
+            let after = service.list_repo_grants(repo.id).await.expect("list again");
+            let target_grants = after.iter().filter(|g| g.user_id == target_id).count();
+            assert_eq!(
+                target_grants, 1,
+                "duplicate grant must not add a second row"
+            );
+
+            // Granting to a non-existent user -> NotFound.
+            let missing = service
+                .grant_repo_role(repo.id, Uuid::new_v4(), "developer")
+                .await;
+            assert!(matches!(missing, Err(AppError::NotFound(_))));
+
+            // Revoke -> access denied again, grant gone.
+            let removed = service
+                .revoke_repo_grants(repo.id, target_id)
+                .await
+                .expect("revoke");
+            assert!(removed >= 1, "revoke should remove at least one row");
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, target_id)
+                    .await
+                    .expect("post-revoke access check"),
+                "revoked user must lose access"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+            for uid in [owner_id, target_id] {
                 let _ = sqlx::query("DELETE FROM users WHERE id = $1")
                     .bind(uid)
                     .execute(&pool)
