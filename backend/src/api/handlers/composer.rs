@@ -126,7 +126,14 @@ fn merge_composer_metadata(
 
     for key in COMPOSER_METADATA_KEYS {
         if let Some(val) = composer.get(*key) {
-            version_entry[*key] = val.clone();
+            // Skip JSON null so absent optional fields are omitted from the
+            // version entry rather than serialized as `"field": null`. This
+            // matters for records stored before ComposerJson gained
+            // `skip_serializing_if`, whose metadata still carries null fields
+            // (#1781).
+            if !val.is_null() {
+                version_entry[*key] = val.clone();
+            }
         }
     }
 }
@@ -183,6 +190,86 @@ async fn fetch_composer_artifacts(
             metadata: r.metadata,
         })
         .collect())
+}
+
+/// Row shape for the root `packages.json` index: one row per
+/// (name, version) artifact plus its merged composer metadata.
+struct PackageIndexRow {
+    name: String,
+    version: Option<String>,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Fetch every (non-deleted) artifact in `repo_id` for the root packages
+/// index. Returning rows (rather than a built map) lets the virtual
+/// `packages_json` fan-out aggregate rows from several members before
+/// rendering (#1781).
+async fn fetch_package_index_rows(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Vec<PackageIndexRow>, Response> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT a.name, a.version,
+               a.checksum_sha256,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1 AND a.is_deleted = false
+        ORDER BY a.name, a.version
+        "#,
+        repo_id
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PackageIndexRow {
+            name: r.name,
+            version: r.version,
+            checksum_sha256: r.checksum_sha256,
+            metadata: r.metadata,
+        })
+        .collect())
+}
+
+/// Build the `packages` map of the root `packages.json` index from artifact
+/// rows, grouping versions under each package name. `repo_key` is threaded
+/// into the dist URLs so (for virtual repos) downloads route back through the
+/// virtual repo rather than the member. Pure, so it is unit-testable (#1781).
+fn build_packages_index(
+    repo_key: &str,
+    rows: &[PackageIndexRow],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut by_name: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    for row in rows {
+        let version = row.version.as_deref().unwrap_or("dev-main");
+        let entry = build_version_entry(
+            repo_key,
+            &row.name,
+            version,
+            &row.checksum_sha256,
+            row.metadata.as_ref(),
+        );
+        by_name.entry(row.name.clone()).or_default().push(entry);
+    }
+
+    let mut packages_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (name, versions) in by_name {
+        packages_map.insert(name, serde_json::Value::Array(versions));
+    }
+    packages_map
 }
 
 /// Render the Composer v2 "minified" metadata document from a member's
@@ -367,49 +454,28 @@ async fn packages_json(
 ) -> Result<Response, Response> {
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
 
-    // Get all distinct vendor/package names in this repository
-    let packages = sqlx::query!(
-        r#"
-        SELECT DISTINCT a.name, a.version,
-               a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1 AND a.is_deleted = false
-        ORDER BY a.name, a.version
-        "#,
-        repo.id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    // Virtual repos aggregate the index from their local/staging members:
+    // collect every member's artifacts and render them under the *virtual*
+    // repo key so dist URLs route back through us. Without this fan-out a
+    // virtual repo returned an empty `{}` even when a member held packages
+    // (#1781). Remote members are not aggregated into the root index (Composer
+    // resolves those per-package via the metadata-url).
+    let rows = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut aggregated: Vec<PackageIndexRow> = Vec::new();
+        for member in &members {
+            if member.repo_type == RepositoryType::Local
+                || member.repo_type == RepositoryType::Staging
+            {
+                aggregated.extend(fetch_package_index_rows(&state.db, member.id).await?);
+            }
+        }
+        aggregated
+    } else {
+        fetch_package_index_rows(&state.db, repo.id).await?
+    };
 
-    // Group artifacts by package name
-    let mut by_name: std::collections::HashMap<String, Vec<serde_json::Value>> =
-        std::collections::HashMap::new();
-
-    for row in &packages {
-        let version = row.version.as_deref().unwrap_or("dev-main");
-        let entry = build_version_entry(
-            &repo_key,
-            &row.name,
-            version,
-            &row.checksum_sha256,
-            row.metadata.as_ref(),
-        );
-        by_name.entry(row.name.clone()).or_default().push(entry);
-    }
-
-    let mut packages_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    for (name, versions) in &by_name {
-        packages_map.insert(name.clone(), serde_json::Value::Array(versions.clone()));
-    }
+    let packages_map = build_packages_index(&repo_key, &rows);
 
     let response = serde_json::json!({
         "packages": packages_map,
@@ -713,10 +779,40 @@ struct SearchQuery {
     q: Option<String>,
     #[serde(rename = "type")]
     package_type: Option<String>,
-    #[allow(dead_code)]
     per_page: Option<i64>,
-    #[allow(dead_code)]
     page: Option<i64>,
+}
+
+/// Build the `next` pagination URL for the search response, preserving the
+/// active `per_page` and `type` query parameters so paginated, filtered
+/// searches keep working past page 1 (#1781).
+///
+/// `per_page` is the *raw* request value (`None` when the client did not send
+/// one); we only append it when explicitly provided so default-page links stay
+/// clean. `type_filter` is appended verbatim when set.
+fn build_search_next_url(
+    repo_key: &str,
+    query_str: &str,
+    page: i64,
+    per_page: Option<i64>,
+    type_filter: Option<&str>,
+) -> String {
+    let per_page_param = match per_page {
+        Some(pp) => format!("&per_page={}", pp),
+        None => String::new(),
+    };
+    let type_param = match type_filter {
+        Some(t) => format!("&type={}", t),
+        None => String::new(),
+    };
+    format!(
+        "/composer/{}/search.json?q={}&page={}{}{}",
+        repo_key,
+        query_str,
+        page + 1,
+        per_page_param,
+        type_param,
+    )
 }
 
 async fn search(
@@ -734,6 +830,15 @@ async fn search(
     // Search by name pattern
     let search_pattern = format!("%{}%", query_str);
 
+    // The `type` filter is applied in SQL (against the composer metadata) so
+    // that pagination LIMIT/OFFSET and the total count both see the same
+    // filtered row set. Filtering in Rust *after* LIMIT/OFFSET (the old
+    // behaviour) under-filled pages and, worse, made the total count ignore
+    // `type` entirely — `type=library` returned total=6 with only 4 results
+    // (#1781). `$3::text IS NULL` short-circuits the predicate when no type is
+    // requested.
+    let type_filter = params.package_type.as_deref();
+
     let results = sqlx::query!(
         r#"
         SELECT DISTINCT a.name,
@@ -743,11 +848,13 @@ async fn search(
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND a.name ILIKE $2
+          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         ORDER BY a.name
-        LIMIT $3 OFFSET $4
+        LIMIT $4 OFFSET $5
         "#,
         repo.id,
         search_pattern,
+        type_filter,
         per_page,
         offset
     )
@@ -761,22 +868,8 @@ async fn search(
             .into_response()
     })?;
 
-    // Optionally filter by type from metadata
     let search_results: Vec<serde_json::Value> = results
         .iter()
-        .filter(|r| {
-            if let Some(ref type_filter) = params.package_type {
-                r.metadata
-                    .as_ref()
-                    .and_then(|m| m.get("composer"))
-                    .and_then(|c| c.get("type"))
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == type_filter)
-                    .unwrap_or(false)
-            } else {
-                true
-            }
-        })
         .map(|r| {
             let description = r
                 .metadata
@@ -796,17 +889,21 @@ async fn search(
         })
         .collect();
 
-    // Count total results for pagination
+    // Count total results for pagination — must honor the same `type`
+    // predicate as the page query (#1781).
     let total_count = sqlx::query_scalar!(
         r#"
-        SELECT COUNT(DISTINCT name)
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND name ILIKE $2
+        SELECT COUNT(DISTINCT a.name)
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.name ILIKE $2
+          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         "#,
         repo.id,
-        search_pattern
+        search_pattern,
+        type_filter
     )
     .fetch_one(&state.db)
     .await
@@ -828,11 +925,12 @@ async fn search(
     });
 
     if has_next {
-        response["next"] = serde_json::Value::String(format!(
-            "/composer/{}/search.json?q={}&page={}",
-            repo_key,
-            query_str,
-            page + 1
+        response["next"] = serde_json::Value::String(build_search_next_url(
+            &repo_key,
+            &query_str,
+            page,
+            params.per_page,
+            type_filter,
         ));
     }
 
@@ -1444,19 +1542,139 @@ mod tests {
 
     #[test]
     fn test_search_next_page_url() {
-        let repo_key = "composer-hosted";
-        let query_str = "monolog";
-        let page = 2i64;
-        let next_url = format!(
-            "/composer/{}/search.json?q={}&page={}",
-            repo_key,
-            query_str,
-            page + 1
-        );
+        // Plain query, default per_page, no type filter: only q + page appear.
+        let next_url = build_search_next_url("composer-hosted", "monolog", 2, None, None);
         assert_eq!(
             next_url,
             "/composer/composer-hosted/search.json?q=monolog&page=3"
         );
+    }
+
+    #[test]
+    fn test_search_next_page_url_preserves_per_page() {
+        // #1781: per_page must survive into the next link so paginated
+        // searches keep the same page size.
+        let next_url = build_search_next_url("repo", "", 1, Some(1), None);
+        assert_eq!(next_url, "/composer/repo/search.json?q=&page=2&per_page=1");
+    }
+
+    #[test]
+    fn test_search_next_page_url_preserves_type() {
+        // #1781: a type-filtered search must keep the type on the next link,
+        // otherwise page 2 silently widens to all packages.
+        let next_url = build_search_next_url("repo", "", 1, None, Some("library"));
+        assert_eq!(
+            next_url,
+            "/composer/repo/search.json?q=&page=2&type=library"
+        );
+    }
+
+    #[test]
+    fn test_search_next_page_url_preserves_per_page_and_type() {
+        // Both active parameters appear together, per_page before type.
+        let next_url = build_search_next_url("repo", "log", 2, Some(5), Some("composer-plugin"));
+        assert_eq!(
+            next_url,
+            "/composer/repo/search.json?q=log&page=3&per_page=5&type=composer-plugin"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_packages_index (#1781) — virtual repo packages.json aggregation
+    // -----------------------------------------------------------------------
+
+    fn index_rows() -> Vec<PackageIndexRow> {
+        vec![
+            PackageIndexRow {
+                name: "testvendor/lib1".to_string(),
+                version: Some("1.0.0".to_string()),
+                checksum_sha256: "hash1".to_string(),
+                metadata: Some(serde_json::json!({"composer": {"type": "library"}})),
+            },
+            PackageIndexRow {
+                name: "testvendor/lib1".to_string(),
+                version: Some("1.1.0".to_string()),
+                checksum_sha256: "hash2".to_string(),
+                metadata: None,
+            },
+            PackageIndexRow {
+                name: "testvendor/myplugin".to_string(),
+                version: Some("2.0.0".to_string()),
+                checksum_sha256: "hash3".to_string(),
+                metadata: Some(serde_json::json!({"composer": {"type": "composer-plugin"}})),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_build_packages_index_groups_versions_by_name() {
+        let map = build_packages_index("virt", &index_rows());
+        assert_eq!(map.len(), 2, "two distinct package names");
+        let lib1 = map["testvendor/lib1"].as_array().unwrap();
+        assert_eq!(lib1.len(), 2, "lib1 has two versions");
+        let plugin = map["testvendor/myplugin"].as_array().unwrap();
+        assert_eq!(plugin.len(), 1);
+        assert_eq!(plugin[0]["type"], "composer-plugin");
+    }
+
+    #[test]
+    fn test_build_packages_index_dist_url_uses_repo_key() {
+        // For a virtual repo the index is rendered under the virtual repo key
+        // so dist downloads route back through us, not the member.
+        let map = build_packages_index("vf-virt", &index_rows());
+        let url = map["testvendor/myplugin"][0]["dist"]["url"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            url,
+            "/composer/vf-virt/dist/testvendor/myplugin/2.0.0/hash3.zip"
+        );
+    }
+
+    #[test]
+    fn test_build_packages_index_empty_rows_is_empty_map() {
+        let map = build_packages_index("virt", &[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_build_packages_index_null_version_falls_back_to_dev_main() {
+        let rows = [PackageIndexRow {
+            name: "vendor/pkg".to_string(),
+            version: None,
+            checksum_sha256: "h".to_string(),
+            metadata: None,
+        }];
+        let map = build_packages_index("r", &rows);
+        assert_eq!(map["vendor/pkg"][0]["version"], "dev-main");
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_composer_metadata: JSON null fields are omitted (#1781)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_composer_metadata_skips_json_null() {
+        // Records stored before ComposerJson gained skip_serializing_if carry
+        // explicit nulls for absent optional fields. Those must NOT leak into
+        // the rendered version entry as `"field": null`.
+        let mut entry = serde_json::json!({"name": "vendor/pkg", "version": "1.0.0"});
+        let metadata = serde_json::json!({
+            "composer": {
+                "description": serde_json::Value::Null,
+                "type": "library",
+                "license": serde_json::Value::Null,
+                "require": serde_json::Value::Null,
+            }
+        });
+        merge_composer_metadata(&mut entry, Some(&metadata));
+        assert_eq!(entry["type"], "library");
+        assert!(
+            entry.get("description").is_none(),
+            "null description must be omitted, not serialized as null"
+        );
+        assert!(entry.get("license").is_none());
+        assert!(entry.get("require").is_none());
     }
 
     #[test]
@@ -2415,6 +2633,149 @@ mod metadata_db_tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         vf.teardown().await;
+    }
+
+    // -- Virtual repo: packages.json aggregates from local members (#1781) --
+
+    #[tokio::test]
+    async fn virtual_packages_json_aggregates_member_packages() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        // The member holds two packages; the virtual root index must surface
+        // both (pre-fix it returned an empty `{}`).
+        insert_artifact(
+            &vf.pool,
+            member_id,
+            "testvendor/mypackage",
+            "1.0.0",
+            "aaa111",
+            Some(serde_json::json!({"composer": {"type": "library"}})),
+        )
+        .await;
+        insert_artifact(
+            &vf.pool,
+            member_id,
+            "testvendor/myplugin",
+            "2.0.0",
+            "bbb222",
+            Some(serde_json::json!({"composer": {"type": "composer-plugin"}})),
+        )
+        .await;
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/packages.json", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        let packages = json["packages"].as_object().unwrap();
+        assert_eq!(
+            packages.len(),
+            2,
+            "virtual packages.json must aggregate both member packages (#1781)"
+        );
+        assert!(packages.contains_key("testvendor/mypackage"));
+        assert!(packages.contains_key("testvendor/myplugin"));
+        // dist URLs route back through the virtual repo, not the member.
+        let url = packages["testvendor/mypackage"][0]["dist"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(
+            url.starts_with(&format!("/composer/{}/dist/", vf.repo_key)),
+            "dist url must point at virtual repo, got {}",
+            url
+        );
+
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
+
+    // -- Search: type filter must constrain BOTH results and total (#1781) --
+
+    #[tokio::test]
+    async fn search_type_filter_constrains_total_count() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // Three libraries, one plugin: a `type=composer-plugin` search must
+        // report total=1, not total=4 (the old count ignored `type`).
+        insert_artifact(
+            &f.pool,
+            f.repo_id,
+            "testvendor/lib1",
+            "1.0.0",
+            "h1",
+            Some(serde_json::json!({"composer": {"type": "library"}})),
+        )
+        .await;
+        insert_artifact(
+            &f.pool,
+            f.repo_id,
+            "testvendor/lib2",
+            "1.0.0",
+            "h2",
+            Some(serde_json::json!({"composer": {"type": "library"}})),
+        )
+        .await;
+        insert_artifact(
+            &f.pool,
+            f.repo_id,
+            "testvendor/lib3",
+            "1.0.0",
+            "h3",
+            Some(serde_json::json!({"composer": {"type": "library"}})),
+        )
+        .await;
+        insert_artifact(
+            &f.pool,
+            f.repo_id,
+            "testvendor/myplugin",
+            "1.0.0",
+            "h4",
+            Some(serde_json::json!({"composer": {"type": "composer-plugin"}})),
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let req = tdh::get(format!("/{}/search.json?type=composer-plugin", f.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "only the plugin matches");
+        assert_eq!(results[0]["name"], "testvendor/myplugin");
+        assert_eq!(
+            json["total"], 1,
+            "total must honor the type filter, not report all packages (#1781)"
+        );
+
+        // And a type-filtered, paginated search keeps type + per_page on next.
+        let app2 = f.router_anon(super::router());
+        let req2 = tdh::get(format!(
+            "/{}/search.json?type=library&per_page=1&page=1",
+            f.repo_key
+        ));
+        let (status2, body2) = tdh::send(app2, req2).await;
+        assert_eq!(status2, axum::http::StatusCode::OK);
+        let json2 = body_json(&body2).await;
+        assert_eq!(json2["total"], 3, "three libraries");
+        let next = json2["next"].as_str().expect("next link present");
+        assert!(
+            next.contains("type=library"),
+            "next must preserve type filter, got {}",
+            next
+        );
+        assert!(
+            next.contains("per_page=1"),
+            "next must preserve per_page, got {}",
+            next
+        );
+
+        f.teardown().await;
     }
 
     // -- Virtual repo: priority order — first member with the package wins -

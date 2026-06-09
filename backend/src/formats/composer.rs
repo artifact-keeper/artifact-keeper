@@ -205,25 +205,29 @@ pub enum ComposerPathKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComposerJson {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub package_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require: Option<HashMap<String, String>>,
-    #[serde(rename = "require-dev", default)]
+    #[serde(
+        rename = "require-dev",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub require_dev: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoload: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authors: Option<Vec<ComposerAuthor>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keywords: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
 }
 
@@ -544,5 +548,48 @@ mod tests {
         assert_eq!(parsed.name, "vendor/pkg");
         assert_eq!(parsed.version, Some("1.0.0".to_string()));
         assert_eq!(parsed.package_type, Some("library".to_string()));
+    }
+
+    // #1781: a minimal composer.json (only name + version) must NOT serialize
+    // absent optional fields as JSON null. The Packagist/Composer spec omits
+    // them; serializing `"description": null` etc. pollutes stored metadata.
+    #[test]
+    fn test_composer_json_omits_none_fields_on_serialize() {
+        let cj = ComposerJson {
+            name: "vendor/minimal".to_string(),
+            description: None,
+            version: Some("1.0.0".to_string()),
+            package_type: None,
+            license: None,
+            require: None,
+            require_dev: None,
+            autoload: None,
+            authors: None,
+            keywords: None,
+            homepage: None,
+        };
+        let value = serde_json::to_value(&cj).unwrap();
+        let obj = value.as_object().unwrap();
+        // Only the fields that are Some are present.
+        assert_eq!(obj.len(), 2, "only name + version should be serialized");
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("version"));
+        for absent in [
+            "description",
+            "type",
+            "license",
+            "require",
+            "require-dev",
+            "autoload",
+            "authors",
+            "keywords",
+            "homepage",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "absent optional field `{}` must be omitted, not null",
+                absent
+            );
+        }
     }
 }
