@@ -975,22 +975,64 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
 
-        let start = std::time::Instant::now();
-
         // Parse host and port from server_url (e.g. ldap://host:389 or ldaps://host:636)
         let url = &row.server_url;
         let (host, port) = Self::parse_ldap_url(url)?;
 
-        let addr = format!("{host}:{port}");
+        Self::probe_ldap_endpoint(&host, port).await
+    }
+
+    /// Resolve, SSRF-vet, and probe a TCP connection to `host:port`.
+    ///
+    /// The connectivity test is the only outbound surface that opens a raw
+    /// socket to an operator-supplied target, so it re-checks the resolved
+    /// IP against the SSRF allowlist before connecting (covering configs
+    /// stored before write-time validation and the DNS-resolution oracle),
+    /// connects to the vetted `SocketAddr` directly, and returns only a
+    /// generic outcome — never the raw OS error or a refused-vs-filtered
+    /// timing distinction — so it cannot be used as an internal port-scan
+    /// oracle. Details are logged server-side via `tracing`.
+    async fn probe_ldap_endpoint(host: &str, port: u16) -> Result<LdapTestResult> {
+        let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
 
-        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await;
+        // Resolve the host. Honor the operator escape hatches via the
+        // Upstream context (UPSTREAM_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS).
+        let resolved: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await
+        {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                tracing::warn!(target: "security", error = %e, "LDAP test: host resolution failed");
+                return Ok(LdapTestResult {
+                    success: false,
+                    message: "Connection failed".to_string(),
+                    response_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        // Reject if every resolved address is an internal/private target;
+        // otherwise pin the first vetted address (do not re-resolve, to
+        // avoid a TOCTOU / DNS-rebind window).
+        let vetted = resolved
+            .into_iter()
+            .find(|sa| !crate::api::validation::is_blocked_resolved_ip(sa.ip()));
+        let Some(vetted) = vetted else {
+            return Err(AppError::Validation(
+                "LDAP server URL is not allowed (private/internal network)".to_string(),
+            ));
+        };
+
+        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&vetted)).await;
         let elapsed = start.elapsed().as_millis() as u64;
 
         let (success, message) = match result {
-            Ok(Ok(_)) => (true, format!("Successfully connected to {addr}")),
-            Ok(Err(e)) => (false, format!("Connection to {addr} failed: {e}")),
-            Err(_) => (false, format!("Connection to {addr} timed out after 5s")),
+            Ok(Ok(_)) => (true, format!("Successfully connected to {host}:{port}")),
+            Ok(Err(e)) => {
+                tracing::warn!(target: "security", error = %e, "LDAP test: connection failed");
+                (false, "Connection failed".to_string())
+            }
+            Err(_) => (false, "Connection timed out".to_string()),
         };
 
         Ok(LdapTestResult {
@@ -1873,6 +1915,47 @@ mod tests {
     fn test_parse_ldap_url_invalid_port() {
         let result = AuthConfigService::parse_ldap_url("ldap://myhost:notaport");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_ldap_endpoint: SSRF-vets the resolved IP before connecting and
+    // returns only a generic outcome (no raw OS error / port-scan oracle).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_probe_ldap_rejects_loopback_before_connect() {
+        // Loopback is hard-blocked regardless of env, so this is stable even
+        // if a parallel test toggles the private-IP allowlist env vars.
+        let err = AuthConfigService::probe_ldap_endpoint("127.0.0.1", 9999)
+            .await
+            .expect_err("loopback must be rejected before any TCP connect");
+        assert!(
+            err.to_string().contains("private/internal network"),
+            "expected a private/internal rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_ldap_rejects_metadata_ip_before_connect() {
+        let err = AuthConfigService::probe_ldap_endpoint("169.254.169.254", 80)
+            .await
+            .expect_err("metadata IP must be rejected before connect");
+        assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ldap_generic_message_on_resolution_failure() {
+        // `.invalid` never resolves (RFC 6761), so this is deterministic and
+        // offline. The failure message must be generic — no OS error echoed.
+        let res = AuthConfigService::probe_ldap_endpoint("nonexistent.invalid", 389)
+            .await
+            .expect("resolution failure returns a generic result, not an error");
+        assert!(!res.success);
+        assert_eq!(res.message, "Connection failed");
+        assert!(
+            !res.message.contains("os error"),
+            "failure message must not leak the OS error string"
+        );
     }
 
     // -----------------------------------------------------------------------

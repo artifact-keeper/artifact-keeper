@@ -147,6 +147,75 @@ pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
     validate_outbound_url_with(url_str, label, OutboundUrlContext::Webhook)
 }
 
+/// Validate an LDAP server URL (`ldap://` or `ldaps://`) against the SSRF
+/// allowlist, reusing the same blocked-host / private-IP rules as
+/// [`validate_outbound_url`]. Split out because the shared validator
+/// rejects any non-http(s) scheme (so the LDAP schemes cannot be passed
+/// through it) and because LDAP uses the `Upstream` context so the
+/// existing `UPSTREAM_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS`
+/// operator escape hatches relax it uniformly.
+///
+/// This checks the string / literal-IP form (and, for DNS names, the
+/// resolution at validation time, like [`is_blocked_url_in`]). The
+/// connect-time resolved-IP re-check is done by the connectivity probe
+/// via [`is_blocked_resolved_ip`] so already-stored configs and the
+/// DNS-rebind window are also covered.
+pub fn validate_outbound_ldap_url(url_str: &str, label: &str) -> Result<()> {
+    let remainder = if let Some(rest) = url_str.strip_prefix("ldaps://") {
+        rest
+    } else if let Some(rest) = url_str.strip_prefix("ldap://") {
+        rest
+    } else {
+        return Err(AppError::Validation(format!(
+            "{} must use ldap or ldaps",
+            label
+        )));
+    };
+
+    // Keep only the authority (drop any path/query/fragment and userinfo),
+    // then extract the host (bracket-aware for IPv6 literals).
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or(remainder);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = ldap_authority_host(authority);
+    if host.is_empty() {
+        return Err(AppError::Validation(format!("{} must have a host", label)));
+    }
+
+    if let Some(reason) = is_blocked_host_str(host, OutboundUrlContext::Upstream) {
+        record_block(label, &reason);
+        return Err(block_reason_to_error(label, reason));
+    }
+
+    Ok(())
+}
+
+/// Extract the host portion (keeping IPv6 brackets) from an LDAP
+/// `host[:port]` authority. Bracket-aware so `[::1]:389` yields `[::1]`
+/// rather than splitting inside the address.
+fn ldap_authority_host(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        // IPv6 literal: host runs up to and including the closing bracket.
+        if let Some(end) = authority.find(']') {
+            return &authority[..=end];
+        }
+        return authority;
+    }
+    match authority.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => authority,
+    }
+}
+
+/// True when a resolved IP must not be contacted from the server in the
+/// upstream context (honors `UPSTREAM_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS`). Used by the LDAP `/test` connectivity
+/// probe to re-check the resolved address before opening a socket, which
+/// closes the literal-IP and hostname-resolution (DNS) port-scan oracle
+/// for already-stored configs.
+pub fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
+    is_blocked_ip_in(ip, OutboundUrlContext::Upstream)
+}
+
 /// Common implementation shared by the per-context validators. The
 /// `ctx` selects which env var the private-IP relaxation toggle reads.
 fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContext) -> Result<()> {
@@ -167,18 +236,26 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
 
     if let Some(reason) = is_blocked_url_in(&parsed, ctx) {
         record_block(label, &reason);
-        return Err(match reason {
-            BlockReason::Hostname(host) => {
-                AppError::Validation(format!("{} host '{}' is not allowed", label, host))
-            }
-            BlockReason::Ip(ip) => AppError::Validation(format!(
-                "{} IP '{}' is not allowed (private/internal network)",
-                label, ip
-            )),
-        });
+        return Err(block_reason_to_error(label, reason));
     }
 
     Ok(())
+}
+
+/// Map a [`BlockReason`] to the user-facing [`AppError::Validation`] with
+/// the standard message wording. Shared by [`validate_outbound_url_with`]
+/// and [`validate_outbound_ldap_url`] so the host/IP messages stay
+/// identical across surfaces.
+fn block_reason_to_error(label: &str, reason: BlockReason) -> AppError {
+    match reason {
+        BlockReason::Hostname(host) => {
+            AppError::Validation(format!("{} host '{}' is not allowed", label, host))
+        }
+        BlockReason::Ip(ip) => AppError::Validation(format!(
+            "{} IP '{}' is not allowed (private/internal network)",
+            label, ip
+        )),
+    }
 }
 
 /// Decide whether a parsed URL targets a blocked address. Used by the
@@ -197,6 +274,16 @@ pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
 /// means the request must not be issued for the given context.
 fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<BlockReason> {
     let host = url.host_str()?;
+    is_blocked_host_str(host, ctx)
+}
+
+/// Decide whether a host string (a DNS name or an IP literal, possibly
+/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
+/// given context. Factored out of [`is_blocked_url_in`] so the
+/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
+/// live in one place and are shared by [`validate_outbound_ldap_url`]
+/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
+fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
     let host_lower = host.to_lowercase();
     // Strip a trailing dot so `localhost.` is treated like `localhost`.
     let host_normalized = host_lower.trim_end_matches('.');
@@ -1513,5 +1600,125 @@ mod tests {
         assert!(webhook_allow_private_ips_enabled());
         std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "maybe");
         assert!(!webhook_allow_private_ips_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // LDAP outbound URL validation (validate_outbound_ldap_url). Reuses the
+    // same blocked-host / private-IP rules as validate_outbound_url but
+    // accepts the ldap:// / ldaps:// schemes (which the http(s)-only
+    // validator rejects).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ldap_allows_public_ldaps_with_port() {
+        assert!(
+            validate_outbound_ldap_url("ldaps://ldap.example.com:636", "LDAP server URL").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_ldap_allows_public_ldap_default_port() {
+        assert!(validate_outbound_ldap_url("ldap://ldap.example.com", "LDAP server URL").is_ok());
+    }
+
+    #[test]
+    fn test_ldap_rejects_private_ip() {
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_ldap_url("ldap://10.0.0.1", "LDAP server URL")
+            .expect_err("private IP must be rejected");
+        assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[test]
+    fn test_ldap_rejects_ipv6_loopback() {
+        let err = validate_outbound_ldap_url("ldap://[::1]:389", "LDAP server URL")
+            .expect_err("ipv6 loopback must be rejected");
+        assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[test]
+    fn test_ldap_rejects_localhost() {
+        let err = validate_outbound_ldap_url("ldap://localhost", "LDAP server URL")
+            .expect_err("localhost must be rejected");
+        assert!(err.to_string().contains("is not allowed"));
+    }
+
+    #[test]
+    fn test_ldap_rejects_docker_service_host() {
+        // BLOCKED_HOSTS entry — the string check catches it with no DNS.
+        let err = validate_outbound_ldap_url("ldaps://postgres", "LDAP server URL")
+            .expect_err("internal docker host must be rejected");
+        assert!(err.to_string().contains("is not allowed"));
+    }
+
+    #[test]
+    fn test_ldap_rejects_non_ldap_scheme() {
+        assert!(validate_outbound_ldap_url("http://ldap.example.com", "LDAP server URL").is_err());
+        assert!(validate_outbound_ldap_url("https://ldap.example.com", "LDAP server URL").is_err());
+        assert!(validate_outbound_ldap_url("ldap.example.com:389", "LDAP server URL").is_err());
+    }
+
+    #[test]
+    fn test_ldap_rejects_hostname_resolving_to_internal() {
+        // Mirror of test_rejects_hostname_resolving_to_internal: a non-listed
+        // hostname that resolves to an internal IP must be rejected by the
+        // resolution step. Guarded so it does not flake where the name does
+        // not resolve (e.g. ak-rt-db is a Docker-network-only name).
+        use std::net::ToSocketAddrs;
+        let host = "localhost.localdomain";
+        let resolves_internal = (host, 0u16)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .any(|a| is_blocked_ip_in(a.ip(), OutboundUrlContext::Upstream))
+            })
+            .unwrap_or(false);
+        if resolves_internal {
+            let err = validate_outbound_ldap_url(&format!("ldap://{host}"), "LDAP server URL")
+                .expect_err("internal-resolving host must be rejected");
+            assert!(err.to_string().contains("private/internal network"));
+        }
+    }
+
+    #[test]
+    fn test_ldap_allow_private_ips_toggle_unblocks() {
+        // The existing Upstream escape hatch relaxes LDAP too (no new env var).
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_ldap_url("ldap://10.0.0.5:389", "LDAP server URL").is_ok(),
+            "private LDAP host must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_ldap_cidr_allowlist_relaxes_private() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.0.0.0/8");
+        assert!(validate_outbound_ldap_url("ldap://10.1.2.3", "LDAP server URL").is_ok());
+        // Outside the allowlisted CIDR — still blocked.
+        assert!(validate_outbound_ldap_url("ldap://192.168.1.1", "LDAP server URL").is_err());
+    }
+
+    #[test]
+    fn test_ldap_allow_private_ips_still_blocks_metadata_and_loopback() {
+        // Even with the blanket toggle, metadata and loopback stay blocked.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        assert!(validate_outbound_ldap_url("ldap://169.254.169.254", "LDAP server URL").is_err());
+        assert!(validate_outbound_ldap_url("ldaps://127.0.0.1:636", "LDAP server URL").is_err());
+    }
+
+    #[test]
+    fn test_is_blocked_resolved_ip_contract() {
+        let _g = AllowlistGuard::new();
+        // Loopback / private / metadata are blocked by default.
+        assert!(is_blocked_resolved_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_resolved_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_resolved_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_resolved_ip("::1".parse().unwrap()));
+        // A public IP passes.
+        assert!(!is_blocked_resolved_ip("93.184.216.34".parse().unwrap()));
     }
 }

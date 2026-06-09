@@ -282,6 +282,7 @@ pub async fn create_ldap(
     Json(req): Json<CreateLdapConfigRequest>,
 ) -> Result<Json<LdapConfigResponse>> {
     require_admin(&auth)?;
+    crate::api::validation::validate_outbound_ldap_url(&req.server_url, "LDAP server URL")?;
     let result = AuthConfigService::create_ldap(&state.db, req).await?;
     Ok(Json(result))
 }
@@ -310,6 +311,9 @@ pub async fn update_ldap(
     Json(req): Json<UpdateLdapConfigRequest>,
 ) -> Result<Json<LdapConfigResponse>> {
     require_admin(&auth)?;
+    if let Some(server_url) = &req.server_url {
+        crate::api::validation::validate_outbound_ldap_url(server_url, "LDAP server URL")?;
+    }
     let result = AuthConfigService::update_ldap(&state.db, id, req).await?;
     Ok(Json(result))
 }
