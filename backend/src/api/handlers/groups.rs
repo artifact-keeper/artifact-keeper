@@ -146,14 +146,18 @@ pub struct GroupListResponse {
     params(ListGroupsQuery),
     responses(
         (status = 200, description = "List of groups", body = GroupListResponse),
+        (status = 401, description = "Authentication required"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_groups(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListGroupsQuery>,
 ) -> Result<Json<GroupListResponse>> {
+    require_auth(auth)?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -330,6 +334,7 @@ pub async fn create_group(
     ),
     responses(
         (status = 200, description = "Group details with paginated members", body = GroupDetailResponse),
+        (status = 401, description = "Authentication required"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -337,9 +342,12 @@ pub async fn create_group(
 )]
 pub async fn get_group(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Query(query): Query<GetGroupQuery>,
 ) -> Result<Json<GroupDetailResponse>> {
+    require_auth(auth)?;
+
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')",
@@ -1408,5 +1416,51 @@ mod tests {
             &["read", "write", "delete", "admin"],
             "admin"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Read endpoints require authentication
+    //
+    // list_groups and get_group call require_auth before touching the DB, so
+    // an anonymous caller (no AuthExtension) is rejected with a 401 instead of
+    // leaking the org's group inventory and member lists. These tests exercise
+    // the same gate the handlers run on their first line and would fail if that
+    // gate were removed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_groups_requires_auth_anonymous_denied() {
+        // No AuthExtension present -> list_groups must reject before the DB query.
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_groups_authenticated_allowed() {
+        // A present AuthExtension passes the gate (admin or not).
+        let auth = make_auth(false);
+        assert!(require_auth(Some(auth)).is_ok());
+    }
+
+    #[test]
+    fn test_get_group_requires_auth_anonymous_denied() {
+        // No AuthExtension present -> get_group must reject before the DB query,
+        // so a valid id and a random id both return 401, not 200/404.
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_get_group_authenticated_allowed() {
+        let auth = make_auth(true);
+        assert!(require_auth(Some(auth)).is_ok());
     }
 }
