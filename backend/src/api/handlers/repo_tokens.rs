@@ -811,6 +811,15 @@ mod admin_scope_policy_tests {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
         let (_repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        // These tests assert the admin-scope 403 gate, not repo visibility. The
+        // #1783 private-repo check returns 404 before that gate for a private,
+        // rule-less repo, so make the setup repo public to reach the scope gate.
+        // The dedicated private-repo test flips this back to private itself.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .expect("make setup repo public");
         let state = tdh::build_state(pool.clone(), "/tmp");
         Some((pool, state, user_id, username, repo_key))
     }
