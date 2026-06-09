@@ -142,6 +142,19 @@ pub fn spawn_all(
                         tracing::warn!("refresh_token_jti cleanup failed: {}", e);
                     }
                 }
+                match crate::services::auth_service::AuthService::cleanup_expired_totp_pending_jti(
+                    &db, grace,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!("Pruned {} expired totp_pending_jti rows", n);
+                    }
+                    Err(e) => {
+                        tracing::warn!("totp_pending_jti cleanup failed: {}", e);
+                    }
+                }
             }
         });
     }

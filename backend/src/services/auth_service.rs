@@ -1210,6 +1210,20 @@ impl AuthService {
         Ok(result.rows_affected())
     }
 
+    /// Prune consumed TOTP pending-token `jti` rows whose underlying JWT has
+    /// been expired longer than `grace`. Mirrors
+    /// [`AuthService::cleanup_expired_refresh_token_jti`] for the single-use
+    /// pending-token table (#1820).
+    pub async fn cleanup_expired_totp_pending_jti(db: &PgPool, grace: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - grace;
+        let result = sqlx::query("DELETE FROM totp_pending_jti WHERE expires_at < $1")
+            .bind(cutoff)
+            .execute(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
         let validation = Validation::new(Algorithm::HS256);
         decode::<Claims>(token, &self.decoding_key, &validation)
@@ -2083,7 +2097,14 @@ impl AuthService {
     // TOTP 2FA Support
     // =========================================================================
 
-    /// Generate a short-lived token for TOTP verification pending state
+    /// Generate a short-lived token for TOTP verification pending state.
+    ///
+    /// Carries a fresh `jti` so the token is single-use: the first
+    /// `/auth/totp/verify` that presents it claims the `jti` via
+    /// [`AuthService::consume_totp_pending_jti`], and every later
+    /// presentation of the same token is rejected. Without this an attacker
+    /// holding the password could replay one pending token to brute-force the
+    /// 6-digit second factor (and race backup-code consumption) (#1820).
     pub fn generate_totp_pending_token(&self, user: &User) -> Result<String> {
         let now = Utc::now();
         let exp = now + Duration::minutes(5);
@@ -2095,20 +2116,61 @@ impl AuthService {
             iat: now.timestamp(),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
-            jti: None,
+            jti: Some(Uuid::new_v4()),
             family_id: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
     }
 
-    /// Validate a TOTP pending token and return claims
+    /// Validate a TOTP pending token and return claims.
+    ///
+    /// Verifies the JWT signature/expiry and that `token_type == "totp_pending"`.
+    /// Single-use enforcement is handled separately by
+    /// [`AuthService::consume_totp_pending_jti`], which the verify handler
+    /// calls before issuing real tokens.
     pub fn validate_totp_pending_token(&self, token: &str) -> Result<Claims> {
         let token_data = self.decode_token(token)?;
         if token_data.claims.token_type != "totp_pending" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
         Ok(token_data.claims)
+    }
+
+    /// Atomically claim a TOTP pending token's `jti`, enforcing single use.
+    ///
+    /// The first caller for a given `jti` inserts a row and gets `Ok(())`;
+    /// any later caller hits the primary-key conflict (zero rows inserted) and
+    /// gets an authentication error. This collapses the brute-force window
+    /// (#1820) and serializes concurrent backup-code verifies (#1822) at the
+    /// token layer. Tokens minted before this change carry `jti = None` and
+    /// are rejected here so they cannot bypass consumption.
+    pub async fn consume_totp_pending_jti(&self, claims: &Claims) -> Result<()> {
+        let jti = claims
+            .jti
+            .ok_or_else(|| AppError::Authentication("Invalid TOTP token".to_string()))?;
+        let expires_at = DateTime::<Utc>::from_timestamp(claims.exp, 0)
+            .ok_or_else(|| AppError::Authentication("Invalid TOTP token".to_string()))?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO totp_pending_jti (jti, user_id, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (jti) DO NOTHING
+            "#,
+        )
+        .bind(jti)
+        .bind(claims.sub)
+        .bind(expires_at)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(AppError::Authentication(
+                "TOTP token already used".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

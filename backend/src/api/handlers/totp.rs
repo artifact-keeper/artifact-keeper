@@ -35,6 +35,18 @@ fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
     .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))
 }
 
+/// Find the index of the first non-empty backup-code hash that matches
+/// `clean_code` (case/normalization already applied by the caller).
+///
+/// Extracted as a pure function so the match-and-consume logic is unit-
+/// testable without a database. An empty hash marks an already-consumed slot
+/// and is skipped.
+fn find_backup_code_index(hashed_codes: &[String], clean_code: &str) -> Option<usize> {
+    hashed_codes
+        .iter()
+        .position(|hash| !hash.is_empty() && bcrypt::verify(clean_code, hash).unwrap_or(false))
+}
+
 /// Decode a base32-encoded secret string into raw bytes.
 fn decode_secret(encoded: &str) -> Result<Vec<u8>> {
     Secret::Encoded(encoded.to_string())
@@ -289,8 +301,12 @@ pub async fn verify_totp(
 ) -> Result<Response> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    // Validate the pending token
+    // Validate the pending token, then atomically consume its `jti` so it is
+    // single-use. This caps a stolen/replayed pending token to one verify
+    // attempt -- defeating brute force of the 6-digit code (#1820) and
+    // serializing concurrent backup-code verifies (#1822).
     let claims = auth_service.validate_totp_pending_token(&payload.totp_token)?;
+    auth_service.consume_totp_pending_jti(&claims).await?;
 
     // Fetch user
     let user_row = sqlx::query!(
@@ -319,33 +335,54 @@ pub async fn verify_totp(
         .map_err(|e| AppError::Internal(format!("TOTP check error: {}", e)))?;
 
     if !code_valid {
-        // Try backup codes
+        // Try backup codes. Consumption must be atomic: a previous read of
+        // `user_row.totp_backup_codes` is a stale snapshot, and concurrent
+        // verifiers sharing it would each pass bcrypt and clobber each other's
+        // UPDATE (last-write-wins), letting one code authenticate many
+        // sessions (TOCTOU, #1822). Re-read under `SELECT ... FOR UPDATE`
+        // inside a transaction so concurrent verifiers serialize on the row
+        // and only the first observes the code as unused.
         let clean_code = payload.code.replace('-', "").to_uppercase();
-        let mut backup_used = false;
 
-        if let Some(ref backup_json) = user_row.totp_backup_codes {
-            if let Ok(hashed_codes) = serde_json::from_str::<Vec<String>>(backup_json) {
-                for (i, hash) in hashed_codes.iter().enumerate() {
-                    if !hash.is_empty() && bcrypt::verify(&clean_code, hash).unwrap_or(false) {
-                        // Remove used backup code
-                        let mut codes = hashed_codes.clone();
-                        codes[i] = String::new();
-                        let updated_json = serde_json::to_string(&codes)
-                            .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
-                        sqlx::query!(
-                            "UPDATE users SET totp_backup_codes = $2 WHERE id = $1",
-                            claims.sub,
-                            updated_json
-                        )
-                        .execute(&state.db)
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let locked_json: Option<String> =
+            sqlx::query_scalar("SELECT totp_backup_codes FROM users WHERE id = $1 FOR UPDATE")
+                .bind(claims.sub)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let backup_used = match locked_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+        {
+            Some(hashed_codes) => match find_backup_code_index(&hashed_codes, &clean_code) {
+                Some(idx) => {
+                    let mut codes = hashed_codes;
+                    codes[idx] = String::new();
+                    let updated_json = serde_json::to_string(&codes)
+                        .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
+                    sqlx::query("UPDATE users SET totp_backup_codes = $2 WHERE id = $1")
+                        .bind(claims.sub)
+                        .bind(updated_json)
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
-                        backup_used = true;
-                        break;
-                    }
+                    true
                 }
-            }
-        }
+                None => false,
+            },
+            None => false,
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if !backup_used {
             return Err(AppError::Authentication("Invalid TOTP code".to_string()));
@@ -383,6 +420,14 @@ pub async fn verify_totp(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let tokens = auth_service.generate_tokens(&user)?;
+    // Persist the refresh `jti` exactly like the password login path
+    // (authenticate -> persist_refresh_jti_from_pair). Without this the
+    // RFC 6819 reuse/replay check has no backing row for 2FA sessions, so
+    // stolen refresh tokens of 2FA users are infinitely replayable and the
+    // token family is never revoked (#1819).
+    auth_service
+        .persist_refresh_jti_from_pair(&tokens, user.id)
+        .await?;
 
     let body = super::auth::LoginResponse {
         access_token: tokens.access_token.clone(),
@@ -1140,6 +1185,219 @@ mod totp_token_invalidation_regression_tests {
         assert!(
             is_token_invalidated(user_id, pre_caller_iat),
             "older tokens must still be invalidated by disable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod totp_verify_hardening_tests {
+    //! Regression coverage for the round-3 2FA hardening:
+    //!  * #1819 — `verify_totp` must persist the refresh `jti` so RFC 6819
+    //!    replay detection works for 2FA sessions.
+    //!  * #1820 — the `totp_pending` token must be single-use (a second
+    //!    `/verify` with the same token is rejected).
+    //!  * #1822 — backup-code consumption must serialize so one code cannot
+    //!    authenticate concurrent sessions.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::user::{AuthProvider, User};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    /// Enrol a fresh user in TOTP with the given backup-code hashes and return
+    /// everything a `verify_totp` call needs: the handler state, a TOTP secret
+    /// for generating live codes, and a freshly minted single-use pending
+    /// token signed with the same key the handler validates against.
+    async fn setup_totp_user(
+        pool: &sqlx::PgPool,
+        backup_hashes: &[String],
+    ) -> (User, SharedState, Vec<u8>, String, std::path::PathBuf) {
+        let (user_id, username) = tdh::create_user(pool).await;
+        let secret = totp_rs::Secret::generate_secret();
+        let secret_b32 = secret.to_encoded().to_string();
+        let secret_bytes = secret.to_bytes().expect("secret bytes");
+        let backup_json = serde_json::to_string(backup_hashes).expect("serialize backup");
+        sqlx::query(
+            "UPDATE users SET totp_secret = $1, totp_enabled = true, totp_backup_codes = $2 \
+             WHERE id = $3",
+        )
+        .bind(&secret_b32)
+        .bind(&backup_json)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("enable totp");
+
+        let storage_dir = std::env::temp_dir().join(format!("totp-verify-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let user = User {
+            id: user_id,
+            username,
+            email: format!("{user_id}@test.local"),
+            password_hash: Some("unused".to_string()),
+            display_name: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            is_admin: false,
+            is_active: true,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: Some(secret_b32),
+            totp_enabled: true,
+            totp_backup_codes: Some(backup_json),
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: Utc::now(),
+            last_login_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let pending = auth_service
+            .generate_totp_pending_token(&user)
+            .expect("pending token");
+        (user, state, secret_bytes, pending, storage_dir)
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, dir: &std::path::Path) {
+        let _ = sqlx::query("DELETE FROM totp_pending_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1819 + #1820: a TOTP code verify persists the refresh `jti`, and the
+    /// pending token cannot be reused for a second verify.
+    #[tokio::test]
+    async fn verify_persists_refresh_jti_and_pending_token_is_single_use() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, state, secret_bytes, pending, dir) = setup_totp_user(&pool, &[]).await;
+        let user_id = user.id;
+        let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
+        let code = totp.generate_current().expect("code");
+
+        let first = verify_totp(
+            State(state.clone()),
+            Json(TotpVerifyRequest {
+                totp_token: pending.clone(),
+                code: code.clone(),
+            }),
+        )
+        .await;
+
+        // Replay the SAME pending token (a fresh valid code, to isolate the
+        // single-use property from code validity).
+        let code2 = totp.generate_current().expect("code");
+        let replay = verify_totp(
+            State(state.clone()),
+            Json(TotpVerifyRequest {
+                totp_token: pending,
+                code: code2,
+            }),
+        )
+        .await;
+
+        let jti_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count jti");
+
+        cleanup(&pool, user_id, &dir).await;
+
+        assert!(
+            first.is_ok(),
+            "first verify must succeed: {:?}",
+            first.err()
+        );
+        assert_eq!(
+            jti_rows, 1,
+            "verify_totp must persist exactly one refresh_token_jti row (#1819)"
+        );
+        assert!(
+            replay.is_err(),
+            "reusing a consumed pending token must be rejected (#1820)"
+        );
+    }
+
+    /// #1822: the same backup code presented by concurrent verifies must
+    /// authenticate at most once. The single-use pending token already caps a
+    /// single login to one verify, so each concurrent attempt uses its own
+    /// freshly minted pending token (the realistic worst case) — the
+    /// `FOR UPDATE` row lock is what must serialize consumption.
+    #[tokio::test]
+    async fn backup_code_consumed_at_most_once_under_concurrency() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let backup_plain = "1YUU4B8U";
+        let hash = bcrypt::hash(backup_plain, 4).expect("hash");
+        let (user, state, _secret, _pending, dir) = setup_totp_user(&pool, &[hash]).await;
+        let user_id = user.id;
+
+        // Mint one valid pending token per concurrent request (single-use
+        // tokens mean an attacker would re-login to feed the race).
+        let cfg = Arc::new(state.config.clone());
+        let svc = AuthService::new(pool.clone(), cfg);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let token = svc.generate_totp_pending_token(&user).expect("pending");
+            let st = state.clone();
+            handles.push(tokio::spawn(async move {
+                verify_totp(
+                    State(st),
+                    Json(TotpVerifyRequest {
+                        totp_token: token,
+                        code: "1YUU-4B8U".to_string(),
+                    }),
+                )
+                .await
+                .is_ok()
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            if h.await.unwrap_or(false) {
+                successes += 1;
+            }
+        }
+
+        let remaining: Option<String> =
+            sqlx::query_scalar("SELECT totp_backup_codes FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
+
+        cleanup(&pool, user_id, &dir).await;
+
+        assert_eq!(
+            successes, 1,
+            "a single backup code must authenticate exactly one concurrent verify (#1822)"
+        );
+        let codes: Vec<String> =
+            serde_json::from_str(&remaining.unwrap_or_default()).unwrap_or_default();
+        assert!(
+            codes.iter().all(|c| c.is_empty()),
+            "the consumed backup-code slot must be cleared"
         );
     }
 }

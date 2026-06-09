@@ -246,6 +246,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
     };
+    // Separate state for the unauthenticated TOTP second-factor endpoint
+    // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
+    // 2FA code is no more brute-forceable than the password it backs (#1820).
+    let totp_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&auth_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+    };
     let api_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&api_rate_limiter),
         exemptions: Arc::clone(&exemptions),
@@ -312,8 +320,16 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // TOTP 2FA routes
-        .nest("/auth/totp", handlers::totp::public_router())
+        // TOTP 2FA routes. The public `/verify` endpoint is the second-factor
+        // exchange; rate-limit it like `/auth` above so the 6-digit code and
+        // backup codes cannot be brute-forced (#1820).
+        .nest(
+            "/auth/totp",
+            handlers::totp::public_router().layer(middleware::from_fn_with_state(
+                totp_rate_limit_state,
+                rate_limit_middleware,
+            )),
+        )
         .nest(
             "/auth/totp",
             handlers::totp::protected_router().layer(middleware::from_fn_with_state(
