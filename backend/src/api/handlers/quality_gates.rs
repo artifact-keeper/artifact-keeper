@@ -552,9 +552,10 @@ async fn get_health_dashboard(
 )]
 async fn trigger_checks(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerChecksRequest>,
 ) -> Result<Json<TriggerChecksResponse>> {
+    auth.require_admin()?;
     if let Some(artifact_id) = body.artifact_id {
         let db = state.db.clone();
         tokio::spawn(async move {
@@ -697,6 +698,7 @@ async fn suppress_issue(
     Path(issue_id): Path<Uuid>,
     Json(body): Json<SuppressIssueRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
     let user_id = auth.user_id;
     qc_service
@@ -721,9 +723,10 @@ async fn suppress_issue(
 )]
 async fn unsuppress_issue(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
     qc_service.unsuppress_issue(issue_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -766,6 +769,7 @@ async fn create_gate(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CreateGateRequest>,
 ) -> Result<Json<GateResponse>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
     let input = crate::services::quality_check_service::CreateQualityGateInput {
         repository_id: body.repository_id,
@@ -835,6 +839,7 @@ async fn update_gate(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateGateRequest>,
 ) -> Result<Json<GateResponse>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
     let input = crate::services::quality_check_service::UpdateQualityGateInput {
         name: body.name,
@@ -878,6 +883,7 @@ async fn delete_gate(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
     qc_service.delete_gate(id).await?;
     state
@@ -903,10 +909,11 @@ async fn delete_gate(
 )]
 async fn evaluate_gate(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<EvaluateGateQuery>,
 ) -> Result<Json<GateEvaluationResponse>> {
+    auth.require_admin()?;
     let qc_service = QualityCheckService::new(state.db.clone());
 
     // Look up the artifact's repository_id if not explicitly provided
@@ -1767,5 +1774,65 @@ mod tests {
         let err = validate_status("bad").unwrap_err();
         assert!(err.contains("bad"));
         assert!(err.contains("pending"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization regression tests (#1805): mutating /quality/* routes must
+    // reject non-admin callers with 403. Before the fix these returned 200 for
+    // any authenticated user (broken function-level authorization).
+    // -----------------------------------------------------------------------
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Build the quality router wired to a fresh non-admin caller, plus a
+    /// throwaway repo to clean up. Returns `None` when no DB is configured so
+    /// the test no-ops. Shared setup keeps each authz case to a single call.
+    async fn nonadmin_quality_app() -> Option<(axum::Router, sqlx::PgPool, Uuid, Uuid)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username); // is_admin: false
+                                                       // The real `auth_middleware` inserts BOTH the concrete `AuthExtension`
+                                                       // and `Option<AuthExtension>`; these quality handlers extract the
+                                                       // concrete shape, so inject both here (mirroring middleware/auth.rs)
+                                                       // to avoid a spurious 500 ("Missing request extension").
+        let app = router()
+            .with_state(state)
+            .layer(axum::Extension(auth.clone()))
+            .layer(axum::Extension(Some(auth)));
+        Some((app, pool, repo_id, user_id))
+    }
+
+    #[tokio::test]
+    async fn test_trigger_checks_denies_nonadmin() {
+        let Some((app, pool, repo_id, user_id)) = nonadmin_quality_app().await else {
+            return;
+        };
+        let body = serde_json::json!({ "repository_id": repo_id }).to_string();
+        let req = tdh::post(
+            "/checks/trigger".to_string(),
+            "application/json",
+            body.into(),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_gate_denies_nonadmin() {
+        let Some((app, pool, repo_id, user_id)) = nonadmin_quality_app().await else {
+            return;
+        };
+        let body = serde_json::json!({
+            "repository_id": repo_id,
+            "name": "authz-regression-gate",
+            "action": "block",
+        })
+        .to_string();
+        let req = tdh::post("/gates".to_string(), "application/json", body.into());
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 }
