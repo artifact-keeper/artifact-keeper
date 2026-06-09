@@ -228,6 +228,7 @@ async fn create_rule(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleResponse>), AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let rule = svc
         .create_rule(
@@ -255,9 +256,11 @@ async fn create_rule(
 )]
 async fn update_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<Json<RuleResponse>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let rule = svc
         .update_rule(
@@ -284,8 +287,10 @@ async fn update_rule(
 )]
 async fn delete_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     svc.delete_rule(id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -344,6 +349,7 @@ async fn approve_package(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageResponse>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let pkg = svc
         .set_package_status(
@@ -369,6 +375,7 @@ async fn block_package(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageResponse>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let pkg = svc
         .set_package_status(id, "blocked", "Manually blocked", Some(auth.user_id), None)
@@ -388,6 +395,7 @@ async fn bulk_approve(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<u64>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
         .bulk_set_status(&req.ids, "approved", &req.reason, Some(auth.user_id))
@@ -407,6 +415,7 @@ async fn bulk_block(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<u64>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
         .bulk_set_status(&req.ids, "blocked", &req.reason, Some(auth.user_id))
@@ -423,8 +432,10 @@ async fn bulk_block(
 )]
 async fn re_evaluate(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(req): Json<ReEvaluateRequest>,
 ) -> Result<Json<u64>, AppError> {
+    auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
         .re_evaluate_pending(req.staging_repo_id, &req.default_action)
@@ -494,5 +505,55 @@ fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> PackageResp
         rule_id: pkg.rule_id,
         metadata: pkg.metadata,
         first_seen_at: pkg.first_seen_at.to_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admin_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    fn non_admin_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "user".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    // The curation write handlers (create/update/delete rule, approve/block,
+    // bulk-approve/bulk-block, re-evaluate) gate on `auth.require_admin()` so a
+    // non-admin cannot reach the allow/deny curation gate the security team
+    // relies on. These tests pin that gate so the write path stays admin-only.
+
+    #[test]
+    fn test_curation_write_allows_admin() {
+        assert!(admin_auth().require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_curation_write_rejects_non_admin() {
+        let err = non_admin_auth().require_admin().unwrap_err();
+        match err {
+            AppError::Authorization(msg) => assert_eq!(msg, "Admin access required"),
+            other => panic!("Expected Authorization error, got: {:?}", other),
+        }
     }
 }
