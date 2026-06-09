@@ -400,6 +400,29 @@ pub async fn get_user(
     Ok(Json(user_to_response(user)))
 }
 
+/// Resolve whether an `is_admin` update is an actual privilege change (#1821).
+///
+/// Returns `true` only when `requested` is `Some` and differs from the user's
+/// current `is_admin`. An idempotent re-apply (same value) or a request that
+/// does not touch `is_admin` (`None`) returns `false`, so benign profile edits
+/// do not bump the `privileges_changed_at` watermark and keep the user logged
+/// in. A missing user also returns `false` (the UPDATE will 404 afterwards).
+async fn is_admin_change_requested(
+    db: &sqlx::PgPool,
+    id: Uuid,
+    requested: Option<bool>,
+) -> Result<bool> {
+    let Some(requested) = requested else {
+        return Ok(false);
+    };
+    let current: Option<bool> = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(current.is_some_and(|was_admin| was_admin != requested))
+}
+
 /// Update user
 #[utoipa::path(
     patch,
@@ -453,6 +476,20 @@ pub async fn update_user(
         }
     }
 
+    // #1821: an admin demotion/promotion is a privilege change. `is_admin` is
+    // baked into JWT claims at mint time with no DB recheck, so a demoted admin
+    // keeps admin authority until the token expires unless we invalidate.
+    // Detect whether `is_admin` actually changes (vs. an idempotent re-apply)
+    // and, if so, bump the persistent `privileges_changed_at` watermark in the
+    // same UPDATE (folded into `fetch_credential_change_watermark`'s GREATEST,
+    // so cross-replica) plus the in-memory fast-path for this replica. We do
+    // NOT bump on a no-op so benign edits keep the user logged in.
+    let privilege_changed = is_admin_change_requested(&state.db, id, payload.is_admin).await?;
+    if privilege_changed {
+        invalidate_user_token_cache_entries(id);
+        invalidate_user_tokens(id);
+    }
+
     let user = sqlx::query_as!(
         User,
         r#"
@@ -462,6 +499,7 @@ pub async fn update_user(
             display_name = COALESCE($3, display_name),
             is_active = COALESCE($4, is_active),
             is_admin = COALESCE($5, is_admin),
+            privileges_changed_at = CASE WHEN $6 THEN NOW() ELSE privileges_changed_at END,
             updated_at = NOW()
         WHERE id = $1
         RETURNING
@@ -476,7 +514,8 @@ pub async fn update_user(
         payload.email,
         payload.display_name,
         payload.is_active,
-        payload.is_admin
+        payload.is_admin,
+        privilege_changed
     )
     .fetch_optional(&state.db)
     .await
@@ -2618,6 +2657,140 @@ mod router_split_tests {
             status,
             StatusCode::FORBIDDEN,
             "non-admin changing another user's password MUST 403 (handler-level guard at users.rs:change_password)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    // ── #1821: privilege change invalidates tokens ─────────────────────
+
+    /// AuthExtension for an admin caller (the request principal that performs
+    /// the demotion). `make_auth` only mints non-admin principals.
+    fn make_admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, username)
+        }
+    }
+
+    async fn privileges_changed_at(pool: &sqlx::PgPool, id: Uuid) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT privileges_changed_at FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read privileges_changed_at")
+    }
+
+    async fn set_admin(pool: &sqlx::PgPool, id: Uuid, is_admin: bool) {
+        sqlx::query("UPDATE users SET is_admin = $2 WHERE id = $1")
+            .bind(id)
+            .bind(is_admin)
+            .execute(pool)
+            .await
+            .expect("set is_admin");
+    }
+
+    /// #1821: demoting an admin (PATCH is_admin:false) must bump
+    /// `privileges_changed_at`, which feeds the credential-change watermark and
+    /// invalidates the pre-demotion JWT whose `is_admin` claim is now stale.
+    #[tokio::test]
+    async fn admin_demotion_bumps_privilege_watermark() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        set_admin(&pool, target_id, true).await;
+        // Backdate so a NOW() bump is unambiguously newer at second resolution.
+        sqlx::query(
+            "UPDATE users SET privileges_changed_at = NOW() - INTERVAL '120 seconds' WHERE id = $1",
+        )
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .expect("backdate watermark");
+        let before = privileges_changed_at(&pool, target_id).await;
+
+        let auth = make_admin_auth(caller_id, &caller_name);
+        let app = build_admin_app(state, auth);
+        let req = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/{}", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"is_admin": false}).to_string()))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "admin demotion must succeed");
+
+        let after = privileges_changed_at(&pool, target_id).await;
+        assert!(
+            after > before,
+            "demotion must bump privileges_changed_at (#1821): before={before}, after={after}"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    /// A benign edit that does not change `is_admin` (display_name only) must
+    /// NOT bump the privilege watermark — otherwise every profile edit would
+    /// log the user out (#1190 invariant preserved).
+    #[tokio::test]
+    async fn benign_profile_edit_keeps_privilege_watermark() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let before = privileges_changed_at(&pool, target_id).await;
+
+        let auth = make_admin_auth(caller_id, &caller_name);
+        let app = build_admin_app(state, auth);
+        let req = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/{}", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"display_name": "Renamed"}).to_string()))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "benign edit must succeed");
+
+        let after = privileges_changed_at(&pool, target_id).await;
+        assert_eq!(
+            after, before,
+            "a non-privilege edit must NOT bump privileges_changed_at (#1190 invariant)"
+        );
+
+        delete_user_row(&pool, caller_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
+    /// Idempotent re-apply of the SAME is_admin value must NOT bump the
+    /// watermark (avoids logging the user out on a no-op admin re-sync).
+    #[tokio::test]
+    async fn idempotent_is_admin_reapply_keeps_privilege_watermark() {
+        let Some((pool, state, caller_id, caller_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await; // is_admin = false
+        let before = privileges_changed_at(&pool, target_id).await;
+
+        let auth = make_admin_auth(caller_id, &caller_name);
+        let app = build_admin_app(state, auth);
+        let req = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/{}", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"is_admin": false}).to_string()))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "no-op re-apply must succeed");
+
+        let after = privileges_changed_at(&pool, target_id).await;
+        assert_eq!(
+            after, before,
+            "re-applying the same is_admin value must NOT bump the watermark"
         );
 
         delete_user_row(&pool, caller_id).await;

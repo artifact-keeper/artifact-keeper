@@ -310,34 +310,41 @@ async fn fetch_credential_change_watermark(
         }
     }
 
-    let row = sqlx::query!(
+    // `privileges_changed_at` (#1821) is folded into the GREATEST so an admin
+    // demotion (or SSO role-set re-sync) invalidates pre-change JWTs whose
+    // `is_admin` claim is now stale. `updated_at` stays excluded (#1190) so
+    // benign profile edits remain non-invalidating. Uses the runtime query
+    // form (tuple-typed `query_as`) instead of the `query!` macro so the
+    // added column does not require regenerating the offline `.sqlx` cache.
+    let row = sqlx::query_as::<_, (DateTime<Utc>, bool)>(
         r#"
         SELECT
             GREATEST(
                 password_changed_at,
-                COALESCE(totp_verified_at, password_changed_at)
-            ) AS "watermark!",
+                COALESCE(totp_verified_at, password_changed_at),
+                privileges_changed_at
+            ) AS watermark,
             is_active
         FROM users
         WHERE id = $1
         "#,
-        user_id
     )
+    .bind(user_id)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some(record) = row else {
+    let Some((watermark_ts, is_active)) = row else {
         return Ok(None);
     };
-    let watermark = record.watermark.timestamp();
+    let watermark = watermark_ts.timestamp();
 
     // Only cache when the user is active. Caching `is_active=false` would
     // require expanding the cache value to a tuple; instead we skip the
     // write so the next lookup re-reads the DB and gets the authoritative
     // status. Inactive lookups are rare on the hot path (the request will
     // 401 anyway) so the extra DB roundtrip is acceptable.
-    if record.is_active {
+    if is_active {
         if let Ok(mut map) = invalidation_map().write() {
             map.insert(user_id, (watermark, Instant::now()));
             let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
@@ -347,7 +354,7 @@ async fn fetch_credential_change_watermark(
 
     Ok(Some(CredentialWatermark {
         watermark,
-        is_active: record.is_active,
+        is_active,
     }))
 }
 
@@ -1780,11 +1787,52 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Update is_admin flag (only if admin group mapping is configured)
+        // Update is_admin flag (only if admin group mapping is configured).
+        //
+        // #1821: an SSO role-set re-sync is a privilege change. Bump
+        // `privileges_changed_at` whenever the resolved `is_admin` differs from
+        // the stored value or the assigned role set changes, so pre-change JWTs
+        // (whose `is_admin` claim is baked in at mint time) are invalidated by
+        // `fetch_credential_change_watermark`. We compare the resolved value
+        // against the current row to avoid bumping the watermark on a no-op
+        // re-sync (which would needlessly log the user out on every login).
+        let privilege_changed: bool = sqlx::query_scalar(
+            r#"
+            WITH prev AS (
+                SELECT is_admin AS was_admin,
+                       ARRAY(
+                           SELECT r.name FROM user_roles ur
+                           JOIN roles r ON r.id = ur.role_id
+                           WHERE ur.user_id = $1
+                           ORDER BY r.name
+                       ) AS prev_roles
+                FROM users WHERE id = $1
+            )
+            SELECT
+                COALESCE($2, prev.was_admin) IS DISTINCT FROM prev.was_admin
+                OR prev.prev_roles IS DISTINCT FROM $3::text[]
+            FROM prev
+            "#,
+        )
+        .bind(user_id)
+        .bind(mapping.is_admin)
+        .bind({
+            let mut roles: Vec<String> = mapping.roles.clone();
+            roles.sort();
+            roles
+        })
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .unwrap_or(false);
+
         sqlx::query!(
-            "UPDATE users SET is_admin = COALESCE($2, is_admin), updated_at = NOW() WHERE id = $1",
+            "UPDATE users SET is_admin = COALESCE($2, is_admin), \
+             privileges_changed_at = CASE WHEN $3 THEN NOW() ELSE privileges_changed_at END, \
+             updated_at = NOW() WHERE id = $1",
             user_id,
-            mapping.is_admin
+            mapping.is_admin,
+            privilege_changed
         )
         .execute(&mut *tx)
         .await
@@ -1820,6 +1868,14 @@ impl AuthService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // #1821: same-replica fast-path. When the privilege set changed we
+        // bumped `privileges_changed_at`; mirror that into the in-memory
+        // invalidation map so this replica rejects pre-change JWTs on the very
+        // next request without waiting for the DB-cache TTL to lapse.
+        if privilege_changed {
+            invalidate_user_tokens(user_id);
+        }
 
         Ok(())
     }
@@ -4158,6 +4214,101 @@ mod tests {
         // Cleanup.
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #1821 regression: an admin demotion must invalidate JWTs minted before
+    /// the demotion. The demote path bumps `privileges_changed_at`; this column
+    /// is folded into `fetch_credential_change_watermark`'s GREATEST, so a token
+    /// whose `iat` predates the bump is rejected by the replica-safe check.
+    ///
+    /// Pre-fix (privileges_changed_at not in the watermark) the same pre-demotion
+    /// token would be accepted, letting a demoted admin keep `is_admin` authority
+    /// until token expiry — exactly the persistence the issue demonstrates.
+    #[tokio::test]
+    async fn test_privilege_change_invalidates_pre_demotion_token() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Fresh admin user. password_changed_at / privileges_changed_at default
+        // to NOW(); backdate both 120s so a "pre-demotion" iat at NOW-60s starts
+        // out ACCEPTED (proving the rejection below is caused by the demotion,
+        // not by the creation-time watermark).
+        let username = format!("priv_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             privileges_changed_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, true, 0, \
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', \
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert admin user");
+
+        // Token minted while still admin (iat = NOW - 60s, after the backdated
+        // creation watermark). Must be ACCEPTED before any demotion.
+        let pre_demotion_iat = (Utc::now() - Duration::seconds(60)).timestamp();
+        let rejected_before = is_token_invalidated_replica_safe(&pool, user_id, pre_demotion_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            !rejected_before,
+            "pre-demotion token must be accepted before the demotion"
+        );
+
+        // Demote: bump privileges_changed_at to NOW (what update_user /
+        // apply_role_mapping do when is_admin/role-set changes). Bypass the
+        // 5s in-memory DB cache so the next check re-reads the DB.
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+        sqlx::query(
+            "UPDATE users SET is_admin = false, privileges_changed_at = NOW() WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("demote user");
+
+        // EXPLOIT GUARD: the SAME pre-demotion token must now be REJECTED.
+        let rejected_after = is_token_invalidated_replica_safe(&pool, user_id, pre_demotion_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            rejected_after,
+            "pre-demotion token must be rejected after privileges_changed_at bump (#1821)"
+        );
+
+        // A token minted AFTER the demotion (with the new is_admin=false claim)
+        // is still accepted — invalidation is watermark-scoped, not a lockout.
+        let post_demotion_iat = (Utc::now() + Duration::seconds(60)).timestamp();
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+        let rejected_post = is_token_invalidated_replica_safe(&pool, user_id, post_demotion_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            !rejected_post,
+            "token minted after the demotion must be accepted"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
