@@ -59,39 +59,64 @@ impl HelmHandler {
         )))
     }
 
-    /// Parse chart filename to extract name and version
-    /// Format: <name>-<version>.tgz
+    /// Returns true if `segment` looks like a chart version token.
+    ///
+    /// Accepts plain semver (`1.24.0`) as well as OCI-style `v`-prefixed tags
+    /// (`v1.14.0`). To avoid mistaking a chart-name segment such as `2nd` for a
+    /// version, the leading numeric run (after an optional `v`/`V`) must be
+    /// followed by a version-structural character (`.`, `-`, `+`) or the end of
+    /// the token — not an alphabetic continuation like `nd`.
+    fn looks_like_version_start(segment: &str) -> bool {
+        let bytes = segment.as_bytes();
+        let mut i = 0;
+        // Optional leading v / V (OCI-style tag).
+        if matches!(bytes.first(), Some(b'v') | Some(b'V')) {
+            i = 1;
+        }
+        // Require at least one digit.
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start {
+            return false;
+        }
+        // The numeric run must end the token or be followed by version syntax.
+        matches!(bytes.get(i), None | Some(b'.') | Some(b'-') | Some(b'+'))
+    }
+
+    /// Parse chart filename to extract name and version.
+    ///
+    /// Format: `<name>-<version>.tgz`
+    ///
+    /// The version may contain hyphens itself (semver pre-release / build
+    /// metadata such as `1.24.0-rc.1` or `1.0.0-alpha.1+build.5`), so we cannot
+    /// simply split on the last hyphen. Instead we scan hyphen boundaries from
+    /// left to right and pick the FIRST one whose right-hand side looks like the
+    /// start of a version (leading digit, or `v`/`V` + digit). This keeps the
+    /// chart name greedy while still capturing the full version, including
+    /// pre-release suffixes that the naive last-hyphen split would truncate.
     fn parse_chart_filename(filename: &str) -> Result<(String, String)> {
-        let name = filename.trim_end_matches(".tgz");
+        let stem = filename.trim_end_matches(".tgz");
 
-        // Find the last hyphen that separates name from version
-        // Version starts with a digit
-        let parts: Vec<&str> = name.rsplitn(2, '-').collect();
-
-        if parts.len() != 2 {
-            return Err(AppError::Validation(format!(
-                "Invalid Helm chart filename: {}",
-                filename
-            )));
+        // Candidate split points: every hyphen that is not the first character.
+        // Walk left-to-right so the chart name stays as long as possible and the
+        // version captures any embedded pre-release hyphens.
+        for (idx, _) in stem.match_indices('-') {
+            if idx == 0 {
+                continue;
+            }
+            let chart_name = &stem[..idx];
+            let version = &stem[idx + 1..];
+            if !version.is_empty() && Self::looks_like_version_start(version) {
+                return Ok((chart_name.to_string(), version.to_string()));
+            }
         }
 
-        let version = parts[0];
-        let chart_name = parts[1];
-
-        // Validate version starts with a digit (semver)
-        if !version
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            return Err(AppError::Validation(format!(
-                "Invalid Helm chart version in filename: {}",
-                filename
-            )));
-        }
-
-        Ok((chart_name.to_string(), version.to_string()))
+        Err(AppError::Validation(format!(
+            "Invalid Helm chart filename: {}",
+            filename
+        )))
     }
 
     /// Extract Chart.yaml from chart package
@@ -266,29 +291,29 @@ pub struct ChartYaml {
     pub api_version: String,
     pub name: String,
     pub version: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kube_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub chart_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keywords: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<ChartDependency>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintainers: Option<Vec<ChartMaintainer>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -297,15 +322,19 @@ pub struct ChartYaml {
 pub struct ChartDependency {
     pub name: String,
     pub version: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
-    #[serde(default, rename = "import-values")]
+    #[serde(
+        default,
+        rename = "import-values",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub import_values: Option<Vec<serde_yaml::Value>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
 }
 
@@ -313,9 +342,9 @@ pub struct ChartDependency {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartMaintainer {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
 
@@ -422,6 +451,63 @@ mod tests {
         // "chart-.tgz" -> version is empty, first char check fails
         let result = HelmHandler::parse_chart_filename("chart-.tgz");
         assert!(result.is_err());
+    }
+
+    // ---- parse_chart_filename: pre-release & v-prefixed versions (#1779) ----
+
+    #[test]
+    fn test_parse_chart_filename_prerelease_suffix() {
+        // Regression (#1779): a semver pre-release suffix contains its own
+        // hyphen. The naive last-hyphen split truncated the version to "rc.1";
+        // the version must be captured in full.
+        let (name, version) = HelmHandler::parse_chart_filename("nginx-1.24.0-rc.1.tgz").unwrap();
+        assert_eq!(name, "nginx");
+        assert_eq!(version, "1.24.0-rc.1");
+    }
+
+    #[test]
+    fn test_parse_chart_filename_prerelease_with_build_metadata() {
+        let (name, version) =
+            HelmHandler::parse_chart_filename("my-chart-1.0.0-alpha.1+build.5.tgz").unwrap();
+        assert_eq!(name, "my-chart");
+        assert_eq!(version, "1.0.0-alpha.1+build.5");
+    }
+
+    #[test]
+    fn test_parse_chart_filename_v_prefixed_version() {
+        // Regression (#1779): OCI-style v-prefixed tags were rejected because
+        // the version did not start with a digit.
+        let (name, version) =
+            HelmHandler::parse_chart_filename("cert-manager-v1.14.0.tgz").unwrap();
+        assert_eq!(name, "cert-manager");
+        assert_eq!(version, "v1.14.0");
+    }
+
+    #[test]
+    fn test_parse_chart_filename_v_prefixed_prerelease() {
+        let (name, version) = HelmHandler::parse_chart_filename("nginx-v1.24.0-rc.1.tgz").unwrap();
+        assert_eq!(name, "nginx");
+        assert_eq!(version, "v1.24.0-rc.1");
+    }
+
+    #[test]
+    fn test_parse_chart_filename_digit_leading_name_segment() {
+        // A chart-name segment that merely starts with a digit (e.g. "2nd")
+        // must NOT be mistaken for the version. Only a proper version token
+        // (digit run ending in '.', '-', '+', or end-of-token) splits.
+        let (name, version) = HelmHandler::parse_chart_filename("my-2nd-chart-1.0.0.tgz").unwrap();
+        assert_eq!(name, "my-2nd-chart");
+        assert_eq!(version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_path_chart_prerelease_roundtrip() {
+        // The download handler relies on parse_path succeeding so it can fall
+        // through to the upstream-index proxy lookup (#1779).
+        let info = HelmHandler::parse_path("charts/nginx-1.24.0-rc.1.tgz").unwrap();
+        assert_eq!(info.name, Some("nginx".to_string()));
+        assert_eq!(info.version, Some("1.24.0-rc.1".to_string()));
+        assert!(!info.is_index);
     }
 
     // ---- parse_path: index.yaml ----
@@ -621,6 +707,102 @@ annotations:
 
         let ann = chart.annotations.unwrap();
         assert_eq!(ann.get("category"), Some(&"database".to_string()));
+    }
+
+    // ---- index.yaml serialization: omit unset optional fields (#1779) ----
+
+    #[test]
+    fn test_chart_yaml_minimal_serializes_without_nulls() {
+        // Regression (#1779): a minimal chart (apiVersion/name/version only)
+        // must NOT emit explicit `null` for every unset optional field, which
+        // violates the ChartMuseum/Helm index.yaml convention.
+        let chart = ChartYaml {
+            api_version: "v2".to_string(),
+            name: "mini".to_string(),
+            version: "0.1.0".to_string(),
+            kube_version: None,
+            description: None,
+            chart_type: None,
+            keywords: None,
+            home: None,
+            sources: None,
+            dependencies: None,
+            maintainers: None,
+            icon: None,
+            app_version: None,
+            deprecated: None,
+            annotations: None,
+        };
+
+        let yaml = serde_yaml::to_string(&chart).unwrap();
+        assert!(!yaml.contains("null"), "unexpected null in:\n{}", yaml);
+        for absent in [
+            "kubeVersion",
+            "description",
+            "type",
+            "keywords",
+            "home",
+            "sources",
+            "dependencies",
+            "maintainers",
+            "icon",
+            "appVersion",
+            "deprecated",
+            "annotations",
+        ] {
+            assert!(
+                !yaml.contains(absent),
+                "field `{}` should be omitted, got:\n{}",
+                absent,
+                yaml
+            );
+        }
+        // Required fields are still present.
+        assert!(yaml.contains("apiVersion: v2"));
+        assert!(yaml.contains("name: mini"));
+        assert!(yaml.contains("version: 0.1.0"));
+
+        // JSON serialization is also clean (used by API metadata paths).
+        let json = serde_json::to_value(&chart).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.values().any(|v| v.is_null()));
+        assert_eq!(obj.len(), 3);
+    }
+
+    #[test]
+    fn test_chart_maintainer_minimal_serializes_without_nulls() {
+        let m = ChartMaintainer {
+            name: "Dev".to_string(),
+            email: None,
+            url: None,
+        };
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert!(!yaml.contains("null"), "unexpected null in:\n{}", yaml);
+        assert!(!yaml.contains("email"));
+        assert!(!yaml.contains("url"));
+        assert!(yaml.contains("name: Dev"));
+    }
+
+    #[test]
+    fn test_chart_dependency_minimal_serializes_without_nulls() {
+        let dep = ChartDependency {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            repository: None,
+            condition: None,
+            tags: None,
+            import_values: None,
+            alias: None,
+        };
+        let yaml = serde_yaml::to_string(&dep).unwrap();
+        assert!(!yaml.contains("null"), "unexpected null in:\n{}", yaml);
+        for absent in ["repository", "condition", "tags", "import-values", "alias"] {
+            assert!(
+                !yaml.contains(absent),
+                "field `{}` should be omitted",
+                absent
+            );
+        }
     }
 
     // ---- ChartDependency serde ----
