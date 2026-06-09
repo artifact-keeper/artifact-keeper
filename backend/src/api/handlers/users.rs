@@ -205,7 +205,9 @@ pub async fn list_users(
     // if someone moves it between routers in the future. See #1257.
     auth.require_admin()?;
     let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
+    // Shared clamp: per_page=0 would otherwise divide by zero in total_pages
+    // and saturate to u32::MAX (#1783 LOW). See clamp_per_page docs.
+    let per_page = crate::api::handlers::repositories::clamp_per_page(query.per_page);
     let offset = ((page - 1) * per_page) as i64;
 
     let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
