@@ -63,6 +63,16 @@ pub struct CreateSessionRequest {
     /// Optional for regular client uploads. Peer replication sets this from
     /// the source artifact row so chunked replication preserves metadata.
     pub artifact_version: Option<String>,
+    /// Source artifact metadata format for peer replication.
+    pub artifact_metadata_format: Option<String>,
+    /// Source artifact metadata for peer replication.
+    pub artifact_metadata: Option<serde_json::Value>,
+    /// Source artifact metadata properties for peer replication.
+    pub artifact_metadata_properties: Option<serde_json::Value>,
+    /// Source package description for peer replication.
+    pub package_description: Option<String>,
+    /// Source package catalog metadata for peer replication.
+    pub package_metadata: Option<serde_json::Value>,
     /// Total file size in bytes
     pub total_size: i64,
     /// Expected SHA256 checksum of the complete file
@@ -131,6 +141,7 @@ pub struct CompleteResponse {
 async fn create_session(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
+    headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Response, Response> {
     let user_id = auth.user_id;
@@ -154,6 +165,8 @@ async fn create_session(
             )
         })?;
 
+    let replication_metadata = replication_session_metadata_from_request(&headers, &req);
+
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
         storage_path: &state.config.storage_path,
@@ -163,6 +176,11 @@ async fn create_session(
         artifact_path: &req.artifact_path,
         artifact_name: req.artifact_name.as_deref(),
         artifact_version: req.artifact_version.as_deref(),
+        artifact_metadata_format: replication_metadata.artifact_metadata_format,
+        artifact_metadata: replication_metadata.artifact_metadata,
+        artifact_metadata_properties: replication_metadata.artifact_metadata_properties,
+        package_description: replication_metadata.package_description,
+        package_metadata: replication_metadata.package_metadata,
         total_size: req.total_size,
         chunk_size: req.chunk_size,
         checksum_sha256: &req.checksum_sha256,
@@ -427,6 +445,21 @@ async fn complete(
     .await
     .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    if let (Some(format), Some(metadata)) = (
+        session.artifact_metadata_format.as_deref(),
+        session.artifact_metadata.clone(),
+    ) {
+        let properties = session
+            .artifact_metadata_properties
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let artifact_service = state.create_artifact_service(storage.clone());
+        artifact_service
+            .set_metadata(artifact_id, format, metadata, properties)
+            .await
+            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+
     if let Some((package_name, package_version)) = completed_package_catalog_entry(&session) {
         PackageService::new(state.db.clone())
             .try_create_or_update_from_artifact(
@@ -435,8 +468,8 @@ async fn complete(
                 package_version,
                 session.total_size,
                 &session.checksum_sha256,
-                None,
-                None,
+                completed_package_description(&session),
+                completed_package_metadata(&session),
             )
             .await;
     }
@@ -575,6 +608,47 @@ fn completed_package_catalog_entry(
     Some((completed_artifact_name(session), version))
 }
 
+fn completed_package_description(session: &upload_service::UploadSession) -> Option<&str> {
+    session.package_description.as_deref()
+}
+
+fn completed_package_metadata(
+    session: &upload_service::UploadSession,
+) -> Option<serde_json::Value> {
+    session.package_metadata.clone()
+}
+
+struct ReplicationSessionMetadata<'a> {
+    artifact_metadata_format: Option<&'a str>,
+    artifact_metadata: Option<&'a serde_json::Value>,
+    artifact_metadata_properties: Option<&'a serde_json::Value>,
+    package_description: Option<&'a str>,
+    package_metadata: Option<&'a serde_json::Value>,
+}
+
+fn replication_session_metadata_from_request<'a>(
+    headers: &HeaderMap,
+    req: &'a CreateSessionRequest,
+) -> ReplicationSessionMetadata<'a> {
+    if !super::is_replication_request(headers) {
+        return ReplicationSessionMetadata {
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
+        };
+    }
+
+    ReplicationSessionMetadata {
+        artifact_metadata_format: req.artifact_metadata_format.as_deref(),
+        artifact_metadata: req.artifact_metadata.as_ref(),
+        artifact_metadata_properties: req.artifact_metadata_properties.as_ref(),
+        package_description: req.package_description.as_deref(),
+        package_metadata: req.package_metadata.as_ref(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -648,6 +722,11 @@ mod tests {
             artifact_path: path.to_string(),
             artifact_name: name.map(str::to_string),
             artifact_version: version.map(str::to_string),
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
             content_type: "application/octet-stream".to_string(),
             total_size: 1,
             chunk_size: 1_048_576,
@@ -709,6 +788,79 @@ mod tests {
         assert_eq!(completed_package_catalog_entry(&session), None);
     }
 
+    fn request_with_replication_metadata() -> CreateSessionRequest {
+        CreateSessionRequest {
+            repository_key: "repo".to_string(),
+            artifact_path: "pool/main/a/app/app_1_amd64.deb".to_string(),
+            artifact_name: Some("app".to_string()),
+            artifact_version: Some("1".to_string()),
+            artifact_metadata_format: Some("debian".to_string()),
+            artifact_metadata: Some(serde_json::json!({
+                "format": "debian",
+                "architecture": "amd64"
+            })),
+            artifact_metadata_properties: Some(serde_json::json!({"source": "peer"})),
+            package_description: Some("replicated Debian package".to_string()),
+            package_metadata: Some(serde_json::json!({
+                "format": "debian",
+                "component": "main"
+            })),
+            total_size: 1024,
+            checksum_sha256: "deadbeef".to_string(),
+            chunk_size: None,
+            content_type: None,
+        }
+    }
+
+    fn headers_with_replication(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_replication_session_metadata_keeps_fields_for_peer_request() {
+        let req = request_with_replication_metadata();
+        let headers = headers_with_replication("true");
+
+        let metadata = replication_session_metadata_from_request(&headers, &req);
+
+        assert_eq!(metadata.artifact_metadata_format, Some("debian"));
+        assert_eq!(
+            metadata.artifact_metadata.unwrap()["architecture"],
+            serde_json::json!("amd64")
+        );
+        assert_eq!(
+            metadata.artifact_metadata_properties.unwrap()["source"],
+            serde_json::json!("peer")
+        );
+        assert_eq!(
+            metadata.package_description,
+            Some("replicated Debian package")
+        );
+        assert_eq!(
+            metadata.package_metadata.unwrap()["component"],
+            serde_json::json!("main")
+        );
+    }
+
+    #[test]
+    fn test_replication_session_metadata_drops_fields_without_peer_marker() {
+        let req = request_with_replication_metadata();
+        let headers = HeaderMap::new();
+
+        let metadata = replication_session_metadata_from_request(&headers, &req);
+
+        assert!(metadata.artifact_metadata_format.is_none());
+        assert!(metadata.artifact_metadata.is_none());
+        assert!(metadata.artifact_metadata_properties.is_none());
+        assert!(metadata.package_description.is_none());
+        assert!(metadata.package_metadata.is_none());
+    }
+
     // -----------------------------------------------------------------------
     // CreateSessionRequest deserialization
     // -----------------------------------------------------------------------
@@ -720,6 +872,11 @@ mod tests {
             "artifact_path": "images/vm.ova",
             "artifact_name": "vm-image",
             "artifact_version": "2026.06.03",
+            "artifact_metadata_format": "debian",
+            "artifact_metadata": {"format": "debian", "architecture": "amd64"},
+            "artifact_metadata_properties": {"source": "peer"},
+            "package_description": "Debian package",
+            "package_metadata": {"format": "debian", "component": "main"},
             "total_size": 21474836480,
             "checksum_sha256": "abc123def456",
             "chunk_size": 16777216,
@@ -730,6 +887,17 @@ mod tests {
         assert_eq!(req.artifact_path, "images/vm.ova");
         assert_eq!(req.artifact_name.as_deref(), Some("vm-image"));
         assert_eq!(req.artifact_version.as_deref(), Some("2026.06.03"));
+        assert_eq!(req.artifact_metadata_format.as_deref(), Some("debian"));
+        assert_eq!(
+            req.artifact_metadata.as_ref().unwrap()["architecture"],
+            "amd64"
+        );
+        assert_eq!(
+            req.artifact_metadata_properties.as_ref().unwrap()["source"],
+            "peer"
+        );
+        assert_eq!(req.package_description.as_deref(), Some("Debian package"));
+        assert_eq!(req.package_metadata.as_ref().unwrap()["component"], "main");
         assert_eq!(req.total_size, 21_474_836_480);
         assert_eq!(req.checksum_sha256, "abc123def456");
         assert_eq!(req.chunk_size, Some(16_777_216));
@@ -749,6 +917,11 @@ mod tests {
         assert_eq!(req.artifact_path, "file.bin");
         assert_eq!(req.artifact_name, None);
         assert_eq!(req.artifact_version, None);
+        assert_eq!(req.artifact_metadata_format, None);
+        assert_eq!(req.artifact_metadata, None);
+        assert_eq!(req.artifact_metadata_properties, None);
+        assert_eq!(req.package_description, None);
+        assert_eq!(req.package_metadata, None);
         assert_eq!(req.total_size, 1024);
         assert_eq!(req.checksum_sha256, "deadbeef");
         assert!(req.chunk_size.is_none());
@@ -1195,6 +1368,11 @@ mod tests {
             artifact_path: "file.bin".into(),
             artifact_name: None,
             artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
             total_size: 100,
             checksum_sha256: "abc".into(),
             chunk_size: None,
@@ -1533,6 +1711,17 @@ mod tests {
         tdh::post("/".to_string(), "application/json", payload)
     }
 
+    fn create_replication_session_req(
+        body: &serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut req = create_session_req(body);
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        req
+    }
+
     /// Wrap the upload router with a bare `Extension(AuthExtension)` layer.
     ///
     /// `tdh::router_with_auth` inserts `Extension::<Option<AuthExtension>>`,
@@ -1732,6 +1921,130 @@ mod tests {
         );
 
         // Clean up everything we wrote.
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_materializes_replication_metadata() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let payload: &[u8] = b"replicated-debian-package-bytes";
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        let artifact_path = "pool/main/a/app/app_1_amd64.deb";
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let create_req = create_replication_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": artifact_path,
+            "artifact_name": "app",
+            "artifact_version": "1",
+            "artifact_metadata_format": "debian",
+            "artifact_metadata": {
+                "format": "debian",
+                "architecture": "amd64",
+                "component": "main"
+            },
+            "artifact_metadata_properties": {"source": "lux"},
+            "package_description": "replicated Debian package",
+            "package_metadata": {
+                "format": "debian",
+                "component": "main"
+            },
+            "total_size": payload.len() as i64,
+            "checksum_sha256": checksum,
+            "chunk_size": 1024 * 1024_i64,
+        }));
+        let (status, body) = tdh::send(app, create_req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create_session must preserve replication metadata; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id: Uuid =
+            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", session_id))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunk PATCH must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "complete must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(f.repo_id)
+                .bind(artifact_path)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query replicated artifact");
+
+        let metadata: (String, serde_json::Value, serde_json::Value) = sqlx::query_as(
+            "SELECT format, metadata, properties FROM artifact_metadata WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query replicated artifact metadata");
+        assert_eq!(metadata.0, "debian");
+        assert_eq!(metadata.1["architecture"], "amd64");
+        assert_eq!(metadata.2["source"], "lux");
+
+        let pkg: (String, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT version, description, metadata FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("app")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query replicated package catalog");
+        assert_eq!(pkg.0, "1");
+        assert_eq!(pkg.1.as_deref(), Some("replicated Debian package"));
+        assert_eq!(pkg.2.expect("package metadata")["component"], "main");
+
         let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
             .bind(session_id)
             .execute(&f.pool)
