@@ -262,8 +262,15 @@ jobs:
             echo "rust_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
-          if git diff --name-only FETCH_HEAD -- '*.rs' | grep -q .; then
+          # Fetch the base branch into a STABLE named remote-tracking ref
+          # (origin/$BASE) instead of relying on the volatile FETCH_HEAD. A bare
+          # `git fetch ... origin $BASE` only writes FETCH_HEAD, which any later
+          # fetch overwrites and which races the on-disk shallow file
+          # ("fatal: shallow file has changed since we read it"). A named ref is
+          # deterministic and never clobbered. (#1798/#1799/#1812/#1813/#1815)
+          BASE="${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          if git diff --name-only "origin/$BASE" -- '*.rs' | grep -q .; then
             echo "rust_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust_changed=false" >> "$GITHUB_OUTPUT"
@@ -326,15 +333,32 @@ jobs:
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
         run: |
           # Fetch base branch so we can diff against it (checkout is shallow by default).
+          #
+          # Fetch the base into a STABLE named remote-tracking ref (origin/$BASE)
+          # rather than relying on the volatile FETCH_HEAD. The previous code did
+          # two fetches in a row — `git fetch ... origin $BASE` (set FETCH_HEAD)
+          # then `git fetch --deepen=200 origin` — and the second fetch rewrote the
+          # on-disk shallow file and clobbered/ambiguated FETCH_HEAD while later
+          # commands were still reading it, producing the intermittent
+          #   fatal: shallow file has changed since we read it
+          #   fatal: ambiguous argument 'FETCH_HEAD': unknown revision ...
+          #   ##[error]Process completed with exit code 128
+          # that failed PRs with no real coverage problem
+          # (#1798/#1799/#1812/#1813/#1815). A named ref is written atomically and
+          # never overwritten by a subsequent fetch, so it is race-free.
+          #
           # Deepen BOTH the base branch AND the PR head: the head is checked out
           # shallow (fetch-depth: 1), so without head-side history `git merge-base`
           # has nothing to walk on the head side and finds no common ancestor.
           # Deepening only the base (the original #1671 behavior) is not enough.
-          git fetch --no-tags --depth=200 origin ${{ github.base_ref }}
-          git fetch --no-tags --deepen=200 origin || true
+          # The deepen targets the head and does NOT touch origin/$BASE, so the ref
+          # we diff against is resolved deterministically regardless of its outcome.
+          BASE="${{ github.base_ref }}"
+          git fetch --no-tags --depth=200 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git fetch --no-tags --deepen=200 origin "$BASE" || true
 
           # Diff against the MERGE-BASE between the PR head and the base branch tip,
-          # NOT the raw base tip (FETCH_HEAD). Diffing against the tip counts changes
+          # NOT the raw base tip (origin/$BASE). Diffing against the tip counts changes
           # from OTHER PRs that merged after this branch was cut as a phantom delta,
           # producing false coverage failures on stale branches (see issue #1646).
           # The merge-base is where this branch actually diverged, so the diff
@@ -346,10 +370,10 @@ jobs:
           # whole step here, before the `if [ -z ]` fallback could run — a false
           # coverage failure rather than a graceful degrade (regression #1689 from
           # #1671). `2>/dev/null || true` keeps the step alive so the fallback runs.
-          MERGE_BASE=$(git merge-base FETCH_HEAD HEAD 2>/dev/null || true)
+          MERGE_BASE=$(git merge-base "origin/$BASE" HEAD 2>/dev/null || true)
           if [ -z "$MERGE_BASE" ]; then
             echo "::warning::Could not compute merge-base on shallow clone; falling back to base tip (issue #1646 trade-off)"
-            MERGE_BASE=$(git rev-parse FETCH_HEAD)
+            MERGE_BASE=$(git rev-parse "origin/$BASE")
           fi
           echo "Diffing new code against merge-base: $MERGE_BASE"
           export MERGE_BASE
@@ -372,7 +396,7 @@ jobs:
           # Step 1: Parse unified diff to find added line numbers per file.
           # Diff against the merge-base (passed in via env) so intervening merges
           # from other PRs do not show up as a phantom delta (issue #1646).
-          merge_base = os.environ.get('MERGE_BASE', 'FETCH_HEAD')
+          merge_base = os.environ['MERGE_BASE']
           diff = subprocess.run(
               ['git', 'diff', '-U0', merge_base, '--', '*.rs'],
               capture_output=True, text=True
@@ -466,9 +490,16 @@ jobs:
           # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
           npm install -g jscpd@4 --silent
 
-          # Get changed .rs files
-          git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
-          CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+          # Get changed .rs files. Fetch the base into a STABLE named
+          # remote-tracking ref (origin/$BASE) rather than the volatile FETCH_HEAD:
+          # a later fetch (or the coverage gate's deepen in the same job) rewrites
+          # the shallow file and clobbers FETCH_HEAD mid-read, causing the
+          # intermittent "fatal: shallow file has changed since we read it" /
+          # "ambiguous argument 'FETCH_HEAD'" exit-128 flake. A named ref is
+          # race-free. (#1798/#1799/#1812/#1813/#1815)
+          BASE="${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null || true
+          CHANGED_RS=$(git diff --name-only "origin/$BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
           # Exclude the per-ecosystem package-format handlers
           # (backend/src/api/handlers/<format>.rs). These are inherent structural
