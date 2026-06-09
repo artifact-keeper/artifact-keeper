@@ -217,7 +217,10 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
-        env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
         env::remove_var("SMTP_HOST");
         env::remove_var("SMTP_PORT");
         env::remove_var("SMTP_USERNAME");
@@ -231,7 +234,10 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
-        env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
         env::set_var("SMTP_HOST", "mail.example.com");
         env::set_var("SMTP_PORT", "465");
         env::set_var("SMTP_USERNAME", "user@example.com");
@@ -282,7 +288,10 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
-        env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
         env::set_var("SMTP_FROM_ADDRESS", "not-an-email");
         env::remove_var("SMTP_HOST");
         let config = Config::from_env().expect("config should parse");
@@ -318,7 +327,10 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
-        env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
         env::set_var("SMTP_TLS_MODE", "invalid-mode");
         let config = Config::from_env().expect("config should parse");
         assert_eq!(config.smtp_tls_mode, "starttls");
@@ -329,7 +341,10 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
-        env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
+        env::set_var(
+            "JWT_SECRET",
+            "smtp-suite-passphrase-with-varied-glyphs-2468",
+        );
         env::set_var("SMTP_HOST", "localhost");
         env::set_var("SMTP_TLS_MODE", "none");
         let config = Config::from_env().expect("config should parse");

@@ -898,37 +898,20 @@ impl Config {
 
     /// Validate that JWT_SECRET meets minimum security requirements.
     ///
-    /// In production (`ENVIRONMENT=production`) any weakness is a hard error so
-    /// the process refuses to start. In every other environment the same checks
-    /// run but only emit a `warn!` — dev/test must not be blocked, yet operators
-    /// still get a clear signal when a weak or placeholder secret is in use.
+    /// A weak, low-entropy, or placeholder signing secret makes every issued
+    /// token forgeable, so it is rejected as a hard error in *every* environment
+    /// — the process refuses to start rather than serve with a guessable key.
+    /// There is intentionally no `ENVIRONMENT`-gated relaxation: dev and test
+    /// must use a strong secret too (or construct `Config` directly, which skips
+    /// this `from_env`-only check). Detection lives in the pure, unit-testable
+    /// [`jwt_secret_strength_error`] helper.
     fn validate_jwt_secret(&self) -> Result<()> {
-        let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into());
-        let warnings = jwt_secret_warnings(&self.jwt_secret);
-
-        if environment == "production" {
-            if let Some(first) = warnings.first() {
-                return Err(AppError::Config(format!(
-                    "JWT_SECRET is unsuitable for production: {} \
-                     Generate a secure random secret (e.g. `openssl rand -base64 48`).",
-                    first.message()
-                )));
-            }
-            return Ok(());
+        if let Some(reason) = jwt_secret_strength_error(&self.jwt_secret) {
+            return Err(AppError::Config(format!(
+                "JWT_SECRET is unsuitable: {reason} \
+                 Generate a secure random secret (e.g. `openssl rand -base64 48`)."
+            )));
         }
-
-        // Non-production: never hard-fail, but surface every weakness so the
-        // operator can rotate the secret before promoting the deployment.
-        for warning in &warnings {
-            tracing::warn!(
-                environment = %environment,
-                "JWT_SECRET weakness: {} This is tolerated outside production, but \
-                 the value MUST be replaced with a strong random secret before \
-                 deploying to production. Generate one with `openssl rand -base64 48`.",
-                warning.message()
-            );
-        }
-
         Ok(())
     }
 }
@@ -958,6 +941,25 @@ const KNOWN_PLACEHOLDERS: &[&str] = &[
     "insecure",
     "todo",
     "placeholder",
+];
+
+/// Weak/guessable fragments that must never appear *anywhere inside* a signing
+/// secret. Unlike [`KNOWN_PLACEHOLDERS`] (which match the whole value) these are
+/// tested as case-insensitive substrings, so a long-enough secret that merely
+/// embeds one of them — e.g. a CI/test value built from these words — is still
+/// rejected. Kept lowercase; the caller lowercases the secret before matching.
+const WEAK_SUBSTRINGS: &[&str] = &[
+    "change-me",
+    "change-this",
+    "placeholder",
+    "redteam",
+    "test-secret",
+    "secret-key",
+    "your-secret",
+    "your_jwt",
+    "example",
+    "insecure",
+    "default",
 ];
 
 /// A specific weakness detected in a JWT secret. Pure data so the detection
@@ -994,7 +996,10 @@ pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
         warnings.push(JwtSecretWarning::TooShort);
     }
 
-    if KNOWN_PLACEHOLDERS.contains(&secret.to_lowercase().as_str()) {
+    let lower = secret.to_lowercase();
+    if KNOWN_PLACEHOLDERS.contains(&lower.as_str())
+        || WEAK_SUBSTRINGS.iter().any(|frag| lower.contains(frag))
+    {
         warnings.push(JwtSecretWarning::KnownPlaceholder);
     }
 
@@ -1003,6 +1008,14 @@ pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
     }
 
     warnings
+}
+
+/// Pure secret-strength gate. Returns `Some(reason)` describing the first
+/// weakness found in `secret`, or `None` if the secret is strong enough to
+/// sign tokens with. Thin wrapper over [`jwt_secret_warnings`] used by the
+/// startup `from_env` check so callers get a single, ready-to-surface message.
+pub(crate) fn jwt_secret_strength_error(secret: &str) -> Option<&'static str> {
+    jwt_secret_warnings(secret).first().map(|w| w.message())
 }
 
 /// Heuristic low-entropy detector for JWT secrets.
@@ -1097,7 +1110,7 @@ mod tests {
     fn test_config_rate_limit_enabled_by_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_ENABLED");
         let config = Config::from_env().expect("config should load");
         assert!(
@@ -1110,7 +1123,7 @@ mod tests {
     fn test_config_rate_limit_disabled_via_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_ENABLED", "false");
         let config = Config::from_env().expect("config should load");
         env::remove_var("RATE_LIMIT_ENABLED");
@@ -1128,7 +1141,7 @@ mod tests {
         let saved_flag = env::var("BLOB_GC_ENABLED").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("BLOB_GC_ENABLED");
 
         let config = Config::from_env().unwrap();
@@ -1326,7 +1339,7 @@ mod tests {
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
         env::remove_var("DATABASE_URL");
-        env::set_var("JWT_SECRET", "test-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
 
         let result = Config::from_env();
         assert!(result.is_err());
@@ -1381,7 +1394,7 @@ mod tests {
 
         // Set only required vars
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Remove optional vars to test defaults
         env::remove_var("BIND_ADDRESS");
@@ -1398,7 +1411,7 @@ mod tests {
         let config = Config::from_env().expect("Config should load with required vars");
 
         assert_eq!(config.database_url, "postgresql://localhost/testdb");
-        assert_eq!(config.jwt_secret, "super-secret");
+        assert_eq!(config.jwt_secret, STRONG_SECRET);
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.log_level, "info");
         assert_eq!(config.storage_backend, "filesystem");
@@ -1478,7 +1491,7 @@ mod tests {
         let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "50");
         env::set_var("DATABASE_MIN_CONNECTIONS", "10");
         env::set_var("DATABASE_ACQUIRE_TIMEOUT_SECS", "15");
@@ -1526,7 +1539,7 @@ mod tests {
         let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
 
         let config = Config::from_env().expect("Config should load even with invalid pool setting");
@@ -1560,7 +1573,7 @@ mod tests {
         let saved_demo = env::var("DEMO_MODE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEMO_MODE", "true");
 
         let config = Config::from_env().unwrap();
@@ -1605,7 +1618,7 @@ mod tests {
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("AK_GUEST_ACCESS_ENABLED");
 
         let config = Config::from_env().unwrap();
@@ -1641,7 +1654,7 @@ mod tests {
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "false");
         assert!(!Config::from_env().unwrap().guest_access_enabled);
@@ -1694,7 +1707,7 @@ mod tests {
         let saved_flag = env::var("ALLOW_LOCAL_ADMIN_LOGIN").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Default is false
         env::remove_var("ALLOW_LOCAL_ADMIN_LOGIN");
@@ -1744,7 +1757,7 @@ mod tests {
         let saved_refresh = env::var("JWT_REFRESH_TOKEN_EXPIRY_DAYS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("JWT_EXPIRATION_SECS", "3600");
         env::set_var("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", "15");
         env::set_var("JWT_REFRESH_TOKEN_EXPIRY_DAYS", "14");
@@ -1790,7 +1803,7 @@ mod tests {
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("GC_SCHEDULE");
 
         let config = Config::from_env().unwrap();
@@ -1820,7 +1833,7 @@ mod tests {
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GC_SCHEDULE", "0 30 2 * * *");
 
         let config = Config::from_env().unwrap();
@@ -1852,7 +1865,7 @@ mod tests {
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("LIFECYCLE_CHECK_INTERVAL_SECS");
 
         let config = Config::from_env().unwrap();
@@ -1882,7 +1895,7 @@ mod tests {
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", "300");
 
         let config = Config::from_env().unwrap();
@@ -1916,7 +1929,7 @@ mod tests {
         let saved_endpoint = env::var("S3_ENDPOINT").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("S3_BUCKET", "my-bucket");
         env::set_var("S3_REGION", "us-east-1");
         env::set_var("S3_ENDPOINT", "http://minio:9000");
@@ -1962,7 +1975,7 @@ mod tests {
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("MAX_UPLOAD_SIZE");
 
         let config = Config::from_env().unwrap();
@@ -1992,7 +2005,7 @@ mod tests {
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "1073741824"); // 1 GB
 
         let config = Config::from_env().unwrap();
@@ -2024,7 +2037,7 @@ mod tests {
         let saved_port = env::var("METRICS_PORT").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("METRICS_PORT");
 
         let config = Config::from_env().unwrap();
@@ -2054,7 +2067,7 @@ mod tests {
         let saved_port = env::var("METRICS_PORT").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "9091");
 
         let config = Config::from_env().unwrap();
@@ -2086,7 +2099,7 @@ mod tests {
         let saved_port = env::var("METRICS_PORT").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "not-a-port");
 
         let config = Config::from_env().unwrap();
@@ -2118,7 +2131,7 @@ mod tests {
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "0");
 
         let config = Config::from_env().unwrap();
@@ -2265,7 +2278,7 @@ mod tests {
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_API_PER_MIN");
 
         let config = Config::from_env().expect("Config should load");
@@ -2299,7 +2312,7 @@ mod tests {
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
 
         let config = Config::from_env().expect("Config should load");
@@ -2334,7 +2347,7 @@ mod tests {
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "30,14,7,3,1");
 
         let config = Config::from_env().unwrap();
@@ -2366,7 +2379,7 @@ mod tests {
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "7,7,3,14,3");
 
         let config = Config::from_env().unwrap();
@@ -2398,7 +2411,7 @@ mod tests {
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "0,7,0,1");
 
         let config = Config::from_env().unwrap();
@@ -2430,7 +2443,7 @@ mod tests {
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "abc,7,,1,xyz");
 
         let config = Config::from_env().unwrap();
@@ -2462,7 +2475,7 @@ mod tests {
         let saved_interval = env::var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", "1800");
 
         let config = Config::from_env().unwrap();
@@ -2497,7 +2510,7 @@ mod tests {
         let saved_search = env::var("RATE_LIMIT_SEARCH_PER_MIN").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_SEARCH_PER_MIN", "500");
 
         let config = Config::from_env().unwrap();
@@ -2538,7 +2551,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         match value {
             Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
             None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
@@ -2644,7 +2657,7 @@ mod tests {
         let saved_url = env::var("DEPENDENCY_TRACK_URL").ok();
 
         env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
-        env::set_var("JWT_SECRET", "secret");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEPENDENCY_TRACK_URL", "http://dt.example.com:8081");
         env::remove_var("DEPENDENCY_TRACK_ENABLED");
 
@@ -2678,14 +2691,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // jwt_secret_warnings (pure; secret-strength detection, shared by the
-    // production hard-fail path and the non-production warn path)
+    // jwt_secret_warnings / jwt_secret_strength_error (pure; secret-strength
+    // detection used by the unconditional startup hard-fail in every environment)
     // -----------------------------------------------------------------------
 
     /// A long, varied, non-sequential secret is strong and yields no warnings.
     /// Deliberately a readable passphrase (not a credential-shaped literal) so
-    /// secret scanners do not flag this test fixture.
-    const STRONG_SECRET: &str = "example-strong-passphrase-with-mixed-words-and-digits-13579";
+    /// secret scanners do not flag this test fixture. It contains none of the
+    /// denied weak substrings and has well over 16 distinct characters.
+    const STRONG_SECRET: &str = "robust-passphrase-with-many-varied-glyphs-2468";
 
     #[test]
     fn jwt_warnings_strong_secret_is_clean() {
@@ -2787,22 +2801,71 @@ mod tests {
     }
 
     #[test]
-    fn validate_jwt_secret_non_production_tolerates_weak() {
+    fn validate_jwt_secret_rejects_weak_regardless_of_environment() {
+        // A weak secret must be a hard error even outside production: there is
+        // no ENVIRONMENT-gated relaxation anymore, so dev/test startup via
+        // from_env refuses a guessable signing key just like production.
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_env = env::var("ENVIRONMENT").ok();
         env::set_var("ENVIRONMENT", "development");
 
-        // The warning path runs (emits tracing::warn!) but must NOT fail.
         let mut config = Config::test_config();
         config.jwt_secret = "secret".into();
+        let result = config.validate_jwt_secret();
         assert!(
-            config.validate_jwt_secret().is_ok(),
-            "non-production must tolerate (warn, not fail) a weak secret"
+            result.is_err(),
+            "a weak secret must be rejected even in development"
         );
+        assert!(result.unwrap_err().to_string().contains("JWT_SECRET"));
 
         match saved_env {
             Some(v) => env::set_var("ENVIRONMENT", v),
             None => env::remove_var("ENVIRONMENT"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // jwt_secret_strength_error (pure first-weakness gate used at startup)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strength_error_rejects_exploit_secret() {
+        // The low-entropy, human-readable rig secret embeds "redteam",
+        // "test-secret" and "secret-key" — it must be rejected on the weak
+        // substring rule, not merely warned about.
+        assert!(jwt_secret_strength_error("redteam-test-secret-key-32-bytes-long").is_some());
+    }
+
+    #[test]
+    fn strength_error_rejects_short_secret() {
+        assert!(jwt_secret_strength_error("short-passphrase-not-here").is_some());
+    }
+
+    #[test]
+    fn strength_error_rejects_low_distinct_secret() {
+        // 36 identical chars: long enough, but a single distinct character.
+        assert!(jwt_secret_strength_error(&"a".repeat(36)).is_some());
+    }
+
+    #[test]
+    fn strength_error_rejects_placeholders_and_substrings() {
+        for weak in [
+            "change-me-in-production-please",
+            "change-this-in-production-use-at-least-32-bytes",
+            "please-change-me-before-any-real-deployment-now",
+            "my-app-default-signing-passphrase-for-tokens",
+            "an-example-passphrase-with-plenty-of-distinct",
+        ] {
+            assert!(
+                jwt_secret_strength_error(weak).is_some(),
+                "expected `{weak}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn strength_error_accepts_strong_secret() {
+        // High-entropy, 32+ chars, >=16 distinct, and NO denied substring.
+        assert!(jwt_secret_strength_error(STRONG_SECRET).is_none());
     }
 }
