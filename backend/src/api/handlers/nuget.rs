@@ -81,6 +81,81 @@ async fn resolve_nuget_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     .await
 }
 
+/// Resolve the set of repository IDs whose local `artifacts` rows should back
+/// a read query for `repo`.
+///
+/// * For a hosted / local repo this is simply `[repo.id]`.
+/// * For a virtual repo it is the IDs of all **non-remote** member repos
+///   (Local / Staging), so local listing/search endpoints federate across
+///   members. Remote members are handled separately via the proxy fallback
+///   because their content is fetched on demand rather than stored locally.
+///
+/// Returns the resolved IDs alongside the list of virtual members (empty for
+/// non-virtual repos) so callers can additionally proxy remote members.
+async fn effective_local_repo_ids(
+    db: &PgPool,
+    repo: &RepoInfo,
+) -> Result<(Vec<uuid::Uuid>, Vec<crate::models::repository::Repository>), Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok((vec![repo.id], Vec::new()));
+    }
+
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let local_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    Ok((local_ids, members))
+}
+
+/// Detect a NuGet pre-release version. Per the SemVer rules NuGet follows, a
+/// pre-release version carries a `-` separated suffix after the version core
+/// (e.g. `2.0.0-beta.1`). Stable versions have no such suffix.
+fn is_prerelease_version(version: &str) -> bool {
+    version.contains('-')
+}
+
+/// Pick the version to surface as "latest" for a package in search results.
+///
+/// When `include_prerelease` is false, the highest **stable** version wins and
+/// pre-release versions are only considered when no stable version exists.
+/// When true, the highest version overall (stable or pre-release) wins.
+/// Returns `"0.0.0"` when `versions` is empty.
+fn select_latest_version(versions: &[String], include_prerelease: bool) -> &str {
+    let highest = |candidates: &[&String]| -> Option<String> {
+        candidates
+            .iter()
+            .max_by(|a, b| version_compare(a, b).cmp(&0))
+            .map(|s| s.to_string())
+    };
+
+    if !include_prerelease {
+        let stable: Vec<&String> = versions
+            .iter()
+            .filter(|v| !is_prerelease_version(v))
+            .collect();
+        if let Some(best) = highest(&stable) {
+            // Return a borrow of the original slice element matching `best`.
+            return versions
+                .iter()
+                .find(|v| **v == best)
+                .map(String::as_str)
+                .unwrap_or("0.0.0");
+        }
+    }
+
+    let all: Vec<&String> = versions.iter().collect();
+    match highest(&all) {
+        Some(best) => versions
+            .iter()
+            .find(|v| **v == best)
+            .map(String::as_str)
+            .unwrap_or("0.0.0"),
+        None => "0.0.0",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /nuget/{repo_key}/v3/index.json — Service index
 // ---------------------------------------------------------------------------
@@ -169,6 +244,7 @@ struct SearchQuery {
 struct SearchPackageRow {
     name: String,
     versions: Vec<String>,
+    description: Option<String>,
 }
 
 async fn search_packages(
@@ -182,7 +258,7 @@ async fn search_packages(
     let query_term = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
     let take = params.take.unwrap_or(20).min(100);
-    let _prerelease = params.prerelease.unwrap_or(false);
+    let prerelease = params.prerelease.unwrap_or(false);
 
     // Determine base URL for building resource links.
     let base = format!(
@@ -194,20 +270,37 @@ async fn search_packages(
     // Search distinct package names matching the query term.
     let search_pattern = format!("%{}%", query_term.to_lowercase());
 
+    // Federate over virtual members (local/staging) when the repo is virtual;
+    // otherwise query the repo itself.
+    let (repo_ids, _members) = effective_local_repo_ids(&state.db, &repo).await?;
+
+    // Pull the latest-by-created_at description per package via a LATERAL
+    // join so the search payload carries the package summary instead of a
+    // hardcoded empty string.
     let packages: Vec<SearchPackageRow> = sqlx::query_as(
         r#"
-        SELECT LOWER(name) AS name,
-               ARRAY_AGG(DISTINCT version) FILTER (WHERE version IS NOT NULL) AS versions
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND LOWER(name) LIKE $2
-        GROUP BY LOWER(name)
-        ORDER BY LOWER(name)
+        SELECT a.name AS name,
+               ARRAY_AGG(DISTINCT a.version) FILTER (WHERE a.version IS NOT NULL) AS versions,
+               (
+                   SELECT am.metadata->>'description'
+                   FROM artifacts a2
+                   LEFT JOIN artifact_metadata am ON am.artifact_id = a2.id
+                   WHERE a2.repository_id = ANY($1::uuid[])
+                     AND a2.is_deleted = false
+                     AND LOWER(a2.name) = LOWER(a.name)
+                   ORDER BY a2.created_at DESC
+                   LIMIT 1
+               ) AS description
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1::uuid[])
+          AND a.is_deleted = false
+          AND LOWER(a.name) LIKE $2
+        GROUP BY LOWER(a.name), a.name
+        ORDER BY LOWER(a.name)
         LIMIT $3 OFFSET $4
         "#,
     )
-    .bind(repo.id)
+    .bind(&repo_ids)
     .bind(&search_pattern)
     .bind(take)
     .bind(skip)
@@ -222,17 +315,17 @@ async fn search_packages(
     })?;
 
     // Get total count for pagination.
-    let total_count = sqlx::query_scalar!(
+    let total_count: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(DISTINCT LOWER(name))::bigint as "count!"
+        SELECT COUNT(DISTINCT LOWER(name))::bigint
         FROM artifacts
-        WHERE repository_id = $1
+        WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
           AND LOWER(name) LIKE $2
         "#,
-        repo.id,
-        search_pattern
     )
+    .bind(&repo_ids)
+    .bind(&search_pattern)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -247,12 +340,9 @@ async fn search_packages(
         .iter()
         .map(|p| {
             let id = &p.name;
-            let latest = p
-                .versions
-                .iter()
-                .max_by(|a, b| version_compare(a, b).cmp(&0))
-                .map(String::as_str)
-                .unwrap_or("0.0.0");
+            // When prerelease=false, prefer the highest *stable* version and
+            // only fall back to a pre-release if no stable version exists.
+            let latest = select_latest_version(&p.versions, prerelease);
 
             // Build version list entry for the latest version.
             let versions = vec![serde_json::json!({
@@ -266,7 +356,7 @@ async fn search_packages(
                 "registration": format!("{}/v3/registration/{}/index.json", base, id),
                 "id": id,
                 "version": latest,
-                "description": "",
+                "description": p.description.clone().unwrap_or_default(),
                 "totalDownloads": 0,
                 "versions": versions
             })
@@ -303,19 +393,23 @@ async fn registration_index(
         repo_key
     );
 
-    // Fetch all versions of this package.
+    // Resolve the set of local repo IDs to query: the repo itself, or all
+    // local/staging members for a virtual repo.
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
+
+    // Fetch all versions of this package across the effective repo IDs.
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.version as "version?", a.path, a.size_bytes,
                am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
+        WHERE a.repository_id = ANY($1::uuid[])
           AND a.is_deleted = false
           AND LOWER(a.name) = $2
         ORDER BY a.created_at ASC
         "#,
-        repo.id,
+        &repo_ids,
         package_id_lower
     )
     .fetch_all(&state.db)
@@ -329,6 +423,65 @@ async fn registration_index(
     })?;
 
     if artifacts.is_empty() {
+        // Cache miss: proxy the registration index from upstream.
+        let upstream_path = format!("v3/registration/{}/index.json", package_id_lower);
+
+        // Remote repo: fetch directly from its upstream.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        CONTENT_TYPE,
+                        content_type.unwrap_or_else(|| "application/json".to_string()),
+                    )
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+
+        // Virtual repo: try each remote member's upstream in priority order.
+        if repo.repo_type == RepositoryType::Virtual {
+            if let Some(proxy) = &state.proxy_service {
+                for member in &members {
+                    if member.repo_type != RepositoryType::Remote {
+                        continue;
+                    }
+                    let Some(upstream_url) = member.upstream_url.as_deref() else {
+                        continue;
+                    };
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await
+                    {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(
+                                CONTENT_TYPE,
+                                content_type.unwrap_or_else(|| "application/json".to_string()),
+                            )
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+            }
+        }
+
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -412,17 +565,21 @@ async fn flatcontainer_versions(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
+    // Resolve the set of local repo IDs to query: the repo itself, or all
+    // local/staging members for a virtual repo.
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
+
     let mut versions: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT DISTINCT version
         FROM artifacts
-        WHERE repository_id = $1
+        WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
           AND LOWER(name) = $2
           AND version IS NOT NULL
         "#,
     )
-    .bind(repo.id)
+    .bind(&repo_ids)
     .bind(&package_id_lower)
     .fetch_all(&state.db)
     .await
@@ -441,6 +598,65 @@ async fn flatcontainer_versions(
     });
 
     if versions.is_empty() {
+        // Cache miss: proxy the flatcontainer version index from upstream.
+        let upstream_path = format!("v3/flatcontainer/{}/index.json", package_id_lower);
+
+        // Remote repo: fetch directly from its upstream.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        CONTENT_TYPE,
+                        content_type.unwrap_or_else(|| "application/json".to_string()),
+                    )
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+
+        // Virtual repo: try each remote member's upstream in priority order.
+        if repo.repo_type == RepositoryType::Virtual {
+            if let Some(proxy) = &state.proxy_service {
+                for member in &members {
+                    if member.repo_type != RepositoryType::Remote {
+                        continue;
+                    }
+                    let Some(upstream_url) = member.upstream_url.as_deref() else {
+                        continue;
+                    };
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await
+                    {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(
+                                CONTENT_TYPE,
+                                content_type.unwrap_or_else(|| "application/json".to_string()),
+                            )
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+            }
+        }
+
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -1760,6 +1976,68 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // is_prerelease_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_prerelease_version_stable() {
+        assert!(!is_prerelease_version("1.0.0"));
+        assert!(!is_prerelease_version("13.0.1"));
+        assert!(!is_prerelease_version("2.0.0"));
+    }
+
+    #[test]
+    fn test_is_prerelease_version_prerelease() {
+        assert!(is_prerelease_version("2.0.0-beta.1"));
+        assert!(is_prerelease_version("1.0.0-rc1"));
+        assert!(is_prerelease_version("3.1.0-alpha"));
+    }
+
+    // -----------------------------------------------------------------------
+    // select_latest_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_latest_version_excludes_prerelease_by_default() {
+        // prerelease=false: the stable 1.0.0 wins over 2.0.0-beta.1, matching
+        // the QA finding where prerelease=false wrongly returned 2.0.0-beta.1.
+        let versions = vec!["1.0.0".to_string(), "2.0.0-beta.1".to_string()];
+        assert_eq!(select_latest_version(&versions, false), "1.0.0");
+    }
+
+    #[test]
+    fn test_select_latest_version_includes_prerelease_when_requested() {
+        // prerelease=true: the highest overall version (the beta) wins.
+        let versions = vec!["1.0.0".to_string(), "2.0.0-beta.1".to_string()];
+        assert_eq!(select_latest_version(&versions, true), "2.0.0-beta.1");
+    }
+
+    #[test]
+    fn test_select_latest_version_falls_back_to_prerelease_when_no_stable() {
+        // Only a pre-release exists; even with prerelease=false it must be
+        // surfaced rather than the "0.0.0" placeholder.
+        let versions = vec!["1.0.0-alpha".to_string()];
+        assert_eq!(select_latest_version(&versions, false), "1.0.0-alpha");
+    }
+
+    #[test]
+    fn test_select_latest_version_highest_stable() {
+        let versions = vec![
+            "1.0.0".to_string(),
+            "1.2.0".to_string(),
+            "1.1.0".to_string(),
+        ];
+        assert_eq!(select_latest_version(&versions, false), "1.2.0");
+    }
+
+    #[test]
+    fn test_select_latest_version_empty() {
+        let versions: Vec<String> = vec![];
+        assert_eq!(select_latest_version(&versions, false), "0.0.0");
+        assert_eq!(select_latest_version(&versions, true), "0.0.0");
+    }
+
     #[tokio::test]
     async fn test_flatcontainer_download_remote_arm_routes_through_cached_or_refetch_helper() {
         let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
@@ -2168,6 +2446,223 @@ mod push_db_tests {
             desc
         );
 
+        f.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-backed read-endpoint regression tests (#1778).
+//
+// These cover the QA findings that the search/registration/flatcontainer read
+// endpoints:
+//   * hardcoded an empty `description` in search results,
+//   * ignored the `prerelease` flag,
+//   * returned 404 instead of federating across virtual-repo members.
+//
+// They no-op cleanly when `DATABASE_URL` is unset.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod read_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use std::io::Write;
+    use uuid::Uuid;
+
+    /// Build a minimal valid `.nupkg` (ZIP with a single `.nuspec`).
+    fn build_nupkg(id: &str, version: &str, description: &str) -> Vec<u8> {
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(format!("{}.nuspec", id), options).unwrap();
+        let nuspec = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <package>\n  <metadata>\n\
+             <id>{}</id>\n\
+             <version>{}</version>\n\
+             <description>{}</description>\n\
+             <authors>Test Author</authors>\n\
+             </metadata>\n</package>",
+            id, version, description
+        );
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        let cursor = zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Push a package into the repo identified by `repo_key` via the handler.
+    async fn push_pkg(
+        f: &tdh::Fixture,
+        repo_key: &str,
+        id: &str,
+        version: &str,
+        description: &str,
+    ) {
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/api/v2/package", repo_key),
+            bytes::Bytes::from(build_nupkg(id, version, description)),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "push of {}.{} failed: {} {:?}",
+            id,
+            version,
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// GET a NuGet read endpoint anonymously (read paths require no auth).
+    async fn get_json(f: &tdh::Fixture, uri: String) -> (StatusCode, serde_json::Value) {
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(uri)).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    // Finding: search always returned a hardcoded empty `description`.
+    #[tokio::test]
+    async fn search_returns_package_description() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(
+            &f,
+            &f.repo_key,
+            "Qa.DescPkg",
+            "1.0.0",
+            "a documented package",
+        )
+        .await;
+
+        let (status, json) = get_json(&f, format!("/{}/v3/search?q=qa.descpkg", f.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = json["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1, "expected one hit; body={json}");
+        assert_eq!(
+            data[0]["description"], "a documented package",
+            "search must surface the package description; body={json}"
+        );
+
+        f.teardown().await;
+    }
+
+    // Finding: the `prerelease` flag was parsed but ignored — search always
+    // returned the highest version including pre-releases.
+    #[tokio::test]
+    async fn search_respects_prerelease_flag() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.PrerelPkg", "1.0.0", "stable").await;
+        push_pkg(&f, &f.repo_key, "Qa.PrerelPkg", "2.0.0-beta.1", "beta").await;
+
+        // prerelease=false → the stable 1.0.0 must win.
+        let (status, json) = get_json(
+            &f,
+            format!("/{}/v3/search?q=qa.prerelpkg&prerelease=false", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["data"][0]["version"], "1.0.0",
+            "prerelease=false must surface the stable version; body={json}"
+        );
+
+        // prerelease=true → the higher pre-release wins.
+        let (status, json) = get_json(
+            &f,
+            format!("/{}/v3/search?q=qa.prerelpkg&prerelease=true", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["data"][0]["version"], "2.0.0-beta.1",
+            "prerelease=true must surface the pre-release; body={json}"
+        );
+
+        f.teardown().await;
+    }
+
+    /// Create a virtual repo and link `member_id` as its sole member.
+    async fn create_virtual_with_member(pool: &sqlx::PgPool, member_id: Uuid) -> (Uuid, String) {
+        let (vid, vkey, _dir) = tdh::create_repo(pool, "virtual", "nuget").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(vid)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+        (vid, vkey)
+    }
+
+    async fn drop_virtual(pool: &sqlx::PgPool, vid: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(vid)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(vid)
+            .execute(pool)
+            .await;
+    }
+
+    // Findings: registration/index, flatcontainer/index, and search all
+    // returned 404 / empty instead of federating across virtual members.
+    #[tokio::test]
+    async fn virtual_repo_federates_read_endpoints_over_local_member() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        // Seed a package into the local member.
+        push_pkg(&f, &f.repo_key, "Qa.FedPkg", "1.0.0", "federated package").await;
+
+        let (vid, vkey) = create_virtual_with_member(&f.pool, f.repo_id).await;
+
+        // registration/index must federate to the member and return 200.
+        let (status, json) = get_json(
+            &f,
+            format!("/{}/v3/registration/qa.fedpkg/index.json", vkey),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual registration must federate; body={json}"
+        );
+        let items = json["items"][0]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["catalogEntry"]["version"], "1.0.0");
+
+        // flatcontainer/index must federate to the member and return 200.
+        let (status, json) = get_json(
+            &f,
+            format!("/{}/v3/flatcontainer/qa.fedpkg/index.json", vkey),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual flatcontainer must federate; body={json}"
+        );
+        assert_eq!(json["versions"][0], "1.0.0");
+
+        // search must federate to the member and return the hit.
+        let (status, json) = get_json(&f, format!("/{}/v3/search?q=qa.fed", vkey)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["totalHits"], 1,
+            "virtual search must federate over members; body={json}"
+        );
+        assert_eq!(json["data"][0]["id"], "qa.fedpkg");
+
+        drop_virtual(&f.pool, vid).await;
         f.teardown().await;
     }
 }
