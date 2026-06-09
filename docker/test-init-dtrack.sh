@@ -12,6 +12,7 @@
 #                                               .maskedKey (NOT .key)  <-- the bug
 #   - DELETE /api/v1/team/<uuid>/key/<pubid> -> 204 (idempotent rotation)
 #   - PUT  /api/v1/team/<uuid>/key           -> {"key":"<unmasked>","publicId":"..."}
+#   - POST /api/v1/permission/<perm>/team/<uuid> -> 204
 #   - POST /api/v1/configProperty            -> 200
 #
 # Mock state and behavior knobs (env vars passed to mock_dtrack.py):
@@ -20,6 +21,8 @@
 #                             integration key on the Automation team
 #   - FAIL_PUT_KEY_ONCE       if "1", the first PUT /key returns 500 to
 #                             exercise the script's negative path
+#   - FAIL_LOGIN              if "1", login returns 401
+#   - FAIL_PERMISSION_CODE    if set, permission grants return this status
 #
 # This test deliberately uses no test framework other than bash + python3 +
 # curl, all of which are already required by the docker image.
@@ -49,6 +52,13 @@ MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 # A passing test must end up with this exact value at the API key file path.
 EXPECTED_KEY="odt_TEST_FAKE_DO_NOT_USE_AUTOMATION"
 MASKED_KEY="odt_********ECRET"  # what GET /team would expose (the broken path)
+REQUIRED_PERMISSIONS=(
+  BOM_UPLOAD
+  PROJECT_CREATION_UPLOAD
+  VIEW_PORTFOLIO
+  VIEW_VULNERABILITY
+  PORTFOLIO_MANAGEMENT
+)
 
 cat > "$WORK_DIR/mock_dtrack.py" <<PYEOF
 import json, os, sys
@@ -66,6 +76,8 @@ SEED_FOREIGN = os.environ.get("SEED_FOREIGN_PUBLIC_ID", "").strip()
 # Negative-path knob: if "1", the first PUT /key returns HTTP 500 so the
 # init script's error branch can be exercised without random fault injection.
 FAIL_PUT_KEY_ONCE = os.environ.get("FAIL_PUT_KEY_ONCE", "0") == "1"
+FAIL_LOGIN = os.environ.get("FAIL_LOGIN", "0") == "1"
+FAIL_PERMISSION_CODE = os.environ.get("FAIL_PERMISSION_CODE", "").strip()
 
 state = {
     "keys": ([{"publicId": SEED_FOREIGN, "maskedKey": MASKED_KEY}]
@@ -115,24 +127,23 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/v1/user/forceChangePassword":
             return self._send(200)
         if self.path == "/api/v1/user/login":
+            if FAIL_LOGIN:
+                return self._send(401)
             # DT login returns a bare JWT string, not JSON.
             return self._send(200, b"eyJhbGciOiJIUzI1NiJ9.mockjwt.signature",
                               ctype="text/plain")
         if self.path == "/api/v1/configProperty":
             return self._send(200)
-        # Permission grant: POST /api/v1/permission/<PERM>/team/<uuid>  (#1530)
-        # DT returns 200 on first grant, 304 if already granted. We emit 200
-        # on the first call per permission and 304 on subsequent calls so
-        # the warm-restart regression can assert the script handled both.
-        prefix = "/api/v1/permission/"
-        suffix = f"/team/{TEAM_UUID}"
-        if self.path.startswith(prefix) and self.path.endswith(suffix):
-            perm = self.path[len(prefix):-len(suffix)]
-            first_time = perm not in state["granted_permissions"]
+        if (self.path.startswith(f"/api/v1/permission/")
+                and self.path.endswith(f"/team/{TEAM_UUID}")):
+            perm = self.path.split("/")[4]
+            already_granted = perm in state["granted_permissions"]
             state["granted_permissions"].add(perm)
             with open(PERM_LOG, "a") as f:
-                f.write(perm + "\n")
-            return self._send(200 if first_time else 304)
+                f.write(self.path + "\n")
+            if FAIL_PERMISSION_CODE:
+                return self._send(int(FAIL_PERMISSION_CODE), b'{"error":"injected permission failure"}')
+            return self._send(304 if already_granted else 204)
         return self._send(404)
 
     def do_PUT(self):
@@ -224,10 +235,10 @@ PUBLIC_ID_MARKER="$SHARED_DIR/.dtrack-publicid"
 
 fail() {
   echo "FAIL: $1" >&2
-  for f in init init2 init3 init4 init5 init6; do
+  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6; do
     if [ -f "$WORK_DIR/${f}.out" ] || [ -f "$WORK_DIR/${f}.err" ]; then
-      echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" 2>/dev/null >&2 || true
-      echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" 2>/dev/null >&2 || true
+      echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" >&2 || true
+      echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" >&2 || true
     fi
   done
   echo "--- mock log ---"   >&2; cat "$WORK_DIR/mock.log" >&2 || true
@@ -249,16 +260,16 @@ OUR_PUBLIC_ID="$(cat "$PUBLIC_ID_MARKER")"
 [ "$OUR_PUBLIC_ID" = "newpub1" ] || \
   fail "Phase 1: publicId marker '$OUR_PUBLIC_ID' != expected 'newpub1'"
 
-# Phase 1 must grant all four DT permissions to the Automation team
+# Phase 1 must grant all required DT permissions to the Automation team
 # (#1472, #1530). Without these the team holds a valid key but every
 # PUT /api/v1/project from the scan pipeline returns 403.
-for PERM in BOM_UPLOAD PROJECT_CREATION_UPLOAD VIEW_PORTFOLIO VIEW_VULNERABILITY; do
-  grep -qx "$PERM" "$PERM_LOG" || \
+for PERM in "${REQUIRED_PERMISSIONS[@]}"; do
+  grep -qx "/api/v1/permission/$PERM/team/11111111-2222-3333-4444-555555555555" "$PERM_LOG" || \
     fail "Phase 1: permission $PERM was not granted (mock POST log: $(tr '\n' ' ' < "$PERM_LOG"))"
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: warm restart — must short-circuit, NOT re-hit PUT /key, AND log it
+# Phase 2: warm restart — must NOT re-hit PUT /key, but must grant permissions
 # ─────────────────────────────────────────────────────────────────────────────
 INIT_RC2=$(run_init init2)
 [ "$INIT_RC2" -eq 0 ] || fail "Phase 2 warm restart exited $INIT_RC2 (expected 0)"
@@ -269,26 +280,44 @@ PUT_COUNT_AFTER_WARM=$(wc -l < "$KEY_LOG" | tr -d ' ')
 [ "$PUT_COUNT_AFTER_WARM" -eq 1 ] || \
   fail "Phase 2: warm restart hit PUT /key (count=${PUT_COUNT_AFTER_WARM}, expected 1)"
 
-# Log-content assertion: warm restart must take the explicit short-circuit
-# branch (line ~54-57 of init-dtrack.sh: "API key already provisioned ...
-# skipping"). Without this, a future refactor that bypasses the early-exit
-# but happens to no-op the PUT elsewhere would still pass PUT_COUNT==1.
 grep -q 'already provisioned' "$WORK_DIR/init2.out" || \
-  fail "Phase 2: warm restart did not emit 'already provisioned' short-circuit log"
+  fail "Phase 2: warm restart did not emit 'already provisioned' log"
 
 # Regression for #1530: the warm-restart fast path MUST still grant the
-# four required permissions so deployments that minted a key with a
+# required permissions so deployments that minted a key with a
 # pre-#1511 build self-repair on next restart. Before this fix the
 # warm-restart took an `exit 0` early branch and skipped permission grants
 # entirely, so the AK <-> DT integration stayed broken indefinitely.
 #
 # The mock returns 304 on a re-grant and the script accepts both 200 and
-# 304 as success. We assert by counting calls in PERM_LOG: each phase that
-# logs in must re-issue all four grants, so after Phase 2 we expect 8
-# entries (4 from Phase 1 + 4 from Phase 2).
+# 304 as success. We assert each required POST path appears twice: once
+# from Phase 1 and once from Phase 2.
 PERM_COUNT_AFTER_WARM=$(wc -l < "$PERM_LOG" | tr -d ' ')
-[ "$PERM_COUNT_AFTER_WARM" -eq 8 ] || \
-  fail "Phase 2: warm restart did not re-apply permission grants (POST count=${PERM_COUNT_AFTER_WARM}, expected 8)"
+[ "$PERM_COUNT_AFTER_WARM" -eq 10 ] || \
+  fail "Phase 2: warm restart did not re-apply permission grants (POST count=${PERM_COUNT_AFTER_WARM}, expected 10)"
+for PERM in "${REQUIRED_PERMISSIONS[@]}"; do
+  COUNT=$(grep -xc "/api/v1/permission/$PERM/team/11111111-2222-3333-4444-555555555555" "$PERM_LOG" || true)
+  [ "$COUNT" -eq 2 ] || \
+    fail "Phase 2: permission $PERM was granted $COUNT times (expected 2)"
+done
+
+# Explicit forced rotation must override the existing-key warm path. This is
+# the operator recovery path when /shared/dtrack-api-key is stale or revoked:
+# preserving that key would keep the backend on HTTP 401 forever.
+PUT_COUNT_BEFORE_EXISTING_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+KEY_BEFORE_EXISTING_FORCE="$(tr -d '\n' < "$KEY_FILE")"
+INIT_RC2_FORCE=$(run_init init2_force env DTRACK_INIT_FORCE_ROTATE=true)
+[ "$INIT_RC2_FORCE" -eq 0 ] || \
+  fail "Phase 2 forced rotation with existing key exited $INIT_RC2_FORCE (expected 0)"
+PUT_COUNT_AFTER_EXISTING_FORCE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+DELTA_EXISTING_FORCE=$((PUT_COUNT_AFTER_EXISTING_FORCE - PUT_COUNT_BEFORE_EXISTING_FORCE))
+[ "$DELTA_EXISTING_FORCE" -eq 1 ] || \
+  fail "Phase 2 forced rotation with existing key minted $DELTA_EXISTING_FORCE keys (expected exactly 1)"
+KEY_AFTER_EXISTING_FORCE="$(tr -d '\n' < "$KEY_FILE")"
+[ "$KEY_AFTER_EXISTING_FORCE" != "$KEY_BEFORE_EXISTING_FORCE" ] || \
+  fail "Phase 2 forced rotation with existing key preserved the stale key"
+grep -q 'DTRACK_INIT_FORCE_ROTATE=true' "$WORK_DIR/init2_force.out" || \
+  fail "Phase 2 forced rotation with existing key did not log FORCE_ROTATE"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 3: cold-start rotation (operator deleted just the API key file)
@@ -360,6 +389,44 @@ TEAM_AFTER_FORCE=$(curl -sf "$MOCK_URL/api/v1/team")
 if echo "$TEAM_AFTER_FORCE" | jq -e '.[] | select(.name=="Automation") | .apiKeys[] | select(.publicId=="operator-integration-key-001")' >/dev/null; then
   fail "Phase 5: foreign key persisted after FORCE_ROTATE — revocation did not fire"
 fi
+
+# Warm restart must preserve the old startup guarantee: if the existing key
+# is present, Dependency-Track admin auth or transient permission failures
+# should warn and exit 0 rather than blocking the dependent container.
+start_mock FAIL_LOGIN=1
+PUT_COUNT_BEFORE_AUTH_FAIL=$(wc -l < "$KEY_LOG" | tr -d ' ')
+INIT_RC2_AUTH_FAIL=$(run_init init2_authfail)
+[ "$INIT_RC2_AUTH_FAIL" -eq 0 ] || \
+  fail "Phase 2 auth failure: existing-key path exited $INIT_RC2_AUTH_FAIL (expected 0)"
+grep -q 'WARNING: Could not authenticate' "$WORK_DIR/init2_authfail.err" || \
+  fail "Phase 2 auth failure: missing best-effort warning"
+PUT_COUNT_AFTER_AUTH_FAIL=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT_AFTER_AUTH_FAIL" -eq "$PUT_COUNT_BEFORE_AUTH_FAIL" ] || \
+  fail "Phase 2 auth failure: warm path minted a key unexpectedly"
+
+start_mock FAIL_PERMISSION_CODE=503
+PUT_COUNT_BEFORE_PERM_FAIL=$(wc -l < "$KEY_LOG" | tr -d ' ')
+INIT_RC2_PERM_FAIL=$(run_init init2_permfail)
+[ "$INIT_RC2_PERM_FAIL" -eq 0 ] || \
+  fail "Phase 2 permission failure: existing-key path exited $INIT_RC2_PERM_FAIL (expected 0)"
+grep -q 'WARNING: granting BOM_UPLOAD returned HTTP 503' "$WORK_DIR/init2_permfail.err" || \
+  fail "Phase 2 permission failure: missing best-effort permission warning"
+PUT_COUNT_AFTER_PERM_FAIL=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT_AFTER_PERM_FAIL" -eq "$PUT_COUNT_BEFORE_PERM_FAIL" ] || \
+  fail "Phase 2 permission failure: warm path minted a key unexpectedly"
+
+kill "$MOCK_PID" 2>/dev/null || true
+wait "$MOCK_PID" 2>/dev/null || true
+MOCK_PID=""
+PUT_COUNT_BEFORE_UNREACHABLE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+INIT_RC2_UNREACHABLE=$(run_init init2_unreachable)
+[ "$INIT_RC2_UNREACHABLE" -eq 0 ] || \
+  fail "Phase 2 unreachable DT: existing-key path exited $INIT_RC2_UNREACHABLE (expected 0)"
+grep -q 'WARNING: Dependency-Track is not reachable' "$WORK_DIR/init2_unreachable.err" || \
+  fail "Phase 2 unreachable DT: missing best-effort readiness warning"
+PUT_COUNT_AFTER_UNREACHABLE=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT_AFTER_UNREACHABLE" -eq "$PUT_COUNT_BEFORE_UNREACHABLE" ] || \
+  fail "Phase 2 unreachable DT: warm path minted a key unexpectedly"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 6: negative path — PUT /key returns 500

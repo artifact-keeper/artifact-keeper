@@ -38,6 +38,8 @@ pub struct OidcConfig {
     pub groups_claim: String,
     /// Group name for admin role
     pub admin_group: Option<String>,
+    /// Default role for all OIDC users (OIDC_DEFAULT_ROLE, defaults to "user").
+    pub default_role: String,
 }
 
 impl OidcConfig {
@@ -64,6 +66,7 @@ impl OidcConfig {
             groups_claim: std::env::var("OIDC_GROUPS_CLAIM")
                 .unwrap_or_else(|_| "groups".to_string()),
             admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
+            default_role: std::env::var("OIDC_DEFAULT_ROLE").unwrap_or_else(|_| "user".to_string()),
         })
     }
 }
@@ -600,15 +603,31 @@ impl OidcService {
         }
     }
 
-    /// Check if user is admin based on group memberships
     fn is_admin_from_groups(&self, groups: &[String]) -> bool {
         if let Some(admin_group) = &self.config.admin_group {
-            groups
+            if groups
                 .iter()
                 .any(|g| g.to_lowercase() == admin_group.to_lowercase())
-        } else {
-            false
+            {
+                return true;
+            }
         }
+
+        if let Ok(mappings) = std::env::var("OIDC_GROUP_ROLE_MAP") {
+            for mapping in mappings.split(';') {
+                if let Some((group, role)) = mapping.split_once(':') {
+                    if role.trim().to_lowercase() == "admin"
+                        && groups
+                            .iter()
+                            .any(|g| g.to_lowercase() == group.trim().to_lowercase())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        self.config.default_role.to_lowercase() == "admin"
     }
 
     /// Extract group memberships for role mapping
@@ -616,24 +635,21 @@ impl OidcService {
         oidc_user.groups.clone()
     }
 
-    /// Map OIDC groups to application roles
     pub fn map_groups_to_roles(&self, groups: &[String]) -> Vec<String> {
-        let mut roles = vec!["user".to_string()];
+        let mut roles = vec![self.config.default_role.clone()];
 
         if self.is_admin_from_groups(groups) {
             roles.push("admin".to_string());
         }
 
-        // Additional role mappings from environment
-        // OIDC_GROUP_ROLE_MAP=developers:developer;admins:admin
         if let Ok(mappings) = std::env::var("OIDC_GROUP_ROLE_MAP") {
             for mapping in mappings.split(';') {
                 if let Some((group, role)) = mapping.split_once(':') {
                     if groups
                         .iter()
-                        .any(|g| g.to_lowercase() == group.to_lowercase())
+                        .any(|g| g.to_lowercase() == group.trim().to_lowercase())
                     {
-                        roles.push(role.to_string());
+                        roles.push(role.trim().to_string());
                     }
                 }
             }

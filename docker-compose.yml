@@ -121,6 +121,9 @@ services:
     volumes:
       - ./docker/init-dtrack.sh:/init-dtrack.sh:ro,z
       - shared_config:/shared
+    environment:
+      DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
+      DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
     entrypoint: ["/bin/sh", "/init-dtrack.sh"]
     restart: "no"
     healthcheck:
@@ -180,6 +183,9 @@ services:
         condition: service_healthy
       scan-workspace-init:
         condition: service_completed_successfully
+      dtrack-init:
+        condition: service_completed_successfully
+        required: false
     entrypoint:
       - /bin/sh
       - -c

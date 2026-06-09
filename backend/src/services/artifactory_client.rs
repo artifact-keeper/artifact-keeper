@@ -268,6 +268,15 @@ pub struct PermissionsResponse {
     pub permissions: Vec<PermissionTarget>,
 }
 
+/// Decide whether an Artifactory-supplied `downloadUri` is safe to follow
+/// (#1423). The storage-API `downloadUri` is attacker-influenceable, so it must
+/// pass the same outbound SSRF policy (`validate_outbound_url`) as any other
+/// upstream URL before we issue a request to it. Factored out as a free
+/// function so the guard is unit-testable without a live HTTP client.
+fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
+    crate::api::validation::validate_outbound_url(download_uri, "Artifactory downloadUri").is_ok()
+}
+
 impl ArtifactoryClient {
     /// Create a new Artifactory client with the given configuration
     pub fn new(config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
@@ -515,8 +524,14 @@ impl ArtifactoryClient {
         self.search_aql(&query).await
     }
 
-    /// List artifacts in a repository with date range filtering
-    pub async fn list_artifacts_with_date_filter(
+    /// List artifacts in a repository with date range filtering.
+    ///
+    /// Named `_impl` to avoid name-shadowing with the
+    /// `SourceRegistry::list_artifacts_with_date_filter` trait method this
+    /// type also implements. The trait impl below explicitly delegates
+    /// to this inherent function; if both were named identically the
+    /// trait method would recursively call itself.
+    pub async fn list_artifacts_with_date_filter_impl(
         &self,
         repo_key: &str,
         offset: i64,
@@ -551,7 +566,7 @@ impl ArtifactoryClient {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        self.list_artifacts_with_date_filter(repo_key, offset, limit, Some(since), None)
+        self.list_artifacts_with_date_filter_impl(repo_key, offset, limit, Some(since), None)
             .await
     }
 
@@ -588,6 +603,42 @@ impl ArtifactoryClient {
         };
 
         if download_uri == raw_url {
+            return Ok(response);
+        }
+
+        // #1423: `download_uri` comes from the upstream Artifactory storage API
+        // response, which is attacker-influenceable (a hostile or compromised
+        // source instance can point it anywhere). It must pass the outbound
+        // SSRF policy before we issue a request to it. The `download_uri ==
+        // raw_url` check above is a migration-specific constraint, NOT an SSRF
+        // guard: any differing path or port (e.g. the cloud-metadata endpoint
+        // `http://169.254.169.254/...`) sails past it. The shared client's
+        // redirect policy only screens redirect *hops*, not this initial
+        // connection. On rejection, fall back to the original 404 response.
+        if !download_uri_is_safe_to_follow(&download_uri) {
+            tracing::warn!(
+                repo = %repo_key,
+                path = %path,
+                download_uri = %download_uri,
+                "Rejecting Artifactory downloadUri: failed outbound SSRF validation"
+            );
+            return Ok(response);
+        }
+
+        // #1420: host-allowlist (defense in depth on top of the SSRF policy
+        // above): only send authenticated requests to a host that matches the
+        // configured Artifactory base_url, so a malicious or misconfigured
+        // source cannot return an attacker-controlled downloadUri that
+        // exfiltrates our credentials to a foreign host. On mismatch, log and
+        // surface the original 404 instead of issuing the request.
+        if !fallback_host_matches(&self.config.base_url, &download_uri) {
+            tracing::warn!(
+                repo = %repo_key,
+                path = %path,
+                base_url = %self.config.base_url,
+                download_uri = %download_uri,
+                "Refusing to follow Artifactory downloadUri to a foreign host; returning original 404"
+            );
             return Ok(response);
         }
 
@@ -727,6 +778,27 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         self.list_artifacts(repo_key, offset, limit).await
     }
 
+    async fn list_artifacts_with_date_filter(
+        &self,
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> Result<AqlResponse, ArtifactoryError> {
+        // Explicitly call the inherent `_impl` method to avoid recursing
+        // into this trait method via method-resolution shadowing.
+        ArtifactoryClient::list_artifacts_with_date_filter_impl(
+            self,
+            repo_key,
+            offset,
+            limit,
+            modified_after,
+            modified_before,
+        )
+        .await
+    }
+
     async fn download_artifact(
         &self,
         repo_key: &str,
@@ -756,9 +828,60 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
     }
 }
 
+/// SSRF host-allowlist predicate for the Artifactory downloadUri fallback.
+///
+/// Returns `true` only when both URLs parse and resolve to the same host
+/// (case-insensitive, exact match — no suffix matching). Mismatched hosts,
+/// missing hosts, and unparseable URLs all return `false` so the caller
+/// surfaces the original 404 instead of leaking auth headers to an
+/// attacker-controlled or misconfigured endpoint.
+pub(crate) fn fallback_host_matches(base_url: &str, download_uri: &str) -> bool {
+    let base_host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let fallback_host = reqwest::Url::parse(download_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    matches!(
+        (base_host.as_deref(), fallback_host.as_deref()),
+        (Some(b), Some(f)) if b == f
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_download_uri_ssrf_guard_rejects_dangerous_targets() {
+        // #1423 regression: a malicious/compromised upstream Artifactory can put
+        // an internal or metadata address in the storage-API `downloadUri`. The
+        // guard must refuse to follow it. These targets are hard-blocked
+        // regardless of the private-IP allowlist toggle, so the assertions are
+        // deterministic and require no network/DNS.
+        assert!(
+            !download_uri_is_safe_to_follow("http://169.254.169.254/latest/meta-data/"),
+            "cloud-metadata link-local IP must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("http://metadata.google.internal/computeMetadata/v1/"),
+            "cloud-metadata hostname must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("http://127.0.0.1:8081/artifactory/x/a.jar"),
+            "loopback must be rejected"
+        );
+        assert!(
+            !download_uri_is_safe_to_follow("file:///etc/passwd"),
+            "non-http(s) scheme must be rejected"
+        );
+        // A normal public upstream URL is still followed (no DNS lookup happens
+        // for a non-literal host, so this is offline-deterministic too).
+        assert!(
+            download_uri_is_safe_to_follow("https://repo.example.com/artifactory/libs/a-1.0.jar"),
+            "a public upstream downloadUri must still be allowed"
+        );
+    }
 
     #[test]
     fn test_config_default() {
@@ -787,6 +910,107 @@ mod tests {
     fn test_config_default_auth_is_api_token() {
         let config = ArtifactoryClientConfig::default();
         assert!(matches!(config.auth, ArtifactoryAuth::ApiToken(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF host-allowlist for download_response_with_fallback
+    //
+    // The helper decides whether a downloadUri returned by Artifactory can be
+    // followed with our auth headers. It now lives at module scope and is
+    // called from `download_response_with_fallback`, so these tests exercise
+    // the production predicate directly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fallback_host_matches_same_host_same_scheme() {
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com/artifactory/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_case_insensitive() {
+        assert!(fallback_host_matches(
+            "https://ArtiFactory.Example.com",
+            "https://artifactory.example.COM/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_foreign_host() {
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://attacker.example.net/exfil"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_invalid_uri() {
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "not a url"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_subdomain_swap() {
+        // Strict equality, not suffix matching: subdomain swaps must fail.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://evil.artifactory.example.com/exfil"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_same_host_different_scheme() {
+        // Host is what we gate on; scheme is irrelevant to the SSRF rule.
+        // A downgrade to http on the same host is still an in-allowlist host
+        // (TLS posture is a separate concern handled by the HTTP client).
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "http://artifactory.example.com/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_matches_same_host_with_explicit_port() {
+        // An explicit port (e.g. 8081) on the same host name still matches:
+        // we compare host strings, not host:port authority.
+        assert!(fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com:8081/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_empty_base_url() {
+        // Empty / unparseable base must not authorize any downloadUri.
+        assert!(!fallback_host_matches(
+            "",
+            "https://artifactory.example.com/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_relative_download_uri() {
+        // Some Artifactory deployments return a path-only downloadUri. We
+        // can't safely follow it from this helper (no host to compare), so
+        // it must be rejected.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "/artifactory/api/storage/foo/bar.jar"
+        ));
+    }
+
+    #[test]
+    fn test_fallback_host_rejects_host_with_trailing_dot() {
+        // Strict equality: "example.com." (FQDN) is NOT equal to
+        // "example.com" as a host string. Treat as a foreign host.
+        assert!(!fallback_host_matches(
+            "https://artifactory.example.com",
+            "https://artifactory.example.com./api/storage/foo/bar.jar"
+        ));
     }
 
     #[test]

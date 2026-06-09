@@ -62,17 +62,21 @@ impl IncusHandler {
     /// Classify an image filename into its type.
     fn classify_file(filename: &str) -> Result<IncusFileType> {
         match filename {
-            "incus.tar.xz" | "lxd.tar.xz" => Ok(IncusFileType::UnifiedTarball),
-            "metadata.tar.xz" | "meta.tar.xz" => Ok(IncusFileType::MetadataTarball),
+            "incus.tar.xz" | "incus.tar.gz" | "incus.tar.zst" | "lxd.tar.xz"
+            | "lxd.tar.gz" | "lxd.tar.zst" => Ok(IncusFileType::UnifiedTarball),
+            "metadata.tar.xz" | "metadata.tar.gz" | "metadata.tar.zst" | "meta.tar.xz"
+            | "meta.tar.gz" | "meta.tar.zst" => Ok(IncusFileType::MetadataTarball),
             "rootfs.squashfs" => Ok(IncusFileType::RootfsSquashfs),
             "rootfs.img" => Ok(IncusFileType::RootfsQcow2),
-            f if f.ends_with(".tar.xz") || f.ends_with(".tar.gz") => {
+            // `incus export --compression=zstd` is a native incus option and
+            // produces `.tar.zst`; accept it alongside xz and gzip.
+            f if f.ends_with(".tar.xz") || f.ends_with(".tar.gz") || f.ends_with(".tar.zst") => {
                 Ok(IncusFileType::UnifiedTarball)
             }
             f if f.ends_with(".squashfs") => Ok(IncusFileType::RootfsSquashfs),
             f if f.ends_with(".qcow2") || f.ends_with(".img") => Ok(IncusFileType::RootfsQcow2),
             _ => Err(AppError::Validation(format!(
-                "Unsupported Incus image file: {}. Expected .tar.xz, .squashfs, .qcow2, or .img",
+                "Unsupported Incus image file: {}. Expected .tar.xz, .tar.gz, .tar.zst, .squashfs, .qcow2, or .img",
                 filename
             ))),
         }
@@ -134,9 +138,14 @@ impl IncusHandler {
         // Chain the magic bytes back with the rest of the reader
         let full_reader = std::io::Cursor::new(magic[..n].to_vec()).chain(reader);
 
-        // Try xz first (magic: FD 37 7A 58 5A), then gzip
+        // Try xz first (FD 37 7A 58 5A), then zstd (28 B5 2F FD), then gzip.
         let decompressor: Box<dyn Read> = if magic.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
             Box::new(xz2::read::XzDecoder::new(full_reader))
+        } else if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+            match zstd::Decoder::new(full_reader) {
+                Ok(d) => Box::new(d),
+                Err(_) => return None,
+            }
         } else {
             Box::new(GzDecoder::new(full_reader))
         };
@@ -317,20 +326,34 @@ pub struct IncusImageMetadata {
 mod tests {
     use super::*;
 
+    /// Parse `path` and assert the resulting product/version/type. Shared by the
+    /// parse-path tests so each case is a single line instead of a repeated
+    /// three-assertion block.
+    fn assert_parsed(path: &str, product: &str, version: &str, file_type: IncusFileType) {
+        let info = IncusHandler::parse_path(path).unwrap();
+        assert_eq!(info.product, Some(product.to_string()));
+        assert_eq!(info.version, Some(version.to_string()));
+        assert_eq!(info.file_type, file_type);
+    }
+
     #[test]
     fn test_parse_unified_tarball_path() {
-        let info = IncusHandler::parse_path("ubuntu-noble/20240215/incus.tar.xz").unwrap();
-        assert_eq!(info.product, Some("ubuntu-noble".to_string()));
-        assert_eq!(info.version, Some("20240215".to_string()));
-        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+        assert_parsed(
+            "ubuntu-noble/20240215/incus.tar.xz",
+            "ubuntu-noble",
+            "20240215",
+            IncusFileType::UnifiedTarball,
+        );
     }
 
     #[test]
     fn test_parse_metadata_tarball_path() {
-        let info = IncusHandler::parse_path("alpine-edge/20240301/metadata.tar.xz").unwrap();
-        assert_eq!(info.product, Some("alpine-edge".to_string()));
-        assert_eq!(info.version, Some("20240301".to_string()));
-        assert_eq!(info.file_type, IncusFileType::MetadataTarball);
+        assert_parsed(
+            "alpine-edge/20240301/metadata.tar.xz",
+            "alpine-edge",
+            "20240301",
+            IncusFileType::MetadataTarball,
+        );
     }
 
     #[test]
@@ -423,6 +446,34 @@ properties:
         assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
     }
 
+    #[test]
+    fn test_parse_unified_tarball_zstd() {
+        assert_parsed(
+            "ubuntu-noble/20240215/incus.tar.zst",
+            "ubuntu-noble",
+            "20240215",
+            IncusFileType::UnifiedTarball,
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_tarball_gzip() {
+        let info = IncusHandler::parse_path("ubuntu-noble/20240215/incus.tar.gz").unwrap();
+        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+    }
+
+    #[test]
+    fn test_parse_metadata_tarball_zstd() {
+        let info = IncusHandler::parse_path("alpine-edge/20240301/metadata.tar.zst").unwrap();
+        assert_eq!(info.file_type, IncusFileType::MetadataTarball);
+    }
+
+    #[test]
+    fn test_lxd_compat_tarball_zstd() {
+        let info = IncusHandler::parse_path("product/v1/lxd.tar.zst").unwrap();
+        assert_eq!(info.file_type, IncusFileType::UnifiedTarball);
+    }
+
     #[tokio::test]
     async fn test_validate_valid_path() {
         let handler = IncusHandler::new();
@@ -436,6 +487,37 @@ properties:
     async fn test_validate_invalid_path() {
         let handler = IncusHandler::new();
         assert!(handler.validate("bad-path", &Bytes::new()).await.is_err());
+    }
+
+    #[test]
+    fn test_extract_metadata_from_zstd_tarball() {
+        // Build a real zstd-compressed tar carrying metadata.yaml and assert the
+        // zstd magic-byte branch in extract_metadata_from_reader decompresses and
+        // parses it. This directly covers the new zstd decode path.
+        let yaml = b"architecture: aarch64\nproperties:\n  os: Debian\n  release: bookworm\n";
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(yaml.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "metadata.yaml", &yaml[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let compressed = zstd::encode_all(std::io::Cursor::new(tar_buf), 0).unwrap();
+        // Sanity-check the zstd magic so this test stays honest about which
+        // branch it exercises.
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+
+        let meta = IncusHandler::extract_metadata(&compressed).unwrap();
+        assert_eq!(meta.architecture, Some("aarch64".to_string()));
+        assert_eq!(meta.os, Some("Debian".to_string()));
+        assert_eq!(meta.release, Some("bookworm".to_string()));
     }
 
     #[tokio::test]

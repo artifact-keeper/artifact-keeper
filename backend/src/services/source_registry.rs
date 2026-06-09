@@ -40,6 +40,22 @@ pub trait SourceRegistry: Send + Sync {
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError>;
 
+    /// List artifacts in a repository with optional modified-date filtering.
+    ///
+    /// The default implementation ignores the date filters so sources that do
+    /// not support incremental listing continue to work unchanged.
+    async fn list_artifacts_with_date_filter(
+        &self,
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> Result<AqlResponse, ArtifactoryError> {
+        let _ = (modified_after, modified_before);
+        self.list_artifacts(repo_key, offset, limit).await
+    }
+
     /// Download an artifact as raw bytes.
     ///
     /// Prefer `download_artifact_stream` for migrations: this method buffers

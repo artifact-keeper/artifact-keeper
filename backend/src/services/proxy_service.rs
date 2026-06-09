@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
+use crate::services::metrics_service::record_proxy_cache_lookup;
 use crate::services::proxy_hydration::{
     BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
 };
@@ -524,6 +525,21 @@ struct RegistryTokenResponse {
 /// transport error; the caller then writes the sidecar without a pin and
 /// fast-path revalidation falls back to pre-#1051 existence-only
 /// semantics for that entry.
+/// Extract the repository key from a proxy-cache storage key for the
+/// Prometheus `repository` label. Cache keys are formatted by
+/// `cache_storage_key` as `proxy-cache/<repo_key>/<path>/__content__`;
+/// the metadata sidecar uses the same prefix. If the key doesn't match
+/// this shape (e.g. caller passed a non-cache key), we fall back to
+/// `"unknown"` so the counter stays low-cardinality and never panics on
+/// a malformed input. Used by `record_proxy_cache_lookup` callsites.
+fn repo_key_from_cache_key(cache_key: &str) -> &str {
+    cache_key
+        .strip_prefix("proxy-cache/")
+        .and_then(|s| s.split('/').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -629,6 +645,17 @@ impl CacheStore {
         metadata_key: &str,
         allow_stale: bool,
     ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
+        // Only the FRESH lookup (`allow_stale == false`) is counted: that is
+        // the single per-request cache-read decision the original PR
+        // instrumented on `get_cached_artifact`. The stale fallback
+        // (`allow_stale == true`) is a *second* body read that only runs
+        // after the fresh read already recorded a `miss_*`/`error` outcome
+        // for the same request (via `revalidate_stale`), so counting it too
+        // would double-count. The repo label is derived from the cache_key
+        // prefix; see `repo_key_from_cache_key`.
+        let repo_label = repo_key_from_cache_key(cache_key);
+
         // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
         // propagates it via `?` to match the original behavior precisely.
         let metadata = if allow_stale {
@@ -639,13 +666,22 @@ impl CacheStore {
         } else {
             match self.load_metadata(metadata_key).await {
                 Ok(Some(m)) => m,
-                Ok(None) => return Ok(None),
+                Ok(None) => {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        metadata_key = %metadata_key,
+                        "Proxy cache miss: metadata sidecar absent"
+                    );
+                    record_proxy_cache_lookup(repo_label, "miss_no_metadata");
+                    return Ok(None);
+                }
                 Err(e) => {
                     tracing::warn!(
                         metadata_key = %metadata_key,
                         error = %e,
                         "proxy cache metadata read failed; treating as miss and refetching upstream"
                     );
+                    record_proxy_cache_lookup(repo_label, "error");
                     return Ok(None);
                 }
             }
@@ -653,7 +689,12 @@ impl CacheStore {
 
         // Fresh reads enforce the expiry gate; the stale fallback skips it.
         if !allow_stale && Utc::now() > metadata.expires_at {
-            tracing::debug!("Cache expired for {}", cache_key);
+            tracing::debug!(
+                cache_key = %cache_key,
+                expires_at = %metadata.expires_at,
+                "Proxy cache miss: entry expired"
+            );
+            record_proxy_cache_lookup(repo_label, "miss_expired");
             return Ok(None);
         }
 
@@ -672,11 +713,12 @@ impl CacheStore {
                         );
                     } else {
                         tracing::warn!(
-                            "Cache checksum mismatch for {}: expected {}, got {}",
-                            cache_key,
-                            metadata.checksum_sha256,
-                            actual_checksum
+                            cache_key = %cache_key,
+                            expected = %metadata.checksum_sha256,
+                            actual = %actual_checksum,
+                            "Proxy cache miss: checksum mismatch (cache will be refilled)"
                         );
+                        record_proxy_cache_lookup(repo_label, "miss_checksum_mismatch");
                     }
                     return Ok(None);
                 }
@@ -688,11 +730,21 @@ impl CacheStore {
                         metadata.expires_at
                     );
                 } else {
-                    tracing::debug!("Cache hit for {}", cache_key);
+                    tracing::debug!(cache_key = %cache_key, "Proxy cache hit");
+                    record_proxy_cache_lookup(repo_label, "hit");
                 }
                 Ok(Some((content, metadata.content_type)))
             }
-            Err(AppError::NotFound(_)) => Ok(None),
+            Err(AppError::NotFound(_)) => {
+                if !allow_stale {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        "Proxy cache miss: content object absent (metadata existed)"
+                    );
+                    record_proxy_cache_lookup(repo_label, "miss_no_content");
+                }
+                Ok(None)
+            }
             // B6 (coalescing 502 leak): a transient storage read error here
             // (e.g. a waiter reading the cache body while the single-flight
             // leader is mid-write, or a partially-written / poisoned entry)
@@ -713,6 +765,7 @@ impl CacheStore {
                         error = %e,
                         "proxy cache read failed; treating as miss and refetching upstream"
                     );
+                    record_proxy_cache_lookup(repo_label, "error");
                     Ok(None)
                 }
             }
@@ -2617,6 +2670,24 @@ impl ProxyService {
     /// `cached_at` come from the sidecar; entries whose sidecar is missing or
     /// unreadable are skipped (a half-written or legacy cache write).
     pub async fn list_cached_artifacts(&self, repo_key: &str) -> Vec<CachedArtifactEntry> {
+        let paths = self.list_cached_paths(repo_key).await;
+        self.load_cached_entries(repo_key, &paths).await
+    }
+
+    /// List the logical paths of every proxy-cached artifact for a repo
+    /// **without** loading any sidecar metadata.
+    ///
+    /// This is the cheap first half of a paginated cached listing (#1571):
+    /// the caller filters + slices these path strings down to the requested
+    /// page (both listing filters — path prefix and substring `q` — are
+    /// purely path-based) and then loads sidecars for just that page via
+    /// [`Self::load_cached_entries`]. That turns a cached listing from O(N)
+    /// sidecar reads on every request into O(page) reads, which is what
+    /// previously made large proxy caches expensive to page through.
+    ///
+    /// Returns paths sorted + deduped (see [`Self::cached_artifact_paths`]),
+    /// or an empty list when the storage backend cannot list the prefix.
+    pub async fn list_cached_paths(&self, repo_key: &str) -> Vec<String> {
         let prefix = format!("proxy-cache/{}/", repo_key);
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
@@ -2631,14 +2702,25 @@ impl ProxyService {
             }
         };
 
-        let logical_paths = Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str));
+        Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str))
+    }
 
-        // Load every sidecar concurrently with bounded parallelism instead of
-        // one sequential storage round-trip per path (#1608). `cached_artifact_paths`
-        // already returns paths sorted+deduped, but `buffer_unordered` yields
-        // results out of order, so the collected entries are re-sorted by path
-        // to keep the output deterministic and identical to the sequential path.
-        let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(logical_paths)
+    /// Load sidecar metadata for a specific, already-paginated set of cached
+    /// `paths`, returning the assembled entries sorted by path.
+    ///
+    /// Pairs with [`Self::list_cached_paths`] so a cached listing only reads
+    /// the sidecars for the requested page rather than every object in the
+    /// cache (#1571). Sidecars are loaded concurrently with bounded
+    /// parallelism (#1608); `buffer_unordered` yields out of order, so the
+    /// collected entries are re-sorted by path to stay deterministic. Paths
+    /// whose sidecar is missing or unreadable are skipped, matching the
+    /// previous whole-cache load.
+    pub async fn load_cached_entries(
+        &self,
+        repo_key: &str,
+        paths: &[String],
+    ) -> Vec<CachedArtifactEntry> {
+        let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(paths.iter().cloned())
             .map(|path| async move {
                 let metadata_key = Self::cache_metadata_key(repo_key, &path).ok()?;
                 match self.load_cache_metadata(&metadata_key).await {
@@ -7073,6 +7155,126 @@ SHA256:
         );
     }
 
+    /// Storage mock that counts every `get` (sidecar read) so a test can
+    /// assert the two-phase cached listing only reads the requested page's
+    /// sidecars rather than every object in the cache (#1571).
+    struct CountingCacheMock {
+        keys: Vec<String>,
+        sidecars: std::collections::HashMap<String, Bytes>,
+        get_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CountingCacheMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.get_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.sidecars.get(key) {
+                Some(b) => Ok(b.clone()),
+                None => Err(AppError::NotFound(key.to_string())),
+            }
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(match prefix {
+                Some(p) => self
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with(p))
+                    .cloned()
+                    .collect(),
+                None => self.keys.clone(),
+            })
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_cached_paths_reads_no_sidecars() {
+        // #1571: recovering the path set must not read a single sidecar, so the
+        // caller can filter + page the paths before paying for any metadata I/O.
+        let repo = "npm-remote";
+        let now = Utc::now();
+        let all = ["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"];
+        let mut sidecars = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for p in all {
+            sidecars.insert(
+                meta_key(repo, p),
+                sidecar_bytes(1, &"a".repeat(64), None, now),
+            );
+            keys.push(content_key(repo, p));
+            keys.push(meta_key(repo, p));
+        }
+        let get_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = std::sync::Arc::new(CountingCacheMock {
+            keys,
+            sidecars,
+            get_count: get_count.clone(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let paths = service.list_cached_paths(repo).await;
+        assert_eq!(paths, vec!["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"]);
+        assert_eq!(
+            get_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "listing cached paths must not read any sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_cached_entries_reads_only_requested_paths() {
+        // #1571: loading a single-path page out of a 3-object cache must read
+        // exactly one sidecar, not all three (the old O(N)-per-listing cost).
+        let repo = "npm-remote";
+        let now = Utc::now();
+        let all = ["a/-/a-1.tgz", "b/-/b-1.tgz", "c/-/c-1.tgz"];
+        let mut sidecars = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for p in all {
+            sidecars.insert(
+                meta_key(repo, p),
+                sidecar_bytes(7, &"b".repeat(64), None, now),
+            );
+            keys.push(content_key(repo, p));
+            keys.push(meta_key(repo, p));
+        }
+        let get_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = std::sync::Arc::new(CountingCacheMock {
+            keys,
+            sidecars,
+            get_count: get_count.clone(),
+        });
+        let service = build_proxy_service_with_storage(mock);
+
+        let page = vec!["b/-/b-1.tgz".to_string()];
+        let entries = service.load_cached_entries(repo, &page).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "b/-/b-1.tgz");
+        assert_eq!(
+            get_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "loading a 1-path page must read exactly one sidecar, not the whole cache"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // extract_streaming_headers: pure header parsing. Verifies the
     // Content-Length parse-or-skip behaviour and the etag/content-type
@@ -7979,7 +8181,8 @@ SHA256:
         let tmp = std::env::temp_dir().join(format!("ak-1365-ok-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create tmp dir");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
-        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+        let repo_key = format!("maven-central-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
 
         // First request: cache miss, streamed from upstream and tee'd to cache.
         let first = proxy
@@ -7999,7 +8202,7 @@ SHA256:
 
         // The cache must now be fresh with the correct length.
         assert!(
-            proxy.is_cache_fresh("maven-central", pom_path).await,
+            proxy.is_cache_fresh(&repo_key, pom_path).await,
             "a non-empty POM must produce a fresh cache entry"
         );
 
@@ -8069,7 +8272,8 @@ SHA256:
         let tmp = std::env::temp_dir().join(format!("ak-1365-empty-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create tmp dir");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
-        let repo = remote_repo_for("maven-central", &server.uri(), tmp.to_str().unwrap());
+        let repo_key = format!("maven-central-empty-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
 
         // First request: empty upstream body. Client gets the empty body
         // for THIS request, but nothing must be cached.
@@ -8086,7 +8290,7 @@ SHA256:
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !proxy.is_cache_fresh("maven-central", pom_path).await,
+            !proxy.is_cache_fresh(&repo_key, pom_path).await,
             "an empty upstream body MUST NOT create a fresh cache entry (#1365)"
         );
 
@@ -9828,5 +10032,52 @@ SHA256:
             b"jar-bytes",
             "immutable streaming hit must serve cached bytes with no upstream contact"
         );
+    }
+
+    // ---- repo_key_from_cache_key (observability label extraction) ------
+
+    #[test]
+    fn test_repo_key_from_cache_key_content_key() {
+        assert_eq!(
+            repo_key_from_cache_key(
+                "proxy-cache/pypi-remote/simple/click/click-8.0.0-py3-none-any.whl/__content__"
+            ),
+            "pypi-remote"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_metadata_key() {
+        assert_eq!(
+            repo_key_from_cache_key(
+                "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__cache_meta__.json"
+            ),
+            "npm-remote"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_handles_dashes_and_underscores() {
+        // Repo keys can include hyphens, underscores, and dots per
+        // `validate_repository_key`. The split-by-`/` extractor should
+        // preserve them verbatim.
+        assert_eq!(
+            repo_key_from_cache_key("proxy-cache/my_repo-v1.2/a/b/__content__"),
+            "my_repo-v1.2"
+        );
+    }
+
+    #[test]
+    fn test_repo_key_from_cache_key_non_proxy_key_fallbacks_to_unknown() {
+        // Defensive: if a caller hands us a non-proxy-cache key, the
+        // function returns "unknown" instead of panicking so the
+        // counter cardinality stays bounded.
+        assert_eq!(
+            repo_key_from_cache_key("maven/org/example/lib/1.0/lib-1.0.jar"),
+            "unknown"
+        );
+        assert_eq!(repo_key_from_cache_key(""), "unknown");
+        assert_eq!(repo_key_from_cache_key("proxy-cache/"), "unknown");
+        assert_eq!(repo_key_from_cache_key("proxy-cache//foo"), "unknown");
     }
 }

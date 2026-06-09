@@ -229,6 +229,12 @@ pub fn router() -> Router<SharedState> {
         // `ProxyService::invalidate_cache` is idempotent so a second call for
         // an already-evicted path still returns 200.
         .route("/:key/cache/invalidate", post(invalidate_cache))
+        // PEP 708 tracks declarations for PyPI dependency-confusion control (#1600)
+        .route("/:key/pypi-tracks", get(list_pypi_tracks))
+        .route(
+            "/:key/pypi-tracks/:project",
+            put(put_pypi_track).delete(delete_pypi_track),
+        )
         // Routing rules for path rewriting on remote repositories
         .route(
             "/:key/routing-rules",
@@ -745,6 +751,196 @@ pub async fn invalidate_cache(
         path: query.path,
         invalidated: true,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// PEP 708 `tracks` declarations (#1600)
+// ---------------------------------------------------------------------------
+
+/// Body for declaring that a locally-owned PyPI project tracks an upstream one.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PypiTrackRequest {
+    /// Upstream Simple index project URL this local project tracks, e.g.
+    /// `https://pypi.org/simple/acme-sdk/`. Recorded and emitted as the PEP 708
+    /// `tracks` value.
+    pub tracks_url: String,
+}
+
+/// A single PEP 708 `tracks` declaration.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PypiTrackResponse {
+    pub repository_key: String,
+    /// PEP 503 normalized project name.
+    pub normalized_name: String,
+    pub tracks_url: String,
+}
+
+/// All `tracks` declarations on a repository.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PypiTracksListResponse {
+    pub items: Vec<PypiTrackResponse>,
+}
+
+#[allow(clippy::result_large_err)]
+fn require_pypi_tracks_repo(repo: &crate::models::repository::Repository) -> Result<()> {
+    // tracks is declared on the hosted repo that OWNS the project (PEP 708:
+    // tracks is a property of the project's own repository). It is meaningless
+    // on a proxy or virtual repo, which hold no authoritative local project.
+    if repo.repo_type != RepositoryType::Local && repo.repo_type != RepositoryType::Staging {
+        return Err(AppError::Validation(
+            "tracks declarations can only be set on a local (hosted) or staging repository"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// List the PEP 708 `tracks` declarations on a repository.
+#[utoipa::path(
+    get,
+    path = "/{key}/pypi-tracks",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(("key" = String, Path, description = "Repository key")),
+    responses(
+        (status = 200, description = "tracks declarations", body = PypiTracksListResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn list_pypi_tracks(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<PypiTracksListResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT normalized_name, tracks_url FROM pypi_project_tracks \
+         WHERE repository_id = $1 ORDER BY normalized_name",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(PypiTracksListResponse {
+        items: rows
+            .into_iter()
+            .map(|(normalized_name, tracks_url)| PypiTrackResponse {
+                repository_key: key.clone(),
+                normalized_name,
+                tracks_url,
+            })
+            .collect(),
+    }))
+}
+
+/// Declare (upsert) that a locally-owned PyPI project tracks an upstream one,
+/// allowing a virtual repository to merge versions across members for that name
+/// instead of isolating it (PEP 708, #1600).
+#[utoipa::path(
+    put,
+    path = "/{key}/pypi-tracks/{project}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name (PEP 503 normalized server-side)"),
+    ),
+    request_body = PypiTrackRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "tracks declaration stored", body = PypiTrackResponse),
+        (status = 400, description = "Invalid request or repository type"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn put_pypi_track(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, project)): Path<(String, String)>,
+    Json(payload): Json<PypiTrackRequest>,
+) -> Result<Json<PypiTrackResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+    require_pypi_tracks_repo(&repo)?;
+
+    let tracks_url = payload.tracks_url.trim().to_string();
+    if !(tracks_url.starts_with("http://") || tracks_url.starts_with("https://")) {
+        return Err(AppError::Validation(
+            "tracks_url must be an absolute http(s) URL".to_string(),
+        ));
+    }
+    let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
+    if normalized.is_empty() {
+        return Err(AppError::Validation("invalid project name".to_string()));
+    }
+
+    sqlx::query(
+        "INSERT INTO pypi_project_tracks (repository_id, normalized_name, tracks_url, created_by) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (repository_id, normalized_name) \
+         DO UPDATE SET tracks_url = EXCLUDED.tracks_url, created_by = EXCLUDED.created_by",
+    )
+    .bind(repo.id)
+    .bind(&normalized)
+    .bind(&tracks_url)
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(PypiTrackResponse {
+        repository_key: key,
+        normalized_name: normalized,
+        tracks_url,
+    }))
+}
+
+/// Remove a PEP 708 `tracks` declaration, restoring local-precedence isolation
+/// for that project name (#1600).
+#[utoipa::path(
+    delete,
+    path = "/{key}/pypi-tracks/{project}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name (PEP 503 normalized server-side)"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "tracks declaration removed (idempotent)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_pypi_track(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, project)): Path<(String, String)>,
+) -> Result<axum::http::StatusCode> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
+    sqlx::query(
+        "DELETE FROM pypi_project_tracks WHERE repository_id = $1 AND normalized_name = $2",
+    )
+    .bind(repo.id)
+    .bind(&normalized)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Resolve the effective cache TTL from a stored `repository_config` value.
@@ -1696,7 +1892,12 @@ pub async fn list_artifacts(
     Query(query): Query<ListArtifactsQuery>,
 ) -> Result<Json<ArtifactListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
+    // Clamp per_page to [1, 100]: a `per_page=0` query previously slipped past
+    // the `.min(100)` upper bound and reached the `total_pages` divisions
+    // below as a divide-by-zero, saturating `total_pages` to u32::MAX for any
+    // non-empty repo (#1571). The lower bound makes both the DB and the
+    // proxy-cache listing branches well-defined.
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = ((page - 1) * per_page) as i64;
 
     let repo_service = RepositoryService::new(state.db.clone());
@@ -1889,18 +2090,33 @@ async fn list_remote_cached_artifacts(
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
-    let entries = match state.proxy_service.as_deref() {
-        Some(proxy) => proxy.list_cached_artifacts(&repo.key).await,
+    // Two-phase listing (#1571): first recover just the cached path strings
+    // (no sidecar reads), filter + slice them to the requested page, and only
+    // then load sidecars for that page. Both listing filters are path-based,
+    // so paging on the paths is exact and avoids the previous O(N) sidecar
+    // read on every request. The trade-off is that `total` counts paths whose
+    // sidecar may since have gone missing (a half-written / legacy cache
+    // write); such a path is still dropped from the returned page, matching
+    // the old per-entry skip, but is no longer pre-excluded from the count —
+    // an acceptable approximation in exchange for O(page) reads.
+    let proxy = state.proxy_service.as_deref();
+    let paths = match proxy {
+        Some(proxy) => proxy.list_cached_paths(&repo.key).await,
         // No proxy service configured (e.g. proxying disabled): nothing cached.
         None => Vec::new(),
     };
 
-    let (page_entries, total) = filter_and_paginate_cached(entries, path_prefix, q, page, per_page);
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let (page_paths, total) = filter_and_paginate_paths(paths, path_prefix, q, page, per_page);
+    let total_pages = cached_total_pages(total, per_page);
 
-    let items = page_entries
-        .into_iter()
-        .map(|entry| build_cached_artifact_response(&entry, key))
+    let entries = match proxy {
+        Some(proxy) => proxy.load_cached_entries(&repo.key, &page_paths).await,
+        None => Vec::new(),
+    };
+
+    let items = entries
+        .iter()
+        .map(|entry| build_cached_artifact_response(entry, key))
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -1917,50 +2133,59 @@ async fn list_remote_cached_artifacts(
 }
 
 /// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
-/// cache entries, then return the slice for the requested page along with the
-/// total match count.
+/// cache **paths**, then return the slice for the requested page along with
+/// the total match count.
 ///
 /// `path_prefix` matches against the start of the logical path; `q` is a
-/// case-insensitive substring match against the path. Pure so the
-/// filter/paginate logic is unit-testable without a storage backend.
-fn filter_and_paginate_cached(
-    entries: Vec<crate::services::proxy_service::CachedArtifactEntry>,
+/// case-insensitive substring match against the path. Both filters are
+/// purely path-based, so this runs on the path strings alone and the caller
+/// loads sidecars only for the returned page (#1571), instead of loading
+/// every sidecar before slicing. `per_page` is treated as at least 1 so a
+/// `per_page == 0` query cannot wedge pagination. Pure / unit-testable
+/// without a storage backend.
+fn filter_and_paginate_paths(
+    paths: Vec<String>,
     path_prefix: Option<&str>,
     q: Option<&str>,
     page: u32,
     per_page: u32,
-) -> (
-    Vec<crate::services::proxy_service::CachedArtifactEntry>,
-    usize,
-) {
+) -> (Vec<String>, usize) {
     let q_lower = q
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_lowercase);
 
-    let mut matched: Vec<_> = entries
+    let mut matched: Vec<String> = paths
         .into_iter()
-        .filter(|e| match path_prefix {
-            Some(prefix) if !prefix.is_empty() => e.path.starts_with(prefix),
+        .filter(|p| match path_prefix {
+            Some(prefix) if !prefix.is_empty() => p.starts_with(prefix),
             _ => true,
         })
-        .filter(|e| match &q_lower {
-            Some(needle) => e.path.to_lowercase().contains(needle),
+        .filter(|p| match &q_lower {
+            Some(needle) => p.to_lowercase().contains(needle),
             None => true,
         })
         .collect();
 
     // Stable ordering for deterministic pagination across requests.
-    matched.sort_by(|a, b| a.path.cmp(&b.path));
+    matched.sort();
 
     let total = matched.len();
-    let offset = ((page.saturating_sub(1)) as usize).saturating_mul(per_page as usize);
-    let page_items = matched
-        .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .collect();
+    let per_page = (per_page.max(1)) as usize;
+    let offset = (page.saturating_sub(1) as usize).saturating_mul(per_page);
+    let page_items = matched.into_iter().skip(offset).take(per_page).collect();
     (page_items, total)
+}
+
+/// Number of pages for a cached listing of `total` items at `per_page`.
+///
+/// Guards `per_page == 0` (a value a query can supply — the handler only caps
+/// the upper bound) so the count cannot saturate to `u32::MAX` the way the
+/// previous `((total as f64) / (per_page as f64)).ceil() as u32` did for any
+/// non-empty repo (#1571). Pure / unit-testable.
+fn cached_total_pages(total: usize, per_page: u32) -> u32 {
+    let per_page = (per_page.max(1)) as usize;
+    total.div_ceil(per_page) as u32
 }
 
 /// Deterministic artifact id for a proxy-cached object.
@@ -4364,6 +4589,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         update_repository,
         delete_repository,
         set_cache_ttl,
+        list_pypi_tracks,
+        put_pypi_track,
+        delete_pypi_track,
         get_cache_ttl,
         invalidate_cache,
         list_artifacts,
@@ -4391,6 +4619,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         CacheTtlResponse,
         InvalidateCacheQuery,
         InvalidateCacheResponse,
+        PypiTrackRequest,
+        PypiTrackResponse,
+        PypiTracksListResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -4541,55 +4772,69 @@ mod tests {
         }
     }
 
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn test_filter_and_paginate_cached_returns_all_sorted() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, None, None, 1, 20);
+    fn test_filter_and_paginate_paths_returns_all_sorted() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, None, None, 1, 20);
         assert_eq!(total, 2);
         assert_eq!(page.len(), 2);
         // Sorted by path.
-        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
-        assert_eq!(page[1].path, "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[1], "lodash/-/lodash-4.17.21.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_applies_path_prefix() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, Some("lodash/"), None, 1, 20);
+    fn test_filter_and_paginate_paths_applies_path_prefix() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, Some("lodash/"), None, 1, 20);
         assert_eq!(total, 1);
         assert_eq!(page.len(), 1);
-        assert_eq!(page[0].path, "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(page[0], "lodash/-/lodash-4.17.21.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_applies_case_insensitive_query() {
-        let entries = vec![
-            make_cached_entry("lodash/-/lodash-4.17.21.tgz"),
-            make_cached_entry("is-odd/-/is-odd-3.0.1.tgz"),
-        ];
-        let (page, total) = filter_and_paginate_cached(entries, None, Some("IS-ODD"), 1, 20);
+    fn test_filter_and_paginate_paths_applies_case_insensitive_query() {
+        let input = paths(&["lodash/-/lodash-4.17.21.tgz", "is-odd/-/is-odd-3.0.1.tgz"]);
+        let (page, total) = filter_and_paginate_paths(input, None, Some("IS-ODD"), 1, 20);
         assert_eq!(total, 1);
-        assert_eq!(page[0].path, "is-odd/-/is-odd-3.0.1.tgz");
+        assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
     }
 
     #[test]
-    fn test_filter_and_paginate_cached_paginates() {
-        let entries = vec![
-            make_cached_entry("a"),
-            make_cached_entry("b"),
-            make_cached_entry("c"),
-        ];
-        let (page2, total) = filter_and_paginate_cached(entries, None, None, 2, 2);
+    fn test_filter_and_paginate_paths_paginates() {
+        let input = paths(&["a", "b", "c"]);
+        let (page2, total) = filter_and_paginate_paths(input, None, None, 2, 2);
         assert_eq!(total, 3);
         // page size 2, page 2 -> just "c"
         assert_eq!(page2.len(), 1);
-        assert_eq!(page2[0].path, "c");
+        assert_eq!(page2[0], "c");
+    }
+
+    #[test]
+    fn test_filter_and_paginate_paths_per_page_zero_does_not_wedge() {
+        // Regression for #1571: a `per_page=0` query must not panic or produce
+        // a degenerate empty page; per_page is treated as at least 1.
+        let input = paths(&["a", "b", "c"]);
+        let (page1, total) = filter_and_paginate_paths(input, None, None, 1, 0);
+        assert_eq!(total, 3);
+        assert_eq!(page1, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_cached_total_pages_guards_per_page_zero() {
+        // Regression for #1571: the previous `(total as f64 / per_page as f64)
+        // .ceil() as u32` returned u32::MAX (saturated infinity) when per_page
+        // was 0 for a non-empty repo. The guarded version returns a sane count.
+        assert_eq!(cached_total_pages(5, 0), 5);
+        assert_eq!(cached_total_pages(0, 0), 0);
+        // Normal ceil-division behaviour is preserved.
+        assert_eq!(cached_total_pages(10, 3), 4);
+        assert_eq!(cached_total_pages(9, 3), 3);
+        assert_eq!(cached_total_pages(0, 20), 0);
     }
 
     #[test]
@@ -10137,5 +10382,98 @@ mod tests {
             status,
             String::from_utf8_lossy(&body)
         );
+    }
+
+    /// PEP 708 (#1600): a PyPI virtual isolates a locally-owned project name by
+    /// default (so an unrelated public package of the same name is never served
+    /// through the virtual), and only unblocks the cross-member union when an
+    /// operator `tracks` declaration exists on the owning member.
+    #[tokio::test]
+    async fn pypi_virtual_isolates_locally_owned_name_until_tracks_declared() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, _lk, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (remote_id, _rk, remote_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (virtual_id, _vk, virtual_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+
+        for (member, priority) in [(local_id, 1_i32), (remote_id, 2_i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        // The local member owns the internal project `acme-sdk`.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(local_id)
+        .bind("acme-sdk/1.0.0/acme_sdk-1.0.0-py3-none-any.whl")
+        .bind("acme-sdk")
+        .bind(1_i64)
+        .bind("0".repeat(64))
+        .bind("application/octet-stream")
+        .bind("pypi/acme/1")
+        .execute(&pool)
+        .await
+        .expect("seed local artifact");
+
+        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream).
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
+                Ok(true)
+            ),
+            "a locally-owned name with no tracks declaration must be isolated"
+        );
+
+        // A name the local member does not own -> proxy normally (no isolation).
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "six").await,
+                Ok(false)
+            ),
+            "a name no local member owns must not be isolated"
+        );
+
+        // Operator declares the local project tracks upstream -> union allowed.
+        sqlx::query(
+            "INSERT INTO pypi_project_tracks (repository_id, normalized_name, tracks_url) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(local_id)
+        .bind("acme-sdk")
+        .bind("https://pypi.org/simple/acme-sdk/")
+        .execute(&pool)
+        .await
+        .expect("declare tracks");
+
+        assert!(
+            matches!(
+                proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
+                Ok(false)
+            ),
+            "a tracks declaration must re-enable the cross-member union"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_id, virtual_id])
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
     }
 }

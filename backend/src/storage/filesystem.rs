@@ -810,7 +810,7 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path());
 
         let result = storage.get("nonexistent-key1234").await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(AppError::NotFound(_))));
     }
 
     #[tokio::test]

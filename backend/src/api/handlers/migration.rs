@@ -1090,12 +1090,6 @@ async fn start_migration(
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
-    // Create storage backend
-    let storage = state.storage_for_repo(&crate::storage::StorageLocation {
-        backend: state.config.storage_backend.clone(),
-        path: state.config.storage_path.clone(),
-    })?;
-
     // Create cancellation token for this job
     let cancel_token = CancellationToken::new();
 
@@ -1115,10 +1109,11 @@ async fn start_migration(
     };
 
     let db = state.db.clone();
+    let storage_registry = state.storage_registry.clone();
     let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
         if let Err(e) = worker
             .process_job(job_id, client, conflict_resolution, None)
             .await
@@ -1229,10 +1224,6 @@ async fn resume_migration(
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
-    let storage = state.storage_for_repo(&crate::storage::StorageLocation {
-        backend: state.config.storage_backend.clone(),
-        path: state.config.storage_path.clone(),
-    })?;
     let cancel_token = CancellationToken::new();
 
     let worker_config = WorkerConfig {
@@ -1250,10 +1241,11 @@ async fn resume_migration(
     };
 
     let db = state.db.clone();
+    let storage_registry = state.storage_registry.clone();
     let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
         if let Err(e) = worker
             .resume_job(job_id, client, conflict_resolution, None)
             .await

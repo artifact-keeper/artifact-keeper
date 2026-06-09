@@ -6,6 +6,12 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use crate::models::migration::{MigrationItemType, MigrationJobStatus};
+use crate::services::artifact_service::ArtifactService;
+use crate::services::artifactory_client::ArtifactoryClient;
+use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
+use crate::services::source_registry::SourceRegistry;
+use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -13,13 +19,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-use crate::models::migration::{MigrationItemType, MigrationJobStatus};
-use crate::services::artifact_service::ArtifactService;
-use crate::services::artifactory_client::ArtifactoryClient;
-use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
-use crate::services::source_registry::SourceRegistry;
-use crate::storage::StorageBackend;
 
 /// Configuration for the migration worker
 #[derive(Debug, Clone)]
@@ -158,7 +157,7 @@ pub struct ProgressUpdate {
 pub struct MigrationWorker {
     db: PgPool,
     migration_service: MigrationService,
-    storage: Arc<dyn StorageBackend>,
+    storage_registry: Arc<StorageRegistry>,
     config: WorkerConfig,
     cancel_token: CancellationToken,
 }
@@ -167,7 +166,7 @@ impl MigrationWorker {
     /// Create a new migration worker
     pub fn new(
         db: PgPool,
-        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<StorageRegistry>,
         config: WorkerConfig,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -175,10 +174,32 @@ impl MigrationWorker {
         Self {
             db,
             migration_service,
-            storage,
+            storage_registry,
             config,
             cancel_token,
         }
+    }
+
+    async fn storage_for_repo(
+        &self,
+        repo_key: &str,
+    ) -> Result<Arc<dyn StorageBackend>, MigrationError> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT storage_backend, storage_path FROM repositories WHERE key = $1")
+                .bind(repo_key)
+                .fetch_optional(&self.db)
+                .await?;
+
+        let (backend, path) = row.ok_or_else(|| {
+            MigrationError::StorageError(format!(
+                "Repository '{}' not found while resolving storage backend",
+                repo_key
+            ))
+        })?;
+
+        self.storage_registry
+            .backend_for(&StorageLocation { backend, path })
+            .map_err(|e| MigrationError::StorageError(e.to_string()))
     }
 
     /// Get a reference to the database pool
@@ -208,6 +229,17 @@ impl MigrationWorker {
         let include_artifacts = true;
         let include_metadata = true;
         let repos = config.include_repos.clone();
+        let date_from = config.date_from.map(|dt| dt.to_rfc3339());
+        let date_to = config.date_to.map(|dt| dt.to_rfc3339());
+
+        if date_from.is_some() || date_to.is_some() {
+            tracing::info!(
+                job_id = %job_id,
+                date_from = ?date_from,
+                date_to = ?date_to,
+                "Migration job will process only artifacts in the requested date window"
+            );
+        }
 
         // Update job status to running
         self.migration_service
@@ -359,12 +391,23 @@ impl MigrationWorker {
             }
 
             if include_artifacts {
+                let repo_storage = match self.storage_for_repo(repo_key).await {
+                    Ok(storage) => storage,
+                    Err(e) => {
+                        tracing::error!(repo = %repo_key, error = %e, "Failed to resolve repository storage");
+                        continue;
+                    }
+                };
+
                 match self
                     .process_repository_artifacts(
                         job_id,
                         client.clone(),
+                        repo_storage,
                         repo_key,
                         package_type,
+                        date_from.as_deref(),
+                        date_to.as_deref(),
                         conflict_resolution,
                         include_metadata,
                         &mut total_completed,
@@ -431,8 +474,11 @@ impl MigrationWorker {
         &self,
         job_id: Uuid,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -458,8 +504,11 @@ impl MigrationWorker {
                 break;
             }
 
-            // List artifacts with pagination
-            let artifacts = client.list_artifacts(repo_key, offset, limit).await?;
+            // List artifacts with pagination, optionally filtered to a date
+            // window for incremental / delta migration runs.
+            let artifacts = client
+                .list_artifacts_with_date_filter(repo_key, offset, limit, date_from, date_to)
+                .await?;
             pages_fetched += 1;
 
             let page_len = artifacts.results.len();
@@ -489,7 +538,7 @@ impl MigrationWorker {
                 // Artifact Keeper uses internally.
                 let item_checksum = expected_sha256.clone().or_else(|| expected_sha1.clone());
 
-                // Skip if already completed (resume support)
+                // Skip if already completed in THIS job (resume support within same job)
                 if self.is_item_already_completed(job_id, &source_path).await? {
                     *skipped += 1;
                     continue;
@@ -500,8 +549,13 @@ impl MigrationWorker {
                 // duplicates that already exist, which makes delta migrations work
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
+                        repo_key,
+                        &artifact_path,
                         &source_path,
-                        item_checksum.as_deref(),
+                        &ExpectedChecksums {
+                            sha256: expected_sha256.clone(),
+                            sha1: expected_sha1.clone(),
+                        },
                         conflict_resolution,
                     )
                     .await?;
@@ -539,6 +593,7 @@ impl MigrationWorker {
                 self.process_single_artifact(
                     item_id,
                     client.clone(),
+                    repo_storage.clone(),
                     repo_key,
                     package_type,
                     &artifact_path,
@@ -626,6 +681,7 @@ impl MigrationWorker {
         &self,
         item_id: Uuid,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
         artifact_path: &str,
@@ -639,13 +695,14 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
-        // Prefer sha256 for duplicate detection since that is what Artifact
-        // Keeper stores internally. Fall back to sha1 when the source only
-        // provides that (common for older Nexus artifacts).
-        let dedup_checksum = expected.sha256.clone().or_else(|| expected.sha1.clone());
-
         let should_skip = self
-            .check_artifact_duplicate(source_path, dedup_checksum.as_deref(), conflict_resolution)
+            .check_artifact_duplicate(
+                repo_key,
+                artifact_path,
+                source_path,
+                &expected,
+                conflict_resolution,
+            )
             .await?;
 
         if should_skip {
@@ -659,6 +716,7 @@ impl MigrationWorker {
         match self
             .transfer_artifact(
                 client,
+                repo_storage,
                 repo_key,
                 package_type,
                 artifact_path,
@@ -829,28 +887,40 @@ impl MigrationWorker {
     /// Check if an artifact already exists with the same checksum
     async fn check_artifact_duplicate(
         &self,
-        path: &str,
-        checksum: Option<&str>,
+        repo_key: &str,
+        artifact_path: &str,
+        legacy_source_path: &str,
+        expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
     ) -> Result<bool, MigrationError> {
-        // Check if an artifact with this path already exists
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT checksum_sha256 FROM artifacts WHERE path = $1 AND is_deleted = false LIMIT 1",
+        // Match artifacts in the same repository by repository-relative path.
+        // Keep a fallback for legacy rows where path was saved as repo-prefixed.
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT a.checksum_sha256, a.checksum_sha1
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE r.key = $1
+              AND a.is_deleted = false
+              AND (a.path = $2 OR a.path = $3)
+            ORDER BY CASE WHEN a.path = $2 THEN 0 ELSE 1 END
+            LIMIT 1
+            "#,
         )
-        .bind(path)
+        .bind(repo_key)
+        .bind(artifact_path)
+        .bind(legacy_source_path)
         .fetch_optional(&self.db)
         .await?;
 
         match existing {
             None => Ok(false), // No duplicate
-            Some((existing_checksum,)) => match conflict_resolution {
-                ConflictResolution::Skip => {
-                    // Skip if checksums match (identical content)
-                    Ok(checksum.map_or(true, |c| c == existing_checksum))
-                }
-                ConflictResolution::Overwrite => Ok(false), // Always process
-                ConflictResolution::Rename => Ok(false),    // Always process (will rename)
-            },
+            Some((existing_sha256, existing_sha1)) => Ok(decide_duplicate_match(
+                expected,
+                &existing_sha256,
+                existing_sha1.as_deref(),
+                conflict_resolution,
+            )),
         }
     }
 
@@ -881,9 +951,11 @@ impl MigrationWorker {
     /// detection happened in `finalize_transfer` AFTER the bytes were
     /// committed, leaving corrupt blobs in storage on failure (#1512
     /// review).
+    #[allow(clippy::too_many_arguments)]
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
         artifact_path: &str,
@@ -1020,7 +1092,7 @@ impl MigrationWorker {
 
         if !self.config.dry_run {
             // Check if content already exists (deduplication)
-            let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
+            let exists = repo_storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
                 // Open the temp file as a `ReaderStream` and hand it to
                 // `put_stream` so the upload itself is memory-bounded. The
@@ -1048,7 +1120,7 @@ impl MigrationWorker {
                         ))
                     })
                 });
-                self.storage
+                repo_storage
                     .put_stream(&storage_key, Box::pin(mapped))
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
@@ -1109,8 +1181,8 @@ impl MigrationWorker {
                 }
                 sqlx::query(
                     r#"
-                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/octet-stream')
+                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'application/octet-stream')
                     ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
                     "#,
                 )
@@ -1120,6 +1192,7 @@ impl MigrationWorker {
                 .bind(parsed.version.as_deref())
                 .bind(content_size as i64)
                 .bind(&sha256_hex)
+                .bind(&sha1_hex)
                 .bind(&storage_key)
                 .execute(&self.db)
                 .await?;
@@ -1163,7 +1236,7 @@ impl MigrationWorker {
             size = content_size,
             sha256 = %sha256_hex,
             sha1 = %sha1_hex,
-            "Artifact transferred"
+            "Artifact transferred via streaming (no memory buffering)"
         );
 
         Ok(TransferResult {
@@ -1886,8 +1959,11 @@ fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool 
         return true;
     }
 
-    // Cargo cache: auto-generated config.json
-    if repo_lower.contains("cargo") && artifact_path.ends_with("config.json") {
+    // Cargo cache: auto-generated registry-root config.json. Match the EXACT
+    // root path "config.json" (no slashes), not any nested path that happens
+    // to end with config.json, otherwise we would skip real crate artifacts
+    // that ship a config.json inside their tarball.
+    if repo_lower.contains("cargo") && artifact_path == "config.json" {
         return true;
     }
 
@@ -1940,6 +2016,41 @@ fn build_cache_skip_reason(err_msg: &str) -> String {
 /// string if no separator is present.
 pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
     artifact_path.rsplit('/').next().unwrap_or(artifact_path)
+}
+
+/// Decide whether a duplicate artifact row should be treated as already
+/// present (return `true` -> skip the transfer) or processed (return
+/// `false` -> proceed with the upload).
+///
+/// Pure, DB-free predicate extracted from `check_artifact_duplicate` so the
+/// branch table is exercised by inline tests without standing up Postgres.
+///
+/// Rules, in order:
+/// - `Overwrite` and `Rename` always re-process the artifact.
+/// - For `Skip`, prefer the strongest declared digest:
+///   - sha256: exact match against the stored sha256.
+///   - sha1 (no sha256 declared): exact match against the stored sha1 if
+///     present; if the stored row has no sha1, treat the path collision as
+///     a duplicate (avoids endless remigration loops on legacy rows).
+///   - Neither digest declared: treat as duplicate by path.
+pub(crate) fn decide_duplicate_match(
+    expected: &ExpectedChecksums,
+    existing_sha256: &str,
+    existing_sha1: Option<&str>,
+    conflict_resolution: ConflictResolution,
+) -> bool {
+    match conflict_resolution {
+        ConflictResolution::Overwrite | ConflictResolution::Rename => false,
+        ConflictResolution::Skip => {
+            if let Some(expected_sha256) = expected.sha256.as_deref() {
+                expected_sha256 == existing_sha256
+            } else if let Some(expected_sha1) = expected.sha1.as_deref() {
+                existing_sha1.map_or(true, |s| s == expected_sha1)
+            } else {
+                true
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2089,14 +2200,22 @@ mod tests {
 
     #[test]
     fn test_should_skip_cache_only_artifact_cargo() {
-        // Cargo auto-generated config
+        // Cargo auto-generated registry-root config.json is skipped
         assert!(should_skip_cache_only_artifact(
             "cargo-remote-cache",
             "config.json"
         ));
-        assert!(should_skip_cache_only_artifact(
+        // Nested paths that happen to end with config.json are NOT registry
+        // metadata and must be migrated normally (Round 1 fix).
+        assert!(!should_skip_cache_only_artifact(
             "cargo-cache",
             "1/registry/config.json"
+        ));
+        // And a real crate tarball that happens to contain "config.json" as
+        // its file name should still migrate.
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-cache",
+            "crates/foo/foo-1.0.0/config.json"
         ));
     }
 
@@ -2409,6 +2528,198 @@ mod tests {
             "Docker-Remote-Cache",
             "library/nginx/sha256__abc/manifest.json"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_duplicate_match - DB-free predicate extracted from
+    // check_artifact_duplicate. Each branch of the digest-fallback table is
+    // exercised so the helper has direct coverage instead of being reached
+    // only through the integration path.
+    // -----------------------------------------------------------------------
+
+    fn checksums(sha256: Option<&str>, sha1: Option<&str>) -> ExpectedChecksums {
+        ExpectedChecksums {
+            sha256: sha256.map(String::from),
+            sha1: sha1.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_overwrite_always_reprocesses() {
+        // Overwrite ignores any digest agreement and always returns false so
+        // the caller re-uploads the artifact.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), Some("def")),
+            "abc",
+            Some("def"),
+            ConflictResolution::Overwrite,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_rename_always_reprocesses() {
+        // Rename currently maps to overwrite semantics in migration.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), None),
+            "abc",
+            None,
+            ConflictResolution::Rename,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha256_exact_match() {
+        // Strongest digest available and stored: must agree exactly.
+        assert!(decide_duplicate_match(
+            &checksums(Some("abc"), None),
+            "abc",
+            None,
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha256_mismatch_reprocesses() {
+        // sha256 declared but the stored row differs: not a duplicate.
+        assert!(!decide_duplicate_match(
+            &checksums(Some("abc"), Some("ignored")),
+            "xyz",
+            Some("ignored"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_match_when_no_sha256() {
+        // Source declares only sha1: must compare against stored sha1.
+        assert!(decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "irrelevant-stored-sha256",
+            Some("def"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_mismatch_reprocesses() {
+        // sha1 declared but stored sha1 differs: not a duplicate.
+        assert!(!decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "stored-sha256",
+            Some("other-sha1"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_sha1_legacy_row_without_stored_sha1() {
+        // Source declares sha1 but legacy row predates sha1 storage. To
+        // avoid endless remigration loops we treat the path collision as a
+        // duplicate.
+        assert!(decide_duplicate_match(
+            &checksums(None, Some("def")),
+            "stored-sha256",
+            None,
+            ConflictResolution::Skip,
+        ));
+    }
+
+    #[test]
+    fn test_decide_duplicate_match_skip_no_digests_treats_as_duplicate() {
+        // Neither digest declared: by-path duplicate.
+        assert!(decide_duplicate_match(
+            &checksums(None, None),
+            "stored-sha256",
+            Some("stored-sha1"),
+            ConflictResolution::Skip,
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // migration_artifact_path - pure path-shape helper. Migration must write
+    // the same `<name>/<version>/<filename>` shape AK's publish handlers use
+    // (with a fallback) so download lookups find the migrated rows. These
+    // exercise the non-maven (name/version) and fallback branches.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migration_artifact_path_uses_name_version_filename_when_parsed() {
+        // Happy path: a parseable filename (e.g. npm tarball) yields the
+        // canonical `<name>/<version>/<filename>` shape that AK's publish
+        // handlers already use.
+        let path = migration_artifact_path(
+            "npm",
+            "lodash",
+            Some("4.17.21"),
+            "lodash-4.17.21.tgz",
+            "npm-remote-cache",
+            "lodash/-/lodash-4.17.21.tgz",
+        );
+        assert_eq!(path, "lodash/4.17.21/lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn test_migration_artifact_path_falls_back_when_version_missing() {
+        // No version recovered (unknown format / unparseable filename):
+        // legacy `<repo>/<source-path>` shape.
+        let path = migration_artifact_path(
+            "generic",
+            "raw-blob",
+            None,
+            "blob.bin",
+            "generic-cache",
+            "some/deep/path/blob.bin",
+        );
+        assert_eq!(path, "generic-cache/some/deep/path/blob.bin");
+    }
+
+    #[test]
+    fn test_migration_artifact_path_falls_back_when_version_is_empty() {
+        // Defensive: empty-string version must also trigger the fallback so
+        // we never write `<name>//<filename>` to the artifacts table.
+        let path = migration_artifact_path(
+            "generic",
+            "weird-pkg",
+            Some(""),
+            "weird-pkg.tar",
+            "raw-cache",
+            "weird-pkg.tar",
+        );
+        assert_eq!(path, "raw-cache/weird-pkg.tar");
+    }
+
+    #[test]
+    fn test_migration_artifact_path_preserves_filename_independent_of_source_layout() {
+        // The canonical shape ignores the source-side layout entirely once a
+        // version was recovered. A PyPI wheel migrated from a deeply nested
+        // hash-prefixed cache path still lands under <name>/<version>/<file>.
+        let path = migration_artifact_path(
+            "pypi",
+            "wheel",
+            Some("0.46.2"),
+            "wheel-0.46.2-py3-none-any.whl",
+            "pypi-remote-cache",
+            "13/2c/5e07/wheel-0.46.2-py3-none-any.whl",
+        );
+        assert_eq!(path, "wheel/0.46.2/wheel-0.46.2-py3-none-any.whl");
+    }
+
+    #[test]
+    fn test_migration_artifact_path_maven_uses_group_prefixed_source_path() {
+        // Maven-family formats keep the full group-prefixed source path
+        // verbatim (clients resolve `com/example/.../file.jar` directly).
+        let path = migration_artifact_path(
+            "maven",
+            "commons-lang3",
+            Some("3.12.0"),
+            "commons-lang3-3.12.0.jar",
+            "maven-cache",
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+        );
+        assert_eq!(
+            path,
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+        );
     }
 
     #[test]
@@ -3699,9 +4010,18 @@ mod tests {
             put_calls: put_calls.clone(),
         });
 
+        // transfer_artifact takes the per-repo storage directly (#1420); the
+        // worker's registry is unused on this path, so wrap the counting mock
+        // in a single-backend registry just to satisfy the constructor.
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "filesystem".to_string(),
+            storage.clone() as Arc<dyn StorageBackend>,
+        );
+        let registry = Arc::new(StorageRegistry::new(backends, "filesystem".to_string()));
         let worker = MigrationWorker::new(
             pool.clone(),
-            storage,
+            registry,
             WorkerConfig {
                 verify_checksums: true,
                 dry_run: false,
@@ -3722,6 +4042,7 @@ mod tests {
         let result = worker
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
+                storage.clone(),
                 "irrelevant-repo",
                 "generic",
                 "irrelevant/path",
@@ -3889,9 +4210,17 @@ mod tests {
             put_file_calls: put_file_calls.clone(),
         });
 
+        // transfer_artifact takes the per-repo storage directly (#1420); wrap
+        // the counting mock in a single-backend registry for the constructor.
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "filesystem".to_string(),
+            storage.clone() as Arc<dyn StorageBackend>,
+        );
+        let registry = Arc::new(StorageRegistry::new(backends, "filesystem".to_string()));
         let worker = MigrationWorker::new(
             pool.clone(),
-            storage,
+            registry,
             WorkerConfig {
                 verify_checksums: true,
                 dry_run: false,
@@ -3910,6 +4239,7 @@ mod tests {
         let _ = worker
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
+                storage.clone(),
                 "irrelevant-repo",
                 "generic",
                 "irrelevant/path",

@@ -1,0 +1,34 @@
+# cargo-nextest configuration.
+#
+# The coverage CI job runs the suite via `cargo llvm-cov nextest`, which
+# executes each test in its OWN PROCESS. Several DB integration tests serialize
+# themselves with an *in-process* `tokio::Mutex` because they mutate GLOBAL,
+# cluster-wide state and assert on exact results:
+#
+#   * `scan_result_service.rs` `CLEANUP_TEST_LOCK` — the `cleanup_stuck_scans_*`
+#     tests share the global stuck-scan reap query + `pg_try_advisory_xact_lock(
+#     STUCK_SCAN_LOCK_ID)`. Concurrent ticks see the lock held by a sibling and
+#     reap 0, failing `assert!(reaped >= 1)`.
+#   * `storage_gc_service.rs` `STORAGE_GC_TEST_LOCK` (via `storage_gc_test_guard`)
+#     — the `test_run_gc_*` tests run a cluster-wide GC reap and assert on the
+#     exact set of keys collected. A concurrent GC test reaps another's fixtures
+#     first, failing e.g. "GC result should include the upload temp and part keys".
+#
+# Under nextest's process-per-test model those in-process mutexes do NOT
+# serialize across the suite, so the tests interfere nondeterministically, fail,
+# and abort the instrumented run before `lcov.info` is written — leaving the
+# Code Coverage gate red (#1753). The plain `cargo test --workspace --lib`
+# unit-test job runs every test in a single process, so the in-process mutexes
+# still work there — which is why that gate stays green while coverage fails.
+#
+# Pin every test that mutates this shared DB state to a single-threaded test
+# group so nextest never runs two of them at once, restoring the serialization
+# the in-process mutexes provide under `cargo test`. Add new tests that take
+# STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()` to the matching filter below.
+
+[test-groups]
+db-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests)'
+test-group = 'db-serial'

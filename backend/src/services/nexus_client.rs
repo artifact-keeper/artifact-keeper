@@ -371,6 +371,17 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         self.list_artifacts(repo_key, offset, limit).await
     }
 
+    async fn list_artifacts_with_date_filter(
+        &self,
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+        _modified_after: Option<&str>,
+        _modified_before: Option<&str>,
+    ) -> Result<AqlResponse, ArtifactoryError> {
+        self.list_artifacts(repo_key, offset, limit).await
+    }
+
     async fn download_artifact(
         &self,
         repo_key: &str,
