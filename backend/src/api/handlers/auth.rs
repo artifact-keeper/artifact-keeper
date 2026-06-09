@@ -233,9 +233,33 @@ pub async fn login(
 )]
 pub async fn logout(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     auth: Option<Extension<AuthExtension>>,
+    body: Option<Json<RefreshTokenRequest>>,
 ) -> Result<Response> {
     if let Some(Extension(auth)) = auth {
+        // Revoke the refresh-token family for THIS session so the presented
+        // refresh token (and its rotation lineage) stop working after logout
+        // (#1807). Scoped to the session's family_id rather than a user-wide
+        // watermark, so other concurrent sessions stay alive. Browser clients
+        // carry the refresh token in the ak_refresh_token cookie; CLI/mobile
+        // clients pass it in the request body (like /auth/refresh). A missing
+        // or malformed refresh token is ignored: logout still clears cookies
+        // and succeeds.
+        let refresh = body
+            .and_then(|Json(b)| b.refresh_token)
+            .or_else(|| extract_cookie(&headers, "ak_refresh_token").map(String::from));
+        if let Some(refresh) = refresh {
+            let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+            if let Err(err) = auth_service.revoke_refresh_token_family_for(&refresh).await {
+                tracing::warn!(
+                    user_id = %auth.user_id,
+                    error = %err,
+                    "logout: failed to revoke refresh-token family",
+                );
+            }
+        }
+
         audit_auth(
             &state,
             AuditAction::Logout,

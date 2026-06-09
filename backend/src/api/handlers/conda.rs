@@ -2639,7 +2639,11 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
         ));
     }
 
-    // Validate that metadata extraction succeeds and has required fields
+    // Validate that metadata extraction succeeds and has required fields,
+    // and that those fields agree with the uploaded filename. Conda clients
+    // key repodata.json off the filename, so a mismatch between the embedded
+    // index.json and the filename silently publishes a package under the
+    // wrong coordinates (the embedded metadata is discarded). Reject it.
     if let Some(meta) = extract_conda_metadata(content, filename) {
         if meta.get("name").and_then(|v| v.as_str()).is_none() {
             return Err("Invalid package metadata: missing 'name' field".to_string());
@@ -2647,9 +2651,56 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
         if meta.get("version").and_then(|v| v.as_str()).is_none() {
             return Err("Invalid package metadata: missing 'version' field".to_string());
         }
+        check_filename_matches_metadata(filename, &meta)?;
     }
     // Note: we don't fail if metadata extraction fails entirely, since
     // the filename already carries name/version info. The package is still usable.
+
+    Ok(())
+}
+
+/// Cross-check the uploaded filename against the embedded `index.json`
+/// metadata. Returns an error string when the filename-derived
+/// `name`/`version`/`build` disagree with the metadata fields.
+///
+/// The `build` is only compared when present in both the filename and the
+/// metadata, since some legacy v1 packages omit a `build` key in index.json.
+/// If the filename cannot be parsed at all, validation is left to the
+/// structural checks above (we do not fail solely on an unparseable name).
+fn check_filename_matches_metadata(
+    filename: &str,
+    meta: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let Ok((fname, fver, fbuild)) =
+        crate::formats::conda_native::CondaNativeHandler::parse_package_filename(filename)
+    else {
+        return Ok(());
+    };
+
+    if let Some(meta_name) = meta.get("name").and_then(|v| v.as_str()) {
+        if meta_name != fname {
+            return Err(format!(
+                "Package name mismatch: filename declares '{}' but index.json metadata says '{}'",
+                fname, meta_name
+            ));
+        }
+    }
+    if let Some(meta_version) = meta.get("version").and_then(|v| v.as_str()) {
+        if meta_version != fver {
+            return Err(format!(
+                "Package version mismatch: filename declares '{}' but index.json metadata says '{}'",
+                fver, meta_version
+            ));
+        }
+    }
+    if let Some(meta_build) = meta.get("build").and_then(|v| v.as_str()) {
+        if meta_build != fbuild {
+            return Err(format!(
+                "Package build mismatch: filename declares '{}' but index.json metadata says '{}'",
+                fbuild, meta_build
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -4461,6 +4512,68 @@ mod tests {
         assert!(
             result.is_ok(),
             "Valid .tar.bz2 package should pass: {:?}",
+            result
+        );
+    }
+
+    /// Regression (#1782): the uploaded filename must match the embedded
+    /// index.json metadata. Previously a package whose filename declared
+    /// `postpkg-3.0.0-py312_0` while index.json said `name=testpkg,
+    /// version=1.0.0` was accepted and silently published under the
+    /// filename coordinates, discarding the embedded metadata.
+    #[test]
+    fn test_validate_v1_package_filename_metadata_mismatch_name() {
+        let index = serde_json::json!({
+            "name": "testpkg",
+            "version": "1.0.0",
+            "build": "py310_0",
+            "depends": [],
+        });
+        let package = build_test_conda_v1_package(&index);
+        // Filename declares a completely different package than index.json.
+        let result = validate_conda_package(&package, "postpkg-3.0.0-py312_0.tar.bz2");
+        assert!(
+            result.is_err(),
+            "filename/metadata mismatch must be rejected, got Ok"
+        );
+        assert!(
+            result.unwrap_err().contains("name mismatch"),
+            "expected a name-mismatch error"
+        );
+    }
+
+    #[test]
+    fn test_validate_v1_package_filename_metadata_mismatch_version() {
+        let index = serde_json::json!({
+            "name": "testpkg",
+            "version": "1.0.0",
+            "build": "py310_0",
+            "depends": [],
+        });
+        let package = build_test_conda_v1_package(&index);
+        // Same name+build, but the version differs from index.json.
+        let result = validate_conda_package(&package, "testpkg-9.9.9-py310_0.tar.bz2");
+        assert!(result.is_err(), "version mismatch must be rejected, got Ok");
+        assert!(
+            result.unwrap_err().contains("version mismatch"),
+            "expected a version-mismatch error"
+        );
+    }
+
+    #[test]
+    fn test_validate_v1_package_filename_metadata_match_ok() {
+        let index = serde_json::json!({
+            "name": "testpkg",
+            "version": "1.0.0",
+            "build": "py310_0",
+            "depends": [],
+        });
+        let package = build_test_conda_v1_package(&index);
+        // Filename agrees with index.json on name, version, and build.
+        let result = validate_conda_package(&package, "testpkg-1.0.0-py310_0.tar.bz2");
+        assert!(
+            result.is_ok(),
+            "matching filename/metadata must pass: {:?}",
             result
         );
     }

@@ -24,6 +24,11 @@ pub struct UploadSession {
     pub artifact_path: String,
     pub artifact_name: Option<String>,
     pub artifact_version: Option<String>,
+    pub artifact_metadata_format: Option<String>,
+    pub artifact_metadata: Option<serde_json::Value>,
+    pub artifact_metadata_properties: Option<serde_json::Value>,
+    pub package_description: Option<String>,
+    pub package_metadata: Option<serde_json::Value>,
     pub content_type: String,
     pub total_size: i64,
     pub chunk_size: i32,
@@ -171,6 +176,11 @@ pub struct CreateSessionParams<'a> {
     pub artifact_path: &'a str,
     pub artifact_name: Option<&'a str>,
     pub artifact_version: Option<&'a str>,
+    pub artifact_metadata_format: Option<&'a str>,
+    pub artifact_metadata: Option<&'a serde_json::Value>,
+    pub artifact_metadata_properties: Option<&'a serde_json::Value>,
+    pub package_description: Option<&'a str>,
+    pub package_metadata: Option<&'a serde_json::Value>,
     pub total_size: i64,
     pub chunk_size: Option<i32>,
     pub checksum_sha256: &'a str,
@@ -201,6 +211,11 @@ impl UploadService {
         let content_type = p.content_type.unwrap_or("application/octet-stream");
         let artifact_name = normalize_optional_metadata(p.artifact_name);
         let artifact_version = normalize_optional_metadata(p.artifact_version);
+        let artifact_metadata_format = normalize_optional_metadata(p.artifact_metadata_format);
+        let artifact_metadata = p.artifact_metadata.cloned();
+        let artifact_metadata_properties = p.artifact_metadata_properties.cloned();
+        let package_description = normalize_optional_metadata(p.package_description);
+        let package_metadata = p.package_metadata.cloned();
 
         let session_id = Uuid::new_v4();
         let temp_dir = PathBuf::from(p.storage_path).join(".uploads");
@@ -224,9 +239,12 @@ impl UploadService {
             r#"
             INSERT INTO upload_sessions
                 (id, user_id, repository_id, repository_key, artifact_path,
-                 artifact_name, artifact_version, content_type, total_size,
-                 chunk_size, total_chunks, checksum_sha256, temp_file_path)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 artifact_name, artifact_version, artifact_metadata_format,
+                 artifact_metadata, artifact_metadata_properties, package_description,
+                 package_metadata, content_type, total_size, chunk_size, total_chunks,
+                 checksum_sha256, temp_file_path)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18)
             RETURNING *
             "#,
         )
@@ -237,6 +255,11 @@ impl UploadService {
         .bind(p.artifact_path)
         .bind(artifact_name)
         .bind(artifact_version)
+        .bind(artifact_metadata_format)
+        .bind(artifact_metadata)
+        .bind(artifact_metadata_properties)
+        .bind(package_description)
+        .bind(package_metadata)
         .bind(content_type)
         .bind(p.total_size)
         .bind(chunk_size)
@@ -1340,6 +1363,11 @@ mod tests {
             artifact_path: "path/to/file.bin".into(),
             artifact_name: Some("source-name".into()),
             artifact_version: Some("1.0.0".into()),
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
             content_type: "application/octet-stream".into(),
             total_size: 1024,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -1369,6 +1397,11 @@ mod tests {
             artifact_path: "file.bin".into(),
             artifact_name: None,
             artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
             content_type: "application/octet-stream".into(),
             total_size: 100,
             chunk_size: DEFAULT_CHUNK_SIZE,

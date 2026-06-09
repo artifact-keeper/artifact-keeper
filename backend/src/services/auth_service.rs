@@ -1195,6 +1195,37 @@ impl AuthService {
         Ok(result.rows_affected())
     }
 
+    /// Revoke just the refresh-token family carried by `refresh_token` (the
+    /// session being logged out). Unlike [`revoke_all_refresh_token_families`]
+    /// this is scoped to a single `family_id`, so logging out one session does
+    /// not tear down the user's other concurrent sessions (#1807).
+    ///
+    /// Returns the number of jti rows revoked (0 if the token carries no
+    /// `family_id` -- e.g. tokens predating the replay table -- or is already
+    /// revoked). Decode failures bubble up so callers can ignore a malformed
+    /// token without revoking anything.
+    pub async fn revoke_refresh_token_family_for(&self, refresh_token: &str) -> Result<u64> {
+        let token_data = self.decode_token(refresh_token)?;
+        if token_data.claims.token_type != "refresh" {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+        let Some(family_id) = token_data.claims.family_id else {
+            return Ok(0);
+        };
+        let result = sqlx::query(
+            r#"
+            UPDATE refresh_token_jti
+            SET revoked_at = NOW()
+            WHERE family_id = $1 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(family_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     /// Delete refresh-token jti rows whose underlying JWT expired more than
     /// `grace` ago. Called by the scheduler janitor (#1174 cleanup).
     /// Returns the number of rows removed.
@@ -4096,6 +4127,79 @@ mod tests {
         assert!(!rejected, "token issued after watermark must be accepted");
 
         // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression for #1807: logging out must revoke the session's
+    /// refresh-token family so the presented refresh token can no longer be
+    /// rotated. Before the fix `logout()` only cleared cookies, so the refresh
+    /// token kept working. `revoke_refresh_token_family_for` is the new
+    /// service hook logout calls; this exercises it end-to-end against the
+    /// `refresh_token_jti` table and the real `refresh_tokens` rotation path.
+    #[tokio::test]
+    async fn test_logout_revokes_refresh_token_family() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("logout_rev_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+
+        let config = make_test_config();
+        let svc = AuthService::new(pool.clone(), config);
+
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username.clone();
+
+        // Control: a freshly minted, persisted refresh token rotates fine
+        // BEFORE logout (proves the family is live and the test plumbing is
+        // sound).
+        let pre = svc.generate_tokens(&user).expect("mint pre-logout pair");
+        svc.persist_refresh_jti_from_pair(&pre, user_id)
+            .await
+            .expect("persist pre-logout jti");
+        assert!(
+            svc.refresh_tokens(&pre.refresh_token).await.is_ok(),
+            "refresh token must rotate before logout"
+        );
+
+        // Mint a second session and persist it. This is the session we log
+        // out of.
+        let session = svc.generate_tokens(&user).expect("mint session pair");
+        svc.persist_refresh_jti_from_pair(&session, user_id)
+            .await
+            .expect("persist session jti");
+
+        // Logout revokes the family for the presented refresh token.
+        let revoked = svc
+            .revoke_refresh_token_family_for(&session.refresh_token)
+            .await
+            .expect("revoke family on logout");
+        assert_eq!(revoked, 1, "exactly the session's family row is revoked");
+
+        // The refresh token from the logged-out session must now be rejected.
+        let err = svc
+            .refresh_tokens(&session.refresh_token)
+            .await
+            .expect_err("logged-out refresh token must be rejected");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected 401 Authentication error after logout, got {err:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
             .execute(&pool)
             .await;

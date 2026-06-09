@@ -682,6 +682,7 @@ fn content_type_for_path(path: &str) -> &'static str {
 
 async fn download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
@@ -723,7 +724,17 @@ async fn download(
             // generation below only queries `repo.id` (which has no
             // artifact rows for a virtual). #1444.
             if repo.repo_type == RepositoryType::Virtual {
+                // #1804: gate the per-member stored-file probes so a public
+                // virtual repo cannot serve a PRIVATE member's stored checksum
+                // or metadata file to a caller who could not read that member
+                // directly.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.permission_service,
+                    auth.as_ref(),
+                    members,
+                )
+                .await;
                 for member in &members {
                     if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
                         if let Ok(content) = member_storage.get(&checksum_storage_key).await {
@@ -765,6 +776,94 @@ async fn download(
                                 .body(Body::from(checksum))
                                 .unwrap());
                         }
+                    }
+                }
+
+                // For remote members, proxy the checksum file (or the
+                // metadata file) from upstream. Proxy-cached metadata is not
+                // in the `artifacts` table, so the generation above cannot
+                // serve checksums for a remote member's upstream metadata. The
+                // virtual repo's own (empty) storage probed earlier also misses.
+                for member in &members {
+                    if member.repo_type == RepositoryType::Remote {
+                        if let (Some(upstream_url), Some(ref proxy)) =
+                            (member.upstream_url.as_deref(), &state.proxy_service)
+                        {
+                            // Prefer the upstream checksum file directly.
+                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                            )
+                            .await
+                            {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/plain")
+                                    .body(Body::from(content))
+                                    .unwrap());
+                            }
+                            // Otherwise compute it from the upstream metadata file.
+                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                base_path,
+                            )
+                            .await
+                            {
+                                let checksum = compute_checksum(&content, checksum_type);
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/plain")
+                                    .body(Body::from(checksum))
+                                    .unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Proxy the checksum file from upstream for remote repos, or
+            // compute it from the proxied metadata file. Proxy-cached metadata
+            // is not in the `artifacts` table, so the DB-only generation below
+            // never serves a checksum for a remote repo's upstream metadata.
+            if metadata_checksum_should_proxy_upstream(
+                &repo.repo_type,
+                repo.upstream_url.is_some(),
+                state.proxy_service.is_some(),
+            ) {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    if let Ok((content, _)) =
+                        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
+                            .await
+                    {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                    if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        base_path,
+                    )
+                    .await
+                    {
+                        let checksum = compute_checksum(&content, checksum_type);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(checksum))
+                            .unwrap());
                     }
                 }
             }
@@ -1042,7 +1141,17 @@ async fn download(
 
         // Virtual repo: try each member in priority order
         if repo.repo_type == RepositoryType::Virtual {
+            // #1804: only members the caller could read directly may serve a
+            // checksum. A private member's checksum reveals the existence and
+            // exact content hash of its artifact, so it must be gated the same
+            // way the artifact bytes are.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            let members = proxy_helpers::authorize_virtual_members(
+                &state.permission_service,
+                auth.as_ref(),
+                members,
+            )
+            .await;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
@@ -1089,7 +1198,7 @@ async fn download(
     }
 
     // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path).await
+    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
 }
 
 async fn generate_metadata_for_artifact(
@@ -1140,6 +1249,7 @@ async fn serve_artifact(
     repo: &RepoInfo,
     repo_key: &str,
     path: &str,
+    auth: Option<&AuthExtension>,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -1250,10 +1360,24 @@ async fn serve_artifact(
                     state.proxy_service.as_deref()
                 };
 
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
+                // #1804: authorize each member against the caller before any of
+                // its bytes can be served. A public virtual repo must not turn
+                // into a confused deputy that streams its PRIVATE members'
+                // artifacts to anonymous / unprivileged callers. Members the
+                // caller could not read directly are dropped, so a denied
+                // member behaves exactly as if it did not contain the artifact
+                // (404), never leaking its existence.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.permission_service,
+                    auth,
+                    members,
+                )
+                .await;
+
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    members,
                     proxy_for_virtual,
-                    repo.id,
                     path,
                     |member_id, location| {
                         let db = db.clone();
@@ -1424,6 +1548,24 @@ async fn serve_artifact(
 /// unit-tested without constructing a full repository row.
 fn checksum_compute_eligible(repo_type: &str) -> bool {
     repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
+}
+
+/// Whether a `maven-metadata.xml.<algo>` checksum request should be served by
+/// proxying upstream (either the upstream checksum file, or computed from the
+/// upstream metadata file).
+///
+/// Remote repos (and remote members of a virtual) cache the upstream
+/// `maven-metadata.xml` in the proxy cache, not the `artifacts` table, so the
+/// DB-only `generate_metadata_for_artifact` path returns no rows and the
+/// request previously 404'd. Proxying is only possible when the repo is
+/// `Remote` and has both an `upstream_url` and a configured proxy service
+/// (#1775).
+fn metadata_checksum_should_proxy_upstream(
+    repo_type: &str,
+    has_upstream_url: bool,
+    has_proxy_service: bool,
+) -> bool {
+    repo_type == RepositoryType::Remote && has_upstream_url && has_proxy_service
 }
 
 async fn serve_computed_checksum(
@@ -2109,6 +2251,53 @@ mod tests {
         assert!(RepositoryType::Staging.is_hosted());
         assert!(!RepositoryType::Remote.is_hosted());
         assert!(!RepositoryType::Virtual.is_hosted());
+    }
+
+    // -----------------------------------------------------------------------
+    // metadata_checksum_should_proxy_upstream (#1775): artifact-level
+    // maven-metadata.xml.<algo> requests against a remote repo (or a remote
+    // member of a virtual) must fall back to proxying upstream instead of
+    // 404'ing, because proxy-cached metadata is not in the `artifacts` table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metadata_checksum_proxies_for_remote_with_upstream_and_proxy() {
+        // Regression for #1775: a fully-configured remote repo must proxy the
+        // metadata checksum upstream rather than return 404.
+        assert!(metadata_checksum_should_proxy_upstream(
+            RepositoryType::Remote.as_str(),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_metadata_checksum_no_proxy_when_missing_upstream_or_service() {
+        // Cannot proxy without an upstream URL or a configured proxy service.
+        assert!(!metadata_checksum_should_proxy_upstream(
+            RepositoryType::Remote.as_str(),
+            false,
+            true,
+        ));
+        assert!(!metadata_checksum_should_proxy_upstream(
+            RepositoryType::Remote.as_str(),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn test_metadata_checksum_no_proxy_for_hosted_or_virtual() {
+        // Hosted repos serve checksums from their own storage / artifact rows;
+        // virtual repos are resolved per-member. Neither proxies at the top
+        // level.
+        for ty in [
+            RepositoryType::Local.as_str(),
+            RepositoryType::Staging.as_str(),
+            RepositoryType::Virtual.as_str(),
+        ] {
+            assert!(!metadata_checksum_should_proxy_upstream(ty, true, true));
+        }
     }
 
     fn sample_coords() -> MavenCoordinates {
