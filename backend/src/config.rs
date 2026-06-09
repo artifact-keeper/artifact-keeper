@@ -896,35 +896,148 @@ impl Config {
         Ok(config)
     }
 
-    /// Validate that JWT_SECRET meets minimum security requirements in production.
-    /// Validation is enforced only when ENVIRONMENT is explicitly set to "production".
+    /// Validate that JWT_SECRET meets minimum security requirements.
+    ///
+    /// In production (`ENVIRONMENT=production`) any weakness is a hard error so
+    /// the process refuses to start. In every other environment the same checks
+    /// run but only emit a `warn!` — dev/test must not be blocked, yet operators
+    /// still get a clear signal when a weak or placeholder secret is in use.
     fn validate_jwt_secret(&self) -> Result<()> {
         let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into());
-        if environment != "production" {
+        let warnings = jwt_secret_warnings(&self.jwt_secret);
+
+        if environment == "production" {
+            if let Some(first) = warnings.first() {
+                return Err(AppError::Config(format!(
+                    "JWT_SECRET is unsuitable for production: {} \
+                     Generate a secure random secret (e.g. `openssl rand -base64 48`).",
+                    first.message()
+                )));
+            }
             return Ok(());
         }
 
-        const KNOWN_PLACEHOLDERS: &[&str] = &[
-            "change-me-in-production-please",
-            "change-this-in-production-use-at-least-32-bytes",
-        ];
-
-        if self.jwt_secret.len() < 32 {
-            return Err(AppError::Config(
-                "JWT_SECRET must be at least 32 characters when ENVIRONMENT=production".into(),
-            ));
-        }
-
-        if KNOWN_PLACEHOLDERS.contains(&self.jwt_secret.as_str()) {
-            return Err(AppError::Config(
-                "JWT_SECRET is set to a known placeholder value. \
-                 Generate a secure random secret for production use."
-                    .into(),
-            ));
+        // Non-production: never hard-fail, but surface every weakness so the
+        // operator can rotate the secret before promoting the deployment.
+        for warning in &warnings {
+            tracing::warn!(
+                environment = %environment,
+                "JWT_SECRET weakness: {} This is tolerated outside production, but \
+                 the value MUST be replaced with a strong random secret before \
+                 deploying to production. Generate one with `openssl rand -base64 48`.",
+                warning.message()
+            );
         }
 
         Ok(())
     }
+}
+
+/// Known throwaway / placeholder JWT secrets that must never reach production.
+/// Kept lowercase; comparison is case-insensitive in `jwt_secret_warnings`.
+const KNOWN_PLACEHOLDERS: &[&str] = &[
+    "change-me-in-production-please",
+    "change-this-in-production-use-at-least-32-bytes",
+    "change-me",
+    "changeme",
+    "secret",
+    "jwt-secret",
+    "jwt_secret",
+    "my-secret",
+    "mysecret",
+    // NB: well-known doc-example secrets (e.g. the jwt.io sample) are
+    // intentionally NOT listed here as literals — the low-entropy heuristic
+    // below already flags them, and listing them trips secret scanners.
+    "supersecret",
+    "super-secret",
+    "test-secret",
+    "testsecret",
+    "dev-secret",
+    "development",
+    "password",
+    "insecure",
+    "todo",
+    "placeholder",
+];
+
+/// A specific weakness detected in a JWT secret. Pure data so the detection
+/// logic is unit-testable without touching the environment or a logger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JwtSecretWarning {
+    /// Fewer than 32 characters.
+    TooShort,
+    /// Matches a well-known placeholder/throwaway value.
+    KnownPlaceholder,
+    /// Low entropy: too few distinct characters or an obvious repeat/sequence.
+    LowEntropy,
+}
+
+impl JwtSecretWarning {
+    fn message(self) -> &'static str {
+        match self {
+            JwtSecretWarning::TooShort => "it is shorter than 32 characters.",
+            JwtSecretWarning::KnownPlaceholder => "it is a known placeholder/default value.",
+            JwtSecretWarning::LowEntropy => {
+                "it has low entropy (too few distinct characters or an obvious pattern)."
+            }
+        }
+    }
+}
+
+/// Pure secret-strength check. Returns the list of weaknesses found, in a
+/// stable order, or an empty vec for a strong secret. Shared by production
+/// (hard-fail) and non-production (warn-only) paths so behavior matches.
+pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
+    let mut warnings = Vec::new();
+
+    if secret.len() < 32 {
+        warnings.push(JwtSecretWarning::TooShort);
+    }
+
+    if KNOWN_PLACEHOLDERS.contains(&secret.to_lowercase().as_str()) {
+        warnings.push(JwtSecretWarning::KnownPlaceholder);
+    }
+
+    if is_low_entropy(secret) {
+        warnings.push(JwtSecretWarning::LowEntropy);
+    }
+
+    warnings
+}
+
+/// Heuristic low-entropy detector for JWT secrets.
+///
+/// Flags secrets that are clearly low-entropy regardless of length: fewer than
+/// 16 distinct characters, a single repeated character, or an obvious
+/// monotonic character sequence (e.g. "abcdefgh...", "12345678..."). It is
+/// intentionally conservative — a genuinely random secret of reasonable length
+/// will comfortably clear these bars and produce no warning.
+fn is_low_entropy(secret: &str) -> bool {
+    if secret.is_empty() {
+        return true;
+    }
+
+    let chars: Vec<char> = secret.chars().collect();
+
+    // Distinct-character count: a strong random secret of 32+ bytes will have
+    // many distinct characters; fewer than 16 is suspiciously low.
+    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len();
+    if distinct < 16 {
+        return true;
+    }
+
+    // Obvious monotonic run over the whole string (ascending or descending by 1),
+    // e.g. the lowercase alphabet immediately followed by the ten digits.
+    let is_run = |step: i32| {
+        chars
+            .windows(2)
+            .all(|w| (w[1] as i32 - w[0] as i32) == step)
+    };
+    if chars.len() >= 2 && (is_run(1) || is_run(-1)) {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -2561,6 +2674,135 @@ mod tests {
         match saved_url {
             Some(v) => env::set_var("DEPENDENCY_TRACK_URL", v),
             None => env::remove_var("DEPENDENCY_TRACK_URL"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // jwt_secret_warnings (pure; secret-strength detection, shared by the
+    // production hard-fail path and the non-production warn path)
+    // -----------------------------------------------------------------------
+
+    /// A long, varied, non-sequential secret is strong and yields no warnings.
+    /// Deliberately a readable passphrase (not a credential-shaped literal) so
+    /// secret scanners do not flag this test fixture.
+    const STRONG_SECRET: &str = "example-strong-passphrase-with-mixed-words-and-digits-13579";
+
+    #[test]
+    fn jwt_warnings_strong_secret_is_clean() {
+        assert!(
+            jwt_secret_warnings(STRONG_SECRET).is_empty(),
+            "a strong random secret must produce no warnings"
+        );
+    }
+
+    #[test]
+    fn jwt_warnings_too_short() {
+        // A short (<32) value flags TooShort. Use a readable, non-credential-
+        // shaped literal so secret scanners do not flag this test fixture.
+        let secret = "short-passphrase-not-secret"; // 27 chars
+        let w = jwt_secret_warnings(secret);
+        assert!(w.contains(&JwtSecretWarning::TooShort));
+        assert!(!w.contains(&JwtSecretWarning::KnownPlaceholder));
+    }
+
+    #[test]
+    fn jwt_warnings_known_placeholder_case_insensitive() {
+        assert!(jwt_secret_warnings("change-me-in-production-please")
+            .contains(&JwtSecretWarning::KnownPlaceholder));
+        assert!(
+            jwt_secret_warnings("ChangeMe").contains(&JwtSecretWarning::KnownPlaceholder),
+            "placeholder match must be case-insensitive"
+        );
+        assert!(
+            jwt_secret_warnings("SECRET").contains(&JwtSecretWarning::KnownPlaceholder),
+            "extended placeholder list must include common throwaways"
+        );
+    }
+
+    #[test]
+    fn jwt_warnings_low_entropy_repeated_char() {
+        // 40 identical chars: long enough, but 1 distinct char -> low entropy.
+        let secret = "a".repeat(40);
+        let w = jwt_secret_warnings(&secret);
+        assert!(w.contains(&JwtSecretWarning::LowEntropy));
+        assert!(
+            !w.contains(&JwtSecretWarning::TooShort),
+            "40 chars is not too short"
+        );
+    }
+
+    #[test]
+    fn jwt_warnings_low_entropy_sequential() {
+        // A single ascending run of 40 ASCII chars: 40 distinct characters and
+        // long enough, but every step is +1 -> an obvious pattern -> low entropy.
+        let secret: String = (b' '..=b'G').map(|b| b as char).collect();
+        assert_eq!(secret.len(), 40);
+        assert!(jwt_secret_warnings(&secret).contains(&JwtSecretWarning::LowEntropy));
+    }
+
+    #[test]
+    fn jwt_warnings_short_placeholder_stacks() {
+        // "secret" is short, a known placeholder, AND low entropy: all three.
+        let w = jwt_secret_warnings("secret");
+        assert!(w.contains(&JwtSecretWarning::TooShort));
+        assert!(w.contains(&JwtSecretWarning::KnownPlaceholder));
+        assert!(w.contains(&JwtSecretWarning::LowEntropy));
+    }
+
+    #[test]
+    fn validate_jwt_secret_production_rejects_weak() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_env = env::var("ENVIRONMENT").ok();
+        env::set_var("ENVIRONMENT", "production");
+
+        let mut config = Config::test_config();
+        config.jwt_secret = "secret".into();
+        let result = config.validate_jwt_secret();
+        assert!(result.is_err(), "production must reject a weak secret");
+        assert!(result.unwrap_err().to_string().contains("JWT_SECRET"));
+
+        match saved_env {
+            Some(v) => env::set_var("ENVIRONMENT", v),
+            None => env::remove_var("ENVIRONMENT"),
+        }
+    }
+
+    #[test]
+    fn validate_jwt_secret_production_accepts_strong() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_env = env::var("ENVIRONMENT").ok();
+        env::set_var("ENVIRONMENT", "production");
+
+        let mut config = Config::test_config();
+        config.jwt_secret = STRONG_SECRET.into();
+        assert!(
+            config.validate_jwt_secret().is_ok(),
+            "production must accept a strong secret"
+        );
+
+        match saved_env {
+            Some(v) => env::set_var("ENVIRONMENT", v),
+            None => env::remove_var("ENVIRONMENT"),
+        }
+    }
+
+    #[test]
+    fn validate_jwt_secret_non_production_tolerates_weak() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_env = env::var("ENVIRONMENT").ok();
+        env::set_var("ENVIRONMENT", "development");
+
+        // The warning path runs (emits tracing::warn!) but must NOT fail.
+        let mut config = Config::test_config();
+        config.jwt_secret = "secret".into();
+        assert!(
+            config.validate_jwt_secret().is_ok(),
+            "non-production must tolerate (warn, not fail) a weak secret"
+        );
+
+        match saved_env {
+            Some(v) => env::set_var("ENVIRONMENT", v),
+            None => env::remove_var("ENVIRONMENT"),
         }
     }
 }
