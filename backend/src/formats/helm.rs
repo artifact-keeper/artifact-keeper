@@ -15,6 +15,39 @@ use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
 
+/// Maximum number of decompressed bytes read from a single tar entry
+/// (e.g. Chart.yaml / values.yaml) before rejecting the upload.
+///
+/// A well-formed Chart.yaml / values.yaml is well under a few hundred KiB.
+/// Capping the per-entry read defends against gzip/tar decompression bombs:
+/// a small compressed payload can otherwise inflate to gigabytes and exhaust
+/// backend memory. The compressed-body limit (axum `DefaultBodyLimit`) only
+/// bounds the COMPRESSED request, not the decompressed output, so an explicit
+/// cap on the inflated stream is required here.
+const MAX_METADATA_ENTRY_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
+/// Read a tar entry into a `String`, capping the decompressed size at
+/// `MAX_METADATA_ENTRY_BYTES`. Rejects gzip/tar decompression bombs by
+/// failing fast once the cap is exceeded, before unbounded buffering.
+fn read_capped_entry_to_string<R: Read>(entry: R, what: &str) -> Result<String> {
+    // Read one extra byte so we can detect "limit exceeded" rather than a
+    // payload that exactly fills the cap.
+    let mut limited = entry.take(MAX_METADATA_ENTRY_BYTES + 1);
+    let mut content = String::new();
+    limited
+        .read_to_string(&mut content)
+        .map_err(|e| AppError::Validation(format!("Failed to read {}: {}", what, e)))?;
+
+    if content.len() as u64 > MAX_METADATA_ENTRY_BYTES {
+        return Err(AppError::Validation(format!(
+            "{} exceeds maximum allowed size of {} bytes",
+            what, MAX_METADATA_ENTRY_BYTES
+        )));
+    }
+
+    Ok(content)
+}
+
 /// Helm format handler
 pub struct HelmHandler;
 
@@ -112,10 +145,7 @@ impl HelmHandler {
 
             // Chart.yaml is typically in <chartname>/Chart.yaml
             if path.ends_with("Chart.yaml") {
-                let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read Chart.yaml: {}", e))
-                })?;
+                let content = read_capped_entry_to_string(&mut entry, "Chart.yaml")?;
 
                 return serde_yaml::from_str(&content)
                     .map_err(|e| AppError::Validation(format!("Invalid Chart.yaml: {}", e)));
@@ -145,10 +175,7 @@ impl HelmHandler {
 
             // values.yaml is typically in <chartname>/values.yaml
             if path.ends_with("values.yaml") {
-                let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read values.yaml: {}", e))
-                })?;
+                let content = read_capped_entry_to_string(&mut entry, "values.yaml")?;
 
                 let values: serde_yaml::Value = serde_yaml::from_str(&content)
                     .map_err(|e| AppError::Validation(format!("Invalid values.yaml: {}", e)))?;
@@ -848,5 +875,75 @@ version: "1.0.0"
         assert_eq!(parsed.chart.name, "test");
         assert_eq!(parsed.urls.len(), 1);
         assert_eq!(parsed.digest, "sha256:abc");
+    }
+
+    // ---- decompression-bomb cap (issue #1806) ----
+
+    /// Build a gzip-compressed tar (`.tgz`) containing a single file at
+    /// `path` whose contents are `body`. Used to construct both a legitimate
+    /// chart and an oversized "bomb" entry.
+    fn build_tgz(path: &str, body: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&tar_buf).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_extract_chart_yaml_normal_chart_parses() {
+        let body = b"apiVersion: v2\nname: nginx\nversion: 1.2.3\n";
+        let tgz = build_tgz("nginx/Chart.yaml", body);
+        let chart = HelmHandler::extract_chart_yaml(&tgz).unwrap();
+        assert_eq!(chart.name, "nginx");
+        assert_eq!(chart.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_extract_chart_yaml_oversized_entry_rejected() {
+        // A Chart.yaml entry that inflates well past the per-entry cap is a
+        // decompression bomb and must be rejected BEFORE buffering it all.
+        let oversized = vec![b'A'; (MAX_METADATA_ENTRY_BYTES + 1024) as usize];
+        let tgz = build_tgz("bomb/Chart.yaml", &oversized);
+        // The compressed payload is tiny (highly repetitive), proving the cap
+        // bounds the decompressed size, not the request body.
+        assert!(tgz.len() < 64 * 1024);
+
+        let err = HelmHandler::extract_chart_yaml(&tgz).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("exceeds maximum allowed size"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_values_yaml_oversized_entry_rejected() {
+        let oversized = vec![b'A'; (MAX_METADATA_ENTRY_BYTES + 1024) as usize];
+        let tgz = build_tgz("bomb/values.yaml", &oversized);
+        let err = HelmHandler::extract_values_yaml(&tgz).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("exceeds maximum allowed size"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
     }
 }
