@@ -3757,6 +3757,16 @@ async fn handle_start_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // #1776: only repositories that store their own manifests (Local/Staging)
+    // accept pushes. Remote and Virtual repos must reject blob uploads instead
+    // of accepting content that the registry cannot durably own/serve.
+    if !stores_own_manifests(&repo.repo_type) {
+        return oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "pushes are not supported on remote or virtual repositories",
+        );
+    }
     let repo_id = repo.id;
     let location = repo.location;
 
@@ -5894,6 +5904,15 @@ async fn handle_put_manifest(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // #1776: only repositories that store their own manifests (Local/Staging)
+    // accept manifest pushes. Remote and Virtual repos must reject the PUT.
+    if !stores_own_manifests(&repo.repo_type) {
+        return oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "pushes are not supported on remote or virtual repositories",
+        );
+    }
     let repo_id = repo.id;
     let image = repo.image;
 
@@ -6061,9 +6080,13 @@ async fn handle_tags_list(
 ) -> Response {
     let host = request_host(headers);
     let scope = pull_scope(image_name);
-    if authenticate_oci(&state.db, &state.config, headers)
-        .await
-        .is_err()
+    // #1776: mirror handle_head_manifest — anonymous tokens are allowed past the
+    // auth gate so a public repository's tags can be listed without credentials.
+    let is_anon = is_anonymous_token(headers);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
     {
         return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
@@ -6072,6 +6095,11 @@ async fn handle_tags_list(
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    // Anonymous tokens may only list tags on public repositories.
+    if is_anon && !repo.is_public {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
+    }
 
     let (n, last) = match parse_pagination_params(query) {
         Ok(v) => v,
@@ -6929,44 +6957,84 @@ async fn handle_delete_manifest(
         }
     };
 
-    // Delete all tag rows pointing to this digest within the repository
-    if let Err(e) = sqlx::query!(
-        "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+    // Remove tag rows for this delete. A digest reference is a content-address
+    // delete, so every tag pointing at that digest in this repo is removed. A
+    // tag-name reference removes ONLY the named tag row, leaving sibling tags
+    // that happen to share the same manifest digest intact (#1776).
+    let tag_delete = if is_digest_reference(reference) {
+        sqlx::query!(
+            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+            repo.id,
+            digest
+        )
+        .execute(&mut *tx)
+        .await
+    } else {
+        sqlx::query!(
+            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            repo.id,
+            repo.image,
+            reference
+        )
+        .execute(&mut *tx)
+        .await
+    };
+    if let Err(e) = tag_delete {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
+    // this repo still points at the same manifest digest, the manifest is still
+    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
+    // intact. The cleanup only runs once the last tag for the digest is gone (or
+    // for a content-addressed digest delete, which removes every such tag).
+    let digest_still_tagged = match sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo.id,
         digest
     )
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
+        Ok(exists) => exists.unwrap_or(false),
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
 
-    // Drop stale index relationships for this digest. Live child edges are
-    // preserved so a still-tagged parent index keeps the child relationship
-    // live and the child's blobs protected.
-    if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
+    if !digest_still_tagged {
+        // Drop stale index relationships for this digest. Live child edges are
+        // preserved so a still-tagged parent index keeps the child relationship
+        // live and the child's blobs protected.
+        if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
 
-    // #1409: drop the manifest's blob refs so its config + layer blobs become
-    // reclaimable once nothing else references them. Scoped to skip a digest
-    // still referenced as a live per-architecture child of a tagged index
-    // (its blobs are protected ONLY by these rows). After #1681 these rows
-    // also gate digest fallback, so a cleanup error must abort the delete.
-    if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        // #1409: drop the manifest's blob refs so its config + layer blobs
+        // become reclaimable once nothing else references them. Scoped to skip a
+        // digest still referenced as a live per-architecture child of a tagged
+        // index (its blobs are protected ONLY by these rows). After #1681 these
+        // rows also gate digest fallback, so a cleanup error must abort the
+        // delete.
+        if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
     }
 
     if let Err(e) = tx.commit().await {
@@ -18808,6 +18876,250 @@ mod cross_repo_session_regression_tests {
         );
 
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #1776: create a non-local OCI repo (remote/virtual) marked public, with a
+    /// configured upstream so resolution succeeds. Returns (id, key, dir).
+    async fn create_typed_oci_repo(
+        pool: &PgPool,
+        repo_type: &str,
+        label: &str,
+    ) -> (Uuid, String, std::path::PathBuf) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-{}-{}-{}", repo_type, label, id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-{}-{}", repo_type, id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let upstream = if repo_type == "remote" {
+            Some("https://upstream.example.test")
+        } else {
+            None
+        };
+        let sql = format!(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public, upstream_url) \
+             VALUES ($1, $2, $2, $3, '{}'::repository_type, 'docker'::repository_format, true, $4)",
+            repo_type
+        );
+        sqlx::query(&sql)
+            .bind(id)
+            .bind(&key)
+            .bind(storage_dir.to_string_lossy().as_ref())
+            .bind(upstream)
+            .execute(pool)
+            .await
+            .expect("insert typed repo");
+        (id, key, storage_dir)
+    }
+
+    /// #1776: a blob upload POST on a remote repository must be rejected with
+    /// 405 UNSUPPORTED — only Local/Staging repos store their own content.
+    #[tokio::test]
+    async fn handle_start_upload_rejected_on_remote_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_typed_oci_repo(&pool, "remote", "push").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let body = b"remote-blob".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "blob upload on a remote repo must be rejected with 405"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #1776: a manifest PUT on a virtual repository must be rejected with 405
+    /// UNSUPPORTED and must not create an oci_tags row.
+    #[tokio::test]
+    async fn handle_put_manifest_rejected_on_virtual_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_typed_oci_repo(&pool, "virtual", "put").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let manifest = br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#.to_vec();
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/myimage/manifests/pushed-tag", repo_key))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(manifest))
+            .unwrap();
+        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "manifest PUT on a virtual repo must be rejected with 405"
+        );
+
+        let tag_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_tags WHERE repository_id = $1 AND tag = 'pushed-tag'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tag_rows, 0, "no tag row may be created on a virtual repo");
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #1776: anonymous GET /v2/{name}/tags/list on a PUBLIC repo must succeed
+    /// (200), mirroring anonymous manifest reads. Pins the is_anon bypass.
+    #[tokio::test]
+    async fn handle_tags_list_allows_anon_on_public_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // create_docker_repo marks the repo is_public = true.
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "anontags").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        // Seed a tag so the repo is "known" and the list is non-empty.
+        let digest = format!("sha256:{}", "a".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'myimage', 'pub1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("seed tag");
+
+        // Anonymous pull token issued by the OCI token endpoint, exactly as a
+        // logged-out Docker/OCI client presents it.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/myimage/tags/list", repo_key))
+            .header("Authorization", "Bearer anonymous")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(router().with_state(state), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "anonymous tags/list on a public repo must return 200"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["tags"][0], "pub1", "tag list must include the tag");
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #1776: deleting one tag by NAME when a sibling tag shares the same
+    /// manifest digest must leave the sibling tag intact and must NOT reclaim
+    /// the manifest's blob refs (still live via the sibling).
+    #[tokio::test]
+    async fn delete_tag_by_name_preserves_sibling_sharing_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let digest = format!("sha256:{}", "7".repeat(64));
+        // Two tags pointing at the same manifest digest.
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'image2', 'tagA', $2, 'application/vnd.oci.image.manifest.v1+json'), \
+                    ($1, 'image2', 'tagB', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed tags");
+        // Blob refs for the shared manifest.
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+             VALUES ($1, $1 || ':cfg', $2, 'config'), ($1, $1 || ':l0', $2, 'layer')",
+        )
+        .bind(&digest)
+        .bind(repo)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed blob refs");
+
+        // Emulate the tag-scoped delete path: remove only tagA, then run the
+        // still-tagged guard before any ref cleanup.
+        let mut tx = fixture.pool.begin().await.expect("tx");
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3")
+            .bind(repo)
+            .bind("image2")
+            .bind("tagA")
+            .execute(&mut *tx)
+            .await
+            .expect("delete tagA");
+        let still_tagged: Option<bool> = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("guard query");
+        assert_eq!(
+            still_tagged,
+            Some(true),
+            "sibling tagB keeps the digest live"
+        );
+        if !still_tagged.unwrap_or(false) {
+            delete_manifest_blob_refs(&mut *tx, repo, &digest)
+                .await
+                .expect("blob refs");
+        }
+        tx.commit().await.expect("commit");
+
+        let remaining_tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 ORDER BY tag",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .fetch_all(&fixture.pool)
+        .await
+        .expect("remaining tags");
+        let blob_ref_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count blob refs");
+        fixture.teardown().await;
+
+        assert_eq!(remaining_tags, vec!["tagB".to_string()], "tagB preserved");
+        assert_eq!(blob_ref_rows, 2, "blob refs preserved while sibling lives");
     }
 
     /// Successive PATCH chunks must each be appended to the temp file
