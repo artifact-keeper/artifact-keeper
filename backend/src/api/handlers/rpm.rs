@@ -83,6 +83,26 @@ async fn resolve_rpm_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo,
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["rpm", "yum"], "an RPM").await
 }
 
+/// Reject RPM uploads to non-hosted (Remote/Virtual) repositories.
+///
+/// `dnf`/`yum` only ever PUT/POST RPMs into hosted repos. Both Remote (proxy)
+/// and Virtual (aggregate) repos must reject the write verb with
+/// `405 Method Not Allowed` so clients receive a consistent, RFC-correct
+/// response. The shared `reject_write_if_not_hosted` helper returns `400` for
+/// Virtual repos (a contract other subsystems depend on), so RPM intercepts
+/// the Virtual case here before delegating the Remote case (#1780).
+#[allow(clippy::result_large_err)]
+fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
+    if repo_type == RepositoryType::Virtual {
+        return Err((
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Cannot publish to a virtual repository",
+        )
+            .into_response());
+    }
+    proxy_helpers::reject_write_if_not_hosted(repo_type)
+}
+
 /// For Remote RPM repos, proxy `upstream_path` from the configured
 /// `upstream_url`. Returns `Ok(Some(response))` on a successful proxy
 /// hit, `Ok(None)` when the repository is not a Remote that can serve
@@ -237,25 +257,60 @@ async fn list_rpm_artifacts(
         .collect())
 }
 
+/// Collect the RPM artifacts a repodata response should describe.
+///
+/// For Hosted (Local/Staging) repos this is just the repo's own artifacts.
+/// For Virtual repos the metadata must reflect the union of every member
+/// repo's packages — otherwise `repomd.xml`/`primary.xml.gz` advertise
+/// `packages="0"` and `dnf` treats the aggregate repo as empty even though
+/// the members hold packages (#1780). We resolve the member repo IDs via
+/// `fetch_virtual_members` and concatenate each member's artifact list.
+async fn collect_repodata_artifacts(
+    db: &sqlx::PgPool,
+    repo: &RepoInfo,
+) -> Result<Vec<RpmArtifact>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return list_rpm_artifacts(db, repo.id).await;
+    }
+
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let mut artifacts = Vec::new();
+    for member in &members {
+        artifacts.extend(list_rpm_artifacts(db, member.id).await?);
+    }
+    Ok(artifacts)
+}
+
 // ---------------------------------------------------------------------------
 // Shared repomd.xml generation
 // ---------------------------------------------------------------------------
 
 fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
-    // Generate primary.xml content and compute its gzipped checksum
+    // Generate primary.xml content and compute both the compressed (gzipped)
+    // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
+    // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
+    // (#1780); omitting them causes stricter clients to reject the metadata.
     let primary_xml = generate_primary_xml(artifacts);
+    let primary_open_sha256 = sha256_hex(primary_xml.as_bytes());
+    let primary_open_size = primary_xml.len();
     let primary_gz = gzip_bytes(primary_xml.as_bytes());
     let primary_sha256 = sha256_hex(&primary_gz);
 
     let filelists_xml = generate_filelists_xml(artifacts);
+    let filelists_open_sha256 = sha256_hex(filelists_xml.as_bytes());
+    let filelists_open_size = filelists_xml.len();
     let filelists_gz = gzip_bytes(filelists_xml.as_bytes());
     let filelists_sha256 = sha256_hex(&filelists_gz);
 
     let other_xml = generate_other_xml(artifacts);
+    let other_open_sha256 = sha256_hex(other_xml.as_bytes());
+    let other_open_size = other_xml.len();
     let other_gz = gzip_bytes(other_xml.as_bytes());
     let other_sha256 = sha256_hex(&other_gz);
 
     let updateinfo_xml = generate_updateinfo_xml();
+    let updateinfo_open_sha256 = sha256_hex(updateinfo_xml.as_bytes());
+    let updateinfo_open_size = updateinfo_xml.len();
     let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
     let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
 
@@ -266,42 +321,59 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<repomd xmlns="http://linux.duke.edu/metadata/repo">
+<repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
+  <revision>{timestamp}</revision>
   <data type="primary">
     <location href="repodata/primary.xml.gz"/>
     <checksum type="sha256">{primary_sha256}</checksum>
+    <open-checksum type="sha256">{primary_open_sha256}</open-checksum>
     <timestamp>{timestamp}</timestamp>
     <size>{primary_size}</size>
+    <open-size>{primary_open_size}</open-size>
   </data>
   <data type="filelists">
     <location href="repodata/filelists.xml.gz"/>
     <checksum type="sha256">{filelists_sha256}</checksum>
+    <open-checksum type="sha256">{filelists_open_sha256}</open-checksum>
     <timestamp>{timestamp}</timestamp>
     <size>{filelists_size}</size>
+    <open-size>{filelists_open_size}</open-size>
   </data>
   <data type="other">
     <location href="repodata/other.xml.gz"/>
     <checksum type="sha256">{other_sha256}</checksum>
+    <open-checksum type="sha256">{other_open_sha256}</open-checksum>
     <timestamp>{timestamp}</timestamp>
     <size>{other_size}</size>
+    <open-size>{other_open_size}</open-size>
   </data>
   <data type="updateinfo">
     <location href="repodata/updateinfo.xml.gz"/>
     <checksum type="sha256">{updateinfo_sha256}</checksum>
+    <open-checksum type="sha256">{updateinfo_open_sha256}</open-checksum>
     <timestamp>{timestamp}</timestamp>
     <size>{updateinfo_size}</size>
+    <open-size>{updateinfo_open_size}</open-size>
   </data>
 </repomd>
 "#,
         primary_sha256 = primary_sha256,
+        primary_open_sha256 = primary_open_sha256,
         filelists_sha256 = filelists_sha256,
+        filelists_open_sha256 = filelists_open_sha256,
         other_sha256 = other_sha256,
+        other_open_sha256 = other_open_sha256,
         updateinfo_sha256 = updateinfo_sha256,
+        updateinfo_open_sha256 = updateinfo_open_sha256,
         timestamp = timestamp,
         primary_size = primary_gz.len(),
+        primary_open_size = primary_open_size,
         filelists_size = filelists_gz.len(),
+        filelists_open_size = filelists_open_size,
         other_size = other_gz.len(),
+        other_open_size = other_open_size,
         updateinfo_size = updateinfo_gz.len(),
+        updateinfo_open_size = updateinfo_open_size,
     )
 }
 
@@ -323,7 +395,7 @@ async fn repomd_xml(
         return Ok(resp);
     }
 
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
     let xml = generate_repomd_xml_content(&artifacts);
 
     Ok(Response::builder()
@@ -355,7 +427,7 @@ async fn repomd_xml_asc(
         return Ok(resp);
     }
 
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
     let repomd_content = generate_repomd_xml_content(&artifacts);
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
@@ -470,7 +542,7 @@ async fn primary_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
 
     let primary_xml = generate_primary_xml(&artifacts);
     let gz = gzip_bytes(primary_xml.as_bytes());
@@ -504,7 +576,7 @@ async fn filelists_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
 
     let filelists_xml = generate_filelists_xml(&artifacts);
     let gz = gzip_bytes(filelists_xml.as_bytes());
@@ -533,7 +605,7 @@ async fn other_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
 
     let other_xml = generate_other_xml(&artifacts);
     let gz = gzip_bytes(other_xml.as_bytes());
@@ -760,7 +832,7 @@ async fn upload_package_put(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path).to_string();
 
@@ -785,7 +857,7 @@ async fn upload_package_post(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
     // Try to get filename from Content-Disposition header, fall back to a hash-based name
     let filename = headers
@@ -2431,5 +2503,167 @@ mod tests {
         );
         // seed_artifact stores checksum "test-seed"; verify it is surfaced.
         assert_eq!(checksum_header.as_deref(), Some("test-seed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1780: repomd.xml must carry <revision>, <open-checksum>, <open-size>
+    // so stricter DNF/createrepo clients accept the metadata.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_repomd_xml_content_has_revision_and_open_metadata() {
+        let xml = generate_repomd_xml_content(&[]);
+        // Top-level revision element present exactly once.
+        assert!(xml.contains("<revision>"), "missing <revision>: {xml}");
+        // Each of the four <data> blocks gets open-checksum + open-size.
+        assert_eq!(
+            xml.matches("<open-checksum type=\"sha256\">").count(),
+            4,
+            "expected 4 <open-checksum> elements: {xml}"
+        );
+        assert_eq!(
+            xml.matches("<open-size>").count(),
+            4,
+            "expected 4 <open-size> elements: {xml}"
+        );
+    }
+
+    #[test]
+    fn test_generate_repomd_open_checksum_matches_uncompressed_primary() {
+        // The primary <open-checksum> must equal sha256 of the *uncompressed*
+        // primary.xml, while the regular <checksum> hashes the gzipped blob.
+        let xml = generate_repomd_xml_content(&[]);
+        let primary_xml = generate_primary_xml(&[]);
+        let expected_open = sha256_hex(primary_xml.as_bytes());
+        assert!(
+            xml.contains(&format!(
+                "<open-checksum type=\"sha256\">{expected_open}</open-checksum>"
+            )),
+            "primary open-checksum should hash the uncompressed primary.xml"
+        );
+        // And the compressed checksum must differ from the open one.
+        let primary_gz_sha = sha256_hex(&gzip_bytes(primary_xml.as_bytes()));
+        assert_ne!(expected_open, primary_gz_sha);
+        assert!(xml.contains(&format!(
+            "<checksum type=\"sha256\">{primary_gz_sha}</checksum>"
+        )));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1780: PUT/POST to a virtual RPM repo must return 405 (not 400), to
+    // match the remote-repo response.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_rpm_write_virtual_returns_405() {
+        let err = reject_rpm_write_if_not_hosted("virtual").unwrap_err();
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn test_reject_rpm_write_remote_returns_405() {
+        let err = reject_rpm_write_if_not_hosted("remote").unwrap_err();
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn test_reject_rpm_write_local_is_ok() {
+        assert!(reject_rpm_write_if_not_hosted("local").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upload_virtual_405() {
+        let Some(f) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/packages/foo-1.0-1.x86_64.rpm", f.repo_key),
+            bytes::Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1780: Virtual repo repodata must aggregate member packages instead of
+    // reporting packages="0".
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_virtual_repomd_aggregates_member_packages() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+
+        // Create a hosted member repo and seed an RPM artifact into it.
+        let (member_id, _member_key, _member_dir) = tdh::create_repo(&f.pool, "local", "rpm").await;
+        let member_repo =
+            tdh::make_repo_info(member_id, "rpm-virt-member", &f.storage_dir, "local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &member_repo,
+            "rpm/member/agg-1.0-1.x86_64.rpm",
+            "packages/agg-1.0-1.x86_64.rpm",
+            "agg",
+            "1.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"member-rpm-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        // Wire the membership: virtual (f.repo_id) -> member.
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(f.repo_id)
+        .bind(member_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert virtual member");
+
+        // primary.xml.gz must report 1 package (decompress and inspect).
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/repodata/primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut decoder = GzDecoder::new(&body[..]);
+        let mut primary = String::new();
+        decoder
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+        assert!(
+            primary.contains("packages=\"1\""),
+            "virtual primary.xml should aggregate the member package, got: {primary}"
+        );
+        assert!(primary.contains("<name>agg</name>"));
+
+        // Cleanup the extra member repo + membership.
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(member_id)
+            .execute(&f.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&f.pool)
+            .await
+            .ok();
+        f.teardown().await;
     }
 }

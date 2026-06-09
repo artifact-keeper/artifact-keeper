@@ -147,6 +147,9 @@ struct SimpleProjectArtifact {
     size_bytes: i64,
     checksum_sha256: String,
     metadata: Option<serde_json::Value>,
+    /// Upload timestamp, surfaced as PEP 700 `upload-time` (RFC 3339) in the
+    /// PEP 691 JSON response and `data-upload-time` in the HTML response.
+    upload_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,10 +470,13 @@ fn build_simple_root_response(
     repo_key: &str,
     packages: &[String],
 ) -> Result<Response, Response> {
-    // Check Accept header for PEP 691 JSON
+    // Content negotiation is driven solely by the Accept header (#1773),
+    // matching `build_simple_project_response`. Previously this also consulted
+    // the request Content-Type, which is the media type of the request *body*,
+    // not a negotiation signal — a client sending `Content-Type: ...+json`
+    // with `Accept: text/html` would wrongly receive JSON.
     let accept = headers
-        .get(CONTENT_TYPE.as_str())
-        .or_else(|| headers.get("accept"))
+        .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
@@ -553,6 +559,7 @@ async fn simple_project(
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.created_at,
                am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
@@ -576,6 +583,7 @@ async fn simple_project(
             size_bytes: a.size_bytes,
             checksum_sha256: a.checksum_sha256,
             metadata: a.metadata,
+            upload_time: Some(a.created_at),
         })
         .collect();
 
@@ -651,6 +659,7 @@ async fn simple_project(
                 let member_rows = sqlx::query!(
                     r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.created_at,
                am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
@@ -672,6 +681,7 @@ async fn simple_project(
                     size_bytes: a.size_bytes,
                     checksum_sha256: a.checksum_sha256,
                     metadata: a.metadata,
+                    upload_time: Some(a.created_at),
                 }));
             }
 
@@ -837,6 +847,12 @@ fn build_simple_project_response(
                 if let Some(rp) = requires_python {
                     file["requires-python"] = serde_json::Value::String(rp);
                 }
+                // PEP 700: surface the distribution's upload timestamp as an
+                // RFC 3339 / ISO 8601 `upload-time` field (#1773).
+                if let Some(ut) = a.upload_time {
+                    file["upload-time"] =
+                        serde_json::Value::String(ut.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                }
                 file
             })
             .collect();
@@ -906,9 +922,16 @@ fn build_simple_project_response(
             .map(|rp| format!(" data-requires-python=\"{}\"", html_escape(rp)))
             .unwrap_or_default();
 
+        // PEP 700: expose the upload timestamp as a `data-upload-time` anchor
+        // attribute (RFC 3339) so HTML clients can read it too (#1773).
+        let ut_attr = a
+            .upload_time
+            .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
+            .unwrap_or_default();
+
         html.push_str(&format!(
-            "<a href=\"{}\"{}>{}</a><br/>\n",
-            url, rp_attr, filename
+            "<a href=\"{}\"{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, filename
         ));
     }
 
@@ -963,9 +986,14 @@ fn merge_local_into_remote_simple_html(
         let rp_attr = requires_python
             .map(|rp| format!(" data-requires-python=\"{}\"", html_escape(rp)))
             .unwrap_or_default();
+        // PEP 700: include the upload timestamp for spliced local entries (#1773).
+        let ut_attr = a
+            .upload_time
+            .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
+            .unwrap_or_default();
         local_lines.push_str(&format!(
-            "<a href=\"{}\"{}>{}</a><br/>\n",
-            url, rp_attr, filename
+            "<a href=\"{}\"{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, filename
         ));
     }
 
@@ -3492,6 +3520,7 @@ mod tests {
             size_bytes: 12345,
             checksum_sha256: "abc123def456".to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let headers = HeaderMap::new();
@@ -3521,6 +3550,7 @@ mod tests {
             size_bytes: 5000,
             checksum_sha256: "aaa111bbb222".to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let headers = HeaderMap::new();
@@ -3565,6 +3595,7 @@ mod tests {
             size_bytes: 4000,
             checksum_sha256: "deadbeef".to_string(),
             metadata: Some(metadata),
+            upload_time: None,
         }];
 
         let headers = HeaderMap::new();
@@ -3593,6 +3624,7 @@ mod tests {
                 size_bytes: 1000,
                 checksum_sha256: "aaa".to_string(),
                 metadata: None,
+                upload_time: None,
             },
             SimpleProjectArtifact {
                 path: "pkg-2.0.0.tar.gz".to_string(),
@@ -3600,6 +3632,7 @@ mod tests {
                 size_bytes: 2000,
                 checksum_sha256: "bbb".to_string(),
                 metadata: None,
+                upload_time: None,
             },
         ];
 
@@ -3632,6 +3665,7 @@ mod tests {
             size_bytes: 5000,
             checksum_sha256: "abc123".to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let mut headers = HeaderMap::new();
@@ -3695,6 +3729,7 @@ mod tests {
             size_bytes: 3000,
             checksum_sha256: "cafe".to_string(),
             metadata: Some(metadata),
+            upload_time: None,
         }];
 
         let mut headers = HeaderMap::new();
@@ -3715,6 +3750,100 @@ mod tests {
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files[0]["requires-python"], ">=3.9,<4.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // PEP 700 upload-time (#1773)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_simple_project_response_json_emits_upload_time() {
+        // Regression for #1773: the PEP 691 JSON file object must carry the
+        // PEP 700 `upload-time` field, formatted as RFC 3339 (UTC, `Z`).
+        let upload_time = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 3000,
+            checksum_sha256: "cafe".to_string(),
+            metadata: None,
+            upload_time: Some(upload_time),
+        }];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+
+        let result = build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]);
+        let response = result.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files[0]["upload-time"], "2026-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn test_build_simple_project_response_json_omits_upload_time_when_absent() {
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "pkg-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "abc".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["files"][0].get("upload-time").is_none());
+    }
+
+    #[test]
+    fn test_build_simple_project_response_html_emits_upload_time() {
+        // Regression for #1773: HTML anchors must carry a `data-upload-time`
+        // attribute when the upload timestamp is known.
+        let upload_time = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "pkg-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "abc".to_string(),
+            metadata: None,
+            upload_time: Some(upload_time),
+        }];
+        let response =
+            build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &artifacts, &[])
+                .unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("data-upload-time=\"2026-01-02T03:04:05Z\""),
+            "HTML should include data-upload-time, got: {}",
+            html
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3788,6 +3917,33 @@ mod tests {
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0]["name"], "flask");
         assert_eq!(projects[1]["name"], "numpy");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_ignores_content_type_for_negotiation() {
+        // Regression for #1773: content negotiation must use ONLY the Accept
+        // header. A request Content-Type of the JSON media type with an
+        // HTML Accept must still yield HTML (the request Content-Type
+        // describes the request body, not the desired response format).
+        let packages = vec!["flask".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        headers.insert("accept", "text/html".parse().unwrap());
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "text/html; charset=utf-8",
+            "Content-Type must not drive response negotiation"
+        );
     }
 
     #[test]
@@ -4073,6 +4229,7 @@ mod tests {
             size_bytes: 4096,
             checksum_sha256: "ffeeddccbbaa99887766554433221100".to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
@@ -4107,6 +4264,7 @@ mod tests {
             checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
@@ -4140,6 +4298,7 @@ mod tests {
             size_bytes: 256,
             checksum_sha256: "deadbeef".to_string(),
             metadata: Some(metadata),
+            upload_time: None,
         }];
 
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
@@ -4165,6 +4324,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "cafebabe".to_string(),
             metadata: None,
+            upload_time: None,
         }];
 
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);

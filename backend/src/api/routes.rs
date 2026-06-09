@@ -610,6 +610,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // #1784: axum 0.7 nest matches `/sbom` (no slash) against the inner `/`
+        // route but does NOT match the trailing-slash form `/sbom/`, which 404'd
+        // with an empty body instead of behaving like the list endpoint. Add an
+        // explicit redirect from the trailing-slash form to the canonical path
+        // so clients that append a slash still reach the list handler.
+        .route(
+            "/sbom/",
+            get(|| async { axum::response::Redirect::permanent("/api/v1/sbom") }),
+        )
         // Promotion routes with auth middleware (staging -> release workflow)
         .nest(
             "/promotion",
@@ -746,6 +755,30 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    #[test]
+    fn sbom_trailing_slash_is_handled() {
+        // Regression for #1784: axum 0.7's `.nest("/sbom", ...)` resolves the
+        // no-slash form `/sbom` (against the inner `/` route) but 404's the
+        // trailing-slash form `/sbom/` with an empty body. The fix registers an
+        // explicit redirect route for the trailing-slash form. A runtime test
+        // would need full app state + a DB; pin the routing decision in source.
+        assert!(
+            ROUTES_RS_SRC.contains(".nest(\n            \"/sbom\","),
+            "sbom nest registration missing; the trailing-slash redirect test \
+             below would otherwise be vacuously true"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains(".route(\n            \"/sbom/\","),
+            "/sbom/ trailing-slash redirect missing; GET /api/v1/sbom/ will \
+             404 with an empty body instead of reaching the list handler \
+             (regression of #1784)"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains("Redirect::permanent(\"/api/v1/sbom\")"),
+            "/sbom/ route must redirect to the canonical /api/v1/sbom path"
         );
     }
 

@@ -330,6 +330,12 @@ fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
         .or_else(|| auth_header.strip_prefix("basic "))
     {
         ExtractedToken::Basic(creds)
+    } else if !auth_header.is_empty() && !auth_header.contains(' ') {
+        // The native cargo client's `cargo:token` credential provider sends the
+        // raw token as the Authorization header value with NO scheme prefix
+        // (e.g. `Authorization: <token>`). A scheme-less, single-word value is
+        // therefore treated as a Bearer token so cargo can authenticate.
+        ExtractedToken::Bearer(auth_header)
     } else {
         ExtractedToken::Invalid
     }
@@ -1086,6 +1092,10 @@ fn unauthorized_response() -> Response {
             "WWW-Authenticate",
             "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
         )
+        // Signals cargo 1.67+ to use the Cargo token protocol (sends the token
+        // as the raw Authorization header value) rather than aborting on the
+        // Basic/Bearer challenges it does not understand.
+        .header("WWW-Authenticate", "Cargo")
         .header(axum::http::header::CONTENT_TYPE, "text/plain")
         .body(axum::body::Body::from("Authentication required"))
         .unwrap()
@@ -2138,6 +2148,31 @@ mod tests {
             www_auth_values.iter().any(|v| v.starts_with("Bearer")),
             "expected a Bearer WWW-Authenticate challenge"
         );
+        // Must also include the Cargo challenge so cargo 1.67+ uses the token
+        // protocol instead of aborting on the Basic/Bearer challenges.
+        assert!(
+            www_auth_values.iter().any(|v| v.starts_with("Cargo")),
+            "expected a Cargo WWW-Authenticate challenge"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_token_treated_as_bearer() {
+        // The native cargo client sends the raw token with no scheme prefix;
+        // a scheme-less single-word value must be accepted as a Bearer token.
+        let result = extract_token_from_auth_header("ak_raw_cargo_token_123");
+        assert!(matches!(
+            result,
+            ExtractedToken::Bearer("ak_raw_cargo_token_123")
+        ));
+    }
+
+    #[test]
+    fn test_extract_plain_token_with_space_is_invalid() {
+        // A multi-word value that matches no known scheme is still invalid
+        // (it is not a raw token).
+        let result = extract_token_from_auth_header("Unknown scheme-value");
+        assert!(matches!(result, ExtractedToken::Invalid));
     }
 
     #[test]

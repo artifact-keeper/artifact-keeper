@@ -10369,6 +10369,7 @@ mod tests {
             upstream_url: upstream_url.map(|s| s.to_string()),
             is_public: true,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
