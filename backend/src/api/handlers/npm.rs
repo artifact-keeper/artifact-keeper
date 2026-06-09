@@ -987,6 +987,20 @@ fn build_tarball_response_stream(
     builder.body(Body::from_stream(stream)).unwrap()
 }
 
+/// Decide the `Content-Type` for an npm tarball served from a Virtual repo.
+///
+/// Virtual downloads are satisfied by a member repo's proxy-cache, and the
+/// sidecar records whatever content type the upstream sent — for npm that is
+/// frequently `application/octet-stream` (and occasionally a bogus
+/// text/HTML type on error pages that slipped into cache). npm tarballs are
+/// always gzip, and downstream SBOM/scanner tooling (Trivy, Grype) keys off
+/// the content type, so the virtual path must normalize to `application/gzip`
+/// just like the direct remote-repo path does. We therefore ignore the cached
+/// content type entirely and always return [`NPM_TARBALL_CONTENT_TYPE`].
+fn npm_virtual_tarball_content_type(_cached: Option<String>) -> Option<String> {
+    Some(NPM_TARBALL_CONTENT_TYPE.to_string())
+}
+
 /// Build an OK response with a given content type and body.
 fn build_ok_response(content_type: &str, body: impl Into<Body>) -> Response {
     Response::builder()
@@ -1226,10 +1240,13 @@ async fn serve_tarball(
         )
         .await?;
 
+        // Always serve npm virtual-repo tarballs as `application/gzip`,
+        // overriding whatever content type the proxy-cache sidecar recorded
+        // for the cached member artifact (see `npm_virtual_tarball_content_type`).
         return Ok(build_tarball_response_stream(
             result.body,
             filename,
-            result.content_type,
+            npm_virtual_tarball_content_type(result.content_type),
             result.content_length,
         ));
     }
@@ -3278,6 +3295,49 @@ mod tests {
             Some("application/x-custom")
         );
         assert!(h.get(CONTENT_LENGTH).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: virtual-repo tarball content-type override (#1774)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_npm_virtual_tarball_content_type_always_gzip() {
+        // A Virtual npm repo serves tarballs out of a member's proxy cache.
+        // Upstream registries (and stale error-page caches) frequently record
+        // a non-gzip content type; the virtual download path must NOT leak that
+        // through, or downstream SBOM/scanner tooling mis-detects the archive.
+        // Regardless of the cached content type, the served type must be gzip,
+        // matching the direct remote-repo path.
+        for cached in [
+            None,
+            Some("application/octet-stream".to_string()),
+            Some("text/html".to_string()),
+            Some("application/gzip".to_string()),
+        ] {
+            assert_eq!(
+                npm_virtual_tarball_content_type(cached),
+                Some(NPM_TARBALL_CONTENT_TYPE.to_string()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_virtual_tarball_response_overrides_octet_stream() {
+        // End-to-end of the helper + response builder: an octet-stream cache
+        // record must be served as application/gzip on the streaming response.
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tgz"))
+            }));
+        let ct = npm_virtual_tarball_content_type(Some("application/octet-stream".to_string()));
+        let resp = build_tarball_response_stream(body, "is-array-1.0.1.tgz", ct, Some(3));
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(NPM_TARBALL_CONTENT_TYPE),
+        );
     }
 
     // -----------------------------------------------------------------------
