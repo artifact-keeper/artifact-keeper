@@ -391,6 +391,57 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
     Some((user.to_owned(), pass.to_owned()))
 }
 
+/// Whether `path` is reachable by a principal flagged `must_change_password`.
+///
+/// A forced-rotation user is otherwise blocked from every route (see
+/// [`auth_middleware`]); this allowlist is the narrow set of endpoints that
+/// let them recover without admin intervention:
+///
+///   * the self password-change route (`.../password`, e.g.
+///     `POST /api/v1/users/:id/password`) — clears the flag, and
+///   * logout (`.../auth/logout`) — lets the client end the session.
+///
+/// Matching is by suffix so it is robust to the `/api/v1` (or any future)
+/// nest prefix the middleware observes on `request.uri().path()`. The
+/// admin reset / force-change routes (`.../password/reset`,
+/// `.../force-password-change`) deliberately do NOT match — they sit behind
+/// `admin_middleware`, not this one, and would not be self-recoverable.
+fn path_exempt_from_password_change(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path.ends_with("/password") || path.ends_with("/auth/logout")
+}
+
+/// 428 Precondition Required: the principal must rotate their password before
+/// any further (non-recovery) request is honoured. Distinct from 401 so the
+/// client can tell "rotate your password" apart from "log in again".
+fn must_change_password_response() -> Response {
+    (
+        StatusCode::PRECONDITION_REQUIRED,
+        "Password change required: rotate your password before continuing",
+    )
+        .into_response()
+}
+
+/// Read the live `must_change_password` watermark for `user_id`.
+///
+/// The flag is not carried in JWT claims, so it is read from the DB on the
+/// request path (only for non-exempt routes — see [`auth_middleware`]). A
+/// missing row or query error is treated as "not flagged": the principal has
+/// already authenticated, and a transient DB hiccup must not convert a normal
+/// request into a forced-rotation lockout. Uses runtime `query_scalar` (not
+/// the compile-time macro) so it needs no offline SQLx cache.
+async fn principal_must_change_password(db: &sqlx::PgPool, user_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT must_change_password FROM users WHERE id = $1 AND is_active = true",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Authentication middleware function - requires valid token
 ///
 /// Supports multiple authentication schemes:
@@ -475,6 +526,21 @@ pub async fn auth_middleware(
 
     let header_error = match header_result {
         Ok((ext, token_iat)) => {
+            // Enforce a forced password rotation (`must_change_password`).
+            //
+            // The flag is advisory in the token/claims, so we read the live DB
+            // watermark for the principal. A flagged user must be unable to do
+            // anything except recover: change their own password or log out.
+            // Every other route is refused with 428 Precondition Required so
+            // clients know the account is in a "must rotate" state rather than
+            // "unauthenticated". The DB read only happens for non-exempt paths,
+            // so the common authenticated request pays nothing extra on the
+            // password-change / logout recovery routes.
+            if !path_exempt_from_password_change(request.uri().path())
+                && principal_must_change_password(auth_service.db(), ext.user_id).await
+            {
+                return must_change_password_response();
+            }
             // Insert BOTH shapes so handlers behind this middleware can
             // extract either `Extension<AuthExtension>` or
             // `Extension<Option<AuthExtension>>`. Without the Option-wrapped
@@ -3947,5 +4013,185 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn test_path_exempt_from_password_change_allowlist() {
+        // Recovery routes: self password-change and logout (with or without a
+        // trailing slash, with or without the nest prefix).
+        assert!(path_exempt_from_password_change(
+            "/api/v1/users/4040201f-c67a-4719-a292-79ec66a7bd2d/password"
+        ));
+        assert!(path_exempt_from_password_change("/users/abc/password/"));
+        assert!(path_exempt_from_password_change("/api/v1/auth/logout"));
+        assert!(path_exempt_from_password_change("/auth/logout/"));
+
+        // Everything else is gated, including the admin reset / force-change
+        // routes (which live behind admin_middleware, not this one) and any
+        // route that merely contains "password" elsewhere.
+        assert!(!path_exempt_from_password_change(
+            "/api/v1/users/abc/password/reset"
+        ));
+        assert!(!path_exempt_from_password_change(
+            "/api/v1/users/abc/force-password-change"
+        ));
+        assert!(!path_exempt_from_password_change("/api/v1/repositories"));
+        assert!(!path_exempt_from_password_change("/api/v1/auth/me"));
+        assert!(!path_exempt_from_password_change("/api/v1/auth/tokens"));
+    }
+
+    /// Build a flagged/unflagged non-admin `User` row and mint a real JWT for it
+    /// through `auth_service`, so the replica-safe validation path resolves.
+    /// Factored out so the two regression assertions below share setup without
+    /// tripping the duplication gate.
+    #[cfg(test)]
+    async fn mint_bearer_for_flagged_user(
+        pool: &sqlx::PgPool,
+        auth_service: &AuthService,
+        must_change_password: bool,
+    ) -> (Uuid, String) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::user::AuthProvider;
+
+        let (user_id, username) = tdh::create_user(pool).await; // non-admin
+        sqlx::query("UPDATE users SET must_change_password = $1 WHERE id = $2")
+            .bind(must_change_password)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("set must_change_password");
+
+        let now = chrono::Utc::now();
+        let user = User {
+            id: user_id,
+            username: username.clone(),
+            email: format!("{}@test.local", username),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth_service.generate_tokens(&user).unwrap().access_token
+        );
+        (user_id, bearer)
+    }
+
+    /// Regression for #1818: a principal flagged `must_change_password` is
+    /// refused (428) on every normal route but may still reach the self
+    /// password-change route and logout to recover. An UNFLAGGED principal is
+    /// unaffected. DB-backed: no-ops when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn test_must_change_password_gates_normal_routes_but_allows_recovery() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::{middleware, routing::any, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+
+        let app = || {
+            Router::new()
+                .route(
+                    "/api/v1/repositories",
+                    any(|| async { (StatusCode::OK, "repos") }),
+                )
+                .route(
+                    "/api/v1/users/:id/password",
+                    any(|| async { (StatusCode::OK, "pw") }),
+                )
+                .route(
+                    "/api/v1/auth/logout",
+                    any(|| async { (StatusCode::OK, "logout") }),
+                )
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                ))
+        };
+
+        let mk_req = |uri: &str, bearer: &str| {
+            axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Flagged principal.
+        let (flagged_id, flagged_bearer) =
+            mint_bearer_for_flagged_user(&pool, &auth_service, true).await;
+
+        // A normal route is refused with 428.
+        let resp = app()
+            .oneshot(mk_req("/api/v1/repositories", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PRECONDITION_REQUIRED,
+            "flagged principal must be 428'd on a normal route"
+        );
+
+        // The self password-change recovery route is still reachable.
+        let resp = app()
+            .oneshot(mk_req(
+                &format!("/api/v1/users/{}/password", flagged_id),
+                &flagged_bearer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flagged principal must still reach the self password-change route"
+        );
+
+        // Logout is reachable too.
+        let resp = app()
+            .oneshot(mk_req("/api/v1/auth/logout", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flagged principal must still be able to log out"
+        );
+
+        // Control: an UNFLAGGED principal sails through the normal route.
+        let (_unflagged_id, unflagged_bearer) =
+            mint_bearer_for_flagged_user(&pool, &auth_service, false).await;
+        let resp = app()
+            .oneshot(mk_req("/api/v1/repositories", &unflagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unflagged principal must not be gated"
+        );
     }
 }
