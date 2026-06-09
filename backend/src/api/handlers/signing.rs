@@ -212,6 +212,7 @@ async fn revoke_key(
     Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     svc.revoke_key(key_id, Some(auth.user_id)).await?;
     Ok(Json(serde_json::json!({"revoked": true})))
@@ -483,6 +484,24 @@ mod tests {
         match require_signing_admin(&ext) {
             Err(AppError::Authorization(_)) => {}
             other => panic!("expected 403 Authorization for non-admin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_revoking_signing_key() {
+        // Regression for #1784: revoke_key previously omitted the admin gate
+        // that create_key, delete_key, and update_repo_signing_config enforce,
+        // letting a non-admin JWT revoke (deactivate) any signing key via
+        // POST /api/v1/signing/keys/{id}/revoke and break the trust chain.
+        // revoke_key now calls require_signing_admin(&auth)? first; pin that a
+        // non-admin is rejected with 403 (no DB needed).
+        let ext = non_admin_jwt();
+        match require_signing_admin(&ext) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "expected 403 Authorization for non-admin revoke, got {:?}",
+                other
+            ),
         }
     }
 
