@@ -1374,6 +1374,12 @@ pub(crate) enum LocalLookup<'a> {
     Path(&'a str),
     /// Match on `name` + `version`.
     NameVersion(&'a str, &'a str),
+    /// Match on `name` + `version` constrained to a trailing `path LIKE`
+    /// pattern (e.g. `%.zip` vs `%.mod`). Needed by the Go proxy where a
+    /// single `(name, version)` pair owns *both* the module `.zip` and the
+    /// `.mod` artifact; the bare `NameVersion` lookup would return whichever
+    /// row was inserted first, serving go.mod bytes for a `.zip` request.
+    NameVersionSuffix(&'a str, &'a str, &'a str),
 }
 
 impl LocalLookup<'_> {
@@ -1394,6 +1400,12 @@ impl LocalLookup<'_> {
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
             }
+            LocalLookup::NameVersionSuffix(_, _, _) => {
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
+                 LIMIT 1"
+            }
         }
     }
 
@@ -1405,6 +1417,9 @@ impl LocalLookup<'_> {
         let query = match self {
             LocalLookup::Path(path) => query.bind(*path),
             LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
+            LocalLookup::NameVersionSuffix(name, version, suffix) => {
+                query.bind(*name).bind(*version).bind(*suffix)
+            }
         };
 
         query
@@ -1520,6 +1535,30 @@ pub async fn local_fetch_by_name_version(
         repo_id,
         location,
         LocalLookup::NameVersion(name, version),
+    )
+    .await?;
+    read_local_stream(db, &artifact, &*storage).await
+}
+
+/// Local artifact fetch by `name` + `version` constrained to a trailing
+/// `path LIKE` pattern. Used by the Go proxy's virtual-member fallback so a
+/// `.zip` request resolves the module archive and a `.mod` request resolves
+/// the go.mod, even though both share the same `(name, version)` coordinates.
+pub async fn local_fetch_by_name_version_and_suffix(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    name: &str,
+    version: &str,
+    suffix_pattern: &str,
+) -> Result<StreamingFetchResult, Response> {
+    let (artifact, storage) = local_lookup_artifact(
+        db,
+        state,
+        repo_id,
+        location,
+        LocalLookup::NameVersionSuffix(name, version, suffix_pattern),
     )
     .await?;
     read_local_stream(db, &artifact, &*storage).await
@@ -2724,13 +2763,34 @@ mod tests {
     }
 
     #[test]
+    fn test_local_lookup_name_version_suffix_select_sql() {
+        // Regression (#1782): the Go proxy's virtual fallback uses this
+        // variant so a `.zip` request and a `.mod` request -- which share the
+        // same (name, version) -- resolve to different artifacts. The WHERE
+        // clause MUST add the `path LIKE $4` filter; without it the bare
+        // NameVersion query returns whichever row was inserted first (serving
+        // go.mod bytes for a `.zip` request).
+        let sql = LocalLookup::NameVersionSuffix("pkg", "1.0.0", "%.zip").select_sql();
+        assert!(
+            sql.contains(
+                "WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false"
+            ),
+            "suffix variant must filter on `path LIKE $4`: {sql}"
+        );
+        assert!(sql.contains("LIMIT 1"));
+    }
+
+    #[test]
     fn test_local_lookup_select_columns_identical() {
-        // Both variants select the same LocalArtifactRow columns; only the
+        // All variants select the same LocalArtifactRow columns; only the
         // WHERE clause differs (the whole point of the S6 collapse).
         let cols =
             "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until";
         assert!(LocalLookup::Path("x").select_sql().starts_with(cols));
         assert!(LocalLookup::NameVersion("n", "v")
+            .select_sql()
+            .starts_with(cols));
+        assert!(LocalLookup::NameVersionSuffix("n", "v", "%.mod")
             .select_sql()
             .starts_with(cols));
     }

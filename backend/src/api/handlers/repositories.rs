@@ -3330,7 +3330,7 @@ pub async fn upload_artifact(
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
 
@@ -3422,14 +3422,17 @@ pub async fn upload_artifact(
         }
     };
 
+    // Content-Type resolution priority:
+    //   1. WASM plugin metadata (format-aware)
+    //   2. the request's declared Content-Type header (honour the client)
+    //   3. mime_guess from the path extension
+    let declared_content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
     let content_type = wasm_metadata
         .as_ref()
         .map(|m| m.content_type.clone())
-        .unwrap_or_else(|| {
-            mime_guess::from_path(&path)
-                .first_or_octet_stream()
-                .to_string()
-        });
+        .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
 
     // Clean up any soft-deleted artifact at the same path so the
     // UNIQUE(repository_id, path) constraint doesn't block re-upload.
@@ -3451,23 +3454,51 @@ pub async fn upload_artifact(
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
-    Ok(Json(ArtifactResponse {
-        id: artifact.id,
-        repository_key: key,
-        path: artifact.path,
-        name: artifact.name,
-        version: artifact.version,
-        size_bytes: artifact.size_bytes,
-        checksum_sha256: artifact.checksum_sha256,
-        content_type: artifact.content_type,
-        download_count: downloads,
-        created_at: artifact.created_at,
-        metadata: metadata_json,
-        // Just-uploaded artifacts have no proxy cache state yet -- the
-        // cache is populated lazily on the first proxy fetch.
-        cache_cached_at: None,
-        cache_expires_at: None,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(ArtifactResponse {
+            id: artifact.id,
+            repository_key: key,
+            path: artifact.path,
+            name: artifact.name,
+            version: artifact.version,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256,
+            content_type: artifact.content_type,
+            download_count: downloads,
+            created_at: artifact.created_at,
+            metadata: metadata_json,
+            // Just-uploaded artifacts have no proxy cache state yet -- the
+            // cache is populated lazily on the first proxy fetch.
+            cache_cached_at: None,
+            cache_expires_at: None,
+        }),
+    ))
+}
+
+/// Resolve the Content-Type for a generic artifact upload.
+///
+/// Honours a client-declared `Content-Type` header when it is a valid,
+/// non-empty MIME type that is not a multipart wrapper (multipart only
+/// describes the request envelope, not the stored object). Otherwise falls
+/// back to guessing from the artifact path's file extension.
+fn resolve_upload_content_type(declared: Option<&str>, path: &str) -> String {
+    if let Some(raw) = declared {
+        let trimmed = raw.trim();
+        // Strip any `; charset=...` parameters for the multipart check, but
+        // preserve the full declared value when we accept it.
+        let base = trimmed.split(';').next().unwrap_or(trimmed).trim();
+        if !base.is_empty()
+            && base.contains('/')
+            && !base.eq_ignore_ascii_case("multipart/form-data")
+            && !base.to_ascii_lowercase().starts_with("multipart/")
+        {
+            return trimmed.to_string();
+        }
+    }
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
 }
 
 /// Upload artifact via multipart/form-data POST (with path in URL).
@@ -3480,7 +3511,7 @@ async fn upload_artifact_multipart_with_path(
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let (body, filename) = extract_multipart_file(multipart).await?;
     let artifact_path = if path.is_empty() || path == "/" {
         filename
@@ -3514,7 +3545,7 @@ async fn upload_artifact_multipart(
     Path(key): Path<String>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Json<ArtifactResponse>> {
+) -> Result<(StatusCode, Json<ArtifactResponse>)> {
     let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
     let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_artifact(
@@ -3795,6 +3826,13 @@ pub async fn download_artifact(
     Path((key, path)): Path<(String, String)>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse> {
+    // A HEAD request must return identical headers to GET but no body, and it
+    // must close the connection. Without this flag the handler builds a
+    // `Body::from_stream(..)` whose Content-Length advertises the full size
+    // while no bytes are written, so HTTP/1.1 keep-alive clients block waiting
+    // for a body that never arrives (the connection hangs).
+    let is_head = request.method() == axum::http::Method::HEAD;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -3946,36 +3984,49 @@ pub async fn download_artifact(
                 )
                 .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy");
 
-            let response = match parse_byte_range(range_header, total) {
-                RangeOutcome::Satisfiable { start, end } => {
-                    let len = end - start + 1;
-                    base.status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_LENGTH, len.to_string())
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", start, end, total),
-                        )
-                        .body(Body::from_stream(slice_byte_stream(body, start, end)))
-                        .map_err(|e| {
-                            AppError::Internal(format!("failed to build response: {}", e))
-                        })?
-                }
-                RangeOutcome::Unsatisfiable => {
-                    // 416 must carry the resource size via Content-Range and no body.
-                    Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header(header::CONTENT_RANGE, format!("bytes */{}", total))
-                        .body(Body::empty())
-                        .map_err(|e| {
-                            AppError::Internal(format!("failed to build response: {}", e))
-                        })?
-                }
-                RangeOutcome::Full => base
-                    .status(StatusCode::OK)
+            let response = if is_head {
+                // HEAD: emit headers only — no body, no streaming. A streamed
+                // body on a HEAD request never terminates (the connection
+                // hangs); HEAD must return the metadata and an empty body
+                // (#1782).
+                base.status(StatusCode::OK)
                     .header(header::CONTENT_LENGTH, total.to_string())
-                    .body(Body::from_stream(body))
-                    .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?,
+                    .body(Body::empty())
+                    .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?
+            } else {
+                match parse_byte_range(range_header, total) {
+                    RangeOutcome::Satisfiable { start, end } => {
+                        let len = end - start + 1;
+                        base.status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_LENGTH, len.to_string())
+                            .header(
+                                header::CONTENT_RANGE,
+                                format!("bytes {}-{}/{}", start, end, total),
+                            )
+                            .body(Body::from_stream(slice_byte_stream(body, start, end)))
+                            .map_err(|e| {
+                                AppError::Internal(format!("failed to build response: {}", e))
+                            })?
+                    }
+                    RangeOutcome::Unsatisfiable => {
+                        // 416 must carry the resource size via Content-Range and no body.
+                        Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::ACCEPT_RANGES, "bytes")
+                            .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+                            .body(Body::empty())
+                            .map_err(|e| {
+                                AppError::Internal(format!("failed to build response: {}", e))
+                            })?
+                    }
+                    RangeOutcome::Full => base
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH, total.to_string())
+                        .body(Body::from_stream(body))
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                        })?,
+                }
             };
             Ok(response)
         }
@@ -4065,7 +4116,12 @@ pub async fn download_artifact(
             if let Some(size) = result.content_length {
                 builder = builder.header(header::CONTENT_LENGTH, size.to_string());
             }
-            Ok(builder.body(Body::from_stream(result.body)).unwrap())
+            let body = if is_head {
+                Body::empty()
+            } else {
+                Body::from_stream(result.body)
+            };
+            Ok(builder.body(body).unwrap())
         }
         Err(e) => Err(e),
     }
@@ -9599,6 +9655,82 @@ mod tests {
         );
     }
 
+    // Regression (#1782): a HEAD request on the generic download endpoint must
+    // return the GET headers (status, Content-Type, Content-Length) but an
+    // EMPTY body. Previously the handler always attached `Body::from_stream`,
+    // so HTTP/1.1 keep-alive clients blocked waiting for `Content-Length`
+    // bytes that were never written and the connection hung.
+    #[tokio::test]
+    async fn test_download_artifact_head_returns_headers_no_body() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let body_bytes: &[u8] = b"head-request-must-not-return-this-body";
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "head/probe.bin",
+            "probe",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        let router = fx.router_with_auth(download_router());
+        let req = axum::http::Request::builder()
+            .method("HEAD")
+            .uri(format!("/{}/download/head/probe.bin", fx.repo_key))
+            .body(Body::empty())
+            .expect("build HEAD request");
+
+        use tower::ServiceExt;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("HEAD download must respond");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect HEAD body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "HEAD on an existing artifact must return 200"
+        );
+        // Content-Length still advertises the full size (HEAD semantics) ...
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(body_bytes.len().to_string().as_str()),
+            "HEAD must still report the artifact size in Content-Length"
+        );
+        // ... but NO body bytes are written, so the connection can close.
+        assert!(
+            collected.is_empty(),
+            "HEAD must return an empty body, got {} bytes",
+            collected.len()
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-test"),
+            "HEAD must carry the same Content-Type as GET"
+        );
+    }
+
     #[tokio::test]
     async fn test_download_artifact_local_missing_path_returns_404() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
@@ -10305,6 +10437,64 @@ mod tests {
                 "artifact_v1.2.3+linux.x86_64.bin"
             ),
             "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Generic upload Content-Type resolution (#1782)
+    //
+    // The handler must honour a client-declared `Content-Type` header instead
+    // of always guessing from the file extension. Multipart wrappers describe
+    // the request envelope, not the stored object, so they must NOT win.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_upload_content_type_honours_declared_header() {
+        // A valid declared MIME type wins over the mime_guess of `.bin`
+        // (which would be application/octet-stream).
+        assert_eq!(
+            resolve_upload_content_type(
+                Some("application/vnd.my-company.binary"),
+                "pkg/v1/binary.bin"
+            ),
+            "application/vnd.my-company.binary"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_preserves_charset_params() {
+        assert_eq!(
+            resolve_upload_content_type(Some("text/plain; charset=utf-8"), "x"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_ignores_multipart_wrapper() {
+        // multipart/form-data only describes the upload envelope. Fall back to
+        // mime_guess (here `.txt` -> text/plain).
+        let ct =
+            resolve_upload_content_type(Some("multipart/form-data; boundary=----abc"), "notes.txt");
+        assert!(ct.starts_with("text/plain"), "got {ct}");
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_falls_back_to_mime_guess() {
+        // No declared header -> guess from extension.
+        let ct = resolve_upload_content_type(None, "archive.json");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn test_resolve_upload_content_type_ignores_empty_and_invalid() {
+        // Empty / malformed (no slash) declared values fall back to guess.
+        assert_eq!(
+            resolve_upload_content_type(Some("   "), "data.json"),
+            "application/json"
+        );
+        assert_eq!(
+            resolve_upload_content_type(Some("not-a-mime"), "data.json"),
+            "application/json"
         );
     }
 
