@@ -497,9 +497,24 @@ jobs:
           # intermittent "fatal: shallow file has changed since we read it" /
           # "ambiguous argument 'FETCH_HEAD'" exit-128 flake. A named ref is
           # race-free. (#1798/#1799/#1812/#1813/#1815)
+          #
+          # Diff against the MERGE-BASE between the PR head and the base branch
+          # tip, NOT the raw base tip — the same #1646 fix the coverage gate
+          # already has. Diffing against the tip counts files changed by OTHER
+          # PRs that merged after this branch was cut as a phantom delta, so a
+          # stale branch inherits e.g. formats/helm.rs (and its pre-existing
+          # clones) from main and fails the gate on code it never touched
+          # (#1824/#1825/#1827/#1796 all failed on identical helm.rs clones).
           BASE="${{ github.base_ref }}"
-          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null || true
-          CHANGED_RS=$(git diff --name-only "origin/$BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+          git fetch --no-tags --depth=200 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null || true
+          git fetch --no-tags --deepen=200 origin "$BASE" 2>/dev/null || true
+          MERGE_BASE=$(git merge-base "origin/$BASE" HEAD 2>/dev/null || true)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::warning::Could not compute merge-base on shallow clone; falling back to base tip (issue #1646 trade-off)"
+            MERGE_BASE=$(git rev-parse "origin/$BASE")
+          fi
+          echo "Diffing changed files against merge-base: $MERGE_BASE"
+          CHANGED_RS=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
           # Exclude the per-ecosystem package-format handlers
           # (backend/src/api/handlers/<format>.rs). These are inherent structural
