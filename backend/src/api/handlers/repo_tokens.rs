@@ -140,6 +140,25 @@ async fn authorize_repo_for_tokens(
         )));
     }
 
+    // Token management is a privileged, per-repo operation: unlike read access
+    // it is never granted by a repository merely being public. Admins bypass;
+    // every other caller must hold a role assignment scoped to the repo
+    // (direct or global). Without this gate a normal user JWT (which has no
+    // `allowed_repo_ids` restriction, so `can_access_repo` is always true)
+    // could list, create, or revoke another repository's scoped tokens.
+    // NotFound (not Forbidden) matches the convention above and avoids
+    // leaking the existence of repositories the caller may not see.
+    if !auth.is_admin
+        && !repo_service
+            .user_can_access_repo(repo.id, auth.user_id)
+            .await?
+    {
+        return Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            key
+        )));
+    }
+
     Ok((auth, repo))
 }
 
@@ -791,7 +810,12 @@ mod admin_scope_policy_tests {
     async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String, String)> {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
-        let (_repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        // Grant the non-admin fixture user a role assignment scoped to the repo
+        // so it passes the per-repo authorization gate in
+        // `authorize_repo_for_tokens` and reaches the admin-scope policy check
+        // these tests exercise.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let state = tdh::build_state(pool.clone(), "/tmp");
         Some((pool, state, user_id, username, repo_key))
     }
@@ -801,6 +825,13 @@ mod admin_scope_policy_tests {
             .bind(user_id)
             .execute(pool)
             .await;
+        let _ = sqlx::query(
+            "DELETE FROM role_assignments WHERE repository_id = \
+             (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(repo_key)
+        .execute(pool)
+        .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
             .bind(repo_key)
             .execute(pool)
@@ -918,5 +949,127 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id, &repo_key).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-repo grant enforcement tests (cross-tenant token disclosure/revocation)
+//
+// `authorize_repo_for_tokens` must require a role assignment scoped to the
+// repository (or global admin) before any token operation. Token management
+// is privileged: a public repository or a mere authenticated session is NOT
+// sufficient. Without the grant gate, a normal-user JWT (no
+// `allowed_repo_ids` restriction, so `can_access_repo` is always true) could
+// list/create/revoke another repository's scoped tokens.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod grant_enforcement_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        repo_tokens_router()
+            .with_state(state)
+            .layer(AxumExtension::<Option<AuthExtension>>(Some(auth)))
+    }
+
+    fn list_request(repo_key: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", repo_key))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// A non-admin JWT user with NO role assignment scoped to the repository
+    /// must be denied (404) listing its tokens — even though the bare
+    /// `can_access_repo` check passes for an unrestricted JWT.
+    #[tokio::test]
+    async fn non_admin_without_grant_cannot_list_repo_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        // Non-admin JWT session, no grant on the repo.
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_app(tdh::build_state(pool.clone(), "/tmp"), auth);
+        let (status, _) = tdh::send(app, list_request(&repo_key)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "ungranted non-admin listing another repo's tokens MUST 404"
+        );
+
+        cleanup(&pool, user_id, repo_id).await;
+    }
+
+    /// A non-admin user WITH a role assignment scoped to the repository may
+    /// list its tokens (200).
+    #[tokio::test]
+    async fn non_admin_with_grant_can_list_repo_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_app(tdh::build_state(pool.clone(), "/tmp"), auth);
+        let (status, body) = tdh::send(app, list_request(&repo_key)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "granted user listing repo tokens MUST 200; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup(&pool, user_id, repo_id).await;
+    }
+
+    /// A global admin bypasses the per-repo grant requirement.
+    #[tokio::test]
+    async fn admin_without_grant_can_list_repo_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_admin = true;
+        let app = build_app(tdh::build_state(pool.clone(), "/tmp"), auth);
+        let (status, body) = tdh::send(app, list_request(&repo_key)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin listing repo tokens MUST 200; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup(&pool, user_id, repo_id).await;
     }
 }
