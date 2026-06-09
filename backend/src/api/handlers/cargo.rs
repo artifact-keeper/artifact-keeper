@@ -395,6 +395,26 @@ async fn search_crates(
         .unwrap_or(10)
         .min(100);
 
+    // Total number of distinct crates matching the query. This must be counted
+    // independently of the paginated (LIMIT-truncated) result set, otherwise
+    // `meta.total` reports the page size rather than the real match count and
+    // cargo's search pagination breaks.
+    let total_matches: i64 = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(DISTINCT a.name)
+        FROM artifacts a
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')
+        "#,
+        repo.id,
+        query,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(map_db_err)?
+    .unwrap_or(0);
+
     // Search for crates matching the query
     let crates = sqlx::query!(
         r#"
@@ -440,18 +460,31 @@ async fn search_crates(
         })
         .collect();
 
-    let response = serde_json::json!({
-        "crates": crate_list,
-        "meta": {
-            "total": crate_list.len(),
-        }
-    });
+    let response = build_search_response(crate_list, total_matches);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&response).unwrap()))
         .unwrap())
+}
+
+/// Build the cargo search-endpoint JSON body.
+///
+/// `meta.total` is the **total** number of distinct crates matching the query
+/// across all pages — not the length of the (LIMIT-truncated) `crate_list`
+/// for the current page. Cargo relies on `meta.total` for pagination, so it
+/// must be derived from a separate COUNT(*) and not from the page slice.
+fn build_search_response(
+    crate_list: Vec<serde_json::Value>,
+    total_matches: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "crates": crate_list,
+        "meta": {
+            "total": total_matches,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1591,33 @@ mod tests {
             "links": null,
             "rust_version": "1.70.0"
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // build_search_response — meta.total must reflect the total match count
+    // across all pages, not the (LIMIT-truncated) current page length (#1777)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_meta_total_reflects_total_not_page_len() {
+        // One crate on the current page, but 3 total matches across all pages.
+        let page: Vec<serde_json::Value> = vec![serde_json::json!({
+            "name": "alpha-crate",
+            "max_version": "0.1.0",
+            "description": "",
+        })];
+        let resp = build_search_response(page, 3);
+        assert_eq!(resp["crates"].as_array().unwrap().len(), 1);
+        // Regression: previously this used crate_list.len() (== 1) and broke
+        // cargo search pagination. It must be the real total (3).
+        assert_eq!(resp["meta"]["total"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_search_meta_total_zero_when_no_matches() {
+        let resp = build_search_response(Vec::new(), 0);
+        assert_eq!(resp["crates"].as_array().unwrap().len(), 0);
+        assert_eq!(resp["meta"]["total"], serde_json::json!(0));
     }
 
     // -----------------------------------------------------------------------
