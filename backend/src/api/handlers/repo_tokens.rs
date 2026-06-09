@@ -140,6 +140,25 @@ async fn authorize_repo_for_tokens(
         )));
     }
 
+    // Per-repo authorization (mirrors `require_visible` in the repositories
+    // handler). The `can_access_repo` check above only enforces the *token's*
+    // repo scope — a broad `write:repositories` token (`allowed_repo_ids =
+    // None`) passes it for ANY repo. Without this DB-level check, any
+    // authenticated user with the write scope could mint repo-scoped tokens on
+    // a PRIVATE repository they cannot see (#1783). A private repo is visible
+    // only to an admin or a user with a role assignment scoped to it.
+    if !repo.is_public
+        && !auth.is_admin
+        && !repo_service
+            .user_can_access_repo(repo.id, auth.user_id)
+            .await?
+    {
+        return Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            key
+        )));
+    }
+
     Ok((auth, repo))
 }
 
@@ -862,6 +881,45 @@ mod admin_scope_policy_tests {
                 String::from_utf8_lossy(&body_bytes),
             );
         }
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// #1783: a non-admin holding only the broad `write:repositories` scope
+    /// (token `allowed_repo_ids = None`, so `can_access_repo` passes for ANY
+    /// repo) must NOT be able to mint a repo token on a PRIVATE repository it
+    /// has no role on. Before the fix the endpoint returned 200/created; it
+    /// must now 404 (existence-hiding), exactly like `require_visible`.
+    #[tokio::test]
+    async fn non_admin_without_role_cannot_mint_token_on_private_repo() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        // Make the repo private; the user from setup() has no role on it.
+        sqlx::query("UPDATE repositories SET is_public = false WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await
+            .expect("set repo private");
+
+        // Non-admin API token with the delegatable write scope but no repo
+        // restriction, requesting a SAFE (non-admin) scope so it clears the
+        // admin-scope gate and reaches the visibility check.
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+
+        let app = build_app(state, auth);
+        let req = post_repo_token_request(&repo_key, "probe-private", &["read:artifacts"]);
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-admin without a role must not mint tokens on a private repo (existence-hiding); got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
 
         cleanup(&pool, user_id, &repo_key).await;
     }
