@@ -22,12 +22,19 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),
     );
-    headers.insert(
-        "content-security-policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
-    );
+    // Only set the global default CSP when the handler did not already set a
+    // tighter, route-specific policy. Using `entry().or_insert()` (rather than
+    // `insert()`, which unconditionally overwrites) preserves a per-handler CSP
+    // such as the restrictive `default-src 'none'` the PyPI simple-index
+    // handler emits, while still providing a safe default for every other
+    // route (#1773).
+    headers
+        .entry("content-security-policy")
+        .or_insert(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+                .parse()
+                .unwrap(),
+        );
 
     response
 }
@@ -137,6 +144,41 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         // We verify the status code is OK, which confirms the handler ran.
         // Body consumption requires http-body-util which is not a direct dependency.
+    }
+
+    #[tokio::test]
+    async fn test_security_headers_preserves_handler_set_csp() {
+        // Regression for #1773: a handler that sets its own (tighter) CSP must
+        // not have it clobbered by the global default. The middleware should
+        // only fill in the default CSP when none is already present.
+        async fn tight_csp_handler() -> axum::response::Response {
+            axum::response::Response::builder()
+                .header(
+                    "content-security-policy",
+                    "default-src 'none'; style-src 'unsafe-inline'",
+                )
+                .body(Body::from("OK"))
+                .unwrap()
+        }
+
+        let app = Router::new()
+            .route("/tight", get(tight_csp_handler))
+            .layer(middleware::from_fn(security_headers_middleware));
+        let request = Request::builder()
+            .uri("/tight")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, "default-src 'none'; style-src 'unsafe-inline'");
+        // The other security headers must still be applied.
+        assert!(resp.headers().get("x-frame-options").is_some());
     }
 
     #[tokio::test]
