@@ -21,6 +21,18 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Unauthorized("Authentication required".to_string()))
 }
 
+/// Parse a comma-separated `status` query value into a trimmed, non-empty list.
+/// Returns `None` when no concrete status is present so the filter is disabled.
+fn parse_status_filter(raw: &str) -> Option<Vec<String>> {
+    let parsed: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!parsed.is_empty()).then_some(parsed)
+}
+
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/reviews", get(list_reviews))
@@ -133,10 +145,14 @@ pub async fn list_reviews(
     let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = i64::from(page - 1) * i64::from(per_page);
 
+    // `status` accepts a comma-separated list (e.g. "approved,rejected") so the UI
+    // can fetch multiple states in one page while keeping pagination totals honest.
+    let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
+
     let (items, total) = svc
         .list_reviews(
             query.repository_key.as_deref(),
-            query.status.as_deref(),
+            statuses.as_deref(),
             offset,
             i64::from(per_page),
         )
@@ -289,6 +305,15 @@ pub async fn update_repo_age_gate(
 ) -> Result<Json<AgeGateConfigResponse>> {
     let auth = require_auth(auth)?;
     auth.require_admin()?;
+
+    // The repositories.age_gate_min_age_days column has a CHECK (1..=3650); validate
+    // here so an out-of-range value returns a clean 400 instead of a 500 DB error.
+    if !(1..=3650).contains(&body.min_age_days) {
+        return Err(AppError::Validation(
+            "min_age_days must be between 1 and 3650".to_string(),
+        ));
+    }
+
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
@@ -336,3 +361,30 @@ pub async fn update_repo_age_gate(
     tags((name = "age-gate", description = "Age-based proxy quality gate"))
 )]
 pub struct AgeGateApi;
+
+#[cfg(test)]
+mod tests {
+    use super::parse_status_filter;
+
+    #[test]
+    fn parse_status_filter_splits_and_trims() {
+        assert_eq!(
+            parse_status_filter("approved, rejected"),
+            Some(vec!["approved".to_string(), "rejected".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_status_filter_single_value() {
+        assert_eq!(
+            parse_status_filter("pending"),
+            Some(vec!["pending".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_status_filter_empty_is_none() {
+        assert_eq!(parse_status_filter(""), None);
+        assert_eq!(parse_status_filter("  , ,"), None);
+    }
+}
