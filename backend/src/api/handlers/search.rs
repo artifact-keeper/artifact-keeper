@@ -191,7 +191,46 @@ pub(crate) fn resolve_checksum_column(algorithm: &str) -> Result<&'static str> {
 ///
 /// The returned value is passed directly to SearchService methods as the
 /// `accessible_repo_ids` parameter.
+/// Intersect a user-visible repo set with an API token's repository scope
+/// (`allowed_repo_ids`), so a token scoped to repo X cannot enumerate other
+/// repos via search (#1803).
+///
+/// * `visible = None` means "no filter" (admin). A repo-scoped token narrows
+///   this to exactly its scoped ids.
+/// * `visible = Some(ids)` is intersected with the token scope.
+/// * `token_scope = None` (unrestricted / JWT / anonymous) leaves `visible`
+///   unchanged.
+pub(crate) fn intersect_token_scope(
+    visible: Option<Vec<Uuid>>,
+    token_scope: Option<&[Uuid]>,
+) -> Option<Vec<Uuid>> {
+    match token_scope {
+        None => visible,
+        Some(scope) => match visible {
+            // Admin (no filter) restricted to the token's scoped repos.
+            None => Some(scope.to_vec()),
+            Some(ids) => Some(
+                ids.into_iter()
+                    .filter(|id| scope.contains(id))
+                    .collect::<Vec<_>>(),
+            ),
+        },
+    }
+}
+
 async fn resolve_accessible_repos(
+    db: &PgPool,
+    auth: &Option<AuthExtension>,
+) -> Result<Option<Vec<Uuid>>> {
+    let visible = resolve_visible_repos(db, auth).await?;
+    let token_scope = auth.as_ref().and_then(|a| a.allowed_repo_ids.as_deref());
+    Ok(intersect_token_scope(visible, token_scope))
+}
+
+/// Resolve the caller's *visibility* set (public + role grants), ignoring any
+/// API-token repository scope. Token scope is layered on top by
+/// [`resolve_accessible_repos`] via [`intersect_token_scope`].
+async fn resolve_visible_repos(
     db: &PgPool,
     auth: &Option<AuthExtension>,
 ) -> Result<Option<Vec<Uuid>>> {
@@ -1313,6 +1352,50 @@ mod tests {
     fn test_classify_repo_access_anonymous() {
         let auth: Option<AuthExtension> = None;
         assert_eq!(classify_repo_access(&auth), RepoAccessMode::PublicOnly);
+    }
+
+    // intersect_token_scope (pure function) — #1803 search scope tightening
+    #[test]
+    fn test_intersect_unrestricted_token_leaves_visible_unchanged() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let visible = Some(vec![a, b]);
+        assert_eq!(
+            intersect_token_scope(visible.clone(), None),
+            visible,
+            "no token scope means no intersection"
+        );
+        // Admin no-filter stays no-filter when token is unrestricted.
+        assert_eq!(intersect_token_scope(None, None), None);
+    }
+
+    #[test]
+    fn test_intersect_narrows_admin_no_filter_to_token_scope() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Admin (None = all repos) with a repo-scoped token is clamped to scope.
+        assert_eq!(intersect_token_scope(None, Some(&[a, b])), Some(vec![a, b]));
+    }
+
+    #[test]
+    fn test_intersect_filters_visible_to_token_scope() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        // Visible {a,b,c}, token scoped to {a,c}, out-of-scope b dropped.
+        let out = intersect_token_scope(Some(vec![a, b, c]), Some(&[a, c]));
+        assert_eq!(out, Some(vec![a, c]));
+    }
+
+    #[test]
+    fn test_intersect_disjoint_yields_empty() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Token scoped to a repo not in the visible set -> nothing visible.
+        assert_eq!(
+            intersect_token_scope(Some(vec![a]), Some(&[b])),
+            Some(vec![])
+        );
     }
 
     #[test]

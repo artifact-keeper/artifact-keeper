@@ -24,6 +24,86 @@ pub fn router() -> Router<SharedState> {
         .route("/content", get(get_content))
 }
 
+/// Pure authorization decision for a tree/content read of a single repository.
+///
+/// The tree-browser routes are nested under `optional_auth_middleware` only,
+/// so they never pass through `repo_visibility_middleware` and must enforce
+/// per-repo authorization themselves (#1803). This mirrors the visibility +
+/// token-scope + role-grant logic of `repo_visibility_middleware` /
+/// `RepositoryService::user_can_access_repo`:
+///
+/// * admins always pass;
+/// * a public repo is readable by anyone **whose token scope permits it**
+///   (`token_allows`), including anonymous callers;
+/// * a private repo requires an authenticated caller that holds a role
+///   assignment on the repo (`has_role_grant`) **and** whose token scope
+///   permits it.
+///
+/// `token_allows` already encodes `AuthExtension::can_access_repo` (an
+/// unrestricted token / non-API-token / anonymous caller passes `true`).
+fn tree_access_allowed(
+    is_admin: bool,
+    is_public: bool,
+    is_authed: bool,
+    token_allows: bool,
+    has_role_grant: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if !token_allows {
+        return false;
+    }
+    if is_public {
+        return true;
+    }
+    // Private repo: must be authenticated AND hold a role grant on it.
+    is_authed && has_role_grant
+}
+
+/// Resolve and enforce read authorization for a tree/content request against a
+/// single repository, returning the existence-hiding 404 on denial so we never
+/// leak whether a private repo exists (#1803).
+async fn authorize_tree_read(
+    state: &SharedState,
+    auth: &Option<AuthExtension>,
+    repo_id: Uuid,
+    is_public: bool,
+    repo_key: &str,
+) -> Result<()> {
+    let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo_key));
+
+    let is_admin = auth.as_ref().map(|a| a.is_admin).unwrap_or(false);
+    let is_authed = auth.is_some();
+    // Token repo-scope (`allowed_repo_ids`): unrestricted / anonymous => true.
+    let token_allows = auth
+        .as_ref()
+        .map(|a| a.can_access_repo(repo_id))
+        .unwrap_or(true);
+
+    // Only consult role grants when they can actually change the outcome
+    // (private repo, non-admin, authenticated, token-permitted). This avoids
+    // an unnecessary DB round-trip for public reads.
+    let has_role_grant = if !is_admin && !is_public && is_authed && token_allows {
+        match auth.as_ref() {
+            Some(a) => state
+                .create_repository_service()
+                .user_can_access_repo(repo_id, a.user_id)
+                .await
+                .unwrap_or(false),
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    if tree_access_allowed(is_admin, is_public, is_authed, token_allows, has_role_grant) {
+        Ok(())
+    } else {
+        Err(not_found())
+    }
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct TreeQuery {
     /// Repository key to browse
@@ -115,13 +195,10 @@ pub async fn get_tree(
     let (repo_id, is_public) = repo_row
         .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
 
-    // Private repos require authentication
-    if !is_public && auth.is_none() {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            repo_key
-        )));
-    }
+    // Per-repo read authorization (#1803). These routes bypass
+    // repo_visibility_middleware, so enforce admin / public+token-scope /
+    // role-grant+token-scope here; deny with an existence-hiding 404.
+    authorize_tree_read(&state, &auth, repo_id, is_public, &repo_key).await?;
 
     let prefix = params.path.unwrap_or_default();
     let prefix_depth = if prefix.is_empty() {
@@ -259,13 +336,10 @@ pub async fn get_content(
         AppError::NotFound(format!("Repository '{}' not found", params.repository_key))
     })?;
 
-    // Private repos require authentication
-    if !is_public && auth.is_none() {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            params.repository_key
-        )));
-    }
+    // Per-repo read authorization (#1803). These routes bypass
+    // repo_visibility_middleware, so enforce admin / public+token-scope /
+    // role-grant+token-scope here; deny with an existence-hiding 404.
+    authorize_tree_read(&state, &auth, repo_id, is_public, &params.repository_key).await?;
 
     // Look up the artifact by repository_id + path
     #[derive(sqlx::FromRow)]
@@ -709,5 +783,137 @@ mod tests {
         let json = r#"{"repository_key": "x", "path": "y", "max_bytes": 0}"#;
         let q: ContentQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.max_bytes, Some(0));
+    }
+
+    // ── tree_access_allowed authorization decision (#1803) ───────────────
+
+    #[test]
+    fn test_access_admin_always_allowed_even_private_out_of_scope() {
+        // Admin bypasses visibility, token scope, and role grants.
+        assert!(tree_access_allowed(
+            /* is_admin */ true, /* is_public */ false, /* is_authed */ true,
+            /* token_allows */ false, /* has_role_grant */ false,
+        ));
+    }
+
+    #[test]
+    fn test_access_public_anonymous_allowed() {
+        assert!(tree_access_allowed(false, true, false, true, false));
+    }
+
+    #[test]
+    fn test_access_public_out_of_token_scope_denied() {
+        // Public repo but the token's allowed_repo_ids does not include it.
+        assert!(!tree_access_allowed(false, true, true, false, true));
+    }
+
+    #[test]
+    fn test_access_private_with_grant_and_scope_allowed() {
+        assert!(tree_access_allowed(false, false, true, true, true));
+    }
+
+    #[test]
+    fn test_access_private_zero_grant_denied() {
+        // The exact #1803 exploit shape: non-admin, authed, token scoped to a
+        // public repo (token_allows happens to be true), zero role grants on
+        // the private target -> must be denied.
+        assert!(!tree_access_allowed(false, false, true, true, false));
+    }
+
+    #[test]
+    fn test_access_private_anonymous_denied() {
+        assert!(!tree_access_allowed(false, false, false, true, false));
+    }
+
+    // ── DB-backed handler authorization (#1803) ──────────────────────────
+    //
+    // No-ops when no test DB is configured (`try_pool` returns None).
+
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// A non-admin caller with NO role assignment on a private repo must get a
+    /// 404 (existence-hiding) from GET /tree — not the private tree.
+    #[tokio::test]
+    async fn test_get_tree_private_zero_grant_nonadmin_denied() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // create_repo defaults to is_public = false (private).
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+
+        let auth = tdh::make_auth(user_id, &username);
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = tdh::router_with_auth(router(), state, auth);
+
+        let uri = format!("/?repository_key={}", repo_key);
+        let (status, _body) = tdh::send(app, tdh::get(uri)).await;
+
+        // Clean up before asserting so a failure does not leak rows.
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "zero-grant non-admin must be denied (404) on a private repo tree"
+        );
+    }
+
+    /// A non-admin caller WITH a role grant on the private repo is authorized
+    /// and reaches the handler (200 + empty node list for an empty repo).
+    #[tokio::test]
+    async fn test_get_tree_private_with_grant_nonadmin_allowed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let auth = tdh::make_auth(user_id, &username);
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = tdh::router_with_auth(router(), state, auth);
+
+        let uri = format!("/?repository_key={}", repo_key);
+        let (status, _body) = tdh::send(app, tdh::get(uri)).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin with a role grant must be allowed to browse the private tree"
+        );
+    }
+
+    /// A token scoped to a different repo (allowed_repo_ids excludes the
+    /// target) must be denied even though the caller holds a role grant.
+    #[tokio::test]
+    async fn test_get_tree_private_token_out_of_scope_denied() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        // Token scoped to some OTHER repo id only.
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = tdh::router_with_auth(router(), state, auth);
+
+        let uri = format!("/?repository_key={}", repo_key);
+        let (status, _body) = tdh::send(app, tdh::get(uri)).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "token whose scope excludes the repo must be denied even with a role grant"
+        );
     }
 }

@@ -10,6 +10,16 @@ use tar::Archive;
 
 use crate::models::quality::{QualityCheckOutput, RawQualityIssue};
 
+/// Maximum number of decompressed (inflated tar) bytes the lint checker will
+/// buffer in memory before rejecting the archive.
+///
+/// Without this cap a small, high-ratio gzip payload (a decompression bomb)
+/// can inflate to gigabytes and exhaust backend memory. The compressed request
+/// body limit does not bound the decompressed size, so an explicit cap on the
+/// inflated stream is required. 64 MiB comfortably exceeds any legitimate Helm
+/// chart archive while preventing unbounded allocation.
+const MAX_DECOMPRESSED_TAR_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
 /// Validates Helm chart archives (.tgz) for structural quality.
 ///
 /// Scoring breakdown (100 points total):
@@ -111,25 +121,52 @@ struct TarInventory {
     template_files: Vec<String>,
 }
 
+/// Build a critical-failure `QualityCheckOutput` for a gzip/tar decompression
+/// problem (invalid archive or decompression bomb).
+fn decompress_failure(title: &str, description: String, error: &str) -> QualityCheckOutput {
+    QualityCheckOutput {
+        score: 0,
+        passed: false,
+        issues: vec![RawQualityIssue {
+            severity: "critical".to_string(),
+            category: "helm-structure".to_string(),
+            title: title.to_string(),
+            description: Some(description),
+            location: None,
+        }],
+        details: json!({ "error": error }),
+    }
+}
+
 /// Decompress gzip content, returning the raw tar bytes on success or a
 /// critical-failure `QualityCheckOutput` on error.
+///
+/// The decompressed stream is capped at `MAX_DECOMPRESSED_TAR_BYTES` to defend
+/// against gzip/tar decompression bombs; an archive that inflates beyond the
+/// cap is rejected instead of being buffered in full.
 fn decompress_gzip(content: &Bytes) -> Result<Vec<u8>, QualityCheckOutput> {
-    let mut decoder = GzDecoder::new(content.as_ref());
+    // Read one byte past the cap so an over-limit archive can be detected
+    // rather than silently truncated.
+    let mut decoder = GzDecoder::new(content.as_ref()).take(MAX_DECOMPRESSED_TAR_BYTES + 1);
     let mut tar_bytes = Vec::new();
     if let Err(e) = decoder.read_to_end(&mut tar_bytes) {
-        return Err(QualityCheckOutput {
-            score: 0,
-            passed: false,
-            issues: vec![RawQualityIssue {
-                severity: "critical".to_string(),
-                category: "helm-structure".to_string(),
-                title: "Not a valid gzip archive".to_string(),
-                description: Some(format!("Failed to decompress gzip: {e}")),
-                location: None,
-            }],
-            details: json!({ "error": "Not a valid gzip archive" }),
-        });
+        return Err(decompress_failure(
+            "Not a valid gzip archive",
+            format!("Failed to decompress gzip: {e}"),
+            "Not a valid gzip archive",
+        ));
     }
+
+    if tar_bytes.len() as u64 > MAX_DECOMPRESSED_TAR_BYTES {
+        return Err(decompress_failure(
+            "Decompressed archive too large",
+            format!(
+                "Decompressed archive exceeds maximum allowed size of {MAX_DECOMPRESSED_TAR_BYTES} bytes"
+            ),
+            "Decompressed archive too large",
+        ));
+    }
+
     Ok(tar_bytes)
 }
 
@@ -627,6 +664,26 @@ maintainers:
         assert_eq!(output.issues.len(), 1);
         assert_eq!(output.issues[0].severity, "critical");
         assert_eq!(output.issues[0].category, "helm-structure");
+    }
+
+    #[test]
+    fn test_decompression_bomb_rejected() {
+        // A tiny compressed payload that inflates past MAX_DECOMPRESSED_TAR_BYTES
+        // must be rejected as a critical failure rather than buffered in full.
+        let oversized = vec![b'A'; (MAX_DECOMPRESSED_TAR_BYTES + 1024) as usize];
+        let tgz = build_tgz(&[("bomb/Chart.yaml", &oversized)]);
+        // Highly repetitive content compresses to far below the cap, proving the
+        // guard bounds the decompressed size, not the request body size.
+        assert!(tgz.len() < (MAX_DECOMPRESSED_TAR_BYTES / 16) as usize);
+
+        let checker = HelmLintChecker;
+        let output = checker.check(&tgz);
+
+        assert_eq!(output.score, 0);
+        assert!(!output.passed);
+        assert_eq!(output.issues.len(), 1);
+        assert_eq!(output.issues[0].severity, "critical");
+        assert_eq!(output.issues[0].title, "Decompressed archive too large");
     }
 
     #[test]

@@ -86,6 +86,24 @@ impl CondaNativeHandler {
         }
     }
 
+    /// Parse a bare Conda package filename (no subdir prefix) into its
+    /// `(name, version, build)` coordinates. Accepts both `.conda` and
+    /// `.tar.bz2` extensions. Used by the upload validator to cross-check the
+    /// filename against the embedded `index.json` metadata.
+    pub fn parse_package_filename(filename: &str) -> Result<(String, String, String)> {
+        let stem = if let Some(s) = filename.strip_suffix(".conda") {
+            s
+        } else if let Some(s) = filename.strip_suffix(".tar.bz2") {
+            s
+        } else {
+            return Err(AppError::Validation(format!(
+                "Invalid Conda package: {}",
+                filename
+            )));
+        };
+        Self::parse_conda_filename(stem)
+    }
+
     /// Parse Conda package filename: `<name>-<version>-<build_string>`
     fn parse_conda_filename(stem: &str) -> Result<(String, String, String)> {
         // Split from the right: build is last, version is second-to-last
@@ -232,5 +250,27 @@ mod tests {
         let info = CondaNativeHandler::parse_path("channeldata.json").unwrap();
         assert!(info.is_index);
         assert!(info.subdir.is_none());
+    }
+
+    #[test]
+    fn test_parse_package_filename_v1_and_v2() {
+        // Bare filename parse used by the upload validator (#1782).
+        let (name, version, build) =
+            CondaNativeHandler::parse_package_filename("testpkg-1.0.0-py310_0.tar.bz2").unwrap();
+        assert_eq!(name, "testpkg");
+        assert_eq!(version, "1.0.0");
+        assert_eq!(build, "py310_0");
+
+        let (name, version, build) =
+            CondaNativeHandler::parse_package_filename("numpy-1.26.4-py312h02b7e37_0.conda")
+                .unwrap();
+        assert_eq!(name, "numpy");
+        assert_eq!(version, "1.26.4");
+        assert_eq!(build, "py312h02b7e37_0");
+    }
+
+    #[test]
+    fn test_parse_package_filename_rejects_unknown_extension() {
+        assert!(CondaNativeHandler::parse_package_filename("pkg-1.0-0.zip").is_err());
     }
 }

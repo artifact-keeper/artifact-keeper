@@ -442,6 +442,50 @@ async fn list_versions(
         .join("\n");
 
     if body.is_empty() {
+        // Virtual repo: the version list also lives in the artifact tables of
+        // local (non-Remote) member repos, which `try_proxy_go_metadata` does
+        // not consult. Aggregate distinct versions across all members first so
+        // a module stored only in a Local member is listed (#1782).
+        if repo.repo_type == RepositoryType::Virtual {
+            let member_versions: Vec<Option<String>> = sqlx::query_scalar!(
+                r#"
+                SELECT DISTINCT a.version
+                FROM artifacts a
+                INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
+                WHERE vrm.virtual_repo_id = $1
+                  AND a.name = $2
+                  AND a.is_deleted = false
+                  AND a.version IS NOT NULL
+                ORDER BY a.version
+                "#,
+                repo.id,
+                module
+            )
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Database error: {}", e),
+                )
+                    .into_response()
+            })?;
+
+            let member_body = member_versions
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if !member_body.is_empty() {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Body::from(member_body))
+                    .unwrap());
+            }
+        }
+
         let encoded = encode_module_path(module);
         let upstream_path = format!("{}/@v/list", encoded);
         if let Ok(resp) =
@@ -505,6 +549,52 @@ async fn version_info(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // Virtual repo: the version may be stored in a local (non-Remote)
+            // member repo whose artifact rows `try_proxy_go_metadata` never
+            // queries. Look across member repos for the earliest matching
+            // artifact before falling through to the upstream proxy (#1782).
+            if repo.repo_type == RepositoryType::Virtual {
+                if let Some(member_row) = sqlx::query!(
+                    r#"
+                    SELECT a.created_at
+                    FROM artifacts a
+                    INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
+                    WHERE vrm.virtual_repo_id = $1
+                      AND a.name = $2
+                      AND a.version = $3
+                      AND a.is_deleted = false
+                    ORDER BY a.created_at ASC
+                    LIMIT 1
+                    "#,
+                    repo.id,
+                    module,
+                    version
+                )
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Database error: {}", e),
+                    )
+                        .into_response()
+                })? {
+                    let time_str = member_row
+                        .created_at
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string();
+                    let info = serde_json::json!({
+                        "Version": version,
+                        "Time": time_str,
+                    });
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_string(&info).unwrap()))
+                        .unwrap());
+                }
+            }
+
             let encoded = encode_module_path(module);
             let upstream_path = format!("{}/@v/{}.info", encoded, version);
             if let Ok(resp) =
@@ -618,8 +708,8 @@ async fn get_mod_file(
                         let name = module_clone.clone();
                         let ver = version_clone.clone();
                         async move {
-                            proxy_helpers::local_fetch_by_name_version(
-                                &db, &state, member_id, &location, &name, &ver,
+                            proxy_helpers::local_fetch_by_name_version_and_suffix(
+                                &db, &state, member_id, &location, &name, &ver, "%.mod",
                             )
                             .await
                         }
@@ -758,8 +848,8 @@ async fn download_zip(
                         let name = module_clone.clone();
                         let ver = version_clone.clone();
                         async move {
-                            proxy_helpers::local_fetch_by_name_version(
-                                &db, &state, member_id, &location, &name, &ver,
+                            proxy_helpers::local_fetch_by_name_version_and_suffix(
+                                &db, &state, member_id, &location, &name, &ver, "%.zip",
                             )
                             .await
                         }
@@ -1838,5 +1928,162 @@ mod tests {
         assert!(!is_sumdb_host_allowed("sum.golang.org.evil.com"));
         assert!(!is_sumdb_host_allowed("evil.com.sum.golang.org"));
         assert!(!is_sumdb_host_allowed("sum-golang-org.evil.com"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual Go repo over a Local member (#1782).
+    //
+    // Three regressions, all driven end-to-end through the goproxy router with
+    // a virtual repo whose sole member is a Local repo holding a module's
+    // `.mod` and `.zip` (the `.mod` is seeded FIRST so the pre-fix
+    // `local_fetch_by_name_version` would return go.mod bytes for a `.zip`
+    // request):
+    //   1. `/@v/list`  must list the version from the local member (was 404).
+    //   2. `/@v/{v}.info` must return 200 + JSON (was 404).
+    //   3. `/@v/{v}.zip` must return the ZIP bytes, and `/@v/{v}.mod` the
+    //      go.mod bytes — never the same artifact for both.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_virtual_go_local_member_list_info_zip_mod() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use bytes::Bytes;
+        use uuid::Uuid;
+
+        // The fixture repo is the LOCAL member that physically holds the bytes.
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+
+        let module = "example.com/qa-test-module";
+        let version = "v1.0.0";
+        let member = fx.repo_info("local", None);
+
+        // Seed the .mod FIRST, then the .zip — order matters for the bug.
+        let mod_bytes = b"module example.com/qa-test-module\n";
+        let zip_bytes = b"PK\x03\x04 this-is-the-zip-archive-not-the-gomod";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member,
+            &format!("go/{}/{}.mod", module, version),
+            &format!("{}/{}/go.mod", module, version),
+            module,
+            version,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(mod_bytes),
+            fx.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member,
+            &format!("go/{}/{}.zip", module, version),
+            &format!("{}/{}/{}.zip", module, version, version),
+            module,
+            version,
+            "application/zip",
+            Bytes::from_static(zip_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Build the virtual repo (shares the fixture's state/storage root so the
+        // local-member fetch can read the seeded bytes back).
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("v-go-1782-{}", virtual_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'go'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+
+        let send = |uri: String| {
+            let router = fx.router_with_auth(super::router());
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap();
+                tdh::send(router, req).await
+            }
+        };
+
+        // 1. /@v/list
+        let (list_status, list_body) = send(format!("/{}/{}/@v/list", virtual_key, module)).await;
+        // 2. /@v/{v}.info
+        let (info_status, _info_body) =
+            send(format!("/{}/{}/@v/{}.info", virtual_key, module, version)).await;
+        // 3a. /@v/{v}.zip
+        let (zip_status, zip_resp) =
+            send(format!("/{}/{}/@v/{}.zip", virtual_key, module, version)).await;
+        // 3b. /@v/{v}.mod
+        let (mod_status, mod_resp) =
+            send(format!("/{}/{}/@v/{}.mod", virtual_key, module, version)).await;
+
+        // Cleanup the virtual repo + members before asserting.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            list_status,
+            StatusCode::OK,
+            "list must resolve from the local member (#1782)"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&list_body).trim(),
+            version,
+            "list must contain the member's version"
+        );
+        assert_eq!(
+            info_status,
+            StatusCode::OK,
+            "info must resolve from the local member (#1782)"
+        );
+        assert_eq!(
+            zip_status,
+            StatusCode::OK,
+            "zip must resolve from the local member"
+        );
+        assert_eq!(
+            &zip_resp[..],
+            zip_bytes,
+            "zip endpoint must serve the .zip artifact, not go.mod (#1782)"
+        );
+        assert_eq!(
+            mod_status,
+            StatusCode::OK,
+            "mod must resolve from the local member"
+        );
+        assert_eq!(
+            &mod_resp[..],
+            mod_bytes,
+            "mod endpoint must serve the go.mod artifact, not the zip (#1782)"
+        );
     }
 }
