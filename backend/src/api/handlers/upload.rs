@@ -165,6 +165,62 @@ async fn create_session(
             )
         })?;
 
+    // Repository write authorization (#817 parity).
+    //
+    // The chunked upload-session create path must enforce the same
+    // fine-grained RBAC write gate that `repo_visibility_middleware` applies to
+    // the rest of the artifact-write surface (see middleware/auth.rs): the
+    // /api/v1/uploads router is layered only with `auth_middleware`
+    // (authentication), so without this check any authenticated user could open
+    // a session against a release/promotion-only repository.
+    //
+    // Admins bypass the check. For a non-admin, if any permission rule exists
+    // for this repository the caller must hold the `write` action (or `admin`,
+    // which implies all actions); a repository with no rules falls through
+    // unchanged. A DB error on the rule lookup fails closed (503), mirroring the
+    // middleware. Authorized peer-replication identities hold write/admin on the
+    // target and continue to pass.
+    let has_rules = if auth.is_admin {
+        false
+    } else {
+        match state
+            .permission_service
+            .has_any_rules_for_target("repository", repo.0)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::error!("permission check failed: database unreachable");
+                return Err(map_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "permission service temporarily unavailable",
+                ));
+            }
+        }
+    };
+    let (has_write, has_admin) = if !auth.is_admin && has_rules {
+        (
+            state
+                .permission_service
+                .check_permission(user_id, "repository", repo.0, "write", false)
+                .await
+                .unwrap_or(false),
+            state
+                .permission_service
+                .check_permission(user_id, "repository", repo.0, "admin", false)
+                .await
+                .unwrap_or(false),
+        )
+    } else {
+        (false, false)
+    };
+    if !upload_write_decision(auth.is_admin, has_rules, has_write, has_admin) {
+        return Err(map_err(
+            StatusCode::FORBIDDEN,
+            "You do not have permission to perform this action on this repository",
+        ));
+    }
+
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
@@ -581,6 +637,28 @@ fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+/// Pure authorization decision for chunked upload-session creation, mirroring
+/// the non-admin RBAC write gate enforced by `repo_visibility_middleware`.
+///
+/// - Admins always pass (any rules state).
+/// - Non-admins on a repository with no permission rules fall through (allowed).
+/// - Non-admins on a rules-bearing repository must hold the `write` action or
+///   the `admin` action (which implies all actions).
+fn upload_write_decision(
+    is_admin: bool,
+    has_rules: bool,
+    has_write: bool,
+    has_admin: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if !has_rules {
+        return true;
+    }
+    has_write || has_admin
+}
+
 /// Extract a simple artifact name from its path (last path component without extension).
 fn artifact_name_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -661,6 +739,42 @@ mod tests {
     // -----------------------------------------------------------------------
     // artifact_name_from_path
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // upload_write_decision (#817 parity with repo_visibility_middleware)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_write_decision_admin_always_allowed() {
+        // Admins bypass the check regardless of rules/actions.
+        assert!(upload_write_decision(true, false, false, false));
+        assert!(upload_write_decision(true, true, false, false));
+        assert!(upload_write_decision(true, true, true, true));
+    }
+
+    #[test]
+    fn test_upload_write_decision_non_admin_no_rules_allowed() {
+        // A repository with no permission rules falls through unchanged.
+        assert!(upload_write_decision(false, false, false, false));
+    }
+
+    #[test]
+    fn test_upload_write_decision_non_admin_rules_with_write_allowed() {
+        assert!(upload_write_decision(false, true, true, false));
+    }
+
+    #[test]
+    fn test_upload_write_decision_non_admin_rules_with_admin_action_allowed() {
+        // The `admin` action implies all actions (including write).
+        assert!(upload_write_decision(false, true, false, true));
+    }
+
+    #[test]
+    fn test_upload_write_decision_non_admin_rules_neither_denied() {
+        // Release/promotion-only repo: rules exist but caller holds neither
+        // write nor admin -> denied.
+        assert!(!upload_write_decision(false, true, false, false));
+    }
 
     #[test]
     fn test_artifact_name_from_path() {
