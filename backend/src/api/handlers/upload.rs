@@ -125,6 +125,46 @@ pub struct CompleteResponse {
 // POST / -- Create upload session
 // ---------------------------------------------------------------------------
 
+/// Pure write-authorization decision for creating a chunked-upload session.
+///
+/// Mirrors the semantics `repo_visibility_middleware` enforces on every other
+/// repository write path, so the body-addressed `/uploads` flow is gated the
+/// same way the URL-addressed legacy artifact PUT is:
+///
+/// * **Token repo-scope (#504):** an API token restricted to a set of repos
+///   (`auth.can_access_repo`) may only target a repo in that set.
+/// * **Admin bypass:** admins skip the fine-grained checks entirely.
+/// * **No-rules fall-through:** a repo with no fine-grained permission rules
+///   keeps working under the default access model (`has_rules == false`).
+/// * **Fine-grained write (#817):** when rules exist, the caller must hold the
+///   `write` (or `admin`) action on the repo.
+///
+/// The permission-service lookups that produce `has_rules`/`has_write`/
+/// `has_admin` are done by the caller; keeping the decision pure makes it
+/// unit-testable without a database.
+fn session_write_authorized(
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    has_rules: bool,
+    has_write: bool,
+    has_admin: bool,
+) -> bool {
+    // #504: token repository scope.
+    if !auth.can_access_repo(repo_id) {
+        return false;
+    }
+    // Admins bypass fine-grained permission checks.
+    if auth.is_admin {
+        return true;
+    }
+    // No fine-grained rules: fall through to the default access model.
+    if !has_rules {
+        return true;
+    }
+    // Rules exist: the caller must hold write (or admin) on this repo.
+    has_write || has_admin
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/uploads",
@@ -134,6 +174,7 @@ pub struct CompleteResponse {
         (status = 201, description = "Upload session created", body = CreateSessionResponse),
         (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -164,6 +205,58 @@ async fn create_session(
                 format!("Repository '{}' not found", req.repository_key),
             )
         })?;
+
+    // Repository write authorization.
+    //
+    // The `/uploads` routes are nested under `auth_middleware` only, not
+    // `repo_visibility_middleware`, and the target repo is named in the JSON
+    // body rather than the URL path -- so the repo-scope (#504) and
+    // fine-grained permission (#817) gates that protect every other write
+    // path never see this request. Apply the same decision here, at the single
+    // point where the cross-tenant write would originate, right after the repo
+    // is resolved (the 404-for-unknown-repo behaviour above is unchanged).
+    //
+    // Only consult the permission service for a non-admin caller that is in
+    // token scope for the repo; admins bypass and out-of-scope tokens are
+    // denied without a DB round-trip. Fail closed (503) on a permission lookup
+    // error, matching `repo_visibility_middleware`.
+    let (has_rules, has_write, has_admin) = if auth.is_admin || !auth.can_access_repo(repo.0) {
+        (false, false, false)
+    } else {
+        let has_rules = state
+            .permission_service
+            .has_any_rules_for_target("repository", repo.0)
+            .await
+            .map_err(|_| {
+                tracing::error!("permission check failed: database unreachable");
+                map_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "permission service temporarily unavailable",
+                )
+            })?;
+        if has_rules {
+            let has_write = state
+                .permission_service
+                .check_permission(auth.user_id, "repository", repo.0, "write", false)
+                .await
+                .unwrap_or(false);
+            let has_admin = state
+                .permission_service
+                .check_permission(auth.user_id, "repository", repo.0, "admin", false)
+                .await
+                .unwrap_or(false);
+            (true, has_write, has_admin)
+        } else {
+            (false, false, false)
+        }
+    };
+
+    if !session_write_authorized(&auth, repo.0, has_rules, has_write, has_admin) {
+        return Err(map_err(
+            StatusCode::FORBIDDEN,
+            "You do not have permission to perform this action on this repository",
+        ));
+    }
 
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
 
@@ -657,6 +750,75 @@ fn replication_session_metadata_from_request<'a>(
 #[allow(clippy::io_other_error, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // session_write_authorized (pure write-authorization decision)
+    // -----------------------------------------------------------------------
+
+    /// Build an `AuthExtension` for the pure-helper tests. `allowed` is the
+    /// token repo-scope (`None` = unrestricted, matching a JWT login).
+    fn auth_for(is_admin: bool, allowed: Option<Vec<Uuid>>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@example.test".to_string(),
+            is_admin,
+            is_api_token: allowed.is_some(),
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: allowed,
+        }
+    }
+
+    #[test]
+    fn session_write_authorized_denies_token_scoped_out() {
+        let repo = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Token restricted to a different repo: denied before any rule check.
+        let auth = auth_for(false, Some(vec![other]));
+        assert!(!session_write_authorized(&auth, repo, false, false, false));
+        // Even an admin token is bound by its repo scope.
+        let admin = auth_for(true, Some(vec![other]));
+        assert!(!session_write_authorized(&admin, repo, false, false, false));
+    }
+
+    #[test]
+    fn session_write_authorized_allows_admin() {
+        let repo = Uuid::new_v4();
+        let auth = auth_for(true, None);
+        // Admin bypasses fine-grained rules even when the user holds nothing.
+        assert!(session_write_authorized(&auth, repo, true, false, false));
+    }
+
+    #[test]
+    fn session_write_authorized_allows_when_no_rules() {
+        let repo = Uuid::new_v4();
+        let auth = auth_for(false, None);
+        // No fine-grained rules -> default access model (fall-through).
+        assert!(session_write_authorized(&auth, repo, false, false, false));
+    }
+
+    #[test]
+    fn session_write_authorized_allows_with_write_grant() {
+        let repo = Uuid::new_v4();
+        let auth = auth_for(false, None);
+        assert!(session_write_authorized(&auth, repo, true, true, false));
+    }
+
+    #[test]
+    fn session_write_authorized_allows_with_admin_action() {
+        let repo = Uuid::new_v4();
+        let auth = auth_for(false, None);
+        assert!(session_write_authorized(&auth, repo, true, false, true));
+    }
+
+    #[test]
+    fn session_write_authorized_denies_rules_without_grant() {
+        let repo = Uuid::new_v4();
+        let auth = auth_for(false, None);
+        // Rules exist but the user holds neither write nor admin: denied.
+        assert!(!session_write_authorized(&auth, repo, true, false, false));
+    }
 
     // -----------------------------------------------------------------------
     // artifact_name_from_path
@@ -1805,6 +1967,160 @@ mod tests {
             "error must echo the missing key, got: {}",
             err_msg
         );
+        f.teardown().await;
+    }
+
+    /// Insert a fine-grained permission rule granting `principal_id` the given
+    /// actions on the repository. Used to exercise the #817 write-authorization
+    /// gate on the session-create path.
+    async fn grant_repo_permission(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        principal_id: Uuid,
+        actions: &[&str],
+    ) {
+        let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO permissions \
+             (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, $3)",
+        )
+        .bind(principal_id)
+        .bind(repo_id)
+        .bind(&actions)
+        .execute(pool)
+        .await
+        .expect("insert permission rule");
+    }
+
+    async fn delete_repo_permissions(pool: &sqlx::PgPool, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Delete any `upload_sessions`/`upload_chunks` rows the handler created in
+    /// response to a successful `create_session` call, parsing the session id
+    /// out of the JSON response body. Fail-soft on every step.
+    async fn cleanup_created_session(pool: &sqlx::PgPool, body: &[u8]) {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(session_id) = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Uuid>().ok())
+        else {
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_session_allows_non_admin_with_write_grant() {
+        // (a) Non-admin holding a fine-grained `write` rule on the target repo
+        // creates a session -> 201.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        grant_repo_permission(&f.pool, f.repo_id, f.user_id, &["read", "write"]).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "grant/ok.bin",
+            "total_size": 16_i64,
+            "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "non-admin with write grant must be allowed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_created_session(&f.pool, &body).await;
+        delete_repo_permissions(&f.pool, f.repo_id).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_denies_non_admin_without_grant_when_rules_exist() {
+        // (b) The exploit case: a non-admin whose target repo HAS fine-grained
+        // rules, but holds no grant for that user, is denied -> 403. (Mirrors a
+        // cross-tenant write attempt into a repo gated by permission rules.)
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // Rules exist for the repo, but they grant another principal, not the
+        // caller.
+        grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "xtenant/blocked.bin",
+            "total_size": 16_i64,
+            "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        }));
+        let (status, _body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin without a grant on a ruled repo must be denied"
+        );
+        // No session must have been created for this repo.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_sessions WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap_or(0);
+        assert_eq!(count, 0, "denied request must not create a session");
+
+        delete_repo_permissions(&f.pool, f.repo_id).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_allows_admin_on_ruled_repo() {
+        // (c) An admin bypasses the fine-grained checks even when rules exist
+        // and grant the admin nothing -> 201.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
+        let mut auth = tdh::make_auth(f.user_id, &f.username);
+        auth.is_admin = true;
+        let app = upload_router_with_auth(f.state.clone(), auth);
+
+        let req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "admin/ok.bin",
+            "total_size": 16_i64,
+            "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "admin must bypass fine-grained rules; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_created_session(&f.pool, &body).await;
+        delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
     }
 
