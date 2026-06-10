@@ -26,6 +26,7 @@ use crate::services::metrics_service::record_proxy_cache_lookup;
 use crate::services::proxy_hydration::{
     BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
 };
+use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
@@ -423,6 +424,15 @@ pub struct CacheMetadata {
     /// sidecars deserializing.
     #[serde(default)]
     pub negative_cached_until: Option<DateTime<Utc>>,
+    /// Package Age Policy hold for this entry (#1770): when set and in the
+    /// future, reads must respond 409 Conflict (via the pure
+    /// `quarantine_service::check_download_allowed` gate) until the instant
+    /// passes. The window is based on the upstream release date when known
+    /// (#1771). `None` for entries written before this field existed or with
+    /// the policy disabled at write time; `#[serde(default)]` preserves
+    /// wire-compat with pre-existing sidecars.
+    #[serde(default)]
+    pub quarantine_until: Option<DateTime<Utc>>,
     /// When the cache entry expires
     pub expires_at: DateTime<Utc>,
     /// Content type from upstream
@@ -447,6 +457,32 @@ impl CacheMetadata {
             negative_cached_until: self.negative_cached_until,
         }
     }
+}
+
+/// Gate a proxy read on a Package Age Policy hold window (#1770).
+///
+/// Reuses the pure `quarantine_service::check_download_allowed` decision the
+/// hosted download paths already use: a `quarantine_until` in the future
+/// blocks the read with 409 Conflict; an elapsed window or an absent hold
+/// (legacy sidecar, or policy disabled at write time) allows it. The error
+/// MUST propagate to the handler — never be degraded to a cache `Miss`, which
+/// would refetch upstream and loop.
+fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
+    match quarantine_until {
+        Some(until) => {
+            quarantine_service::check_download_allowed(Some("quarantined"), Some(until), Utc::now())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Parse an HTTP `Last-Modified` header value (RFC 7231 IMF-fixdate, which is
+/// RFC 2822-compatible) into a UTC timestamp. Returns `None` for absent or
+/// unparseable values so callers fall back to ingestion time (#1771).
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Outcome of the up-front cache read on the buffered proxy path (#1611).
@@ -906,6 +942,7 @@ impl CachePersister {
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
+        quarantine_until: Option<DateTime<Utc>>,
     ) -> Result<()> {
         // #1618 S9 / #1365: never cache a zero-byte body on the buffered
         // path either. An empty upstream response (204 / empty 200) must
@@ -946,6 +983,10 @@ impl CachePersister {
             storage_etag,
             last_modified,
             negative_cached_until: None,
+            // Package Age Policy hold resolved by the caller (#1770): recorded
+            // on the sidecar (NOT the `artifacts` table, per #1278) so every
+            // read path can gate on it.
+            quarantine_until,
             expires_at: now + chrono::Duration::seconds(ttl_secs),
             content_type,
             size_bytes: content.len() as i64,
@@ -1106,6 +1147,10 @@ impl CachePersister {
                         storage_etag,
                         last_modified: template.last_modified,
                         negative_cached_until: None,
+                        // The streaming leader refuses to open upstream at all
+                        // while the repo's Package Age Policy is enabled
+                        // (#1770), so a tee'd entry is never under a hold.
+                        quarantine_until: None,
                         expires_at: now + chrono::Duration::seconds(template.ttl_secs),
                         content_type: template.content_type,
                         size_bytes: result.bytes_written as i64,
@@ -1998,7 +2043,21 @@ impl ProxyService {
         // path below (`fetch_artifact_streaming`) is the layer-2 plug-in point.
         self.coordinator.coordinate(
             &hydration_lease_key,
-            || async { self.get_cached_artifact(&cache_key, &metadata_key).await },
+            || async {
+                let cached = self.get_cached_artifact(&cache_key, &metadata_key).await?;
+                if cached.is_some() {
+                    // Package Age Policy (#1770): a follower re-checking the
+                    // cache must not serve an entry the leader just wrote
+                    // under an active hold. The sidecar load mirrors the
+                    // B6-safe stance (read error -> no hold known).
+                    if let Some(metadata) =
+                        self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
+                    {
+                        check_quarantine_until(metadata.quarantine_until)?;
+                    }
+                }
+                Ok(cached)
+            },
             || async {
                 let full_url = Self::build_upstream_url(upstream_url, fetch_path);
                 let upstream_result = self
@@ -2009,6 +2068,13 @@ impl ProxyService {
                     Ok(resp) => {
                         // #1611: mutability-aware TTL (immutable -> forever).
                         let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
+                        // Package Age Policy (#1770): resolve the hold window
+                        // BEFORE caching so the sidecar records it; the window
+                        // is based on the upstream release date when known
+                        // (#1771).
+                        let quarantine_until = self
+                            .quarantine_until_for_new_entry(repo.id, resp.last_modified.as_deref())
+                            .await;
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
                         // already SUCCEEDED -- `resp.content` is in hand. A failure to
                         // persist the cache entry must NOT fail the client request.
@@ -2034,6 +2100,7 @@ impl ProxyService {
                                 cache_ttl,
                                 repo.id,
                                 cache_path,
+                                quarantine_until,
                             )
                             .await
                         {
@@ -2050,6 +2117,12 @@ impl ProxyService {
                             self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
                                 .await;
                         }
+
+                        // Package Age Policy (#1770): hold the just-fetched
+                        // bytes too — the policy must block the FIRST response,
+                        // not only later cache hits, and must hold even when
+                        // the best-effort cache write above failed.
+                        check_quarantine_until(quarantine_until)?;
 
                         Ok((resp.content, resp.content_type))
                     }
@@ -2242,6 +2315,10 @@ impl ProxyService {
             cache_classifier::Freshness::Fresh => {
                 // Immutable hits reach here and never touch upstream.
                 let metadata = metadata.expect("fresh implies metadata present");
+                // Package Age Policy (#1770): a held entry must 409 — checked
+                // AFTER freshness evaluation; the error propagates and is
+                // never degraded to a Miss (which would refetch upstream).
+                check_quarantine_until(metadata.quarantine_until)?;
                 match self.open_cached_stream(cache_key, &metadata).await? {
                     Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
                     None => Ok(StreamingCacheReadOutcome::Miss),
@@ -2256,6 +2333,9 @@ impl ProxyService {
                     // 304 extended the TTL; stream the cached body.
                     RevalidationVerdict::ServeRevalidated
                     | RevalidationVerdict::ServeStaleIfError => {
+                        // Package Age Policy (#1770): gate the revalidated /
+                        // stale-if-error body the same way as a fresh hit.
+                        check_quarantine_until(metadata.quarantine_until)?;
                         match self.open_cached_stream(cache_key, &metadata).await? {
                             Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
                             None => Ok(StreamingCacheReadOutcome::Miss),
@@ -2305,6 +2385,19 @@ impl ProxyService {
         cache_key: String,
         metadata_key: String,
     ) -> Result<StreamHandle> {
+        // Package Age Policy (#1770): the streaming path has no buffered
+        // upstream `Last-Modified` to base a release-date hold on (#1771), so
+        // a repo with the policy enabled conservatively refuses to open a new
+        // streaming fetch outright. Entries cached while the policy was off
+        // are unaffected (gated by their sidecar on the hit path above), and
+        // the error propagates as 409 rather than degrading to a fall-back.
+        let quarantine_config = quarantine_service::resolve_config(&self.db, repo.id).await;
+        if quarantine_service::should_quarantine(&quarantine_config) {
+            return Err(AppError::Conflict(
+                "Artifact is quarantined and pending security review".to_string(),
+            ));
+        }
+
         let upstream_url = Self::remote_target(repo)?;
         let full_url = Self::build_upstream_url(upstream_url, path);
         let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
@@ -3069,6 +3162,15 @@ impl ProxyService {
             cache_classifier::Freshness::Miss => Ok(CacheReadOutcome::Miss),
             cache_classifier::Freshness::NegativeHit => Ok(CacheReadOutcome::NegativeHit),
             cache_classifier::Freshness::Fresh => {
+                // Package Age Policy (#1770): a held entry must 409 — checked
+                // AFTER freshness evaluation, and the error propagates rather
+                // than degrading to a Miss (which would refetch upstream).
+                check_quarantine_until(
+                    metadata
+                        .as_ref()
+                        .expect("fresh implies metadata present")
+                        .quarantine_until,
+                )?;
                 // Serve the body. Immutable hits reach here and never touch
                 // upstream. `get_cached_artifact` re-verifies checksum + body
                 // presence; a missing/poisoned body degrades to Miss (B6).
@@ -3080,15 +3182,19 @@ impl ProxyService {
                 }
             }
             cache_classifier::Freshness::Stale => {
-                self.revalidate_stale(
-                    repo,
-                    fetch_path,
-                    cache_key,
-                    metadata_key,
-                    // Safe: Stale only arises when metadata is present.
-                    metadata.as_ref().expect("stale implies metadata present"),
-                )
-                .await
+                // Safe: Stale only arises when metadata is present.
+                let stale_metadata = metadata.as_ref().expect("stale implies metadata present");
+                let outcome = self
+                    .revalidate_stale(repo, fetch_path, cache_key, metadata_key, stale_metadata)
+                    .await?;
+                // Package Age Policy (#1770): gate a revalidated /
+                // stale-if-error body the same way as a fresh hit. A Refill
+                // (Miss) is NOT gated here — the upstream refetch records and
+                // enforces its own hold window.
+                if matches!(outcome, CacheReadOutcome::Hit(..)) {
+                    check_quarantine_until(stale_metadata.quarantine_until)?;
+                }
+                Ok(outcome)
             }
         }
     }
@@ -3248,6 +3354,7 @@ impl ProxyService {
             upstream_etag: None,
             storage_etag: None,
             last_modified: None,
+            quarantine_until: None,
             negative_cached_until: Some(now + neg_ttl),
             // expires_at mirrors the negative window so any expiry-only reader
             // also treats it as expired once the window passes.
@@ -3377,6 +3484,7 @@ impl ProxyService {
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
+        quarantine_until: Option<DateTime<Utc>>,
     ) -> Result<()> {
         self.cache_persister
             .write_buffered(
@@ -3389,8 +3497,33 @@ impl ProxyService {
                 ttl_secs,
                 repository_id,
                 artifact_path,
+                quarantine_until,
             )
             .await
+    }
+
+    /// Resolve the Package Age Policy hold window for a newly cached proxy
+    /// entry (#1770). Returns `None` when the repository's quarantine policy
+    /// is disabled. The window is measured from the upstream release date
+    /// (`Last-Modified`) when present and parseable, falling back to the
+    /// ingestion time (#1771): an upstream release older than the configured
+    /// window yields an already-elapsed hold, so old packages are not re-held
+    /// from their first proxy fetch.
+    async fn quarantine_until_for_new_entry(
+        &self,
+        repository_id: Uuid,
+        last_modified: Option<&str>,
+    ) -> Option<DateTime<Utc>> {
+        let config = quarantine_service::resolve_config(&self.db, repository_id).await;
+        if !quarantine_service::should_quarantine(&config) {
+            return None;
+        }
+        let release = last_modified.and_then(parse_http_date);
+        Some(quarantine_service::quarantine_until_from_release(
+            &config,
+            release,
+            Utc::now(),
+        ))
     }
 
     /// Emit a structured warning when a brand-new artifact is cached from
@@ -3553,6 +3686,82 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Package Age Policy on the proxy sidecar (#1770 / #1771)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_quarantine_until_none_allows() {
+        assert!(check_quarantine_until(None).is_ok());
+    }
+
+    #[test]
+    fn test_check_quarantine_until_future_blocks_with_conflict() {
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        let err = check_quarantine_until(Some(until)).unwrap_err();
+        match err {
+            AppError::Conflict(_) => {}
+            other => panic!("expected 409 Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_quarantine_until_past_allows() {
+        let until = Utc::now() - chrono::Duration::minutes(1);
+        assert!(check_quarantine_until(Some(until)).is_ok());
+    }
+
+    #[test]
+    fn test_parse_http_date_rfc7231_imf_fixdate() {
+        let parsed = parse_http_date("Tue, 05 May 2026 01:10:54 GMT").expect("parseable");
+        assert_eq!(parsed.to_rfc3339(), "2026-05-05T01:10:54+00:00");
+    }
+
+    #[test]
+    fn test_parse_http_date_rejects_garbage() {
+        assert!(parse_http_date("not-a-date").is_none());
+        assert!(parse_http_date("").is_none());
+    }
+
+    #[test]
+    fn test_legacy_sidecar_without_quarantine_deserializes_to_none() {
+        // A sidecar written before the quarantine field existed (and before
+        // last_modified / negative_cached_until / storage_etag) must still
+        // deserialize, with quarantine_until defaulting to None.
+        let legacy = r#"{
+            "cached_at": "2026-01-01T00:00:00Z",
+            "upstream_etag": null,
+            "expires_at": "2030-01-01T00:00:00Z",
+            "content_type": "application/octet-stream",
+            "size_bytes": 10,
+            "checksum_sha256": "abc"
+        }"#;
+        let meta: CacheMetadata = serde_json::from_str(legacy).expect("legacy sidecar parses");
+        assert!(meta.quarantine_until.is_none());
+        assert!(check_quarantine_until(meta.quarantine_until).is_ok());
+    }
+
+    #[test]
+    fn test_sidecar_round_trips_quarantine_until() {
+        let until = Utc::now() + chrono::Duration::minutes(120);
+        let meta = CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            quarantine_until: Some(until),
+            negative_cached_until: None,
+            expires_at: Utc::now() + chrono::Duration::hours(24),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "abc".to_string(),
+        };
+        let json = serde_json::to_vec(&meta).unwrap();
+        let back: CacheMetadata = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.quarantine_until, Some(until));
+        assert!(check_quarantine_until(back.quarantine_until).is_err());
+    }
 
     // -----------------------------------------------------------------------
     // should_warn_proxy_scan_skipped — scan-on-proxy gap warning gate (#1274)
@@ -4225,6 +4434,7 @@ mod tests {
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(24),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 1024,
@@ -4248,6 +4458,7 @@ mod tests {
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::seconds(3600),
             content_type: None,
             size_bytes: 0,
@@ -4272,6 +4483,7 @@ mod tests {
             storage_etag: Some("\"storage-etag\"".to_string()),
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: expires,
             content_type: Some("application/json".to_string()),
             size_bytes: 4096,
@@ -4293,6 +4505,7 @@ mod tests {
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: i64::MAX,
@@ -4335,6 +4548,7 @@ mod tests {
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: None,
             size_bytes: 100,
@@ -4352,6 +4566,7 @@ mod tests {
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: None,
             size_bytes: 100,
@@ -4677,6 +4892,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: Some("application/java-archive".to_string()),
             size_bytes: 2048,
@@ -4700,6 +4916,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 512,
@@ -4719,6 +4936,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now - chrono::Duration::seconds(1),
             content_type: Some("application/gzip".to_string()),
             size_bytes: 4096,
@@ -5323,6 +5541,7 @@ SHA256:
             storage_etag,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
@@ -5338,6 +5557,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: Utc::now() - chrono::Duration::seconds(1),
             content_type: None,
             size_bytes: 0,
@@ -6469,6 +6689,7 @@ SHA256:
                 3600,
                 Uuid::nil(),
                 "repo/path",
+                None,
             )
             .await
             .expect("write_buffered should succeed");
@@ -6906,6 +7127,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: cached_at + chrono::Duration::hours(1),
             content_type: content_type.map(|s| s.to_string()),
             size_bytes: size,
@@ -6930,6 +7152,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::hours(1),
             content_type: Some("application/gzip".to_string()),
             size_bytes: 789,
@@ -6957,6 +7180,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::hours(1),
             content_type: None,
             size_bytes: 1,
@@ -8044,6 +8268,7 @@ SHA256:
                 DEFAULT_CACHE_TTL_SECS,
                 Uuid::new_v4(),
                 cache_path,
+                None,
             )
             .await
             .expect("cache_artifact must succeed on a healthy filesystem backend");
@@ -8471,6 +8696,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at,
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
@@ -9560,6 +9786,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             // Already expired -> Stale for a mutable path.
             expires_at: now - chrono::Duration::seconds(1),
             content_type: Some("application/octet-stream".to_string()),
@@ -9830,6 +10057,7 @@ SHA256:
             storage_etag: None,
             last_modified: None,
             negative_cached_until: None,
+            quarantine_until: None,
             expires_at: now + chrono::Duration::seconds(ttl_secs),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
@@ -9848,6 +10076,7 @@ SHA256:
             upstream_etag: None,
             storage_etag: None,
             last_modified: None,
+            quarantine_until: None,
             negative_cached_until: Some(now + neg_ttl),
             expires_at: now + neg_ttl,
             content_type: None,

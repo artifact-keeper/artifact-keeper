@@ -67,6 +67,22 @@ pub fn quarantine_until(config: &QuarantineConfig, now: DateTime<Utc>) -> DateTi
     now + Duration::minutes(config.duration_minutes)
 }
 
+/// Calculate the quarantine expiry from the upstream release date.
+///
+/// The Package Age Policy holds an artifact for `duration_minutes` measured
+/// from when it was *released* upstream, not from when this instance first
+/// ingested it (#1771). A release date older than the configured window
+/// therefore yields an already-elapsed expiry, so an old upstream package is
+/// not re-held from its first proxy fetch. Falls back to `now` (matching
+/// [`quarantine_until`]) when no release date is known.
+pub fn quarantine_until_from_release(
+    config: &QuarantineConfig,
+    release_date: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    release_date.unwrap_or(now) + Duration::minutes(config.duration_minutes)
+}
+
 /// Decide whether a download should be blocked based on quarantine state.
 ///
 /// Returns `Ok(())` if the download is allowed, or `Err` with a 409 Conflict
@@ -114,6 +130,46 @@ pub fn status_after_scan(has_findings: bool) -> QuarantineState {
 // Database helpers (I/O layer)
 // ---------------------------------------------------------------------------
 
+/// Read the raw per-repository quarantine settings from `repository_config`.
+///
+/// Unlike [`resolve_config`], this does NOT merge global env defaults: it
+/// returns exactly what is stored for the repository (`None` when a key is
+/// unset or unparseable) so the repository API can echo the configured policy
+/// back to clients (#1770 B).
+pub async fn repo_settings(db: &PgPool, repository_id: Uuid) -> (Option<bool>, Option<i64>) {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config \
+         WHERE repository_id = $1 AND key IN ('quarantine_enabled', 'quarantine_duration_minutes')",
+    )
+    .bind(repository_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut enabled = None;
+    let mut duration = None;
+
+    for (key, value) in &rows {
+        match key.as_str() {
+            "quarantine_enabled" => {
+                if let Some(v) = value {
+                    enabled = Some(v == "true" || v == "1");
+                }
+            }
+            "quarantine_duration_minutes" => {
+                if let Some(v) = value {
+                    if let Ok(d) = v.parse::<i64>() {
+                        duration = Some(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (enabled, duration)
+}
+
 /// Resolve the effective quarantine config for a repository.
 ///
 /// Checks `repository_config` first, then falls back to env vars, then defaults.
@@ -127,40 +183,12 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_DURATION_MINUTES);
 
-    // Try per-repo overrides from repository_config
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT key, value FROM repository_config \
-         WHERE repository_id = $1 AND key IN ('quarantine_enabled', 'quarantine_duration_minutes')",
-    )
-    .bind(repository_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    let mut enabled = global_enabled;
-    let mut duration = global_duration;
-
-    for (key, value) in &rows {
-        match key.as_str() {
-            "quarantine_enabled" => {
-                if let Some(v) = value {
-                    enabled = v == "true" || v == "1";
-                }
-            }
-            "quarantine_duration_minutes" => {
-                if let Some(v) = value {
-                    if let Ok(d) = v.parse::<i64>() {
-                        duration = d;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    // Per-repo overrides from repository_config take precedence.
+    let (enabled, duration) = repo_settings(db, repository_id).await;
 
     QuarantineConfig {
-        enabled,
-        duration_minutes: validate_duration(duration),
+        enabled: enabled.unwrap_or(global_enabled),
+        duration_minutes: validate_duration(duration.unwrap_or(global_duration)),
     }
 }
 
@@ -219,11 +247,15 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
     Ok(())
 }
 
-/// Fetch the current quarantine status and expiry for an artifact.
-pub async fn get_status(
+/// Fetch the raw `(quarantine_status, quarantine_until)` for a live artifact.
+///
+/// Returns `Ok(None)` when no matching (non-deleted) row exists. Shared by
+/// [`get_status`] and [`check_artifact_download`] so the identical SELECT is
+/// expressed once.
+async fn fetch_quarantine_fields(
     db: &PgPool,
     artifact_id: Uuid,
-) -> Result<(Option<String>, Option<DateTime<Utc>>)> {
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>)>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         quarantine_status: Option<String>,
@@ -236,10 +268,19 @@ pub async fn get_status(
     .bind(artifact_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok((row.quarantine_status, row.quarantine_until))
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until)))
+}
+
+/// Fetch the current quarantine status and expiry for an artifact.
+pub async fn get_status(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<(Option<String>, Option<DateTime<Utc>>)> {
+    fetch_quarantine_fields(db, artifact_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))
 }
 
 /// Fetch quarantine status along with the artifact's repository_id.
@@ -279,26 +320,8 @@ pub async fn get_status_with_repo(
 /// artifact's quarantine fields and returns an error if the artifact is
 /// quarantined (409 Conflict) or rejected (403 Forbidden).
 pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        quarantine_status: Option<String>,
-        quarantine_until: Option<DateTime<Utc>>,
-    }
-
-    let row = sqlx::query_as::<_, Row>(
-        "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1 AND is_deleted = false",
-    )
-    .bind(artifact_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if let Some(row) = row {
-        check_download_allowed(
-            row.quarantine_status.as_deref(),
-            row.quarantine_until,
-            Utc::now(),
-        )?;
+    if let Some((status, until)) = fetch_quarantine_fields(db, artifact_id).await? {
+        check_download_allowed(status.as_deref(), until, Utc::now())?;
     }
 
     Ok(())
@@ -362,6 +385,51 @@ mod tests {
         };
         let until = quarantine_until(&config, now);
         assert_eq!(until, now);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarantine_until_from_release
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quarantine_until_from_release_recent_release_in_future() {
+        let now = Utc::now();
+        let config = QuarantineConfig {
+            enabled: true,
+            duration_minutes: 120,
+        };
+        let release = now - Duration::minutes(30);
+        let until = quarantine_until_from_release(&config, Some(release), now);
+        assert_eq!(until, release + Duration::minutes(120));
+        assert!(until > now, "recent release must still be held");
+        // The held window composes with check_download_allowed -> blocked.
+        assert!(check_download_allowed(Some("quarantined"), Some(until), now).is_err());
+    }
+
+    #[test]
+    fn test_quarantine_until_from_release_old_release_already_expired() {
+        let now = Utc::now();
+        let config = QuarantineConfig {
+            enabled: true,
+            duration_minutes: 60,
+        };
+        // Released long before the window: the hold has already elapsed.
+        let release = now - Duration::days(365);
+        let until = quarantine_until_from_release(&config, Some(release), now);
+        assert!(until < now, "old release must yield an elapsed window");
+        // And composes with check_download_allowed -> downloadable.
+        assert!(check_download_allowed(Some("quarantined"), Some(until), now).is_ok());
+    }
+
+    #[test]
+    fn test_quarantine_until_from_release_falls_back_to_now() {
+        let now = Utc::now();
+        let config = QuarantineConfig {
+            enabled: true,
+            duration_minutes: 45,
+        };
+        let until = quarantine_until_from_release(&config, None, now);
+        assert_eq!(until, quarantine_until(&config, now));
     }
 
     // -----------------------------------------------------------------------

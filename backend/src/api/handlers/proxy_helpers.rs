@@ -384,6 +384,31 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             )
                 .into_response()
         }
+        // Package Age Policy (#1770): a quarantine hold is a deliberate
+        // 409 Conflict from the proxy read/write gate, NOT an upstream
+        // failure. It must surface verbatim to the client rather than folding
+        // into the 502 catch-all below (which would mask the policy and, for
+        // the cache-miss path, look like a transient upstream error).
+        crate::error::AppError::Conflict(msg) => {
+            tracing::info!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy download blocked by quarantine policy: {}",
+                e
+            );
+            (StatusCode::CONFLICT, msg.clone()).into_response()
+        }
+        // A rejected artifact (failed review) is a 403 Forbidden from the
+        // same quarantine gate; surface it directly for the same reason.
+        crate::error::AppError::Authorization(msg) => {
+            tracing::info!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy download forbidden by quarantine policy: {}",
+                e
+            );
+            (StatusCode::FORBIDDEN, msg.clone()).into_response()
+        }
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
@@ -1084,8 +1109,16 @@ where
                     (proxy_service, member.upstream_url.as_deref())
                 {
                     let repo = build_remote_repo(member.id, &member.key, upstream_url);
-                    if let Ok(result) = proxy.fetch_artifact_streaming(&repo, path).await {
-                        return Ok(result);
+                    match proxy.fetch_artifact_streaming(&repo, path).await {
+                        Ok(result) => return Ok(result),
+                        // Package Age Policy (#1770): a quarantine block from a
+                        // member is a deliberate 409/403, NOT a "member miss".
+                        // Surface it immediately instead of silently trying the
+                        // next member (which would mask the policy and 404).
+                        Err(e) if is_quarantine_block(&e) => {
+                            return Err(map_proxy_error(&member.key, path, e));
+                        }
+                        Err(_) => { /* genuine miss: try the next member */ }
                     }
                 }
             }
@@ -1103,6 +1136,27 @@ where
         "Artifact not found in any member repository",
     )
         .into_response())
+}
+
+/// Whether an [`AppError`] from a proxy member fetch is a deliberate Package
+/// Age Policy / quarantine block (#1770) — a 409 Conflict (held) or 403
+/// Authorization (rejected) — as opposed to an ordinary cache/upstream miss.
+/// Such a block must surface from virtual-repo resolution rather than being
+/// treated as "try the next member".
+fn is_quarantine_block(e: &crate::error::AppError) -> bool {
+    matches!(
+        e,
+        crate::error::AppError::Conflict(_) | crate::error::AppError::Authorization(_)
+    )
+}
+
+/// `Response`-level sibling of [`is_quarantine_block`] for the streaming
+/// virtual-download path, where the member fetch has already mapped its
+/// [`AppError`] to a [`Response`] (#1770). A 409 Conflict (held) or 403
+/// Forbidden (rejected) is a quarantine block that must surface from
+/// virtual-repo resolution rather than fall through to the next member.
+fn is_quarantine_block_response(resp: &Response) -> bool {
+    matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
 }
 
 /// Streaming sibling of [`resolve_virtual_download`] that avoids
@@ -1161,7 +1215,7 @@ where
                 if let (Some(proxy), Some(upstream_url)) =
                     (proxy_service, member.upstream_url.as_deref())
                 {
-                    if let Ok(response) = proxy_fetch_streaming_with_disposition(
+                    match proxy_fetch_streaming_with_disposition(
                         proxy,
                         member.id,
                         &member.key,
@@ -1172,7 +1226,12 @@ where
                     )
                     .await
                     {
-                        return Ok(response);
+                        Ok(response) => return Ok(response),
+                        // Package Age Policy (#1770): a member's quarantine
+                        // block (409/403, already mapped to a Response) must
+                        // surface rather than fall through to the next member.
+                        Err(resp) if is_quarantine_block_response(&resp) => return Err(resp),
+                        Err(_) => { /* genuine miss: try the next member */ }
                     }
                 }
             }
@@ -2813,6 +2872,62 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, StatusCode};
+
+    // ── Package Age Policy quarantine surfacing (#1770) ──────────────
+
+    #[test]
+    fn test_is_quarantine_block_matches_conflict_and_authorization() {
+        use crate::error::AppError;
+        assert!(is_quarantine_block(&AppError::Conflict("held".into())));
+        assert!(is_quarantine_block(&AppError::Authorization(
+            "rejected".into()
+        )));
+    }
+
+    #[test]
+    fn test_is_quarantine_block_ignores_ordinary_misses() {
+        use crate::error::AppError;
+        assert!(!is_quarantine_block(&AppError::NotFound("gone".into())));
+        assert!(!is_quarantine_block(&AppError::BadGateway(
+            "upstream".into()
+        )));
+        assert!(!is_quarantine_block(&AppError::Storage("io".into())));
+    }
+
+    #[test]
+    fn test_map_proxy_error_surfaces_quarantine_conflict_as_409() {
+        let resp = map_proxy_error(
+            "npm-age",
+            "axios/-/axios-1.6.0.tgz",
+            crate::error::AppError::Conflict(
+                "Artifact is quarantined and pending security review".into(),
+            ),
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(is_quarantine_block_response(&resp));
+    }
+
+    #[test]
+    fn test_map_proxy_error_surfaces_rejected_as_403() {
+        let resp = map_proxy_error(
+            "npm-age",
+            "axios/-/axios-1.6.0.tgz",
+            crate::error::AppError::Authorization("Artifact was rejected".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(is_quarantine_block_response(&resp));
+    }
+
+    #[test]
+    fn test_map_proxy_error_keeps_transient_failure_as_502() {
+        let resp = map_proxy_error(
+            "npm-age",
+            "axios/-/axios-1.6.0.tgz",
+            crate::error::AppError::Storage("connection reset".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_quarantine_block_response(&resp));
+    }
 
     // ── promotion_only direct-upload gate ───────────────────────────
 
