@@ -418,6 +418,124 @@ pub fn parse_metadata_versions(xml: &str) -> Option<(String, String, Vec<String>
     Some((group_id, artifact_id, versions))
 }
 
+/// A `<plugin>` entry from a group-level plugin-prefix maven-metadata.xml
+/// (e.g. `org/apache/maven/plugins/maven-metadata.xml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPrefixEntry {
+    pub name: Option<String>,
+    pub prefix: String,
+    pub artifact_id: String,
+}
+
+/// Minimal XML text escaping for re-emitting merged metadata values.
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Minimal XML text unescaping for values read from member metadata.
+fn xml_unescape_text(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Extract the text of a direct child element from an XML fragment.
+fn extract_element_text(fragment: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let text = fragment
+        .split(open.as_str())
+        .nth(1)?
+        .split(close.as_str())
+        .next()?
+        .trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(xml_unescape_text(text))
+    }
+}
+
+/// Parse the `<plugins>` block of a group-level plugin-prefix
+/// maven-metadata.xml. Returns an empty Vec for documents without plugin
+/// entries (such as artifact-level metadata carrying a `<versions>` block).
+pub fn parse_plugin_prefix_entries(xml: &str) -> Vec<PluginPrefixEntry> {
+    let mut entries = Vec::new();
+    let plugins_block = match xml.split("<plugins>").nth(1) {
+        Some(block) => block,
+        None => return entries,
+    };
+    let plugins_block = match plugins_block.split("</plugins>").next() {
+        Some(block) => block,
+        None => return entries,
+    };
+    for segment in plugins_block.split("<plugin>").skip(1) {
+        let plugin = match segment.split("</plugin>").next() {
+            Some(plugin) => plugin,
+            None => continue,
+        };
+        if let (Some(prefix), Some(artifact_id)) = (
+            extract_element_text(plugin, "prefix"),
+            extract_element_text(plugin, "artifactId"),
+        ) {
+            entries.push(PluginPrefixEntry {
+                name: extract_element_text(plugin, "name"),
+                prefix,
+                artifact_id,
+            });
+        }
+    }
+    entries
+}
+
+/// Merge group-level plugin-prefix metadata documents from the members of a
+/// virtual repository. `<plugin>` entries are deduped by `<prefix>` with
+/// first-writer-wins order. Returns `None` when no document contributes any
+/// plugin entry (e.g. all documents are artifact-level version metadata),
+/// so callers can fall through to their not-found handling.
+pub fn merge_plugin_prefix_metadata(docs: &[String]) -> Option<String> {
+    let mut merged: Vec<PluginPrefixEntry> = Vec::new();
+    for doc in docs {
+        for entry in parse_plugin_prefix_entries(doc) {
+            if !merged.iter().any(|e| e.prefix == entry.prefix) {
+                merged.push(entry);
+            }
+        }
+    }
+    if merged.is_empty() {
+        return None;
+    }
+
+    let mut plugins_xml = String::new();
+    for entry in &merged {
+        plugins_xml.push_str("    <plugin>\n");
+        if let Some(ref name) = entry.name {
+            plugins_xml.push_str(&format!("      <name>{}</name>\n", xml_escape_text(name)));
+        }
+        plugins_xml.push_str(&format!(
+            "      <prefix>{}</prefix>\n",
+            xml_escape_text(&entry.prefix)
+        ));
+        plugins_xml.push_str(&format!(
+            "      <artifactId>{}</artifactId>\n",
+            xml_escape_text(&entry.artifact_id)
+        ));
+        plugins_xml.push_str("    </plugin>\n");
+    }
+
+    Some(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <plugins>
+{}  </plugins>
+</metadata>
+"#,
+        plugins_xml
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +748,130 @@ mod tests {
         assert_eq!(g, "com.example");
         assert_eq!(a, "my-lib");
         assert_eq!(versions, vec!["1.0.0", "1.1.0"]);
+    }
+
+    const PLUGIN_PREFIX_DOC_A: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <plugins>
+    <plugin>
+      <name>Apache Maven Compiler Plugin</name>
+      <prefix>compiler</prefix>
+      <artifactId>maven-compiler-plugin</artifactId>
+    </plugin>
+    <plugin>
+      <name>Apache Maven Deploy Plugin</name>
+      <prefix>deploy</prefix>
+      <artifactId>maven-deploy-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#;
+
+    const PLUGIN_PREFIX_DOC_B: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <plugins>
+    <plugin>
+      <name>Other Compiler Plugin</name>
+      <prefix>compiler</prefix>
+      <artifactId>other-compiler-plugin</artifactId>
+    </plugin>
+    <plugin>
+      <name>Versions Maven Plugin</name>
+      <prefix>versions</prefix>
+      <artifactId>versions-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#;
+
+    #[test]
+    fn test_parse_plugin_prefix_entries() {
+        let entries = parse_plugin_prefix_entries(PLUGIN_PREFIX_DOC_A);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].prefix, "compiler");
+        assert_eq!(entries[0].artifact_id, "maven-compiler-plugin");
+        assert_eq!(
+            entries[0].name.as_deref(),
+            Some("Apache Maven Compiler Plugin")
+        );
+        assert_eq!(entries[1].prefix, "deploy");
+        assert_eq!(entries[1].artifact_id, "maven-deploy-plugin");
+        assert_eq!(
+            entries[1].name.as_deref(),
+            Some("Apache Maven Deploy Plugin")
+        );
+    }
+
+    #[test]
+    fn test_parse_plugin_prefix_entries_versions_doc_is_empty() {
+        let xml = generate_metadata_xml(
+            "com.example",
+            "my-lib",
+            &["1.0.0".into(), "1.1.0".into()],
+            "1.1.0",
+            Some("1.1.0"),
+        );
+        assert!(parse_plugin_prefix_entries(&xml).is_empty());
+    }
+
+    #[test]
+    fn test_merge_plugin_prefix_metadata_union_dedup_by_prefix() {
+        let merged = merge_plugin_prefix_metadata(&[
+            PLUGIN_PREFIX_DOC_A.to_string(),
+            PLUGIN_PREFIX_DOC_B.to_string(),
+        ])
+        .unwrap();
+        // Single <plugins> block.
+        assert_eq!(merged.matches("<plugins>").count(), 1);
+        assert_eq!(merged.matches("</plugins>").count(), 1);
+        // Union of distinct prefixes from both members.
+        assert!(merged.contains("<prefix>compiler</prefix>"));
+        assert!(merged.contains("<prefix>deploy</prefix>"));
+        assert!(merged.contains("<prefix>versions</prefix>"));
+        assert!(merged.contains("<artifactId>maven-deploy-plugin</artifactId>"));
+        assert!(merged.contains("<artifactId>versions-maven-plugin</artifactId>"));
+        // Deduped by prefix, first-writer-wins: doc A's compiler entry kept,
+        // doc B's overlapping compiler entry dropped.
+        assert_eq!(merged.matches("<prefix>compiler</prefix>").count(), 1);
+        assert!(merged.contains("<artifactId>maven-compiler-plugin</artifactId>"));
+        assert!(!merged.contains("other-compiler-plugin"));
+        // First-writer-wins order: compiler (doc A) before versions (doc B).
+        assert!(
+            merged.find("<prefix>compiler</prefix>").unwrap()
+                < merged.find("<prefix>versions</prefix>").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_merge_plugin_prefix_metadata_none_for_no_plugins() {
+        assert!(merge_plugin_prefix_metadata(&[]).is_none());
+        let versions_doc = generate_metadata_xml(
+            "com.example",
+            "my-lib",
+            &["1.0.0".into()],
+            "1.0.0",
+            Some("1.0.0"),
+        );
+        assert!(merge_plugin_prefix_metadata(&[versions_doc, "<metadata/>".to_string()]).is_none());
+    }
+
+    #[test]
+    fn test_merge_plugin_prefix_metadata_escapes_ampersand() {
+        let doc = r#"<metadata>
+  <plugins>
+    <plugin>
+      <name>Build &amp; Release Plugin</name>
+      <prefix>build</prefix>
+      <artifactId>build-release-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#
+        .to_string();
+        let entries = parse_plugin_prefix_entries(&doc);
+        assert_eq!(entries[0].name.as_deref(), Some("Build & Release Plugin"));
+        let merged = merge_plugin_prefix_metadata(&[doc]).unwrap();
+        assert!(merged.contains("<name>Build &amp; Release Plugin</name>"));
+        assert!(!merged.contains("& Release"));
     }
 }

@@ -1000,6 +1000,56 @@ async fn download(
                         .body(Body::from(xml))
                         .unwrap());
                 }
+
+                // Group-level plugin-prefix metadata (#1595). A path like
+                // `org/apache/maven/plugins/maven-metadata.xml` matches
+                // parse_metadata_path but carries <plugins> entries instead
+                // of a <versions> block, so the version merge above yields
+                // nothing. Collect each member's plugin-prefix metadata
+                // (stored file first, upstream for remote members) and serve
+                // the union of <plugin> entries deduped by <prefix>.
+                let mut member_docs: Vec<String> = Vec::new();
+                for member in &members {
+                    let member_storage_key = format!("maven/{}", path);
+                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
+                        if let Ok(content) = member_storage.get(&member_storage_key).await {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                member_docs.push(xml_str.to_string());
+                                continue;
+                            }
+                        }
+                    }
+
+                    if member.repo_type == RepositoryType::Remote {
+                        if let (Some(upstream_url), Some(ref proxy)) =
+                            (member.upstream_url.as_deref(), &state.proxy_service)
+                        {
+                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                            )
+                            .await
+                            {
+                                if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                    member_docs.push(xml_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs)
+                {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/xml")
+                        .header(CONTENT_LENGTH, xml.len().to_string())
+                        .body(Body::from(xml))
+                        .unwrap());
+                }
             }
 
             // Virtual repo: SNAPSHOT version-level metadata (#839).
