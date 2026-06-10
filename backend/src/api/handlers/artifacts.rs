@@ -21,7 +21,7 @@ use crate::error::{AppError, Result};
 /// Unauthenticated requests are rejected for artifacts in private repos.
 /// Authenticated requests with repository-scoped API tokens are rejected
 /// if the artifact's repository is not in the token's allowed set.
-async fn check_artifact_visibility(
+pub(crate) async fn check_artifact_visibility(
     auth: &Option<AuthExtension>,
     artifact_id: Uuid,
     db: &sqlx::PgPool,

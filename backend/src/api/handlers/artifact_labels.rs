@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -85,6 +86,25 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Authorize a label read: require an authenticated caller.
+///
+/// Repository visibility/scope is enforced separately by
+/// [`check_artifact_visibility`] (which needs DB access) at the call site.
+fn authorize_label_read(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    require_auth(auth)
+}
+
+/// Authorize a label mutation: require an authenticated caller that also holds
+/// the `write` scope, mirroring the sibling artifact-mutation handlers.
+///
+/// Repository visibility/scope is enforced separately by
+/// [`check_artifact_visibility`] (which needs DB access) at the call site.
+fn authorize_label_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    Ok(auth)
+}
+
 fn label_to_response(label: ArtifactLabel) -> ArtifactLabelResponse {
     ArtifactLabelResponse {
         id: label.id,
@@ -138,8 +158,9 @@ async fn list_labels(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactLabelsListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = authorize_label_read(auth)?;
 
+    check_artifact_visibility(&Some(auth), id, &state.db).await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
@@ -171,8 +192,9 @@ async fn set_labels(
     Path(id): Path<Uuid>,
     Json(payload): Json<SetArtifactLabelsRequest>,
 ) -> Result<Json<ArtifactLabelsListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = authorize_label_write(auth)?;
 
+    check_artifact_visibility(&Some(auth), id, &state.db).await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let entries: Vec<LabelEntry> = payload
@@ -216,8 +238,9 @@ async fn add_label(
     Path((id, label_key)): Path<(Uuid, String)>,
     Json(payload): Json<AddArtifactLabelRequest>,
 ) -> Result<Json<ArtifactLabelResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = authorize_label_write(auth)?;
 
+    check_artifact_visibility(&Some(auth), id, &state.db).await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
@@ -252,8 +275,9 @@ async fn delete_label(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((id, label_key)): Path<(Uuid, String)>,
 ) -> Result<axum::http::StatusCode> {
-    let _auth = require_auth(auth)?;
+    let auth = authorize_label_write(auth)?;
 
+    check_artifact_visibility(&Some(auth), id, &state.db).await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
@@ -457,6 +481,77 @@ mod tests {
         let returned = result.unwrap();
         assert_eq!(returned.user_id, auth.user_id);
         assert_eq!(returned.username, "admin");
+    }
+
+    // -----------------------------------------------------------------------
+    // authorize_label_read / authorize_label_write
+    // -----------------------------------------------------------------------
+
+    fn jwt_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_authorize_label_read_none_returns_error() {
+        let result = authorize_label_read(None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_authorize_label_read_some_returns_ok() {
+        let result = authorize_label_read(Some(jwt_auth()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_authorize_label_write_none_returns_error() {
+        let result = authorize_label_write(None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_authorize_label_write_jwt_session_returns_ok() {
+        // JWT session (is_api_token = false) is not scope-restricted.
+        let result = authorize_label_write(Some(jwt_auth()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_authorize_label_write_unrestricted_token_returns_ok() {
+        // API token with no scope restriction (scopes = None) passes write scope.
+        let mut auth = jwt_auth();
+        auth.is_api_token = true;
+        auth.scopes = None;
+        let result = authorize_label_write(Some(auth));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_authorize_label_write_read_only_token_returns_error() {
+        // Read-only scoped API token must fail the write-scope check.
+        let mut auth = jwt_auth();
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["read".to_string()]);
+        let result = authorize_label_write(Some(auth));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_authorize_label_write_token_with_write_scope_returns_ok() {
+        let mut auth = jwt_auth();
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["read".to_string(), "write".to_string()]);
+        let result = authorize_label_write(Some(auth));
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
