@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::services::package_service::PackageService;
@@ -153,17 +154,40 @@ async fn create_session(
     // (the soft-delete pattern lives on `artifacts`); the previous
     // `AND is_deleted = false` predicate was a copy-paste from artifact
     // queries that crashed every session create (issue #1168).
-    let repo = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM repositories WHERE key = $1")
-        .bind(&req.repository_key)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| {
-            map_err(
-                StatusCode::NOT_FOUND,
-                format!("Repository '{}' not found", req.repository_key),
-            )
-        })?;
+    let repo = sqlx::query_as::<_, (Uuid, bool)>(
+        "SELECT id, promotion_only FROM repositories WHERE key = $1",
+    )
+    .bind(&req.repository_key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| {
+        map_err(
+            StatusCode::NOT_FOUND,
+            format!("Repository '{}' not found", req.repository_key),
+        )
+    })?;
+    let repo_id = repo.0;
+    let repo_promotion_only = repo.1;
+
+    // Promotion-only gate (#817 parity with the direct upload path).
+    //
+    // A `promotion_only` repository accepts artifacts ONLY via the promotion
+    // path (staging -> promotion -> approval). The direct artifact-write handler
+    // (`repositories::upload_artifact`) already rejects non-admin direct uploads
+    // to such repos; the chunked upload-session API is another direct-write entry
+    // point and must enforce the SAME gate, otherwise a non-admin can sidestep
+    // promotion/approval by opening a session against a release repo.
+    //
+    // This is enforced INDEPENDENTLY of the RBAC permission-rule check below: a
+    // promotion_only repo with no explicit permission rules must still be blocked
+    // for non-admin direct uploads. The promotion service writes through its own
+    // RAW SQL INSERT path (handlers/promotion.rs), which does not pass through
+    // these HTTP handlers, so promotions remain unaffected. Admins are exempt
+    // (break-glass / bootstrap), matching the direct path.
+    if let Some(rejection) = reject_session_if_promotion_only(repo_promotion_only, auth.is_admin) {
+        return Err(rejection);
+    }
 
     // Repository write authorization (#817 parity).
     //
@@ -185,7 +209,7 @@ async fn create_session(
     } else {
         match state
             .permission_service
-            .has_any_rules_for_target("repository", repo.0)
+            .has_any_rules_for_target("repository", repo_id)
             .await
         {
             Ok(v) => v,
@@ -202,12 +226,12 @@ async fn create_session(
         (
             state
                 .permission_service
-                .check_permission(user_id, "repository", repo.0, "write", false)
+                .check_permission(user_id, "repository", repo_id, "write", false)
                 .await
                 .unwrap_or(false),
             state
                 .permission_service
-                .check_permission(user_id, "repository", repo.0, "admin", false)
+                .check_permission(user_id, "repository", repo_id, "admin", false)
                 .await
                 .unwrap_or(false),
         )
@@ -227,7 +251,7 @@ async fn create_session(
         db: &state.db,
         storage_path: &state.config.storage_path,
         user_id,
-        repo_id: repo.0,
+        repo_id,
         repo_key: &req.repository_key,
         artifact_path: &req.artifact_path,
         artifact_name: req.artifact_name.as_deref(),
@@ -659,6 +683,27 @@ fn upload_write_decision(
     has_write || has_admin
 }
 
+/// Build the rejection for a direct upload-session create against a
+/// `promotion_only` repository, or `None` if the upload is permitted.
+///
+/// Mirrors the direct artifact-write path (`repositories::upload_artifact`):
+/// non-admin direct uploads to a promotion-only repo are blocked (`403`) so the
+/// chunked upload-session API cannot be used to sidestep promotion/approval.
+/// Admins are exempt (break-glass / bootstrap), and normal (non-promotion_only)
+/// repositories are never blocked here. The promotion service writes through its
+/// own raw-SQL path and does not pass through this handler, so promotions are
+/// unaffected.
+fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Option<Response> {
+    if proxy_helpers::promotion_only_blocks_direct_upload(promotion_only, is_admin) {
+        Some(map_err(
+            StatusCode::FORBIDDEN,
+            "Direct uploads are disabled for this repository; publish via promotion",
+        ))
+    } else {
+        None
+    }
+}
+
 /// Extract a simple artifact name from its path (last path component without extension).
 fn artifact_name_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -774,6 +819,35 @@ mod tests {
         // Release/promotion-only repo: rules exist but caller holds neither
         // write nor admin -> denied.
         assert!(!upload_write_decision(false, true, false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // reject_session_if_promotion_only (#817 parity with direct upload path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promotion_only_session_blocks_non_admin() {
+        // Non-admin opening a session against a promotion_only repo is rejected
+        // with 403, mirroring the direct upload path. This is the re-attack:
+        // a promotion_only release repo with NO permission rules must still be
+        // blocked, independent of the RBAC permission-rule check.
+        let rejection = reject_session_if_promotion_only(true, false)
+            .expect("non-admin direct upload session to promotion_only repo must be rejected");
+        assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_promotion_only_session_admin_allowed() {
+        // Admins are exempt (break-glass / bootstrap): no rejection.
+        assert!(reject_session_if_promotion_only(true, true).is_none());
+    }
+
+    #[test]
+    fn test_promotion_only_session_normal_repo_allowed() {
+        // A normal (non-promotion_only) repo is never blocked here -> no
+        // regression for legitimate uploads by either non-admins or admins.
+        assert!(reject_session_if_promotion_only(false, false).is_none());
+        assert!(reject_session_if_promotion_only(false, true).is_none());
     }
 
     #[test]
