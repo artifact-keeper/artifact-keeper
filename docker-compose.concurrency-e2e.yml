@@ -127,7 +127,7 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: concurrency-e2e-secret-key-32bytes-long
+      JWT_SECRET: concurrency-e2e-nonprod-amber-cobalt-river-7391
       ADMIN_PASSWORD: TestRunner!2026secure
       ENVIRONMENT: development
       RUST_LOG: info

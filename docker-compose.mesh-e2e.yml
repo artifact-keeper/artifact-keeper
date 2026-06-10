@@ -68,7 +68,7 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
+      JWT_SECRET: mesh-e2e-nonprod-saffron-indigo-harbor-7391
       ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info,artifact_keeper=debug
       HOST: 0.0.0.0
@@ -105,7 +105,7 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
+      JWT_SECRET: mesh-e2e-nonprod-saffron-indigo-harbor-7391
       ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info,artifact_keeper=debug
       HOST: 0.0.0.0

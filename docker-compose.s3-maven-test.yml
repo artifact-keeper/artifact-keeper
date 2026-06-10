@@ -81,7 +81,7 @@ services:
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       # General config
-      JWT_SECRET: test-secret-for-s3-maven
+      JWT_SECRET: s3-maven-nonprod-crimson-jade-summit-7391
       ADMIN_PASSWORD: admin
       RUST_LOG: info,artifact_keeper=debug,artifact_keeper_backend::storage::s3=trace
       ENVIRONMENT: development

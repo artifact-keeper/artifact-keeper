@@ -60,7 +60,7 @@ services:
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: e2e-test-secret-key-32-bytes-long
+      JWT_SECRET: smoke-e2e-nonprod-violet-quartz-meadow-7391
       ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info
       TRIVY_URL: http://trivy:8090
