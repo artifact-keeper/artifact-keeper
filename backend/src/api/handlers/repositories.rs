@@ -493,6 +493,15 @@ pub struct RepositoryResponse {
     pub upstream_url: Option<String>,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
+    /// Whether the Package Age / quarantine policy is enabled for this
+    /// repository, read back from `repository_config` (#1770 B). `None` when
+    /// the repository has no explicit setting (the global default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_enabled: Option<bool>,
+    /// Configured quarantine hold duration in minutes, read back from
+    /// `repository_config` (#1770 B). `None` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_duration_minutes: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -523,9 +532,29 @@ fn repo_to_response(
         upstream_url: repo.upstream_url,
         upstream_auth_type: None,
         upstream_auth_configured: false,
+        // Populated by the handlers that have a DB handle (see
+        // `with_quarantine_settings`); `repo_to_response` itself is sync and
+        // db-less, mirroring `upstream_auth_*` above (#1770 B).
+        quarantine_enabled: None,
+        quarantine_duration_minutes: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
+}
+
+/// Populate `RepositoryResponse.quarantine_*` from `repository_config` (#1770
+/// B). Split out so the detail and update handlers, which both have a DB
+/// handle, can echo the configured Package Age Policy back to clients. The
+/// listing path stays db-light and omits these per-repo lookups.
+async fn with_quarantine_settings(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
+    response.quarantine_enabled = enabled;
+    response.quarantine_duration_minutes = duration;
+    response
 }
 
 /// Validate that a repository key is safe and well-formed.
@@ -1440,9 +1469,11 @@ pub async fn get_repository(
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
+    let repo_id = repo.id;
     let mut response = repo_to_response(repo, storage_used);
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
+    let response = with_quarantine_settings(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -1616,7 +1647,10 @@ pub async fn update_repository(
         Some(auth.username.clone()),
     );
 
-    Ok(Json(repo_to_response(repo, storage_used)))
+    let repo_id = repo.id;
+    let response = repo_to_response(repo, storage_used);
+    let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    Ok(Json(response))
 }
 
 /// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
@@ -6185,6 +6219,8 @@ mod tests {
             upstream_url: None,
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            quarantine_enabled: None,
+            quarantine_duration_minutes: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -7430,6 +7466,43 @@ mod tests {
         assert_eq!(response.storage_used_bytes, 5000);
         assert_eq!(response.quota_bytes, Some(1073741824));
         assert!(response.upstream_url.is_none());
+        // #1770 B: db-less `repo_to_response` leaves quarantine fields unset;
+        // the handlers populate them from `repository_config`. Unset fields
+        // are omitted from the JSON (serde skip).
+        assert!(response.quarantine_enabled.is_none());
+        assert!(response.quarantine_duration_minutes.is_none());
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("quarantine_enabled"));
+        assert!(!json.contains("quarantine_duration_minutes"));
+    }
+
+    #[test]
+    fn test_repository_response_serializes_quarantine_when_set() {
+        // #1770 B: when the handler populates the quarantine settings from
+        // `repository_config`, they appear in the serialized detail response.
+        let resp = RepositoryResponse {
+            id: Uuid::new_v4(),
+            key: "npm-age".to_string(),
+            name: "npm-age".to_string(),
+            description: None,
+            format: "npm".to_string(),
+            repo_type: "remote".to_string(),
+            is_public: true,
+            allow_anonymous_access: true,
+            promotion_only: false,
+            storage_used_bytes: 0,
+            quota_bytes: None,
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
+            quarantine_enabled: Some(true),
+            quarantine_duration_minutes: Some(525600),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"quarantine_enabled\":true"));
+        assert!(json.contains("\"quarantine_duration_minutes\":525600"));
     }
 
     #[test]
