@@ -402,6 +402,68 @@ fn oci_forbidden_scope(required: &str) -> Response {
         .unwrap()
 }
 
+/// Build a 403 Forbidden response when a caller is authenticated but lacks
+/// write/delete access to the target repository (private-repo members-only
+/// gate). Uses the OCI `DENIED` error code, the registry-standard code for an
+/// authorization failure on an authenticated request.
+fn oci_denied_repo_access() -> Response {
+    oci_error(
+        StatusCode::FORBIDDEN,
+        "DENIED",
+        "You do not have access to this repository",
+    )
+}
+
+/// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
+///
+/// The REST artifact path enforces a private-repository members-only gate
+/// (`require_repo_write_access` in `handlers/repositories.rs`, the #1764
+/// lineage): admins bypass, public repositories are writable by any
+/// authenticated caller, and every other caller must hold a role assignment
+/// scoped to the repository (direct or global) — exactly
+/// `RepositoryService::user_can_access_repo`. The /v2 write/delete handlers
+/// authenticate the caller and check the OCI token scope, but never consulted
+/// this per-repo membership gate, so a non-admin non-member could push to /
+/// delete from a PRIVATE repository that the REST path denies with 403. Apply
+/// the same decision here.
+///
+/// This is intentionally the per-repo membership check, NOT the fine-grained
+/// permission-rule check (`check_permission`/`has_any_rules_for_target`): the
+/// latter defaults to "no rules => allow", which would leave a freshly-created
+/// private repo with no rules wide open — the gap that the REST gate closes.
+///
+/// Public-pull / anonymous-read paths never reach this helper (it is only
+/// invoked on write/delete handlers after authentication). Proxy/mirror flows
+/// are unaffected: remote/virtual repos reject pushes earlier, and replication
+/// identities hold a repo-scoped or global grant. Fails closed (503) if the
+/// membership lookup errors, mirroring the REST middleware.
+async fn require_oci_repo_write_access(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    repo_is_public: bool,
+) -> Result<(), Response> {
+    if claims.is_admin || repo_is_public {
+        return Ok(());
+    }
+    match state
+        .create_repository_service()
+        .user_can_access_repo(repo_id, claims.sub)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(oci_denied_repo_access()),
+        Err(e) => {
+            tracing::error!("OCI repository write authorization lookup failed: {}", e);
+            Err(oci_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DENIED",
+                "repository authorization temporarily unavailable",
+            ))
+        }
+    }
+}
+
 /// Build a Docker/OCI scope string for a repository resource.
 fn pull_scope(image_name: &str) -> String {
     format!("repository:{}:pull", image_name)
@@ -529,15 +591,19 @@ async fn put_request_body_stream(
     );
     match storage.put_stream(key, stream).await {
         Ok(result) => Ok(result),
-        Err(e)
-            if limit_exceeded.load(Ordering::Relaxed) || matches!(&e, AppError::Validation(_)) =>
-        {
-            Err(oci_error(
-                StatusCode::BAD_REQUEST,
-                "BLOB_UPLOAD_INVALID",
-                &e.to_string(),
-            ))
-        }
+        // The streamed body exceeded the configured max upload size: this is a
+        // payload-size rejection, so surface 413 Payload Too Large (not 400) so
+        // clients and proxies can distinguish "too big" from a malformed body.
+        Err(e) if limit_exceeded.load(Ordering::Relaxed) => Err(oci_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BLOB_UPLOAD_INVALID",
+            &e.to_string(),
+        )),
+        Err(e) if matches!(&e, AppError::Validation(_)) => Err(oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            &e.to_string(),
+        )),
         Err(e) => Err(oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BLOB_UPLOAD_UNKNOWN",
@@ -589,8 +655,12 @@ where
 }
 
 fn upload_session_size_error(max_upload_size_bytes: u64) -> Response {
+    // 413 Payload Too Large: the declared (Content-Length / Content-Range) or
+    // cumulative session size exceeds the configured cap. Rejecting on the
+    // declared size lets us refuse an oversized chunk before streaming a single
+    // byte, which is the cheap DoS guard for the /v2 blob upload routes.
     oci_error(
-        StatusCode::BAD_REQUEST,
+        StatusCode::PAYLOAD_TOO_LARGE,
         "BLOB_UPLOAD_INVALID",
         &format!(
             "upload session exceeds configured max upload size of {} bytes",
@@ -3757,6 +3827,13 @@ async fn handle_start_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write authorization (private-repo members-only gate, parity
+    // with the REST artifact-write path). Without this a non-admin non-member
+    // could open a blob upload against a PRIVATE repo it has no grant on.
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
     // #1776: only repositories that store their own manifests (Local/Staging)
     // accept pushes. Remote and Virtual repos must reject blob uploads instead
     // of accepting content that the registry cannot durably own/serve.
@@ -4053,7 +4130,6 @@ async fn handle_patch_upload(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
         };
-    let _ = claims;
     // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
     if !oci_scopes_grant(&token_scopes, "write") {
         return oci_forbidden_scope("write");
@@ -4078,6 +4154,11 @@ async fn handle_patch_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write authorization (private-repo members-only gate).
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
 
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -4292,7 +4373,6 @@ async fn handle_cancel_upload(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
         };
-    let _ = claims;
     if !oci_scopes_grant(&token_scopes, "write") {
         return oci_forbidden_scope("write");
     }
@@ -4312,6 +4392,11 @@ async fn handle_cancel_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write authorization (private-repo members-only gate).
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
         Err(e) => {
@@ -4508,7 +4593,6 @@ async fn handle_complete_upload(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
         };
-    let _ = claims;
     // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
     if !oci_scopes_grant(&token_scopes, "write") {
         return oci_forbidden_scope("write");
@@ -4550,6 +4634,11 @@ async fn handle_complete_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write authorization (private-repo members-only gate).
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
 
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
@@ -5898,12 +5987,16 @@ async fn handle_put_manifest(
     if !oci_scopes_grant(&token_scopes, "write") {
         return oci_forbidden_scope("write");
     }
-    let _ = claims;
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write authorization (private-repo members-only gate).
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
     // #1776: only repositories that store their own manifests (Local/Staging)
     // accept manifest pushes. Remote and Virtual repos must reject the PUT.
     if !stores_own_manifests(&repo.repo_type) {
@@ -6876,7 +6969,6 @@ async fn handle_delete_manifest(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
         };
-    let _ = claims;
     // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
     // delete scope on API tokens. JWT/password callers pass through.
     if !oci_scopes_grant(&token_scopes, "delete") {
@@ -6887,6 +6979,11 @@ async fn handle_delete_manifest(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // Repository write/delete authorization (private-repo members-only gate).
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
+    {
+        return resp;
+    }
 
     // Resolve the digest the reference (tag name or digest) maps to. For a
     // hosted repo a digest reference is deletable even with no surviving tag
@@ -12122,6 +12219,11 @@ mod manifest_digest_db_tests {
         .execute(&fx.pool)
         .await
         .expect("create shared-backend repo");
+        // Grant the fixture user write access to repo B so the new per-repo
+        // write-authorization gate passes; this test exercises digest repo
+        // scoping on a shared backend (repo B must not serve repo A's digest),
+        // not the authz denial.
+        tdh::grant_repo_access(&fx.pool, other_id, fx.user_id).await;
 
         // Push a manifest into repo A only.
         let body = Bytes::from_static(
@@ -14655,6 +14757,10 @@ mod oci_blob_upload_streaming_tests {
         let app = f.app();
         let (other_repo_id, other_repo_key, _other_storage_dir) =
             tdh::create_repo(&f.inner.pool, "local", "docker").await;
+        // Grant the fixture user write access to the second repo so the new
+        // per-repo write-authorization gate passes and the test exercises the
+        // cross-repo session rejection (404), not the authz denial (403).
+        tdh::grant_repo_access(&f.inner.pool, other_repo_id, f.inner.user_id).await;
 
         let (status, headers, body) = send(
             app.clone(),
@@ -14718,6 +14824,9 @@ mod oci_blob_upload_streaming_tests {
         let app = f.app();
         let (other_repo_id, other_repo_key, _other_storage_dir) =
             tdh::create_repo(&f.inner.pool, "local", "docker").await;
+        // Grant write access to the second repo so the per-repo write-authz gate
+        // passes and the test exercises cross-repo session rejection (404).
+        tdh::grant_repo_access(&f.inner.pool, other_repo_id, f.inner.user_id).await;
         let content = Bytes::from_static(b"repo-bound upload");
         let digest = compute_sha256(&content);
 
@@ -15015,7 +15124,7 @@ mod oci_blob_upload_streaming_tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(oci_blob_count(&f, &digest).await, 0);
         assert!(!storage.exists(&blob_storage_key(&digest)).await.unwrap());
 
@@ -15040,7 +15149,7 @@ mod oci_blob_upload_streaming_tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         let sessions: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE repository_id = $1")
                 .bind(f.inner.repo_id)
@@ -15092,7 +15201,7 @@ mod oci_blob_upload_streaming_tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         let session = sqlx::query(
             "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
         )
@@ -15164,7 +15273,7 @@ mod oci_blob_upload_streaming_tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 
         let session = sqlx::query(
             "SELECT bytes_received, computed_digest FROM oci_upload_sessions WHERE id = $1",
@@ -15255,7 +15364,7 @@ mod oci_blob_upload_streaming_tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
             chunks_read.load(AtomicOrdering::SeqCst),
             0,
@@ -15628,7 +15737,7 @@ mod oci_blob_upload_streaming_tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(oci_blob_count(&f, &digest).await, 0);
         assert!(!f
             .storage()
@@ -15711,7 +15820,7 @@ mod oci_blob_upload_streaming_tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
             chunks_read.load(AtomicOrdering::SeqCst),
             0,
@@ -19357,5 +19466,201 @@ mod cross_repo_session_regression_tests {
         );
 
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+}
+
+// ===========================================================================
+// OCI v2 write authorization + body-size cap.
+//
+// Authorization: the /v2 blob-upload and manifest write/delete paths must
+// enforce the SAME private-repo members-only gate the REST artifact path
+// enforces (`require_repo_write_access` -> `user_can_access_repo`, the #1764
+// lineage). A non-admin non-member is denied on a PRIVATE repo; admins and
+// granted members are allowed; public repos and anonymous reads are unaffected.
+//
+// Size cap: an over-limit body must yield 413 Payload Too Large (declared
+// Content-Length / Content-Range rejection, or the streaming cumulative cap),
+// never 400, so size rejections are distinguishable from malformed bodies.
+// ===========================================================================
+#[cfg(test)]
+mod oci_write_authz_and_size_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn create_oci_user(pool: &PgPool, is_admin: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("oci-authz-{}", id);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+             VALUES ($1, $2, $3, 'unused', 'local', $4, true)",
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .bind(is_admin)
+        .execute(pool)
+        .await
+        .expect("insert user");
+        id
+    }
+
+    async fn create_private_docker_repo(pool: &PgPool) -> (Uuid, String, std::path::PathBuf) {
+        let id = Uuid::new_v4();
+        let key = format!("oci-authz-repo-{}", id);
+        let storage_dir = std::env::temp_dir().join(format!("oci-authz-{}", id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'docker'::repository_format, false)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert private repo");
+        (id, key, storage_dir)
+    }
+
+    async fn bearer_for(state: &SharedState, user_id: Uuid) -> String {
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let user = sqlx::query_as::<_, crate::models::user::User>(
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name, auth_provider,
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            FROM users WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("fetch user");
+        let tokens = auth_service
+            .generate_tokens(&user)
+            .expect("generate Bearer token");
+        format!("Bearer {}", tokens.access_token)
+    }
+
+    async fn start_upload_status(state: &SharedState, repo_key: &str, bearer: &str) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/image/blobs/uploads/", repo_key))
+            .header("Authorization", bearer)
+            .body(Body::empty())
+            .unwrap();
+        router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn start_upload_denied_for_nonadmin_nonmember_on_private_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_private_docker_repo(&pool).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let outsider = create_oci_user(&pool, false).await;
+        let bearer = bearer_for(&state, outsider).await;
+
+        let status = start_upload_status(&state, &repo_key, &bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin non-member must be denied a blob upload on a private repo"
+        );
+
+        tdh::cleanup(&pool, repo_id, outsider).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn start_upload_allowed_for_admin_on_private_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_private_docker_repo(&pool).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = create_oci_user(&pool, true).await;
+        let bearer = bearer_for(&state, admin).await;
+
+        let status = start_upload_status(&state, &repo_key, &bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "an admin must be allowed to open a blob upload session"
+        );
+
+        let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, admin).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn start_upload_allowed_for_granted_member_on_private_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_private_docker_repo(&pool).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let member = create_oci_user(&pool, false).await;
+        tdh::grant_repo_access(&pool, repo_id, member).await;
+        let bearer = bearer_for(&state, member).await;
+
+        let status = start_upload_status(&state, &repo_key, &bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a non-admin with a repo-scoped grant must be allowed to push"
+        );
+
+        let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, member).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- body-size cap (413, not 400) ------------------------------------
+
+    #[test]
+    fn upload_session_size_error_is_413() {
+        assert_eq!(
+            upload_session_size_error(1024).status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+    }
+
+    #[test]
+    fn reject_oversized_content_length_declared_over_limit_is_413() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "100".parse().unwrap());
+        let resp = reject_oversized_content_length(&headers, 10, 10)
+            .expect("declared Content-Length over the limit must be rejected");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn reject_oversized_content_length_under_limit_is_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "5".parse().unwrap());
+        assert!(
+            reject_oversized_content_length(&headers, 10, 10).is_none(),
+            "a declared Content-Length within the limit must not be rejected"
+        );
     }
 }
