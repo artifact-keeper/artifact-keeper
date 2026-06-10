@@ -13,6 +13,8 @@ pub enum AuthProvider {
     Ldap,
     Saml,
     Oidc,
+    /// CI/CD pipelines authenticated via CI OIDC token exchange.
+    Ci,
 }
 
 /// User entity
