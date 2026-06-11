@@ -110,7 +110,11 @@ impl PackageService {
             existing.0
         };
 
-        // Upsert into `package_versions`
+        // Keep `package_versions` deterministic when a package format (PyPI in
+        // particular) publishes multiple distributions for the same version.
+        // Different peers may process wheel/sdist artifacts in different
+        // orders during replication recovery, so "last writer wins" makes
+        // otherwise-equivalent repositories diverge at the DB row level.
         sqlx::query(
             r#"
             INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256)
@@ -118,6 +122,8 @@ impl PackageService {
             ON CONFLICT (package_id, version) DO UPDATE SET
                 size_bytes      = EXCLUDED.size_bytes,
                 checksum_sha256 = EXCLUDED.checksum_sha256
+            WHERE (EXCLUDED.checksum_sha256, EXCLUDED.size_bytes)
+                < (package_versions.checksum_sha256, package_versions.size_bytes)
             "#,
         )
         .bind(package_id)
@@ -159,6 +165,17 @@ impl PackageService {
             );
         }
     }
+}
+
+#[cfg(test)]
+fn should_replace_package_version(
+    existing_checksum_sha256: &str,
+    existing_size_bytes: i64,
+    candidate_checksum_sha256: &str,
+    candidate_size_bytes: i64,
+) -> bool {
+    (candidate_checksum_sha256, candidate_size_bytes)
+        < (existing_checksum_sha256, existing_size_bytes)
 }
 
 #[cfg(test)]
@@ -209,6 +226,19 @@ mod tests {
         assert!(metadata["authors"].is_array());
         assert_eq!(metadata["authors"].as_array().unwrap().len(), 2);
         assert_eq!(metadata["dependencies"]["serde"], "1.0");
+    }
+
+    #[test]
+    fn test_package_version_representative_is_checksum_deterministic() {
+        assert!(should_replace_package_version("bbbb", 100, "aaaa", 500));
+        assert!(!should_replace_package_version("aaaa", 500, "bbbb", 100));
+    }
+
+    #[test]
+    fn test_package_version_representative_uses_size_tiebreaker() {
+        assert!(should_replace_package_version("aaaa", 500, "aaaa", 100));
+        assert!(!should_replace_package_version("aaaa", 100, "aaaa", 500));
+        assert!(!should_replace_package_version("aaaa", 100, "aaaa", 100));
     }
 
     // -----------------------------------------------------------------------

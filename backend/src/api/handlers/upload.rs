@@ -258,7 +258,12 @@ async fn create_session(
         ));
     }
 
+    let is_replication = super::is_replication_request(&headers);
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
+
+    if is_replication {
+        cleanup_stale_replication_upload_sessions(&state.db, repo.0, &req.artifact_path).await;
+    }
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
@@ -274,6 +279,7 @@ async fn create_session(
         artifact_metadata_properties: replication_metadata.artifact_metadata_properties,
         package_description: replication_metadata.package_description,
         package_metadata: replication_metadata.package_metadata,
+        is_replication,
         total_size: req.total_size,
         chunk_size: req.chunk_size,
         checksum_sha256: &req.checksum_sha256,
@@ -465,9 +471,11 @@ async fn get_session_status(
 async fn complete(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
+    headers: HeaderMap,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
     let user_id = auth.user_id;
+    let is_replication_request = super::is_replication_request(&headers);
 
     // C3: Verify user owns this session
     let session = UploadService::complete_session(&state.db, session_id, user_id)
@@ -574,6 +582,10 @@ async fn complete(
         session.total_size,
         &session.checksum_sha256[..12.min(session.checksum_sha256.len())]
     );
+
+    if is_replication_request || session.is_replication {
+        cleanup_completed_upload_session(&state.db, session_id).await;
+    }
 
     Ok(Json(CompleteResponse {
         artifact_id,
@@ -709,6 +721,71 @@ fn completed_package_metadata(
     session: &upload_service::UploadSession,
 ) -> Option<serde_json::Value> {
     session.package_metadata.clone()
+}
+
+async fn cleanup_completed_upload_session(db: &sqlx::PgPool, session_id: Uuid) {
+    match sqlx::query("DELETE FROM upload_sessions WHERE id = $1 AND status = 'completed'")
+        .bind(session_id)
+        .execute(db)
+        .await
+    {
+        Ok(result) if result.rows_affected() == 0 => {
+            tracing::warn!(
+                %session_id,
+                "Completed upload session cleanup did not remove a row"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "Failed to clean up completed upload session"
+            );
+        }
+    }
+}
+
+async fn cleanup_stale_replication_upload_sessions(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    artifact_path: &str,
+) {
+    let stale = match sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        DELETE FROM upload_sessions
+        WHERE repository_id = $1
+          AND artifact_path = $2
+          AND is_replication = true
+        RETURNING id, temp_file_path
+        "#,
+    )
+    .bind(repository_id)
+    .bind(artifact_path)
+    .fetch_all(db)
+    .await
+    {
+        Ok(stale) => stale,
+        Err(e) => {
+            tracing::warn!(
+                %repository_id,
+                artifact_path = %artifact_path,
+                error = %e,
+                "Failed to clean up stale replication upload sessions"
+            );
+            return;
+        }
+    };
+
+    for (session_id, temp_file_path) in &stale {
+        let _ = tokio::fs::remove_file(temp_file_path).await;
+        tracing::info!(
+            %session_id,
+            %repository_id,
+            artifact_path = %artifact_path,
+            "Removed stale replication upload session before retry"
+        );
+    }
 }
 
 struct ReplicationSessionMetadata<'a> {
@@ -889,6 +966,7 @@ mod tests {
             artifact_metadata_properties: None,
             package_description: None,
             package_metadata: None,
+            is_replication: false,
             content_type: "application/octet-stream".to_string(),
             total_size: 1,
             chunk_size: 1_048_576,
@@ -2024,6 +2102,123 @@ mod tests {
             .await;
     }
 
+    async fn upload_session_row_counts(pool: &sqlx::PgPool, session_id: Uuid) -> (i64, i64) {
+        let sessions =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .expect("count upload session rows");
+        let chunks = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_chunks WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("count upload chunk rows");
+        (sessions, chunks)
+    }
+
+    #[tokio::test]
+    async fn create_replication_session_removes_stale_replication_session_for_same_path() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let artifact_path = "torch/2.0.0/torch-2.0.0-cp311-cp311-win_amd64.whl";
+        let stale_session_id = Uuid::new_v4();
+        let stale_temp = f
+            .storage_dir
+            .join(".uploads")
+            .join(stale_session_id.to_string());
+        tokio::fs::create_dir_all(stale_temp.parent().expect("stale temp parent"))
+            .await
+            .expect("create stale temp dir");
+        tokio::fs::write(&stale_temp, b"partial replication bytes")
+            .await
+            .expect("write stale temp file");
+
+        sqlx::query(
+            r#"
+            INSERT INTO upload_sessions
+                (id, user_id, repository_id, repository_key, artifact_path,
+                 content_type, total_size, chunk_size, total_chunks,
+                 completed_chunks, bytes_received, checksum_sha256, temp_file_path,
+                 status, is_replication)
+            VALUES ($1, $2, $3, $4, $5, 'application/zip', 172305868, 52428800, 4,
+                    2, 104857600, $6, $7, 'in_progress', true)
+            "#,
+        )
+        .bind(stale_session_id)
+        .bind(f.user_id)
+        .bind(f.repo_id)
+        .bind(&f.repo_key)
+        .bind(artifact_path)
+        .bind("2802f84f021907deee7e9470ed10c0e78af7457ac9a08a6cd7d55adef835fede")
+        .bind(stale_temp.to_string_lossy().as_ref())
+        .execute(&f.pool)
+        .await
+        .expect("insert stale replication session");
+
+        sqlx::query(
+            "INSERT INTO upload_chunks (session_id, chunk_index, byte_offset, byte_length, status) \
+             VALUES ($1, 0, 0, 52428800, 'completed')",
+        )
+        .bind(stale_session_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert stale chunk row");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = create_replication_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": artifact_path,
+            "artifact_name": "torch",
+            "artifact_version": "2.0.0",
+            "artifact_metadata_format": "pypi",
+            "artifact_metadata": {"format": "pypi", "filename": "torch-2.0.0-cp311-cp311-win_amd64.whl"},
+            "package_metadata": {"format": "pypi", "filename": "torch-2.0.0-cp311-cp311-win_amd64.whl"},
+            "total_size": 172305868_i64,
+            "checksum_sha256": "2802f84f021907deee7e9470ed10c0e78af7457ac9a08a6cd7d55adef835fede",
+            "chunk_size": 52428800_i64,
+        }));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "retry create_session must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        assert_eq!(
+            upload_session_row_counts(&f.pool, stale_session_id).await,
+            (0, 0),
+            "retrying peer replication must remove stale upload session/chunk rows"
+        );
+        assert!(
+            !stale_temp.exists(),
+            "retry cleanup should remove the stale replication temp file"
+        );
+
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let new_session_id: Uuid =
+            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
+        let is_replication: bool =
+            sqlx::query_scalar("SELECT is_replication FROM upload_sessions WHERE id = $1")
+                .bind(new_session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query new upload session");
+        assert!(
+            is_replication,
+            "new peer-created upload session must be marked as replication"
+        );
+
+        cleanup_created_session(&f.pool, &body).await;
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn create_session_allows_non_admin_with_write_grant() {
         // (a) Non-admin holding a fine-grained `write` rule on the target repo
@@ -2196,6 +2391,11 @@ mod tests {
             "complete must succeed; body: {}",
             String::from_utf8_lossy(&body)
         );
+        assert_eq!(
+            upload_session_row_counts(&f.pool, session_id).await,
+            (1, 1),
+            "regular completed upload sessions remain queryable for client status"
+        );
 
         // 4) The new path uses content-addressable storage under the
         //    repo-scoped backend. Verify the bytes are there at the expected
@@ -2320,6 +2520,7 @@ mod tests {
         let req = axum::http::Request::builder()
             .method("PUT")
             .uri(format!("/{}/complete", session_id))
+            .header("x-artifact-keeper-replication", "true")
             .body(axum::body::Body::empty())
             .unwrap();
         let (status, body) = tdh::send(app, req).await;
@@ -2328,6 +2529,11 @@ mod tests {
             StatusCode::OK,
             "complete must succeed; body: {}",
             String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            upload_session_row_counts(&f.pool, session_id).await,
+            (0, 0),
+            "replication upload complete must not leave stale upload session/chunk rows"
         );
 
         let artifact_id: Uuid =

@@ -1569,6 +1569,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -1717,21 +1718,12 @@ async fn upload(
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
-    // Store the file
-    let storage_key = format!("pypi/{}/{}/{}", normalized, pkg_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, content.clone())
-        .await
-        .map_err(map_storage_err)?;
-
     // Build metadata JSON
     let mut pkg_metadata = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "filename": filename,
+        "name": &pkg_name,
+        "normalized_name": &normalized,
+        "version": &pkg_version,
+        "filename": &filename,
     });
     if let Some(rp) = &requires_python {
         pkg_metadata["pkg_info"] = serde_json::json!({
@@ -1739,10 +1731,15 @@ async fn upload(
         });
     }
     if let Some(s) = &summary {
-        pkg_metadata["pkg_info"]
-            .as_object_mut()
-            .get_or_insert(&mut serde_json::Map::new())
-            .insert("summary".to_string(), serde_json::Value::String(s.clone()));
+        if !pkg_metadata["pkg_info"].is_object() {
+            pkg_metadata["pkg_info"] = serde_json::json!({});
+        }
+        if let Some(pkg_info) = pkg_metadata["pkg_info"].as_object_mut() {
+            pkg_info.insert("summary".to_string(), serde_json::Value::String(s.clone()));
+        }
+    }
+    if !metadata_fields.is_empty() {
+        pkg_metadata["upload_metadata"] = serde_json::Value::Object(metadata_fields);
     }
 
     let content_type = pypi_content_type(&filename);
@@ -1752,42 +1749,28 @@ async fn upload(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let artifact_service = state.create_artifact_service(storage);
+    let artifact = artifact_service
+        .upload_with_sync_options(
+            repo.id,
+            &artifact_path,
+            &normalized,
+            Some(&pkg_version),
+            content_type,
+            content,
+            Some(user_id),
+            should_enqueue_pypi_sync_tasks(&headers),
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        normalized,
-        pkg_version,
-        size_bytes,
-        computed_sha256,
-        content_type,
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(map_db_err)?;
+        .await
+        .map_err(|e| e.into_response())?;
 
-    // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'pypi', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        pkg_metadata,
-    )
-    .execute(&state.db)
-    .await;
+    artifact_service
+        .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
+        .await
+        .map_err(|e| e.into_response())?;
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -1806,9 +1789,12 @@ async fn upload(
                 &normalized,
                 &pkg_version,
                 size_bytes,
-                &computed_sha256,
+                &artifact.checksum_sha256,
                 summary.as_deref(),
-                Some(serde_json::json!({ "format": "pypi" })),
+                Some(build_pypi_package_catalog_metadata(
+                    &filename,
+                    requires_python.as_deref(),
+                )),
             )
             .await;
     }
@@ -1827,6 +1813,24 @@ async fn upload(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn should_enqueue_pypi_sync_tasks(headers: &HeaderMap) -> bool {
+    !super::is_replication_request(headers)
+}
+
+fn build_pypi_package_catalog_metadata(
+    filename: &str,
+    requires_python: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::json!({
+        "format": "pypi",
+        "filename": filename,
+    });
+    if let Some(rp) = requires_python.filter(|value| !value.trim().is_empty()) {
+        metadata["requires_python"] = serde_json::Value::String(rp.to_string());
+    }
+    metadata
+}
 
 /// Determine the Content-Type for a PyPI filename based on its extension.
 fn pypi_content_type(filename: &str) -> &'static str {
@@ -1992,6 +1996,65 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 mod tests {
     use super::*;
 
+    fn headers_with_replication(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    fn pypi_upload_multipart(
+        project: &str,
+        version: &str,
+        filename: &str,
+        content: &[u8],
+        summary: &str,
+        requires_python: &str,
+    ) -> (String, Bytes) {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let sha256 = format!("{:x}", hasher.finalize());
+        let boundary = format!("ak-pypi-test-{}", project.replace('-', "_"));
+        let fields = [
+            (":action", "file_upload"),
+            ("protocol_version", "1"),
+            ("metadata_version", "2.1"),
+            ("name", project),
+            ("version", version),
+            ("summary", summary),
+            ("sha256_digest", sha256.as_str()),
+            ("filetype", "bdist_wheel"),
+            ("pyversion", "py3"),
+            ("requires_python", requires_python),
+        ];
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/zip\r\n\r\n");
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        (
+            format!("multipart/form-data; boundary={boundary}"),
+            Bytes::from(body),
+        )
+    }
+
     // -----------------------------------------------------------------------
     // pypi_upstream_url_and_path (#1130)
     // -----------------------------------------------------------------------
@@ -2048,6 +2111,18 @@ mod tests {
         let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
         assert_eq!(url, "/");
         assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_should_enqueue_pypi_sync_tasks_for_direct_upload() {
+        assert!(should_enqueue_pypi_sync_tasks(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn test_should_enqueue_pypi_sync_tasks_skips_peer_replication() {
+        assert!(!should_enqueue_pypi_sync_tasks(&headers_with_replication(
+            "true"
+        )));
     }
 
     #[test]
@@ -3417,6 +3492,201 @@ mod tests {
         );
 
         cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn pypi_upload_queues_sync_tasks_and_preserves_replication_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest, ReplicationMode,
+        };
+
+        async fn sync_task_count(pool: &sqlx::PgPool, repo_id: uuid::Uuid, path: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM sync_tasks st
+                JOIN artifacts a ON a.id = st.artifact_id
+                WHERE a.repository_id = $1
+                  AND a.path = $2
+                "#,
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_one(pool)
+            .await
+            .expect("count sync tasks")
+        }
+
+        async fn wait_for_sync_task_count(
+            pool: &sqlx::PgPool,
+            repo_id: uuid::Uuid,
+            path: &str,
+            expected: i64,
+        ) -> i64 {
+            for _ in 0..40 {
+                let count = sync_task_count(pool, repo_id, path).await;
+                if count == expected {
+                    return count;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            sync_task_count(pool, repo_id, path).await
+        }
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let peer_service = PeerInstanceService::new(fx.pool.clone());
+        let peer = peer_service
+            .register(RegisterPeerInstanceRequest {
+                name: format!("pypi-repl-peer-{}", fx.repo_id),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "peer-key".to_string(),
+            })
+            .await
+            .expect("register test peer");
+        peer_service
+            .assign_repository(
+                peer.id,
+                fx.repo_id,
+                true,
+                Some(ReplicationMode::Mirror),
+                None,
+                None,
+            )
+            .await
+            .expect("assign repo to peer");
+
+        let project = "ak-pypi-replication-smoke";
+        let version = "0.1.0";
+        let filename = "ak_pypi_replication_smoke-0.1.0-py3-none-any.whl";
+        let artifact_path = format!("{project}/{version}/{filename}");
+        let payload = b"fake-wheel-bytes-for-replication";
+        let (content_type, body) = pypi_upload_multipart(
+            project,
+            version,
+            filename,
+            payload,
+            "PyPI peer replication smoke package",
+            ">=3.8",
+        );
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PyPI upload must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        assert_eq!(
+            wait_for_sync_task_count(&fx.pool, fx.repo_id, &artifact_path, 1).await,
+            1,
+            "direct PyPI upload must queue exactly one peer sync task"
+        );
+
+        let metadata: (String, serde_json::Value) = sqlx::query_as(
+            r#"
+            SELECT am.format, am.metadata
+            FROM artifact_metadata am
+            JOIN artifacts a ON a.id = am.artifact_id
+            WHERE a.repository_id = $1
+              AND a.path = $2
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("query PyPI artifact metadata");
+        assert_eq!(metadata.0, "pypi");
+        assert_eq!(metadata.1["filename"], filename);
+        assert_eq!(metadata.1["pkg_info"]["requires_python"], ">=3.8");
+        assert_eq!(
+            metadata.1["pkg_info"]["summary"],
+            "PyPI peer replication smoke package"
+        );
+        assert_eq!(metadata.1["upload_metadata"]["metadata_version"], "2.1");
+
+        let package: (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT description, metadata FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(project)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("query package catalog row");
+        assert_eq!(
+            package.0.as_deref(),
+            Some("PyPI peer replication smoke package")
+        );
+        let package_metadata = package.1.expect("package metadata");
+        assert_eq!(package_metadata["format"], "pypi");
+        assert_eq!(package_metadata["filename"], filename);
+        assert_eq!(package_metadata["requires_python"], ">=3.8");
+
+        let version_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM package_versions pv
+            JOIN packages p ON p.id = pv.package_id
+            WHERE p.repository_id = $1
+              AND p.name = $2
+              AND pv.version = $3
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(project)
+        .bind(version)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("query package version row");
+        assert_eq!(version_rows, 1);
+
+        let replicated_project = "ak-pypi-replication-incoming";
+        let replicated_version = "0.2.0";
+        let replicated_filename = "ak_pypi_replication_incoming-0.2.0-py3-none-any.whl";
+        let replicated_path =
+            format!("{replicated_project}/{replicated_version}/{replicated_filename}");
+        let (content_type, body) = pypi_upload_multipart(
+            replicated_project,
+            replicated_version,
+            replicated_filename,
+            b"incoming-replication-wheel",
+            "Incoming replicated PyPI package",
+            ">=3.9",
+        );
+        let app = fx.router_with_auth(super::router());
+        let mut req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "replication-marked PyPI upload must persist; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            sync_task_count(&fx.pool, fx.repo_id, &replicated_path).await,
+            0,
+            "incoming peer replication writes must not requeue back to peers"
+        );
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------

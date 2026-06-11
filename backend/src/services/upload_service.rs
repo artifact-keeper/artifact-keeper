@@ -29,6 +29,7 @@ pub struct UploadSession {
     pub artifact_metadata_properties: Option<serde_json::Value>,
     pub package_description: Option<String>,
     pub package_metadata: Option<serde_json::Value>,
+    pub is_replication: bool,
     pub content_type: String,
     pub total_size: i64,
     pub chunk_size: i32,
@@ -181,6 +182,7 @@ pub struct CreateSessionParams<'a> {
     pub artifact_metadata_properties: Option<&'a serde_json::Value>,
     pub package_description: Option<&'a str>,
     pub package_metadata: Option<&'a serde_json::Value>,
+    pub is_replication: bool,
     pub total_size: i64,
     pub chunk_size: Option<i32>,
     pub checksum_sha256: &'a str,
@@ -241,10 +243,10 @@ impl UploadService {
                 (id, user_id, repository_id, repository_key, artifact_path,
                  artifact_name, artifact_version, artifact_metadata_format,
                  artifact_metadata, artifact_metadata_properties, package_description,
-                 package_metadata, content_type, total_size, chunk_size, total_chunks,
-                 checksum_sha256, temp_file_path)
+                 package_metadata, is_replication, content_type, total_size, chunk_size,
+                 total_chunks, checksum_sha256, temp_file_path)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18)
+                    $14, $15, $16, $17, $18, $19)
             RETURNING *
             "#,
         )
@@ -260,6 +262,7 @@ impl UploadService {
         .bind(artifact_metadata_properties)
         .bind(package_description)
         .bind(package_metadata)
+        .bind(p.is_replication)
         .bind(content_type)
         .bind(p.total_size)
         .bind(chunk_size)
@@ -1368,6 +1371,7 @@ mod tests {
             artifact_metadata_properties: None,
             package_description: None,
             package_metadata: None,
+            is_replication: false,
             content_type: "application/octet-stream".into(),
             total_size: 1024,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -1402,6 +1406,7 @@ mod tests {
             artifact_metadata_properties: None,
             package_description: None,
             package_metadata: None,
+            is_replication: false,
             content_type: "application/octet-stream".into(),
             total_size: 100,
             chunk_size: DEFAULT_CHUNK_SIZE,
