@@ -1,7 +1,7 @@
 # Red team security testing container
 # Usage: docker compose -f docker-compose.test.yml --profile redteam up --build
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Core tools from Alpine repos
 RUN apk add --no-cache \

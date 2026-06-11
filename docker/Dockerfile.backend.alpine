@@ -54,14 +54,14 @@ FROM ghcr.io/anchore/grype:v0.113.0 AS grype-bin
 # Populates the Grype DB at build time so the image works on egress-restricted
 # networks (e.g. ARC runner pods) without a first-scan network fetch from
 # grype.anchore.io. See artifact-keeper#1001.
-FROM alpine:3.23 AS grype-db-seed
+FROM alpine:3.24 AS grype-db-seed
 RUN apk add --no-cache ca-certificates
 COPY --from=grype-bin /grype /usr/local/bin/grype
 ENV GRYPE_DB_CACHE_DIR=/grype-db
 RUN mkdir -p /grype-db && grype db update && grype db status
 
 # ---------- Stage 5: Alpine runtime ----------
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
 RUN apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
