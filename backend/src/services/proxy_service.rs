@@ -2191,6 +2191,28 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<StreamingFetchResult> {
+        self.fetch_artifact_streaming_with_cache_path(repo, path, path)
+            .await
+    }
+
+    /// Streaming sibling of [`Self::fetch_artifact_with_cache_path`]: fetch
+    /// from upstream using `fetch_path` for the URL but key the proxy cache
+    /// on `cache_path`. This lets format handlers whose upstream download
+    /// URL differs from the canonical artifact path (e.g. PyPI, where wheels
+    /// live on files.pythonhosted.org while the cache key is
+    /// `simple/{project}/{filename}`) use the streaming path instead of
+    /// buffering whole package files in memory.
+    ///
+    /// `cache_path` drives every cache-semantics decision (storage keys,
+    /// TTL classification, negative caching, scan-on-proxy warning);
+    /// `fetch_path` is only ever combined with the repo's upstream URL to
+    /// build the outbound request.
+    pub async fn fetch_artifact_streaming_with_cache_path(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+    ) -> Result<StreamingFetchResult> {
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -2202,13 +2224,41 @@ impl ProxyService {
         // warm cache or wins the election outright.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
-            if let Some(result) = self.try_fetch_artifact_streaming_once(repo, path).await? {
+            if let Some(result) = self
+                .try_fetch_artifact_streaming_once(repo, fetch_path, cache_path)
+                .await?
+            {
                 return Ok(result);
             }
         }
         // Exhausted re-enters (pathological contention): do one final
         // uncoordinated attempt so the request never spuriously fails.
-        self.fetch_artifact_streaming_uncoordinated(repo, path)
+        self.fetch_artifact_streaming_uncoordinated(repo, fetch_path, cache_path)
+            .await
+    }
+
+    /// Streaming cache probe: serve `cache_path` straight from the proxy
+    /// cache as a stream, without contacting upstream on a miss.
+    ///
+    /// Returns `Ok(None)` on a cache miss (including a stale entry that
+    /// failed revalidation) and `Err(NotFound)` when the path is
+    /// negative-cached. Callers that treat the probe as best-effort (the
+    /// PyPI download pre-check) map both to "miss" and fall through to the
+    /// full fetch, which re-applies the negative-cache gate itself.
+    ///
+    /// Revalidation of a stale mutable entry uses `cache_path` as the
+    /// upstream path — the same behavior the buffered
+    /// [`Self::get_cached_artifact_by_path`] probe had implicitly, since
+    /// package files classify as immutable and never revalidate in
+    /// practice.
+    pub async fn streaming_cached_artifact_by_path(
+        &self,
+        repo: &Repository,
+        cache_path: &str,
+    ) -> Result<Option<StreamingFetchResult>> {
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
             .await
     }
 
@@ -2220,10 +2270,11 @@ impl ProxyService {
     async fn try_fetch_artifact_streaming_once(
         &self,
         repo: &Repository,
-        path: &str,
+        fetch_path: &str,
+        cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
-        let cache_key = Self::cache_storage_key(&repo.key, path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
         // Cache hit fast path: load metadata sidecar, stream content
         // straight from storage. The slow-path SHA verification done by
@@ -2233,7 +2284,7 @@ impl ProxyService {
         // they do for presigned redirects (#1018 R-tradeoff already
         // accepted upstream).
         if let Some(result) = self
-            .try_streaming_cache_hit(repo, path, &cache_key, &metadata_key)
+            .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
             .await?
         {
             return Ok(Some(result));
@@ -2246,7 +2297,13 @@ impl ProxyService {
         let handle = self
             .coordinator
             .coordinate_stream(&stream_lease_key, || {
-                self.open_streaming_leader(repo, path, cache_key.clone(), metadata_key.clone())
+                self.open_streaming_leader(
+                    repo,
+                    fetch_path,
+                    cache_path,
+                    cache_key.clone(),
+                    metadata_key.clone(),
+                )
             })
             .await?;
 
@@ -2260,18 +2317,25 @@ impl ProxyService {
     async fn try_streaming_cache_hit(
         &self,
         repo: &Repository,
-        path: &str,
+        fetch_path: &str,
+        cache_path: &str,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<StreamingFetchResult>> {
         match self
-            .read_cached_with_revalidation_streaming(repo, path, path, cache_key, metadata_key)
+            .read_cached_with_revalidation_streaming(
+                repo,
+                fetch_path,
+                cache_path,
+                cache_key,
+                metadata_key,
+            )
             .await?
         {
             StreamingCacheReadOutcome::Hit(result) => Ok(Some(result)),
             StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
                 "Upstream returned 404 (negative-cached) for {}",
-                path
+                cache_path
             ))),
             StreamingCacheReadOutcome::Miss => Ok(None),
         }
@@ -2381,7 +2445,8 @@ impl ProxyService {
     async fn open_streaming_leader(
         &self,
         repo: &Repository,
-        path: &str,
+        fetch_path: &str,
+        cache_path: &str,
         cache_key: String,
         metadata_key: String,
     ) -> Result<StreamHandle> {
@@ -2399,26 +2464,34 @@ impl ProxyService {
         }
 
         let upstream_url = Self::remote_target(repo)?;
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
         let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
             Err(err) => {
                 return self
-                    .handle_streaming_leader_upstream_error(path, &cache_key, &metadata_key, err)
+                    .handle_streaming_leader_upstream_error(
+                        cache_path,
+                        &cache_key,
+                        &metadata_key,
+                        err,
+                    )
                     .await;
             }
         };
 
         // #1611: classify the path. Immutable paths (versioned artifacts, OCI
         // blobs) cache effectively forever; mutable indexes get the short
-        // conservative TTL (or the repo-configured override).
-        let cache_ttl = self.cache_ttl_for_path(repo, path).await;
+        // conservative TTL (or the repo-configured override). Classification
+        // keys off `cache_path` — the canonical artifact identity — not the
+        // upstream-specific download URL.
+        let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
 
         // Cache miss + successful upstream fetch: a new artifact is being
         // cached. Surface the scan-on-proxy gap (#1274) before teeing to
         // the background cache writer so an enabled-but-unimplemented
         // setting is observable in logs rather than silently doing nothing.
-        self.warn_if_proxy_scan_unsupported(repo.id, path).await;
+        self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
+            .await;
 
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
@@ -2491,20 +2564,21 @@ impl ProxyService {
     async fn fetch_artifact_streaming_uncoordinated(
         &self,
         repo: &Repository,
-        path: &str,
+        fetch_path: &str,
+        cache_path: &str,
     ) -> Result<StreamingFetchResult> {
-        let cache_key = Self::cache_storage_key(&repo.key, path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
         if let Some(result) = self
-            .try_streaming_cache_hit(repo, path, &cache_key, &metadata_key)
+            .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
             .await?
         {
             return Ok(result);
         }
 
         let handle = self
-            .open_streaming_leader(repo, path, cache_key, metadata_key)
+            .open_streaming_leader(repo, fetch_path, cache_path, cache_key, metadata_key)
             .await?;
         Ok(StreamingFetchResult::from(handle))
     }
@@ -8699,6 +8773,120 @@ SHA256:
         build_proxy_service_with_storage(Arc::new(GetCachedMock { metadata, body }))
     }
 
+    // --- fetch_artifact_streaming_with_cache_path: key derivation -----------
+
+    /// Map-backed storage that records every key requested via `get`, so
+    /// tests can assert which cache keys the streaming path derives.
+    struct RecordingMapStorage {
+        entries: std::collections::HashMap<String, Bytes>,
+        requested: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for RecordingMapStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.requested.lock().unwrap().push(key.to_string());
+            self.entries
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.entries.contains_key(key))
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            Ok(self.entries.get(key).map(|b| b.len() as u64).unwrap_or(0))
+        }
+    }
+
+    /// PyPI-shaped remote repo for the cache-path threading tests: wheels
+    /// classify as immutable under [`cache_classifier`], so a cached entry
+    /// streams without contacting upstream or the database.
+    fn pypi_remote_repo(key: &str) -> Repository {
+        let mut repo = remote_repo_for(key, "https://pypi.org/simple", "/tmp/x");
+        repo.format = RepositoryFormat::Pypi;
+        repo
+    }
+
+    async fn collect_streaming_body(
+        mut body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    ) -> Bytes {
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        Bytes::from(buf)
+    }
+
+    #[tokio::test]
+    async fn test_streaming_with_cache_path_keys_cache_on_cache_path() {
+        // The PyPI handler fetches wheels from files.pythonhosted.org-style
+        // URLs but caches them under the stable simple/{project}/{file} key.
+        // A cache hit must be found under `cache_path` even though
+        // `fetch_path` points somewhere else entirely — and the fetch path
+        // must never be used to derive a storage key.
+        let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
+        let fetch_path = "packages/ab/cd/numpy-2.0.0-py3-none-any.whl";
+        let wheel_body = Bytes::from_static(b"fake wheel bytes");
+
+        let keys = CacheKeys::derive("pypi-remote", cache_path).unwrap();
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(keys.metadata.clone(), fresh_metadata_bytes());
+        entries.insert(keys.content.clone(), wheel_body.clone());
+
+        let storage = Arc::new(RecordingMapStorage {
+            entries,
+            requested: std::sync::Mutex::new(Vec::new()),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone());
+        let repo = pypi_remote_repo("pypi-remote");
+
+        let result = svc
+            .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+            .await
+            .expect("cached entry under cache_path must stream as a hit");
+
+        let body = collect_streaming_body(result.body).await;
+        assert_eq!(body, wheel_body);
+
+        let requested = storage.requested.lock().unwrap();
+        assert!(
+            requested.iter().all(|k| !k.contains("packages/")),
+            "no storage key may be derived from fetch_path; requested: {:?}",
+            *requested
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_cached_artifact_by_path_returns_none_on_miss() {
+        // Empty storage: the streaming probe must report a miss without
+        // erroring (callers fall through to the full upstream fetch).
+        let storage = Arc::new(RecordingMapStorage {
+            entries: std::collections::HashMap::new(),
+            requested: std::sync::Mutex::new(Vec::new()),
+        });
+        let svc = build_proxy_service_with_storage(storage);
+        let repo = pypi_remote_repo("pypi-remote");
+
+        let probe = svc
+            .streaming_cached_artifact_by_path(&repo, "simple/numpy/numpy-2.0.0-py3-none-any.whl")
+            .await
+            .expect("a cache miss must not be an error");
+        assert!(probe.is_none(), "missing sidecar must probe as a miss");
+    }
+
     // --- Divergence #1: expiry gate -----------------------------------------
 
     #[tokio::test]
@@ -9351,6 +9539,76 @@ SHA256:
             .expect_err("a 5xx upstream must fail the streaming fetch");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
+    }
+
+    /// PyPI-shaped split (#895 follow-up): the upstream download URL
+    /// (files.pythonhosted.org-style `packages/...` path) differs from the
+    /// stable cache key (`simple/{project}/{file}`). The streaming leader
+    /// must fetch `fetch_path` from upstream but tee the body into the
+    /// cache under `cache_path`-derived keys only.
+    #[tokio::test]
+    async fn test_fetch_artifact_streaming_with_cache_path_tees_under_cache_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/ab/cd/demo-1.0-py3-none-any.whl"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/zip")
+                    .set_body_bytes(b"wheel-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-cachepath-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("pypi-split", &server.uri(), tmp.to_str().unwrap());
+
+        let fetch_path = "packages/ab/cd/demo-1.0-py3-none-any.whl";
+        let cache_path = "simple/demo/demo-1.0-py3-none-any.whl";
+        let result = proxy
+            .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+            .await
+            .expect("streaming fetch with split fetch/cache paths must succeed");
+
+        let mut collected = Vec::new();
+        let mut body = result.body;
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
+        }
+        assert_eq!(collected, b"wheel-body");
+
+        // The tee writes the cache in a background task after the client
+        // stream drains; poll briefly for the content object to land.
+        let content_rel = CacheKeys::derive("pypi-split", cache_path)
+            .expect("derive")
+            .content;
+        let content_file = tmp.join(&content_rel);
+        let mut cached = Vec::new();
+        for _ in 0..50 {
+            if let Ok(bytes) = std::fs::read(&content_file) {
+                cached = bytes;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            cached, b"wheel-body",
+            "cache body must land under the cache_path-derived key"
+        );
+        // Nothing may be cached under a fetch_path-derived location.
+        assert!(
+            !tmp.join("proxy-cache/pypi-split/packages").exists(),
+            "no cache entry may be derived from fetch_path"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #1631 layer 2 (#1694): N concurrent cold-cache streaming requests for
