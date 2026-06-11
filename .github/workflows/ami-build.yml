@@ -51,7 +51,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Setup Packer
-        uses: hashicorp/setup-packer@c3d53c525d422944e50ee27b840746d6522b08de # main
+        uses: hashicorp/setup-packer@3286471d6cc6756d056a0b199fea5e0becdbc189 # main
         with:
           version: "1.11.2"
 
