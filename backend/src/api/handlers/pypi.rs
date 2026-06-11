@@ -4835,8 +4835,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tmp = std::env::temp_dir()
-            .join(format!("pypi-stream-e2e-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("pypi-stream-e2e-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("tmp dir");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let repo_id = uuid::Uuid::new_v4();
@@ -4867,9 +4866,7 @@ mod tests {
 
         let wheel_data = Bytes::from_static(b"wheel-content");
         let data_len = wheel_data.len() as u64;
-        let stream = stream::once(async move {
-            Ok::<Bytes, crate::error::AppError>(wheel_data)
-        });
+        let stream = stream::once(async move { Ok::<Bytes, crate::error::AppError>(wheel_data) });
         let result = crate::services::proxy_service::StreamingFetchResult {
             body: Box::pin(stream),
             content_type: Some("application/zip".to_string()),
