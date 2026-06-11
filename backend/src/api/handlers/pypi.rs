@@ -4741,4 +4741,190 @@ mod tests {
 
         do_cleanup().await;
     }
+
+    // -----------------------------------------------------------------------
+    // resolve_pypi_remote_fetch_target / fetch_from_pypi_remote_streaming
+    // -----------------------------------------------------------------------
+    //
+    // DB-free helpers (MissingSvcStorage / build_proxy_service_no_db) are used
+    // for tests that only probe the cache layer (e.g. cache-miss probes).
+    // Tests that exercise the upstream fetch path require a real PgPool so that
+    // load_upstream_auth succeeds; they use tdh::try_pool() and skip when
+    // DATABASE_URL is unset.
+
+    /// Storage backend that implements `storage_service::StorageBackend` (the
+    /// richer trait used by `StorageService` / `ProxyService`). Reports every
+    /// `get` as a miss (NotFound) so tests hit the upstream fetch path.
+    struct MissingSvcStorage;
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for MissingSvcStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn build_proxy_service_no_db() -> crate::services::proxy_service::ProxyService {
+        use crate::services::storage_service::StorageService;
+        let storage = std::sync::Arc::new(MissingSvcStorage);
+        let storage_svc = std::sync::Arc::new(StorageService::new(storage));
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+    }
+
+    /// End-to-end test for the streaming download path via the fallback route.
+    ///
+    /// The simple index page has no matching href, so `resolve_pypi_remote_fetch_target`
+    /// falls through to the stable `simple/{project}/{filename}` fallback path.
+    /// This avoids the SSRF check (which hard-blocks loopback) while still
+    /// exercising `fetch_from_pypi_remote_streaming` and `proxy_fetch_streaming_with_cache_key`.
+    ///
+    /// Skipped when `DATABASE_URL` is unset (CI always sets it).
+    #[tokio::test]
+    async fn test_fetch_from_pypi_remote_streaming_fallback_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let wheel_body = b"fake-wheel-bytes";
+
+        // Empty simple-index page → find_upstream_url_for_file returns None →
+        // resolve_pypi_remote_fetch_target falls back to simple/{project}/{filename}.
+        Mock::given(method("GET"))
+            .and(path("/simple/numpy/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<!DOCTYPE html><html><body></body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        // The fallback fetch path is simple/{normalized}/{filename}.
+        Mock::given(method("GET"))
+            .and(path("/simple/numpy/numpy-2.0.0-py3-none-any.whl"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/zip")
+                    .set_body_bytes(wheel_body.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir()
+            .join(format!("pypi-stream-e2e-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_from_pypi_remote_streaming(
+            &proxy,
+            repo_id,
+            "pypi-remote",
+            &server.uri(),
+            "numpy",
+            "numpy-2.0.0-py3-none-any.whl",
+        )
+        .await
+        .expect("streaming fetch via fallback path must succeed");
+
+        let mut body_bytes = Vec::new();
+        let mut body = result.body;
+        while let Some(chunk) = body.next().await {
+            body_bytes.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(body_bytes, wheel_body);
+    }
+
+    #[tokio::test]
+    async fn test_build_streaming_file_response_headers() {
+        use futures::stream;
+
+        let wheel_data = Bytes::from_static(b"wheel-content");
+        let data_len = wheel_data.len() as u64;
+        let stream = stream::once(async move {
+            Ok::<Bytes, crate::error::AppError>(wheel_data)
+        });
+        let result = crate::services::proxy_service::StreamingFetchResult {
+            body: Box::pin(stream),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(data_len),
+        };
+
+        let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/zip"),
+            "content-type must be application/zip, got: {ct}"
+        );
+        let cd = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cd.contains("numpy-1.0-py3-none-any.whl"),
+            "content-disposition must contain filename, got: {cd}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(data_len.to_string().as_str()),
+            "content-length must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_check_cache_streaming_returns_none_on_miss() {
+        // Empty MissingStorage → streaming probe returns None without errors.
+        let proxy = build_proxy_service_no_db();
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = super::proxy_helpers::proxy_check_cache_streaming(
+            &proxy,
+            repo_id,
+            "pypi-remote",
+            "https://pypi.org/simple",
+            "simple/numpy/numpy-2.0.0-py3-none-any.whl",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "cache miss must yield None, not Some(result)"
+        );
+    }
 }
