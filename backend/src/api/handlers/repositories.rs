@@ -3876,6 +3876,56 @@ fn slice_byte_stream(
     stream.boxed()
 }
 
+/// Build a range-aware streaming download response, shared by the generic
+/// artifact download and the format handlers (e.g. incus image download) so
+/// every streaming download path honours HTTP `Range` identically (#1847).
+///
+/// `base_headers` are applied to the `200` and `206` responses; `416` carries
+/// only `Accept-Ranges` and `Content-Range` (no body). The helper always
+/// advertises `Accept-Ranges: bytes`, so clients know they may resume.
+pub(crate) fn ranged_stream_response(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+) -> Result<Response> {
+    let build_base = || {
+        let mut b = Response::builder().header(header::ACCEPT_RANGES, "bytes");
+        for (name, value) in &base_headers {
+            b = b.header(name.clone(), value.clone());
+        }
+        b
+    };
+    let mk_err =
+        |e: axum::http::Error| AppError::Internal(format!("failed to build response: {e}"));
+    let response = match parse_byte_range(range_header, total) {
+        RangeOutcome::Satisfiable { start, end } => {
+            let len = end - start + 1;
+            build_base()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, total),
+                )
+                .body(Body::from_stream(slice_byte_stream(body, start, end)))
+                .map_err(mk_err)?
+        }
+        RangeOutcome::Unsatisfiable => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+            .body(Body::empty())
+            .map_err(mk_err)?,
+        RangeOutcome::Full => build_base()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .body(Body::from_stream(body))
+            .map_err(mk_err)?,
+    };
+    Ok(response)
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -4041,52 +4091,25 @@ pub async fn download_artifact(
             // blank-pads shorter values on read; trim before emitting so the
             // header carries the bare checksum.
 
-            let base = Response::builder()
-                .header(header::CONTENT_TYPE, artifact.content_type)
-                .header(
+            // Shared range-aware streaming (#1847): one primitive serves the
+            // 200 / 206 / 416 cases for both this generic path and the format
+            // handlers (e.g. incus image download).
+            let base_headers = vec![
+                (header::CONTENT_TYPE, artifact.content_type),
+                (
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", download_filename(&path)),
-                )
-                // Advertise byte-range support so clients (resumable downloads,
-                // media players) know they may issue `Range` requests.
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(
+                ),
+                (
                     header::HeaderName::from_static("x-checksum-sha256"),
                     checksum,
-                )
-                .header(header::HeaderName::from_static(X_ARTIFACT_STORAGE), "proxy");
-
-            let response = match parse_byte_range(range_header, total) {
-                RangeOutcome::Satisfiable { start, end } => {
-                    let len = end - start + 1;
-                    base.status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_LENGTH, len.to_string())
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", start, end, total),
-                        )
-                        .body(Body::from_stream(slice_byte_stream(body, start, end)))
-                        .map_err(|e| {
-                            AppError::Internal(format!("failed to build response: {}", e))
-                        })?
-                }
-                RangeOutcome::Unsatisfiable => {
-                    // 416 must carry the resource size via Content-Range and no body.
-                    Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header(header::CONTENT_RANGE, format!("bytes */{}", total))
-                        .body(Body::empty())
-                        .map_err(|e| {
-                            AppError::Internal(format!("failed to build response: {}", e))
-                        })?
-                }
-                RangeOutcome::Full => base
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_LENGTH, total.to_string())
-                    .body(Body::from_stream(body))
-                    .map_err(|e| AppError::Internal(format!("failed to build response: {}", e)))?,
-            };
+                ),
+                (
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "proxy".to_string(),
+                ),
+            ];
+            let response = ranged_stream_response(range_header, total, body, base_headers)?;
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {

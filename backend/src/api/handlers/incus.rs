@@ -22,7 +22,7 @@
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -719,6 +719,7 @@ async fn streams_images(
 
 async fn download_image(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -784,21 +785,34 @@ async fn download_image(
         }
     })?;
 
-    let content_type = content_type_for_download(&filename);
-    let body =
-        Body::from_stream(stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))));
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, size_bytes.to_string())
-        .header(
-            "Content-Disposition",
+    // Honour HTTP `Range` so large images are resumable, via the shared
+    // range-aware streaming helper that the generic artifact download uses
+    // (#1847). Previously this handler ignored `Range` and always returned a
+    // full `200`, so a dropped multi-GiB transfer could never resume.
+    let range_header = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    let base_headers = vec![
+        (
+            CONTENT_TYPE,
+            content_type_for_download(&filename).to_string(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", filename),
-        )
-        .header("X-Checksum-Sha256", checksum)
-        .body(body)
-        .unwrap())
+        ),
+        (
+            axum::http::header::HeaderName::from_static("x-checksum-sha256"),
+            checksum,
+        ),
+    ];
+    crate::api::handlers::repositories::ranged_stream_response(
+        range_header,
+        size_bytes.max(0) as u64,
+        stream,
+        base_headers,
+    )
+    .map_err(|e| e.into_response())
 }
 
 // ---------------------------------------------------------------------------

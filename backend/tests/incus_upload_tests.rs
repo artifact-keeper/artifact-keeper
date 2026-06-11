@@ -1156,3 +1156,133 @@ async fn test_chunked_upload_cross_repo_session_rejected() {
         .await
         .ok();
 }
+
+// ===========================================================================
+// Range support on download (#1847)
+//
+// The incus image download previously ignored HTTP `Range` and always returned
+// a full `200`, so a dropped multi-GiB transfer could never resume. It now
+// routes through the same range-aware streaming helper as the generic artifact
+// download: a `200` advertises `Accept-Ranges: bytes`, a satisfiable range
+// returns `206` + `Content-Range` + the sliced body, and an unsatisfiable range
+// returns `416`.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_incus_download_honours_range() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let username = format!("incus-range-{}", &Uuid::new_v4().to_string()[..8]);
+    let user_id = create_test_user(&pool, &username, "testpass123").await;
+    let (repo_id, storage_path) = create_incus_repo(&pool, "range-test").await;
+    let key = repo_key(&pool, repo_id).await;
+    let state = build_state(pool.clone(), storage_path.to_str().unwrap());
+
+    let data = test_data(4096);
+    let sha = sha256_hex(&data);
+
+    // Stage the artifact directly (row + stored bytes) so the test isolates the
+    // *download* path rather than exercising the async upload/finalize flow.
+    let repo =
+        artifact_keeper_backend::services::repository_service::RepositoryService::new(pool.clone())
+            .get_by_id(repo_id)
+            .await
+            .unwrap();
+    let storage = state.storage_for_repo(&repo.storage_location()).unwrap();
+    let storage_key = format!("range-test/{}", Uuid::new_v4());
+    storage
+        .put(&storage_key, bytes::Bytes::from(data.clone()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by) \
+         VALUES ($1, 'ubuntu/24.04/rootfs.tar.xz', 'rootfs', '24.04', $2, $3, 'application/x-xz', $4, $5)",
+    )
+    .bind(repo_id)
+    .bind(data.len() as i64)
+    .bind(&sha)
+    .bind(&storage_key)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("insert artifact row");
+
+    let dl_uri = format!("/{}/images/ubuntu/24.04/rootfs.tar.xz", key);
+
+    // (a) No Range -> 200 and Accept-Ranges advertised (regression: was absent).
+    let resp = incus::router()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&dl_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes"),
+        "200 response must advertise Accept-Ranges: bytes"
+    );
+
+    // (b) bytes=0-1023 -> 206, Content-Range, and exactly the first 1024 bytes.
+    let resp = incus::router()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&dl_uri)
+                .header("Range", "bytes=0-1023")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "ranged GET must return 206 Partial Content"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 0-1023/4096")
+    );
+    let part = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(part.len(), 1024);
+    assert_eq!(&part[..], &data[0..1024]);
+
+    // (c) Unsatisfiable range -> 416 + Content-Range: bytes */<total>.
+    let resp = incus::router()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&dl_uri)
+                .header("Range", "bytes=999999-")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes */4096")
+    );
+
+    let _ = std::fs::remove_dir_all(&storage_path);
+    cleanup(&pool, repo_id, user_id).await;
+}
