@@ -892,8 +892,11 @@ jobs:
           push: false
           load: true
           tags: artifact-keeper-backend:pr-test
-          cache-from: type=gha,scope=backend-linux/amd64
-          cache-to: type=gha,scope=backend-linux/amd64,mode=max
+          # Read-only registry cache, warmed by docker-publish.yml on main.
+          # No cache-to: PR-triggered jobs must not get packages:write (fork
+          # PRs would inherit it — pwn-request risk), and anonymous GHCR
+          # reads work because the packages are public.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
 
       - name: Verify image starts
         run: |
@@ -943,8 +946,8 @@ jobs:
           push: false
           load: true
           tags: artifact-keeper-openscap:pr-test
-          cache-from: type=gha,scope=openscap-linux/amd64
-          cache-to: type=gha,scope=openscap-linux/amd64,mode=max
+          # Read-only registry cache — see backend image build for rationale.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-openscap:buildcache-amd64
 
       - name: Verify image starts
         run: |

@@ -121,8 +121,10 @@ jobs:
           file: docker/Dockerfile.backend
           load: true
           tags: artifact-keeper-backend:test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Read-only registry cache warmed by docker-publish.yml on main;
+          # this workflow only has contents:read, so it cannot (and should
+          # not) push cache back to GHCR.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
 
       - name: Download PKI assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

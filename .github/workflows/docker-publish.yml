@@ -52,8 +52,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ak-ci-runners
+            cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            cache-tag: arm64
     outputs:
       digest-amd64: ${{ steps.build.outputs.digest }}
       digest-arm64: ${{ steps.build.outputs.digest }}
@@ -97,8 +99,12 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=backend-${{ matrix.platform }}
-          cache-to: type=gha,scope=backend-${{ matrix.platform }},mode=max
+          # Registry cache instead of type=gha: buildkit blobs were consuming
+          # ~7.7GB of the repo's 10GB Actions cache quota, evicting the rust
+          # caches daily. image-manifest+oci-mediatypes are required for GHCR
+          # to accept mode=max cache manifests.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
           sbom: true
           provenance: mode=max
           build-args: |
@@ -131,8 +137,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ak-ci-runners
+            cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            cache-tag: arm64
     outputs:
       digest-amd64: ${{ steps.build.outputs.digest }}
       digest-arm64: ${{ steps.build.outputs.digest }}
@@ -174,8 +182,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=openscap-${{ matrix.platform }}
-          cache-to: type=gha,scope=openscap-${{ matrix.platform }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:buildcache-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
           sbom: true
           provenance: mode=max
 
@@ -209,8 +217,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ak-ci-runners
+            cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            cache-tag: arm64
     outputs:
       digest-amd64: ${{ steps.build.outputs.digest }}
       digest-arm64: ${{ steps.build.outputs.digest }}
@@ -244,8 +254,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=backend-alpine-${{ matrix.platform }}
-          cache-to: type=gha,scope=backend-alpine-${{ matrix.platform }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-alpine-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-alpine-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
           sbom: true
           provenance: mode=max
           build-args: |
