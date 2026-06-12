@@ -1190,9 +1190,11 @@ async fn get_license_policy(
 )]
 async fn upsert_license_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<UpsertLicensePolicyRequest>,
 ) -> Result<Json<LicensePolicyResponse>> {
+    auth.require_admin()?;
+
     let action = PolicyAction::parse(&body.action)
         .ok_or_else(|| AppError::Validation(format!("Unknown action: {}", body.action)))?;
 
@@ -1246,9 +1248,11 @@ async fn upsert_license_policy(
 )]
 async fn delete_license_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
+
     sqlx::query("DELETE FROM license_policies WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -2196,6 +2200,39 @@ mod tests {
         assert!(req.allow_unknown); // default_true
         assert_eq!(req.action, "warn"); // default_action
         assert!(req.is_enabled); // default_true
+    }
+
+    // -----------------------------------------------------------------------
+    // License-policy mutation gate: upsert_license_policy and
+    // delete_license_policy call `auth.require_admin()?` as their first
+    // statement, matching the gRPC SecurityPolicyService admin interceptor.
+    // These tests cover both branches of that gate.
+    // -----------------------------------------------------------------------
+
+    fn make_policy_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "policy-tester".to_string(),
+            email: "policy-tester@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_license_policy_mutation_gate_rejects_non_admin() {
+        let auth = make_policy_auth(false);
+        let err = auth.require_admin().unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
+    }
+
+    #[test]
+    fn test_license_policy_mutation_gate_allows_admin() {
+        let auth = make_policy_auth(true);
+        assert!(auth.require_admin().is_ok());
     }
 
     #[test]
