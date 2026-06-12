@@ -1,7 +1,7 @@
 //! Sync policy management handlers.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     routing::{get, post},
     Json, Router,
 };
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::sync_policy_service::{
@@ -427,8 +428,10 @@ async fn list_policies(State(state): State<SharedState>) -> Result<Json<SyncPoli
 )]
 async fn create_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateSyncPolicyPayload>,
 ) -> Result<Json<SyncPolicyResponse>> {
+    auth.require_admin()?;
     let repo_selector: RepoSelector = parse_selector(payload.repo_selector)?;
     let peer_selector: PeerSelector = parse_selector(payload.peer_selector)?;
     let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter)?;
@@ -506,9 +509,11 @@ async fn get_policy(
 )]
 async fn update_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSyncPolicyPayload>,
 ) -> Result<Json<SyncPolicyResponse>> {
+    auth.require_admin()?;
     let repo_selector: Option<RepoSelector> = payload
         .repo_selector
         .map(|v| parse_selector(Some(v)))
@@ -563,8 +568,10 @@ async fn update_policy(
 )]
 async fn delete_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode> {
+    auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
     service.delete_policy(id).await?;
 
@@ -594,9 +601,11 @@ async fn delete_policy(
 )]
 async fn toggle_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<TogglePolicyPayload>,
 ) -> Result<Json<SyncPolicyResponse>> {
+    auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
     let policy = service.toggle_policy(id, payload.enabled).await?;
 
@@ -621,7 +630,9 @@ async fn toggle_policy(
 )]
 async fn evaluate_policies(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<EvaluationResultResponse>> {
+    auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
     let result = service.evaluate_policies().await?;
     Ok(Json(evaluation_to_response(result)))
@@ -1067,5 +1078,40 @@ mod tests {
         }
         let obj = json.as_object().unwrap();
         assert_eq!(obj.len(), 13, "SyncPolicyResponse should have 13 fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin gate: the mutating sync-policy handlers (create / update /
+    // delete / toggle / evaluate) now call auth.require_admin()? before
+    // touching the service. These tests exercise the exact guard
+    // expression those handlers run.
+    // -----------------------------------------------------------------------
+
+    /// Build an [`AuthExtension`] with the given admin flag.
+    fn policy_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: if is_admin { "admin" } else { "glen.globex" }.to_string(),
+            email: "policy-test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_policy_write_guard_rejects_non_admin() {
+        let err = policy_auth(false).require_admin().unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin must be rejected with an Authorization error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_policy_write_guard_allows_admin() {
+        assert!(policy_auth(true).require_admin().is_ok());
     }
 }

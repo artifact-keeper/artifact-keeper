@@ -10,6 +10,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::peer_instance_service::{
@@ -290,9 +291,12 @@ pub async fn list_peers(
 )]
 pub async fn register_peer(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<RegisterPeerRequest>,
 ) -> Result<Json<PeerInstanceResponse>> {
+    auth.require_admin()?;
+    validate_outbound_url(&payload.endpoint_url, "Peer endpoint URL")?;
+
     let service = PeerInstanceService::new(state.db.clone());
 
     let instance = service
@@ -403,9 +407,10 @@ pub async fn get_peer(
 )]
 pub async fn unregister_peer(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     service.unregister(id).await?;
     Ok(())
@@ -462,9 +467,10 @@ pub async fn heartbeat(
 )]
 pub async fn trigger_sync(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     service.update_sync_status(id, false).await?;
     Ok(())
@@ -558,10 +564,11 @@ pub async fn get_assigned_repos(
 )]
 pub async fn assign_repo(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<AssignRepoRequest>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let replication_mode =
         payload
             .replication_mode
@@ -653,9 +660,10 @@ pub async fn get_subscription(
 )]
 pub async fn run_subscription_now(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, repo_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(axum::http::StatusCode, Json<RunNowResponse>)> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     let queued = service.run_subscription_now(id, repo_id).await?;
     Ok((
@@ -686,9 +694,10 @@ pub async fn run_subscription_now(
 )]
 pub async fn unassign_repo(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, repo_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     service.unassign_repository(id, repo_id).await?;
     Ok(())
@@ -713,6 +722,7 @@ async fn announce_peer(
     Json(body): Json<AnnouncePeerRequest>,
 ) -> Result<Json<serde_json::Value>> {
     auth.require_admin()?;
+    validate_outbound_url(&body.endpoint_url, "Peer endpoint URL")?;
 
     let peer_svc = PeerService::new(state.db.clone());
     let instance_svc = PeerInstanceService::new(state.db.clone());
@@ -1515,5 +1525,118 @@ mod tests {
         // verifies at least one route is registered, and the route table
         // construction itself will panic if a path is malformed.
         assert!(router.has_routes());
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF: peer endpoint_url must go through the shared outbound-URL
+    // allowlist (validate_outbound_url) before it is persisted. The sync
+    // worker later issues outbound requests to the stored endpoint, so a
+    // loopback / RFC1918 / metadata / dotless-decimal endpoint would be an
+    // SSRF primitive without this guard. Mirrors the same allowlist that
+    // every other outbound sink enforces.
+    // -----------------------------------------------------------------------
+
+    /// Assert the peer-endpoint validator rejects an SSRF target URL.
+    fn assert_peer_endpoint_blocked(url: &str) {
+        assert!(
+            validate_outbound_url(url, "Peer endpoint URL").is_err(),
+            "peer endpoint_url '{url}' must be rejected by the SSRF allowlist"
+        );
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_loopback() {
+        assert_peer_endpoint_blocked("http://127.0.0.1:19099/peer-reg");
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_ipv6_loopback() {
+        assert_peer_endpoint_blocked("http://[::1]/");
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_unspecified() {
+        assert_peer_endpoint_blocked("http://0.0.0.0/");
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_rfc1918() {
+        // 10.0.0.0/8 is only blocked under default config; an operator can
+        // opt RFC1918 in via UPSTREAM_ALLOW_PRIVATE_IPS / the CIDR
+        // allowlist. Skip the strict assertion if a parallel test in the
+        // same binary has that relaxation active so this does not flake.
+        if crate::api::validation::upstream_allow_private_ips_enabled()
+            || crate::api::validation::private_cidr_allowlist_value().is_some()
+        {
+            return;
+        }
+        assert_peer_endpoint_blocked("http://10.0.0.5/");
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_metadata() {
+        assert_peer_endpoint_blocked("http://169.254.169.254/");
+    }
+
+    #[test]
+    fn test_peer_endpoint_rejects_dotless_decimal_loopback() {
+        // 2130706433 == 127.0.0.1; the URL parser canonicalises the
+        // dotless-decimal integer host to the IPv4 literal, which the
+        // allowlist then classifies as loopback.
+        assert_peer_endpoint_blocked("http://2130706433/");
+    }
+
+    #[test]
+    fn test_peer_endpoint_allows_public_https() {
+        assert!(
+            validate_outbound_url("https://peer1.example.com", "Peer endpoint URL").is_ok(),
+            "a legitimate public peer endpoint must still be accepted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin gate: the mutating peer handlers (register / unregister /
+    // trigger_sync / assign / unassign / run-now) now call
+    // auth.require_admin()? before touching the service, matching the
+    // in-file pattern already used by heartbeat / announce / identity.
+    // -----------------------------------------------------------------------
+
+    /// Build an [`AuthExtension`] for a non-admin caller.
+    fn non_admin_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "victor.user".to_string(),
+            email: "victor@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Build an [`AuthExtension`] for an admin caller.
+    fn admin_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_peer_write_guard_rejects_non_admin() {
+        // The exact guard expression each mutating peer handler now runs.
+        assert!(non_admin_auth().require_admin().is_err());
+    }
+
+    #[test]
+    fn test_peer_write_guard_allows_admin() {
+        assert!(admin_auth().require_admin().is_ok());
     }
 }
