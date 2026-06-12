@@ -63,6 +63,19 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/-/package/:package/dist-tags/:tag",
             put(dist_tags_put).delete(dist_tags_delete),
         )
+        // npm /-/ meta namespace: GET /npm/{repo_key}/-/*rest
+        //
+        // The npm registry protocol reserves `/-/` as a meta namespace for
+        // registry-level operations (ping, whoami, search, login, audit, etc.).
+        // Without an explicit catch-all here, requests like `/-/ping` fall into
+        // the `/:package/:version` catch-all with `package="-"` and
+        // `version="ping"`, producing a spurious 404 ("Version 'ping' not found
+        // for package '-'"). This route must appear before every `:package`
+        // catch-all so axum resolves it first. More specific `/-/…` routes
+        // registered above (audit endpoints, dist-tags) continue to shadow this
+        // wildcard because axum prefers literal segments over `*` wildcards.
+        // See the filed issue for the full reproducer and impact analysis.
+        .route("/:repo_key/-/*rest", get(npm_meta_get))
         // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
         .route(
             "/:repo_key/@:scope/:package/-/:filename",
@@ -311,6 +324,150 @@ async fn proxy_npm_audit_post(
             empty_fallback()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// npm /-/ meta namespace — GET handler
+// ---------------------------------------------------------------------------
+
+/// Forward a GET request to the upstream registry at the given meta path.
+///
+/// Returns the upstream status + body verbatim. On any transport error (DNS,
+/// TLS, timeout) returns `None` so the caller can fall through to the local
+/// fallback.
+async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
+    let base = upstream_url.trim_end_matches('/');
+    // meta_path already carries the leading slash from the `*rest` wildcard
+    // (axum includes the slash: `*rest` on `/-/ping` yields `/ping`).
+    let path_with_dash = format!("/-{}", meta_path);
+    let url = format!("{}{}", base, path_with_dash);
+    let client = crate::services::http_client::default_client();
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            debug!(
+                target: "npm_meta",
+                upstream = %url,
+                error = %err,
+                "npm meta GET upstream unreachable"
+            );
+            return None;
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    match resp.bytes().await {
+        Ok(bytes) => Some(
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+                }),
+        ),
+        Err(err) => {
+            debug!(
+                target: "npm_meta",
+                upstream = %url,
+                error = %err,
+                "npm meta GET failed to read upstream body"
+            );
+            None
+        }
+    }
+}
+
+/// Handler for `GET /npm/{repo_key}/-/*rest`.
+///
+/// Implements the npm registry `/-/<endpoint>` meta namespace:
+///
+/// - **Remote / Virtual repos** — forwards the request transparently to the
+///   configured upstream (or the first reachable Remote member, for Virtual).
+///   This is the correct behaviour for proxy/group repos: the upstream already
+///   handles these endpoints correctly, so AK acts as a pass-through.
+///
+/// - **Local / Staging repos** — the registry is self-contained; no upstream
+///   to forward to. Minimal built-in responses:
+///   - `/-/ping` → `200 {}` (standard liveness probe)
+///   - `/-/whoami` → `200 {"username":"<name>"}` when authenticated,
+///     `401 {"error":"unauthenticated"}` otherwise
+///   - All other `/-/` paths → `501 Not Implemented`
+///
+/// Without this route, the `/:package/:version` catch-all previously matched
+/// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
+/// 404 ("Version 'ping' not found for package '-'"). See the linked issue.
+async fn npm_meta_get(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, rest)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    // Remote: proxy the whole request to upstream verbatim.
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+                return Ok(resp);
+            }
+        }
+        // Upstream misconfigured or unreachable — fall through to local stub.
+    }
+
+    // Virtual: try the first Remote member whose upstream is reachable.
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            let Some(ref upstream_url) = member.upstream_url else {
+                continue;
+            };
+            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+                return Ok(resp);
+            }
+        }
+        // No reachable Remote member — fall through to local stub.
+    }
+
+    // Local / Staging (or Remote/Virtual without a reachable upstream):
+    // serve minimal built-in responses for the standard meta endpoints.
+    let endpoint = rest.trim_start_matches('/');
+
+    if endpoint == "ping" {
+        return Ok(build_json_metadata_response("{}".to_string()));
+    }
+
+    if endpoint == "whoami" {
+        return match auth {
+            Some(a) => Ok(build_json_metadata_response(
+                serde_json::json!({"username": a.username}).to_string(),
+            )),
+            None => Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "unauthenticated"})),
+            )
+                .into_response()),
+        };
+    }
+
+    // All other /-/ endpoints are not implemented for local repos.
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(
+            serde_json::json!({"error": format!("/-/{} is not implemented for local repositories", endpoint)}),
+        ),
+    )
+        .into_response())
 }
 
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
@@ -4047,5 +4204,174 @@ mod tests {
 
         assert!(del_next.is_ok(), "DELETE of a custom tag should succeed");
         assert!(del_latest.is_err(), "DELETE of `latest` must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // npm /-/ meta namespace (/-/ping, /-/whoami, etc.)
+    // -----------------------------------------------------------------------
+
+    /// Local repo: `/-/ping` must return `200 {}` so health-check tooling
+    /// (connectors, IDE integrations, `npm ping`) works against local repos.
+    #[tokio::test]
+    async fn test_local_repo_meta_ping_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "/-/ping must return 200");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("/-/ping body must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "/-/ping must return empty JSON object {{}}, got {parsed:?}"
+        );
+    }
+
+    /// Local repo: `/-/whoami` with auth returns `200 {"username":"<name>"}`.
+    #[tokio::test]
+    async fn test_local_repo_meta_whoami_authenticated_returns_username() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_with_auth(super::router());
+        let uri = format!("/{}/-/whoami", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let username = fx.username.clone();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "authenticated /-/whoami must return 200"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("/-/whoami body must be JSON");
+        assert_eq!(
+            parsed.get("username").and_then(|v| v.as_str()),
+            Some(username.as_str()),
+            "/-/whoami must echo the authenticated username"
+        );
+    }
+
+    /// Local repo: `/-/whoami` without auth returns 401.
+    #[tokio::test]
+    async fn test_local_repo_meta_whoami_unauthenticated_returns_401() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/whoami", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, _) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated /-/whoami must return 401"
+        );
+    }
+
+    /// Remote repo: `/-/ping` is forwarded to the upstream registry and the
+    /// upstream response (200 `{}`) is returned verbatim to the client.
+    #[tokio::test]
+    async fn test_remote_repo_meta_ping_proxied_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/-/ping"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("{}"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Remote /-/ping must be proxied; got {status}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("upstream ping body must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "proxied /-/ping must return the upstream payload, got {parsed:?}"
+        );
+    }
+
+    /// Regression guard: requests that previously fell into the /:package/:version
+    /// catch-all (package="-", version="ping") must no longer produce
+    /// `404 Version 'ping' not found for package '-'`.
+    #[tokio::test]
+    async fn test_local_repo_meta_ping_does_not_produce_package_not_found_404() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        // The old behaviour was 404 with body mentioning package `-`.
+        // The new route must never return that error.
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "/-/ping must not 404; the catch-all regression is back"
+        );
+        if status == StatusCode::NOT_FOUND {
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("package '-'") && !body.contains("Version 'ping'"),
+                "/-/ping must not be treated as package lookup, got: {body}"
+            );
+        }
     }
 }
