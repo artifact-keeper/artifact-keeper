@@ -98,6 +98,9 @@ pub enum UploadError {
 
     #[error("invalid chunk size: must be between 1 MB and 256 MB")]
     InvalidChunkSize,
+
+    #[error("total_size {size} exceeds maximum allowed upload size {max}")]
+    TooLarge { size: i64, max: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +157,24 @@ pub fn validate_artifact_path(path: &str) -> Result<(), UploadError> {
     Ok(())
 }
 
+/// Enforce an upper bound on the attacker-controlled `total_size` before any
+/// expensive work (temp-file pre-allocation, per-chunk row inserts) happens.
+///
+/// `max` is the configured `max_upload_size_bytes`; a value of `0` disables the
+/// cap (matching the direct-upload path semantics). Without this bound an
+/// authenticated caller could pick an enormous `total_size` and force the
+/// session-create transaction to insert one `upload_chunks` row per chunk,
+/// amplifying a tiny request into millions of synchronous INSERTs.
+pub fn enforce_max_total_size(total_size: i64, max: u64) -> Result<(), UploadError> {
+    if max != 0 && total_size as u64 > max {
+        return Err(UploadError::TooLarge {
+            size: total_size,
+            max,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -184,6 +205,9 @@ pub struct CreateSessionParams<'a> {
     pub package_metadata: Option<&'a serde_json::Value>,
     pub is_replication: bool,
     pub total_size: i64,
+    /// Maximum permitted `total_size` (`config.max_upload_size_bytes`); `0`
+    /// disables the cap. Bounds the eager per-chunk row loop below.
+    pub max_upload_size: u64,
     pub chunk_size: Option<i32>,
     pub checksum_sha256: &'a str,
     pub content_type: Option<&'a str>,
@@ -203,6 +227,13 @@ impl UploadService {
                 "total_size must be a positive integer".into(),
             ));
         }
+
+        // Bound the attacker-controlled total_size before pre-allocating the
+        // temp file or inserting per-chunk rows. Rejecting here keeps the
+        // eager chunk-row loop below provably bounded (<= max / chunk_size
+        // rows) and stops a tiny request from amplifying into millions of
+        // synchronous INSERTs.
+        enforce_max_total_size(p.total_size, p.max_upload_size)?;
 
         let chunk_size = p.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
         if (chunk_size as i64) < MIN_CHUNK_SIZE || (chunk_size as i64) > MAX_CHUNK_SIZE {
@@ -715,6 +746,50 @@ mod tests {
     fn test_normalize_optional_metadata_keeps_non_empty() {
         assert_eq!(normalize_optional_metadata(Some("pkg")), Some("pkg"));
         assert_eq!(normalize_optional_metadata(Some(" ")), Some(" "));
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_max_total_size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_enforce_max_total_size_at_limit_ok() {
+        // total_size exactly at the configured max is accepted.
+        let max: u64 = 10_737_418_240; // 10 GiB default
+        assert!(enforce_max_total_size(max as i64, max).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_max_total_size_one_over_rejected() {
+        let max: u64 = 10_737_418_240;
+        let err = enforce_max_total_size(max as i64 + 1, max).unwrap_err();
+        match err {
+            UploadError::TooLarge { size, max: m } => {
+                assert_eq!(size, max as i64 + 1);
+                assert_eq!(m, max);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_enforce_max_total_size_zero_disables_cap() {
+        // max == 0 disables the cap, mirroring the direct-upload path.
+        assert!(enforce_max_total_size(i64::MAX, 0).is_ok());
+        assert!(enforce_max_total_size(9_999_999_999_999, 0).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_max_total_size_bounds_chunk_count() {
+        // With the cap enforced, the eager per-chunk row count is bounded:
+        // at the 10 GiB default and the 8 MiB default chunk size the loop can
+        // create at most 1280 rows, versus ~1.19M for the unbounded exploit.
+        let max: u64 = 10_737_418_240;
+        let chunk_size: i64 = DEFAULT_CHUNK_SIZE as i64;
+        let max_chunks = (max as i64 + chunk_size - 1) / chunk_size;
+        assert_eq!(max_chunks, 1280);
+        // The exploit value is rejected before the loop ever runs.
+        assert!(enforce_max_total_size(9_999_999_999_999, max).is_err());
     }
 
     // -----------------------------------------------------------------------

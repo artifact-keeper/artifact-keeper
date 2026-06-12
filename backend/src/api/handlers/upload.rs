@@ -369,6 +369,27 @@ async fn create_session(
         cleanup_stale_replication_upload_sessions(&state.db, repo.0, &req.artifact_path).await;
     }
 
+    // Repository storage-quota gate (parity with the direct artifact-write
+    // path, `ArtifactService::store` -> `RepositoryService::check_quota`). The
+    // chunked upload-session API is another direct-write entry point: without
+    // this check an attacker-chosen `total_size` would both bypass the quota
+    // and drive one DB row per chunk. Skipped for peer replication so artifacts
+    // that legitimately predate a quota change can still replicate; the
+    // `max_upload_size` cap inside `create_session` still applies in that case.
+    if !is_replication {
+        let within_quota = state
+            .create_repository_service()
+            .check_quota(repo_id, req.total_size)
+            .await
+            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !within_quota {
+            return Err(map_err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Repository storage quota exceeded",
+            ));
+        }
+    }
+
     let session = UploadService::create_session(upload_service::CreateSessionParams {
         db: &state.db,
         storage_path: &state.config.storage_path,
@@ -385,6 +406,7 @@ async fn create_session(
         package_metadata: replication_metadata.package_metadata,
         is_replication,
         total_size: req.total_size,
+        max_upload_size: state.config.max_upload_size_bytes,
         chunk_size: req.chunk_size,
         checksum_sha256: &req.checksum_sha256,
         content_type: req.content_type.as_deref(),
@@ -769,6 +791,7 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::Expired => (StatusCode::GONE, e.to_string()),
         UploadError::InvalidChunk(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::InvalidChunkSize => (StatusCode::BAD_REQUEST, e.to_string()),
+        UploadError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         UploadError::InvalidStatus(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::ChecksumMismatch { .. } => (StatusCode::CONFLICT, e.to_string()),
         UploadError::IncompleteChunks { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -1767,6 +1790,15 @@ mod tests {
     fn test_map_upload_err_repository_not_found() {
         let resp = map_upload_err(UploadError::RepositoryNotFound("gone-repo".into()));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_upload_err_too_large() {
+        let resp = map_upload_err(UploadError::TooLarge {
+            size: 9_999_999_999_999,
+            max: 10_737_418_240,
+        });
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
