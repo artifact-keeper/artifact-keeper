@@ -1095,18 +1095,27 @@ async fn serve_file(
                     // Try the proxy cache first using a predictable local
                     // path. This avoids fetching the simple index from upstream
                     // just to rediscover the download URL when the file is
-                    // already cached from a previous request.
+                    // already cached from a previous request. Streamed straight
+                    // from storage (#895): buffering cached multi-hundred-MiB
+                    // wheels per request OOM-killed memory-constrained pods.
                     let normalized = PypiHandler::normalize_name(project);
                     let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                    if let Some((content, _ct)) =
-                        proxy_helpers::proxy_check_cache(proxy, repo_key, &local_cache_path).await
+                    if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &local_cache_path,
+                    )
+                    .await
                     {
-                        return Ok(build_file_response(filename, content));
+                        return Ok(build_streaming_file_response(filename, result));
                     }
 
-                    // Cache miss: use PyPI-specific fetch logic.
-                    let content = fetch_from_pypi_remote(
+                    // Cache miss: use PyPI-specific fetch logic, streaming the
+                    // package file from upstream while teeing it into the cache.
+                    let result = fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
                         repo_key,
@@ -1116,7 +1125,7 @@ async fn serve_file(
                     )
                     .await?;
 
-                    return Ok(build_file_response(filename, content));
+                    return Ok(build_streaming_file_response(filename, result));
                 }
             }
             // Virtual repo: try each member in priority order.
@@ -1213,17 +1222,19 @@ async fn serve_file(
                             let normalized = PypiHandler::normalize_name(project);
                             let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                            if let Some((content, _ct)) = proxy_helpers::proxy_check_cache(
+                            if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                                 proxy,
+                                member.id,
                                 &member.key,
+                                upstream_url,
                                 &local_cache_path,
                             )
                             .await
                             {
-                                return Ok(build_file_response(filename, content));
+                                return Ok(build_streaming_file_response(filename, result));
                             }
 
-                            match fetch_from_pypi_remote(
+                            match fetch_from_pypi_remote_streaming(
                                 proxy,
                                 member.id,
                                 &member.key,
@@ -1233,8 +1244,8 @@ async fn serve_file(
                             )
                             .await
                             {
-                                Ok(content) => {
-                                    return Ok(build_file_response(filename, content));
+                                Ok(result) => {
+                                    return Ok(build_streaming_file_response(filename, result));
                                 }
                                 Err(e) => {
                                     debug!(
@@ -1304,8 +1315,9 @@ async fn serve_file(
     };
 
     // Record download statistics for locally-stored artifacts only.
-    // Proxied and virtual-repo fetches go through build_file_response()
-    // which intentionally skips stats since the artifact is not ours.
+    // Proxied and virtual-repo fetches go through
+    // build_streaming_file_response() which intentionally skips stats since
+    // the artifact is not ours.
     let _ = sqlx::query!(
         "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
         artifact.id
@@ -1370,20 +1382,38 @@ where
     }
 }
 
-/// Fetch a file from a remote PyPI upstream using the format-specific URL
-/// resolution logic. External PyPI registries (e.g. pypi.org) host files on a
+/// Resolved upstream download target for a PyPI remote file, produced by
+/// [`resolve_pypi_remote_fetch_target`] and consumed by both the buffered
+/// and the streaming fetch variants.
+struct PypiRemoteFetchTarget {
+    /// Upstream base URL for the file download (may be a different host
+    /// than the simple index, e.g. files.pythonhosted.org).
+    fetch_base: String,
+    /// Path relative to `fetch_base`.
+    fetch_path: String,
+    /// Stable proxy-cache key (`simple/{project}/{filename}`), independent
+    /// of the actual upstream URL layout.
+    cache_path: String,
+}
+
+/// Resolve the real download URL for a file hosted by a remote PyPI
+/// upstream. External PyPI registries (e.g. pypi.org) host files on a
 /// different domain (files.pythonhosted.org), so we cannot just append the
 /// filename to the upstream URL. Instead, we fetch the simple index page,
-/// parse it to discover the real download URL for the file, and then download
-/// from that URL.
-async fn fetch_from_pypi_remote(
+/// parse it to discover the real download URL for the file, and validate it
+/// against SSRF before returning.
+///
+/// The index fetch stays buffered by design: simple-index pages are small
+/// HTML documents that must be parsed in-process. Only the package file
+/// itself (potentially hundreds of MiB) needs the streaming path.
+async fn resolve_pypi_remote_fetch_target(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
     project: &str,
     filename: &str,
-) -> Result<Bytes, Response> {
+) -> Result<PypiRemoteFetchTarget, Response> {
     let normalized = PypiHandler::normalize_name(project);
 
     // Strip a trailing `/simple` from the configured upstream URL so we do
@@ -1441,43 +1471,116 @@ async fn fetch_from_pypi_remote(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let local_cache_path = format!("simple/{}/{}", normalized, filename);
+    let cache_path = format!("simple/{}/{}", normalized, filename);
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
         None => fallback(),
     };
 
+    Ok(PypiRemoteFetchTarget {
+        fetch_base,
+        fetch_path,
+        cache_path,
+    })
+}
+
+/// Fetch a file from a remote PyPI upstream using the format-specific URL
+/// resolution logic, buffering the whole body in memory.
+///
+/// **Prefer [`fetch_from_pypi_remote_streaming`] on download paths.** This
+/// buffered variant exists only for callers that genuinely need the full
+/// `Bytes` in-process — currently the cache-recovery closure in
+/// [`get_remote_cached_or_refetch_stream`], which must write the refetched
+/// payload back to storage.
+async fn fetch_from_pypi_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Bytes, Response> {
+    let target =
+        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
+            .await?;
+
     let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
         proxy,
         repo_id,
         repo_key,
-        &fetch_base,
-        &fetch_path,
-        &local_cache_path,
+        &target.fetch_base,
+        &target.fetch_path,
+        &target.cache_path,
     )
     .await?;
 
     Ok(content)
 }
 
-/// Build the HTTP response for serving a PyPI file download.
+/// Streaming sibling of [`fetch_from_pypi_remote`] (#895 OOM relief).
 ///
-/// Used for proxied and virtual-repo fetches. Download statistics are not
-/// recorded here because the artifact is not stored locally; stats are only
-/// tracked for artifacts served from our own storage (see `serve_file`).
-fn build_file_response(filename: &str, content: Bytes) -> Response {
+/// Resolves the real download URL via the simple index exactly like the
+/// buffered variant, then streams the package file from upstream — teed
+/// into the proxy cache — instead of buffering it in memory. Large wheels
+/// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
+/// memory-constrained pods when several `pip install` runs downloaded
+/// concurrently through the buffered path.
+async fn fetch_from_pypi_remote_streaming(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    let target =
+        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
+            .await?;
+
+    proxy_helpers::proxy_fetch_streaming_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        &target.fetch_path,
+        &target.cache_path,
+    )
+    .await
+}
+
+/// Build the HTTP response for serving a PyPI file download from a
+/// [`StreamingFetchResult`] (proxied and virtual-repo fetches, #895).
+///
+/// Sets the format-specific `Content-Type` and an attachment
+/// `Content-Disposition`; the body is driven from the stream without
+/// buffering. `Content-Length` is set only when the result advertises one;
+/// otherwise the response uses chunked transfer encoding. Download
+/// statistics are not recorded here because the artifact is not stored
+/// locally; stats are only tracked for artifacts served from our own
+/// storage (see `serve_file`).
+fn build_streaming_file_response(
+    filename: &str,
+    result: crate::services::proxy_service::StreamingFetchResult,
+) -> Response {
     let content_type = pypi_content_type(filename);
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
+        );
+    if let Some(len) = result.content_length {
+        builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    builder
+        .body(Body::from_stream(
+            result
+                .body
+                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+        ))
         .unwrap()
 }
 
@@ -2969,22 +3072,43 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_file_response
+    // build_streaming_file_response
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_build_file_response_wheel_content_type() {
-        let content = Bytes::from_static(b"fake wheel data");
-        let resp =
-            build_file_response("numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl", content);
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "application/zip");
+    /// Wrap static bytes in a one-shot [`StreamingFetchResult`] for header
+    /// tests, with `content_length` advertised only when `len` is `Some`.
+    fn streaming_result_with(
+        content: &'static [u8],
+        len: Option<u64>,
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
+            content_type: None,
+            content_length: len,
+        }
     }
 
     #[test]
-    fn test_build_file_response_sdist_content_type() {
-        let content = Bytes::from_static(b"fake sdist data");
-        let resp = build_file_response("six-1.16.0.tar.gz", content);
+    fn test_build_streaming_file_response_wheel_content_type() {
+        let resp = build_streaming_file_response(
+            "numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl",
+            streaming_result_with(b"fake wheel data", Some(15)),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "application/zip");
+        assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "15");
+        assert_eq!(
+            resp.headers().get("Content-Disposition").unwrap(),
+            "attachment; filename=\"numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl\""
+        );
+    }
+
+    #[test]
+    fn test_build_streaming_file_response_sdist_content_type() {
+        let resp = build_streaming_file_response(
+            "six-1.16.0.tar.gz",
+            streaming_result_with(b"fake sdist data", Some(15)),
+        );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(CONTENT_TYPE).unwrap(),
@@ -2993,16 +3117,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_file_response_zip_extension() {
-        let content = Bytes::from_static(b"some data");
-        let resp = build_file_response("package-1.0.zip", content);
+    fn test_build_streaming_file_response_zip_extension() {
+        let resp = build_streaming_file_response(
+            "package-1.0.zip",
+            streaming_result_with(b"some data", Some(9)),
+        );
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "application/zip");
     }
 
     #[test]
-    fn test_build_file_response_unknown_extension() {
-        let content = Bytes::from_static(b"some data");
-        let resp = build_file_response("package-1.0.egg", content);
+    fn test_build_streaming_file_response_unknown_extension() {
+        let resp = build_streaming_file_response(
+            "package-1.0.egg",
+            streaming_result_with(b"some data", Some(9)),
+        );
         assert_eq!(
             resp.headers().get(CONTENT_TYPE).unwrap(),
             "application/octet-stream"
@@ -3010,9 +3138,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_file_response_content_disposition() {
-        let content = Bytes::from_static(b"data");
-        let resp = build_file_response("requests-2.31.0.tar.gz", content);
+    fn test_build_streaming_file_response_unknown_length_omits_content_length() {
+        // No advertised length -> no Content-Length header; axum falls back
+        // to chunked transfer encoding for the streamed body.
+        let resp = build_streaming_file_response(
+            "package-1.0.whl",
+            streaming_result_with(b"some data", None),
+        );
+        assert!(resp.headers().get(CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn test_build_streaming_file_response_content_disposition() {
+        let resp = build_streaming_file_response(
+            "requests-2.31.0.tar.gz",
+            streaming_result_with(b"data", Some(4)),
+        );
         assert_eq!(
             resp.headers().get("Content-Disposition").unwrap(),
             "attachment; filename=\"requests-2.31.0.tar.gz\""
@@ -3020,10 +3161,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_file_response_content_length() {
+    fn test_build_streaming_file_response_content_length() {
         let data = b"hello world data here";
-        let content = Bytes::from_static(data);
-        let resp = build_file_response("pkg-1.0.tar.gz", content);
+        let resp = build_streaming_file_response(
+            "pkg-1.0.tar.gz",
+            streaming_result_with(data, Some(data.len() as u64)),
+        );
         assert_eq!(
             resp.headers().get(CONTENT_LENGTH).unwrap(),
             &data.len().to_string()
@@ -4867,5 +5010,188 @@ mod tests {
         );
 
         do_cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_pypi_remote_fetch_target / fetch_from_pypi_remote_streaming
+    // -----------------------------------------------------------------------
+    //
+    // DB-free helpers (MissingSvcStorage / build_proxy_service_no_db) are used
+    // for tests that only probe the cache layer (e.g. cache-miss probes).
+    // Tests that exercise the upstream fetch path require a real PgPool so that
+    // load_upstream_auth succeeds; they use tdh::try_pool() and skip when
+    // DATABASE_URL is unset.
+
+    /// Storage backend that implements `storage_service::StorageBackend` (the
+    /// richer trait used by `StorageService` / `ProxyService`). Reports every
+    /// `get` as a miss (NotFound) so tests hit the upstream fetch path.
+    struct MissingSvcStorage;
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for MissingSvcStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn build_proxy_service_no_db() -> crate::services::proxy_service::ProxyService {
+        use crate::services::storage_service::StorageService;
+        let storage = std::sync::Arc::new(MissingSvcStorage);
+        let storage_svc = std::sync::Arc::new(StorageService::new(storage));
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+    }
+
+    /// End-to-end test for the streaming download path via the fallback route.
+    ///
+    /// The simple index page has no matching href, so `resolve_pypi_remote_fetch_target`
+    /// falls through to the stable `simple/{project}/{filename}` fallback path.
+    /// This avoids the SSRF check (which hard-blocks loopback) while still
+    /// exercising `fetch_from_pypi_remote_streaming` and `proxy_fetch_streaming_with_cache_key`.
+    ///
+    /// Skipped when `DATABASE_URL` is unset (CI always sets it).
+    #[tokio::test]
+    async fn test_fetch_from_pypi_remote_streaming_fallback_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let wheel_body = b"fake-wheel-bytes";
+
+        // Empty simple-index page → find_upstream_url_for_file returns None →
+        // resolve_pypi_remote_fetch_target falls back to simple/{project}/{filename}.
+        Mock::given(method("GET"))
+            .and(path("/simple/numpy/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<!DOCTYPE html><html><body></body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        // The fallback fetch path is simple/{normalized}/{filename}.
+        Mock::given(method("GET"))
+            .and(path("/simple/numpy/numpy-2.0.0-py3-none-any.whl"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/zip")
+                    .set_body_bytes(wheel_body.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("pypi-stream-e2e-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_from_pypi_remote_streaming(
+            &proxy,
+            repo_id,
+            "pypi-remote",
+            &server.uri(),
+            "numpy",
+            "numpy-2.0.0-py3-none-any.whl",
+        )
+        .await
+        .expect("streaming fetch via fallback path must succeed");
+
+        let mut body_bytes = Vec::new();
+        let mut body = result.body;
+        while let Some(chunk) = body.next().await {
+            body_bytes.extend_from_slice(&chunk.expect("stream chunk must be Ok"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(body_bytes, wheel_body);
+    }
+
+    #[tokio::test]
+    async fn test_build_streaming_file_response_headers() {
+        use futures::stream;
+
+        let wheel_data = Bytes::from_static(b"wheel-content");
+        let data_len = wheel_data.len() as u64;
+        let stream = stream::once(async move { Ok::<Bytes, crate::error::AppError>(wheel_data) });
+        let result = crate::services::proxy_service::StreamingFetchResult {
+            body: Box::pin(stream),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(data_len),
+        };
+
+        let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/zip"),
+            "content-type must be application/zip, got: {ct}"
+        );
+        let cd = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cd.contains("numpy-1.0-py3-none-any.whl"),
+            "content-disposition must contain filename, got: {cd}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(data_len.to_string().as_str()),
+            "content-length must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_check_cache_streaming_returns_none_on_miss() {
+        // Empty MissingStorage → streaming probe returns None without errors.
+        let proxy = build_proxy_service_no_db();
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = super::proxy_helpers::proxy_check_cache_streaming(
+            &proxy,
+            repo_id,
+            "pypi-remote",
+            "https://pypi.org/simple",
+            "simple/numpy/numpy-2.0.0-py3-none-any.whl",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "cache miss must yield None, not Some(result)"
+        );
     }
 }

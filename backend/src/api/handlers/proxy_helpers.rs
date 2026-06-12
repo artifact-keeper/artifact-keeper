@@ -937,6 +937,64 @@ pub async fn proxy_fetch_with_cache_key(
     .await
 }
 
+/// Streaming sibling of [`proxy_fetch_with_cache_key`] (#895 OOM relief for
+/// format handlers whose upstream download URL differs from the canonical
+/// artifact path). Fetches `fetch_path` from the upstream but keys the proxy
+/// cache on `cache_path`, returning the body as a [`StreamingFetchResult`]
+/// that the caller tees to the client without buffering.
+pub async fn proxy_fetch_streaming_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+                .await
+        },
+    )
+    .await
+}
+
+/// Streaming sibling of [`proxy_check_cache`]: probe the proxy cache for
+/// `cache_path` and stream a hit straight from storage instead of buffering
+/// the cached body in memory. Returns `None` on miss or on any probe error
+/// (including a negative-cache hit) — best-effort semantics matching the
+/// buffered probe, so callers fall through to the full fetch, which
+/// re-applies the negative-cache gate itself.
+pub async fn proxy_check_cache_streaming(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    cache_path: &str,
+) -> Option<crate::services::proxy_service::StreamingFetchResult> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    match proxy_service
+        .streaming_cached_artifact_by_path(&repo, cache_path)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::debug!(
+                "Streaming cache probe failed for {}/{}, treating as miss: {}",
+                repo_key,
+                cache_path,
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Fetch from upstream directly, bypassing the proxy cache.
 ///
 /// Use this instead of [`proxy_fetch`] when the caller needs the raw upstream
