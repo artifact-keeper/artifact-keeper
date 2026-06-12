@@ -21,9 +21,11 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::repositories::require_repo_write_access;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::services::package_service::PackageService;
+use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
 // ---------------------------------------------------------------------------
@@ -210,6 +212,28 @@ async fn create_session(
     })?;
     let repo_id = repo.0;
     let repo_promotion_only = repo.1;
+
+    // Tenant write gate (xtenant-write-authz-systemic).
+    //
+    // The /uploads router runs under auth_middleware only (no
+    // repo_visibility_middleware), and the target repo is named in the JSON body,
+    // so the tenant-membership gate that protects the URL-addressed artifact PUT
+    // never sees this request. The fine-grained RBAC checks below fall OPEN when
+    // a repo has no permission rules (`has_rules == false`), so derive the tenant
+    // boundary from `is_public` + role_assignments membership
+    // (`require_repo_write_access`): a non-member, non-admin can never open a
+    // session against another tenant's private repo regardless of whether any
+    // permission rule exists. Admins, public-repo writers, same-org members and
+    // write/admin-holding peer-replication identities all pass unchanged. Mirrors
+    // `repositories::upload_artifact`.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo_record = repo_service
+        .get_by_key(&req.repository_key)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    require_repo_write_access(&auth, &repo_record, &repo_service)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     // Promotion-only gate (#817 parity with the direct upload path).
     //
@@ -950,6 +974,27 @@ fn replication_session_metadata_from_request<'a>(
 #[allow(clippy::io_other_error, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
+
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). `session_write_authorized`
+    /// (and `upload_write_decision`) fall OPEN when the target repo has no
+    /// fine-grained permission rules (`!has_rules`), so `create_session` must
+    /// ALSO enforce the rule-independent tenant gate `require_repo_write_access`
+    /// (is_public + role_assignments membership). String-grep because the handler
+    /// needs a real DB to run.
+    #[test]
+    fn test_create_session_enforces_tenant_gate() {
+        let source = include_str!("upload.rs");
+        let start = source
+            .find("async fn create_session(")
+            .expect("create_session not found");
+        let rest = &source[start..];
+        let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+        assert!(
+            rest[..end].contains("require_repo_write_access("),
+            "create_session must call require_repo_write_access independent of \
+             fine-grained rule existence (xtenant)"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // session_write_authorized (pure write-authorization decision)

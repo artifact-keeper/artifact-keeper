@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -97,6 +98,21 @@ fn labels_list_response(labels: Vec<RepositoryLabel>) -> LabelsListResponse {
     LabelsListResponse { items, total }
 }
 
+/// Re-evaluate sync policies after a label mutation. A failure here is logged at
+/// `warn!` and swallowed so a sync-policy hiccup never turns a successful label
+/// write into a 5xx. Factored out of the three mutating handlers (they shared an
+/// identical block).
+async fn reevaluate_sync_policies(db: &sqlx::PgPool, repo_id: Uuid) {
+    let sync_svc = SyncPolicyService::new(db.clone());
+    if let Err(e) = sync_svc.evaluate_for_repository(repo_id).await {
+        tracing::warn!(
+            "Sync policy re-evaluation failed for repo {}: {}",
+            repo_id,
+            e
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -122,10 +138,14 @@ async fn list_labels(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<LabelsListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    // The /repositories nest is not gated by repo_visibility_middleware, so the
+    // read must enforce the canonical visibility gate (is_public + per-repo
+    // role-assignment membership) itself to avoid leaking a private repo's labels.
+    require_visible(&repo, &Some(auth), &repo_service).await?;
 
     let label_service = RepositoryLabelService::new(state.db.clone());
     let labels = label_service.get_labels(repo.id).await?;
@@ -156,10 +176,13 @@ async fn set_labels(
     Path(key): Path<String>,
     Json(payload): Json<SetLabelsRequest>,
 ) -> Result<Json<LabelsListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
+    // so enforce is_public + role-assignment membership here (see #xtenant).
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     let entries: Vec<LabelEntry> = payload
         .labels
@@ -173,15 +196,7 @@ async fn set_labels(
     let label_service = RepositoryLabelService::new(state.db.clone());
     let labels = label_service.set_labels(repo.id, &entries).await?;
 
-    // Re-evaluate sync policies after label change
-    let sync_svc = SyncPolicyService::new(state.db.clone());
-    if let Err(e) = sync_svc.evaluate_for_repository(repo.id).await {
-        tracing::warn!(
-            "Sync policy re-evaluation failed for repo {}: {}",
-            repo.id,
-            e
-        );
-    }
+    reevaluate_sync_policies(&state.db, repo.id).await;
 
     Ok(Json(labels_list_response(labels)))
 }
@@ -210,25 +225,20 @@ async fn add_label(
     Path((key, label_key)): Path<(String, String)>,
     Json(payload): Json<AddLabelRequest>,
 ) -> Result<Json<LabelResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
+    // so enforce is_public + role-assignment membership here (see #xtenant).
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     let label_service = RepositoryLabelService::new(state.db.clone());
     let label = label_service
         .add_label(repo.id, &label_key, &payload.value)
         .await?;
 
-    // Re-evaluate sync policies after label change
-    let sync_svc = SyncPolicyService::new(state.db.clone());
-    if let Err(e) = sync_svc.evaluate_for_repository(repo.id).await {
-        tracing::warn!(
-            "Sync policy re-evaluation failed for repo {}: {}",
-            repo.id,
-            e
-        );
-    }
+    reevaluate_sync_policies(&state.db, repo.id).await;
 
     Ok(Json(label_to_response(label)))
 }
@@ -255,23 +265,18 @@ async fn delete_label(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, label_key)): Path<(String, String)>,
 ) -> Result<axum::http::StatusCode> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
+    // so enforce is_public + role-assignment membership here (see #xtenant).
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     let label_service = RepositoryLabelService::new(state.db.clone());
     label_service.remove_label(repo.id, &label_key).await?;
 
-    // Re-evaluate sync policies after label change
-    let sync_svc = SyncPolicyService::new(state.db.clone());
-    if let Err(e) = sync_svc.evaluate_for_repository(repo.id).await {
-        tracing::warn!(
-            "Sync policy re-evaluation failed for repo {}: {}",
-            repo.id,
-            e
-        );
-    }
+    reevaluate_sync_policies(&state.db, repo.id).await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -279,6 +284,37 @@ async fn delete_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). The labels
+    /// surface lives under the /repositories nest, which is NOT covered by
+    /// repo_visibility_middleware, so each handler must enforce the tenant gate
+    /// itself. Assert the mutating handlers call `require_repo_write_access` and
+    /// the read handler calls `require_visible`. String-grep because the handlers
+    /// need a full DB-backed `SharedState` to run.
+    #[test]
+    fn test_label_handlers_enforce_tenant_gate() {
+        let source = include_str!("repository_labels.rs");
+        for handler in ["set_labels", "add_label", "delete_label"] {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("require_repo_write_access("),
+                "handler `{}` must call require_repo_write_access (xtenant)",
+                handler
+            );
+        }
+        let start = source.find("async fn list_labels(").expect("list_labels");
+        let rest = &source[start..];
+        let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+        assert!(
+            rest[..end].contains("require_visible("),
+            "list_labels must call require_visible (xtenant)"
+        );
+    }
 
     #[test]
     fn test_set_labels_request_deserialization() {

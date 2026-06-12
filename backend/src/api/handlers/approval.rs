@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::api::dto::Pagination;
 use crate::api::handlers::promotion::validate_promotion_repos;
+use crate::api::handlers::repositories::require_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -208,6 +209,15 @@ pub async fn request_approval(
     let source_repo = repo_service.get_by_key(&req.source_repository).await?;
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
+
+    // Close the cross-tenant existence oracle. The /approval surface resolves the
+    // source repository by key with NO caller visibility filter and then probes
+    // it for the artifact below; without this gate a non-member could use that
+    // probe as an existence oracle against another tenant's private repo and
+    // write a promotion_approvals row referencing it. require_visible derives the
+    // gate from is_public + per-repo role-assignment membership (NotFound on a
+    // private repo the caller cannot see), so the denial happens BEFORE the probe.
+    require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
 
     // Verify the artifact exists in the source repo
     let artifact_exists: Option<(Uuid,)> = sqlx::query_as(
@@ -873,6 +883,32 @@ pub struct ApprovalApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-tenant oracle guard (xtenant-write-authz-systemic). `request_approval`
+    /// resolves the source repository by key and probes it for the artifact; it
+    /// must call `require_visible` on the source repo BEFORE that probe so a
+    /// non-member cannot use the probe as an existence oracle against another
+    /// tenant's private repo. String-grep because the handler needs a real DB.
+    #[test]
+    fn test_request_approval_gates_source_repo_before_probe() {
+        let source = include_str!("approval.rs");
+        let start = source
+            .find("pub async fn request_approval(")
+            .expect("request_approval not found");
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        let gate = body
+            .find("require_visible(")
+            .expect("request_approval must call require_visible on the source repo (xtenant)");
+        let probe = body
+            .find("SELECT id FROM artifacts WHERE id = $1")
+            .expect("artifact existence probe not found");
+        assert!(
+            gate < probe,
+            "require_visible must run BEFORE the artifact existence probe (xtenant oracle)"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)

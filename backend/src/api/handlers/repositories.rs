@@ -93,7 +93,14 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
 /// repositories, per-repo authorization: admins bypass; every other caller must
 /// hold a role assignment scoped to the repo (direct or global). Public repos
 /// keep their existing behavior (token-scope only).
-async fn require_repo_write_access(
+///
+/// Exposed as `pub(crate)` so the repository sub-resource handlers that live in
+/// sibling modules (labels, security, email subscriptions) and the chunked
+/// upload-session create path can route through the SAME tenant write gate
+/// rather than re-deriving (or forgetting) it. The `/api/v1/repositories` nest
+/// runs under `optional_auth_middleware` only, NOT `repo_visibility_middleware`,
+/// so each sub-handler must enforce this itself.
+pub(crate) async fn require_repo_write_access(
     auth: &AuthExtension,
     repo: &crate::models::repository::Repository,
     repo_service: &RepositoryService,
@@ -123,7 +130,10 @@ async fn require_repo_write_access(
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
 /// leaking the existence of repositories the caller may not see.
-async fn require_visible(
+///
+/// Exposed as `pub(crate)` so leaky-read sub-resource handlers in sibling
+/// modules (labels list, security read) can reuse the canonical visibility gate.
+pub(crate) async fn require_visible(
     repo: &crate::models::repository::Repository,
     auth: &Option<AuthExtension>,
     repo_service: &RepositoryService,
@@ -718,7 +728,7 @@ pub async fn set_cache_ttl(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
@@ -852,7 +862,7 @@ pub async fn invalidate_cache(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -994,7 +1004,7 @@ pub async fn put_pypi_track(
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
     require_pypi_tracks_repo(&repo)?;
 
     let tracks_url = payload.tracks_url.trim().to_string();
@@ -1056,7 +1066,7 @@ pub async fn delete_pypi_track(
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
     sqlx::query(
@@ -4752,6 +4762,8 @@ pub async fn set_upstream_auth(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
 
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
@@ -4805,6 +4817,8 @@ pub async fn test_upstream(
     let auth = require_auth(auth)?;
     auth.require_scope("read")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
@@ -4947,7 +4961,7 @@ pub async fn set_routing_rules(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     let value = serde_json::to_string(&payload.rules)
         .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
@@ -4998,7 +5012,7 @@ pub async fn delete_routing_rules(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
+    require_repo_write_access(&auth, &repo, &service).await?;
 
     sqlx::query(
         r#"
@@ -8018,6 +8032,53 @@ mod tests {
             "list_virtual_members must filter the response by \
              can_access_repo(member_repo_id) (issue #913)"
         );
+    }
+
+    /// Cross-tenant write authz (xtenant-write-authz-systemic):
+    ///
+    /// The `/api/v1/repositories` REST nest runs under `optional_auth_middleware`
+    /// only, NOT `repo_visibility_middleware`, so each sub-resource mutation
+    /// handler must enforce the tenant write gate itself. Assert every such
+    /// handler references `require_repo_write_access` (the canonical
+    /// `is_public + role_assignments` gate) so a future handler cannot silently
+    /// fall open to a non-member, non-admin caller on a private repo. String-grep
+    /// because the handlers need a full `SharedState` to run.
+    #[test]
+    fn test_repo_mutation_handlers_call_write_gate() {
+        let source = include_str!("repositories.rs");
+
+        for handler in [
+            "set_cache_ttl",
+            "invalidate_cache",
+            "put_pypi_track",
+            "delete_pypi_track",
+            "set_routing_rules",
+            "delete_routing_rules",
+            "set_upstream_auth",
+            "upload_artifact",
+            "delete_artifact",
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found in repositories.rs", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("require_repo_write_access("),
+                "handler `{}` does not call `require_repo_write_access` \
+                 (xtenant-write-authz-systemic). The /repositories nest is not \
+                 covered by repo_visibility_middleware, so each mutation handler \
+                 must enforce the tenant write gate itself. If you intentionally \
+                 restructured the authz model, update this test to match.",
+                handler
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

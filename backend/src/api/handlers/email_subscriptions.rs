@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::require_repo_write_access;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -186,6 +187,34 @@ fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     Ok(auth)
 }
 
+/// Resolve a repository by key and fully authorize the caller for an
+/// email-subscription operation on it. Combines the three gates the handlers
+/// share: write scope (`require_repo_write`), token repo-scope with
+/// existence-hiding 404 (`can_access_repo`), and the canonical tenant gate
+/// (`require_repo_write_access` = is_public + per-repo role-assignment
+/// membership). Returns the authorized principal and the resolved repository id.
+///
+/// The /repositories nest runs under `optional_auth_middleware` only, NOT
+/// `repo_visibility_middleware`, so this enforcement lives in-handler; factoring
+/// it here keeps the three handlers from re-deriving (or forgetting) the gate.
+async fn authorize_subscription_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+) -> Result<(AuthExtension, Uuid)> {
+    let auth = require_repo_write(auth)?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(key).await?;
+    if !auth.can_access_repo(repo.id) {
+        return Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            key
+        )));
+    }
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    Ok((auth, repo.id))
+}
+
 /// Validate the supplied event-type tokens against [`VALID_EVENT_TYPES`].
 /// Returns `Err(Validation)` listing unknown tokens; doing this at write
 /// time prevents typos from silently dropping notifications at delivery.
@@ -284,16 +313,7 @@ pub async fn list_subscriptions(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<EmailSubscriptionListResponse>> {
-    let auth = require_repo_write(auth)?;
-    let repo = RepositoryService::new(state.db.clone())
-        .get_by_key(&key)
-        .await?;
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (_auth, repo_id) = authorize_subscription_repo(&state, auth, &key).await?;
 
     let rows: Vec<EmailSubscriptionRow> = sqlx::query_as(
         r#"
@@ -304,7 +324,7 @@ pub async fn list_subscriptions(
         ORDER BY created_at DESC
         "#,
     )
-    .bind(repo.id)
+    .bind(repo_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -336,16 +356,7 @@ pub async fn create_subscription(
     Path(key): Path<String>,
     Json(body): Json<CreateEmailSubscriptionRequest>,
 ) -> Result<Json<EmailSubscriptionResponse>> {
-    let auth = require_repo_write(auth)?;
-    let repo = RepositoryService::new(state.db.clone())
-        .get_by_key(&key)
-        .await?;
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (auth, repo_id) = authorize_subscription_repo(&state, auth, &key).await?;
 
     validate_event_types(&body.event_types)?;
     validate_recipients(&body.recipients)?;
@@ -359,7 +370,7 @@ pub async fn create_subscription(
                   created_at, updated_at
         "#,
     )
-    .bind(repo.id)
+    .bind(repo_id)
     .bind(&body.recipients)
     .bind(&body.event_types)
     .bind(body.enabled)
@@ -375,7 +386,7 @@ pub async fn create_subscription(
         &state,
         AuditAction::EmailSubscriptionCreated,
         auth.user_id,
-        repo.id,
+        repo_id,
         row.id,
         serde_json::json!({
             "recipient_count": row.recipients.len(),
@@ -411,21 +422,12 @@ pub async fn delete_subscription(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, subscription_id)): Path<(String, Uuid)>,
 ) -> Result<axum::http::StatusCode> {
-    let auth = require_repo_write(auth)?;
-    let repo = RepositoryService::new(state.db.clone())
-        .get_by_key(&key)
-        .await?;
-    if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
-    }
+    let (auth, repo_id) = authorize_subscription_repo(&state, auth, &key).await?;
 
     let result =
         sqlx::query("DELETE FROM email_subscriptions WHERE id = $1 AND repository_id = $2")
             .bind(subscription_id)
-            .bind(repo.id)
+            .bind(repo_id)
             .execute(&state.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -443,7 +445,7 @@ pub async fn delete_subscription(
         &state,
         AuditAction::EmailSubscriptionDeleted,
         auth.user_id,
-        repo.id,
+        repo_id,
         subscription_id,
         serde_json::json!({}),
     )
@@ -467,6 +469,44 @@ pub struct EmailSubscriptionsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). The
+    /// email-subscription endpoints live under the /repositories nest (not gated
+    /// by repo_visibility_middleware) and previously enforced only token-scope
+    /// (`can_access_repo`), which falls open across tenants. Assert each handler
+    /// also calls the tenant gate `require_repo_write_access` (is_public +
+    /// role_assignments membership). String-grep because the handlers need a DB.
+    #[test]
+    fn test_email_subscription_handlers_enforce_tenant_gate() {
+        let source = include_str!("email_subscriptions.rs");
+        for handler in [
+            "list_subscriptions",
+            "create_subscription",
+            "delete_subscription",
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("authorize_subscription_repo("),
+                "handler `{}` must authorize through authorize_subscription_repo (xtenant)",
+                handler
+            );
+        }
+        // The shared helper is where the tenant gate actually lives.
+        let helper_start = source
+            .find("async fn authorize_subscription_repo(")
+            .expect("authorize_subscription_repo helper not found");
+        let helper = &source[helper_start..];
+        let helper_end = helper.find("\n}\n").map(|i| i + 2).unwrap_or(helper.len());
+        assert!(
+            helper[..helper_end].contains("require_repo_write_access("),
+            "authorize_subscription_repo must call require_repo_write_access (xtenant)"
+        );
+    }
 
     #[test]
     fn test_validate_event_types_accepts_known_tokens() {

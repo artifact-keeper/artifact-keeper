@@ -10,11 +10,13 @@ use sqlx::PgPool;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
 use crate::services::policy_service::PolicyService;
+use crate::services::repository_service::RepositoryService;
 use crate::services::scan_config_service::{ScanConfigService, UpsertScanConfigRequest};
 use crate::services::scan_result_service::ScanResultService;
 
@@ -1018,14 +1020,16 @@ async fn get_repo_security(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepoSecurityResponse>> {
-    let _auth =
+    let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    // Resolve repository by key
-    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    // Resolve repository by key. The /repositories nest is NOT gated by
+    // repo_visibility_middleware, so enforce the canonical visibility gate
+    // (is_public + per-repo role-assignment membership) here to avoid leaking a
+    // private repo's security config/score to a non-member.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &Some(auth), &repo_service).await?;
+    let repo = repo.id;
 
     let config_svc = ScanConfigService::new(state.db.clone());
     let result_svc = ScanResultService::new(state.db.clone());
@@ -1060,13 +1064,14 @@ async fn update_repo_security(
     Path(key): Path<String>,
     Json(body): Json<UpsertScanConfigRequest>,
 ) -> Result<Json<ScanConfigResponse>> {
-    let _auth =
+    let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
+    // so enforce is_public + per-repo role-assignment membership here.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = repo.id;
 
     let svc = ScanConfigService::new(state.db.clone());
     let c = svc.upsert_config(repo, &body).await?;
@@ -1136,13 +1141,15 @@ async fn list_repo_scans(
     Path(key): Path<String>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
-    let _auth =
+    let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    // Resolve repository by key. The /repositories nest bypasses
+    // repo_visibility_middleware, so enforce the canonical visibility gate here
+    // to avoid leaking a private repo's scan list to a non-member.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &Some(auth), &repo_service).await?;
+    let repo = repo.id;
 
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
@@ -1201,6 +1208,37 @@ pub struct SecurityApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). The repo-scoped
+    /// security endpoints live under the /repositories nest (not gated by
+    /// repo_visibility_middleware), so each must enforce the tenant gate itself.
+    /// Assert the write handler calls `require_repo_write_access` and the read
+    /// handlers call `require_visible`. String-grep because the handlers need a
+    /// full DB-backed `SharedState` to run.
+    #[test]
+    fn test_repo_security_handlers_enforce_tenant_gate() {
+        let source = include_str!("security.rs");
+        let body_of = |handler: &str| -> &str {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(
+            body_of("update_repo_security").contains("require_repo_write_access("),
+            "update_repo_security must call require_repo_write_access (xtenant)"
+        );
+        for reader in ["get_repo_security", "list_repo_scans"] {
+            assert!(
+                body_of(reader).contains("require_visible("),
+                "{} must call require_visible (xtenant)",
+                reader
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (testable without DB)
