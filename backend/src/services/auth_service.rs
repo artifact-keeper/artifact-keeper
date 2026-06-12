@@ -732,6 +732,21 @@ impl AuthService {
         }
     }
 
+    /// Decide whether a *rejected* (wrong-password) login attempt should be
+    /// reported to the caller as a lockout rather than a plain invalid
+    /// credential.
+    ///
+    /// `newly_locked` is true when this failed attempt crossed the lockout
+    /// threshold (i.e. `should_lock` returned a timestamp); `already_locked`
+    /// is true when the account's existing `locked_until` was still in the
+    /// future when the attempt arrived. Either condition surfaces the locked
+    /// message, so brute-force feedback is preserved both at the moment the
+    /// threshold is crossed and on every subsequent wrong guess while the lock
+    /// holds. Pure function so it can be unit-tested without a database.
+    pub fn failed_attempt_is_locked(newly_locked: bool, already_locked: bool) -> bool {
+        newly_locked || already_locked
+    }
+
     /// Authenticate user with username and password
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
         // Fetch user from database
@@ -755,13 +770,17 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
 
-        // Check account lockout before verifying credentials
+        // Capture whether the account is currently locked, but do NOT
+        // short-circuit on it here. The lockout must not lock out the
+        // legitimate owner: a caller presenting the CORRECT password always
+        // authenticates and clears the lock (the success branch below resets
+        // failed_login_attempts and locked_until). Only a WRONG password is
+        // rejected, and it still surfaces the lockout message while the lock
+        // holds (see `failed_attempt_is_locked`). This removes the
+        // unauthenticated DoS where 5 wrong guesses for a known username would
+        // bar even the owner's correct password.
         let now = Utc::now();
-        if Self::is_account_locked(user.locked_until, now) {
-            return Err(AppError::Authentication(
-                "Account temporarily locked due to too many failed login attempts".to_string(),
-            ));
-        }
+        let already_locked = Self::is_account_locked(user.locked_until, now);
 
         // Verify password for local auth
         if user.auth_provider != AuthProvider::Local {
@@ -802,7 +821,7 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-            if lock_until.is_some() {
+            if Self::failed_attempt_is_locked(lock_until.is_some(), already_locked) {
                 return Err(AppError::Authentication(
                     "Account temporarily locked due to too many failed login attempts".to_string(),
                 ));
@@ -4061,6 +4080,30 @@ mod tests {
         assert!(result.is_some());
     }
 
+    // Truth table for `failed_attempt_is_locked`: a rejected attempt is reported
+    // as locked when it just crossed the threshold (newly_locked) OR when the
+    // account's existing lock was still holding (already_locked). Only a wrong
+    // password below threshold on an unlocked account reports plain-invalid.
+    #[test]
+    fn test_failed_attempt_is_locked_neither() {
+        assert!(!AuthService::failed_attempt_is_locked(false, false));
+    }
+
+    #[test]
+    fn test_failed_attempt_is_locked_newly_locked_only() {
+        assert!(AuthService::failed_attempt_is_locked(true, false));
+    }
+
+    #[test]
+    fn test_failed_attempt_is_locked_already_locked_only() {
+        assert!(AuthService::failed_attempt_is_locked(false, true));
+    }
+
+    #[test]
+    fn test_failed_attempt_is_locked_both() {
+        assert!(AuthService::failed_attempt_is_locked(true, true));
+    }
+
     // -----------------------------------------------------------------------
     // is_password_expired
     // -----------------------------------------------------------------------
@@ -4496,6 +4539,170 @@ mod tests {
             .await
             .expect("query succeeds even for missing user");
         assert!(!result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Account-lockout DoS fix: a CORRECT password must authenticate even when
+    // the account has been locked by prior wrong guesses (the lock no longer
+    // short-circuits before the password is verified), while a WRONG password
+    // is still rejected, still bumps the counter, and still surfaces the
+    // locked message. DB-backed; skips silently without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    /// Create a local user with a known password, reusing `insert_test_user`
+    /// (which sets sane credential watermarks) and then storing a real bcrypt
+    /// hash so `authenticate` can verify it.
+    async fn insert_test_user_with_password(
+        pool: &sqlx::PgPool,
+        username: &str,
+        password: &str,
+    ) -> Uuid {
+        let id = insert_test_user(pool, username).await;
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash password");
+        sqlx::query!(
+            "UPDATE users SET password_hash = $2 WHERE id = $1",
+            id,
+            hash
+        )
+        .execute(pool)
+        .await
+        .expect("store password hash");
+        id
+    }
+
+    #[tokio::test]
+    async fn test_locked_account_accepts_correct_password_and_clears_lock() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("lockdos_ok_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+
+        // Drive the account into the locked state with threshold wrong guesses.
+        for _ in 0..svc.config.account_lockout_threshold {
+            let err = svc.authenticate(&username, "wrong-password").await;
+            assert!(err.is_err(), "wrong password must be rejected");
+        }
+        // Sanity: the account is now locked in the DB.
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until FROM users WHERE id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load user");
+        assert!(
+            row.locked_until.is_some(),
+            "account should be locked after threshold failures"
+        );
+
+        // EXPLOIT GUARD: the legitimate owner's CORRECT password must now
+        // authenticate (pre-fix this returned the locked error) and clear the
+        // lock counters.
+        let ok = svc.authenticate(&username, password).await;
+        assert!(
+            ok.is_ok(),
+            "correct password must succeed past the lockout, got {ok:?}"
+        );
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until FROM users WHERE id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load user");
+        assert_eq!(row.failed_login_attempts, 0, "lock counter must reset");
+        assert!(row.locked_until.is_none(), "lock must be cleared");
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_locked_account_wrong_password_still_reports_locked() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("lockdos_bad_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+
+        for _ in 0..svc.config.account_lockout_threshold {
+            let _ = svc.authenticate(&username, "wrong-password").await;
+        }
+
+        // Brute-force feedback preserved: a wrong password while locked still
+        // returns the locked message, not "invalid".
+        let err = svc
+            .authenticate(&username, "still-wrong")
+            .await
+            .expect_err("wrong password on a locked account must error");
+        match err {
+            AppError::Authentication(msg) => assert_eq!(
+                msg,
+                "Account temporarily locked due to too many failed login attempts"
+            ),
+            other => panic!("expected locked Authentication error, got {other:?}"),
+        }
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_password_below_threshold_reports_invalid() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("lockdos_inv_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+
+        // A single wrong guess (below threshold) keeps the unchanged
+        // invalid-credential message.
+        let err = svc
+            .authenticate(&username, "wrong-password")
+            .await
+            .expect_err("wrong password must error");
+        match err {
+            AppError::Authentication(msg) => {
+                assert_eq!(msg, "Invalid username or password")
+            }
+            other => panic!("expected invalid Authentication error, got {other:?}"),
+        }
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
