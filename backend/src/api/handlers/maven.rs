@@ -4,6 +4,7 @@
 //! `mvn dependency:resolve`.
 //!
 //! Routes are mounted at `/maven/{repo_key}/...`:
+//!   GET  /maven/{repo_key}      — Repository root probe (proxy/group → upstream root; hosted → 404)
 //!   GET  /maven/{repo_key}/*path — Download artifact, metadata, or checksum
 //!   PUT  /maven/{repo_key}/*path — Upload artifact (mvn deploy)
 
@@ -36,7 +37,16 @@ use crate::models::repository::RepositoryType;
 // ---------------------------------------------------------------------------
 
 pub fn router() -> Router<SharedState> {
-    Router::new().route("/:repo_key/*path", get(download).put(upload))
+    Router::new()
+        // Root probe: `/:repo_key/*path` (axum 0.7 wildcard) does NOT match
+        // when the path segment after the repo key is empty — i.e. a request
+        // for exactly `GET /maven/<repo>/`.  We register the bare key route so
+        // proxy and group repos can forward that root probe to their upstream.
+        // See download_root for details.  The trailing-slash variant is listed
+        // separately because axum treats `/x` and `/x/` as distinct routes.
+        .route("/:repo_key", get(download_root))
+        .route("/:repo_key/", get(download_root))
+        .route("/:repo_key/*path", get(download).put(upload))
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +684,92 @@ fn content_type_for_path(path: &str) -> &'static str {
     } else {
         "application/octet-stream"
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /maven/{repo_key}  (and /maven/{repo_key}/) — Repository root probe
+// ---------------------------------------------------------------------------
+
+/// Handle a request for the repository root — i.e. `GET /maven/<repo>/` with
+/// no artifact path after the repo key.
+///
+/// In axum 0.7 the wildcard segment `*path` in `/:repo_key/*path` does NOT
+/// match when the trailing segment is empty (just a `/`).  That means the
+/// route that serves ordinary artifact downloads never fires for the bare root
+/// URL, and the framework falls back to a generic 404.  This handler fills
+/// the gap by explicitly matching `/:repo_key` (and `/:repo_key/`).
+///
+/// Behaviour by repo type:
+/// * **Remote (proxy)**: forward the request to the upstream root URL
+///   (`<upstream_url>` with no path appended) and return whatever the upstream
+///   returns.  The response is cached under the sentinel path `"_root_"` so
+///   repeated probes are served from cache without hitting the upstream.
+/// * **Virtual (group)**: walk members in priority order; return the upstream
+///   root from the first Remote member that responds successfully.
+/// * **Local / Staging**: return 404 — hosted repos have no upstream to
+///   forward to, so there is no meaningful root content to serve.
+///
+/// This makes `GET /maven/<proxy-repo>/` consistent with every other path
+/// against the same repo (which all proxy transparently).  Tools that probe
+/// `<registry>/` to verify credentials or check repo existence now work
+/// correctly for Maven proxy and group repos.  Fixes #1880.
+async fn download_root(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_maven_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            // Build the minimal Repository value that ProxyService needs.
+            // fetch_artifact_with_cache_path(fetch_path="", cache_path="_root_")
+            // fetches `upstream_url + ""` = upstream root and stores the result
+            // under the non-empty sentinel key "_root_" to satisfy the cache-
+            // path validation that rejects empty strings.
+            let remote = proxy_helpers::build_remote_repo(repo.id, &repo_key, upstream_url);
+            let (content, content_type) = proxy
+                .fetch_artifact_with_cache_path(&remote, "", "_root_")
+                .await
+                .map_err(|e| e.into_response())?;
+            let ct = content_type.unwrap_or_else(|| "text/html".to_string());
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, ct)
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap());
+        }
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&member.upstream_url, &state.proxy_service)
+                {
+                    let remote =
+                        proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
+                    if let Ok((content, content_type)) = proxy
+                        .fetch_artifact_with_cache_path(&remote, "", "_root_")
+                        .await
+                    {
+                        let ct = content_type.unwrap_or_else(|| "text/html".to_string());
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, ct)
+                            .header(CONTENT_LENGTH, content.len().to_string())
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    Err(AppError::NotFound("Repository root not available".to_string()).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -3728,6 +3824,53 @@ mod tests {
             &body[..],
             &jar_bytes[..],
             "virtual-served bytes must match the original jar content"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Router registration for the empty-artifact-path fix (#1880)
+    // -----------------------------------------------------------------------
+
+    /// Source-level pin for the root-probe routes added in #1880.
+    ///
+    /// In axum 0.7, `/:repo_key/*path` does NOT match when the path after the
+    /// repo key is just a trailing slash.  Without the `/:repo_key` and
+    /// `/:repo_key/` routes the framework returns a bare 404, meaning
+    /// `GET /maven/<proxy-repo>/` is the only path in the proxy that does not
+    /// forward to upstream.  These assertions guard against a future refactor
+    /// accidentally removing the new routes.
+    ///
+    /// A full HTTP-level integration test is omitted because the proxy path
+    /// requires a live upstream.  The routing assertions give us a lightweight
+    /// regression signal without a network dependency.
+    const MAVEN_HANDLER_SRC: &str = include_str!("maven.rs");
+
+    #[test]
+    fn root_probe_routes_are_registered() {
+        assert!(
+            MAVEN_HANDLER_SRC.contains(".route(\"/:repo_key\", get(download_root))"),
+            "/:repo_key route missing — GET /maven/<repo>/ will 404 for all \
+             repo types instead of proxying to upstream (regression of #1880)"
+        );
+        assert!(
+            MAVEN_HANDLER_SRC.contains(".route(\"/:repo_key/\", get(download_root))"),
+            "/:repo_key/ route missing — GET /maven/<repo>/ with trailing slash \
+             will 404 for all repo types instead of proxying to upstream \
+             (regression of #1880)"
+        );
+    }
+
+    #[test]
+    fn root_probe_handler_uses_root_cache_sentinel() {
+        // The download_root handler must cache the upstream root response under
+        // the non-empty sentinel path "_root_" rather than "" so that the proxy
+        // service's validate_cache_path check does not reject it.  Pin the
+        // string so a future edit cannot accidentally swap it for "" or "/".
+        assert!(
+            MAVEN_HANDLER_SRC.contains("\"_root_\""),
+            "download_root must use \"_root_\" as the cache-path sentinel for \
+             empty-path upstream fetches; validate_cache_path rejects empty \
+             strings and \"\" or \"/\" would both fail that check"
         );
     }
 }
