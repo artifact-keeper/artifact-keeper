@@ -4224,17 +4224,40 @@ pub async fn download_artifact(
 ///
 /// A delete is blocked when the coordinates classify as
 /// [`cache_classifier::Mutability::Immutable`] (the same structural rule the
-/// upload and proxy-cache paths use) and the caller is neither an admin nor an
-/// internal replication request. Admins keep an explicit retraction escape
+/// upload and proxy-cache paths use) and the caller is neither an admin nor a
+/// *trusted* replication request. Admins keep an explicit retraction escape
 /// hatch; replication must be able to mirror upstream deletes; mutable paths
 /// (e.g. Maven SNAPSHOT directories, indexes) are always deletable.
+///
+/// `replication_trusted` must already fold in the caller's machine identity:
+/// the raw replication request marker is a client-supplied header and so is
+/// only honored here when it accompanies a trusted principal (admin or service
+/// account). See [`replication_exemption_trusted`] and the call site in
+/// [`delete_artifact`].
 fn delete_blocked_by_immutability(
     format: &RepositoryFormat,
     path: &str,
     is_admin: bool,
-    is_replication: bool,
+    replication_trusted: bool,
 ) -> bool {
-    !is_admin && !is_replication && cache_classifier::classify(format, path).is_immutable()
+    !is_admin && !replication_trusted && cache_classifier::classify(format, path).is_immutable()
+}
+
+/// Whether the replication escape hatch on the immutability delete guard may be
+/// honored for this request.
+///
+/// The replication marker itself is a client-supplied request header, so it is
+/// forgeable by any authenticated caller. We therefore only treat it as a
+/// genuine replication write when it accompanies a trusted machine identity —
+/// an admin or a service account — which an ordinary human-user token cannot
+/// assert. Genuine peer replication runs under such a token, so legitimate
+/// mirroring of upstream immutable-artifact deletes is preserved.
+fn replication_exemption_trusted(
+    is_replication: bool,
+    is_admin: bool,
+    is_service_account: bool,
+) -> bool {
+    is_replication && (is_admin || is_service_account)
 }
 
 /// Delete artifact
@@ -4274,12 +4297,17 @@ pub async fn delete_artifact(
     // the SAME structural classification the proxy-cache and upload paths use.
     // Admins retain an explicit escape hatch for genuine retractions; mutable
     // paths (e.g. Maven SNAPSHOT directories) are unaffected.
-    if delete_blocked_by_immutability(
-        &repo.format,
-        &path,
-        auth.is_admin,
-        is_replication_request(&headers),
-    ) {
+    //
+    // The replication exemption must reflect a real machine identity, not just
+    // the client-supplied replication header (which any caller can forge).
+    // Genuine peer replication runs under a service-account or admin peer token,
+    // so only honor the exemption when the header accompanies such a principal.
+    // The raw `is_replication` marker is still used below purely for sync-loop
+    // suppression, where its semantics are unchanged.
+    let is_replication = is_replication_request(&headers);
+    let replication_trusted =
+        replication_exemption_trusted(is_replication, auth.is_admin, auth.is_service_account);
+    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin, replication_trusted) {
         return Err(AppError::Conflict(
             "Cannot delete an immutable/released artifact".to_string(),
         ));
@@ -4300,7 +4328,7 @@ pub async fn delete_artifact(
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     artifact_service
-        .delete_with_sync_options(artifact, !is_replication_request(&headers))
+        .delete_with_sync_options(artifact, !is_replication)
         .await?;
 
     Ok(())
@@ -11517,7 +11545,18 @@ mod tests {
             &RepositoryFormat::Maven,
             immutable_path,
             false, // not admin
-            false, // not replication
+            false, // not a trusted replication request
+        ));
+
+        // The replication exemption is keyed on a *trusted* machine identity,
+        // not the raw client-supplied replication header. A forged header on an
+        // ordinary user token does not produce `replication_trusted`, so the
+        // delete is still blocked -> the header-forgery bypass is closed.
+        assert!(delete_blocked_by_immutability(
+            &RepositoryFormat::Maven,
+            immutable_path,
+            false, // not admin
+            false, // forged header on a normal user yields replication_trusted = false
         ));
 
         // Same coordinates: an admin retraction is allowed.
@@ -11528,7 +11567,9 @@ mod tests {
             false,
         ));
 
-        // Same coordinates: an internal replication delete is allowed.
+        // Same coordinates: a genuine peer replication delete under a
+        // service-account or admin peer token (replication_trusted = true) is
+        // allowed -> legitimate peer replication still works.
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Maven,
             immutable_path,
@@ -11564,6 +11605,24 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn test_replication_exemption_requires_trusted_identity() {
+        // A forged replication header on an ordinary human-user token (no admin,
+        // no service account) must NOT grant the exemption -> immutability holds.
+        assert!(!replication_exemption_trusted(true, false, false));
+
+        // Without the replication marker at all, identity is irrelevant.
+        assert!(!replication_exemption_trusted(false, true, false));
+        assert!(!replication_exemption_trusted(false, false, true));
+        assert!(!replication_exemption_trusted(false, false, false));
+
+        // Genuine peer replication runs under a service-account or admin token
+        // carrying the marker -> the exemption is honored.
+        assert!(replication_exemption_trusted(true, false, true));
+        assert!(replication_exemption_trusted(true, true, false));
+        assert!(replication_exemption_trusted(true, true, true));
     }
 
     #[test]
