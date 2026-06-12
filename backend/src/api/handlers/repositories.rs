@@ -7841,6 +7841,152 @@ mod tests {
         assert!(!member_mutation_admin_allowed(false, false));
     }
 
+    // -----------------------------------------------------------------------
+    // xtenant-write-authz-systemic: behavioral coverage for the two shared
+    // tenant gates (`require_repo_write_access` / `require_visible`) that every
+    // repository sub-resource handler now routes through. The no-DB
+    // short-circuits (token scope, public, admin, anonymous) run everywhere;
+    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
+    // (the same `try_pool()` convention the virtual-member tests use).
+    // -----------------------------------------------------------------------
+    fn no_db_repo_service() -> RepositoryService {
+        RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool())
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_admin_short_circuits_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_repo_write_access(&make_admin_ext(), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "admin must pass the write gate via is_admin, no DB: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_public_allowed_no_db() {
+        let repo = make_repo(true); // is_public = true
+        let res =
+            require_repo_write_access(&make_auth_ext(None), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "a public repo is writable past the gate, no DB: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_out_of_token_scope_denied_no_db() {
+        // A repo-scoped token whose scope excludes this repo is denied before any
+        // DB lookup (the `require_repo_access` token-scope gate).
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let res = require_repo_write_access(&auth, &repo, &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "a repo-scoped token must be denied write outside its scope: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_public_is_visible_to_anonymous_no_db() {
+        let repo = make_repo(true);
+        let res = require_visible(&repo, &None, &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "public repos are visible to anonymous callers: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_private_hidden_from_anonymous_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_visible(&repo, &None, &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "private repos must be hidden (NotFound) from anonymous callers: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_out_of_token_scope_not_found_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let res = require_visible(&repo, &Some(auth), &no_db_repo_service()).await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "a repo-scoped token must not see a repo outside its scope: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_admin_sees_private_no_db() {
+        let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
+        let res = require_visible(&repo, &Some(make_admin_ext()), &no_db_repo_service()).await;
+        assert!(
+            res.is_ok(),
+            "admins see any repo via the is_admin short-circuit: {res:?}"
+        );
+    }
+
+    /// DB-backed: a non-admin, unrestricted-scope session (the password/JWT shape
+    /// the systemic fix targets) is DENIED write to a private repo it holds no
+    /// role on, and granting a role lets it through. Skips with no DATABASE_URL.
+    #[tokio::test]
+    async fn test_require_repo_write_access_nonmember_denied_then_granted_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let repo = make_repo_with_id(repo_id, &key); // is_public = false
+        let ext = tdh::make_auth(user_id, &username);
+        let svc = RepositoryService::new(pool.clone());
+
+        let denied = require_repo_write_access(&ext, &repo, &svc).await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "non-member must be denied write on a private repo: {denied:?}"
+        );
+
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let allowed = require_repo_write_access(&ext, &repo, &svc).await;
+        assert!(
+            allowed.is_ok(),
+            "a granted member must pass the write gate: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// DB-backed sibling for the read/visibility gate: a non-member gets NotFound
+    /// on a private repo; a granted member sees it. Skips with no DATABASE_URL.
+    #[tokio::test]
+    async fn test_require_visible_nonmember_not_found_then_granted_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let repo = make_repo_with_id(repo_id, &key);
+        let ext = tdh::make_auth(user_id, &username);
+        let svc = RepositoryService::new(pool.clone());
+
+        let hidden = require_visible(&repo, &Some(ext.clone()), &svc).await;
+        assert!(
+            matches!(hidden, Err(AppError::NotFound(_))),
+            "non-member must get NotFound on a private repo: {hidden:?}"
+        );
+
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let seen = require_visible(&repo, &Some(ext), &svc).await;
+        assert!(seen.is_ok(), "a granted member must see the repo: {seen:?}");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
     /// DB-backed: a non-admin without `repository:admin` on the virtual parent
     /// is rejected (Insufficient permissions), and granting the rule lets them
     /// through — mirroring the gate `update_repository` enforces. Skips when no
