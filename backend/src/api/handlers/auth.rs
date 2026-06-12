@@ -180,6 +180,45 @@ fn local_login_gate(
     }
 }
 
+/// DB-backed enforcement of the local-login SSO policy for an already-verified
+/// user. Returns whether any SSO provider is enabled (so the caller can emit the
+/// admin break-glass warning), or an `Authentication` error when the user must
+/// use SSO. Split out of the `login` handler so the policy decision — the SSO
+/// lookup plus [`local_login_gate`] plus the reject-side audit — is unit-testable
+/// against a seeded database without standing up the full login path.
+async fn enforce_local_login_sso_policy(
+    state: &SharedState,
+    user_id: Uuid,
+    username: &str,
+    user_is_admin: bool,
+) -> Result<bool> {
+    let sso_enabled = !AuthConfigService::list_enabled_providers(&state.db)
+        .await?
+        .is_empty();
+    match local_login_gate(
+        sso_enabled,
+        user_is_admin,
+        state.config.allow_local_admin_login,
+    ) {
+        LocalLoginGate::Allow => Ok(sso_enabled),
+        LocalLoginGate::RejectSso => {
+            audit_auth(
+                state,
+                AuditAction::LoginFailed,
+                Some(user_id),
+                serde_json::json!({
+                    "username": username,
+                    "reason": "local_login_disabled_sso",
+                }),
+            )
+            .await;
+            Err(AppError::Authentication(
+                "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
+            ))
+        }
+    }
+}
+
 /// Login with credentials
 #[utoipa::path(
     post,
@@ -225,38 +264,15 @@ pub async fn login(
     // Evaluated AFTER authentication so the decision is based on the
     // *verified* `is_admin` flag: admins keep a break-glass recovery path
     // for a misconfigured SSO provider (issue #443), while non-admin local
-    // login stays disabled.
-    let sso_enabled = !AuthConfigService::list_enabled_providers(&state.db)
-        .await?
-        .is_empty();
-    match local_login_gate(
-        sso_enabled,
-        user.is_admin,
-        state.config.allow_local_admin_login,
-    ) {
-        LocalLoginGate::Allow => {
-            if sso_enabled {
-                tracing::warn!(
-                    username = %user.username,
-                    "Local admin break-glass login while SSO is enabled"
-                );
-            }
-        }
-        LocalLoginGate::RejectSso => {
-            audit_auth(
-                &state,
-                AuditAction::LoginFailed,
-                Some(user.id),
-                serde_json::json!({
-                    "username": user.username,
-                    "reason": "local_login_disabled_sso",
-                }),
-            )
-            .await;
-            return Err(AppError::Authentication(
-                "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
-            ));
-        }
+    // login stays disabled. The DB-backed decision lives in
+    // `enforce_local_login_sso_policy` so it can be unit-tested directly.
+    let sso_enabled =
+        enforce_local_login_sso_policy(&state, user.id, &user.username, user.is_admin).await?;
+    if sso_enabled {
+        tracing::warn!(
+            username = %user.username,
+            "Local admin break-glass login while SSO is enabled"
+        );
     }
 
     // If TOTP is enabled, return a pending token instead of real tokens
@@ -824,6 +840,57 @@ mod tests {
             local_login_gate(true, false, true),
             LocalLoginGate::RejectSso
         );
+    }
+
+    /// DB-backed: exercises the full SSO policy enforcement that the `login`
+    /// handler delegates to — the enabled-provider lookup, the gate decision,
+    /// and the reject-side audit — without standing up the bcrypt/authenticate
+    /// path. Skips cleanly when no DATABASE_URL is configured (try_pool).
+    #[tokio::test]
+    async fn test_enforce_local_login_sso_policy_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-sso-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let uid = Uuid::new_v4();
+        let provider = format!("ph-test-ldap-{uid}");
+
+        // No SSO providers enabled: local login is allowed for everyone and the
+        // returned sso_enabled flag is false (no break-glass warning).
+        let none = enforce_local_login_sso_policy(&state, uid, "alice", false).await;
+        assert!(!none.expect("no-SSO non-admin must be allowed"));
+
+        // Enable one LDAP provider. list_enabled_providers only reads id+name,
+        // so the remaining columns can take their schema defaults.
+        sqlx::query(
+            "INSERT INTO ldap_configs (name, server_url, user_base_dn, is_enabled) \
+             VALUES ($1, 'ldap://test.invalid', 'dc=test', true)",
+        )
+        .bind(&provider)
+        .execute(&pool)
+        .await
+        .expect("seed enabled LDAP provider");
+
+        // SSO enabled + non-admin -> rejected with the SSO message (and audited).
+        let denied = enforce_local_login_sso_policy(&state, uid, "alice", false).await;
+        assert!(
+            matches!(denied, Err(AppError::Authentication(_))),
+            "non-admin local login must be rejected when SSO is enabled: {denied:?}"
+        );
+
+        // SSO enabled + verified admin -> break-glass allowed; sso_enabled=true.
+        let allowed = enforce_local_login_sso_policy(&state, uid, "admin", true).await;
+        assert!(
+            allowed.expect("admin break-glass must be allowed"),
+            "admin must keep local login and observe sso_enabled=true"
+        );
+
+        let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")
+            .bind(&provider)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
