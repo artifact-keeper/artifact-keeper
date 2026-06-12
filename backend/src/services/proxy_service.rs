@@ -8663,6 +8663,109 @@ SHA256:
         );
     }
 
+    /// Regression test for the doubled-prefix storage routing bug (v1.1.9).
+    ///
+    /// **Bug**: `cache_artifact` wrote cached content via the global `self.storage`
+    /// backend (a `FilesystemBackend` rooted at `STORAGE_PATH`) and also inserted
+    /// a row into the `artifacts` table with `storage_key =
+    /// "proxy-cache/<repo_key>/<path>/__content__"`.
+    ///
+    /// On the next request, every format handler found that row in the DB and
+    /// tried to serve the file via `state.storage_for_repo(repo.storage_location())`,
+    /// which returns a fresh `FilesystemStorage` rooted at
+    /// `repo.storage_path` (e.g. `/data/storage/team-maven-proxy`).
+    ///
+    /// That storage instance resolved the key to
+    /// `/data/storage/team-maven-proxy/proxy-cache/team-maven-proxy/.../__content__`
+    /// — a **doubled-prefix path** that does not exist on disk, because the file
+    /// lives at `/data/storage/proxy-cache/team-maven-proxy/.../__content__`.
+    ///
+    /// The result was HTTP 500 / `STORAGE_ERROR` on every cached read after the
+    /// first, affecting all 28+ format handlers on filesystem-backed deployments.
+    ///
+    /// **Fix (commit 63f1409, v1.2.0-rc.2)**: remove the DB insert from
+    /// `cache_artifact`. Cached items are served exclusively through
+    /// `proxy_check_cache` → `get_cached_artifact_by_path` → `self.storage.get`,
+    /// which always uses the same global backend that the write used. The
+    /// `storage_for_repo` dispatch path is never taken for proxy-cached content.
+    ///
+    /// This test pins the storage-routing invariant directly: the cache key
+    /// written by `cache_artifact` is readable via the same backend, and NOT
+    /// readable via a `FilesystemStorage` rooted at a per-repo subdirectory
+    /// (simulating the state of the `artifacts` table row's storage resolution).
+    #[tokio::test]
+    async fn test_proxy_cache_read_uses_global_storage_not_per_repo_storage() {
+        use crate::storage::filesystem::FilesystemStorage;
+        use crate::services::storage_service::{FilesystemBackend, StorageService};
+        use crate::storage::StorageBackend as _;
+
+        // Global storage root, mirroring STORAGE_PATH
+        let global_root = std::env::temp_dir().join(format!("ak-1278-global-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&global_root).expect("create global root");
+
+        // Per-repo storage root, mirroring repo.storage_path = "<STORAGE_PATH>/<repo_key>"
+        let repo_key = "team-maven-proxy";
+        let per_repo_root = global_root.join(repo_key);
+        std::fs::create_dir_all(&per_repo_root).expect("create per-repo root");
+
+        // Build ProxyService with the global backend (what production does)
+        let global_backend = Arc::new(FilesystemBackend::new(global_root.clone()));
+        let storage = Arc::new(StorageService::new(global_backend));
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let proxy = ProxyService::new(pool, storage);
+
+        let artifact_path = "org/junit/junit/4.13.2/junit-4.13.2.jar";
+        let content = Bytes::from_static(b"fake-junit-jar-bytes");
+        let cache_key = ProxyService::cache_storage_key(repo_key, artifact_path).unwrap();
+        let metadata_key = ProxyService::cache_metadata_key(repo_key, artifact_path).unwrap();
+
+        // Write via cache_artifact (uses self.storage = global backend)
+        proxy
+            .cache_artifact(
+                &cache_key,
+                &metadata_key,
+                &content,
+                Some("application/java-archive".to_string()),
+                Some("\"d98a9a02a99a9acd22d7653cbcc1f31f\"".to_string()),
+                None,
+                DEFAULT_CACHE_TTL_SECS,
+                Uuid::new_v4(),
+                artifact_path,
+                None,
+            )
+            .await
+            .expect("cache_artifact must succeed");
+
+        // Read back via the global backend (same as the write path) — MUST succeed
+        let hit = proxy
+            .get_cached_artifact_by_path(repo_key, artifact_path)
+            .await
+            .expect("lookup must not error");
+        assert!(
+            hit.is_some(),
+            "proxy_check_cache path (global backend) must find the cached content; \
+             a None here means the write and read backends are not the same"
+        );
+        assert_eq!(hit.unwrap().0.as_ref(), content.as_ref());
+
+        // Attempt to read via a per-repo FilesystemStorage rooted at repo.storage_path
+        // (the path that the v1.1.9 bug took via artifacts-table lookup).
+        // This MUST NOT find the file — the content lives at
+        //   <global_root>/proxy-cache/<repo_key>/.../__content__
+        // not at
+        //   <per_repo_root>/proxy-cache/<repo_key>/.../__content__
+        let per_repo_storage = FilesystemStorage::new(&per_repo_root);
+        let per_repo_result = per_repo_storage.get(&cache_key).await;
+        assert!(
+            per_repo_result.is_err(),
+            "a per-repo FilesystemStorage rooted at repo.storage_path MUST NOT \
+             find a proxy-cache key — if it does, the global and per-repo roots \
+             coincide, which would mask the doubled-prefix bug this test guards"
+        );
+
+        let _ = std::fs::remove_dir_all(&global_root);
+    }
+
     // -----------------------------------------------------------------------
     // get_cached(allow_stale) behavioral tests (#1630, S2 of #1618)
     //
