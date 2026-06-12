@@ -1846,7 +1846,10 @@ impl AuthService {
             WITH prev AS (
                 SELECT is_admin AS was_admin,
                        ARRAY(
-                           SELECT r.name FROM user_roles ur
+                           -- roles.name is VARCHAR(255); without the cast the
+                           -- IS DISTINCT FROM below is varchar[] vs text[],
+                           -- which Postgres has no operator for.
+                           SELECT r.name::text FROM user_roles ur
                            JOIN roles r ON r.id = ur.role_id
                            WHERE ur.user_id = $1
                            ORDER BY r.name
@@ -4245,6 +4248,82 @@ mod tests {
         assert!(!rejected, "token issued after watermark must be accepted");
 
         // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// `apply_role_mapping` runs on every federated (LDAP/OIDC/SAML) login.
+    /// Its privilege-change probe builds the user's previous role list from
+    /// `roles.name` (VARCHAR) and compares it `IS DISTINCT FROM` a `text[]`
+    /// bind; without the explicit `::text` element cast Postgres rejects the
+    /// statement (`operator does not exist: character varying[] = text[]`)
+    /// and every federated login 500s. This exercises the real statement
+    /// against the real schema, plus both branches of the watermark CASE.
+    #[tokio::test]
+    async fn test_apply_role_mapping_probes_varchar_roles_without_db_error() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return, // No DB: silently skip; covered in CI.
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return, // DB not reachable: skip.
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+        let user_id = insert_test_user(&pool, &format!("rolemap-{}", Uuid::new_v4())).await;
+
+        let watermark = |pool: &sqlx::PgPool, id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    "SELECT privileges_changed_at FROM users WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch privileges_changed_at")
+            }
+        };
+        let initial = watermark(&pool, user_id).await;
+
+        // No-op mapping: the varchar[]-vs-text[] comparison must execute
+        // without a DB error, and an unchanged privilege set must not bump
+        // the watermark.
+        let noop = RoleMapping {
+            is_admin: None,
+            roles: vec![],
+        };
+        service
+            .apply_role_mapping(user_id, &noop)
+            .await
+            .expect("no-op apply_role_mapping must not hit a DB error");
+        assert_eq!(
+            watermark(&pool, user_id).await,
+            initial,
+            "no-op role sync must not bump privileges_changed_at"
+        );
+
+        // Privilege change (admin grant): same statement, other CASE branch —
+        // the watermark must move forward.
+        let promote = RoleMapping {
+            is_admin: Some(true),
+            roles: vec![],
+        };
+        service
+            .apply_role_mapping(user_id, &promote)
+            .await
+            .expect("promoting apply_role_mapping must not hit a DB error");
+        assert!(
+            watermark(&pool, user_id).await > initial,
+            "admin grant must bump privileges_changed_at"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
             .execute(&pool)
             .await;
