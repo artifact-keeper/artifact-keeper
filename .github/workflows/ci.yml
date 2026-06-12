@@ -51,6 +51,12 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
+      # unavailable ("Cannot open/write log file '/cache/sccache-error.log'",
+      # "Timed out waiting for server startup"), which fails every sccache-wrapped
+      # rustc invocation at ~50s. Mirrors the coverage job's RUSTC_WRAPPER override;
+      # the Swatinem rust-cache still caches deps. Revert once the runner is restored.
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
@@ -109,6 +115,10 @@ jobs:
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
       CARGO_INCREMENTAL: "0"
+      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
+      # unavailable (see check-rust). Without this, every rustc invocation fails
+      # at ~50s ("Timed out waiting for server startup"). Revert once restored.
+      RUSTC_WRAPPER: ""
     services:
       # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
       # readiness gate) that silently no-op via `Fixture::setup` when
@@ -1092,6 +1102,10 @@ jobs:
           SQLX_OFFLINE: true
           CARGO_TERM_COLOR: always
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          # Bypass sccache while the ak-ci-runners /cache volume / sccache server
+          # is unavailable (see check-rust) — it crashed the cross-compile at
+          # startup. Revert once the runner cache is restored.
+          RUSTC_WRAPPER: ""
         run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
 
       - name: Package binary
