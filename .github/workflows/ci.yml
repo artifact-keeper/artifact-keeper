@@ -94,6 +94,11 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
@@ -195,6 +200,11 @@ jobs:
         # blob-GC readiness gate is a cluster-wide query, so a concurrent
         # cross-module test's transient rows can make gate/GC assertions flaky.
         run: cargo test --workspace --lib --verbose -- --test-threads=1
+
+      # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   shell-tests:
     name: 🐚 Shell Tests
@@ -732,6 +742,11 @@ jobs:
             test_chunked_upload_cross_repo_session_rejected \
             -- --ignored --test-threads=1
 
+      # Hit-rate data to evaluate dropping the GHA rust-cache from the unit/clippy jobs (this job has no rust-cache; stats give a no-GHA-cache baseline).
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   # ════════════════════════════════════════════════════════════════════════════
   # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
   # Spins up fresh backend + postgres, runs native client tests, tears down
@@ -1109,3 +1124,8 @@ jobs:
           path: |
             dist/artifact-keeper-windows-amd64.exe
             dist/artifact-keeper-windows-amd64.exe.sha256
+
+      # Hit-rate data to evaluate dropping the GHA rust-cache from the unit/clippy jobs (this job has no rust-cache; stats give a no-GHA-cache baseline).
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
