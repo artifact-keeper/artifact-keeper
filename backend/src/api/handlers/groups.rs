@@ -1597,4 +1597,139 @@ mod tests {
         let sql = visible_groups_predicate("g.id", "$2");
         assert!(sql.contains("p.target_id = g.id"));
     }
+
+    /// DB-backed: exercises the scoped query branches of `list_groups` and
+    /// `get_group`. A non-admin sees only the group it is a member of (not a
+    /// non-member group), and a non-member `get_group` returns NotFound (no
+    /// existence oracle); an admin is unscoped and sees both. Skips cleanly when
+    /// no DATABASE_URL is configured (the `try_pool` convention).
+    #[tokio::test]
+    async fn test_group_read_scoping_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, Query, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Two groups; the user is a member of `mine`, not of `other`.
+        let mine = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mine_name = format!("ph-grp-mine-{mine}");
+        let other_name = format!("ph-grp-other-{other}");
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2), ($3, $4)")
+            .bind(mine)
+            .bind(&mine_name)
+            .bind(other)
+            .bind(&other_name)
+            .execute(&pool)
+            .await
+            .expect("seed groups");
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(mine)
+            .execute(&pool)
+            .await
+            .expect("seed membership");
+
+        let nonadmin = tdh::make_auth(user_id, &username); // is_admin = false
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let list_q = || ListGroupsQuery {
+            search: None,
+            page: None,
+            per_page: None,
+        };
+        let get_q = || GetGroupQuery {
+            member_limit: None,
+            member_offset: None,
+        };
+
+        // list_groups: non-admin sees `mine`, not `other`.
+        let listed = list_groups(
+            State(state.clone()),
+            Extension(Some(nonadmin.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("non-admin list ok")
+        .0;
+        let names: Vec<&str> = listed.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&mine_name.as_str()),
+            "non-admin must see its own group"
+        );
+        assert!(
+            !names.contains(&other_name.as_str()),
+            "non-admin must NOT see a non-member group (BOLA): {names:?}"
+        );
+
+        // list_groups: admin is unscoped and sees both.
+        let listed_admin = list_groups(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("admin list ok")
+        .0;
+        let admin_names: Vec<&str> = listed_admin.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            admin_names.contains(&mine_name.as_str()) && admin_names.contains(&other_name.as_str()),
+            "admin must see all groups unscoped: {admin_names:?}"
+        );
+
+        // get_group: non-admin -> own 200, non-member -> 404 (no existence oracle).
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(nonadmin.clone())),
+                Path(mine),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "non-admin must read its own group"
+        );
+        let denied = get_group(
+            State(state.clone()),
+            Extension(Some(nonadmin)),
+            Path(other),
+            Query(get_q()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member get_group must be NotFound, not a leak: {denied:?}"
+        );
+        // get_group: admin reads any group.
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(admin)),
+                Path(other),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "admin must read any group"
+        );
+
+        // cleanup (user_group_members cascades on group/user delete).
+        let _ = sqlx::query("DELETE FROM groups WHERE id IN ($1, $2)")
+            .bind(mine)
+            .bind(other)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
 }
