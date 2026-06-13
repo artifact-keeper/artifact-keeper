@@ -3873,4 +3873,85 @@ mod tests {
              strings and \"\" or \"/\" would both fail that check"
         );
     }
+
+    /// DB-backed behavioral test for `download_root` (#1880): an empty/root
+    /// request is forwarded to the upstream root for REMOTE and VIRTUAL repos
+    /// (200 from upstream) and returns NotFound for a hosted LOCAL repo. Skips
+    /// cleanly without a DATABASE_URL (the `try_pool` convention).
+    #[tokio::test]
+    async fn test_download_root_forwards_remote_and_virtual_but_404s_local() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Upstream root index served by wiremock (any GET → the index body).
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("maven-root-index"))
+            .mount(&mock)
+            .await;
+
+        // Remote member pointed at the mock.
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        async fn root_body(resp: axum::response::Response) -> bytes::Bytes {
+            axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body")
+        }
+
+        // REMOTE: GET /maven/<remote>/ → 200 from the upstream root.
+        let remote_resp = download_root(State(state.clone()), Path(remote_key.clone()))
+            .await
+            .expect("remote root must proxy 200");
+        assert_eq!(remote_resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(&root_body(remote_resp).await[..], b"maven-root-index");
+
+        // VIRTUAL: a virtual repo with the remote as a member forwards the same.
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("link remote as virtual member");
+        let virtual_resp = download_root(State(state.clone()), Path(virtual_key.clone()))
+            .await
+            .expect("virtual root must proxy 200 from its remote member");
+        assert_eq!(virtual_resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(&root_body(virtual_resp).await[..], b"maven-root-index");
+
+        // LOCAL: a hosted repo does not forward an empty path → NotFound.
+        let (local_id, local_key, _ldir) = tdh::create_repo(&pool, "local", "maven").await;
+        let denied = download_root(State(state.clone()), Path(local_key.clone())).await;
+        assert!(
+            denied.is_err(),
+            "local repo root must be NotFound, not forwarded upstream"
+        );
+
+        // cleanup (members cascade on repo delete).
+        for id in [virtual_id, remote_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
 }
