@@ -337,9 +337,10 @@ async fn proxy_npm_audit_post(
 /// fallback.
 async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
     let base = upstream_url.trim_end_matches('/');
-    // meta_path already carries the leading slash from the `*rest` wildcard
-    // (axum includes the slash: `*rest` on `/-/ping` yields `/ping`).
-    let path_with_dash = format!("/-{}", meta_path);
+    // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
+    // include a leading slash (`*rest` on `/-/ping` yields `ping`, not `/ping`),
+    // so prepend `/-/` and strip any stray leading slash to be robust either way.
+    let path_with_dash = format!("/-/{}", meta_path.trim_start_matches('/'));
     let url = format!("{}{}", base, path_with_dash);
     let client = crate::services::http_client::default_client();
 
