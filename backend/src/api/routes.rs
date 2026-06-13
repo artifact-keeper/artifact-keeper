@@ -1,8 +1,18 @@
 //! Route definitions for the API.
 
-use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
+use axum::{
+    error_handling::HandleErrorLayer, extract::DefaultBodyLimit, middleware, routing::get,
+    BoxError, Router,
+};
 use std::sync::Arc;
+use std::time::Duration;
+use tower::{
+    limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, timeout::TimeoutLayer,
+    ServiceBuilder,
+};
 use utoipa_swagger_ui::SwaggerUi;
+
+use crate::error::AppError;
 
 use super::handlers;
 use super::middleware::auth::{
@@ -176,12 +186,81 @@ pub fn create_router(state: SharedState) -> Router {
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
 
-    // Correlation ID middleware (outermost layer — runs first on every request).
-    // Extracts or generates a correlation ID and sets the X-Correlation-ID
-    // response header.
+    // Correlation ID middleware (runs first on every request after the global
+    // backstop below). Extracts or generates a correlation ID and sets the
+    // X-Correlation-ID response header.
     router = router.layer(middleware::from_fn(correlation_id_middleware));
 
-    router.with_state(state)
+    // Defense-in-depth backstop (outermost layer). A router-wide load-shed +
+    // concurrency limit (+ optional request timeout) so that NO request path —
+    // even one that runs an unbounded CPU-bound operation (bcrypt,
+    // decompression) on a worker thread — can pin every worker and starve the
+    // accept loop. Excess concurrent requests are shed with 503 + Retry-After
+    // instead of queueing; a request exceeding the global timeout is aborted
+    // with 503. Both limits are config-driven with generous defaults and a `0`
+    // sentinel that disables the respective layer (see config.rs). Layered
+    // OUTSIDE correlation-id (after `with_state`) so shedding happens before
+    // any real work.
+    let max_concurrency = state.config.global_max_concurrency;
+    let request_timeout_secs = state.config.global_request_timeout_secs;
+    apply_global_backstop(
+        router.with_state(state),
+        max_concurrency,
+        request_timeout_secs,
+    )
+}
+
+/// Map a backstop layer error (load-shed `Overloaded` or timeout `Elapsed`)
+/// onto a 503 so clients back off and retry, mirroring the auth-semaphore
+/// shed policy. `Retry-After` is attached by `AppError`'s `IntoResponse`.
+async fn handle_backstop_error(err: BoxError) -> AppError {
+    AppError::ServiceUnavailable(format!("Server overloaded, please retry: {err}"))
+}
+
+/// Wrap `router` in the outermost defense-in-depth backstop. Each layer is
+/// applied only when its config value is non-zero (`0` disables it), so the
+/// behaviour is identical to the unpatched router when both are disabled.
+///
+/// `HandleErrorLayer` requires the error type of the inner stack to be fixed,
+/// which `ServiceBuilder::option_layer` (its `Either`/`Infallible` branches)
+/// makes ambiguous — so the on/off combinations are spelled out explicitly,
+/// each building a homogeneous fallible stack before `HandleErrorLayer`
+/// collapses it back to an infallible axum service mapping shed/timeout
+/// errors to 503.
+fn apply_global_backstop(
+    router: Router,
+    max_concurrency: usize,
+    request_timeout_secs: u64,
+) -> Router {
+    let concurrency_on = max_concurrency != 0;
+    let timeout_on = request_timeout_secs != 0;
+    let timeout = Duration::from_secs(request_timeout_secs);
+
+    match (concurrency_on, timeout_on) {
+        // Nothing enabled -> router untouched (no extra layer cost).
+        (false, false) => router,
+        // Concurrency limit + load-shed only.
+        (true, false) => router.layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_backstop_error))
+                .layer(LoadShedLayer::new())
+                .layer(GlobalConcurrencyLimitLayer::new(max_concurrency)),
+        ),
+        // Request timeout only.
+        (false, true) => router.layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_backstop_error))
+                .layer(TimeoutLayer::new(timeout)),
+        ),
+        // Full backstop: load-shed + concurrency limit + timeout.
+        (true, true) => router.layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_backstop_error))
+                .layer(LoadShedLayer::new())
+                .layer(GlobalConcurrencyLimitLayer::new(max_concurrency))
+                .layer(TimeoutLayer::new(timeout)),
+        ),
+    }
 }
 
 /// API v1 routes

@@ -81,6 +81,8 @@ fn test_config(storage_path: &str) -> Config {
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
         auth_max_concurrency: 8,
+        global_max_concurrency: 512,
+        global_request_timeout_secs: 120,
         rate_limit_enabled: true,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,

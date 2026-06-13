@@ -35,16 +35,44 @@ fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
     .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))
 }
 
+/// Normalize a user-supplied backup code into the canonical form that is
+/// bcrypt-matched: strip dashes and upper-case. Pure and unit-testable.
+fn normalize_backup_code(code: &str) -> String {
+    code.replace('-', "").to_uppercase()
+}
+
+/// True when this slot is a live (not-yet-consumed) backup-code hash. An empty
+/// string marks an already-consumed slot and is skipped. Pure helper so the
+/// skip logic is unit-testable without running bcrypt.
+fn is_live_backup_slot(hash: &str) -> bool {
+    !hash.is_empty()
+}
+
 /// Find the index of the first non-empty backup-code hash that matches
-/// `clean_code` (case/normalization already applied by the caller).
+/// `clean_code` (normalization already applied by the caller via
+/// [`normalize_backup_code`]).
 ///
-/// Extracted as a pure function so the match-and-consume logic is unit-
-/// testable without a database. An empty hash marks an already-consumed slot
-/// and is skipped.
-fn find_backup_code_index(hashed_codes: &[String], clean_code: &str) -> Option<usize> {
-    hashed_codes
-        .iter()
-        .position(|hash| !hash.is_empty() && bcrypt::verify(clean_code, hash).unwrap_or(false))
+/// First-match-wins over the slots, preserving the consume-exactly-once
+/// invariant (#1822). Each candidate bcrypt verify runs through
+/// [`AuthService::verify_password`] so it is offloaded with
+/// `spawn_blocking` and bounded by the process-wide auth-concurrency
+/// semaphore — exactly like password login — instead of blocking a tokio
+/// worker inline. An empty hash marks an already-consumed slot and is skipped.
+async fn find_backup_code_index(hashed_codes: &[String], clean_code: &str) -> Option<usize> {
+    for (idx, hash) in hashed_codes.iter().enumerate() {
+        if !is_live_backup_slot(hash) {
+            continue;
+        }
+        // bcrypt::verify reads the cost from the stored hash, so both legacy
+        // cost-10 and newer DEFAULT_COST backup-code hashes verify here.
+        if AuthService::verify_password(clean_code, hash)
+            .await
+            .unwrap_or(false)
+        {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 /// Decode a base32-encoded secret string into raw bytes.
@@ -179,11 +207,12 @@ pub async fn enable_totp(
         return Err(AppError::Authentication("Invalid TOTP code".to_string()));
     }
 
-    // Generate backup codes (scoped to drop rng before any .await)
-    let (backup_codes, hashed_codes) = {
+    // Generate the plaintext backup codes (scoped to drop rng before any
+    // .await — the rng is not Send).
+    let backup_codes: Vec<String> = {
         use rand::Rng;
         let mut rng = rand::rng();
-        let codes: Vec<String> = (0..10)
+        (0..10)
             .map(|_| {
                 let code: String = (0..8)
                     .map(|_| {
@@ -197,16 +226,17 @@ pub async fn enable_totp(
                     .collect();
                 format!("{}-{}", &code[..4], &code[4..])
             })
-            .collect();
-        let hashed: Vec<String> = codes
-            .iter()
-            .map(|code| {
-                let clean = code.replace('-', "");
-                bcrypt::hash(&clean, 10).unwrap_or_default()
-            })
-            .collect();
-        (codes, hashed)
+            .collect()
     };
+    // Hash each code through the capped + spawn_blocking auth path
+    // (`AuthService::hash_password`) so the 10 bcrypt hashes are offloaded
+    // off the tokio worker and bounded by the auth-concurrency semaphore,
+    // instead of running inline and starving the runtime.
+    let mut hashed_codes: Vec<String> = Vec::with_capacity(backup_codes.len());
+    for code in &backup_codes {
+        let clean = code.replace('-', "");
+        hashed_codes.push(AuthService::hash_password(&clean).await?);
+    }
     let hashed_json = serde_json::to_string(&hashed_codes)
         .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
 
@@ -342,7 +372,7 @@ pub async fn verify_totp(
         // sessions (TOCTOU, #1822). Re-read under `SELECT ... FOR UPDATE`
         // inside a transaction so concurrent verifiers serialize on the row
         // and only the first observes the code as unused.
-        let clean_code = payload.code.replace('-', "").to_uppercase();
+        let clean_code = normalize_backup_code(&payload.code);
 
         let mut tx = state
             .db
@@ -361,7 +391,7 @@ pub async fn verify_totp(
             .as_deref()
             .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
         {
-            Some(hashed_codes) => match find_backup_code_index(&hashed_codes, &clean_code) {
+            Some(hashed_codes) => match find_backup_code_index(&hashed_codes, &clean_code).await {
                 Some(idx) => {
                     let mut codes = hashed_codes;
                     codes[idx] = String::new();
@@ -489,9 +519,10 @@ pub async fn disable_totp(
         .password_hash
         .ok_or_else(|| AppError::Authentication("No password set".to_string()))?;
 
-    if !bcrypt::verify(&payload.password, &password_hash)
-        .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))?
-    {
+    // Verify through the capped + spawn_blocking auth path so this bcrypt
+    // verify is offloaded and load-shed-bounded exactly like password login,
+    // rather than blocking a tokio worker inline.
+    if !AuthService::verify_password(&payload.password, &password_hash).await? {
         return Err(AppError::Authentication("Invalid password".to_string()));
     }
 
@@ -782,23 +813,64 @@ mod tests {
 
     #[test]
     fn test_backup_code_clean_format() {
-        let code = "ABCD-1234";
-        let clean = code.replace('-', "").to_uppercase();
-        assert_eq!(clean, "ABCD1234");
+        assert_eq!(normalize_backup_code("ABCD-1234"), "ABCD1234");
     }
 
     #[test]
     fn test_backup_code_clean_already_clean() {
-        let code = "ABCD1234";
-        let clean = code.replace('-', "").to_uppercase();
-        assert_eq!(clean, "ABCD1234");
+        assert_eq!(normalize_backup_code("ABCD1234"), "ABCD1234");
     }
 
     #[test]
     fn test_backup_code_clean_lowercase() {
-        let code = "abcd-1234";
-        let clean = code.replace('-', "").to_uppercase();
-        assert_eq!(clean, "ABCD1234");
+        assert_eq!(normalize_backup_code("abcd-1234"), "ABCD1234");
+    }
+
+    #[test]
+    fn test_is_live_backup_slot() {
+        assert!(is_live_backup_slot("$2b$10$somehash"));
+        assert!(!is_live_backup_slot(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // find_backup_code_index — first-match-wins over live slots, skips
+    // consumed (empty) slots, and matches regardless of stored bcrypt cost
+    // (verify reads the cost from the hash, so legacy cost-10 and newer
+    // DEFAULT_COST hashes both verify).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_find_backup_code_index_matches_first_live_slot() {
+        let clean = "1YUU4B8U";
+        let hashed = vec![
+            String::new(),                          // already consumed
+            bcrypt::hash(clean, 4).expect("hash"),  // the match
+            bcrypt::hash(clean, 4).expect("hash2"), // duplicate, must not win
+        ];
+        assert_eq!(find_backup_code_index(&hashed, clean).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_find_backup_code_index_no_match() {
+        let hashed = vec![bcrypt::hash("OTHERCODE", 4).expect("hash")];
+        assert_eq!(find_backup_code_index(&hashed, "1YUU4B8U").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_backup_code_index_skips_empty() {
+        let clean = "ABCD1234";
+        let hashed = vec![String::new(), String::new()];
+        assert_eq!(find_backup_code_index(&hashed, clean).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_backup_code_index_legacy_cost10_still_verifies() {
+        // A pre-existing cost-10 hash (the old enable_totp default) must keep
+        // verifying after the fix routes hashing through DEFAULT_COST.
+        let clean = "C0ST10VR";
+        let legacy = bcrypt::hash(clean, 10).expect("legacy cost-10 hash");
+        let hashed = vec![legacy];
+        assert_eq!(find_backup_code_index(&hashed, clean).await, Some(0));
     }
 
     // -----------------------------------------------------------------------

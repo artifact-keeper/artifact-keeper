@@ -327,6 +327,28 @@ pub struct Config {
     /// (legacy behaviour, not recommended in production).
     pub auth_max_concurrency: usize,
 
+    /// Router-wide in-flight request cap applied as the outermost application
+    /// layer (defense-in-depth load-shed). When more than this many requests
+    /// are being processed concurrently, excess requests are shed with 503
+    /// rather than queueing — this keeps the accept loop responsive even if
+    /// some other code path runs an unbounded CPU-bound (e.g. bcrypt /
+    /// decompression) operation on a worker thread.
+    ///
+    /// Must be generous: well above the tokio worker count so it never throttles
+    /// legitimate parallel CI auth/upload traffic. Env var:
+    /// `GLOBAL_MAX_CONCURRENCY`. Default 512. Set to 0 to disable the layer.
+    pub global_max_concurrency: usize,
+
+    /// Router-wide request timeout in seconds applied as the outermost
+    /// application layer (defense-in-depth). A request that runs longer than
+    /// this is aborted with 503 so a single wedged/CPU-bound request cannot
+    /// hold a worker indefinitely.
+    ///
+    /// Must exceed the slowest legitimate request — large multi-GB artifact
+    /// uploads — or they will be killed. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
+    /// Default 120. Set to 0 to disable the layer.
+    pub global_request_timeout_secs: u64,
+
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
     pub database_idle_timeout_secs: u64,
@@ -526,6 +548,8 @@ redacted_debug!(Config {
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show auth_max_concurrency,
+    show global_max_concurrency,
+    show global_request_timeout_secs,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -615,6 +639,8 @@ impl Default for Config {
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             auth_max_concurrency: default_auth_max_concurrency(),
+            global_max_concurrency: 512,
+            global_request_timeout_secs: 120,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
@@ -798,6 +824,8 @@ impl Config {
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
+            global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
+            global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
@@ -1246,6 +1274,92 @@ mod tests {
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
         assert_eq!(config.smtp_port, 587);
         assert_eq!(config.smtp_tls_mode, "starttls");
+    }
+
+    // -----------------------------------------------------------------------
+    // Global defense-in-depth backstop (concurrency limit + request timeout)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_global_backstop_defaults_are_generous() {
+        let config = Config::default();
+        // The concurrency cap must be well above the worker pool so it never
+        // throttles legitimate parallel CI traffic, and the timeout must be
+        // generous enough not to kill large uploads.
+        assert_eq!(config.global_max_concurrency, 512);
+        assert_eq!(config.global_request_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_global_backstop_zero_disables_each_layer() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
+        let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("GLOBAL_MAX_CONCURRENCY", "0");
+        env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "0");
+
+        let config = Config::from_env().expect("config should load");
+        // 0 is the documented "disable this layer" sentinel for both.
+        assert_eq!(config.global_max_concurrency, 0);
+        assert_eq!(config.global_request_timeout_secs, 0);
+
+        // Restore
+        env::remove_var("GLOBAL_MAX_CONCURRENCY");
+        env::remove_var("GLOBAL_REQUEST_TIMEOUT_SECS");
+        if let Some(v) = saved_conc {
+            env::set_var("GLOBAL_MAX_CONCURRENCY", v);
+        }
+        if let Some(v) = saved_to {
+            env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", v);
+        }
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
+    }
+
+    #[test]
+    fn test_global_backstop_parses_custom_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
+        let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("GLOBAL_MAX_CONCURRENCY", "1024");
+        env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "300");
+
+        let config = Config::from_env().expect("config should load");
+        assert_eq!(config.global_max_concurrency, 1024);
+        assert_eq!(config.global_request_timeout_secs, 300);
+
+        env::remove_var("GLOBAL_MAX_CONCURRENCY");
+        env::remove_var("GLOBAL_REQUEST_TIMEOUT_SECS");
+        if let Some(v) = saved_conc {
+            env::set_var("GLOBAL_MAX_CONCURRENCY", v);
+        }
+        if let Some(v) = saved_to {
+            env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", v);
+        }
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
     }
 
     #[test]
