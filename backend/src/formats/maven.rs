@@ -55,49 +55,87 @@ impl MavenHandler {
     ) -> Result<(Option<String>, String)> {
         let expected_prefix = format!("{}-{}", artifact_id, version);
 
+        // sbt cross-versioned plugins publish under a directory named after the
+        // full cross-versioned artifact ID (e.g. `sbt-foo_2.12_1.0`) but write
+        // filenames using only the short base name without the cross-version
+        // suffix (e.g. `sbt-foo-2.0.4.jar`). Strip up to two trailing
+        // `_segment` components where each segment looks like a version string
+        // (contains `.` or starts with a digit) to derive the short base name.
+        let looks_like_version =
+            |s: &str| s.contains('.') || s.chars().next().is_some_and(|c| c.is_ascii_digit());
+        let short_base: Option<&str> = artifact_id.rfind('_').and_then(|i| {
+            if looks_like_version(&artifact_id[i + 1..]) {
+                let after = &artifact_id[..i];
+                Some(
+                    after
+                        .rfind('_')
+                        .filter(|&j| looks_like_version(&after[j + 1..]))
+                        .map_or(after, |j| &after[..j]),
+                )
+            } else {
+                None
+            }
+        });
+
         // For SNAPSHOT versions, Maven resolves the filename to a timestamp like:
         // artifact-1.0.0-20260211.124623-1.jar instead of artifact-1.0.0-SNAPSHOT.jar
         // Accept either the exact version or the timestamp-resolved form.
-        let snapshot_prefix = version
-            .strip_suffix("-SNAPSHOT")
-            .map(|base_version| format!("{}-{}", artifact_id, base_version));
+        let base_version = version.strip_suffix("-SNAPSHOT");
+        let snapshot_prefix = base_version.map(|bv| format!("{}-{}", artifact_id, bv));
 
-        let mut is_snapshot_timestamp = false;
-        let remainder = if filename.starts_with(&expected_prefix) {
-            &filename[expected_prefix.len()..]
-        } else if let Some(ref snap) = snapshot_prefix {
-            if filename.starts_with(snap) {
-                is_snapshot_timestamp = true;
-                &filename[snap.len()..]
-            } else {
-                // Could be metadata file
-                if filename == "maven-metadata.xml"
-                    || filename.ends_with(".md5")
-                    || filename.ends_with(".sha1")
-                    || filename.ends_with(".sha256")
-                    || filename.ends_with(".sha512")
-                {
-                    return Ok((None, filename.to_string()));
-                }
-                return Err(AppError::Validation(format!(
-                    "Invalid Maven filename: expected to start with {}",
-                    expected_prefix
-                )));
-            }
-        } else {
-            // Could be metadata file
-            if filename == "maven-metadata.xml"
-                || filename.ends_with(".md5")
-                || filename.ends_with(".sha1")
-                || filename.ends_with(".sha256")
-                || filename.ends_with(".sha512")
-            {
-                return Ok((None, filename.to_string()));
-            }
-            return Err(AppError::Validation(format!(
+        // Short-form prefixes for sbt plugins. `short_prefix` includes the full
+        // version (e.g. `sbt-foo-2.0.4-SNAPSHOT`) so it matches exact-SNAPSHOT
+        // filenames before `short_snapshot_prefix` can misparse `-SNAPSHOT` as a
+        // classifier.
+        let short_prefix = short_base.map(|sb| format!("{}-{}", sb, version));
+        let short_snapshot_prefix = short_base
+            .zip(base_version)
+            .map(|(sb, bv)| format!("{}-{}", sb, bv));
+
+        let is_metadata = |f: &str| {
+            f == "maven-metadata.xml"
+                || f.ends_with(".md5")
+                || f.ends_with(".sha1")
+                || f.ends_with(".sha256")
+                || f.ends_with(".sha512")
+        };
+        let validation_err = || {
+            Err(AppError::Validation(format!(
                 "Invalid Maven filename: expected to start with {}",
                 expected_prefix
-            )));
+            )))
+        };
+
+        // Try prefixes in priority order. `short_prefix` comes before
+        // `short_snapshot_prefix` so the exact-SNAPSHOT short form is handled
+        // before the timestamp branch can misparse `-SNAPSHOT` as a classifier.
+        let remainder: &str = 'find: {
+            if filename.starts_with(&expected_prefix) {
+                break 'find &filename[expected_prefix.len()..];
+            }
+            if let Some(ref snap) = snapshot_prefix {
+                if filename.starts_with(snap.as_str()) {
+                    let rem = &filename[snap.len()..];
+                    // Strip the timestamp-build suffix (-YYYYMMDD.HHMMSS-N) so
+                    // classifier parsing works correctly on the remainder.
+                    break 'find Self::strip_snapshot_timestamp(rem);
+                }
+            }
+            if let Some(ref spfx) = short_prefix {
+                if filename.starts_with(spfx.as_str()) {
+                    break 'find &filename[spfx.len()..];
+                }
+            }
+            if let Some(ref ssnap) = short_snapshot_prefix {
+                if filename.starts_with(ssnap.as_str()) {
+                    let rem = &filename[ssnap.len()..];
+                    break 'find Self::strip_snapshot_timestamp(rem);
+                }
+            }
+            if is_metadata(filename) {
+                return Ok((None, filename.to_string()));
+            }
+            return validation_err();
         };
 
         if remainder.is_empty() {
@@ -105,15 +143,6 @@ impl MavenHandler {
                 "Invalid Maven filename: missing extension".to_string(),
             ));
         }
-
-        // For snapshot timestamps, the remainder starts with the
-        // timestamp-build suffix: -YYYYMMDD.HHMMSS-N
-        // Strip it so classifier parsing works correctly.
-        let remainder = if is_snapshot_timestamp {
-            Self::strip_snapshot_timestamp(remainder)
-        } else {
-            remainder
-        };
 
         // Check for classifier: -classifier.ext
         //
@@ -853,6 +882,57 @@ mod tests {
             Some("1.0.0"),
         );
         assert!(merge_plugin_prefix_metadata(&[versions_doc, "<metadata/>".to_string()]).is_none());
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_short_filename() {
+        // sbt plugins publish under `artifact_2.12_1.0/` but write filenames in
+        // the short form without the cross-version suffix (`artifact-2.0.4.jar`).
+        let coords =
+            MavenHandler::parse_coordinates("com/example/sbt-foo_2.12_1.0/2.0.4/sbt-foo-2.0.4.jar")
+                .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12_1.0");
+        assert_eq!(coords.version, "2.0.4");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_single_underscore() {
+        // Plugins with a single cross-version component (scala version only)
+        // must also be handled by the short-filename path.
+        let coords =
+            MavenHandler::parse_coordinates("com/example/sbt-foo_2.12/2.0.4/sbt-foo-2.0.4.jar")
+                .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12");
+        assert_eq!(coords.version, "2.0.4");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_snapshot_timestamp() {
+        // sbt SNAPSHOT plugins may publish timestamp-resolved filenames.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12_1.0/2.0.4-SNAPSHOT/sbt-foo-2.0.4-20240101.120000-3.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12_1.0");
+        assert_eq!(coords.version, "2.0.4-SNAPSHOT");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_exact_snapshot_not_misclassified() {
+        // Exact-SNAPSHOT filename (`sbt-foo-2.0.4-SNAPSHOT.jar`) must NOT parse
+        // `-SNAPSHOT` as a classifier — it should be a no-classifier `.jar`.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12_1.0/2.0.4-SNAPSHOT/sbt-foo-2.0.4-SNAPSHOT.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
     }
 
     #[test]
