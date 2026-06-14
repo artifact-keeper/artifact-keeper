@@ -2144,8 +2144,17 @@ async fn upload(
 
     match gav_existing {
         Some((existing_id, existing_path, existing_storage_key, existing_meta)) => {
-            // An artifact record already exists for this GAV.
-            let existing_is_pom = MavenHandler::is_pom(&existing_path);
+            // An artifact record already exists for this GAV. The anchor row is
+            // the first-created file in the directory, which — depending on the
+            // client's upload order — can be a POM or a classifier artifact
+            // (e.g. sbt publishes `-tests-sources.jar` before the main `.jar`).
+            // Determine whether that anchor is itself a primary packaging
+            // artifact so a later-arriving primary can be promoted over it.
+            let existing_coords = MavenHandler::parse_coordinates(&existing_path).ok();
+            let existing_is_primary = existing_coords
+                .as_ref()
+                .map(is_primary_maven_artifact)
+                .unwrap_or(false);
 
             let new_file = make_file_entry(
                 &path,
@@ -2156,15 +2165,18 @@ async fn upload(
                 &checksum_sha256,
             );
 
-            if is_primary && existing_is_pom {
-                // The existing record is a POM-only placeholder. Promote the new
-                // JAR/WAR to primary and demote the POM into the files list.
-                let old_pom_coords = MavenHandler::parse_coordinates(&existing_path).ok();
-                let old_ext = old_pom_coords
+            if is_primary && !existing_is_primary {
+                // The existing record is a non-primary placeholder: either a POM,
+                // or a classifier artifact that happened to be uploaded before the
+                // main artifact (sbt's publish order). Promote the new JAR/WAR to
+                // primary and demote the existing file into the files list, so the
+                // canonical row is always the main artifact regardless of the order
+                // files arrived in.
+                let old_ext = existing_coords
                     .as_ref()
                     .map(|c| c.extension.as_str())
                     .unwrap_or("pom");
-                let old_classifier = old_pom_coords
+                let old_classifier = existing_coords
                     .as_ref()
                     .and_then(|c| c.classifier.as_deref());
 
@@ -2181,7 +2193,7 @@ async fn upload(
                     .unwrap_or("")
                     .to_string();
 
-                let pom_file = make_file_entry(
+                let demoted_file = make_file_entry(
                     &existing_path,
                     old_ext,
                     old_classifier,
@@ -2196,7 +2208,7 @@ async fn upload(
                     .and_then(|f| f.as_array())
                     .cloned()
                     .unwrap_or_default();
-                files.push(pom_file);
+                files.push(demoted_file);
 
                 // Merge POM-parsed fields into the new primary metadata
                 let mut merged = file_metadata.clone();
