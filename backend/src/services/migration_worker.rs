@@ -375,6 +375,22 @@ impl MigrationWorker {
             repos_to_process.push((migration_config.target_key, migration_config.package_type));
         }
 
+        // Surface the no-op case explicitly. Without this, a job that ended
+        // up with zero processable repos would walk straight to
+        // `determine_final_status(0, 0) = Completed` and the operator would
+        // see a "Completed 0/0" run with no log line explaining why — the
+        // exact UX gap reported in issue #1901 before the `include_repos: []`
+        // semantics were fixed. We still let the job finish normally so the
+        // existing UI/state-machine contracts hold.
+        if repos_to_process.is_empty() {
+            tracing::warn!(
+                job_id = %job_id,
+                requested = repos.len(),
+                source_repos = source_repos.len(),
+                "No repositories available to migrate; the source listed none, every requested key was missing/unsupported, or every resolved candidate conflicted with an incompatible destination. Job will complete as a no-op."
+            );
+        }
+
         // Process each repository
         for (repo_key, package_type) in &repos_to_process {
             // Check for pause/cancel
@@ -1810,6 +1826,14 @@ pub(crate) struct ResolveRepoPlan {
 /// Match each requested repository key against the source-side repository
 /// list and prepare a `RepositoryMigrationConfig` for it.
 ///
+/// An empty `requested` slice is treated as "every repository the source
+/// reports" — matching the convention used by include/exclude filter pairs
+/// in apt, yum, Bazel, Helm, etc. The previous "empty == migrate nothing"
+/// behavior caused jobs submitted with the default `include_repos: []`
+/// (which is what the UI sends when no specific repo is picked) to silently
+/// complete in ~200ms with `0/0/0`, never enumerating the source and never
+/// writing `migration_items` or `migration_reports` rows (issue #1901).
+///
 /// Pure (no DB, no I/O) so it can be unit-tested end-to-end. The DB-touching
 /// `check_repository_conflict` / `create_repository` follow-up runs in
 /// `MigrationWorker::process_job` over the `resolved` slice.
@@ -1818,6 +1842,20 @@ pub(crate) fn resolve_repos_for_provisioning(
     source_repos: &[crate::services::artifactory_client::RepositoryListItem],
 ) -> ResolveRepoPlan {
     let mut plan = ResolveRepoPlan::default();
+
+    if requested.is_empty() {
+        for source_repo in source_repos {
+            match MigrationService::prepare_repository_migration(source_repo, None) {
+                Ok(c) => plan.resolved.push(c),
+                Err(e) => plan.unsupported.push(UnsupportedRepo {
+                    repo_key: source_repo.key.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        return plan;
+    }
+
     for repo_key in requested {
         let source_repo = match source_repos.iter().find(|r| &r.key == repo_key) {
             Some(r) => r,
@@ -3736,9 +3774,51 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_repos_empty_request_yields_empty_plan() {
-        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+    fn test_resolve_repos_empty_request_resolves_all_source_repos() {
+        // Empty `include_repos` means "every repository the source reports"
+        // — matching the apt/yum/Bazel/Helm include-list convention. The
+        // previous "empty == migrate nothing" behavior caused jobs created
+        // with the default empty list to silently no-op (issue #1901).
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("npm-releases", "LOCAL", "Npm"),
+        ];
         let plan = resolve_repos_for_provisioning(&[], &source);
+        assert_eq!(plan.resolved.len(), 2);
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+        let resolved_keys: Vec<&str> = plan
+            .resolved
+            .iter()
+            .map(|c| c.target_key.as_str())
+            .collect();
+        assert!(resolved_keys.contains(&"maven-releases"));
+        assert!(resolved_keys.contains(&"npm-releases"));
+    }
+
+    #[test]
+    fn test_resolve_repos_empty_request_routes_unsupported_source_repos_to_unsupported_bucket() {
+        // Even in the "empty == all" path, an unmappable source repo type
+        // must land in `unsupported` rather than poison the rest of the
+        // plan or short-circuit the whole job.
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("weird-repo", "BOGUS_TYPE", "Maven"),
+        ];
+        let plan = resolve_repos_for_provisioning(&[], &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.resolved[0].target_key, "maven-releases");
+        assert!(plan.missing.is_empty());
+        assert_eq!(plan.unsupported.len(), 1);
+        assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
+    }
+
+    #[test]
+    fn test_resolve_repos_empty_request_with_empty_source_yields_empty_plan() {
+        // When both sides are empty there really is nothing to migrate;
+        // verify we return a fully empty plan (caller turns that into a
+        // "no repositories to migrate" warning).
+        let plan = resolve_repos_for_provisioning(&[], &[]);
         assert!(plan.resolved.is_empty());
         assert!(plan.missing.is_empty());
         assert!(plan.unsupported.is_empty());
