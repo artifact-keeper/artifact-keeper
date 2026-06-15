@@ -71,12 +71,21 @@ pub enum RepositoryType {
 }
 
 impl RepositoryType {
-    /// Parse from Artifactory repository type string
+    /// Parse a source-side repository type string.
+    ///
+    /// Accepts both the Artifactory vocabulary (`local` / `remote` /
+    /// `virtual`) and the Nexus vocabulary (`hosted` / `proxy` / `group`).
+    /// The two sets denote the same three logical kinds — the enum doc
+    /// comments above have always pinned this mapping. Prior to this fix
+    /// the function only matched the Artifactory triple, so every Nexus
+    /// repository was rejected by `prepare_repository_migration` with
+    /// `Unknown repository type: hosted` and an entire Nexus source was
+    /// effectively un-migratable (issue #1889).
     pub fn from_artifactory(rclass: &str) -> Option<Self> {
         match rclass.to_lowercase().as_str() {
-            "local" => Some(Self::Local),
-            "remote" => Some(Self::Remote),
-            "virtual" => Some(Self::Virtual),
+            "local" | "hosted" => Some(Self::Local),
+            "remote" | "proxy" => Some(Self::Remote),
+            "virtual" | "group" => Some(Self::Virtual),
             _ => None,
         }
     }
@@ -1317,9 +1326,14 @@ mod tests {
         // Regression test for issue #857: when Nexus reports `maven2`, the
         // prepared config should carry the canonical `maven` name so the
         // created repository uses the correct AK format.
+        //
+        // `repo_type` here is the real Nexus vocabulary (`hosted`) — not the
+        // Artifactory `local`. Prior fixtures used `local` and so masked
+        // issue #1889, where `RepositoryType::from_artifactory` rejected
+        // every Nexus repo on a live source.
         let repo = RepositoryListItem {
             key: "releases".to_string(),
-            repo_type: "local".to_string(),
+            repo_type: "hosted".to_string(),
             package_type: "maven2".to_string(),
             url: None,
             description: None,
@@ -1333,7 +1347,7 @@ mod tests {
     fn test_prepare_repository_migration_normalizes_nexus_yum() {
         let repo = RepositoryListItem {
             key: "yum".to_string(),
-            repo_type: "local".to_string(),
+            repo_type: "hosted".to_string(),
             package_type: "yum".to_string(),
             url: None,
             description: None,
@@ -1347,7 +1361,7 @@ mod tests {
     fn test_prepare_repository_migration_normalizes_nexus_raw() {
         let repo = RepositoryListItem {
             key: "resources".to_string(),
-            repo_type: "local".to_string(),
+            repo_type: "hosted".to_string(),
             package_type: "raw".to_string(),
             url: None,
             description: None,
@@ -1355,6 +1369,38 @@ mod tests {
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "generic");
         assert_eq!(config.format_compatibility, FormatCompatibility::Full);
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_accepts_nexus_proxy() {
+        // Nexus `proxy` ≡ Artifactory `remote`; both must map to
+        // `RepositoryType::Remote` (issue #1889 regression).
+        let repo = RepositoryListItem {
+            key: "maven-central".to_string(),
+            repo_type: "proxy".to_string(),
+            package_type: "maven2".to_string(),
+            url: Some("https://repo1.maven.org/maven2/".to_string()),
+            description: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.repo_type, RepositoryType::Remote);
+        assert_eq!(config.package_type, "maven");
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_accepts_nexus_group() {
+        // Nexus `group` ≡ Artifactory `virtual`; both must map to
+        // `RepositoryType::Virtual` (issue #1889 regression).
+        let repo = RepositoryListItem {
+            key: "maven-public".to_string(),
+            repo_type: "group".to_string(),
+            package_type: "maven2".to_string(),
+            url: None,
+            description: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.repo_type, RepositoryType::Virtual);
+        assert_eq!(config.package_type, "maven");
     }
 
     #[test]
@@ -1453,9 +1499,46 @@ mod tests {
 
     #[test]
     fn test_repository_type_from_artifactory_unknown() {
+        // `federated` (Artifactory) and `unknown_kind` are genuinely
+        // unmapped. `hosted` used to live here too — see #1889; it is
+        // Nexus's name for `Local` and is now accepted by
+        // `from_artifactory` via the alias branch below.
         assert_eq!(RepositoryType::from_artifactory("federated"), None);
         assert_eq!(RepositoryType::from_artifactory(""), None);
-        assert_eq!(RepositoryType::from_artifactory("hosted"), None);
+        assert_eq!(RepositoryType::from_artifactory("unknown_kind"), None);
+    }
+
+    #[test]
+    fn test_repository_type_from_artifactory_accepts_nexus_aliases() {
+        // Nexus reports `hosted` / `proxy` / `group`; these are the same
+        // three kinds as Artifactory's `local` / `remote` / `virtual` and
+        // must map to the same `RepositoryType` variants. Regression
+        // coverage for issue #1889.
+        assert_eq!(
+            RepositoryType::from_artifactory("hosted"),
+            Some(RepositoryType::Local)
+        );
+        assert_eq!(
+            RepositoryType::from_artifactory("proxy"),
+            Some(RepositoryType::Remote)
+        );
+        assert_eq!(
+            RepositoryType::from_artifactory("group"),
+            Some(RepositoryType::Virtual)
+        );
+        // Case-insensitive across the Nexus vocabulary as well.
+        assert_eq!(
+            RepositoryType::from_artifactory("HOSTED"),
+            Some(RepositoryType::Local)
+        );
+        assert_eq!(
+            RepositoryType::from_artifactory("Proxy"),
+            Some(RepositoryType::Remote)
+        );
+        assert_eq!(
+            RepositoryType::from_artifactory("GROUP"),
+            Some(RepositoryType::Virtual)
+        );
     }
 
     #[test]
