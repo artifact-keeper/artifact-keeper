@@ -92,6 +92,24 @@ fi
 
 echo "==> Artifact download returned HTTP $HTTP_CODE"
 
+# Verify packages API shows the uploaded artifact
+echo "==> Verifying package appears in packages API..."
+API_BASE="http://localhost:30080/api/v1"
+PACKAGES_JSON=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" \
+  "$API_BASE/packages?repository_key=test-maven")
+
+if ! echo "$PACKAGES_JSON" | grep -q '"total":1'; then
+  echo "FAIL: Expected 1 package in packages API, got: $PACKAGES_JSON"
+  exit 1
+fi
+
+if ! echo "$PACKAGES_JSON" | grep -q '"name":"test-artifact-native"'; then
+  echo "FAIL: Package 'test-artifact-native' not found in packages API"
+  exit 1
+fi
+
+echo "==> Packages API correctly shows the uploaded artifact"
+
 # Verify maven-metadata.xml
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   "$REGISTRY_URL/com/test/test-artifact-native/maven-metadata.xml")

@@ -28,6 +28,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
 use crate::models::repository::RepositoryType;
+use crate::services::package_service::PackageService;
 
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
@@ -2323,6 +2324,23 @@ async fn upload(
             .bind(&metadata)
             .execute(&state.db)
             .await;
+
+            // Populate packages / package_versions tables (best-effort)
+            let pkg_description = metadata.get("description").and_then(|v| v.as_str());
+            PackageService::new(state.db.clone())
+                .try_create_or_update_from_artifact(
+                    repo.id,
+                    &name,
+                    &coords.version,
+                    size_bytes,
+                    &checksum_sha256,
+                    pkg_description,
+                    Some(serde_json::json!({
+                        "groupId": coords.group_id,
+                        "artifactId": coords.artifact_id,
+                    })),
+                )
+                .await;
         }
     }
 
