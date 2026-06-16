@@ -2166,25 +2166,27 @@ pub async fn list_artifacts(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
-    // For Maven/Gradle, also load the metadata.files arrays so we can
-    // surface POM, sources, javadoc, and other secondary files that the
-    // upload handler groups under one artifact row (#1092). Without this
-    // expansion the listing only sees the primary JAR/WAR and any
-    // secondary files appear "hidden" until a downstream remote proxy
-    // pulls them, at which point the proxy records them as their own
-    // artifact rows.
+    // Legacy Maven/Gradle uploads used to group POM, sources, javadoc, and
+    // other companion files under one artifact row in metadata.files (#1092).
+    // New uploads store each Maven asset as its own `artifacts` row, but keep
+    // this expansion so older repositories remain browsable after upgrade.
     //
-    // Note: `pagination.total` is the number of primary artifact rows,
-    // not the post-expansion item count. The items array therefore
-    // exceeds `per_page` for any page that contains a GAV with grouped
-    // secondary files. Clients that need exact page sizes should call
-    // the grouped-by-component endpoint instead (`group_by=maven_component`).
+    // Note for legacy rows: `pagination.total` is the number of artifact rows,
+    // not the post-expansion item count. The items array can therefore exceed
+    // `per_page` for a page that contains an old GAV-grouped row. Fresh Maven
+    // uploads already have one row per physical asset and do not rely on this
+    // compatibility expansion.
     let maven_files_by_artifact: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
         if is_maven_format {
             load_maven_secondary_files(&state.db, &artifact_ids).await
         } else {
             std::collections::HashMap::new()
         };
+    let listed_maven_paths: std::collections::HashSet<String> = if is_maven_format {
+        artifacts.iter().map(|a| a.path.clone()).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     // For npm-family repos the artifact is stored under the
     // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
@@ -2209,7 +2211,12 @@ pub async fn list_artifacts(
         items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
-            items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
+            items.extend(expand_maven_secondary_files(
+                &artifact,
+                &key,
+                secondary,
+                &listed_maven_paths,
+            ));
         }
     }
 
@@ -2546,15 +2553,16 @@ fn expand_maven_secondary_files(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
     secondary: &[serde_json::Value],
+    listed_paths: &std::collections::HashSet<String>,
 ) -> Vec<ArtifactResponse> {
     let mut out = Vec::new();
     for f in secondary {
         let Some(fpath) = f.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if fpath == artifact.path {
-            // Skip the primary's own entry if it ever made it into the
-            // files array.
+        if fpath == artifact.path || listed_paths.contains(fpath) {
+            // Skip the primary's own entry, and skip legacy metadata entries
+            // once the same path exists as a real artifact row.
             continue;
         }
         let size = f.get("sizeBytes").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -5649,7 +5657,12 @@ mod tests {
                 "sha256": "src-sha",
             }),
         ];
-        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "maven-hosted",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path, "com/example/demo/1.0.0/demo-1.0.0.pom");
         assert_eq!(rows[0].content_type, "text/xml");
@@ -5672,7 +5685,28 @@ mod tests {
             "sizeBytes": 500,
             "sha256": "primary-sha",
         })];
-        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "maven-hosted",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_skips_real_artifact_rows() {
+        let primary = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let real_path = "com/example/demo/1.0.0/demo-1.0.0.pom".to_string();
+        let secondary = vec![serde_json::json!({
+            "path": real_path,
+            "extension": "pom",
+            "sizeBytes": 200,
+            "sha256": "pom-sha",
+        })];
+        let listed_paths = std::collections::HashSet::from([real_path]);
+        let rows =
+            expand_maven_secondary_files(&primary, "maven-hosted", &secondary, &listed_paths);
         assert!(rows.is_empty());
     }
 
@@ -5685,7 +5719,12 @@ mod tests {
             serde_json::json!({"extension": "pom", "sizeBytes": 100}),
             serde_json::json!({"path": "p/demo.pom", "extension": "pom"}),
         ];
-        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "k",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "p/demo.pom");
     }
@@ -5694,7 +5733,12 @@ mod tests {
     fn test_expand_maven_secondary_files_handles_missing_size_and_sha() {
         let primary = make_artifact_for_test("p/demo.jar");
         let secondary = vec![serde_json::json!({"path": "p/demo.pom", "extension": "pom"})];
-        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "k",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows[0].size_bytes, 0);
         assert_eq!(rows[0].checksum_sha256, "");
     }

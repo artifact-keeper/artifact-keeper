@@ -42,7 +42,9 @@ impl PackageService {
         metadata: Option<JsonValue>,
     ) -> anyhow::Result<Uuid> {
         // Keep one package row per repository/name and let that row reflect
-        // the latest known version.
+        // the latest known version. The row's size is synchronized after the
+        // deterministic `package_versions` upsert below so multi-asset package
+        // formats do not depend on upload or replication order.
         let inserted: Option<(Uuid,)> = sqlx::query_as(
             r#"
             INSERT INTO packages (repository_id, name, version, description, size_bytes, metadata)
@@ -60,8 +62,8 @@ impl PackageService {
         .fetch_optional(&self.db)
         .await?;
 
-        let package_id = if let Some((package_id,)) = inserted {
-            package_id
+        let (package_id, should_update_package_row) = if let Some((package_id,)) = inserted {
+            (package_id, true)
         } else {
             let existing: (Uuid, String) = sqlx::query_as(
                 r#"
@@ -75,44 +77,13 @@ impl PackageService {
             .fetch_one(&self.db)
             .await?;
 
-            if version_compare(version, &existing.1) >= 0 {
-                sqlx::query(
-                    r#"
-                    UPDATE packages
-                    SET version = $2,
-                        description = COALESCE($3, description),
-                        size_bytes = $4,
-                        metadata = COALESCE($5, metadata),
-                        updated_at = NOW()
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(existing.0)
-                .bind(version)
-                .bind(description)
-                .bind(size_bytes)
-                .bind(&metadata)
-                .execute(&self.db)
-                .await?;
-            } else {
-                sqlx::query(
-                    r#"
-                    UPDATE packages
-                    SET updated_at = NOW()
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(existing.0)
-                .execute(&self.db)
-                .await?;
-            }
-
-            existing.0
+            (existing.0, version_compare(version, &existing.1) >= 0)
         };
 
-        // Keep `package_versions` deterministic when a package format (PyPI in
-        // particular) publishes multiple distributions for the same version.
-        // Different peers may process wheel/sdist artifacts in different
+        // Keep `package_versions` deterministic when a package format
+        // publishes multiple physical assets for the same version. Different
+        // peers may process Maven JAR/POM/module/classifier files or PyPI
+        // wheel/sdist artifacts in different
         // orders during replication recovery, so "last writer wins" makes
         // otherwise-equivalent repositories diverge at the DB row level.
         sqlx::query(
@@ -132,6 +103,42 @@ impl PackageService {
         .bind(checksum_sha256)
         .execute(&self.db)
         .await?;
+
+        if should_update_package_row {
+            sqlx::query(
+                r#"
+                UPDATE packages
+                SET version = $2,
+                    description = COALESCE($3, description),
+                    size_bytes = (
+                        SELECT pv.size_bytes
+                        FROM package_versions pv
+                        WHERE pv.package_id = packages.id
+                          AND pv.version = $2
+                    ),
+                    metadata = COALESCE($4, metadata),
+                    updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(package_id)
+            .bind(version)
+            .bind(description)
+            .bind(&metadata)
+            .execute(&self.db)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE packages
+                SET updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(package_id)
+            .execute(&self.db)
+            .await?;
+        }
 
         Ok(package_id)
     }
@@ -239,6 +246,82 @@ mod tests {
         assert!(should_replace_package_version("aaaa", 500, "aaaa", 100));
         assert!(!should_replace_package_version("aaaa", 100, "aaaa", 500));
         assert!(!should_replace_package_version("aaaa", 100, "aaaa", 100));
+    }
+
+    #[tokio::test]
+    async fn test_package_size_tracks_deterministic_version_representative() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "multi-asset-package";
+        let version = "1.0.0";
+        let checksum_b = "b".repeat(64);
+        let checksum_a = "a".repeat(64);
+        let checksum_c = "c".repeat(64);
+
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id,
+                package,
+                version,
+                900,
+                &checksum_b,
+                None,
+                None,
+            )
+            .await
+            .expect("insert first representative");
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id,
+                package,
+                version,
+                300,
+                &checksum_a,
+                None,
+                None,
+            )
+            .await
+            .expect("replace with lower checksum representative");
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id,
+                package,
+                version,
+                100,
+                &checksum_c,
+                None,
+                None,
+            )
+            .await
+            .expect("ignore later non-representative asset");
+
+        let row: (i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT p.size_bytes, pv.size_bytes, pv.checksum_sha256
+            FROM packages p
+            JOIN package_versions pv ON pv.package_id = p.id
+            WHERE p.repository_id = $1
+              AND p.name = $2
+              AND pv.version = $3
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .bind(version)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("query deterministic package representative");
+
+        fx.teardown().await;
+
+        assert_eq!(row.0, 300);
+        assert_eq!(row.1, 300);
+        assert_eq!(row.2, checksum_a);
     }
 
     // -----------------------------------------------------------------------
