@@ -310,6 +310,38 @@ fn extract_streaming_headers(
     (content_type, etag, content_length)
 }
 
+/// Whether a freshly streamed proxy-cache write should be committed or
+/// rejected. A rejected object is deleted (and its metadata sidecar skipped)
+/// so the next request refetches upstream and self-heals.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamWriteOutcome {
+    /// Write is good; persist the metadata sidecar.
+    Commit,
+    /// Zero-byte body — never cache it (#1365).
+    RejectEmpty,
+    /// Bytes written disagree with the upstream `Content-Length`, i.e. the
+    /// stream was truncated/interrupted mid-body. Committing it would poison
+    /// the cache and serve a corrupt archive (#1912).
+    RejectTruncated { expected: u64, actual: u64 },
+}
+
+/// Classify a completed streaming cache write. `expected_len` is the upstream
+/// `Content-Length` when known; truncation is only enforced when it is present
+/// (a chunked/auto-decompressed response strips it, so we cannot validate and
+/// must not falsely reject).
+fn classify_stream_write(bytes_written: u64, expected_len: Option<u64>) -> StreamWriteOutcome {
+    if bytes_written == 0 {
+        return StreamWriteOutcome::RejectEmpty;
+    }
+    match expected_len {
+        Some(expected) if bytes_written != expected => StreamWriteOutcome::RejectTruncated {
+            expected,
+            actual: bytes_written,
+        },
+        _ => StreamWriteOutcome::Commit,
+    }
+}
+
 /// Decide whether to emit a "scan-on-proxy is configured but did not run"
 /// warning for a freshly cached upstream artifact.
 ///
@@ -1076,6 +1108,7 @@ impl CachePersister {
         cache_key: String,
         metadata_key: String,
         template: CacheMetadataTemplate,
+        expected_len: Option<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
         let storage = Arc::clone(&self.storage);
 
@@ -1101,85 +1134,102 @@ impl CachePersister {
                 .await;
 
             match put_result {
-                Ok(result) if result.bytes_written == 0 => {
-                    // #1618 S9 / #1365: never cache a zero-byte body. A
-                    // Maven client resolving dependencies can drive an
-                    // upstream response with no body (a 204, a 200 with
-                    // `Content-Length: 0`, or a HEAD-style probe that
-                    // reaches the streaming download path), and the upstream
-                    // POM/JAR is non-empty. Writing the metadata sidecar
-                    // here would mark the empty object as a fresh,
-                    // non-expired cache hit; the next GET would then serve
-                    // `Content-Length: 0`, and Gradle fails parsing the POM
-                    // with "Content is not allowed in prolog." Skip the
-                    // sidecar so the entry is treated as a miss, and delete
-                    // the empty object we just wrote so a later GET
-                    // re-fetches the real body from upstream (self-heal).
-                    // The buffered sibling [`Self::write_buffered`] applies
-                    // the same guard before the content write.
-                    tracing::warn!(
-                        cache_key = %cache_key_for_writer,
-                        "proxy upstream returned an empty body; not caching the zero-byte \
-                         object (no metadata sidecar) so the next request refetches upstream"
-                    );
-                    if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                        tracing::debug!(
-                            cache_key = %cache_key_for_writer,
-                            error = %e,
-                            "best-effort delete of empty proxy-cache object failed; \
-                             the missing metadata sidecar still forces a refetch"
-                        );
-                    }
-                }
-                Ok(result) => {
-                    let now = Utc::now();
-                    // #1618 S9 / #1051: pin the storage backend's ETag at
-                    // write time so the fast path can re-HEAD on each hit
-                    // and detect tampering / backend-side replacement. See
-                    // [`pin_storage_etag`] for the best-effort semantics on
-                    // backends without an ETag concept or on transport
-                    // error.
-                    let storage_etag =
-                        pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
-                    let metadata = CacheMetadata {
-                        cached_at: now,
-                        upstream_etag: template.etag,
-                        storage_etag,
-                        last_modified: template.last_modified,
-                        negative_cached_until: None,
-                        // The streaming leader refuses to open upstream at all
-                        // while the repo's Package Age Policy is enabled
-                        // (#1770), so a tee'd entry is never under a hold.
-                        quarantine_until: None,
-                        expires_at: now + chrono::Duration::seconds(template.ttl_secs),
-                        content_type: template.content_type,
-                        size_bytes: result.bytes_written as i64,
-                        checksum_sha256: result.checksum_sha256,
-                    };
-                    match serde_json::to_vec(&metadata) {
-                        Ok(json) => {
-                            // #1618 S9: sidecar written second, after the
-                            // streaming content write (put_stream) above.
-                            if let Err(e) =
-                                storage_clone.put(&metadata_key, Bytes::from(json)).await
-                            {
+                Ok(result) => match classify_stream_write(result.bytes_written, expected_len) {
+                    StreamWriteOutcome::Commit => {
+                        let now = Utc::now();
+                        // #1618 S9 / #1051: pin the storage backend's ETag at
+                        // write time so the fast path can re-HEAD on each hit
+                        // and detect tampering / backend-side replacement. See
+                        // [`pin_storage_etag`] for the best-effort semantics on
+                        // backends without an ETag concept or on transport
+                        // error.
+                        let storage_etag =
+                            pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
+                        let metadata = CacheMetadata {
+                            cached_at: now,
+                            upstream_etag: template.etag,
+                            storage_etag,
+                            last_modified: template.last_modified,
+                            negative_cached_until: None,
+                            // The streaming leader refuses to open upstream at all
+                            // while the repo's Package Age Policy is enabled
+                            // (#1770), so a tee'd entry is never under a hold.
+                            quarantine_until: None,
+                            expires_at: now + chrono::Duration::seconds(template.ttl_secs),
+                            content_type: template.content_type,
+                            size_bytes: result.bytes_written as i64,
+                            checksum_sha256: result.checksum_sha256,
+                        };
+                        match serde_json::to_vec(&metadata) {
+                            Ok(json) => {
+                                // #1618 S9: sidecar written second, after the
+                                // streaming content write (put_stream) above.
+                                if let Err(e) =
+                                    storage_clone.put(&metadata_key, Bytes::from(json)).await
+                                {
+                                    tracing::warn!(
+                                        cache_key = %cache_key_for_writer,
+                                        metadata_key = %metadata_key,
+                                        error = %e,
+                                        "proxy cache metadata sidecar write failed; cache will refetch next request"
+                                    );
+                                }
+                            }
+                            Err(e) => {
                                 tracing::warn!(
                                     cache_key = %cache_key_for_writer,
-                                    metadata_key = %metadata_key,
                                     error = %e,
-                                    "proxy cache metadata sidecar write failed; cache will refetch next request"
+                                    "proxy cache metadata JSON serialization failed"
                                 );
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
+                    }
+                    rejected => {
+                        // Reject path for both guards (#1365 empty, #1912
+                        // truncated): writing a sidecar would mark a corrupt
+                        // object as a fresh cache hit. An empty body (a 204, a
+                        // 200 with `Content-Length: 0`, or a HEAD-style probe
+                        // reaching the download path) would serve
+                        // `Content-Length: 0` (e.g. Gradle fails parsing the
+                        // POM: "Content is not allowed in prolog."); a truncated
+                        // body (stream cut mid-download below the advertised
+                        // `Content-Length`) would serve a short, SHA-mismatched
+                        // blob and clients hit "unexpected BufError" extracting
+                        // the archive. Skip the sidecar (entry treated as a
+                        // miss) and delete the bad object so a later GET
+                        // refetches upstream (self-heal). The buffered sibling
+                        // [`Self::write_buffered`] applies the empty-body guard
+                        // before the content write.
+                        match rejected {
+                            StreamWriteOutcome::RejectTruncated { expected, actual } => {
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    expected_bytes = expected,
+                                    written_bytes = actual,
+                                    "proxy upstream body was truncated (written != Content-Length); \
+                                     not caching the partial object (no metadata sidecar) so the \
+                                     next request refetches upstream"
+                                );
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    "proxy upstream returned an empty body; not caching the \
+                                     zero-byte object (no metadata sidecar) so the next request \
+                                     refetches upstream"
+                                );
+                            }
+                        }
+                        if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                            tracing::debug!(
                                 cache_key = %cache_key_for_writer,
                                 error = %e,
-                                "proxy cache metadata JSON serialization failed"
+                                "best-effort delete of rejected proxy-cache object failed; \
+                                 the missing metadata sidecar still forces a refetch"
                             );
                         }
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(
                         cache_key = %cache_key_for_writer,
@@ -2508,6 +2558,7 @@ impl ProxyService {
                 last_modified: None,
                 ttl_secs: cache_ttl,
             },
+            upstream.content_length,
         );
 
         Ok(StreamHandle { body, headers })
@@ -6312,7 +6363,7 @@ SHA256:
         metadata_key: String,
         template: CacheMetadataTemplate,
     ) -> BoxStream<'static, Result<Bytes>> {
-        CachePersister::new(storage).tee_stream(upstream, cache_key, metadata_key, template)
+        CachePersister::new(storage).tee_stream(upstream, cache_key, metadata_key, template, None)
     }
 
     fn template() -> CacheMetadataTemplate {
@@ -6447,6 +6498,119 @@ SHA256:
             backend.deletes.lock().await.as_slice(),
             ["cache-key".to_string()],
             "the empty cache object must be deleted so the next request refetches"
+        );
+    }
+
+    #[test]
+    fn test_classify_stream_write_rejects_empty() {
+        assert_eq!(
+            classify_stream_write(0, None),
+            StreamWriteOutcome::RejectEmpty
+        );
+        assert_eq!(
+            classify_stream_write(0, Some(10)),
+            StreamWriteOutcome::RejectEmpty
+        );
+    }
+
+    #[test]
+    fn test_classify_stream_write_commits_when_length_unknown_or_matching() {
+        assert_eq!(classify_stream_write(11, None), StreamWriteOutcome::Commit);
+        assert_eq!(
+            classify_stream_write(11, Some(11)),
+            StreamWriteOutcome::Commit
+        );
+    }
+
+    #[test]
+    fn test_classify_stream_write_rejects_size_mismatch() {
+        assert_eq!(
+            classify_stream_write(11, Some(100)),
+            StreamWriteOutcome::RejectTruncated {
+                expected: 100,
+                actual: 11,
+            }
+        );
+        // A body longer than advertised is equally corrupt; reject it too.
+        assert_eq!(
+            classify_stream_write(120, Some(100)),
+            StreamWriteOutcome::RejectTruncated {
+                expected: 100,
+                actual: 120,
+            }
+        );
+    }
+
+    /// #1912 regression: a truncated upstream body (bytes written < the
+    /// advertised `Content-Length`) must NOT be cached. Committing it would
+    /// serve a short, SHA-mismatched archive on the next GET and clients hit
+    /// "unexpected BufError" extracting it. The writer must skip the metadata
+    /// sidecar and delete the partial object so the next request refetches.
+    #[tokio::test]
+    async fn test_tee_truncated_upstream_is_not_cached() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        // Upstream advertises 100 bytes but only delivers 11.
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+            Some(100),
+        );
+
+        let mut total: usize = 0;
+        while let Some(chunk) = client.next().await {
+            total += chunk.unwrap().len();
+        }
+        assert_eq!(
+            total, 11,
+            "client still receives the (truncated) body it got"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "truncated upstream body MUST NOT write a metadata sidecar (#1912)"
+        );
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "the truncated cache object must be deleted so the next request refetches"
+        );
+    }
+
+    /// A complete streamed body whose byte count matches the advertised
+    /// `Content-Length` is cached normally — the #1912 guard does not fire on
+    /// well-formed responses.
+    #[tokio::test]
+    async fn test_tee_complete_upstream_with_matching_length_is_cached() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+            Some(11),
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a complete body with a matching Content-Length writes its sidecar"
+        );
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "a complete body must not be deleted"
         );
     }
 
