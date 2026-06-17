@@ -174,15 +174,16 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 /// The DB columns (`password_changed_at`, `totp_verified_at`, `updated_at`)
 /// remain the source of truth across replicas.
 ///
-/// Boundary (regression of #931, fixed by #1436): the replica-safe path in
-/// `is_token_invalidated_replica_safe` compares with strict `<` (#1265),
-/// not `<=`. A JWT minted in the same wall-clock second as the password
-/// change would otherwise survive: `iat == watermark` makes `iat < watermark`
-/// false. We write `now + 1` so any token with `iat <= now` is rejected.
-/// The sync map at `is_token_invalidated` uses `<=` so the `+1` does not
-/// double-count there.
+/// The watermark is set to `Utc::now().timestamp()` (no offset), matching
+/// the DB path precision. The replica-safe path uses strict `<` so a token
+/// minted in the same wall-clock second as the invalidation (`iat == watermark`)
+/// survives — this is the OIDC login case where `generate_tokens` runs
+/// immediately after `invalidate_user_tokens` in the same request.
+/// Tokens from strictly before the invalidation (`iat < watermark`) are
+/// rejected. The sync map at `is_token_invalidated` uses `<=` and catches
+/// same-second tokens there.
 pub fn invalidate_user_tokens(user_id: Uuid) {
-    let watermark = Utc::now().timestamp().saturating_add(1);
+    let watermark = Utc::now().timestamp();
     invalidate_user_tokens_at(user_id, watermark);
 }
 
@@ -3539,11 +3540,11 @@ mod tests {
     fn test_token_issued_after_invalidation_is_accepted() {
         let user_id = Uuid::new_v4();
         invalidate_user_tokens(user_id);
-        // Watermark is `now + 1` (#1436 fix) so the sync `<=` map rejects
-        // every iat <= now+1. We bump the test "after" to `now + 2` to
+        // Watermark is `now` (no offset) so the sync `<=` map rejects
+        // every iat <= now. We bump the test "after" to `now + 1` to
         // represent a JWT minted at least one whole second after the
         // invalidation completed.
-        let after = Utc::now().timestamp() + 2;
+        let after = Utc::now().timestamp() + 1;
         assert!(!is_token_invalidated(user_id, after));
     }
 
@@ -3561,8 +3562,9 @@ mod tests {
         // Slight delay so second invalidation gets a newer timestamp
         std::thread::sleep(std::time::Duration::from_millis(10));
         invalidate_user_tokens(user_id);
-        // Same `+2` rationale as test_token_issued_after_invalidation_is_accepted.
-        let after = Utc::now().timestamp() + 2;
+        // Watermark is `now` (no offset). Use `+1` to represent a token
+        // minted strictly after the invalidation.
+        let after = Utc::now().timestamp() + 1;
         // Token issued before second invalidation is still rejected
         assert!(is_token_invalidated(user_id, mid - 1));
         // Token issued after second invalidation is accepted
@@ -3711,13 +3713,53 @@ mod tests {
         invalidate_user_tokens(user.id);
 
         // A token minted at least one whole second after the invalidation.
-        // The watermark is `now + 1` (#1436), so `now + 2` is strictly newer.
-        let post_change_iat = Utc::now().timestamp() + 2;
+        // The watermark is `now`, so `now + 1` is strictly newer.
+        let post_change_iat = Utc::now().timestamp() + 1;
         let post_change_token = mint_access_token_at(&cfg, &user, post_change_iat);
 
         assert!(
             service.validate_access_token(&post_change_token).is_ok(),
             "a token minted after the credential change MUST be accepted"
+        );
+    }
+
+    /// Regression test for #1911: OIDC login self-invalidation race condition.
+    ///
+    /// The `authenticate_federated` flow calls `apply_role_mapping` (which
+    /// calls `invalidate_user_tokens` on privilege change) immediately before
+    /// `generate_tokens`. Without the fix, the `+1` watermark offset caused
+    /// the freshly-minted JWT to be rejected by `is_token_invalidated_replica_safe`
+    /// for up to `CREDENTIAL_DB_CACHE_TTL_SECS` (5 s).
+    ///
+    /// Uses the lazy (never-connected) pool — the in-memory cache populated
+    /// by `invalidate_user_tokens` serves the watermark without a DB round-trip.
+    #[tokio::test]
+    async fn test_oidc_login_token_not_self_invalidated() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // Step 1: simulate apply_role_mapping → invalidate_user_tokens
+        invalidate_user_tokens(user.id);
+
+        // Step 2: simulate generate_tokens immediately after (same wall-clock second)
+        let now = Utc::now().timestamp();
+        let token = mint_access_token_at(&cfg, &user, now);
+
+        // The replica-safe async path (HTTP auth middleware) must accept this token.
+        let result = service.validate_access_token_async(&token).await;
+        assert!(
+            result.is_ok(),
+            "OIDC login token must not self-invalidate: {:?}",
+            result.err(),
+        );
+
+        // Pre-existing tokens (iat before invalidation) must still be rejected.
+        let old_iat = now - 10;
+        let old_token = mint_access_token_at(&cfg, &user, old_iat);
+        let old_result = service.validate_access_token_async(&old_token).await;
+        assert!(
+            old_result.is_err(),
+            "pre-invalidation token must be rejected"
         );
     }
 
