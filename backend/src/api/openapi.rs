@@ -13,7 +13,7 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "Artifact Keeper API",
         description = "Enterprise artifact registry supporting 45+ package formats.",
-        version = "1.0.0-rc.3",
+        version = "1.2.1",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
