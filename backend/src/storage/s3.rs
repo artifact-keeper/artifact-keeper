@@ -3836,4 +3836,64 @@ mod integration_tests {
             .expect("Failed to delete test file");
         println!("Test complete");
     }
+
+    /// #1555 live: the proxy-cache handle (env-derived config with prefix
+    /// forced to None, as `StorageService::from_config` builds it) must put,
+    /// presign, and serve a `proxy-cache/...` key at the bucket root with NO
+    /// `S3_PREFIX`. Run with:
+    ///   AK_S3_E2E=1 S3_BUCKET=<test> S3_REGION=us-east-1 S3_REDIRECT_DOWNLOADS=true \
+    ///   cargo test -p artifact-keeper-backend test_proxy_cache_presign_no_prefix_live_1555 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_proxy_cache_presign_no_prefix_live_1555() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        // Mirror from_config's proxy-cache handle: env-derived config, prefix=None.
+        let mut config = S3Config::from_env().expect("S3Config::from_env");
+        config.prefix = None;
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        assert!(
+            StorageBackendTrait::supports_redirect(&backend),
+            "S3_REDIRECT_DOWNLOADS must be true for this test"
+        );
+
+        let key = "proxy-cache/pypi-remote/simple/foo/foo-1.0-py3-none-any.whl/__content__";
+        let body = Bytes::from_static(b"hello-presign-1555");
+        StorageBackendTrait::put(&backend, key, body.clone())
+            .await
+            .expect("put no-prefix proxy-cache object");
+
+        let pre = StorageBackendTrait::get_presigned_url(&backend, key, Duration::from_secs(300))
+            .await
+            .expect("get_presigned_url ok")
+            .expect("presigned URL present");
+        println!("presigned url: {}", pre.url);
+
+        assert!(
+            pre.url.contains("/proxy-cache/pypi-remote/simple/foo/"),
+            "URL must carry the verbatim no-prefix key: {}",
+            pre.url
+        );
+        assert!(
+            !pre.url.contains("artifact-keeper"),
+            "URL must NOT carry a global prefix (#1555): {}",
+            pre.url
+        );
+
+        let resp = reqwest::get(&pre.url).await.expect("GET presigned URL");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "S3 must serve AK's presigned no-prefix URL"
+        );
+        let got = resp.bytes().await.expect("body");
+        assert_eq!(&got[..], &body[..], "served bytes must match");
+
+        let _ = StorageBackendTrait::delete(&backend, key).await;
+        println!("#1555 no-prefix presign live test OK");
+    }
 }
