@@ -4007,6 +4007,25 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
     )
 }
 
+/// HTTP 451 JSON body when a package version is blocked by the age gate with no LKG.
+pub fn age_gate_blocked_body(
+    review_id: uuid::Uuid,
+    package: &str,
+    version: &str,
+    min_age_days: i32,
+    requested_age_days: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "age_gate_blocked",
+        "review_id": review_id,
+        "package": package,
+        "version": version,
+        "min_age_days": min_age_days,
+        "requested_age_days": requested_age_days,
+        "message": "Package version is younger than the configured age threshold and is pending review"
+    })
+}
+
 /// HTTP 451 response when a package version is blocked by the age gate with no LKG.
 pub fn age_gate_blocked_response(
     review_id: uuid::Uuid,
@@ -4015,15 +4034,13 @@ pub fn age_gate_blocked_response(
     min_age_days: i32,
     requested_age_days: Option<i64>,
 ) -> Response {
-    let body = serde_json::json!({
-        "error": "age_gate_blocked",
-        "review_id": review_id,
-        "package": package,
-        "version": version,
-        "min_age_days": min_age_days,
-        "requested_age_days": requested_age_days,
-        "message": "Package version is younger than the configured age threshold and is pending review"
-    });
+    let body = age_gate_blocked_body(
+        review_id,
+        package,
+        version,
+        min_age_days,
+        requested_age_days,
+    );
     (
         StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -8802,5 +8819,35 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn age_gate_params_maps_remote_npm_repo() {
+        let info = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "npm-remote".to_string(),
+            storage_path: "/data".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            format: "npm".to_string(),
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            age_gate_enabled: true,
+            age_gate_min_age_days: 14,
+        };
+        let params = age_gate_params(&info);
+        assert!(params.age_gate_enabled);
+        assert_eq!(params.age_gate_min_age_days, 14);
+        assert_eq!(params.key, "npm-remote");
+    }
+
+    #[test]
+    fn age_gate_blocked_body_fields() {
+        let id = uuid::Uuid::new_v4();
+        let body = age_gate_blocked_body(id, "lodash", "4.0.0", 7, Some(2));
+        assert_eq!(body["error"], "age_gate_blocked");
+        assert_eq!(body["review_id"], id.to_string());
+        assert_eq!(body["package"], "lodash");
+        assert_eq!(body["min_age_days"], 7);
+        assert_eq!(body["requested_age_days"], 2);
     }
 }

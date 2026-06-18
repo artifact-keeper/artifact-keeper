@@ -1215,6 +1215,18 @@ async fn download_or_metadata(
     serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref()).await
 }
 
+fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
+    artifact_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(artifact_path)
+        .to_string()
+}
+
+fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> String {
+    format!("simple/{}/{}", normalized_project, filename)
+}
+
 async fn apply_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1256,13 +1268,9 @@ async fn apply_pypi_download_age_gate(
         AgeGateDecision::Block {
             review_id: _,
             last_known_good: Some(lkg),
-        } => Ok(Some(
-            lkg.artifact_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&lkg.artifact_path)
-                .to_string(),
-        )),
+        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
+            &lkg.artifact_path,
+        ))),
         AgeGateDecision::Block {
             review_id,
             last_known_good: None,
@@ -1318,7 +1326,8 @@ async fn serve_file(
                     if let Some(lkg_filename) =
                         apply_pypi_download_age_gate(state, repo, project, filename).await?
                     {
-                        let lkg_cache_path = format!("simple/{}/{}", normalized, lkg_filename);
+                        let lkg_cache_path =
+                            build_pypi_proxy_cache_path(&normalized, &lkg_filename);
                         if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                             proxy,
                             repo.id,
@@ -1348,8 +1357,7 @@ async fn serve_file(
                     // already cached from a previous request. Streamed straight
                     // from storage (#895): buffering cached multi-hundred-MiB
                     // wheels per request OOM-killed memory-constrained pods.
-                    let normalized = PypiHandler::normalize_name(project);
-                    let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                    let local_cache_path = build_pypi_proxy_cache_path(&normalized, filename);
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
@@ -1486,7 +1494,8 @@ async fn serve_file(
                             // simple index from upstream when the file is already
                             // cached from a previous request through this member.
                             let normalized = PypiHandler::normalize_name(project);
-                            let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                            let local_cache_path =
+                                build_pypi_proxy_cache_path(&normalized, filename);
 
                             // #1555: redirect to a presigned URL on a fresh
                             // cache hit before falling back to streaming.
@@ -2761,6 +2770,22 @@ mod tests {
     // -----------------------------------------------------------------------
     // pypi_upstream_url_and_path (#1130)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn pypi_lkg_filename_from_artifact_path_takes_basename() {
+        assert_eq!(
+            pypi_lkg_filename_from_artifact_path("pkg/1.0.0/wheel.whl"),
+            "wheel.whl"
+        );
+    }
+
+    #[test]
+    fn build_pypi_proxy_cache_path_format() {
+        assert_eq!(
+            build_pypi_proxy_cache_path("requests", "requests-2.31.0.tar.gz"),
+            "simple/requests/requests-2.31.0.tar.gz"
+        );
+    }
 
     #[test]
     fn test_pypi_upstream_strips_trailing_simple() {
