@@ -1545,13 +1545,20 @@ async fn pypi_proxy_cache_redirect(
     if !state.config.presigned_downloads_enabled {
         return None;
     }
+    // #1555: resolve the no-prefix presign handle and confirm redirect support
+    // BEFORE the `is_cache_fresh` probe — the probe loads the cache-meta
+    // sidecar, so we avoid a wasted S3 GET when we can't redirect anyway (the
+    // streaming fallback re-reads the same sidecar).
+    let storage = proxy.cache_storage_backend();
+    if !storage.supports_redirect() {
+        return None;
+    }
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
     let cache_key =
         crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, cache_path)
             .ok()?;
-    let storage = proxy.cache_storage_backend()?;
     let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
     proxy_helpers::try_proxy_cache_redirect(
         storage.as_ref(),

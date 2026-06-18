@@ -2029,10 +2029,10 @@ impl ProxyService {
     /// this handle — the same one `is_cache_fresh` and the cache reads/writes
     /// use — so the signed key matches where the object actually lives. Signing
     /// via a prefixed handle yields a key the object store has no object for.
-    pub fn cache_storage_backend(
+    pub(crate) fn cache_storage_backend(
         &self,
-    ) -> Option<std::sync::Arc<dyn crate::storage::StorageBackend>> {
-        self.storage.presign_backend()
+    ) -> std::sync::Arc<dyn crate::services::storage_service::StorageBackend> {
+        self.storage.backend()
     }
 
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {

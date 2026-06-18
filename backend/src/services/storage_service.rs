@@ -54,6 +54,27 @@ pub trait StorageBackend: Send + Sync {
     /// Delete content by key
     async fn delete(&self, key: &str) -> Result<()>;
 
+    /// Whether this backend can issue presigned download URLs. Default `false`
+    /// so filesystem and test backends opt out. The S3/GCS wrappers forward
+    /// to the inner backend, making presign capability type-enforced on the
+    /// single backend handle (#1555) instead of a side-channel field.
+    fn supports_redirect(&self) -> bool {
+        false
+    }
+
+    /// Get a presigned URL for direct download, or `Ok(None)` when the backend
+    /// does not support presigning. Default returns `None`; the S3/GCS wrappers
+    /// forward to the inner backend. Proxy-cache presigns go through this so the
+    /// signed key matches the no-prefix cache layout (#1555).
+    async fn get_presigned_url(
+        &self,
+        key: &str,
+        expires_in: std::time::Duration,
+    ) -> Result<Option<crate::storage::PresignedUrl>> {
+        let _ = (key, expires_in);
+        Ok(None)
+    }
+
     /// List keys with optional prefix
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>>;
 
@@ -347,8 +368,10 @@ impl StorageBackend for FilesystemBackend {
 
 /// Generate a StorageBackend wrapper that delegates to an inner backend.
 ///
-/// Both the `crate::storage::StorageBackend` trait (put/get/exists/delete) and
-/// the extended methods (list/copy/size) are forwarded to the inner type.
+/// Forwards the core `crate::storage::StorageBackend` methods
+/// (put/get/exists/delete), the extended methods (list/copy/size), and the
+/// presign capability (supports_redirect/get_presigned_url, #1555) to the
+/// inner type — so the facade handle is presign-capable when the inner is.
 macro_rules! impl_storage_wrapper {
     ($wrapper:ident, $inner_ty:ty) => {
         #[async_trait]
@@ -367,6 +390,23 @@ macro_rules! impl_storage_wrapper {
             }
             async fn delete(&self, key: &str) -> Result<()> {
                 crate::storage::StorageBackend::delete(self.inner.as_ref(), key).await
+            }
+            // Presign capability forwarded from the inner backend (#1555) so a
+            // single facade handle carries it — no parallel side-channel field.
+            fn supports_redirect(&self) -> bool {
+                crate::storage::StorageBackend::supports_redirect(self.inner.as_ref())
+            }
+            async fn get_presigned_url(
+                &self,
+                key: &str,
+                expires_in: std::time::Duration,
+            ) -> Result<Option<crate::storage::PresignedUrl>> {
+                crate::storage::StorageBackend::get_presigned_url(
+                    self.inner.as_ref(),
+                    key,
+                    expires_in,
+                )
+                .await
             }
             async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
                 self.inner.list(prefix).await
@@ -404,9 +444,10 @@ macro_rules! impl_storage_wrapper {
 
 /// S3 storage backend (wrapper for integration with StorageService).
 ///
-/// Holds the inner backend behind an `Arc` so the same no-prefix object can
-/// also be handed out as a presign-capable `crate::storage::StorageBackend`
-/// (see `StorageService::presign_backend`).
+/// Forwards the facade `StorageBackend` trait — including `supports_redirect`
+/// and `get_presigned_url` — to the inner S3 backend, so the single facade
+/// handle carries presign capability (built with `prefix = None` for the
+/// proxy cache; #1555).
 pub struct S3BackendWrapper {
     inner: Arc<crate::storage::s3::S3Backend>,
 }
@@ -426,53 +467,54 @@ impl_storage_wrapper!(GcsBackendWrapper, crate::storage::gcs::GcsBackend);
 
 /// Storage service facade
 pub struct StorageService {
-    backend: Arc<dyn StorageBackend>,
-    /// Presign-capable view of the same underlying object store, when the
-    /// backend supports it (S3/GCS). `None` for filesystem and test backends.
+    /// Single backend handle. Presign capability is type-enforced on this
+    /// facade trait (`supports_redirect` / `get_presigned_url`), forwarded by
+    /// `impl_storage_wrapper!` from the inner S3/GCS backend (#1555). No
+    /// parallel side-channel field, so no call site can silently get a
+    /// non-presigning handle.
     ///
-    /// This is the concrete `crate::storage::StorageBackend` (the trait that
-    /// carries `get_presigned_url`), not the facade trait above. Proxy-cache
-    /// presigns must use THIS handle so the signed key matches the no-prefix
-    /// layout the proxy cache writes (#1555).
-    presign_backend: Option<Arc<dyn crate::storage::StorageBackend>>,
+    /// For S3 the inner backend is built with `prefix = None` so the signed
+    /// key matches the no-prefix layout the proxy cache writes.
+    backend: Arc<dyn StorageBackend>,
 }
 
 impl StorageService {
     /// Create storage service from config
     pub async fn from_config(config: &Config) -> Result<Self> {
-        let (backend, presign_backend): (
-            Arc<dyn StorageBackend>,
-            Option<Arc<dyn crate::storage::StorageBackend>>,
-        ) = match config.storage_backend.as_str() {
+        let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
             "filesystem" => {
                 let path = PathBuf::from(&config.storage_path);
                 fs::create_dir_all(&path).await?;
-                (Arc::new(FilesystemBackend::new(path)), None)
+                Arc::new(FilesystemBackend::new(path))
             }
             "s3" => {
-                let s3_config = crate::storage::s3::S3Config::new(
-                    config.s3_bucket.clone().unwrap_or_default(),
-                    config
-                        .s3_region
-                        .clone()
-                        .unwrap_or_else(|| "us-east-1".to_string()),
-                    config.s3_endpoint.clone(),
-                    None, // No prefix: proxy-cache content lives at the bucket root.
-                );
+                // Build the proxy-cache S3 backend from the SAME env-derived
+                // config the primary storage uses (redirect_downloads, presign
+                // creds, CloudFront, path_format, TLS, pool tuning), then force
+                // the key prefix to None. Proxy-cache content lives at the
+                // bucket root (`proxy-cache/...`), not under S3_PREFIX, so the
+                // signed key must carry no prefix. Reusing from_env() (instead
+                // of S3Config::new, which hardcodes redirect_downloads=false and
+                // no presign creds) is what makes presigning actually fire on
+                // this handle (#1555).
+                let mut s3_config = crate::storage::s3::S3Config::from_env()?;
+                s3_config.prefix = None;
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
-                let wrapper = Arc::new(S3BackendWrapper {
-                    inner: Arc::clone(&inner),
-                });
-                (wrapper, Some(inner))
+                Arc::new(S3BackendWrapper { inner })
             }
             "gcs" => {
                 let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
                 let inner = Arc::new(crate::storage::gcs::GcsBackend::new(gcs_config).await?);
-                let wrapper = Arc::new(GcsBackendWrapper {
-                    inner: Arc::clone(&inner),
-                });
-                (wrapper, Some(inner))
+                Arc::new(GcsBackendWrapper { inner })
             }
+            // TODO(#1555): Azure has no arm here. main.rs builds an Azure
+            // primary backend, but this facade has no AzureBackendWrapper
+            // (the `impl_storage_wrapper!` macro forwards inherent
+            // list/copy/size, which AzureBackend does not yet expose). An
+            // Azure deployment therefore errors loudly below rather than
+            // silently losing presign capability. Wire up a wrapper +
+            // no-prefix presign handle (mirroring the s3/gcs arms) before
+            // enabling Azure for the proxy cache.
             other => {
                 return Err(AppError::Config(format!(
                     "Unknown storage backend: {}",
@@ -481,24 +523,12 @@ impl StorageService {
             }
         };
 
-        Ok(Self {
-            backend,
-            presign_backend,
-        })
+        Ok(Self { backend })
     }
 
     /// Create with a specific backend (for testing)
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self {
-            backend,
-            presign_backend: None,
-        }
-    }
-
-    /// Presign-capable handle for the underlying object store, or `None` when
-    /// the backend cannot issue presigned URLs (filesystem / test backends).
-    pub fn presign_backend(&self) -> Option<Arc<dyn crate::storage::StorageBackend>> {
-        self.presign_backend.clone()
+        Self { backend }
     }
 
     /// Calculate SHA-256 hash of content

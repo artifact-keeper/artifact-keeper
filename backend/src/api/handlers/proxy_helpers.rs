@@ -686,11 +686,19 @@ pub async fn proxy_fetch_or_redirect(
     // cache is already fresh, redirect to the signed URL without ever
     // pulling the cached body into the backend's memory. The freshness
     // probe is metadata-only (HEAD-equivalent on cloud backends).
-    if presigned_enabled && proxy_service.is_cache_fresh(repo_key, path).await {
-        // #1555: proxy-cache content is stored without the global key prefix,
-        // so it must be signed through the proxy's own (no-prefix) backend, not
-        // the prefixed repo handle, or the signed key 404s in the object store.
-        if let Some(storage) = proxy_service.cache_storage_backend() {
+    //
+    // #1555: resolve the no-prefix presign handle FIRST and skip the
+    // freshness probe entirely if we can't redirect (no handle, or the
+    // backend doesn't support redirects). The probe loads the cache-meta
+    // sidecar; on a backend that can't presign it would be a pure wasted
+    // S3 GET, since the slow path below re-reads the same sidecar anyway.
+    if presigned_enabled {
+        let storage = proxy_service.cache_storage_backend();
+        if storage.supports_redirect() && proxy_service.is_cache_fresh(repo_key, path).await {
+            // proxy-cache content is stored without the global key prefix,
+            // so it must be signed through the proxy's own (no-prefix)
+            // backend, not the prefixed repo handle, or the signed key
+            // 404s in the object store.
             if let Some(redirect) = try_proxy_cache_redirect(
                 storage.as_ref(),
                 &cache_key,
@@ -716,13 +724,18 @@ pub async fn proxy_fetch_or_redirect(
     if presigned_enabled {
         // #1555: sign the just-populated cache entry through the proxy's
         // no-prefix backend (same handle that wrote it), not the prefixed
-        // repo handle.
-        if let Some(storage) = proxy_service.cache_storage_backend() {
-            if let Some(redirect) =
-                try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
-            {
-                return Ok(redirect);
-            }
+        // repo handle. The entry was just written, so treat it as fresh.
+        let storage = proxy_service.cache_storage_backend();
+        if let Some(redirect) = try_proxy_cache_redirect(
+            storage.as_ref(),
+            &cache_key,
+            presigned_enabled,
+            expiry,
+            /* cache_is_fresh = */ true,
+        )
+        .await
+        {
+            return Ok(redirect);
         }
     }
 
@@ -749,17 +762,48 @@ pub async fn proxy_fetch_or_redirect(
 ///
 /// Extracted from `proxy_fetch_or_redirect` so the redirect short-circuit can
 /// be exercised in unit tests with recording mock storage backends.
-pub(crate) async fn try_proxy_cache_redirect<S: crate::storage::StorageBackend + ?Sized>(
+///
+/// Generic over the facade `storage_service::StorageBackend` trait (#1555):
+/// proxy-cache presigns flow through the single no-prefix backend handle, which
+/// carries presign capability type-enforced on the facade trait — not a
+/// side-channel field. The redirect is built inline (mirroring
+/// `try_presigned_redirect`) since that helper is bound to the inner storage
+/// trait.
+pub(crate) async fn try_proxy_cache_redirect<
+    S: crate::services::storage_service::StorageBackend + ?Sized,
+>(
     storage: &S,
     cache_key: &str,
     presigned_enabled: bool,
     expiry: Duration,
     cache_is_fresh: bool,
 ) -> Option<Response> {
-    if !presigned_enabled || !cache_is_fresh {
+    if !presigned_enabled || !cache_is_fresh || !storage.supports_redirect() {
         return None;
     }
-    try_presigned_redirect(storage, cache_key, true, expiry).await
+    match storage.get_presigned_url(cache_key, expiry).await {
+        Ok(Some(presigned)) => {
+            tracing::debug!(
+                key = %cache_key,
+                source = ?presigned.source,
+                expiry_secs = expiry.as_secs(),
+                "Serving proxy-cache artifact via presigned redirect"
+            );
+            Some(
+                crate::api::download_response::DownloadResponse::redirect(presigned)
+                    .into_response(),
+            )
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                key = %cache_key,
+                error = %e,
+                "Failed to generate proxy-cache presigned URL, falling back"
+            );
+            None
+        }
+    }
 }
 
 /// Check whether an artifact is present in the proxy cache under `path`
@@ -1283,28 +1327,35 @@ where
                     // Mirrors the fast path in `proxy_fetch_or_redirect`.
                     // Falls through to streaming on a cache miss, so the
                     // OOM-avoidance from #1215 still covers uncached bodies.
-                    if state.config.presigned_downloads_enabled
-                        && proxy.is_cache_fresh(&member.key, path).await
-                    {
-                        if let (Ok(cache_key), Some(storage)) = (
-                            ProxyService::cache_storage_key(&member.key, path),
-                            proxy.cache_storage_backend(),
-                        ) {
-                            // #1555: sign through the proxy's no-prefix backend
-                            // (proxy-cache content lives at the storage root,
-                            // not under the global key prefix).
-                            let expiry =
-                                Duration::from_secs(state.config.presigned_download_expiry_secs);
-                            if let Some(redirect) = try_proxy_cache_redirect(
-                                storage.as_ref(),
-                                &cache_key,
-                                /* presigned_enabled = */ true,
-                                expiry,
-                                /* cache_is_fresh = */ true,
-                            )
-                            .await
+                    // #1555: resolve the no-prefix presign handle and check
+                    // redirect support BEFORE the `is_cache_fresh` probe — the
+                    // probe loads the cache-meta sidecar, so skipping it when we
+                    // can't redirect avoids a wasted S3 GET on the (common)
+                    // cache-miss path that then re-reads the sidecar in the
+                    // streaming fallback below.
+                    if state.config.presigned_downloads_enabled {
+                        let storage = proxy.cache_storage_backend();
+                        if let Ok(cache_key) = ProxyService::cache_storage_key(&member.key, path) {
+                            if storage.supports_redirect()
+                                && proxy.is_cache_fresh(&member.key, path).await
                             {
-                                return Ok(redirect);
+                                // sign through the proxy's no-prefix backend
+                                // (proxy-cache content lives at the storage
+                                // root, not under the global key prefix).
+                                let expiry = Duration::from_secs(
+                                    state.config.presigned_download_expiry_secs,
+                                );
+                                if let Some(redirect) = try_proxy_cache_redirect(
+                                    storage.as_ref(),
+                                    &cache_key,
+                                    /* presigned_enabled = */ true,
+                                    expiry,
+                                    /* cache_is_fresh = */ true,
+                                )
+                                .await
+                                {
+                                    return Ok(redirect);
+                                }
                             }
                         }
                     }
@@ -1952,21 +2003,35 @@ pub async fn local_fetch_or_redirect(
         // no-prefix backend. Hosted artifacts are content-addressed under the
         // global prefix and sign correctly via the repo handle — only switch
         // handles for proxy-cache keys.
-        let cache_backend = if ProxyService::is_proxy_cache_key(&artifact.storage_key) {
+        //
+        // The two handles live on different traits (the proxy's no-prefix
+        // backend is the facade `storage_service::StorageBackend`; the repo
+        // handle is the inner `crate::storage::StorageBackend`), so branch on
+        // the key shape rather than coercing both into one trait object.
+        let proxy_cache_backend = if ProxyService::is_proxy_cache_key(&artifact.storage_key) {
             state
                 .proxy_service
                 .as_deref()
-                .and_then(|p| p.cache_storage_backend())
+                .map(|p| p.cache_storage_backend())
         } else {
             None
         };
-        let presign_storage: &dyn crate::storage::StorageBackend = match &cache_backend {
-            Some(b) => b.as_ref(),
-            None => storage.as_ref(),
+        let redirect = match &proxy_cache_backend {
+            Some(b) => {
+                try_proxy_cache_redirect(
+                    b.as_ref(),
+                    &artifact.storage_key,
+                    /* presigned_enabled = */ true,
+                    expiry,
+                    /* cache_is_fresh = */ true,
+                )
+                .await
+            }
+            None => {
+                try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+            }
         };
-        if let Some(redirect) =
-            try_presigned_redirect(presign_storage, &artifact.storage_key, true, expiry).await
-        {
+        if let Some(redirect) = redirect {
             return Ok(redirect);
         }
     }
@@ -3940,6 +4005,59 @@ mod tests {
         }
     }
 
+    // Facade-trait impl so `RecordingStorage` can be driven directly through
+    // `try_proxy_cache_redirect` (now generic over the facade trait, #1555)
+    // while still serving as an inner-trait registry backend elsewhere. Both
+    // impls share the same call counters.
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for RecordingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_put.lock().unwrap() = Some((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            match self.get_behavior {
+                RecordingGetBehavior::Hit => Ok(Bytes::from_static(b"full-body")),
+                RecordingGetBehavior::Miss => Err(crate::error::AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key
+                ))),
+            }
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+        fn supports_redirect(&self) -> bool {
+            self.supports
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            self.presigned_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::storage::PresignedUrl {
+                url: format!("https://signed.example.com/{}", key),
+                expires_in,
+                source: crate::storage::PresignedUrlSource::S3,
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn test_try_proxy_cache_redirect_skips_get_on_fresh_cache_hit() {
         // Bug #1018: a fresh cache hit with presigned enabled must NOT
@@ -3982,6 +4100,74 @@ mod tests {
             location.contains("signed.example.com"),
             "redirect should point at the signed URL, got {}",
             location
+        );
+    }
+
+    /// #1555 runtime assertion (no DB): drive the proxy-cache presign path
+    /// through the real `StorageService` facade built on a redirect-capable,
+    /// no-prefix backend, and assert the SIGNED key carries NO global prefix.
+    ///
+    /// This replaces the old source-grep guards (which only checked WHICH
+    /// symbol was called, so they passed even while the feature was dead on
+    /// S3). Here the backend echoes the exact key it was asked to sign into the
+    /// URL, so a prefixed key would surface as a real assertion failure.
+    #[tokio::test]
+    async fn test_proxy_cache_presign_signs_no_prefix_key_1555() {
+        // The proxy's own backend: redirect-capable, signs the key verbatim
+        // (a no-prefix S3 handle does exactly this — no `make_full_key` prefix).
+        let proxy_backend = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let service = StdArc::new(crate::services::storage_service::StorageService::new(
+            proxy_backend.clone(),
+        ));
+
+        // `cache_storage_backend()` returns this single facade handle; capability
+        // is type-enforced on the facade trait (no side-channel field).
+        let storage = service.backend();
+        assert!(
+            storage.supports_redirect(),
+            "no-prefix proxy-cache backend must report redirect support (#1555)"
+        );
+
+        let cache_key = "proxy-cache/pypi-remote/pkg/pkg-1.0.0-py3-none-any.whl/__content__";
+        let resp = super::try_proxy_cache_redirect(
+            storage.as_ref(),
+            cache_key,
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await
+        .expect("fresh cache + redirect-capable backend must yield a redirect");
+
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("location header")
+            .to_str()
+            .unwrap();
+
+        // The signed key is the raw proxy-cache key: starts with `proxy-cache/`
+        // and carries no global (`artifact-keeper/`) prefix.
+        assert!(
+            location.ends_with(cache_key),
+            "signed URL must end with the verbatim no-prefix cache key, got {}",
+            location
+        );
+        assert!(
+            !location.contains("artifact-keeper/"),
+            "signed key must NOT carry a global prefix (#1555), got {}",
+            location
+        );
+        assert_eq!(
+            proxy_backend.presigned_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one presign through the no-prefix handle"
+        );
+        assert_eq!(
+            proxy_backend.get_calls.load(Ordering::SeqCst),
+            0,
+            "body must not be downloaded on the presign fast path"
         );
     }
 
@@ -6125,6 +6311,24 @@ mod tests {
         async fn size(&self, _key: &str) -> crate::error::Result<u64> {
             Ok(9)
         }
+        // #1555: this is the proxy's OWN no-prefix backend (`cache_storage_backend`),
+        // so it must report redirect support and sign the key verbatim — no
+        // `artifact-keeper/` prefix is added. The signed URL echoes the key so
+        // tests can assert the no-prefix layout end to end.
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            Ok(Some(crate::storage::PresignedUrl {
+                url: format!("https://signed.example.com/{}", key),
+                expires_in,
+                source: crate::storage::PresignedUrlSource::S3,
+            }))
+        }
     }
 
     /// #1555 runtime coverage: a fresh proxy-cache hit on an S3-backed Remote
@@ -6151,12 +6355,15 @@ mod tests {
         let (member_id, _member_key, _) = db_helpers::create_repo(&pool, "remote", "pypi").await;
         db_helpers::link_member(&pool, virtual_id, member_id, 0).await;
 
-        // Redirect-capable default backend (registry side) + presigned config.
-        let redirect_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        // Registry-side backend is irrelevant here: #1555 signs proxy-cache
+        // keys through the PROXY's own no-prefix backend, not the registry
+        // handle. We assert the registry backend is never touched for presign.
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
         let state =
-            db_helpers::build_state_presigned(pool.clone(), "s3-test", redirect_storage.clone());
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", registry_storage.clone());
 
-        // ProxyService whose `is_cache_fresh` returns true for any path.
+        // ProxyService whose own (no-prefix) backend reports the cache fresh
+        // AND presigns, echoing the signed key into the URL.
         let proxy = ProxyService::new(
             pool.clone(),
             StdArc::new(crate::services::storage_service::StorageService::new(
@@ -6198,15 +6405,26 @@ mod tests {
             "Location must point at the presigned URL, got {}",
             location
         );
-        assert_eq!(
-            redirect_storage.presigned_calls.load(Ordering::SeqCst),
-            1,
-            "exactly one presigned URL request expected"
+        // #1555 core assertion: the signed key has NO global prefix — it is the
+        // raw proxy-cache key starting with `proxy-cache/`, never wrapped in an
+        // `artifact-keeper/` (or any) prefix. Signing through a prefixed handle
+        // was the original bug; the no-prefix backend fixes it.
+        assert!(
+            location.contains("/proxy-cache/"),
+            "signed key must be the no-prefix proxy-cache key, got {}",
+            location
         );
+        assert!(
+            !location.contains("artifact-keeper/"),
+            "signed key must NOT carry a global prefix (#1555), got {}",
+            location
+        );
+        // The registry-side backend must never be asked to presign: proxy-cache
+        // signing goes exclusively through the proxy's no-prefix handle.
         assert_eq!(
-            redirect_storage.get_calls.load(Ordering::SeqCst),
+            registry_storage.presigned_calls.load(Ordering::SeqCst),
             0,
-            "the full body must NOT be downloaded when redirecting"
+            "registry backend must NOT presign proxy-cache keys (#1555)"
         );
 
         db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;
