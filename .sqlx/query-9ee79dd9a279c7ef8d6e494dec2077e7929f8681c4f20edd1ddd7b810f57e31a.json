@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes, r.promotion_only,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days,\n                created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -184,18 +184,28 @@
       },
       {
         "ordinal": 19,
+        "name": "age_gate_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 20,
+        "name": "age_gate_min_age_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 21,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 20,
+        "ordinal": 22,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -219,8 +229,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "cebba2a2790e783ccf06d96ab32877f39b9e727b0472d93237b1ad978a222e6d"
+  "hash": "9ee79dd9a279c7ef8d6e494dec2077e7929f8681c4f20edd1ddd7b810f57e31a"
 }
