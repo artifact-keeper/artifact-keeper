@@ -135,6 +135,37 @@ fn age_gate_service(
         .ok_or_else(|| AppError::Internal("Age gate service not initialized".to_string()))
 }
 
+/// Build the audit-log details for an approve/reject action.
+fn build_review_audit_details(
+    review: &AgeGateReviewResponse,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "review_id": review.id,
+        "package": review.package_name,
+        "version": review.package_version,
+        "reason": reason,
+    })
+}
+
+/// Build the audit-log details for a per-repo age-gate config update.
+fn build_repo_config_audit_details(enabled: bool, min_age_days: i32) -> serde_json::Value {
+    serde_json::json!({
+        "age_gate_enabled": enabled,
+        "age_gate_min_age_days": min_age_days,
+    })
+}
+
+/// Return `Err` when the repository type does not support age-gating.
+fn require_remote_repo_for_age_gate(repo_type: &RepositoryType) -> Result<()> {
+    if *repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "Age gate applies only to remote (proxy) repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     get,
     path = "/age-gate/reviews",
@@ -219,22 +250,19 @@ pub async fn approve_review(
         .approve(id, auth.user_id, body.reason.as_deref())
         .await?;
 
+    let repository_id = review.repository_id;
+    let resp = review_to_response(review);
     let audit = AuditService::new(state.db.clone());
     let _ = audit
         .log(
             AuditEntry::new(AuditAction::AgeGateApproved, ResourceType::Repository)
                 .user(auth.user_id)
-                .resource(review.repository_id)
-                .details(serde_json::json!({
-                    "review_id": review.id,
-                    "package": review.package_name,
-                    "version": review.package_version,
-                    "reason": body.reason,
-                })),
+                .resource(repository_id)
+                .details(build_review_audit_details(&resp, body.reason.as_deref())),
         )
         .await;
 
-    Ok(Json(review_to_response(review)))
+    Ok(Json(resp))
 }
 
 #[utoipa::path(
@@ -256,22 +284,19 @@ pub async fn reject_review(
     let svc = age_gate_service(&state)?;
     let review = svc.reject(id, auth.user_id, body.reason.as_deref()).await?;
 
+    let repository_id = review.repository_id;
+    let resp = review_to_response(review);
     let audit = AuditService::new(state.db.clone());
     let _ = audit
         .log(
             AuditEntry::new(AuditAction::AgeGateRejected, ResourceType::Repository)
                 .user(auth.user_id)
-                .resource(review.repository_id)
-                .details(serde_json::json!({
-                    "review_id": review.id,
-                    "package": review.package_name,
-                    "version": review.package_version,
-                    "reason": body.reason,
-                })),
+                .resource(repository_id)
+                .details(build_review_audit_details(&resp, body.reason.as_deref())),
         )
         .await;
 
-    Ok(Json(review_to_response(review)))
+    Ok(Json(resp))
 }
 
 #[utoipa::path(
@@ -322,11 +347,7 @@ pub async fn update_repo_age_gate(
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
-    if repo.repo_type != RepositoryType::Remote {
-        return Err(AppError::Validation(
-            "Age gate applies only to remote (proxy) repositories".to_string(),
-        ));
-    }
+    require_remote_repo_for_age_gate(&repo.repo_type)?;
 
     let svc = age_gate_service(&state)?;
     svc.update_repo_config(repo.id, body.enabled, body.min_age_days)
@@ -338,10 +359,7 @@ pub async fn update_repo_age_gate(
             AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
                 .user(auth.user_id)
                 .resource(repo.id)
-                .details(serde_json::json!({
-                    "age_gate_enabled": body.enabled,
-                    "age_gate_min_age_days": body.min_age_days,
-                })),
+                .details(build_repo_config_audit_details(body.enabled, body.min_age_days)),
         )
         .await;
 
@@ -406,6 +424,42 @@ mod tests {
     fn compute_review_total_pages_ceil_and_zero() {
         assert_eq!(compute_review_total_pages(45, 20), 3);
         assert_eq!(compute_review_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn require_remote_repo_for_age_gate_rejects_local() {
+        assert!(require_remote_repo_for_age_gate(&RepositoryType::Local).is_err());
+        assert!(require_remote_repo_for_age_gate(&RepositoryType::Remote).is_ok());
+    }
+
+    #[test]
+    fn build_review_audit_details_includes_fields() {
+        let now = Utc::now();
+        let resp = AgeGateReviewResponse {
+            id: Uuid::new_v4(),
+            repository_key: "npm-remote".to_string(),
+            package_name: "react".to_string(),
+            package_version: "18.0.0".to_string(),
+            upstream_published_at: None,
+            status: "pending".to_string(),
+            requested_at: now,
+            reviewed_by: None,
+            reviewed_at: None,
+            review_reason: None,
+            request_count: 1,
+            last_requested_at: now,
+        };
+        let details = build_review_audit_details(&resp, Some("looks safe"));
+        assert_eq!(details["package"], "react");
+        assert_eq!(details["version"], "18.0.0");
+        assert_eq!(details["reason"], "looks safe");
+    }
+
+    #[test]
+    fn build_repo_config_audit_details_includes_fields() {
+        let d = build_repo_config_audit_details(true, 14);
+        assert_eq!(d["age_gate_enabled"], true);
+        assert_eq!(d["age_gate_min_age_days"], 14);
     }
 
     #[test]
