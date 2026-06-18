@@ -1549,11 +1549,38 @@ fn build_json_metadata_response(json_string: String) -> Response {
 
 /// Build the tarball filename for an npm package version.
 fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
+    format!("{}-{}.tgz", npm_tarball_short_name(package_name), version)
+}
+
+/// Short tarball filename prefix for scoped packages (`@angular/core` -> `core`).
+fn npm_tarball_short_name(package_name: &str) -> &str {
     if package_name.starts_with('@') {
-        let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-        format!("{}-{}.tgz", short_name, version)
+        package_name.rsplit('/').next().unwrap_or(package_name)
     } else {
-        format!("{}-{}.tgz", package_name, version)
+        package_name
+    }
+}
+
+/// Build upstream tarball path using literal `/` scope separators (B7 / #1377).
+fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String {
+    build_tarball_upstream_path(package_name, filename)
+}
+
+/// Map an age-gate block decision with LKG into upstream path + filename.
+fn npm_lkg_redirect_from_decision(
+    decision: &AgeGateDecision,
+    package_name: &str,
+) -> Option<(String, String)> {
+    if let AgeGateDecision::Block {
+        last_known_good: Some(lkg),
+        ..
+    } = decision
+    {
+        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+        Some((lkg_path, lkg_filename))
+    } else {
+        None
     }
 }
 
@@ -1592,26 +1619,22 @@ async fn apply_npm_download_age_gate(
         return Ok(None);
     }
 
+    let short_name = npm_tarball_short_name(package_name);
     let version =
-        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, package_name)
+        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
             .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
-    match svc
+    let decision = svc
         .check(&params, package_name, &version, published_at)
         .await
-        .map_err(|e| e.into_response())?
-    {
+        .map_err(|e| e.into_response())?;
+    match decision {
         AgeGateDecision::Allow => Ok(None),
         AgeGateDecision::Block {
             review_id: _,
-            last_known_good: Some(lkg),
-        } => {
-            let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
-            let encoded_name = encode_package_name_for_upstream(package_name);
-            let lkg_path = format!("{}/-/{}", encoded_name, lkg_filename);
-            Ok(Some((lkg_path, lkg_filename)))
-        }
+            last_known_good: Some(_),
+        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
         AgeGateDecision::Block {
             review_id,
             last_known_good: None,
@@ -3863,6 +3886,51 @@ mod tests {
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
         assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    #[test]
+    fn test_npm_tarball_short_name_scoped_and_unscoped() {
+        assert_eq!(npm_tarball_short_name("@angular/core"), "core");
+        assert_eq!(npm_tarball_short_name("express"), "express");
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_uses_literal_slash_path() {
+        use crate::services::age_gate_service::LastKnownGood;
+
+        let decision = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: Some(LastKnownGood {
+                version: "16.0.0".to_string(),
+                artifact_path: "ignored".to_string(),
+            }),
+        };
+        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        assert_eq!(filename, "core-16.0.0.tgz");
+        assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
+        assert!(!path.contains("%2F"));
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_none_without_last_known_good() {
+        // Allow and Block-without-LKG decisions produce no redirect target.
+        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
+        let blocked_no_lkg = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: None,
+        };
+        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_scoped_tarball_uses_short_name() {
+        let filename = "core-17.0.0.tgz";
+        let version = crate::formats::npm::NpmHandler::extract_version_from_filename(
+            filename,
+            npm_tarball_short_name("@angular/core"),
+        )
+        .unwrap();
+        assert_eq!(version, "17.0.0");
     }
 
     // -----------------------------------------------------------------------
