@@ -1243,7 +1243,7 @@ fn is_quarantine_block_response(resp: &Response) -> bool {
 /// emits the same outbound headers as the buffered
 /// [`build_download_response`] used to.
 pub async fn resolve_virtual_download_streaming<F, Fut>(
-    db: &PgPool,
+    state: &AppState,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
@@ -1255,7 +1255,7 @@ where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let members = fetch_virtual_members(&state.db, virtual_repo_id).await?;
 
     if members.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
@@ -1273,6 +1273,41 @@ where
                 if let (Some(proxy), Some(upstream_url)) =
                     (proxy_service, member.upstream_url.as_deref())
                 {
+                    // #1555: prefer a presigned S3 redirect for a fresh cache
+                    // hit so large artifacts (e.g. torch wheels, multi-GB) are
+                    // not streamed through the backend. Streaming holds a
+                    // worker thread for the whole transfer; under burst load
+                    // that saturates the dispatcher and cascades into 502s.
+                    // Mirrors the fast path in `proxy_fetch_or_redirect`.
+                    // Falls through to streaming on a cache miss, so the
+                    // OOM-avoidance from #1215 still covers uncached bodies.
+                    if state.config.presigned_downloads_enabled
+                        && proxy.is_cache_fresh(&member.key, path).await
+                    {
+                        if let Ok(cache_key) = ProxyService::cache_storage_key(&member.key, path) {
+                            let storage_location = StorageLocation {
+                                backend: state.config.storage_backend.clone(),
+                                path: state.config.storage_path.clone(),
+                            };
+                            if let Ok(storage) = state.storage_for_repo(&storage_location) {
+                                let expiry = Duration::from_secs(
+                                    state.config.presigned_download_expiry_secs,
+                                );
+                                if let Some(redirect) = try_proxy_cache_redirect(
+                                    storage.as_ref(),
+                                    &cache_key,
+                                    /* presigned_enabled = */ true,
+                                    expiry,
+                                    /* cache_is_fresh = */ true,
+                                )
+                                .await
+                                {
+                                    return Ok(redirect);
+                                }
+                            }
+                        }
+                    }
+
                     match proxy_fetch_streaming_with_disposition(
                         proxy,
                         member.id,
@@ -1828,6 +1863,40 @@ pub async fn local_fetch_by_path_suffix(
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
     local_fetch_by_path(db, state, repo_id, location, &path).await
+}
+
+/// Variant of [`local_fetch_by_path_suffix`] that issues a presigned S3
+/// redirect instead of streaming when `state.config.presigned_downloads_enabled`
+/// is set (#1555). The suffix→path resolution is identical; only the response
+/// shape differs: a 307 redirect for S3-backed artifacts, or streaming when the
+/// storage backend does not support presigning.
+///
+/// Used by the PyPI virtual-download path (`pypi.rs::serve_file`) which has its
+/// own member-iteration loop and could not share the generic
+/// `resolve_virtual_download_streaming` fix.
+pub async fn local_fetch_or_redirect_by_suffix(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    path_suffix: &str,
+) -> Result<Response, Response> {
+    let reversed_pattern = reverse_suffix_for_like(path_suffix);
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM artifacts \
+         WHERE repository_id = $1 \
+           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
+           AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&reversed_pattern)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    local_fetch_or_redirect(db, state, repo_id, location, &path).await
 }
 
 /// Build the reversed-+-escaped LIKE prefix for a path-suffix query
@@ -2413,7 +2482,7 @@ pub async fn try_remote_or_virtual_download(
                 let suffix = suffix.to_string();
                 let state_arc = state.clone();
                 resolve_virtual_download_streaming(
-                    &state.db,
+                    state,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
@@ -2435,7 +2504,7 @@ pub async fn try_remote_or_virtual_download(
                 let path = path.to_string();
                 let state_arc = state.clone();
                 resolve_virtual_download_streaming(
-                    &state.db,
+                    state,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
@@ -4752,6 +4821,33 @@ mod tests {
             ))
         }
 
+        /// Build an `AppState` whose default storage backend is the named,
+        /// caller-supplied `redirect_backend` and whose config has presigned
+        /// downloads enabled. Used by the #1555 redirect test to drive
+        /// `resolve_virtual_download_streaming` into its presigned-redirect
+        /// fast path: `config.storage_backend` must resolve through the
+        /// registry to a redirect-capable backend.
+        pub fn build_state_presigned(
+            pool: PgPool,
+            backend_name: &str,
+            redirect_backend: Arc<dyn crate::storage::StorageBackend>,
+        ) -> SharedState {
+            let mut config = test_config("/tmp/ph-presigned");
+            config.presigned_downloads_enabled = true;
+            config.storage_backend = backend_name.to_string();
+
+            let mut backends: std::collections::HashMap<
+                String,
+                Arc<dyn crate::storage::StorageBackend>,
+            > = std::collections::HashMap::new();
+            backends.insert(backend_name.to_string(), redirect_backend.clone());
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                backends,
+                backend_name.to_string(),
+            ));
+            Arc::new(AppState::new(config, pool, redirect_backend, registry))
+        }
+
         pub async fn create_user(pool: &PgPool) -> Uuid {
             let id = Uuid::new_v4();
             let username = format!("ph-test-u-{}", id);
@@ -4801,6 +4897,26 @@ mod tests {
                 .await
                 .expect("create repo");
             (id, key, storage_dir)
+        }
+
+        /// Insert a `virtual_repo_members` row so `fetch_virtual_members`
+        /// returns `member_repo_id` when resolving `virtual_repo_id`.
+        pub async fn link_member(
+            pool: &PgPool,
+            virtual_repo_id: Uuid,
+            member_repo_id: Uuid,
+            priority: i32,
+        ) {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_repo_id)
+            .bind(member_repo_id)
+            .bind(priority)
+            .execute(pool)
+            .await
+            .expect("link virtual member");
         }
 
         pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
@@ -5861,6 +5977,178 @@ mod tests {
              it would defeat the whole point of having a streaming \
              resolver."
         );
+    }
+
+    #[test]
+    fn test_resolve_virtual_download_streaming_redirects_before_streaming_1555() {
+        // #1555: a fresh proxy-cache hit on an S3-backed member must be
+        // served as a presigned redirect, NOT streamed through the
+        // backend. Streaming holds a worker thread for the whole transfer
+        // and saturates the dispatcher under burst load. The redirect
+        // attempt must sit BEFORE the streaming fallback so cached bodies
+        // never reach `proxy_fetch_streaming_with_disposition`.
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn resolve_virtual_download_streaming<")
+            .expect("resolve_virtual_download_streaming must exist");
+        let window_end = (fn_start + 4096).min(src.len());
+        let window = &src[fn_start..window_end];
+
+        let redirect_pos = window.find("try_proxy_cache_redirect(").expect(
+            "`resolve_virtual_download_streaming` MUST attempt \
+             `try_proxy_cache_redirect(` for fresh proxy-cache hits (#1555).",
+        );
+        assert!(
+            window.contains("is_cache_fresh("),
+            "redirect fast-path MUST gate on a metadata-only \
+             `is_cache_fresh(` probe (#1555) so it never pulls the body.",
+        );
+        let stream_pos = window
+            .find("proxy_fetch_streaming_with_disposition(")
+            .expect("streaming fallback must still exist (#1215)");
+        assert!(
+            redirect_pos < stream_pos,
+            "the presigned redirect attempt (#1555) MUST come BEFORE the \
+             streaming fallback (#1215); otherwise cached large artifacts \
+             still stream through the backend.",
+        );
+    }
+
+    /// Proxy-cache storage mock (the `StorageService` trait) that reports a
+    /// single fresh, positive cache entry. The metadata sidecar deserializes
+    /// to a non-expired `CacheMetadata` with no pinned ETag, so
+    /// `ProxyService::is_cache_fresh` takes the existence-check branch and the
+    /// `__content__` key reports as present. The body itself is never read on
+    /// the fast path, so `get` of the content key returns NotFound to surface
+    /// any accidental download as a failure.
+    struct FreshProxyCacheStorage;
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for FreshProxyCacheStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            if key.ends_with("__cache_meta__.json") {
+                let meta = crate::services::proxy_service::CacheMetadata {
+                    cached_at: Utc::now(),
+                    upstream_etag: None,
+                    storage_etag: None,
+                    last_modified: None,
+                    negative_cached_until: None,
+                    quarantine_until: None,
+                    expires_at: Utc::now() + chrono::Duration::seconds(3600),
+                    content_type: Some("application/octet-stream".to_string()),
+                    size_bytes: 9,
+                    checksum_sha256: "deadbeef".to_string(),
+                };
+                Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
+            } else {
+                Err(crate::error::AppError::NotFound(key.to_string()))
+            }
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            // Both the content key and the metadata sidecar report present.
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(9)
+        }
+    }
+
+    /// #1555 runtime coverage: a fresh proxy-cache hit on an S3-backed Remote
+    /// member of a Virtual repo must be served as a presigned 302 redirect,
+    /// NOT streamed through the backend.
+    ///
+    /// This drives the real `resolve_virtual_download_streaming` redirect
+    /// branch end to end: a Remote member is resolved from the DB, the proxy
+    /// reports the cache as fresh, the default storage backend supports
+    /// redirects, and the helper returns a 302 with a `Location` header. The
+    /// `local_fetch` closure panics if invoked, proving the redirect fired
+    /// before any streaming / local fallback.
+    ///
+    /// DB-gated like the other `try_pool` tests: skips when `DATABASE_URL` is
+    /// unset (no live Postgres), runs in CI where one is provisioned.
+    #[tokio::test]
+    async fn test_resolve_virtual_download_streaming_returns_presigned_redirect_1555() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        // Virtual repo with one Remote member.
+        let (virtual_id, _, _) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (member_id, _member_key, _) = db_helpers::create_repo(&pool, "remote", "pypi").await;
+        db_helpers::link_member(&pool, virtual_id, member_id, 0).await;
+
+        // Redirect-capable default backend (registry side) + presigned config.
+        let redirect_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state =
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", redirect_storage.clone());
+
+        // ProxyService whose `is_cache_fresh` returns true for any path.
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                StdArc::new(FreshProxyCacheStorage),
+            )),
+        );
+
+        let resp = resolve_virtual_download_streaming(
+            &state,
+            Some(&proxy),
+            virtual_id,
+            "pkg/pkg-1.0.0-py3-none-any.whl",
+            "application/octet-stream",
+            None,
+            // Remote member must redirect before reaching any local fetch.
+            |_id, _loc| async {
+                panic!("local_fetch must NOT run: the redirect fast path should win");
+                #[allow(unreachable_code)]
+                Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            },
+        )
+        .await
+        .expect("fresh cache hit must resolve to a redirect, not an error");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "fresh proxy-cache hit on an S3-backed member must yield a 302 \
+             redirect (#1555), not a streamed 200"
+        );
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("redirect must carry a Location header")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("signed.example.com"),
+            "Location must point at the presigned URL, got {}",
+            location
+        );
+        assert_eq!(
+            redirect_storage.presigned_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one presigned URL request expected"
+        );
+        assert_eq!(
+            redirect_storage.get_calls.load(Ordering::SeqCst),
+            0,
+            "the full body must NOT be downloaded when redirecting"
+        );
+
+        db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;
+        db_helpers::cleanup(&pool, member_id, Uuid::nil()).await;
     }
 
     // ── #1804: per-member authorization for virtual repos ───────────────

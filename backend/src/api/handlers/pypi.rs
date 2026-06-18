@@ -1166,8 +1166,9 @@ async fn serve_file(
 
                 for member in &members {
                     // Try local storage first (works for hosted repos and
-                    // cached remote artifacts)
-                    match proxy_helpers::local_fetch_by_path_suffix(
+                    // cached remote artifacts). #1555: redirect to S3 presigned
+                    // URL instead of streaming when enabled.
+                    match proxy_helpers::local_fetch_or_redirect_by_suffix(
                         &state.db,
                         state,
                         member.id,
@@ -1176,19 +1177,8 @@ async fn serve_file(
                     )
                     .await
                     {
-                        Ok(result) => {
-                            let content_type = pypi_content_type(filename);
-                            let mut builder = Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, content_type)
-                                .header(
-                                    "Content-Disposition",
-                                    format!("attachment; filename=\"{}\"", filename),
-                                );
-                            if let Some(size) = result.content_length {
-                                builder = builder.header(CONTENT_LENGTH, size.to_string());
-                            }
-                            return Ok(builder.body(Body::from_stream(result.body)).unwrap());
+                        Ok(response) => {
+                            return Ok(response);
                         }
                         Err(e) => {
                             debug!(
@@ -1222,8 +1212,14 @@ async fn serve_file(
                             let normalized = PypiHandler::normalize_name(project);
                             let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                            if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
+                            // #1555: proxy_fetch_or_redirect handles presigned redirect
+                            // on a cache hit (or streaming if presigning is unavailable)
+                            // in a single freshness check. Falls through to the PyPI-specific
+                            // upstream fetch on a cache miss (proxy_fetch uses the generic
+                            // path which can't resolve PyPI CDN URLs).
+                            if let Ok(resp) = proxy_helpers::proxy_fetch_or_redirect(
                                 proxy,
+                                state,
                                 member.id,
                                 &member.key,
                                 upstream_url,
@@ -1231,7 +1227,7 @@ async fn serve_file(
                             )
                             .await
                             {
-                                return Ok(build_streaming_file_response(filename, result));
+                                return Ok(resp);
                             }
 
                             match fetch_from_pypi_remote_streaming(
