@@ -28,6 +28,7 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
@@ -549,45 +550,63 @@ async fn security_audits_quick(
 async fn get_metadata(
     State(state): State<SharedState>,
     Path((repo_key, package)): Path<(String, String)>,
+    base_url: RequestBaseUrl,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    get_package_metadata(&state, &repo_key, &package, &headers).await
+    let want_abbreviated = wants_abbreviated_metadata(&headers);
+    get_package_metadata(
+        &state,
+        &repo_key,
+        &package,
+        base_url.as_str(),
+        want_abbreviated,
+    )
+    .await
 }
 
 async fn get_scoped_metadata(
     State(state): State<SharedState>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
+    base_url: RequestBaseUrl,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
-    get_package_metadata(&state, &repo_key, &full_name, &headers).await
+    let want_abbreviated = wants_abbreviated_metadata(&headers);
+    get_package_metadata(
+        &state,
+        &repo_key,
+        &full_name,
+        base_url.as_str(),
+        want_abbreviated,
+    )
+    .await
 }
 
 async fn get_version_metadata(
     State(state): State<SharedState>,
     Path((repo_key, package, version)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    get_package_version_metadata(&state, &repo_key, &package, &version, &headers).await
+    get_package_version_metadata(&state, &repo_key, &package, &version, base_url.as_str()).await
 }
 
 async fn get_scoped_version_metadata(
     State(state): State<SharedState>,
     Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
-    get_package_version_metadata(&state, &repo_key, &full_name, &version, &headers).await
+    get_package_version_metadata(&state, &repo_key, &full_name, &version, base_url.as_str()).await
 }
 
 /// Minimal artifact info needed to construct npm package metadata.
@@ -807,11 +826,9 @@ async fn get_package_metadata(
     state: &SharedState,
     repo_key: &str,
     package_name: &str,
-    headers: &HeaderMap,
+    base_url: &str,
+    want_abbreviated: bool,
 ) -> Result<Response, Response> {
-    let want_abbreviated = wants_abbreviated_metadata(headers);
-    let base_url = proxy_helpers::request_base_url(headers);
-
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
     // For remote repos, always proxy metadata from upstream. Cached tarball
@@ -833,7 +850,7 @@ async fn get_package_metadata(
                 return Ok(rewrite_and_respond(
                     content,
                     content_type,
-                    &base_url,
+                    base_url,
                     repo_key,
                     want_abbreviated,
                 ));
@@ -865,7 +882,7 @@ async fn get_package_metadata(
                     return build_npm_metadata_response(
                         &meta,
                         package_name,
-                        &base_url,
+                        base_url,
                         repo_key,
                         &dist_tags,
                         want_abbreviated,
@@ -900,7 +917,7 @@ async fn get_package_metadata(
                     return Ok(rewrite_and_respond(
                         content,
                         content_type,
-                        &base_url,
+                        base_url,
                         repo_key,
                         want_abbreviated,
                     ));
@@ -931,7 +948,7 @@ async fn get_package_metadata(
     build_npm_metadata_response(
         &meta_artifacts,
         package_name,
-        &base_url,
+        base_url,
         repo_key,
         &dist_tags,
         want_abbreviated,
@@ -950,16 +967,15 @@ async fn get_package_version_metadata(
     repo_key: &str,
     package_name: &str,
     version: &str,
-    headers: &HeaderMap,
+    base_url: &str,
 ) -> Result<Response, Response> {
-    let base_url = proxy_helpers::request_base_url(headers);
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
     // Build or fetch the full packument as a JSON value.
     let packument: serde_json::Value = if repo.repo_type == RepositoryType::Remote {
-        fetch_remote_packument(state, &repo, repo_key, package_name, &base_url).await?
+        fetch_remote_packument(state, &repo, repo_key, package_name, base_url).await?
     } else if repo.repo_type == RepositoryType::Virtual {
-        fetch_virtual_packument(state, &repo, repo_key, package_name, &base_url).await?
+        fetch_virtual_packument(state, &repo, repo_key, package_name, base_url).await?
     } else {
         let artifacts = fetch_npm_artifacts(&state.db, repo.id, package_name).await?;
         if artifacts.is_empty() {
@@ -970,7 +986,7 @@ async fn get_package_version_metadata(
         let resp = build_npm_metadata_response(
             &artifacts,
             package_name,
-            &base_url,
+            base_url,
             repo_key,
             &serde_json::Map::new(),
             false,
@@ -1891,12 +1907,15 @@ async fn publish_package(
 async fn dist_tags_get(
     State(state): State<SharedState>,
     Path((repo_key, package)): Path<(String, String)>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
 
-    let resp = get_package_metadata(&state, &repo_key, &package, &headers).await?;
+    // dist-tags are present in both the full and abbreviated packument, but we
+    // parse the response body ourselves below; request the full packument so the
+    // shape is stable regardless of any Accept header on the request.
+    let resp = get_package_metadata(&state, &repo_key, &package, base_url.as_str(), false).await?;
     if !resp.status().is_success() {
         return Ok(resp);
     }
@@ -2690,11 +2709,22 @@ mod tests {
             ACCEPT,
             axum::http::HeaderValue::from_static(NPM_ABBREVIATED_CONTENT_TYPE),
         );
-        let abbreviated =
-            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &abbreviated_headers)
-                .await;
-        let full =
-            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+        let abbreviated = super::get_package_metadata(
+            &fx.state,
+            &fx.repo_key,
+            "widget",
+            "http://localhost",
+            super::wants_abbreviated_metadata(&abbreviated_headers),
+        )
+        .await;
+        let full = super::get_package_metadata(
+            &fx.state,
+            &fx.repo_key,
+            "widget",
+            "http://localhost",
+            super::wants_abbreviated_metadata(&HeaderMap::new()),
+        )
+        .await;
 
         fx.teardown().await;
 
@@ -4400,8 +4430,14 @@ mod tests {
             .await
             .expect("seed npm_dist_tags");
 
-        let result =
-            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+        let result = super::get_package_metadata(
+            &fx.state,
+            &fx.repo_key,
+            "widget",
+            "http://localhost",
+            false,
+        )
+        .await;
 
         // Tear down before asserting so a failure never leaks DB/storage state.
         fx.teardown().await;
@@ -4476,8 +4512,14 @@ mod tests {
 
         // Read back the stored tags and the served packument.
         let stored = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
-        let meta =
-            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+        let meta = super::get_package_metadata(
+            &fx.state,
+            &fx.repo_key,
+            "widget",
+            "http://localhost",
+            false,
+        )
+        .await;
 
         fx.teardown().await;
 
@@ -4591,7 +4633,7 @@ mod tests {
         let get_tags = super::dist_tags_get(
             axum::extract::State(fx.state.clone()),
             axum::extract::Path((fx.repo_key.clone(), "widget".to_string())),
-            HeaderMap::new(),
+            RequestBaseUrl("http://localhost".to_string()),
         )
         .await;
 

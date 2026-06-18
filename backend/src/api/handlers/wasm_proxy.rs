@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::services::repository_service::RepositoryService;
@@ -46,15 +47,6 @@ fn normalize_path(sub_path: &str) -> String {
         sub_path.to_string()
     } else {
         format!("/{}", sub_path)
-    }
-}
-
-/// Determine the URL scheme based on the host header.
-fn scheme_for_host(host: &str) -> &'static str {
-    if host.contains("localhost") || host.contains("127.0.0.1") {
-        "http"
-    } else {
-        "https"
     }
 }
 
@@ -106,6 +98,7 @@ async fn handle_wasm_request(
     State(state): State<SharedState>,
     method: Method,
     headers: HeaderMap,
+    base_url: RequestBaseUrl,
     Path(params): Path<Vec<(String, String)>>,
     body: Bytes,
 ) -> Result<Response<Body>, Response<Body>> {
@@ -157,8 +150,15 @@ async fn handle_wasm_request(
     })?;
 
     // 5. Build request and context
-    let (wasm_request, wasm_context) =
-        build_wasm_request(&headers, &method, request_path, body, format_key, repo_key);
+    let (wasm_request, wasm_context) = build_wasm_request(
+        &headers,
+        &method,
+        base_url.as_str(),
+        request_path,
+        body,
+        format_key,
+        repo_key,
+    );
 
     // 6. Execute plugin
     let response = registry
@@ -180,20 +180,16 @@ async fn handle_wasm_request(
 fn build_wasm_request(
     headers: &HeaderMap,
     method: &Method,
+    request_base_url: &str,
     request_path: String,
     body: Bytes,
     format_key: &str,
     repo_key: &str,
 ) -> (WasmHttpRequest, WasmRepoContext) {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:8080");
-    let scheme = scheme_for_host(host);
-    let base_url = format!("{}://{}/ext/{}/{}", scheme, host, format_key, repo_key);
+    let base_url = format!("{}/ext/{}/{}", request_base_url, format_key, repo_key);
     let download_base_url = format!(
-        "{}://{}/api/v1/repositories/{}/download",
-        scheme, host, repo_key
+        "{}/api/v1/repositories/{}/download",
+        request_base_url, repo_key
     );
     let header_pairs = headers_to_pairs(headers);
 
@@ -343,28 +339,6 @@ mod tests {
     fn test_normalize_path_without_leading_slash() {
         assert_eq!(normalize_path("simple/"), "/simple/");
         assert_eq!(normalize_path("packages/my-lib"), "/packages/my-lib");
-    }
-
-    // -----------------------------------------------------------------------
-    // scheme_for_host
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_scheme_localhost() {
-        assert_eq!(scheme_for_host("localhost:8080"), "http");
-        assert_eq!(scheme_for_host("localhost"), "http");
-    }
-
-    #[test]
-    fn test_scheme_loopback() {
-        assert_eq!(scheme_for_host("127.0.0.1:8080"), "http");
-        assert_eq!(scheme_for_host("127.0.0.1"), "http");
-    }
-
-    #[test]
-    fn test_scheme_remote() {
-        assert_eq!(scheme_for_host("registry.example.com"), "https");
-        assert_eq!(scheme_for_host("artifacts.internal:443"), "https");
     }
 
     // -----------------------------------------------------------------------
@@ -527,6 +501,7 @@ mod tests {
         let (req, ctx) = build_wasm_request(
             &headers,
             &Method::GET,
+            "http://localhost:8080",
             "/simple/".to_string(),
             Bytes::new(),
             "pypi-custom",
@@ -548,12 +523,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_wasm_request_remote_host() {
+    fn test_build_wasm_request_uses_supplied_base_url() {
         let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
         let (req, ctx) = build_wasm_request(
             &headers,
             &Method::POST,
+            "https://registry.example.com",
             "/upload".to_string(),
             Bytes::from(vec![0xde, 0xad]),
             "rpm-custom",
@@ -561,23 +537,31 @@ mod tests {
         );
         assert_eq!(req.method, "POST");
         assert_eq!(req.body, vec![0xde, 0xad]);
+        assert_eq!(req.headers.len(), 1);
         assert_eq!(ctx.repo_key, "centos-repo");
-        assert!(ctx.base_url.starts_with("https://"));
-        assert!(ctx.download_base_url.starts_with("https://"));
+        assert_eq!(
+            ctx.base_url,
+            "https://registry.example.com/ext/rpm-custom/centos-repo"
+        );
+        assert_eq!(
+            ctx.download_base_url,
+            "https://registry.example.com/api/v1/repositories/centos-repo/download"
+        );
     }
 
     #[test]
-    fn test_build_wasm_request_no_host_header() {
+    fn test_build_wasm_request_uses_fallback_base_url() {
         let headers = HeaderMap::new();
         let (_, ctx) = build_wasm_request(
             &headers,
             &Method::GET,
+            "http://localhost",
             "/".to_string(),
             Bytes::new(),
             "fmt",
             "repo",
         );
-        assert!(ctx.base_url.starts_with("http://localhost:8080"));
+        assert_eq!(ctx.base_url, "http://localhost/ext/fmt/repo");
     }
 
     // -----------------------------------------------------------------------

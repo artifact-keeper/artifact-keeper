@@ -23,10 +23,12 @@
 
 use axum::{
     async_trait,
-    extract::{rejection::JsonRejection, FromRequest, Request},
+    extract::{rejection::JsonRejection, FromRequest, FromRequestParts, Request},
+    http::{request::Parts, HeaderMap, Uri},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use std::convert::Infallible;
 
 use crate::error::AppError;
 
@@ -77,15 +79,356 @@ fn map_json_rejection(rejection: JsonRejection) -> AppError {
     AppError::Validation(rejection.body_text())
 }
 
+/// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
+/// the value is a syntactically valid `http`/`https` absolute URL with no
+/// embedded userinfo. Kept separate from [`configured_external_url`] so the
+/// validation rules can be unit-tested without poisoning the process-wide
+/// `OnceLock`.
+fn parse_external_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = match url::Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                value = %trimmed,
+                error = %e,
+                "AK_EXTERNAL_URL is not a valid URL; ignoring"
+            );
+            return None;
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        tracing::warn!(
+            value = %trimmed,
+            scheme = parsed.scheme(),
+            "AK_EXTERNAL_URL scheme must be http or https; ignoring"
+        );
+        return None;
+    }
+    if parsed.host_str().map_or(true, str::is_empty) {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must have a host; ignoring"
+        );
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        tracing::warn!(
+            value = %trimmed,
+            "AK_EXTERNAL_URL must not contain embedded credentials; ignoring"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Operator-configured external base URL, read once from `AK_EXTERNAL_URL`
+/// and cached for the process lifetime. When set, this overrides whatever
+/// [`request_base_url_from_request`] derives from request metadata.
+fn configured_external_url() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var("AK_EXTERNAL_URL").ok()?;
+            parse_external_url(&raw)
+        })
+        .as_deref()
+}
+
+/// External base URL derived from request metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestBaseUrl(pub String);
+
+impl RequestBaseUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RequestBaseUrl
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(request_base_url_from_request(
+            &parts.headers,
+            Some(&parts.uri),
+        )))
+    }
+}
+
+/// Derive the external base URL from reverse-proxy headers and request URI.
+///
+/// Resolution order (#1021):
+/// 1. `AK_EXTERNAL_URL` environment variable, if set.
+/// 2. `X-Forwarded-Host` + `X-Forwarded-Proto`.
+/// 3. The request URI authority (`:authority` for h2c / HTTP/2).
+/// 4. The `Host` request header.
+/// 5. `http://localhost` as a last-resort fallback.
+pub fn request_base_url_from_request(headers: &HeaderMap, uri: Option<&Uri>) -> String {
+    if let Some(external) = configured_external_url() {
+        return external.to_string();
+    }
+
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.and_then(Uri::scheme_str))
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.and_then(Uri::authority).map(|a| a.as_str()))
+        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()))
+        .unwrap_or("localhost");
+
+    if host.contains("://") {
+        host.to_string()
+    } else {
+        format!("{}://{}", scheme, host)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{header, Request, StatusCode},
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri, Version},
         response::IntoResponse,
     };
     use serde::Deserialize;
+
+    fn request_base_url(headers: &HeaderMap) -> String {
+        request_base_url_from_request(headers, None)
+    }
+
+    #[test]
+    fn test_request_base_url_no_headers() {
+        let headers = HeaderMap::new();
+        assert_eq!(request_base_url(&headers), "http://localhost");
+    }
+
+    #[test]
+    fn test_request_base_url_host_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:8080"));
+        assert_eq!(request_base_url(&headers), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(request_base_url(&headers), "https://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com:30443"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            request_base_url(&headers),
+            "https://registry.example.com:30443"
+        );
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host_without_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com"),
+        );
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_uses_uri_authority_before_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        let uri = Uri::from_static("http://registry.example.com/v2/");
+
+        assert_eq!(
+            request_base_url_from_request(&headers, Some(&uri)),
+            "http://registry.example.com"
+        );
+    }
+
+    #[test]
+    fn test_request_base_url_uses_uri_scheme() {
+        let headers = HeaderMap::new();
+        let uri = Uri::from_static("https://registry.example.com/v2/");
+
+        assert_eq!(
+            request_base_url_from_request(&headers, Some(&uri)),
+            "https://registry.example.com"
+        );
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host_takes_precedence_over_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("external.example.com"),
+        );
+        let uri = Uri::from_static("http://internal.example.com/v2/");
+
+        assert_eq!(
+            request_base_url_from_request(&headers, Some(&uri)),
+            "https://external.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_base_url_extractor_uses_http2_authority_before_host() {
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .uri("http://registry.example.com/v2/")
+            .header("host", "backend:8080")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+
+        let base_url = RequestBaseUrl::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(base_url.as_str(), "http://registry.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_request_base_url_extractor_forwarded_host_precedes_http2_authority() {
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .uri("http://internal.example.com/v2/")
+            .header("host", "backend:8080")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "external.example.com")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+
+        let base_url = RequestBaseUrl::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(base_url.as_str(), "https://external.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_embedded_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_static("https://already-absolute.example.com"),
+        );
+        assert_eq!(
+            request_base_url(&headers),
+            "https://already-absolute.example.com"
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_https() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_http() {
+        assert_eq!(
+            parse_external_url("http://localhost:8080"),
+            Some("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_strips_trailing_slash() {
+        assert_eq!(
+            parse_external_url("https://registry.example.com/"),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_trims_whitespace() {
+        assert_eq!(
+            parse_external_url("  https://registry.example.com/  "),
+            Some("https://registry.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_empty_rejected() {
+        assert_eq!(parse_external_url(""), None);
+        assert_eq!(parse_external_url("   "), None);
+        assert_eq!(parse_external_url("/"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_missing_scheme_rejected() {
+        assert_eq!(parse_external_url("registry.example.com"), None);
+        assert_eq!(parse_external_url("//registry.example.com"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_non_http_scheme_rejected() {
+        assert_eq!(parse_external_url("ftp://registry.example.com"), None);
+        assert_eq!(parse_external_url("file:///etc/passwd"), None);
+        assert_eq!(parse_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_embedded_credentials_rejected() {
+        assert_eq!(
+            parse_external_url("https://user:pass@registry.example.com"),
+            None
+        );
+        assert_eq!(
+            parse_external_url("https://user@registry.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_external_url_invalid_garbage_rejected() {
+        assert_eq!(parse_external_url("https://"), None);
+        assert_eq!(parse_external_url("not a url at all"), None);
+    }
+
+    #[test]
+    fn test_parse_external_url_with_path_preserved() {
+        assert_eq!(
+            parse_external_url("https://example.com/registry"),
+            Some("https://example.com/registry".to_string())
+        );
+    }
 
     #[derive(Debug, Deserialize)]
     struct Sample {

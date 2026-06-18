@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
@@ -342,7 +343,7 @@ async fn resolve_cargo_repo(
 async fn config_json(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
@@ -356,11 +357,9 @@ async fn config_json(
     };
 
     // Determine the base URL from reverse-proxy / Host headers.
-    let base_url = proxy_helpers::request_base_url(&headers);
-
     let config = serde_json::json!({
-        "dl": format!("{}/cargo/{}/api/v1/crates", base_url, repo_key),
-        "api": format!("{}/cargo/{}", base_url, repo_key),
+        "dl": format!("{}/cargo/{}/api/v1/crates", base_url.as_str(), repo_key),
+        "api": format!("{}/cargo/{}", base_url.as_str(), repo_key),
         // For private repos, tell cargo to send credentials on all requests
         // (index fetches included).  Without this flag cargo only sends auth
         // after a 401 challenge, but it does not retry 401s on index entries.

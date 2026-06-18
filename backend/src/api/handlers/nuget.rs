@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -163,16 +164,12 @@ fn select_latest_version(versions: &[String], include_prerelease: bool) -> &str 
 async fn service_index(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let _repo = resolve_nuget_repo(&state.db, &repo_key).await?;
 
     // Determine the base URL from reverse-proxy / Host headers.
-    let base = format!(
-        "{}/nuget/{}",
-        proxy_helpers::request_base_url(&headers),
-        repo_key
-    );
+    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
 
     let index = serde_json::json!({
         "version": "3.0.0",
@@ -251,7 +248,7 @@ async fn search_packages(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
     Query(params): Query<SearchQuery>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
 
@@ -261,11 +258,7 @@ async fn search_packages(
     let prerelease = params.prerelease.unwrap_or(false);
 
     // Determine base URL for building resource links.
-    let base = format!(
-        "{}/nuget/{}",
-        proxy_helpers::request_base_url(&headers),
-        repo_key
-    );
+    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
 
     // Search distinct package names matching the query term.
     let search_pattern = format!("%{}%", query_term.to_lowercase());
@@ -382,16 +375,12 @@ async fn search_packages(
 async fn registration_index(
     State(state): State<SharedState>,
     Path((repo_key, package_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
-    let base = format!(
-        "{}/nuget/{}",
-        proxy_helpers::request_base_url(&headers),
-        repo_key
-    );
+    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
     // local/staging members for a virtual repo.

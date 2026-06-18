@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -271,6 +272,7 @@ async fn batch(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
+    request_base_url: RequestBaseUrl,
     body: Bytes,
 ) -> Result<Response, Response> {
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
@@ -298,7 +300,7 @@ async fn batch(
         None
     };
 
-    let base_url = build_base_url(&headers, &repo_key);
+    let base_url = build_base_url(request_base_url.as_str(), &repo_key);
     let mut response_objects = Vec::with_capacity(request.objects.len());
 
     for obj in &request.objects {
@@ -420,12 +422,8 @@ async fn batch(
     Ok(lfs_json_response(StatusCode::OK, &response))
 }
 
-fn build_base_url(headers: &HeaderMap, repo_key: &str) -> String {
-    format!(
-        "{}/lfs/{}",
-        proxy_helpers::request_base_url(headers),
-        repo_key
-    )
+fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
+    format!("{}/lfs/{}", request_base_url, repo_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1092,6 @@ async fn delete_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
     // extract_credentials
@@ -1160,34 +1157,6 @@ mod tests {
     #[test]
     fn test_lfs_content_type() {
         assert_eq!(LFS_CONTENT_TYPE, "application/vnd.git-lfs+json");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_base_url
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_base_url_default() {
-        let headers = HeaderMap::new();
-        let url = build_base_url(&headers, "my-repo");
-        assert_eq!(url, "http://localhost/lfs/my-repo");
-    }
-
-    #[test]
-    fn test_build_base_url_with_host_and_scheme() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("git.example.com"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        let url = build_base_url(&headers, "my-lfs");
-        assert_eq!(url, "https://git.example.com/lfs/my-lfs");
-    }
-
-    #[test]
-    fn test_build_base_url_host_only() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("example.com:8080"));
-        let url = build_base_url(&headers, "repo");
-        assert_eq!(url, "http://example.com:8080/lfs/repo");
     }
 
     // -----------------------------------------------------------------------
