@@ -1,4 +1,13 @@
 //! Age-based quality gate for remote NPM and PyPI proxy registries.
+//!
+//! # v1 scope limitation
+//!
+//! The gate applies **only to direct Remote repositories** (npm and PyPI).
+//! Virtual repositories whose members include Remote repositories are not
+//! age-gated on the download path — only the Direct Remote branch is checked.
+//! Consumers fetching through a Virtual repo receive unfiltered pass-through.
+//! This is intentional for v1 and should be addressed before extending the
+//! gate to other repository types.
 
 use std::sync::Arc;
 
