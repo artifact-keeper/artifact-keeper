@@ -33,6 +33,19 @@ fn parse_status_filter(raw: &str) -> Option<Vec<String>> {
     (!parsed.is_empty()).then_some(parsed)
 }
 
+/// Clamp review-list pagination inputs and compute SQL offset.
+fn normalize_review_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).clamp(1, 100);
+    let offset = i64::from(page - 1) * i64::from(per_page);
+    (page, per_page, offset)
+}
+
+/// Compute total pages for a paginated review list.
+fn compute_review_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/reviews", get(list_reviews))
@@ -141,9 +154,7 @@ pub async fn list_reviews(
     Query(query): Query<ReviewListQuery>,
 ) -> Result<Json<AgeGateReviewListResponse>> {
     let svc = age_gate_service(&state)?;
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
-    let offset = i64::from(page - 1) * i64::from(per_page);
+    let (page, per_page, offset) = normalize_review_pagination(query.page, query.per_page);
 
     // `status` accepts a comma-separated list (e.g. "approved,rejected") so the UI
     // can fetch multiple states in one page while keeping pagination totals honest.
@@ -158,7 +169,7 @@ pub async fn list_reviews(
         )
         .await?;
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let total_pages = compute_review_total_pages(total, per_page);
     Ok(Json(AgeGateReviewListResponse {
         items: items.into_iter().map(review_to_response).collect(),
         pagination: Pagination {
@@ -306,13 +317,7 @@ pub async fn update_repo_age_gate(
     let auth = require_auth(auth)?;
     auth.require_admin()?;
 
-    // The repositories.age_gate_min_age_days column has a CHECK (1..=3650); validate
-    // here so an out-of-range value returns a clean 400 instead of a 500 DB error.
-    if !(1..=3650).contains(&body.min_age_days) {
-        return Err(AppError::Validation(
-            "min_age_days must be between 1 and 3650".to_string(),
-        ));
-    }
+    crate::services::age_gate_service::validate_min_age_days(body.min_age_days)?;
 
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -364,7 +369,9 @@ pub struct AgeGateApi;
 
 #[cfg(test)]
 mod tests {
-    use super::parse_status_filter;
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
 
     #[test]
     fn parse_status_filter_splits_and_trims() {
@@ -386,5 +393,42 @@ mod tests {
     fn parse_status_filter_empty_is_none() {
         assert_eq!(parse_status_filter(""), None);
         assert_eq!(parse_status_filter("  , ,"), None);
+    }
+
+    #[test]
+    fn normalize_review_pagination_defaults_and_clamps() {
+        assert_eq!(normalize_review_pagination(None, None), (1, 20, 0));
+        assert_eq!(normalize_review_pagination(Some(0), Some(200)), (1, 100, 0));
+        assert_eq!(normalize_review_pagination(Some(3), Some(25)), (3, 25, 50));
+    }
+
+    #[test]
+    fn compute_review_total_pages_ceil_and_zero() {
+        assert_eq!(compute_review_total_pages(45, 20), 3);
+        assert_eq!(compute_review_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn review_to_response_maps_fields_and_default_key() {
+        let now = Utc::now();
+        let review = crate::services::age_gate_service::AgeGateReview {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            package_name: "lodash".to_string(),
+            package_version: "4.0.0".to_string(),
+            upstream_published_at: None,
+            status: "pending".to_string(),
+            requested_at: now,
+            reviewed_by: None,
+            reviewed_at: None,
+            review_reason: None,
+            request_count: 1,
+            last_requested_at: now,
+            repository_key: None,
+        };
+        let resp = review_to_response(review);
+        assert_eq!(resp.repository_key, "");
+        assert_eq!(resp.package_name, "lodash");
+        assert_eq!(resp.status, "pending");
     }
 }
