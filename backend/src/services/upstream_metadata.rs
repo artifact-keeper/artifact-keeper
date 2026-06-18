@@ -57,7 +57,7 @@ impl UpstreamMetadataCache {
         upstream_url: &str,
         project: &str,
     ) -> Result<PublishTimeMap> {
-        let cache_key = (repo_id, project.to_ascii_lowercase());
+        let cache_key = pypi_cache_key(repo_id, project);
         if let Some(cached) = self.get_pypi_cached(&cache_key) {
             return Ok(cached);
         }
@@ -90,7 +90,7 @@ impl UpstreamMetadataCache {
     fn get_pypi_cached(&self, key: &(Uuid, String)) -> Option<PublishTimeMap> {
         let guard = self.pypi.read().ok()?;
         let entry = guard.get(key)?;
-        if entry.fetched_at.elapsed() <= PYPI_CACHE_TTL {
+        if is_pypi_cache_fresh(entry.fetched_at.elapsed(), PYPI_CACHE_TTL) {
             Some(entry.times.clone())
         } else {
             None
@@ -118,7 +118,16 @@ pub fn metadata_http_client() -> Result<Client> {
         .map_err(|e| AppError::Internal(format!("HTTP client build failed: {e}")))
 }
 
-fn pypi_json_url(upstream_url: &str, project: &str) -> String {
+fn pypi_cache_key(repo_id: Uuid, project: &str) -> (Uuid, String) {
+    (repo_id, project.to_ascii_lowercase())
+}
+
+fn is_pypi_cache_fresh(elapsed: Duration, ttl: Duration) -> bool {
+    elapsed <= ttl
+}
+
+/// Build the PyPI Warehouse JSON URL from a simple-index upstream base.
+pub fn pypi_json_url(upstream_url: &str, project: &str) -> String {
     let mut base = upstream_url.trim_end_matches('/');
     if let Some(stripped) = base.strip_suffix("/simple") {
         base = stripped;
@@ -126,7 +135,8 @@ fn pypi_json_url(upstream_url: &str, project: &str) -> String {
     format!("{base}/pypi/{project}/json")
 }
 
-fn parse_pypi_releases_json(body: &serde_json::Value) -> PublishTimeMap {
+/// Parse PyPI Warehouse `releases` JSON into version -> earliest upload time.
+pub fn parse_pypi_releases_json(body: &serde_json::Value) -> PublishTimeMap {
     let mut map = PublishTimeMap::new();
     let Some(releases) = body.get("releases").and_then(|r| r.as_object()) else {
         return map;
@@ -155,7 +165,7 @@ fn parse_pypi_releases_json(body: &serde_json::Value) -> PublishTimeMap {
     map
 }
 
-fn parse_iso_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_iso_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     let s = value.as_str()?;
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
@@ -173,6 +183,7 @@ fn parse_iso_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn parse_npm_publish_times_skips_meta_keys() {
@@ -229,5 +240,54 @@ mod tests {
         // Non-timestamps stay None.
         assert!(parse_iso_timestamp(&json!("not-a-date")).is_none());
         assert!(parse_iso_timestamp(&json!(12345)).is_none());
+    }
+
+    #[test]
+    fn parse_npm_publish_times_missing_time_is_empty() {
+        assert!(UpstreamMetadataCache::parse_npm_publish_times(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_pypi_releases_json_earliest_wins() {
+        let body = json!({
+            "releases": {
+                "1.0.0": [
+                    { "upload_time_iso_8601": "2024-07-02T12:00:00.000Z" },
+                    { "upload_time_iso_8601": "2024-06-01T12:00:00.000Z" }
+                ]
+            }
+        });
+        let times = parse_pypi_releases_json(&body);
+        let ts = times.get("1.0.0").unwrap();
+        // Earliest of the two files wins; `to_rfc3339` renders zero-fraction UTC
+        // as `+00:00` (see `parse_iso_timestamp_handles_rfc3339_and_offsetless`).
+        assert_eq!(ts.to_rfc3339(), "2024-06-01T12:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_pypi_releases_json_handles_missing_and_malformed() {
+        // Body without a `releases` object yields no publish times.
+        assert!(parse_pypi_releases_json(&json!({})).is_empty());
+        // A release whose file list is not an array is skipped, not panicked on.
+        let body = json!({ "releases": { "1.0.0": "not-an-array" } });
+        assert!(parse_pypi_releases_json(&body).is_empty());
+    }
+
+    #[test]
+    fn pypi_cache_key_lowercases_project() {
+        let id = Uuid::new_v4();
+        assert_eq!(pypi_cache_key(id, "Requests"), (id, "requests".to_string()));
+    }
+
+    #[test]
+    fn is_pypi_cache_fresh_boundary() {
+        assert!(is_pypi_cache_fresh(
+            Duration::from_secs(30),
+            Duration::from_secs(60)
+        ));
+        assert!(!is_pypi_cache_fresh(
+            Duration::from_secs(61),
+            Duration::from_secs(60)
+        ));
     }
 }
