@@ -786,442 +786,35 @@ async fn download(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    // 1. Check if this is a checksum request for metadata
+    // 1. Check if this is a checksum request for metadata.
+    //    Always compute the checksum from the actual metadata XML bytes
+    //    so the result is guaranteed to match what this same URL returns
+    //    for the base maven-metadata.xml request — regardless of whether
+    //    the repo is local, remote, or virtual (with merge).
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         if MavenHandler::is_metadata(base_path) {
-            // Try stored checksum file first
-            let checksum_storage_key = format!("maven/{}", path);
-            if let Ok(content) = storage.get(&checksum_storage_key).await {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-
-            // Try stored metadata file and compute checksum from it
-            let meta_storage_key = format!("maven/{}", base_path);
-            if let Ok(content) = storage.get(&meta_storage_key).await {
-                let checksum = compute_checksum(&content, checksum_type);
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::from(checksum))
-                    .unwrap());
-            }
-
-            // Virtual repo: walk members and try the same two probes
-            // (stored checksum file, then stored metadata file) against
-            // each member's storage before falling through to dynamic
-            // generation. Without this, a `maven-metadata.xml.sha256`
-            // request against a virtual repo whose member holds the
-            // metadata file returned 404, because `repo.storage_location()`
-            // above is the virtual's own (empty) storage and the dynamic
-            // generation below only queries `repo.id` (which has no
-            // artifact rows for a virtual). #1444.
-            if repo.repo_type == RepositoryType::Virtual {
-                // #1804: gate the per-member stored-file probes so a public
-                // virtual repo cannot serve a PRIVATE member's stored checksum
-                // or metadata file to a caller who could not read that member
-                // directly.
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-                let members = proxy_helpers::authorize_virtual_members(
-                    &state.permission_service,
-                    auth.as_ref(),
-                    members,
-                )
-                .await;
-                for member in &members {
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&checksum_storage_key).await {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, "text/plain")
-                                .body(Body::from(content))
-                                .unwrap());
-                        }
-                        if let Ok(content) = member_storage.get(&meta_storage_key).await {
-                            let checksum = compute_checksum(&content, checksum_type);
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, "text/plain")
-                                .body(Body::from(checksum))
-                                .unwrap());
-                        }
-                    }
-                }
-
-                // Also generate metadata from members' artifact rows.
-                // Artifact-level (group/artifact) metadata can be
-                // synthesised from `artifact_metadata` rows even when no
-                // member uploaded a precomputed `maven-metadata.xml`.
-                if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
-                    for member in &members {
-                        if let Ok(xml) = generate_metadata_for_artifact(
-                            &state.db,
-                            member.id,
-                            &group_id,
-                            &artifact_id,
-                        )
-                        .await
-                        {
-                            let checksum = compute_checksum(xml.as_bytes(), checksum_type);
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, "text/plain")
-                                .body(Body::from(checksum))
-                                .unwrap());
-                        }
-                    }
-                }
-
-                // For remote members, proxy the checksum file (or the
-                // metadata file) from upstream. Proxy-cached metadata is not
-                // in the `artifacts` table, so the generation above cannot
-                // serve checksums for a remote member's upstream metadata. The
-                // virtual repo's own (empty) storage probed earlier also misses.
-                for member in &members {
-                    if member.repo_type == RepositoryType::Remote {
-                        if let (Some(upstream_url), Some(ref proxy)) =
-                            (member.upstream_url.as_deref(), &state.proxy_service)
-                        {
-                            // Prefer the upstream checksum file directly.
-                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                            )
-                            .await
-                            {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(CONTENT_TYPE, "text/plain")
-                                    .body(Body::from(content))
-                                    .unwrap());
-                            }
-                            // Otherwise compute it from the upstream metadata file.
-                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                base_path,
-                            )
-                            .await
-                            {
-                                let checksum = compute_checksum(&content, checksum_type);
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(CONTENT_TYPE, "text/plain")
-                                    .body(Body::from(checksum))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Proxy the checksum file from upstream for remote repos, or
-            // compute it from the proxied metadata file. Proxy-cached metadata
-            // is not in the `artifacts` table, so the DB-only generation below
-            // never serves a checksum for a remote repo's upstream metadata.
-            if metadata_checksum_should_proxy_upstream(
-                &repo.repo_type,
-                repo.upstream_url.is_some(),
-                state.proxy_service.is_some(),
-            ) {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    if let Ok((content, _)) =
-                        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                            .await
-                    {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
-                    if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        base_path,
-                    )
-                    .await
-                    {
-                        let checksum = compute_checksum(&content, checksum_type);
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(checksum))
-                            .unwrap());
-                    }
-                }
-            }
-
-            // Fall back to dynamic generation for artifact-level metadata
-            if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
-                let xml =
-                    generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id)
-                        .await?;
-                let checksum = compute_checksum(xml.as_bytes(), checksum_type);
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::from(checksum))
-                    .unwrap());
-            }
+            let content =
+                fetch_maven_metadata_bytes(&state, &repo, &repo_key, base_path, auth.as_ref())
+                    .await?;
+            let checksum = compute_checksum(&content, checksum_type);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(checksum))
+                .unwrap());
         }
     }
 
     // 2. Check if this is a maven-metadata.xml request
     if MavenHandler::is_metadata(&path) {
-        // Try stored metadata file first (handles version-level metadata)
-        let meta_storage_key = format!("maven/{}", path);
-        if let Ok(content) = storage.get(&meta_storage_key).await {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/xml")
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .body(Body::from(content))
-                .unwrap());
-        }
-
-        // Fall back to dynamic generation for artifact-level metadata
-        if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
-            let xml =
-                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await;
-            if let Ok(xml) = xml {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/xml")
-                    .header(CONTENT_LENGTH, xml.len().to_string())
-                    .body(Body::from(xml))
-                    .unwrap());
-            }
-        }
-
-        // Fallback: proxy metadata from upstream for remote repos
-        if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                let (content, _content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                        .await?;
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/xml")
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-        }
-
-        // Virtual repo: merge metadata from all members
-        if repo.repo_type == RepositoryType::Virtual {
-            if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
-                let mut all_versions: Vec<String> = Vec::new();
-
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-                for member in &members {
-                    // Try generating metadata from this member's artifacts
-                    if let Ok(xml) = generate_metadata_for_artifact(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                    )
-                    .await
-                    {
-                        if let Some((_, _, versions)) =
-                            crate::formats::maven::parse_metadata_versions(&xml)
-                        {
-                            all_versions.extend(versions);
-                        }
-                    }
-
-                    // For remote members, also try proxying metadata from upstream
-                    if member.repo_type == RepositoryType::Remote {
-                        if let (Some(upstream_url), Some(ref proxy)) =
-                            (member.upstream_url.as_deref(), &state.proxy_service)
-                        {
-                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                            )
-                            .await
-                            {
-                                if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                    if let Some((_, _, versions)) =
-                                        crate::formats::maven::parse_metadata_versions(xml_str)
-                                    {
-                                        all_versions.extend(versions);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !all_versions.is_empty() {
-                    all_versions.sort();
-                    all_versions.dedup();
-
-                    use crate::formats::maven_version;
-                    let sorted = maven_version::sort_maven_versions(&all_versions);
-                    let latest = sorted.last().unwrap().clone();
-                    let release = maven_version::latest_release(&sorted).cloned();
-
-                    let xml = generate_metadata_xml(
-                        &group_id,
-                        &artifact_id,
-                        &sorted,
-                        &latest,
-                        release.as_deref(),
-                    );
-
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/xml")
-                        .header(CONTENT_LENGTH, xml.len().to_string())
-                        .body(Body::from(xml))
-                        .unwrap());
-                }
-
-                // Group-level plugin-prefix metadata (#1595). A path like
-                // `org/apache/maven/plugins/maven-metadata.xml` matches
-                // parse_metadata_path but carries <plugins> entries instead
-                // of a <versions> block, so the version merge above yields
-                // nothing. Collect each member's plugin-prefix metadata
-                // (stored file first, upstream for remote members) and serve
-                // the union of <plugin> entries deduped by <prefix>.
-                let mut member_docs: Vec<String> = Vec::new();
-                for member in &members {
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                member_docs.push(xml_str.to_string());
-                                continue;
-                            }
-                        }
-                    }
-
-                    if member.repo_type == RepositoryType::Remote {
-                        if let (Some(upstream_url), Some(ref proxy)) =
-                            (member.upstream_url.as_deref(), &state.proxy_service)
-                        {
-                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                            )
-                            .await
-                            {
-                                if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                    member_docs.push(xml_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs)
-                {
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/xml")
-                        .header(CONTENT_LENGTH, xml.len().to_string())
-                        .body(Body::from(xml))
-                        .unwrap());
-                }
-            }
-
-            // Virtual repo: SNAPSHOT version-level metadata (#839).
-            // parse_metadata_path returns None for `g/a/v-SNAPSHOT/maven-metadata.xml`
-            // paths, so we handle those separately here. For each member, try the
-            // stored metadata file first, then generate from member artifacts, then
-            // proxy from upstream for remote members.
-            if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(&path) {
-                let mut all_entries: Vec<SnapshotEntry> = Vec::new();
-
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-                for member in &members {
-                    // First try the member's stored maven-metadata.xml directly.
-                    // This captures uploads that deployed a precomputed metadata file.
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
-                            }
-                        }
-                    }
-
-                    // Collect entries directly from the member's artifact rows.
-                    let entries = collect_snapshot_entries(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                        &version,
-                    )
-                    .await;
-                    all_entries.extend(entries);
-
-                    // For remote members, also try proxying the upstream metadata.
-                    if member.repo_type == RepositoryType::Remote {
-                        if let (Some(upstream_url), Some(ref proxy)) =
-                            (member.upstream_url.as_deref(), &state.proxy_service)
-                        {
-                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                            )
-                            .await
-                            {
-                                if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                    all_entries.extend(parse_snapshot_versions_xml(xml_str));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !all_entries.is_empty() {
-                    if let Some(xml) = generate_snapshot_metadata_xml(
-                        &group_id,
-                        &artifact_id,
-                        &version,
-                        &all_entries,
-                    ) {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/xml")
-                            .header(CONTENT_LENGTH, xml.len().to_string())
-                            .body(Body::from(xml))
-                            .unwrap());
-                    }
-                }
-            }
-        }
-
-        // Metadata not found anywhere
-        return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
+        let content =
+            fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/xml")
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap());
     }
 
     // 3. Check if this is a checksum request for a stored file
@@ -1345,6 +938,226 @@ async fn download(
 
     // 4. Serve the artifact file
     serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
+}
+
+async fn fetch_maven_metadata_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    path: &str,
+    auth: Option<&AuthExtension>,
+) -> Result<Bytes, Response> {
+    // Remote repos: proxy from upstream. No local storage probe, no dynamic
+    // generation — the upstream is the source of truth.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let (content, _) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, path).await?;
+            return Ok(content);
+        }
+        return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
+    }
+
+    // Virtual repos: merge metadata from all members.
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let members =
+            proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members)
+                .await;
+
+        if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
+            let mut all_versions: Vec<String> = Vec::new();
+
+            for member in &members {
+                if member.repo_type == RepositoryType::Remote {
+                    // Remote members: proxy metadata from upstream directly.
+                    if let (Some(upstream_url), Some(ref proxy)) =
+                        (member.upstream_url.as_deref(), &state.proxy_service)
+                    {
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            path,
+                        )
+                        .await
+                        {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                if let Some((_, _, versions)) =
+                                    crate::formats::maven::parse_metadata_versions(xml_str)
+                                {
+                                    all_versions.extend(versions);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Local/Staging members: generate from artifact rows.
+                    if let Ok(xml) = generate_metadata_for_artifact(
+                        &state.db,
+                        member.id,
+                        &group_id,
+                        &artifact_id,
+                    )
+                    .await
+                    {
+                        if let Some((_, _, versions)) =
+                            crate::formats::maven::parse_metadata_versions(&xml)
+                        {
+                            all_versions.extend(versions);
+                        }
+                    }
+                }
+            }
+
+            if !all_versions.is_empty() {
+                all_versions.sort();
+                all_versions.dedup();
+
+                use crate::formats::maven_version;
+                let sorted = maven_version::sort_maven_versions(&all_versions);
+                let latest = sorted.last().unwrap().clone();
+                let release = maven_version::latest_release(&sorted).cloned();
+
+                let xml = generate_metadata_xml(
+                    &group_id,
+                    &artifact_id,
+                    &sorted,
+                    &latest,
+                    release.as_deref(),
+                );
+
+                return Ok(Bytes::from(xml));
+            }
+
+            // Group-level plugin-prefix metadata (#1595). A path like
+            // `org/apache/maven/plugins/maven-metadata.xml` matches
+            // parse_metadata_path but carries <plugins> entries instead of a
+            // <versions> block. Collect each member's plugin-prefix metadata
+            // and serve the union of <plugin> entries deduped by <prefix>.
+            let mut member_docs: Vec<String> = Vec::new();
+            for member in &members {
+                if member.repo_type == RepositoryType::Remote {
+                    // Remote members: fetch from upstream.
+                    if let (Some(upstream_url), Some(ref proxy)) =
+                        (member.upstream_url.as_deref(), &state.proxy_service)
+                    {
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            path,
+                        )
+                        .await
+                        {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                member_docs.push(xml_str.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    // Local/Staging members: try stored metadata file.
+                    let member_storage_key = format!("maven/{}", path);
+                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
+                        if let Ok(content) = member_storage.get(&member_storage_key).await {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                member_docs.push(xml_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
+                return Ok(Bytes::from(xml));
+            }
+        }
+
+        // Virtual repo: SNAPSHOT version-level metadata (#839).
+        // parse_metadata_path returns None for `g/a/v-SNAPSHOT/maven-metadata.xml`
+        // paths, so handle those separately.
+        if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+            let mut all_entries: Vec<SnapshotEntry> = Vec::new();
+
+            for member in &members {
+                if member.repo_type == RepositoryType::Remote {
+                    // Remote members: proxy snapshot metadata from upstream.
+                    if let (Some(upstream_url), Some(ref proxy)) =
+                        (member.upstream_url.as_deref(), &state.proxy_service)
+                    {
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            path,
+                        )
+                        .await
+                        {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                            }
+                        }
+                    }
+                } else {
+                    // Local/Staging members: try stored metadata file, then
+                    // collect entries from artifact rows.
+                    let member_storage_key = format!("maven/{}", path);
+                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
+                        if let Ok(content) = member_storage.get(&member_storage_key).await {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                            }
+                        }
+                    }
+
+                    let entries = collect_snapshot_entries(
+                        &state.db,
+                        member.id,
+                        &group_id,
+                        &artifact_id,
+                        &version,
+                    )
+                    .await;
+                    all_entries.extend(entries);
+                }
+            }
+
+            if !all_entries.is_empty() {
+                if let Some(xml) =
+                    generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &all_entries)
+                {
+                    return Ok(Bytes::from(xml));
+                }
+            }
+        }
+
+        return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
+    }
+
+    // Local/Staging repos: try stored metadata file, then dynamic generation.
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let meta_storage_key = format!("maven/{}", path);
+    if let Ok(content) = storage.get(&meta_storage_key).await {
+        return Ok(content);
+    }
+
+    if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
+        if let Ok(xml) =
+            generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await
+        {
+            return Ok(Bytes::from(xml));
+        }
+    }
+
+    Err(AppError::NotFound("Metadata not found".to_string()).into_response())
 }
 
 async fn generate_metadata_for_artifact(
@@ -1694,24 +1507,6 @@ async fn serve_artifact(
 /// unit-tested without constructing a full repository row.
 fn checksum_compute_eligible(repo_type: &str) -> bool {
     repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
-}
-
-/// Whether a `maven-metadata.xml.<algo>` checksum request should be served by
-/// proxying upstream (either the upstream checksum file, or computed from the
-/// upstream metadata file).
-///
-/// Remote repos (and remote members of a virtual) cache the upstream
-/// `maven-metadata.xml` in the proxy cache, not the `artifacts` table, so the
-/// DB-only `generate_metadata_for_artifact` path returns no rows and the
-/// request previously 404'd. Proxying is only possible when the repo is
-/// `Remote` and has both an `upstream_url` and a configured proxy service
-/// (#1775).
-fn metadata_checksum_should_proxy_upstream(
-    repo_type: &str,
-    has_upstream_url: bool,
-    has_proxy_service: bool,
-) -> bool {
-    repo_type == RepositoryType::Remote && has_upstream_url && has_proxy_service
 }
 
 async fn serve_computed_checksum(
@@ -2421,53 +2216,6 @@ mod tests {
         assert!(!RepositoryType::Virtual.is_hosted());
     }
 
-    // -----------------------------------------------------------------------
-    // metadata_checksum_should_proxy_upstream (#1775): artifact-level
-    // maven-metadata.xml.<algo> requests against a remote repo (or a remote
-    // member of a virtual) must fall back to proxying upstream instead of
-    // 404'ing, because proxy-cached metadata is not in the `artifacts` table.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_metadata_checksum_proxies_for_remote_with_upstream_and_proxy() {
-        // Regression for #1775: a fully-configured remote repo must proxy the
-        // metadata checksum upstream rather than return 404.
-        assert!(metadata_checksum_should_proxy_upstream(
-            RepositoryType::Remote.as_str(),
-            true,
-            true,
-        ));
-    }
-
-    #[test]
-    fn test_metadata_checksum_no_proxy_when_missing_upstream_or_service() {
-        // Cannot proxy without an upstream URL or a configured proxy service.
-        assert!(!metadata_checksum_should_proxy_upstream(
-            RepositoryType::Remote.as_str(),
-            false,
-            true,
-        ));
-        assert!(!metadata_checksum_should_proxy_upstream(
-            RepositoryType::Remote.as_str(),
-            true,
-            false,
-        ));
-    }
-
-    #[test]
-    fn test_metadata_checksum_no_proxy_for_hosted_or_virtual() {
-        // Hosted repos serve checksums from their own storage / artifact rows;
-        // virtual repos are resolved per-member. Neither proxies at the top
-        // level.
-        for ty in [
-            RepositoryType::Local.as_str(),
-            RepositoryType::Staging.as_str(),
-            RepositoryType::Virtual.as_str(),
-        ] {
-            assert!(!metadata_checksum_should_proxy_upstream(ty, true, true));
-        }
-    }
-
     fn sample_coords() -> MavenCoordinates {
         MavenCoordinates {
             group_id: "com.example".to_string(),
@@ -2783,6 +2531,19 @@ mod tests {
         assert!(matches!(ct, ChecksumType::Sha1));
     }
 
+    #[test]
+    fn test_parse_checksum_group_level_plugin_metadata_sha1() {
+        let result = parse_checksum_path("org/codehaus/mojo/maven-metadata.xml.sha1");
+        assert!(result.is_some());
+        let (base, ct) = result.unwrap();
+        assert_eq!(base, "org/codehaus/mojo/maven-metadata.xml");
+        assert!(matches!(ct, ChecksumType::Sha1));
+        assert_eq!(
+            parse_metadata_path(base),
+            Some(("org.codehaus".to_string(), "mojo".to_string()))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // content_type_for_path
     // -----------------------------------------------------------------------
@@ -2908,6 +2669,45 @@ mod tests {
         assert_ne!(sha256, sha1);
         assert_ne!(sha256, md5);
         assert_ne!(sha1, md5);
+    }
+
+    #[test]
+    fn test_virtual_plugin_metadata_checksum_uses_merged_xml() {
+        let member_a = r#"<metadata>
+  <plugins>
+    <plugin>
+      <name>Mojo Plugin A</name>
+      <prefix>a</prefix>
+      <artifactId>a-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#
+        .to_string();
+        let member_b = r#"<metadata>
+  <plugins>
+    <plugin>
+      <name>Mojo Plugin B</name>
+      <prefix>b</prefix>
+      <artifactId>b-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#
+        .to_string();
+
+        let merged =
+            crate::formats::maven::merge_plugin_prefix_metadata(&[member_a.clone(), member_b])
+                .unwrap();
+        let merged_sha1 = compute_checksum(merged.as_bytes(), ChecksumType::Sha1);
+
+        assert_eq!(merged_sha1.len(), 40);
+        assert!(merged.contains("<prefix>a</prefix>"));
+        assert!(merged.contains("<prefix>b</prefix>"));
+        assert_ne!(
+            merged_sha1,
+            compute_checksum(member_a.as_bytes(), ChecksumType::Sha1)
+        );
     }
 
     // -----------------------------------------------------------------------
