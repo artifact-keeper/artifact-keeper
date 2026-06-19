@@ -19,7 +19,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 use tracing::info;
 
@@ -115,16 +115,63 @@ pub struct GrypeArtifact {
     pub licenses: Option<Vec<GrypeLicense>>,
 }
 
-/// Per-license entry inside `artifact.licenses`. Grype emits objects of
-/// the shape `{"value": "MIT", "spdxExpression": "MIT", "type": "declared"}`.
-/// We only need the `value` (or `spdxExpression` when present) — the rest
-/// is informational.
-#[derive(Debug, Deserialize)]
+/// Per-license entry inside `artifact.licenses`.
+///
+/// Grype serializes this array heterogeneously: an entry is either an object
+/// `{"value": "MIT", "spdxExpression": "MIT", "type": "declared"}` or a bare
+/// string holding the raw declared license — which may be an SPDX id (`"BSD"`)
+/// or even a URL. For example `grype log4j-core-2.14.1.jar -o json` (grype
+/// v0.114.0 / syft v1.45.1) emits
+/// `"licenses": ["https://www.apache.org/licenses/LICENSE-2.0.txt"]`.
+///
+/// A struct-only `derive(Deserialize)` rejects the string form with
+/// `invalid type: string "...", expected struct GrypeLicense`, and because
+/// `licenses` is nested inside the report that aborts the *entire* parse — one
+/// string-shaped license turns an otherwise successful scan into a hard
+/// failure. The deserializer below accepts both shapes. Only
+/// `value`/`spdxExpression` are consumed downstream; the rest is informational.
+#[derive(Debug)]
 pub struct GrypeLicense {
-    #[serde(default)]
     pub value: Option<String>,
-    #[serde(default, rename = "spdxExpression")]
     pub spdx_expression: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for GrypeLicense {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Accept either the bare-string or the object form. `untagged` tries
+        // the variants in order, so a string matches `Str` and an object falls
+        // through to `Obj`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            /// Bare string: the raw declared license (an SPDX id or a URL).
+            Str(String),
+            /// Structured form: `{"value": "MIT", "spdxExpression": "MIT"}`.
+            Obj {
+                #[serde(default)]
+                value: Option<String>,
+                #[serde(default, rename = "spdxExpression")]
+                spdx_expression: Option<String>,
+            },
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Str(value) => GrypeLicense {
+                value: Some(value),
+                spdx_expression: None,
+            },
+            Raw::Obj {
+                value,
+                spdx_expression,
+            } => GrypeLicense {
+                value,
+                spdx_expression,
+            },
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,5 +2122,53 @@ mod tests {
             Some("Apache-2.0"),
             "valid SPDX licenses must pass through the sanitizer unchanged"
         );
+    }
+
+    /// Regression: Grype emits `artifact.licenses` entries as either an object
+    /// or a bare string (an SPDX id or a URL). The struct-only deserialize
+    /// aborted the whole report parse on the first string-shaped license
+    /// (`invalid type: string "...", expected struct GrypeLicense`), turning a
+    /// successful scan into a hard failure. The string below is the literal
+    /// value `grype log4j-core-2.14.1.jar -o json` (v0.114.0) produced. Both
+    /// shapes — and a mix of the two in one array — must parse.
+    #[test]
+    fn test_grype_license_accepts_bare_string_and_object() {
+        let json = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "CVE-2024-0001",
+                    "severity": "High"
+                },
+                "artifact": {
+                    "name": "libfoo",
+                    "version": "1.0.0",
+                    "type": "deb",
+                    "licenses": [
+                        "https://www.apache.org/licenses/LICENSE-2.0.txt",
+                        {"value": "MIT", "spdxExpression": "MIT", "type": "declared"}
+                    ]
+                }
+            }]
+        }"#;
+
+        // On `main` this `from_str` fails with `invalid type: string "..."`.
+        let report: GrypeReport = serde_json::from_str(json).expect("must parse");
+        let licenses = report.matches[0]
+            .artifact
+            .licenses
+            .as_ref()
+            .expect("licenses must parse");
+        assert_eq!(licenses.len(), 2);
+
+        // Bare string -> value only, no SPDX expression.
+        assert_eq!(
+            licenses[0].value.as_deref(),
+            Some("https://www.apache.org/licenses/LICENSE-2.0.txt")
+        );
+        assert_eq!(licenses[0].spdx_expression.as_deref(), None);
+
+        // Object form -> both fields preserved.
+        assert_eq!(licenses[1].value.as_deref(), Some("MIT"));
+        assert_eq!(licenses[1].spdx_expression.as_deref(), Some("MIT"));
     }
 }
