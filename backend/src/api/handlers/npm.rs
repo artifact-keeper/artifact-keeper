@@ -14,7 +14,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -24,6 +24,8 @@ use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
@@ -97,6 +99,19 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/:package/:version", get(get_version_metadata))
         // Unscoped package metadata / publish: GET/PUT /npm/{repo_key}/{package}
         .route("/:repo_key/:package", get(get_metadata).put(publish))
+        // gzip/br for metadata JSON; excludes already-compressed tarball bodies.
+        .layer(npm_metadata_compression_layer())
+}
+
+/// gzip/br compression for npm metadata. Tarballs are served as
+/// `application/gzip`; that and `application/octet-stream` are excluded as
+/// defence-in-depth so tarball bytes are never recompressed.
+fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().gzip(true).br(true).compress_when(
+        DefaultPredicate::new()
+            .and(NotForContentType::const_new("application/gzip"))
+            .and(NotForContentType::const_new("application/octet-stream")),
+    )
 }
 
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;
@@ -594,6 +609,7 @@ fn build_npm_metadata_response(
     base_url: &str,
     repo_key: &str,
     stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
+    want_abbreviated: bool,
 ) -> Result<Response, Response> {
     let mut versions = serde_json::Map::new();
     let mut version_list: Vec<String> = Vec::new();
@@ -671,9 +687,7 @@ fn build_npm_metadata_response(
         "dist-tags": serde_json::Value::Object(dist_tags),
     });
 
-    Ok(build_json_metadata_response(
-        serde_json::to_string(&response).unwrap(),
-    ))
+    Ok(respond_with_packument(response, want_abbreviated))
 }
 
 /// Choose the `latest` dist-tag for a set of versions when none is recorded.
@@ -787,13 +801,15 @@ async fn fetch_npm_artifacts(
         .collect())
 }
 
-/// Build and return the npm package metadata JSON for all versions.
+/// Return the package metadata: the full packument, or the abbreviated document
+/// when the client requests it.
 async fn get_package_metadata(
     state: &SharedState,
     repo_key: &str,
     package_name: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    let want_abbreviated = wants_abbreviated_metadata(headers);
     let base_url = proxy_helpers::request_base_url(headers);
 
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
@@ -819,6 +835,7 @@ async fn get_package_metadata(
                     content_type,
                     &base_url,
                     repo_key,
+                    want_abbreviated,
                 ));
             }
         }
@@ -851,6 +868,7 @@ async fn get_package_metadata(
                         &base_url,
                         repo_key,
                         &dist_tags,
+                        want_abbreviated,
                     );
                 }
                 continue;
@@ -884,6 +902,7 @@ async fn get_package_metadata(
                         content_type,
                         &base_url,
                         repo_key,
+                        want_abbreviated,
                     ));
                 }
                 Err(_e) => {
@@ -915,6 +934,7 @@ async fn get_package_metadata(
         &base_url,
         repo_key,
         &dist_tags,
+        want_abbreviated,
     )
 }
 
@@ -946,12 +966,14 @@ async fn get_package_version_metadata(
             return Err(AppError::NotFound("Package not found".to_string()).into_response());
         }
         // Version extraction ignores dist-tags; pass an empty map.
+        // Always build the full packument here so the version can be extracted.
         let resp = build_npm_metadata_response(
             &artifacts,
             package_name,
             &base_url,
             repo_key,
             &serde_json::Map::new(),
+            false,
         )?;
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
@@ -1027,12 +1049,14 @@ async fn fetch_virtual_packument(
         {
             let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
             if !meta.is_empty() {
+                // Always build the full packument here so the version can be extracted.
                 let resp = build_npm_metadata_response(
                     &meta,
                     package_name,
                     base_url,
                     repo_key,
                     &serde_json::Map::new(),
+                    false,
                 )?;
                 let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
                     .await
@@ -1184,13 +1208,15 @@ fn rewrite_and_respond(
     content_type: Option<String>,
     base_url: &str,
     repo_key: &str,
+    want_abbreviated: bool,
 ) -> Response {
     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
+        // Abbreviate after the tarball rewrite so abbreviated `dist.tarball`
+        // URLs point at this proxy.
         rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
-        let rewritten = serde_json::to_string(&json).unwrap_or_default();
-        return build_json_metadata_response(rewritten);
+        return respond_with_packument(json, want_abbreviated);
     }
-    // Not valid JSON: pass through with the original content type
+    // Not valid JSON: pass through with the original content type (never abbreviate).
     let ct = content_type.unwrap_or_else(|| "application/json".to_string());
     build_ok_response(&ct, content)
 }
@@ -2041,6 +2067,114 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
     }
 }
 
+// ---------------------------------------------------------------------------
+// Abbreviated ("corgi") install metadata. Format reference:
+// https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md
+// ---------------------------------------------------------------------------
+
+/// Media type for the abbreviated install document.
+const NPM_ABBREVIATED_CONTENT_TYPE: &str = "application/vnd.npm.install-v1+json";
+
+/// True when the client's `Accept` header requests the abbreviated document.
+fn wants_abbreviated_metadata(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains(NPM_ABBREVIATED_CONTENT_TYPE))
+}
+
+/// Version-object keys kept in the abbreviated document. Matches the field set
+/// registry.npmjs.org serves for `application/vnd.npm.install-v1+json`.
+const ABBREVIATED_VERSION_KEYS: &[&str] = &[
+    "name",
+    "version",
+    "dependencies",
+    "optionalDependencies",
+    "devDependencies",
+    "bundleDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "bin",
+    "dist",
+    "engines",
+    "_hasShrinkwrap",
+    "hasInstallScript",
+    "deprecated",
+    "os",
+    "cpu",
+    "libc",
+    "acceptDependencies",
+    "funding",
+];
+
+/// Transform a full packument into the abbreviated install document.
+fn abbreviate_packument(full: &serde_json::Value) -> serde_json::Value {
+    let obj = match full.as_object() {
+        Some(o) => o,
+        // Non-object: pass through unchanged.
+        None => return full.clone(),
+    };
+
+    let mut out = serde_json::Map::new();
+
+    if let Some(name) = obj.get("name") {
+        out.insert("name".to_string(), name.clone());
+    }
+    if let Some(dist_tags) = obj.get("dist-tags") {
+        out.insert("dist-tags".to_string(), dist_tags.clone());
+    }
+
+    // Fall back to `time.modified` when top-level `modified` is absent.
+    let modified = obj
+        .get("modified")
+        .cloned()
+        .or_else(|| obj.get("time").and_then(|t| t.get("modified")).cloned());
+    if let Some(modified) = modified {
+        out.insert("modified".to_string(), modified);
+    }
+
+    let mut abbreviated_versions = serde_json::Map::new();
+    if let Some(versions) = obj.get("versions").and_then(|v| v.as_object()) {
+        for (version, version_data) in versions {
+            abbreviated_versions.insert(version.clone(), abbreviate_version(version_data));
+        }
+    }
+    out.insert(
+        "versions".to_string(),
+        serde_json::Value::Object(abbreviated_versions),
+    );
+
+    serde_json::Value::Object(out)
+}
+
+/// Reduce a single version object to the abbreviated key set.
+fn abbreviate_version(version_data: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = version_data.as_object() else {
+        return version_data.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for &key in ABBREVIATED_VERSION_KEYS {
+        if let Some(value) = obj.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Serialize a packument as a metadata response, abbreviating first when requested.
+fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> Response {
+    if want_abbreviated {
+        let abbreviated = abbreviate_packument(&value);
+        return build_ok_response(
+            NPM_ABBREVIATED_CONTENT_TYPE,
+            serde_json::to_string(&abbreviated).expect("packument serialization is infallible"),
+        );
+    }
+    build_json_metadata_response(
+        serde_json::to_string(&value).expect("packument serialization is infallible"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2287,6 +2421,303 @@ mod tests {
             .unwrap();
         assert!(t1.starts_with("http://local:8080/npm/npm/lodash/-/"));
         assert!(t2.starts_with("http://local:8080/npm/npm/lodash/-/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // abbreviated metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_abbreviate_packument_strips_non_install_fields() {
+        let full = serde_json::json!({
+            "name": "example",
+            "dist-tags": { "latest": "1.0.0" },
+            "readme": "# Example\nlots of prose",
+            "maintainers": [{ "name": "alice", "email": "alice@example.com" }],
+            "users": { "bob": true },
+            "_id": "example",
+            "_rev": "3-abc",
+            "description": "a top-level description",
+            "time": { "modified": "2024-01-02T03:04:05.000Z", "1.0.0": "2024-01-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "example",
+                    "version": "1.0.0",
+                    "description": "per-version description",
+                    "dependencies": { "left-pad": "^1.3.0" },
+                    "devDependencies": { "jest": "^29.0.0" },
+                    "scripts": { "test": "jest", "postinstall": "node ./hack.js" },
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/example/-/example-1.0.0.tgz",
+                        "integrity": "sha512-deadbeef"
+                    },
+                    "engines": { "node": ">=18" },
+                    "_npmUser": { "name": "alice" },
+                    "gitHead": "abcdef",
+                    "readme": "per-version readme",
+                    "maintainers": [{ "name": "alice" }],
+                    "keywords": ["a", "b"]
+                }
+            }
+        });
+
+        let abbreviated = abbreviate_packument(&full);
+        let obj = abbreviated.as_object().expect("abbreviated is an object");
+
+        // Top level: kept.
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("example"));
+        assert!(obj.contains_key("dist-tags"));
+        assert!(obj.contains_key("versions"));
+        // `modified` derived from `time.modified`.
+        assert_eq!(
+            obj.get("modified").and_then(|v| v.as_str()),
+            Some("2024-01-02T03:04:05.000Z")
+        );
+        // Top level: dropped.
+        assert!(!obj.contains_key("readme"));
+        assert!(!obj.contains_key("maintainers"));
+        assert!(!obj.contains_key("users"));
+        assert!(!obj.contains_key("_id"));
+        assert!(!obj.contains_key("_rev"));
+        assert!(!obj.contains_key("description"));
+        assert!(!obj.contains_key("time"));
+
+        // Per-version: kept install-relevant fields.
+        let ver = abbreviated["versions"]["1.0.0"]
+            .as_object()
+            .expect("version object");
+        assert!(ver.contains_key("name"));
+        assert!(ver.contains_key("version"));
+        assert!(ver.contains_key("dependencies"));
+        assert!(ver.contains_key("dist"));
+        assert!(ver.contains_key("engines"));
+        // devDependencies is kept: registry.npmjs.org includes it in the
+        // abbreviated document, and this proxy mirrors that.
+        assert!(ver.contains_key("devDependencies"));
+        // Per-version: dropped (non-install fields).
+        assert!(!ver.contains_key("scripts"));
+        assert!(!ver.contains_key("description"));
+        assert!(!ver.contains_key("_npmUser"));
+        assert!(!ver.contains_key("gitHead"));
+        assert!(!ver.contains_key("readme"));
+        assert!(!ver.contains_key("maintainers"));
+        assert!(!ver.contains_key("keywords"));
+    }
+
+    #[test]
+    fn test_abbreviate_packument_prefers_top_level_modified() {
+        let full = serde_json::json!({
+            "name": "example",
+            "dist-tags": {},
+            "modified": "2025-05-05T00:00:00.000Z",
+            "time": { "modified": "2024-01-01T00:00:00.000Z" },
+            "versions": {}
+        });
+        let abbreviated = abbreviate_packument(&full);
+        assert_eq!(
+            abbreviated.get("modified").and_then(|v| v.as_str()),
+            Some("2025-05-05T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn test_abbreviate_packument_scoped_name_keeps_versions() {
+        let full = serde_json::json!({
+            "name": "@scope/pkg",
+            "dist-tags": { "latest": "2.1.0" },
+            "versions": {
+                "2.1.0": {
+                    "name": "@scope/pkg",
+                    "version": "2.1.0",
+                    "dependencies": { "left-pad": "^1.0.0" },
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@scope/pkg/-/pkg-2.1.0.tgz",
+                        "integrity": "sha512-abc"
+                    },
+                    "readme": "drop me"
+                }
+            }
+        });
+
+        let abbreviated = abbreviate_packument(&full);
+        assert_eq!(abbreviated["name"], "@scope/pkg");
+        let versions = abbreviated["versions"]
+            .as_object()
+            .expect("versions object");
+        assert!(versions.contains_key("2.1.0"));
+        let ver = &abbreviated["versions"]["2.1.0"];
+        assert!(ver.get("dist").is_some());
+        assert!(ver.get("readme").is_none());
+    }
+
+    #[test]
+    fn test_abbreviate_packument_no_versions_key_yields_empty_object() {
+        let full = serde_json::json!({
+            "name": "no-versions",
+            "dist-tags": {}
+        });
+
+        let abbreviated = abbreviate_packument(&full);
+        let versions = abbreviated["versions"]
+            .as_object()
+            .expect("versions is an object");
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn test_abbreviate_packument_no_modified_anywhere_omits_key() {
+        let full = serde_json::json!({
+            "name": "no-modified",
+            "dist-tags": {},
+            "versions": {}
+        });
+
+        let abbreviated = abbreviate_packument(&full);
+        let obj = abbreviated.as_object().expect("abbreviated is an object");
+        assert!(!obj.contains_key("modified"));
+    }
+
+    #[test]
+    fn test_abbreviate_version_minimal_object_keeps_dist_only() {
+        let version_data = serde_json::json!({
+            "name": "minimal",
+            "version": "1.2.3",
+            "dist": {
+                "tarball": "https://registry.npmjs.org/minimal/-/minimal-1.2.3.tgz",
+                "integrity": "sha512-xyz"
+            }
+        });
+
+        let abbreviated = abbreviate_version(&version_data);
+        let obj = abbreviated.as_object().expect("version is an object");
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("minimal"));
+        assert_eq!(obj.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
+        assert_eq!(
+            obj["dist"]["tarball"].as_str(),
+            Some("https://registry.npmjs.org/minimal/-/minimal-1.2.3.tgz")
+        );
+        assert_eq!(obj["dist"]["integrity"].as_str(), Some("sha512-xyz"));
+        // No keys invented beyond what was present.
+        assert_eq!(obj.len(), 3);
+    }
+
+    #[test]
+    fn test_abbreviate_version_preserves_rewritten_proxy_tarball() {
+        let proxy_tarball = "http://localhost:8080/npm/npm-virtual/lodash/-/lodash-4.17.21.tgz";
+        let version_data = serde_json::json!({
+            "name": "lodash",
+            "version": "4.17.21",
+            "dist": {
+                "tarball": proxy_tarball,
+                "integrity": "sha512-rewritten"
+            }
+        });
+
+        let abbreviated = abbreviate_version(&version_data);
+        assert_eq!(
+            abbreviated["dist"]["tarball"].as_str(),
+            Some(proxy_tarball),
+            "rewritten proxy tarball URL must survive abbreviation verbatim"
+        );
+    }
+
+    #[test]
+    fn test_wants_abbreviated_metadata() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!wants_abbreviated_metadata(&headers));
+
+        headers.insert(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        assert!(!wants_abbreviated_metadata(&headers));
+
+        headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.npm.install-v1+json".parse().unwrap(),
+        );
+        assert!(wants_abbreviated_metadata(&headers));
+
+        // npm sends both, comma-separated.
+        headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*; q=0.1"
+                .parse()
+                .unwrap(),
+        );
+        assert!(wants_abbreviated_metadata(&headers));
+    }
+
+    /// Regression for #1931: a request advertising the abbreviated ("corgi")
+    /// `Accept` must receive the abbreviated install document, while the default
+    /// request still gets the full packument. Before the fix the `Accept` header
+    /// was ignored and the full packument (`application/json`) was always
+    /// returned, so the first assertion fails on the pre-fix code. Skips when no
+    /// test database is configured.
+    #[tokio::test]
+    async fn test_abbreviated_accept_returns_corgi_document() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let path = "widget/1.0.0/widget-1.0.0.tgz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            "widget",
+            "1.0.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        let mut abbreviated_headers = HeaderMap::new();
+        abbreviated_headers.insert(
+            ACCEPT,
+            axum::http::HeaderValue::from_static(NPM_ABBREVIATED_CONTENT_TYPE),
+        );
+        let abbreviated =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &abbreviated_headers)
+                .await;
+        let full =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        fx.teardown().await;
+
+        let abbreviated = abbreviated.unwrap_or_else(|r| r);
+        assert_eq!(
+            abbreviated
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(NPM_ABBREVIATED_CONTENT_TYPE),
+            "abbreviated Accept must yield the abbreviated content type"
+        );
+
+        let full = full.unwrap_or_else(|r| r);
+        assert_eq!(
+            full.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "default request must still return the full packument"
+        );
+
+        let body = axum::body::to_bytes(abbreviated.into_body(), 1024 * 1024)
+            .await
+            .expect("read abbreviated body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse abbreviated json");
+        assert!(
+            json["versions"]["1.0.0"]["dist"]["tarball"].is_string(),
+            "abbreviated version keeps dist.tarball, got {json:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2949,6 +3380,7 @@ mod tests {
             base_url,
             repo_key,
             &serde_json::Map::new(),
+            false,
         )
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3322,6 +3754,7 @@ mod tests {
             "http://localhost:8080",
             "npm-hosted",
             &serde_json::Map::new(),
+            false,
         )
         .unwrap();
         let resp_scoped = build_npm_metadata_response(
@@ -3330,6 +3763,7 @@ mod tests {
             "http://localhost:8080",
             "npm-hosted",
             &serde_json::Map::new(),
+            false,
         )
         .unwrap();
 
