@@ -70,6 +70,11 @@ pub struct DownloadTicketAuth;
 /// (TOTP enable/disable, password change) to exempt the calling session's
 /// own token from being killed by the same operation it just performed.
 /// Issue #1370.
+///
+/// Carries the calling token's **millisecond** issued-at
+/// (`Claims::effective_iat_ms`) so the exempt-caller watermark can be set with
+/// millisecond precision (`caller_iat_ms - 1`), exempting only the caller and
+/// catching every strictly-older token — including one from the same second.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenIat(pub i64);
 
@@ -475,7 +480,7 @@ pub async fn auth_middleware(
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
                 Ok(claims) => {
-                    let iat = TokenIat(claims.iat);
+                    let iat = TokenIat(claims.effective_iat_ms());
                     Ok((AuthExtension::from(claims), Some(iat)))
                 }
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
@@ -1769,6 +1774,7 @@ mod tests {
             email: "test@example.com".to_string(),
             is_admin: true,
             iat: 1000,
+            iat_ms: None,
             exp: 2000,
             token_type: "access".to_string(),
             jti: None,
@@ -1792,6 +1798,7 @@ mod tests {
             email: "regular@example.com".to_string(),
             is_admin: false,
             iat: 1000,
+            iat_ms: None,
             exp: 2000,
             token_type: "access".to_string(),
             jti: None,

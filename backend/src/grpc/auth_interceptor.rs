@@ -81,7 +81,7 @@ impl AuthInterceptor {
                     crate::services::auth_service::is_token_invalidated_replica_safe(
                         db,
                         token_data.claims.sub,
-                        token_data.claims.iat,
+                        token_data.claims.effective_iat_ms(),
                     ),
                 )
             })
@@ -90,7 +90,7 @@ impl AuthInterceptor {
             // No DB pool wired (test mode) — fall back to in-memory only.
             crate::services::auth_service::is_token_invalidated(
                 token_data.claims.sub,
-                token_data.claims.iat,
+                token_data.claims.effective_iat_ms(),
             )
         };
         if invalidated {
@@ -120,6 +120,7 @@ mod tests {
             email: "test@example.com".to_string(),
             is_admin,
             iat: chrono::Utc::now().timestamp(),
+            iat_ms: None,
             exp: chrono::Utc::now().timestamp() + 3600,
             token_type: token_type.to_string(),
             jti: None,
@@ -245,6 +246,7 @@ mod tests {
             email: "test@example.com".to_string(),
             is_admin: true,
             iat,
+            iat_ms: Some(iat.saturating_mul(1000)),
             exp: iat + 3600,
             token_type: "access".to_string(),
             jti: None,

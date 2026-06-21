@@ -251,10 +251,12 @@ pub async fn enable_totp(
     // When the caller didn't use a JWT (no `iat`), fall back to `NOW()` so
     // the original #1146 semantic still holds for any other JWT sessions
     // this user has.
-    let caller_iat = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
-    let verified_ts: DateTime<Utc> = match caller_iat {
-        Some(iat) => DateTime::<Utc>::from_timestamp(iat, 0).ok_or_else(|| {
-            AppError::Internal(format!("Invalid caller iat for totp_verified_at: {iat}"))
+    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    let verified_ts: DateTime<Utc> = match caller_iat_ms {
+        Some(iat_ms) => DateTime::<Utc>::from_timestamp_millis(iat_ms).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Invalid caller iat_ms for totp_verified_at: {iat_ms}"
+            ))
         })?,
         None => Utc::now(),
     };
@@ -277,8 +279,8 @@ pub async fn enable_totp(
     // Refresh tokens are revoked via the DB on every replica below so the
     // OAuth refresh-grant cannot mint a fresh access token from a stale
     // refresh JWT — that's the original #1146 threat.
-    match caller_iat {
-        Some(iat) => invalidate_user_tokens_except_caller(auth.user_id, iat),
+    match caller_iat_ms {
+        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
         None => invalidate_user_tokens(auth.user_id),
     }
 
@@ -561,9 +563,9 @@ pub async fn disable_totp(
     // Invalidate prior tokens issued under the stricter (TOTP-required)
     // policy while exempting the calling session so the user is not signed
     // out by their own disable action (#1370).
-    let caller_iat = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
-    match caller_iat {
-        Some(iat) => invalidate_user_tokens_except_caller(auth.user_id, iat),
+    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    match caller_iat_ms {
+        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
         None => invalidate_user_tokens(auth.user_id),
     }
 
@@ -967,9 +969,10 @@ mod totp_token_invalidation_regression_tests {
             allowed_repo_ids: None,
         };
 
-        // Token issued one minute before the change — should fail
+        // Token issued one minute before the change (millisecond issued-at,
+        // matching `Claims::effective_iat_ms`) — should fail
         // is_token_invalidated after enable_totp runs.
-        let pre_change_iat = Utc::now().timestamp() - 60;
+        let pre_change_iat = Utc::now().timestamp_millis() - 60_000;
         assert!(
             !is_token_invalidated(user_id, pre_change_iat),
             "fresh user must not be pre-invalidated"
@@ -1047,15 +1050,19 @@ mod totp_token_invalidation_regression_tests {
             allowed_repo_ids: None,
         };
 
-        // The caller's token was issued "now"; tokens issued before now must
-        // be killed; the caller's own token must survive.
-        let caller_iat = Utc::now().timestamp();
-        let pre_caller_iat = caller_iat - 60;
+        // The caller's token was issued "now" (millisecond `iat_ms`, as the
+        // middleware now supplies via `Claims::effective_iat_ms`); tokens
+        // issued before now must be killed; the caller's own token must
+        // survive. An older token from the SAME second (caller - 1 ms) must
+        // also be caught now that the watermark is millisecond-precise.
+        let caller_iat_ms = Utc::now().timestamp_millis();
+        let pre_caller_iat_ms = caller_iat_ms - 60_000;
+        let older_same_second_ms = caller_iat_ms - 1;
 
         let result = enable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat))),
+            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -1072,12 +1079,16 @@ mod totp_token_invalidation_regression_tests {
             result.err()
         );
         assert!(
-            !is_token_invalidated(user_id, caller_iat),
+            !is_token_invalidated(user_id, caller_iat_ms),
             "calling token (iat == watermark anchor) must NOT be invalidated"
         );
         assert!(
-            is_token_invalidated(user_id, pre_caller_iat),
+            is_token_invalidated(user_id, pre_caller_iat_ms),
             "tokens issued strictly before the caller's iat must be invalidated"
+        );
+        assert!(
+            is_token_invalidated(user_id, older_same_second_ms),
+            "an older token from the SAME second must now be invalidated (ms precision)"
         );
     }
 
@@ -1127,7 +1138,7 @@ mod totp_token_invalidation_regression_tests {
             allowed_repo_ids: None,
         };
 
-        let pre_change_iat = Utc::now().timestamp() - 60;
+        let pre_change_iat = Utc::now().timestamp_millis() - 60_000;
         // Note: enable_totp already invalidates by other tests' side effects
         // potentially, but `tdh::create_user` returns a fresh Uuid, so this
         // user_id has never been invalidated before.
@@ -1211,13 +1222,14 @@ mod totp_token_invalidation_regression_tests {
             allowed_repo_ids: None,
         };
 
-        let caller_iat = Utc::now().timestamp();
-        let pre_caller_iat = caller_iat - 60;
+        let caller_iat_ms = Utc::now().timestamp_millis();
+        let pre_caller_iat_ms = caller_iat_ms - 60_000;
+        let older_same_second_ms = caller_iat_ms - 1;
 
         let result = disable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat))),
+            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,
@@ -1251,12 +1263,16 @@ mod totp_token_invalidation_regression_tests {
             "users.totp_enabled must be false after disable (drives /auth/me response)"
         );
         assert!(
-            !is_token_invalidated(user_id, caller_iat),
+            !is_token_invalidated(user_id, caller_iat_ms),
             "calling token must survive its own disable (#1370)"
         );
         assert!(
-            is_token_invalidated(user_id, pre_caller_iat),
+            is_token_invalidated(user_id, pre_caller_iat_ms),
             "older tokens must still be invalidated by disable"
+        );
+        assert!(
+            is_token_invalidated(user_id, older_same_second_ms),
+            "an older token from the SAME second must now be invalidated (ms precision)"
         );
     }
 }
