@@ -297,6 +297,9 @@ mod credential_change_grpc {
             email: "grpc-user@test.local".to_string(),
             is_admin: true,
             iat,
+            // Legacy whole-second token shape (no ms claim); exercises the
+            // effective_iat_ms() fallback to iat*1000.
+            iat_ms: None,
             exp: iat + 3600,
             token_type: "access".to_string(),
             jti: None,
