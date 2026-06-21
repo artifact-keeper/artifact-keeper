@@ -462,6 +462,47 @@ impl PromotionRuleService {
         })
     }
 
+    /// Evaluate an artifact against every ENABLED promotion rule that governs the
+    /// given (source -> target) repository pair. Returns the aggregated blocking
+    /// violations across all matching rules. An empty result means promotion is
+    /// allowed by the rules system (including the no-matching-rule case, which
+    /// preserves the historical default-allow behavior for repos with no rules).
+    ///
+    /// Note: this is independent of `auto_promote`. `auto_promote` governs the
+    /// (currently unused) background auto-promotion daemon; a manually-triggered
+    /// promotion must respect any enabled rule for the pair regardless of that
+    /// flag. `is_enabled = false` rules are skipped (they are disabled). Reuses
+    /// [`Self::evaluate_artifact`] so the live gate and the advisory dry-run can
+    /// never diverge.
+    pub async fn evaluate_for_promotion(
+        &self,
+        artifact_id: Uuid,
+        source_repo_id: Uuid,
+        target_repo_id: Uuid,
+    ) -> Result<Vec<RuleEvaluationResult>> {
+        let rules: Vec<PromotionRule> = sqlx::query_as::<_, PromotionRule>(
+            r#"
+            SELECT * FROM promotion_rules
+            WHERE source_repo_id = $1 AND target_repo_id = $2 AND is_enabled = true
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(source_repo_id)
+        .bind(target_repo_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut failing = Vec::new();
+        for rule in &rules {
+            let eval = self.evaluate_artifact(artifact_id, rule).await?;
+            if !eval.passed {
+                failing.push(eval);
+            }
+        }
+        Ok(failing)
+    }
+
     /// Find all enabled rules for a source repository, evaluate each against the
     /// given artifact, and return results. Actual promotion is left to the caller
     /// to avoid coupling storage concerns into this service.

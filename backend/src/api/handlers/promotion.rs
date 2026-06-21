@@ -447,6 +447,25 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
     }
 }
 
+/// Flatten failing promotion-rule evaluations into the [`PolicyViolation`] shape
+/// used by the promotion response, tagging each with the rule name. Pure so it is
+/// unit-testable without a DB. Returns an empty vec when there are no failing
+/// rules.
+fn rule_violations_to_policy_violations(
+    failing: &[crate::services::promotion_rule_service::RuleEvaluationResult],
+) -> Vec<PolicyViolation> {
+    failing
+        .iter()
+        .flat_map(|e| {
+            e.violations.iter().map(move |v| PolicyViolation {
+                rule: e.rule_name.clone(),
+                severity: "high".to_string(),
+                message: v.clone(),
+            })
+        })
+        .collect()
+}
+
 #[utoipa::path(
     post,
     path = "/repositories/{key}/artifacts/{artifact_id}/promote",
@@ -598,6 +617,30 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
+            }));
+        }
+    }
+
+    // Enforce the per-pair promotion_rules (min_staging_hours, require_signature,
+    // min_health_score, max_cve_severity, ...) created via /api/v1/promotion-rules.
+    // These are a separate policy system from PromotionPolicyService above; reuse
+    // the same evaluator the advisory /evaluate dry-run uses so enforcement and
+    // dry-run can never diverge. Gated behind `skip_policy_check` to match the
+    // other promotion gates' documented admin override.
+    if !req.skip_policy_check {
+        let rule_service =
+            crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
+        let failing = rule_service
+            .evaluate_for_promotion(artifact_id, source_repo.id, target_repo.id)
+            .await?;
+        if !failing.is_empty() {
+            return Ok(Json(PromotionResponse {
+                promoted: false,
+                source: format!("{}/{}", repo_key, artifact.path),
+                target: format!("{}/{}", target_key, artifact.path),
+                promotion_id: None,
+                policy_violations: rule_violations_to_policy_violations(&failing),
+                message: Some("Promotion blocked by promotion rule violations".to_string()),
             }));
         }
     }
@@ -787,6 +830,42 @@ pub async fn promote_artifacts_bulk(
 
         let source_display = format!("{}/{}", repo_key, artifact.path);
         let target_display = format!("{}/{}", target_key, artifact.path);
+
+        // Enforce per-pair promotion_rules per item before copying. Mirrors the
+        // single-promote gate; a rule-blocked item fails and the batch continues
+        // so the rest of the artifacts remain promotable. Honors the
+        // skip_policy_check admin override.
+        if !req.skip_policy_check {
+            let rule_service = crate::services::promotion_rule_service::PromotionRuleService::new(
+                state.db.clone(),
+            );
+            match rule_service
+                .evaluate_for_promotion(*artifact_id, source_repo.id, target_repo.id)
+                .await
+            {
+                Ok(failing) if !failing.is_empty() => {
+                    failed += 1;
+                    let mut resp = failed_response(
+                        source_display,
+                        target_display,
+                        "Promotion blocked by promotion rule violations".to_string(),
+                    );
+                    resp.policy_violations = rule_violations_to_policy_violations(&failing);
+                    results.push(resp);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    results.push(failed_response(
+                        source_display,
+                        target_display,
+                        format!("Rule evaluation error: {}", e),
+                    ));
+                    continue;
+                }
+            }
+        }
 
         let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
         let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
@@ -1363,6 +1442,65 @@ mod tests {
     #[test]
     fn test_ensure_promotion_authorized_admin_ok() {
         assert!(ensure_promotion_authorized(true).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // rule_violations_to_policy_violations (promotion_rules -> response shape)
+    // -----------------------------------------------------------------------
+
+    fn rule_eval(
+        name: &str,
+        passed: bool,
+        violations: &[&str],
+    ) -> crate::services::promotion_rule_service::RuleEvaluationResult {
+        crate::services::promotion_rule_service::RuleEvaluationResult {
+            rule_id: Uuid::new_v4(),
+            rule_name: name.to_string(),
+            passed,
+            violations: violations.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_rule_violations_empty_when_no_failing_rules() {
+        let out = rule_violations_to_policy_violations(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_rule_violations_single_failing_rule_maps_name_and_messages() {
+        let failing = vec![rule_eval(
+            "strict-release",
+            false,
+            &[
+                "Artifact does not have a valid signature",
+                "Health score 20 < 100",
+            ],
+        )];
+        let out = rule_violations_to_policy_violations(&failing);
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert_eq!(v.rule, "strict-release");
+            assert_eq!(v.severity, "high");
+        }
+        assert_eq!(out[0].message, "Artifact does not have a valid signature");
+        assert_eq!(out[1].message, "Health score 20 < 100");
+    }
+
+    #[test]
+    fn test_rule_violations_many_failing_rules_flattened() {
+        let failing = vec![
+            rule_eval("rule-a", false, &["a1", "a2"]),
+            rule_eval("rule-b", false, &["b1"]),
+        ];
+        let out = rule_violations_to_policy_violations(&failing);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].rule, "rule-a");
+        assert_eq!(out[0].message, "a1");
+        assert_eq!(out[1].rule, "rule-a");
+        assert_eq!(out[1].message, "a2");
+        assert_eq!(out[2].rule, "rule-b");
+        assert_eq!(out[2].message, "b1");
     }
 
     #[test]
