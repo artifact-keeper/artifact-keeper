@@ -507,6 +507,38 @@ pub(crate) async fn is_token_invalidated_replica_safe(
     }
 }
 
+/// Read the live server-side admin role for a user from the DB.
+///
+/// The JWT `is_admin` claim is client-supplied (modulo the HMAC signature) and
+/// must never be the authorization source of truth. Every admin gate consumes
+/// the validated `Claims`, so re-deriving `is_admin` here — at the validation
+/// chokepoint — makes the claim advisory and the DB role authoritative for all
+/// downstream consumers (HTTP middleware, OCI registry, gRPC) at once.
+///
+/// Returns:
+///   * `Ok(Some(is_admin))` — the live `users.is_admin` for an active user.
+///   * `Ok(None)`           — no active user row (deleted / deactivated). The
+///     caller MUST treat this as a failed authentication, never as admin.
+///
+/// Runtime `query_scalar` (not the `query!` macro) so this does not require
+/// regenerating the offline `.sqlx` cache. The lookup is an indexed primary-key
+/// read.
+pub(crate) async fn fetch_live_is_admin(db: &PgPool, user_id: Uuid) -> Result<Option<bool>> {
+    let row = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT is_admin
+        FROM users
+        WHERE id = $1 AND is_active = true
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row)
+}
+
 /// Global record of users whose API-token cache entries have been forcibly
 /// invalidated (e.g. when an admin sets `is_active=false`). The value is the
 /// Unix timestamp of the invalidation so cache entries inserted before that
@@ -1130,7 +1162,7 @@ impl AuthService {
     /// token-exchange) so a credential change on replica A is honored on
     /// replica B (#1173).
     pub async fn validate_access_token_async(&self, token: &str) -> Result<Claims> {
-        let token_data = self.decode_token(token)?;
+        let mut token_data = self.decode_token(token)?;
 
         if token_data.claims.token_type != "access" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
@@ -1146,6 +1178,23 @@ impl AuthService {
             return Err(AppError::Authentication(
                 "Token invalidated by credential change".to_string(),
             ));
+        }
+
+        // Re-derive `is_admin` from the live server-side role. The JWT claim is
+        // client-supplied and must not be the authorization source of truth; a
+        // validly-signed token forged for a real low-priv subject with
+        // `is_admin:true` must NOT be granted admin. Overwriting here makes the
+        // claim advisory and the DB role authoritative for every downstream
+        // consumer of these claims (HTTP middleware, OCI, gRPC). A missing
+        // active row (None) means the subject is gone/deactivated — fail
+        // authentication rather than trust the claim.
+        match fetch_live_is_admin(&self.db, token_data.claims.sub).await? {
+            Some(db_is_admin) => token_data.claims.is_admin = db_is_admin,
+            None => {
+                return Err(AppError::Authentication(
+                    "Token subject is no longer an active user".to_string(),
+                ));
+            }
         }
 
         Ok(token_data.claims)
@@ -3762,6 +3811,49 @@ mod tests {
         (AuthService::new(pool, cfg.clone()), cfg)
     }
 
+    /// DB-backed variant of [`invalidation_test_service`] for tests that drive
+    /// `validate_access_token_async` end-to-end. Since the async validator now
+    /// re-stamps `is_admin` from the live `users` row (the admin-authz fix), the
+    /// subject must be a real active DB row; an invalid/lazy pool would fail the
+    /// `fetch_live_is_admin` read. Inserts an active NON-admin user with the
+    /// given `user_id` (matching `make_test_user`'s default `is_admin = false`)
+    /// and backdated watermarks so the credential-change check starts permissive
+    /// and the *invalidation ordering* under test is the only discriminator.
+    ///
+    /// Returns `None` when `DATABASE_URL` is unset so these tests skip silently
+    /// on offline `cargo test --lib`, matching the other DB-backed tests here.
+    async fn invalidation_test_service_with_db(
+        user_id: Uuid,
+    ) -> Option<(AuthService, Arc<Config>, sqlx::PgPool)> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', \
+             NOW() - INTERVAL '120 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert invalidation test user");
+        let cfg = make_test_config();
+        Some((AuthService::new(pool.clone(), cfg.clone()), cfg, pool))
+    }
+
+    /// Drop a row inserted by [`invalidation_test_service_with_db`].
+    async fn cleanup_invtest_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
     /// Mint an access JWT for `user` with an explicit `iat` (seconds), signed
     /// with the service's configured secret — exactly the shape the HTTP
     /// middleware decodes.
@@ -3865,8 +3957,12 @@ mod tests {
     /// by the invalidation serves the watermark without a DB round-trip.
     #[tokio::test]
     async fn test_oidc_login_token_not_self_invalidated() {
-        let (service, cfg) = invalidation_test_service();
         let user = make_test_user();
+        // DB-backed: the async validator re-stamps is_admin from the live row,
+        // so the subject must exist. Skips silently without DATABASE_URL.
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
 
         // Anchor on the current second so the JWT `exp` is in the future and
         // the watermark is within the in-memory retention window; the
@@ -3897,6 +3993,8 @@ mod tests {
             old_result.is_err(),
             "pre-invalidation token must be rejected"
         );
+
+        cleanup_invtest_user(&pool, user.id).await;
     }
 
     // -----------------------------------------------------------------------
@@ -3942,8 +4040,10 @@ mod tests {
     /// older same-second token. This is the test that would have caught #1933.
     #[tokio::test]
     async fn test_same_second_relogin_after_invalidation_accepted() {
-        let (service, cfg) = invalidation_test_service();
         let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
 
         // Anchor on the current second; PINNED sub-second offsets discriminate.
         let iat_sec = Utc::now().timestamp();
@@ -3978,6 +4078,8 @@ mod tests {
                 .is_err(),
             "async plane must still reject the same-second pre-change token"
         );
+
+        cleanup_invtest_user(&pool, user.id).await;
     }
 
     /// 10 rapid same-second re-logins (mirrors
@@ -3986,8 +4088,10 @@ mod tests {
     /// validate. The seconds-granularity comparator gave `0/10` here under #1933.
     #[tokio::test]
     async fn test_ten_rapid_same_second_relogins_all_accepted() {
-        let (service, cfg) = invalidation_test_service();
         let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
 
         // Anchor on the current second; PINNED 1-ms steps discriminate.
         let iat_sec = Utc::now().timestamp();
@@ -4005,6 +4109,8 @@ mod tests {
                 "async plane: same-second re-login #{i} must be accepted"
             );
         }
+
+        cleanup_invtest_user(&pool, user.id).await;
     }
 
     /// Fresh-user same-second first login (#1173/rbac/mesh): the DB-read
@@ -4015,8 +4121,10 @@ mod tests {
     /// REJECTS a same-second pre-change token. Numbers pinned.
     #[tokio::test]
     async fn test_fresh_user_same_second_first_login_accepted() {
-        let (service, cfg) = invalidation_test_service();
         let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
 
         // DB-derived creation watermark at full ms (sub-second creation
         // offset), anchored on the current second so the JWT `exp` is future
@@ -4046,6 +4154,8 @@ mod tests {
                 .is_err(),
             "a same-second pre-change token must be rejected after a real password change"
         );
+
+        cleanup_invtest_user(&pool, user.id).await;
     }
 
     /// Legacy token (no `iat_ms`) backward-compat: `effective_iat_ms` falls back
@@ -5064,6 +5174,216 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Admin authorization is derived from the live server-side role, not the
+    // JWT `is_admin` claim. `validate_access_token_async` re-stamps `is_admin`
+    // from `users.is_admin` so a validly-signed token forged for a real
+    // low-priv subject with `is_admin:true` is NOT granted admin. DB-backed;
+    // skips silently without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    /// Mint an access JWT for an explicit subject id with an explicit `is_admin`
+    /// claim, signed with the service secret. Used to model a forged-admin token
+    /// for a real low-priv subject. `iat` is recent so the credential-change
+    /// watermark accepts it (the test isolates the is_admin re-stamp, not the
+    /// watermark).
+    fn mint_access_token_for_sub(cfg: &Config, sub: Uuid, claim_is_admin: bool) -> String {
+        let now = Utc::now();
+        let claims = Claims {
+            sub,
+            username: "forged".to_string(),
+            email: "forged@test.local".to_string(),
+            is_admin: claim_is_admin,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode access token")
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_restamps_forged_admin_to_db_false() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // A real, active, NON-admin DB user.
+        let username = format!("restamp_low_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // A validly-signed token forged for that subject claiming is_admin=true.
+        let forged = mint_access_token_for_sub(&cfg, user_id, true);
+        let claims = svc
+            .validate_access_token_async(&forged)
+            .await
+            .expect("validation succeeds (token is well-formed and active)");
+
+        // EXPLOIT GUARD: the returned claim must reflect the DB role (false),
+        // NOT the forged claim (true).
+        assert!(
+            !claims.is_admin,
+            "validate_access_token_async must re-stamp is_admin from the DB; a \
+             forged is_admin=true token for a non-admin user must yield false"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_keeps_real_admin_true() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // A real, active ADMIN DB user.
+        let username = format!("restamp_admin_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, true, 0, \
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+             NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert admin user");
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // Even a token whose claim said is_admin=false is re-stamped to the DB
+        // truth (true) — the DB is authoritative in both directions.
+        let token = mint_access_token_for_sub(&cfg, user_id, false);
+        let claims = svc
+            .validate_access_token_async(&token)
+            .await
+            .expect("validation succeeds for an active admin");
+        assert!(
+            claims.is_admin,
+            "a real DB admin must be re-stamped is_admin=true"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_rejects_inactive_subject() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // An inactive user. fetch_live_is_admin returns None (no active row),
+        // so validation must FAIL — never silently grant (or even authenticate).
+        let username = format!("restamp_inactive_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, 0, \
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+             NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert inactive user");
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        let token = mint_access_token_for_sub(&cfg, user_id, true);
+        let result = svc.validate_access_token_async(&token).await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "an inactive/deleted subject must fail authentication, never silently \
+             return admin; got {result:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_live_is_admin_reads_db_role() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Non-admin active user => Some(false).
+        let username = format!("fla_low_{}", &Uuid::new_v4().to_string()[..8]);
+        let low_id = insert_test_user(&pool, &username).await;
+        assert_eq!(
+            fetch_live_is_admin(&pool, low_id).await.expect("query ok"),
+            Some(false)
+        );
+
+        // Unknown subject => None.
+        assert_eq!(
+            fetch_live_is_admin(&pool, Uuid::new_v4())
+                .await
+                .expect("query ok"),
+            None
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(low_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
     // Account-lockout DoS fix: a CORRECT password must authenticate even when
     // the account has been locked by prior wrong guesses (the lock no longer
     // short-circuits before the password is verified), while a WRONG password
@@ -5637,6 +5957,45 @@ mod tests {
             found_in.contains(&"src/api/middleware/auth.rs"),
             "middleware/auth.rs must call the replica-safe validator; \
              found references only in: {found_in:?}",
+        );
+    }
+
+    /// Meta-test: assert that `validate_access_token_async` re-stamps `is_admin`
+    /// from the live DB role. Admin authorization MUST derive from
+    /// `users.is_admin`, not the client-supplied JWT claim. A future refactor
+    /// that drops the `fetch_live_is_admin` re-stamp would silently reopen the
+    /// "forged is_admin=true for a real low-priv subject grants admin" gap.
+    ///
+    /// Implemented as a source-text search (mirroring
+    /// `test_validate_access_token_async_has_production_caller`) because the
+    /// re-stamp is an in-function assignment the type system gives no free way
+    /// to observe.
+    #[test]
+    fn test_validate_async_restamps_is_admin_from_db() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir).join("src/services/auth_service.rs");
+        let src = std::fs::read_to_string(&path).expect("read auth_service.rs");
+
+        // The validator must call the live-role helper.
+        assert!(
+            src.contains("fetch_live_is_admin"),
+            "validate_access_token_async MUST consult fetch_live_is_admin so \
+             admin authorization derives from the DB role, not the JWT claim."
+        );
+        // And it must assign the result back onto the claims (the re-stamp).
+        assert!(
+            src.contains("token_data.claims.is_admin = "),
+            "validate_access_token_async MUST overwrite token_data.claims.is_admin \
+             with the live DB role; do not return the client-supplied claim."
+        );
+
+        // The gRPC interceptor must do the same when a DB pool is wired.
+        let grpc_path = std::path::Path::new(manifest_dir).join("src/grpc/auth_interceptor.rs");
+        let grpc = std::fs::read_to_string(&grpc_path).expect("read auth_interceptor.rs");
+        assert!(
+            grpc.contains("fetch_live_is_admin"),
+            "the gRPC interceptor MUST re-stamp is_admin from the DB role before \
+             the require_admin gate when a DB pool is present."
         );
     }
 }

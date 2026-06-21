@@ -62,7 +62,7 @@ impl AuthInterceptor {
             .ok_or_else(|| Status::unauthenticated("Missing or invalid authorization token"))?;
 
         let validation = Validation::new(Algorithm::HS256);
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation)
+        let mut token_data = decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 
         if token_data.claims.token_type != "access" {
@@ -95,6 +95,32 @@ impl AuthInterceptor {
         };
         if invalidated {
             return Err(Status::unauthenticated("Token has been revoked"));
+        }
+
+        // Re-derive `is_admin` from the live server-side role. The JWT claim is
+        // client-supplied and must not be the authorization source of truth: a
+        // validly-signed token forged for a real low-priv subject with
+        // `is_admin:true` must NOT be granted admin here either. When a DB pool
+        // is wired we overwrite the claim with the live `users.is_admin`
+        // (mirroring `validate_access_token_async`); a missing active row means
+        // the subject is gone/deactivated and is rejected. In test mode
+        // (`db = None`) there is no DB to consult, so we keep trusting the
+        // claim, matching the in-memory invalidation fallback above.
+        if let Some(db) = &self.db {
+            let live_is_admin = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::services::auth_service::fetch_live_is_admin(db, token_data.claims.sub),
+                )
+            })
+            .map_err(|e| Status::internal(format!("Authorization lookup failed: {}", e)))?;
+            match live_is_admin {
+                Some(db_is_admin) => token_data.claims.is_admin = db_is_admin,
+                None => {
+                    return Err(Status::unauthenticated(
+                        "Token subject is no longer an active user",
+                    ));
+                }
+            }
         }
 
         // Authorization: reject non-admin users when admin is required.
@@ -267,5 +293,112 @@ mod tests {
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert!(err.message().contains("revoked"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin authorization derives from the live DB role, not the JWT claim.
+    // When a DB pool is wired the interceptor re-stamps is_admin from
+    // `users.is_admin` before the require_admin gate, so a forged is_admin=true
+    // token for a real low-priv subject is denied. DB-backed; skips silently
+    // without DATABASE_URL. The interceptor runs the async DB lookup via
+    // `block_in_place`, so this test needs a multi-thread runtime.
+    // -----------------------------------------------------------------------
+
+    fn make_token_for_sub(jwt_secret: &str, sub: Uuid, is_admin: bool) -> String {
+        let claims = Claims {
+            sub,
+            username: "forged".to_string(),
+            email: "forged@test.local".to_string(),
+            is_admin,
+            iat: chrono::Utc::now().timestamp(),
+            iat_ms: Some(chrono::Utc::now().timestamp_millis()),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(jwt_secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    async fn insert_user(pool: &PgPool, is_admin: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("grpc_{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', $4, true, 0, \
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+             NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(is_admin)
+        .execute(pool)
+        .await
+        .expect("insert user");
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_forged_admin_denied_when_db_role_is_non_admin() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // Make sure the in-memory invalidation cache doesn't short-circuit.
+        let low_id = insert_user(&pool, false).await;
+
+        let interceptor = AuthInterceptor::new("secret", Some(pool.clone()));
+        let forged = make_token_for_sub("secret", low_id, true);
+        let err = interceptor
+            .intercept(request_with_token(&forged))
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "a forged is_admin=true token for a non-admin DB user must be denied"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(low_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_real_admin_allowed_with_db() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let admin_id = insert_user(&pool, true).await;
+
+        let interceptor = AuthInterceptor::new("secret", Some(pool.clone()));
+        // Even a token claiming is_admin=false is re-stamped to the DB truth.
+        let token = make_token_for_sub("secret", admin_id, false);
+        assert!(
+            interceptor.intercept(request_with_token(&token)).is_ok(),
+            "a real DB admin must be allowed (is_admin re-stamped from the DB)"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
     }
 }
