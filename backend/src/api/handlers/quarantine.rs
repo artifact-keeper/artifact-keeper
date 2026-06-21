@@ -166,6 +166,7 @@ pub async fn release_artifact(
     post,
     path = "/{artifact_id}/reject",
     context_path = "/api/v1/quarantine",
+    operation_id = "reject_quarantined_artifact",
     tag = "quarantine",
     params(
         ("artifact_id" = Uuid, Path, description = "Artifact ID"),

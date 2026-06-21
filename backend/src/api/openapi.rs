@@ -235,6 +235,56 @@ mod tests {
         );
     }
 
+    /// Regression: every operation must have a globally unique `operationId`.
+    /// utoipa derives it from the handler fn name by default, so two handlers
+    /// that share a name (e.g. `reject_artifact` in both promotion.rs and
+    /// quarantine.rs) silently produce a duplicate `operationId`. That fails the
+    /// artifact-keeper-api spectral gate (`operation-operationId-unique`), which
+    /// skips ALL SDK generation/publishing for the release — the reason the
+    /// published `@artifact-keeper/sdk` stalled at 1.1.6. Catch it here, in
+    /// backend CI, instead of discovering it after a release tag is cut.
+    #[test]
+    fn test_openapi_operation_ids_are_unique() {
+        use std::collections::HashMap;
+
+        let spec = build_openapi();
+        let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (path, item) in &spec.paths.paths {
+            for (method, op) in [
+                ("GET", &item.get),
+                ("PUT", &item.put),
+                ("POST", &item.post),
+                ("DELETE", &item.delete),
+                ("PATCH", &item.patch),
+                ("HEAD", &item.head),
+            ] {
+                if let Some(op) = op {
+                    if let Some(id) = &op.operation_id {
+                        seen.entry(id.clone())
+                            .or_default()
+                            .push(format!("{method} {path}"));
+                    }
+                }
+            }
+        }
+
+        let mut dups: Vec<String> = seen
+            .iter()
+            .filter(|(_, locs)| locs.len() > 1)
+            .map(|(id, locs)| format!("  {id}: {}", locs.join(", ")))
+            .collect();
+        dups.sort();
+
+        assert!(
+            dups.is_empty(),
+            "Duplicate operationId(s) found — these fail the api-repo spectral gate \
+             and block SDK generation/publishing. Give one handler an explicit \
+             `operation_id = \"...\"` in its #[utoipa::path]:\n{}",
+            dups.join("\n")
+        );
+    }
+
     #[test]
     fn test_repository_labels_endpoints_in_spec() {
         let spec = build_openapi();
