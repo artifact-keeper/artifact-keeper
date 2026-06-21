@@ -148,15 +148,26 @@ struct CachedApiTokenEntry {
 
 /// In-memory fast-path cache for the DB-backed credential-invalidation
 /// check. The value is the highest of `users.password_changed_at` and
-/// `users.totp_verified_at` (as a Unix timestamp) plus the `Instant` it
-/// was cached so entries can expire after [`CREDENTIAL_DB_CACHE_TTL_SECS`].
+/// `users.totp_verified_at` (as a Unix timestamp in **milliseconds**) plus
+/// the `Instant` it was cached so entries can expire after
+/// [`CREDENTIAL_DB_CACHE_TTL_SECS`].
 /// `users.updated_at` is deliberately NOT folded into the watermark — it
 /// bumps on benign profile edits (display name, email, role) so including
 /// it would invalidate tokens on changes that are not credential-bearing
 /// (regression caught in PR #1190 review). Process-local; DB is the
 /// source of truth so multi-replica deployments stay consistent (#1173).
+///
+/// The `i64` watermark is in **milliseconds** (sub-second precision) so a
+/// token whose RFC-7519 whole-second `iat` floors to the same wall-clock
+/// second as a credential change is still ordered correctly: a real
+/// password change happens strictly after the token was minted, so its
+/// `password_changed_at` carries a positive millisecond offset above the
+/// token's floored `iat * 1000` and the token is rejected. JWT `iat` is
+/// NOT widened; consumers compare `iat * 1000` against this value.
 static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
-const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
+/// Retention window for in-memory watermarks, in **milliseconds** (matches
+/// the millisecond watermark unit).
+const INVALIDATION_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// How long a DB-backed credential-change watermark stays cached in the
 /// in-memory fast-path. 5 s is short enough that an invalidation on
 /// another replica is observed by every other replica almost immediately
@@ -174,28 +185,54 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 /// The DB columns (`password_changed_at`, `totp_verified_at`, `updated_at`)
 /// remain the source of truth across replicas.
 ///
-/// The watermark is set to `Utc::now().timestamp()` (no offset), matching
-/// the DB path precision. The replica-safe path uses strict `<` so a token
-/// minted in the same wall-clock second as the invalidation (`iat == watermark`)
-/// survives — this is the OIDC login case where `generate_tokens` runs
-/// immediately after `invalidate_user_tokens` in the same request.
-/// Tokens from strictly before the invalidation (`iat < watermark`) are
-/// rejected. The sync map at `is_token_invalidated` uses `<=` and catches
-/// same-second tokens there.
+/// The watermark is set to `Utc::now().timestamp_millis()` (full millisecond
+/// precision) — the **mint-then-invalidate** variant used by password change,
+/// password reset and deactivation. Because the credential change happens
+/// strictly after any pre-change token was minted, the watermark carries a
+/// positive sub-second offset above the token's floored `iat * 1000`, so even
+/// a token minted in the same wall-clock second (`iat * 1000 == floor_sec*1000
+/// < watermark_ms`) is rejected by the replica-safe strict `<`. For the
+/// **invalidate-then-mint** case (OIDC login / admin reset that mints in the
+/// same request) use [`invalidate_user_tokens_floor_second`] instead, which
+/// floors the watermark to the start of the current second so the freshly
+/// minted token survives.
 pub fn invalidate_user_tokens(user_id: Uuid) {
-    let watermark = Utc::now().timestamp();
-    invalidate_user_tokens_at(user_id, watermark);
+    let watermark_ms = Utc::now().timestamp_millis();
+    invalidate_user_tokens_at(user_id, watermark_ms);
+}
+
+/// Invalidate-then-mint variant of [`invalidate_user_tokens`].
+///
+/// Writes a watermark floored to the **start of the current wall-clock
+/// second** in milliseconds (`Utc::now().timestamp() * 1000`). Used by paths
+/// that invalidate and then immediately mint a fresh JWT in the same request
+/// (OIDC `apply_role_mapping`, admin reset-then-login). The fresh token's
+/// `iat` floors DOWN to the same second, so `iat * 1000 == watermark` and the
+/// replica-safe strict `<` (`iat * 1000 < watermark`) is **false** ⇒ the
+/// fresh token is **accepted**, while any token from a strictly earlier
+/// second (`iat * 1000 <= (sec - 1) * 1000 < watermark`) is rejected.
+///
+/// This is the counterpart to the full-precision [`invalidate_user_tokens`]:
+/// the floored watermark is what distinguishes invalidate-then-mint (same
+/// second must survive, #1911) from mint-then-invalidate (same second must be
+/// rejected, the #931 invariant). See the safety note on
+/// [`is_token_invalidated_replica_safe`].
+pub fn invalidate_user_tokens_floor_second(user_id: Uuid) {
+    let watermark_ms = Utc::now().timestamp().saturating_mul(1000);
+    invalidate_user_tokens_at(user_id, watermark_ms);
 }
 
 /// Variant of [`invalidate_user_tokens`] that exempts the caller's own JWT.
 ///
 /// `caller_iat` is the calling token's issued-at (seconds). The in-memory
-/// watermark is set to `caller_iat - 1` so the sync `<=` check still passes
-/// for the calling token (`caller_iat <= caller_iat - 1` is false), while
-/// every token issued at any second strictly before `caller_iat` is
-/// invalidated. The sync path is the one consulted by the gRPC interceptor
-/// (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so the `-1`
-/// here is load-bearing on those code paths.
+/// watermark is set to `caller_iat * 1000 - 1` (milliseconds, one millisecond
+/// below the start of the caller's `iat` second) so the sync `<=` check still
+/// passes for the calling token (`caller_iat * 1000 <= caller_iat * 1000 - 1`
+/// is false), while every token issued at any second strictly before
+/// `caller_iat` (`iat * 1000 <= (caller_iat - 1) * 1000 < caller_iat * 1000 -
+/// 1`) is invalidated. The sync path is the one consulted by the gRPC
+/// interceptor (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so
+/// the exempt-caller offset here is load-bearing on those code paths.
 ///
 /// Used by TOTP enable/disable so the session that initiated the credential
 /// change is not logged out by the same operation. Other sessions (and any
@@ -203,19 +240,32 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
 /// from #1146 is closed separately by the caller via
 /// [`AuthService::revoke_all_refresh_token_families`].
 pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat: i64) {
-    // -1 so the sync `<=` check at the line `issued_at <= changed_at` lets
-    // the calling token through. Older tokens (iat <= caller_iat - 1) are
-    // still caught.
-    invalidate_user_tokens_at(user_id, caller_iat.saturating_sub(1));
+    // `caller_iat * 1000 - 1` (ms) so the sync `<=` check at the line
+    // `issued_at * 1000 <= changed_at` lets the calling token through. Older
+    // tokens (iat <= caller_iat - 1) are still caught.
+    let watermark_ms = caller_iat.saturating_mul(1000).saturating_sub(1);
+    invalidate_user_tokens_at(user_id, watermark_ms);
 }
 
-/// Set the in-memory watermark to a specific epoch second. Shared by the
-/// "invalidate everything" and "exempt caller" variants above.
-fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
+/// Set the in-memory watermark to a specific epoch **millisecond**. Shared by
+/// the "invalidate everything", "floor second" and "exempt caller" variants
+/// above.
+///
+/// The write is **monotonic**: an existing entry is only raised, never
+/// lowered. This prevents a late stale DB fetch (or a lower-precision
+/// invalidate) from clobbering a higher watermark already recorded by a
+/// password change on this replica (cross-replica / >5s-cache hardening).
+fn invalidate_user_tokens_at(user_id: Uuid, watermark_ms: i64) {
     if let Ok(mut map) = invalidation_map().write() {
-        map.insert(user_id, (watermark, Instant::now()));
-        let now = Utc::now().timestamp();
-        let cutoff = now - INVALIDATION_RETENTION_SECS;
+        let now = Instant::now();
+        map.entry(user_id)
+            .and_modify(|e| {
+                if watermark_ms > e.0 {
+                    *e = (watermark_ms, now);
+                }
+            })
+            .or_insert((watermark_ms, now));
+        let cutoff = Utc::now().timestamp_millis() - INVALIDATION_RETENTION_MS;
         map.retain(|_, (ts, _)| *ts > cutoff);
     }
 }
@@ -253,8 +303,11 @@ fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
 /// fast-path for the same replica.
 pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
     if let Ok(map) = invalidation_map().read() {
-        if let Some(&(changed_at, _)) = map.get(&user_id) {
-            return issued_at <= changed_at;
+        if let Some(&(changed_at_ms, _)) = map.get(&user_id) {
+            // `issued_at` is RFC-7519 whole seconds; the watermark is in
+            // milliseconds. Sync plane keeps `<=` (see #1248 distinction at
+            // `is_token_invalidated_replica_safe`); only the unit changed.
+            return issued_at.saturating_mul(1000) <= changed_at_ms;
         }
     }
     false
@@ -263,8 +316,11 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
 /// Outcome of the DB-backed credential-change lookup for a user.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CredentialWatermark {
-    /// Unix-timestamp (seconds) of the most recent credential-bearing
-    /// change on the user row.
+    /// Unix-timestamp (**milliseconds**) of the most recent credential-bearing
+    /// change on the user row. Millisecond precision preserves the sub-second
+    /// component of `password_changed_at` (microsecond TIMESTAMPTZ) so a token
+    /// minted in the same wall-clock second as a credential change is ordered
+    /// correctly against the watermark.
     pub(crate) watermark: i64,
     /// `users.is_active`. When `false`, [`is_token_invalidated_replica_safe`]
     /// rejects every token regardless of `iat` so a deactivation processed
@@ -276,8 +332,8 @@ pub(crate) struct CredentialWatermark {
 /// every `validate_access_token_async` / `refresh_tokens` call.
 ///
 /// Returns the highest of `users.password_changed_at` and
-/// `users.totp_verified_at` as a Unix timestamp (in seconds), alongside
-/// `users.is_active`, or `None` if the user no longer exists.
+/// `users.totp_verified_at` as a Unix timestamp (in **milliseconds**),
+/// alongside `users.is_active`, or `None` if the user no longer exists.
 ///
 /// Note: `users.updated_at` is deliberately NOT included. Profile edits
 /// (display name, email, last_login_at touches) bump `updated_at` without
@@ -338,7 +394,21 @@ async fn fetch_credential_change_watermark(
     let Some((watermark_ts, is_active)) = row else {
         return Ok(None);
     };
-    let watermark = watermark_ts.timestamp();
+    // FLOOR the DB-derived watermark to the second (then to ms). Unlike the
+    // in-memory full-millisecond watermark written by `invalidate_user_tokens`
+    // on an *actual* credential change, the DB-read path must not reject a
+    // token whose `iat` falls in the same wall-clock second as a value that was
+    // merely set at user CREATION. `users.password_changed_at DEFAULT NOW()`
+    // (migration 076) carries the sub-second creation offset (e.g. ...787141),
+    // so `.timestamp_millis()` would make a brand-new user's first same-second
+    // login (`iat * 1000` == ...787000) satisfy `iat*1000 < watermark_ms` and
+    // be wrongly rejected (the #1173/rbac/mesh fresh-user "401" regression).
+    // Flooring to the second makes the creation watermark equal a same-second
+    // login `iat*1000`, so strict `<` ACCEPTS the fresh first login. Real
+    // password-change rejection still comes from the full-ms watermark written
+    // synchronously to the in-memory map by `invalidate_user_tokens`, which the
+    // monotonic-max writer keeps above this floored value on a single replica.
+    let watermark = watermark_ts.timestamp().saturating_mul(1000);
 
     // Only cache when the user is active. Caching `is_active=false` would
     // require expanding the cache value to a tuple; instead we skip the
@@ -346,11 +416,11 @@ async fn fetch_credential_change_watermark(
     // status. Inactive lookups are rare on the hot path (the request will
     // 401 anyway) so the extra DB roundtrip is acceptable.
     if is_active {
-        if let Ok(mut map) = invalidation_map().write() {
-            map.insert(user_id, (watermark, Instant::now()));
-            let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
-            map.retain(|_, (ts, _)| *ts > cutoff);
-        }
+        // Reuse the monotonic-max writer so a stale DB fetch on this replica
+        // can never lower a higher watermark already recorded by an explicit
+        // password-change invalidation (#1173 cross-replica hardening). The
+        // watermark is in milliseconds.
+        invalidate_user_tokens_at(user_id, watermark);
     }
 
     Ok(Some(CredentialWatermark {
@@ -363,24 +433,39 @@ async fn fetch_credential_change_watermark(
 ///
 /// Returns `true` when the user's credentials have changed strictly after
 /// the token's `iat`. JWT `iat` is whole seconds (RFC 7519); the DB
-/// `password_changed_at` is microsecond-precision but
-/// [`fetch_credential_change_watermark`] truncates it to seconds via
-/// `.timestamp()`. We use strict `<` (not `<=`) so a token minted in the
-/// same wall-clock second as the watermark is accepted — this is the
-/// fresh-user case where `POST /users` sets `password_changed_at = NOW()`
-/// (column DEFAULT) and the user's first login mints a JWT whose `iat`
-/// also resolves to that second (#1173 follow-up: release-gate
-/// `rbac-tests` and `mesh-tests` saw HTTP 401 instead of the expected 403
-/// for fresh non-admin users).
+/// `password_changed_at` is microsecond-precision and
+/// [`fetch_credential_change_watermark`] now preserves it at **millisecond**
+/// precision via `.timestamp_millis()`. We compare `iat * 1000` against the
+/// millisecond watermark with strict `<` (not `<=`).
+///
+/// Sub-second precision resolves the same-second conflict that floor-second
+/// data could not:
+///   * **mint-then-invalidate** (password change / reset / deactivation,
+///     full-precision [`invalidate_user_tokens`]): the change happens strictly
+///     after the token was minted, so the watermark carries a positive
+///     sub-second offset and a same-second pre-change token
+///     (`iat * 1000 == floor_sec*1000 < watermark_ms`) is **rejected**. This
+///     restores the #931 invariant the floor-second `<` had regressed.
+///   * **invalidate-then-mint** (OIDC login / admin reset, floored
+///     [`invalidate_user_tokens_floor_second`]): the watermark is floored to
+///     the start of the current second, so the same-request fresh JWT
+///     (`iat * 1000 == watermark`) survives strict `<` while any
+///     strictly-earlier-second token is rejected (#1911).
+///   * **fresh user** (`POST /users` sets `password_changed_at = NOW()`,
+///     first login mints `iat` in a later second): `iat * 1000 >
+///     watermark_ms` ⇒ accepted (#1173 follow-up).
 ///
 /// Safety of `<` for the actual-password-change case: a JWT with `iat`
-/// equal to the post-change watermark would have to have been minted in
-/// the same wall-clock second the password was changed. The server
-/// requires a successful authentication to mint a JWT, so such a JWT
-/// could only have been minted with the OLD password right up until the
-/// password change — which means the attacker already had the old
-/// password and any JWT obtained that way is equivalent to one obtained
-/// a moment earlier through normal use. There is no exploitable window.
+/// floored to the same second as the post-change watermark would have to
+/// have been minted in the same wall-clock second the password was changed.
+/// The server requires a successful authentication to mint a JWT, so such a
+/// JWT could only have been minted with the OLD password right up until the
+/// password change — which means the attacker already had the old password
+/// and any JWT obtained that way is equivalent to one obtained a moment
+/// earlier through normal use. With millisecond precision such a pre-change
+/// token is now rejected anyway; only the invalidate-then-mint fresh token
+/// (minted by a successful auth in the same request) survives. There is no
+/// exploitable window.
 ///
 /// Resolution order:
 ///   1. DB watermark, served from the in-memory cache when fresh
@@ -415,7 +500,15 @@ pub(crate) async fn is_token_invalidated_replica_safe(
             if !entry.is_active {
                 return Ok(true);
             }
-            Ok(issued_at < entry.watermark)
+            // `issued_at` is RFC-7519 whole seconds; `entry.watermark` is in
+            // milliseconds. Strict `<` (#1248 async-plane comparator): a
+            // full-precision password-change watermark carries a positive
+            // sub-second offset, so a same-second pre-change token
+            // (`iat * 1000 == floor_sec*1000 < watermark_ms`) is rejected,
+            // while an invalidate-then-mint floored watermark
+            // (`watermark == floor_sec*1000`) lets the same-second fresh token
+            // survive (`iat * 1000 == watermark`, strict `<` is false).
+            Ok(issued_at.saturating_mul(1000) < entry.watermark)
         }
         None => Ok(false),
     }
@@ -1941,8 +2034,15 @@ impl AuthService {
         // bumped `privileges_changed_at`; mirror that into the in-memory
         // invalidation map so this replica rejects pre-change JWTs on the very
         // next request without waiting for the DB-cache TTL to lapse.
+        //
+        // This is an **invalidate-then-mint** flow: `authenticate_federated`
+        // calls `generate_tokens` immediately after this, in the same request.
+        // Use the floored-second watermark so the freshly-minted JWT (whose
+        // `iat` floors to the current second) survives the strict `<` check,
+        // while every pre-change token from an earlier second is rejected
+        // (#1911 OIDC self-invalidation guard).
         if privilege_changed {
-            invalidate_user_tokens(user_id);
+            invalidate_user_tokens_floor_second(user_id);
         }
 
         Ok(())
@@ -3573,25 +3673,29 @@ mod tests {
 
     #[test]
     fn test_token_issued_at_exact_invalidation_time_is_rejected() {
-        // Boundary fix (#1173): `iat == changed_at` (1-second JWT resolution)
-        // must be rejected. Previously this was `<` and silently let through
-        // tokens minted in the same wall-clock second as the invalidation.
+        // Boundary fix (#1173): `iat` (whole-second) floored to the same
+        // wall-clock second as a full-precision watermark must be rejected on
+        // the sync plane (`<=`). The watermark is now in milliseconds; the
+        // token `iat` stays in seconds and is scaled by 1000 internally.
         let user_id = Uuid::new_v4();
         let pre = Utc::now().timestamp();
         invalidate_user_tokens(user_id);
-        // A token issued in the same second as the invalidation (iat == watermark)
-        // should now be rejected.
+        // The in-memory watermark is in milliseconds; the floored second of
+        // the watermark is the "same second" token's `iat`.
         let map = invalidation_map().read().unwrap();
-        let &(watermark, _) = map.get(&user_id).unwrap();
+        let &(watermark_ms, _) = map.get(&user_id).unwrap();
         drop(map);
+        let watermark_sec = watermark_ms.div_euclid(1000);
+        // A token issued in the same second as the invalidation
+        // (`iat * 1000 <= watermark_ms`) should be rejected.
         assert!(
-            is_token_invalidated(user_id, watermark),
+            is_token_invalidated(user_id, watermark_sec),
             "same-second token must be rejected"
         );
         // Token issued strictly before invalidation is still rejected.
         assert!(is_token_invalidated(user_id, pre - 1));
-        // Token issued strictly after invalidation is still accepted.
-        assert!(!is_token_invalidated(user_id, watermark + 1));
+        // Token issued in a strictly later second is still accepted.
+        assert!(!is_token_invalidated(user_id, watermark_sec + 1));
     }
 
     #[test]
@@ -3726,20 +3830,23 @@ mod tests {
     /// Regression test for #1911: OIDC login self-invalidation race condition.
     ///
     /// The `authenticate_federated` flow calls `apply_role_mapping` (which
-    /// calls `invalidate_user_tokens` on privilege change) immediately before
-    /// `generate_tokens`. Without the fix, the `+1` watermark offset caused
-    /// the freshly-minted JWT to be rejected by `is_token_invalidated_replica_safe`
-    /// for up to `CREDENTIAL_DB_CACHE_TTL_SECS` (5 s).
+    /// calls `invalidate_user_tokens_floor_second` on privilege change)
+    /// immediately before `generate_tokens`. This is the invalidate-then-mint
+    /// case: the freshly-minted JWT (whose `iat` floors to the current second)
+    /// must NOT be rejected by `is_token_invalidated_replica_safe`. The floored
+    /// watermark (`floor_sec * 1000`) equals the fresh token's `iat * 1000`, so
+    /// strict `<` accepts it.
     ///
     /// Uses the lazy (never-connected) pool — the in-memory cache populated
-    /// by `invalidate_user_tokens` serves the watermark without a DB round-trip.
+    /// by the invalidation serves the watermark without a DB round-trip.
     #[tokio::test]
     async fn test_oidc_login_token_not_self_invalidated() {
         let (service, cfg) = invalidation_test_service();
         let user = make_test_user();
 
-        // Step 1: simulate apply_role_mapping → invalidate_user_tokens
-        invalidate_user_tokens(user.id);
+        // Step 1: simulate apply_role_mapping → invalidate_user_tokens_floor_second
+        // (the invalidate-then-mint variant used by OIDC login).
+        invalidate_user_tokens_floor_second(user.id);
 
         // Step 2: simulate generate_tokens immediately after (same wall-clock second)
         let now = Utc::now().timestamp();
@@ -3760,6 +3867,174 @@ mod tests {
         assert!(
             old_result.is_err(),
             "pre-invalidation token must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-second (millisecond) watermark precision (#931 invariant restore;
+    // the #1915 floor-second regression). The watermark is in milliseconds so
+    // a token whose whole-second `iat` floors to the same wall-clock second as
+    // a credential change is ordered correctly.
+    // -----------------------------------------------------------------------
+
+    /// The gate-failure case: a password change (full-precision
+    /// `invalidate_user_tokens`) must reject a token minted in the SAME
+    /// wall-clock second, on both the sync and the replica-safe async plane.
+    #[tokio::test]
+    async fn test_password_change_rejects_same_second_pre_change_token() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // The token's `iat` is the floored current second (what a real JWT
+        // minted "just before" the change carries).
+        let iat_sec = Utc::now().timestamp();
+        let token = mint_access_token_at(&cfg, &user, iat_sec);
+
+        // Full-precision (mint-then-invalidate) credential change. Its
+        // millisecond watermark carries a positive sub-second offset above
+        // `iat_sec * 1000`.
+        invalidate_user_tokens(user.id);
+
+        // Sync plane (`<=`): same-second pre-change token rejected.
+        assert!(
+            service.validate_access_token(&token).is_err(),
+            "sync plane must reject the same-second pre-change token"
+        );
+        // Replica-safe async plane (strict `<`, served from the in-memory
+        // cache so no DB round-trip): same-second pre-change token rejected.
+        // This is the exact regression the release gate caught.
+        assert!(
+            service.validate_access_token_async(&token).await.is_err(),
+            "async plane must reject the same-second pre-change token (the regression)"
+        );
+    }
+
+    /// Fresh-user regression (#1173/rbac/mesh): `users.password_changed_at`
+    /// is `DEFAULT NOW()` at user CREATION (migration 076) and carries a
+    /// sub-second offset (e.g. ...787141). The DB-read path floors that
+    /// watermark to the second (`...787000`) so a brand-new user's first login
+    /// in the SAME wall-clock second (`iat * 1000 == ...787000`) is ACCEPTED
+    /// under strict `<` — it must not be wrongly rejected. Meanwhile a REAL
+    /// password change (full-ms `invalidate_user_tokens`) in that same second
+    /// still REJECTS a same-second pre-change token, because the in-memory
+    /// full-ms watermark dominates the floored creation watermark.
+    #[tokio::test]
+    async fn test_fresh_user_same_second_first_login_accepted() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // Simulate the DB-derived creation watermark: `password_changed_at`
+        // was set at creation with a sub-second offset, but the DB-read path
+        // FLOORS it to the second before recording it in the in-memory map
+        // (exactly what `fetch_credential_change_watermark` now does:
+        // `watermark_ts.timestamp() * 1000`).
+        let now_sec = Utc::now().timestamp();
+        let floored_creation_watermark_ms = now_sec.saturating_mul(1000);
+        invalidate_user_tokens_at(user.id, floored_creation_watermark_ms);
+
+        // The fresh user's first login in the SAME second mints `iat = now_sec`.
+        let fresh_login = mint_access_token_at(&cfg, &user, now_sec);
+        assert!(
+            service
+                .validate_access_token_async(&fresh_login)
+                .await
+                .is_ok(),
+            "fresh-user same-second first login must be accepted (floored DB-read watermark)"
+        );
+
+        // Now a REAL password change writes the full-ms watermark for the same
+        // second; the monotonic-max writer keeps it above the floored creation
+        // value, so a same-second PRE-change token is correctly rejected.
+        invalidate_user_tokens(user.id);
+        let pre_change = mint_access_token_at(&cfg, &user, now_sec);
+        assert!(
+            service
+                .validate_access_token_async(&pre_change)
+                .await
+                .is_err(),
+            "a same-second pre-change token must still be rejected after a real password change"
+        );
+    }
+
+    /// Invalidate-then-mint (OIDC / admin reset): the floored-second variant
+    /// keeps a same-second freshly-minted token valid while rejecting any
+    /// token from a strictly earlier second.
+    #[tokio::test]
+    async fn test_oidc_floor_second_keeps_fresh_token() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // Floored-second invalidate (apply_role_mapping path).
+        invalidate_user_tokens_floor_second(user.id);
+
+        // A token minted in the same second survives (`iat * 1000 ==
+        // floor_sec * 1000 == watermark`, strict `<` is false).
+        let now = Utc::now().timestamp();
+        let fresh = mint_access_token_at(&cfg, &user, now);
+        assert!(
+            service.validate_access_token_async(&fresh).await.is_ok(),
+            "same-second freshly-minted token must be accepted (invalidate-then-mint)"
+        );
+
+        // A token from a strictly earlier second is rejected.
+        let prev = mint_access_token_at(&cfg, &user, now - 1);
+        assert!(
+            service.validate_access_token_async(&prev).await.is_err(),
+            "a token from a strictly earlier second must be rejected"
+        );
+    }
+
+    /// The exempt-caller variant operates in milliseconds: the calling token
+    /// (`caller_iat`) is exempt, while a token from any earlier second is
+    /// invalidated.
+    #[test]
+    fn test_except_caller_ms() {
+        let user_id = Uuid::new_v4();
+        let caller_iat = Utc::now().timestamp();
+
+        invalidate_user_tokens_except_caller(user_id, caller_iat);
+
+        // The watermark is `caller_iat * 1000 - 1` (ms): the calling token
+        // (`caller_iat * 1000 <= caller_iat * 1000 - 1` is false) survives.
+        assert!(
+            !is_token_invalidated(user_id, caller_iat),
+            "the calling token must be exempt"
+        );
+        // A token from the previous second is invalidated.
+        assert!(
+            is_token_invalidated(user_id, caller_iat - 1),
+            "a token from an earlier second must be invalidated"
+        );
+    }
+
+    /// The in-memory watermark write is monotonic: a later, lower watermark
+    /// (e.g. a stale DB fetch arriving after a fresh password-change
+    /// invalidation) must NOT lower the recorded watermark.
+    #[test]
+    fn test_watermark_monotonic_no_stale_lowering() {
+        let user_id = Uuid::new_v4();
+        let high_ms = Utc::now().timestamp_millis();
+        let low_ms = high_ms - 60_000; // one minute earlier (a stale fetch)
+
+        // Record the high watermark (the real password change), then attempt
+        // to lower it with a stale value.
+        invalidate_user_tokens_at(user_id, high_ms);
+        invalidate_user_tokens_at(user_id, low_ms);
+
+        let stored = {
+            let map = invalidation_map().read().unwrap();
+            map.get(&user_id).map(|&(ms, _)| ms).unwrap()
+        };
+        assert_eq!(
+            stored, high_ms,
+            "a later, lower watermark must not lower the stored watermark"
+        );
+
+        // A token at the low watermark's second is still rejected (the high
+        // watermark dominates).
+        assert!(
+            is_token_invalidated(user_id, low_ms.div_euclid(1000)),
+            "the high watermark must keep rejecting pre-change tokens"
         );
     }
 
