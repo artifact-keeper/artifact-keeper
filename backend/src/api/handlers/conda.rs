@@ -3106,7 +3106,15 @@ async fn store_conda_package(
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Conda,
+        repo.id,
+        &artifact_path,
+        &computed_sha256,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the file
     let storage_key = format!("conda/{}/{}/{}", repo.id, subdir, filename);

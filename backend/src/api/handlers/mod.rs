@@ -30,6 +30,52 @@ pub async fn cleanup_soft_deleted_artifact(
     .await;
 }
 
+/// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
+/// INSERT won't violate `UNIQUE(repository_id, path)` — UNLESS the coordinate is
+/// structurally immutable (per [`cache_classifier`]) AND the incoming bytes
+/// differ from the tombstoned bytes.
+///
+/// In that case the re-upload would be a release-immutability swap (a DELETE
+/// followed by re-uploading DIFFERENT content under a released coordinate), so
+/// it is rejected with the same 409 the live PUT-overwrite path returns.
+/// Re-uploading the IDENTICAL bytes (idempotent republish / undelete) and all
+/// mutable / unknown-format paths are always allowed — the purge proceeds as
+/// before. This is the single pre-insert chokepoint every upload handler shares.
+pub async fn cleanup_soft_deleted_artifact_checked(
+    db: &sqlx::PgPool,
+    format: &crate::models::repository::RepositoryFormat,
+    repository_id: uuid::Uuid,
+    path: &str,
+    new_checksum_sha256: &str,
+) -> crate::error::Result<()> {
+    use crate::error::AppError;
+    use crate::services::cache_classifier;
+
+    if cache_classifier::classify(format, path).is_immutable() {
+        // Inspect the tombstone (if any) BEFORE it is purged.
+        let prior = sqlx::query_scalar::<_, String>(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some(prior_sha) = prior {
+            if !prior_sha.eq_ignore_ascii_case(new_checksum_sha256) {
+                return Err(AppError::Conflict(
+                    "Artifact version already exists and is immutable".to_string(),
+                ));
+            }
+        }
+    }
+
+    cleanup_soft_deleted_artifact(db, repository_id, path).await;
+    Ok(())
+}
+
 /// Escape SQL `LIKE` wildcards (`%`, `_`) and the escape character (`\`) in
 /// user-supplied input that will be concatenated into a `LIKE` pattern.
 ///
@@ -389,5 +435,209 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "null".as_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_soft_deleted_artifact_checked — release-immutability swap guard
+    //
+    // DB-backed; no-ops cleanly when DATABASE_URL is unset (CI seeds Postgres
+    // before `cargo llvm-cov --lib`). Validates that a DELETE + re-upload of
+    // DIFFERENT bytes to a structurally-immutable coordinate is rejected with
+    // a 409, while identical-bytes republish, mutable paths, and the
+    // no-tombstone case all proceed.
+    // -----------------------------------------------------------------------
+
+    use crate::models::repository::RepositoryFormat;
+
+    /// Create a hosted repo of the given `format` (a `repository_format` enum
+    /// literal such as `'maven'`). Returns its id.
+    async fn make_repo(pool: &sqlx::PgPool, format: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let key = format!("immut-test-{}", id);
+        let dir = std::env::temp_dir().join(&key);
+        let sql = format!(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local'::repository_type, '{}'::repository_format)",
+            format
+        );
+        sqlx::query(&sql)
+            .bind(id)
+            .bind(&key)
+            .bind(&key)
+            .bind(dir.to_string_lossy().as_ref())
+            .execute(pool)
+            .await
+            .expect("create test repo");
+        id
+    }
+
+    /// Insert a SOFT-DELETED (tombstoned) artifact row at `(repo, path)` with
+    /// the given sha256 — simulating a prior publish that was then DELETEd.
+    async fn insert_tombstone(pool: &sqlx::PgPool, repo: uuid::Uuid, path: &str, sha: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, '1.0.0', 1, $4, 'application/octet-stream', $5, true)",
+        )
+        .bind(repo)
+        .bind(path)
+        .bind(path)
+        .bind(sha)
+        .bind(format!("sk/{}", sha))
+        .execute(pool)
+        .await
+        .expect("insert tombstone");
+    }
+
+    async fn cleanup_repo(pool: &sqlx::PgPool, repo: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_blocks_immutable_swap_different_bytes() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let path = "com/x/app/1.0.0/app-1.0.0.jar"; // classifier: immutable
+        insert_tombstone(
+            &pool,
+            repo,
+            path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        // Re-upload DIFFERENT bytes -> must be rejected (the exploit, blocked).
+        let res = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::Conflict(_))),
+            "delete + re-upload of different bytes to an immutable Maven coordinate must 409",
+        );
+        // Tombstone must still be present (purge refused).
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 1, "immutable tombstone must not be purged");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_allows_identical_bytes_republish() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let path = "com/x/app/1.0.0/app-1.0.0.jar";
+        insert_tombstone(
+            &pool,
+            repo,
+            path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        // Re-upload IDENTICAL bytes -> allowed (idempotent republish).
+        let res = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // same sha, case-insensitive
+        )
+        .await;
+        assert!(res.is_ok(), "identical-bytes republish must be allowed");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "tombstone purged for identical-bytes republish"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_allows_mutable_path_swap() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let path = "com/x/app/maven-metadata.xml"; // classifier: mutable
+        insert_tombstone(
+            &pool,
+            repo,
+            path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        // Mutable coordinate: re-upload of different bytes proceeds (purge).
+        let res = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "mutable maven-metadata.xml swap must be allowed"
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0, "mutable tombstone purged as before");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_no_tombstone_proceeds() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let path = "com/x/app/2.0.0/app-2.0.0.jar"; // immutable, but no tombstone
+
+        // First upload (no prior tombstone) -> proceeds unconditionally.
+        let res = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .await;
+        assert!(res.is_ok(), "first upload with no tombstone must proceed");
+
+        cleanup_repo(&pool, repo).await;
     }
 }

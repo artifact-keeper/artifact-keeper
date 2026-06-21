@@ -649,7 +649,15 @@ async fn store_crate_artifact(
     let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     let size_bytes = crate_bytes.len() as i64;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Cargo,
+        repo.id,
+        &artifact_path,
+        checksum,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     let artifact_id = sqlx::query_scalar!(
         r#"

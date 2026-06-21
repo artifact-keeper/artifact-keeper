@@ -2075,8 +2075,18 @@ async fn upload(
         .await;
     } else {
         // Clean up any soft-deleted artifact at the same path so the
-        // UNIQUE(repository_id, path) constraint doesn't block re-upload.
-        super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
+        // UNIQUE(repository_id, path) constraint doesn't block re-upload —
+        // unless this is a release-immutability swap (delete + re-upload of
+        // DIFFERENT bytes to an immutable coordinate), which is rejected.
+        super::cleanup_soft_deleted_artifact_checked(
+            &state.db,
+            &crate::models::repository::RepositoryFormat::Maven,
+            repo.id,
+            &path,
+            &checksum_sha256,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
     }
 
     // Store file in object storage regardless of grouping outcome

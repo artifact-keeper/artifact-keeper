@@ -1850,7 +1850,12 @@ async fn upload(
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
     let size_bytes = content.len() as i64;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // No pre-cleanup here: this path persists through
+    // `artifact_service::upload_with_sync_options`, whose release-immutability
+    // backstop must see the soft-deleted tombstone (purging it first would hide
+    // a release-immutability swap). The service's `ON CONFLICT DO UPDATE`
+    // resurrects the soft-deleted row in the allowed (identical-bytes / mutable)
+    // cases, so the UNIQUE(repository_id, path) constraint is still satisfied.
 
     let storage = state
         .storage_for_repo(&repo.storage_location())

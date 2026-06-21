@@ -346,6 +346,35 @@ impl ArtifactService {
             }
         }
 
+        // Release-immutability backstop for the service-backed upload paths
+        // (generic / pypi / debian). The live-overwrite check above only sees
+        // non-deleted rows, so a DELETE (soft-delete) followed by re-uploading
+        // DIFFERENT bytes to a structurally-immutable coordinate would otherwise
+        // slip through the `ON CONFLICT DO UPDATE` below. Re-query INCLUDING
+        // soft-deleted rows: if the coordinate is immutable and the incoming
+        // bytes differ from the tombstoned bytes, reject with the same 409.
+        // Identical-bytes republish and mutable/unknown-format paths proceed.
+        if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
+            if crate::services::cache_classifier::classify(&repo.format, path).is_immutable() {
+                let prior = sqlx::query_scalar::<_, String>(
+                    "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(repository_id)
+                .bind(path)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+                if let Some(prior_sha) = prior {
+                    if !prior_sha.eq_ignore_ascii_case(&checksum_sha256) {
+                        return Err(AppError::Conflict(
+                            "Artifact version already exists and is immutable".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Check if content already exists (deduplication)
         let content_exists = self.storage.exists(&storage_key).await?;
 

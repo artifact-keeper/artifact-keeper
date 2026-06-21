@@ -1691,7 +1691,15 @@ async fn store_npm_version(
         .into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo_id, &artifact_path).await;
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Npm,
+        repo_id,
+        &artifact_path,
+        &ver.sha256,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the tarball
     let storage_key = format!(

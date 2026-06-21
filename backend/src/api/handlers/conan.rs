@@ -1094,7 +1094,18 @@ async fn recipe_file_upload(
 
     // Clean up soft-deleted rows (including the one just soft-deleted above)
     // so the UNIQUE(repository_id, path) constraint won't block the INSERT.
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // The checked variant additionally rejects a release-immutability swap on
+    // any coordinate the classifier marks immutable (Conan paths are mutable
+    // today, so this is a no-op for them and preserves same-revision overwrite).
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Conan,
+        repo.id,
+        &artifact_path,
+        &checksum_sha256,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the file
     let storage = state
@@ -1801,7 +1812,18 @@ async fn package_file_upload(
 
     // Clean up soft-deleted rows (including the one just soft-deleted above)
     // so the UNIQUE(repository_id, path) constraint won't block the INSERT.
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // The checked variant additionally rejects a release-immutability swap on
+    // any coordinate the classifier marks immutable (Conan paths are mutable
+    // today, so this is a no-op for them and preserves same-revision overwrite).
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Conan,
+        repo.id,
+        &artifact_path,
+        &checksum_sha256,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the file
     let storage = state

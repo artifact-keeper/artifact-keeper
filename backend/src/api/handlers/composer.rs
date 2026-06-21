@@ -1023,7 +1023,15 @@ async fn upload(
             .into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Composer,
+        repo.id,
+        &artifact_path,
+        &sha256,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the archive
     let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);

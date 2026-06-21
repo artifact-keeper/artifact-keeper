@@ -979,7 +979,15 @@ async fn push_package(
     let artifact_path = format!("{}/{}/{}", package_id, version, filename);
     let storage_key = format!("nuget/{}/{}/{}", package_id, version, filename);
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Nuget,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Store the file.
     let storage = state
