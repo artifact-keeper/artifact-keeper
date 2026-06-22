@@ -92,6 +92,7 @@ state = {
 }
 KEY_LOG = os.environ["KEY_LOG"]
 PERM_LOG = os.environ["PERM_LOG"]
+CONFIG_LOG = os.environ["CONFIG_LOG"]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k):
@@ -133,6 +134,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, b"eyJhbGciOiJIUzI1NiJ9.mockjwt.signature",
                               ctype="text/plain")
         if self.path == "/api/v1/configProperty":
+            with open(CONFIG_LOG, "a") as f:
+                f.write(body.decode("utf-8", "replace") + "\n")
             return self._send(200)
         if (self.path.startswith(f"/api/v1/permission/")
                 and self.path.endswith(f"/team/{TEAM_UUID}")):
@@ -186,6 +189,9 @@ KEY_LOG="$WORK_DIR/keys.log"
 PERM_LOG="$WORK_DIR/perms.log"
 : > "$PERM_LOG"
 
+CONFIG_LOG="$WORK_DIR/config.log"
+: > "$CONFIG_LOG"
+
 # start_mock <var=value>... — (re)launch the mock with the given env overrides.
 # Tests that need to inject foreign keys or fault-injection knobs restart
 # the mock between phases; a fresh server discards the previous state.
@@ -199,7 +205,7 @@ start_mock() {
   # KEY=val passed by callers are honored as env assignments. The shell
   # only treats inline VAR=val as an env override when it appears literally
   # at the start of a command — not when it arrives via "$@" expansion.
-  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" PERM_LOG="$PERM_LOG" \
+  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" PERM_LOG="$PERM_LOG" CONFIG_LOG="$CONFIG_LOG" \
     "$@" \
     python3 "$WORK_DIR/mock_dtrack.py" "$MOCK_PORT" >>"$WORK_DIR/mock.log" 2>&1 &
   MOCK_PID=$!
@@ -235,7 +241,7 @@ PUBLIC_ID_MARKER="$SHARED_DIR/.dtrack-publicid"
 
 fail() {
   echo "FAIL: $1" >&2
-  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6; do
+  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6 init_osv_off init_osv_on; do
     if [ -f "$WORK_DIR/${f}.out" ] || [ -f "$WORK_DIR/${f}.err" ]; then
       echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" >&2 || true
       echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" >&2 || true
@@ -445,4 +451,39 @@ INIT_RC6=$(run_init init6)
 [ ! -f "$KEY_FILE.tmp" ] || \
   fail "Phase 6: failed init left a stale $KEY_FILE.tmp on disk"
 
-echo "PASS: init-dtrack.sh — bug #978 + foreign-key safety rail (#1041 follow-up)"
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 7: Google OSV vuln source is opt-in (DTRACK_INIT_OSV_ENABLED).
+# NVD is always enabled; OSV must be enabled only when the flag is set. Both are
+# configured on the cold mint path, so each case runs cold from a wiped state.
+# ─────────────────────────────────────────────────────────────────────────────
+# Default (flag unset): NVD enabled, OSV NOT enabled.
+rm -f "$KEY_FILE" "$PUBLIC_ID_MARKER" "$SHARED_DIR/.dtrack-bootstrapped"
+start_mock
+: > "$CONFIG_LOG"
+INIT_RC_OSV_OFF=$(run_init init_osv_off)
+[ "$INIT_RC_OSV_OFF" -eq 0 ] || \
+  fail "Phase 7: OSV-off init exited $INIT_RC_OSV_OFF"
+grep -q 'Google OSV mirroring disabled' "$WORK_DIR/init_osv_off.out" || \
+  fail "Phase 7: OSV-off must log 'disabled'"
+grep -q 'nvd.api.enabled' "$CONFIG_LOG" || \
+  fail "Phase 7: NVD must always be enabled (nvd.api.enabled not POSTed)"
+! grep -q 'google.osv.enabled' "$CONFIG_LOG" || \
+  fail "Phase 7: google.osv.enabled must NOT be POSTed when DTRACK_INIT_OSV_ENABLED is unset"
+
+# Opt-in (flag=true): OSV enabled with the AK-hosted ∩ OSV-supported ecosystems.
+rm -f "$KEY_FILE" "$PUBLIC_ID_MARKER" "$SHARED_DIR/.dtrack-bootstrapped"
+start_mock
+: > "$CONFIG_LOG"
+INIT_RC_OSV_ON=$(run_init init_osv_on env DTRACK_INIT_OSV_ENABLED=true)
+[ "$INIT_RC_OSV_ON" -eq 0 ] || \
+  fail "Phase 7: OSV-on init exited $INIT_RC_OSV_ON"
+grep -q 'Google OSV mirroring enabled' "$WORK_DIR/init_osv_on.out" || \
+  fail "Phase 7: OSV-on must log 'enabled'"
+grep -q 'google.osv.enabled' "$CONFIG_LOG" || \
+  fail "Phase 7: google.osv.enabled must be POSTed when DTRACK_INIT_OSV_ENABLED=true"
+grep -q 'Packagist' "$CONFIG_LOG" || \
+  fail "Phase 7: OSV ecosystem list should include Packagist (Composer)"
+
+echo "[test] OSV opt-in: NVD always on; OSV off -> no google.osv.enabled POST, on -> POSTed incl. Packagist"
+
+echo "PASS: init-dtrack.sh — bug #978 + foreign-key safety rail (#1041 follow-up) + OSV opt-in"
