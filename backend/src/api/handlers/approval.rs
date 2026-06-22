@@ -1704,4 +1704,366 @@ mod tests {
         let clause = build_where_clause(&conditions);
         assert!(clause.starts_with(" WHERE"));
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed approve_promotion gate tests (PR #1940).
+    //
+    // The approval-execute path (`approve_promotion`) is the THIRD manual
+    // promote path; `promote_artifact` FORCES approval-required repos through
+    // it, so governance-ruled repos bypassed the single/bulk gate entirely
+    // until #1940 added this gate. These drive the real handler end to end.
+    //
+    // Runs under `cargo llvm-cov --lib` with a live DATABASE_URL (CI coverage
+    // job); runtime-skips when no DATABASE_URL is set (NOT `#[ignore]`, so the
+    // coverage instrument sees the gate path). Mirrors the in-`src` DB-test
+    // pattern. Relocated from backend/tests/promotion_rules_gate_tests.rs (an
+    // integration target that did not count toward `--lib` coverage).
+    // -----------------------------------------------------------------------
+    mod gate_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::SharedState;
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        async fn make_repo_key(pool: &PgPool, tag: &str, storage_path: &std::path::Path) -> String {
+            let id = Uuid::new_v4();
+            let key = format!("pr1940-{}-{}", tag, &id.to_string()[..8]);
+            std::fs::create_dir_all(storage_path).expect("create storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, false)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(storage_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            key
+        }
+
+        async fn repo_id_for_key(pool: &PgPool, key: &str) -> Uuid {
+            let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_one(pool)
+                .await
+                .expect("repo id");
+            id
+        }
+
+        async fn make_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            id
+        }
+
+        fn admin_ext(user_id: Uuid) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: "pr1940-admin".to_string(),
+                email: "pr1940-admin@test.local".to_string(),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: None,
+            }
+        }
+
+        async fn storage_for(
+            state: &SharedState,
+            pool: &PgPool,
+            repo_id: Uuid,
+        ) -> Arc<dyn crate::storage::StorageBackend> {
+            let repo = RepositoryService::new(pool.clone())
+                .get_by_id(repo_id)
+                .await
+                .expect("get_by_id");
+            state
+                .storage_for_repo(&repo.storage_location())
+                .expect("storage_for_repo")
+        }
+
+        async fn make_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert artifact");
+            id
+        }
+
+        async fn make_rule(
+            pool: &PgPool,
+            source: Uuid,
+            target: Uuid,
+            max_cve_severity: Option<&str>,
+            min_staging_hours: Option<i32>,
+        ) {
+            sqlx::query(
+                "INSERT INTO promotion_rules (id, name, source_repo_id, target_repo_id, is_enabled, \
+                 max_cve_severity, require_signature, min_staging_hours, auto_promote) \
+                 VALUES ($1, $2, $3, $4, true, $5, false, $6, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(format!("pr1940-rule-{}", &Uuid::new_v4().to_string()[..8]))
+            .bind(source)
+            .bind(target)
+            .bind(max_cve_severity)
+            .bind(min_staging_hours)
+            .execute(pool)
+            .await
+            .expect("insert rule");
+        }
+
+        async fn make_pending_approval(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            source: Uuid,
+            target: Uuid,
+            requested_by: Uuid,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO promotion_approvals (id, artifact_id, source_repo_id, target_repo_id, \
+                 requested_by, status, skip_policy_check) \
+                 VALUES ($1, $2, $3, $4, $5, 'pending', false)",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(source)
+            .bind(target)
+            .bind(requested_by)
+            .execute(pool)
+            .await
+            .expect("insert approval");
+            id
+        }
+
+        async fn target_has_artifact(pool: &PgPool, target: Uuid, path_like: &str) -> bool {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path LIKE $2 AND is_deleted = false",
+            )
+            .bind(target)
+            .bind(format!("%{}%", path_like))
+            .fetch_one(pool)
+            .await
+            .expect("count");
+            n > 0
+        }
+
+        async fn approval_status(pool: &PgPool, id: Uuid) -> String {
+            let (s,): (String,) =
+                sqlx::query_as("SELECT status FROM promotion_approvals WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("status");
+            s
+        }
+
+        async fn cleanup(pool: &PgPool, repos: &[Uuid], user: Uuid) {
+            for r in repos {
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_approvals WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_rules WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+
+        /// The gap PR #1940 closed: approving a rule-UNMET promotion must be
+        /// BLOCKED (403 Authorization), must NOT copy the artifact, and must
+        /// leave the approval pending.
+        #[tokio::test]
+        async fn test_approval_path_blocks_rule_unmet() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-arej-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-arej-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "arej-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "arej-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "arej").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "arej").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, user).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            match res {
+                Err(AppError::Authorization(msg)) => assert!(
+                    msg.contains("promotion rule"),
+                    "block message should cite the rule; got: {msg}"
+                ),
+                other => panic!(
+                    "expected Authorization (403) block, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+            assert!(
+                !target_has_artifact(&pool, tgt, "arej").await,
+                "a rule-blocked approval must NOT copy the artifact"
+            );
+            assert_eq!(
+                approval_status(&pool, approval).await,
+                "pending",
+                "a blocked approval must remain pending"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// A rule-MET approval still executes: the artifact lands in the target
+        /// and the approval is marked approved.
+        #[tokio::test]
+        async fn test_approval_path_allows_rule_met() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-aok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-aok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "aok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "aok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "aok").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "aok").await;
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, user).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: Some("ok".to_string()),
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(res.is_ok(), "a rule-met approval must execute");
+            assert!(
+                target_has_artifact(&pool, tgt, "aok").await,
+                "a rule-met approval must copy the artifact"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// skip_policy_check admin break-glass still works on the approval path:
+        /// a rule-unmet promotion executes when the reviewer overrides.
+        #[tokio::test]
+        async fn test_approval_path_skip_policy_check_override() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-askip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-askip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "askip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "askip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "askip").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "askip").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, user).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: true,
+                }),
+            )
+            .await;
+            assert!(res.is_ok(), "skip_policy_check must bypass the rule gate");
+            assert!(
+                target_has_artifact(&pool, tgt, "askip").await,
+                "break-glass approval must execute the promotion"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+    }
 }

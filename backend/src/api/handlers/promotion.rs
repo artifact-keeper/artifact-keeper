@@ -2850,4 +2850,499 @@ mod tests {
         // Target must remain untouched.
         assert!(target.received.lock().unwrap().is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed promotion_rules enforcement tests (PR #1940).
+    //
+    // These exercise the new promotion_rules gate on the SINGLE and BULK
+    // promote handlers, plus the `max_cve_severity` unset-vs-set default fix
+    // via the shared evaluator. They run under `cargo llvm-cov --lib` with a
+    // live DATABASE_URL (the CI coverage job), and runtime-skip cleanly when
+    // no DATABASE_URL is configured (NOT `#[ignore]`, so the coverage instrument
+    // sees these paths). Mirrors the in-`src` DB-test pattern used elsewhere in
+    // this crate (e.g. quality_gates.rs): `let Some(pool) = try_pool().await
+    // else { return; };`.
+    //
+    // Relocated from backend/tests/promotion_rules_gate_tests.rs, which lived in
+    // the integration target and therefore did not count toward `--lib`
+    // coverage.
+    // -----------------------------------------------------------------------
+    mod gate_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use crate::api::SharedState;
+        use crate::services::promotion_rule_service::PromotionRuleService;
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        /// Create a hosted ('local') repo with its own filesystem storage dir.
+        async fn make_repo_key(pool: &PgPool, tag: &str, storage_path: &std::path::Path) -> String {
+            let id = Uuid::new_v4();
+            let key = format!("pr1940-{}-{}", tag, &id.to_string()[..8]);
+            std::fs::create_dir_all(storage_path).expect("create storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, false)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(storage_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            key
+        }
+
+        async fn repo_id_for_key(pool: &PgPool, key: &str) -> Uuid {
+            let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_one(pool)
+                .await
+                .expect("repo id");
+            id
+        }
+
+        async fn make_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            id
+        }
+
+        fn admin_ext(user_id: Uuid) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: "pr1940-admin".to_string(),
+                email: "pr1940-admin@test.local".to_string(),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: None,
+            }
+        }
+
+        /// Storage backend resolved through the repo's own storage_location().
+        async fn storage_for(
+            state: &SharedState,
+            pool: &PgPool,
+            repo_id: Uuid,
+        ) -> Arc<dyn crate::storage::StorageBackend> {
+            let repo = RepositoryService::new(pool.clone())
+                .get_by_id(repo_id)
+                .await
+                .expect("get_by_id");
+            state
+                .storage_for_repo(&repo.storage_location())
+                .expect("storage_for_repo")
+        }
+
+        /// Insert an artifact whose `created_at` is now() with real bytes in the
+        /// repo's storage, so any positive `min_staging_hours` rule is violated.
+        async fn make_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert artifact");
+            id
+        }
+
+        async fn make_rule(
+            pool: &PgPool,
+            source: Uuid,
+            target: Uuid,
+            max_cve_severity: Option<&str>,
+            min_staging_hours: Option<i32>,
+        ) {
+            sqlx::query(
+                "INSERT INTO promotion_rules (id, name, source_repo_id, target_repo_id, is_enabled, \
+                 max_cve_severity, require_signature, min_staging_hours, auto_promote) \
+                 VALUES ($1, $2, $3, $4, true, $5, false, $6, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(format!("pr1940-rule-{}", &Uuid::new_v4().to_string()[..8]))
+            .bind(source)
+            .bind(target)
+            .bind(max_cve_severity)
+            .bind(min_staging_hours)
+            .execute(pool)
+            .await
+            .expect("insert rule");
+        }
+
+        async fn target_has_artifact(pool: &PgPool, target: Uuid, path_like: &str) -> bool {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path LIKE $2 AND is_deleted = false",
+            )
+            .bind(target)
+            .bind(format!("%{}%", path_like))
+            .fetch_one(pool)
+            .await
+            .expect("count");
+            n > 0
+        }
+
+        async fn cleanup(pool: &PgPool, repos: &[Uuid], user: Uuid) {
+            for r in repos {
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_approvals WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_rules WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+
+        // ---- single-promote handler: rule-MET promotes -----------------------
+
+        #[tokio::test]
+        async fn test_single_promote_rule_met_promotes() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-sok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-sok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "sok").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sok").await;
+            // Satisfied rule: min_staging_hours = 0, no CVE gate.
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote should succeed");
+            assert!(res.0.promoted, "a rule-met single promote must promote");
+            assert!(
+                target_has_artifact(&pool, tgt, "sok").await,
+                "rule-met single promote must copy the artifact into the target"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- single-promote handler: rule-UNMET blocks -----------------------
+
+        #[tokio::test]
+        async fn test_single_promote_rule_unmet_blocks() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-sno-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-sno-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sno-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sno-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "sno").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sno").await;
+            // The live-bypass rule: 720h staging on a seconds-old artifact.
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("handler returns Ok with promoted:false on a rule block");
+            assert!(
+                !res.0.promoted,
+                "a rule-unmet single promote must be blocked"
+            );
+            assert!(
+                res.0
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("promotion rule"),
+                "block message must cite the promotion rule; got {:?}",
+                res.0.message
+            );
+            assert!(
+                !res.0.policy_violations.is_empty(),
+                "blocked single promote must surface rule violations"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "sno").await,
+                "a rule-blocked single promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- single-promote handler: skip_policy_check override --------------
+
+        #[tokio::test]
+        async fn test_single_promote_skip_policy_check_override() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-ssk-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-ssk-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "ssk-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "ssk-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "ssk").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "ssk").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("skip_policy_check must bypass the rule gate");
+            assert!(res.0.promoted, "break-glass single promote must promote");
+            assert!(target_has_artifact(&pool, tgt, "ssk").await);
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- bulk-promote handler: rule-MET vs rule-UNMET --------------------
+
+        #[tokio::test]
+        async fn test_bulk_promote_rule_met_and_unmet() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-bulk-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-bulk-t-{}", Uuid::new_v4()));
+            // rule-MET case
+            let met_s_key = make_repo_key(&pool, "bok-s", &sdir).await;
+            let met_t_key = make_repo_key(&pool, "bok-t", &tdir).await;
+            let met_s = repo_id_for_key(&pool, &met_s_key).await;
+            let met_t = repo_id_for_key(&pool, &met_t_key).await;
+            let user = make_admin(&pool, "bulk").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let met_storage = storage_for(&state, &pool, met_s).await;
+            let met_art = make_artifact(&pool, met_s, &met_storage, "bok").await;
+            make_rule(&pool, met_s, met_t, None, Some(0)).await;
+
+            let met_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(met_s_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(met_t_key.clone()),
+                    artifact_ids: vec![met_art],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote ok");
+            assert_eq!(met_res.0.promoted, 1, "rule-met bulk item must promote");
+            assert_eq!(met_res.0.failed, 0);
+            assert!(target_has_artifact(&pool, met_t, "bok").await);
+
+            // rule-UNMET case (separate repo pair).
+            let sdir2 = std::env::temp_dir().join(format!("pr1940-bno-s-{}", Uuid::new_v4()));
+            let tdir2 = std::env::temp_dir().join(format!("pr1940-bno-t-{}", Uuid::new_v4()));
+            let no_s_key = make_repo_key(&pool, "bno-s", &sdir2).await;
+            let no_t_key = make_repo_key(&pool, "bno-t", &tdir2).await;
+            let no_s = repo_id_for_key(&pool, &no_s_key).await;
+            let no_t = repo_id_for_key(&pool, &no_t_key).await;
+            let no_storage = storage_for(&state, &pool, no_s).await;
+            let no_art = make_artifact(&pool, no_s, &no_storage, "bno").await;
+            make_rule(&pool, no_s, no_t, None, Some(720)).await;
+
+            let no_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(no_s_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(no_t_key.clone()),
+                    artifact_ids: vec![no_art],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote ok");
+            assert_eq!(
+                no_res.0.promoted, 0,
+                "rule-unmet bulk item must NOT promote"
+            );
+            assert_eq!(no_res.0.failed, 1);
+            assert!(
+                no_res.0.results[0]
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("promotion rule"),
+                "bulk block must cite the promotion rule; got {:?}",
+                no_res.0.results[0].message
+            );
+            assert!(
+                !no_res.0.results[0].policy_violations.is_empty(),
+                "blocked bulk item must surface rule violations"
+            );
+            assert!(
+                !target_has_artifact(&pool, no_t, "bno").await,
+                "a rule-blocked bulk item must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[met_s, met_t, no_s, no_t], user).await;
+        }
+
+        // ---- max_cve_severity default fix (shared evaluator) -----------------
+
+        /// #1940: a rule that does NOT set max_cve_severity (NULL) must NOT
+        /// silently require a clean scan, so an unscanned artifact under a
+        /// satisfied hours-only rule is not falsely blocked.
+        #[tokio::test]
+        async fn test_unset_cve_severity_does_not_require_scan() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-nocve-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-nocve-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "nocve-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "nocve-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "nocve").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            // Unscanned artifact (no scan_results rows).
+            let artifact = make_artifact(&pool, src, &storage, "nocve").await;
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+
+            let svc = PromotionRuleService::new(pool.clone());
+            let failing = svc
+                .evaluate_for_promotion(artifact, src, tgt)
+                .await
+                .expect("evaluate");
+            assert!(
+                failing.is_empty(),
+                "an hours-only rule (max_cve_severity NULL) must NOT block an unscanned artifact; got {:?}",
+                failing
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// Conservative counterpart: a rule that DOES set max_cve_severity still
+        /// blocks an unscanned artifact (the CVE gate is opt-in, fail-closed when
+        /// requested).
+        #[tokio::test]
+        async fn test_explicit_cve_severity_still_requires_scan() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-cve-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-cve-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "cve-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "cve-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "cve").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "cve").await;
+            // Explicit CVE bound + satisfied hours -> unscanned must fail closed.
+            make_rule(&pool, src, tgt, Some("medium"), Some(0)).await;
+
+            let svc = PromotionRuleService::new(pool.clone());
+            let failing = svc
+                .evaluate_for_promotion(artifact, src, tgt)
+                .await
+                .expect("evaluate");
+            assert!(
+                !failing.is_empty(),
+                "an explicit max_cve_severity rule must still block an unscanned artifact (fail-closed)"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+    }
 }
