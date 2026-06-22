@@ -32,15 +32,22 @@ pub async fn cleanup_soft_deleted_artifact(
 
 /// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
 /// INSERT won't violate `UNIQUE(repository_id, path)` — UNLESS the coordinate is
-/// structurally immutable (per [`cache_classifier`]) AND the incoming bytes
-/// differ from the tombstoned bytes.
+/// a *released* one AND the incoming bytes differ from the tombstoned bytes.
 ///
-/// In that case the re-upload would be a release-immutability swap (a DELETE
-/// followed by re-uploading DIFFERENT content under a released coordinate), so
-/// it is rejected with the same 409 the live PUT-overwrite path returns.
-/// Re-uploading the IDENTICAL bytes (idempotent republish / undelete) and all
-/// mutable / unknown-format paths are always allowed — the purge proceeds as
-/// before. This is the single pre-insert chokepoint every upload handler shares.
+/// This is the pre-insert chokepoint the format handlers that do their own
+/// INSERT (cargo / maven / npm / nuget / conan / composer / conda) share, and it
+/// mirrors the release-immutability backstop in
+/// [`ArtifactService::upload_with_sync_options`] for the service-backed paths.
+///
+/// A coordinate is *released* (immutable) when a prior row exists there AND the
+/// path is not a format's genuinely in-place-rewritten index file
+/// (`maven-metadata.xml`, npm packument, OCI tag, ...). The structural
+/// [`cache_classifier`] supplies the index/immutable distinction; for the
+/// default-format families (Nuget / Conan / Composer / Generic / ...) every
+/// stored path is a release coordinate, so a versioned re-upload is protected
+/// too. Re-uploading the IDENTICAL bytes (idempotent republish / undelete) and
+/// genuine mutable index files are always allowed — the purge proceeds as
+/// before.
 pub async fn cleanup_soft_deleted_artifact_checked(
     db: &sqlx::PgPool,
     format: &crate::models::repository::RepositoryFormat,
@@ -51,20 +58,29 @@ pub async fn cleanup_soft_deleted_artifact_checked(
     use crate::error::AppError;
     use crate::services::cache_classifier;
 
-    if cache_classifier::classify(format, path).is_immutable() {
+    // Genuine in-place index files (a format's mutable pointers) are always
+    // freely re-uploadable; everything else is a candidate release coordinate.
+    if !cache_classifier::is_explicitly_mutable_index(format, path) {
         // Inspect the tombstone (if any) BEFORE it is purged.
-        let prior = sqlx::query_scalar::<_, String>(
-            "SELECT checksum_sha256 FROM artifacts \
+        let prior = sqlx::query!(
+            "SELECT checksum_sha256, version FROM artifacts \
              WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+            repository_id,
+            path
         )
-        .bind(repository_id)
-        .bind(path)
         .fetch_optional(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        if let Some(prior_sha) = prior {
-            if !prior_sha.eq_ignore_ascii_case(new_checksum_sha256) {
+        if let Some(prior) = prior {
+            // Released = versioned coordinate or structurally immutable path.
+            let is_released =
+                prior.version.is_some() || cache_classifier::classify(format, path).is_immutable();
+            if is_released
+                && !prior
+                    .checksum_sha256
+                    .eq_ignore_ascii_case(new_checksum_sha256)
+            {
                 return Err(AppError::Conflict(
                     "Artifact version already exists and is immutable".to_string(),
                 ));

@@ -3516,9 +3516,16 @@ pub async fn upload_artifact(
         .map(|m| m.content_type.clone())
         .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
 
-    // Clean up any soft-deleted artifact at the same path so the
-    // UNIQUE(repository_id, path) constraint doesn't block re-upload.
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
+    // No pre-cleanup here: this generic upload endpoint (and the multipart
+    // variants that delegate to it) persists through
+    // `artifact_service::upload_with_sync_options`, whose release-immutability
+    // backstop must SEE any soft-deleted tombstone at this coordinate — purging
+    // it first would hide a release-immutability swap (DELETE + re-upload of
+    // DIFFERENT bytes to a released coordinate, the exploited path). The
+    // service's `ON CONFLICT (repository_id, path) DO UPDATE ... is_deleted =
+    // false` resurrects the tombstone for the allowed cases (identical-bytes
+    // republish / mutable index files), so the UNIQUE(repository_id, path)
+    // constraint is still satisfied without the manual purge.
 
     let artifact = artifact_service
         .upload_with_sync_options(
@@ -8009,6 +8016,178 @@ mod tests {
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Release-immutability swap via DELETE + re-upload (the exploited endpoint).
+    //
+    // These drive the SAME `upload_artifact` / `delete_artifact` handlers the
+    // generic repo-scoped `/repositories/{key}/artifacts/*path` route maps to —
+    // the endpoint the red-team reproduction hits and which earlier fixes never
+    // wired to the guard. DB-backed; skip cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+
+    /// Upload a versioned artifact, DELETE it, then PUT DIFFERENT bytes to the
+    /// same coordinate -> the re-upload MUST be rejected (409 Conflict). Covers
+    /// a default-format (Generic) repo, proving the oracle protects coordinates
+    /// the proxy-cache classifier alone treats as mutable.
+    #[tokio::test]
+    async fn delete_then_reupload_different_bytes_blocked_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+        // {package}/{version}/{filename} -> a versioned release coordinate.
+        let path = "app/1.0.0/app-1.0.0.bin".to_string();
+
+        // 1) Initial publish.
+        let up = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"ORIGINAL-RELEASE-BYTES"),
+        )
+        .await;
+        assert!(up.is_ok(), "initial publish must succeed: {up:?}");
+
+        // 2) DELETE (soft-delete -> tombstone). Generic classifies mutable, so
+        // the delete guard permits this even for a non-admin.
+        let del = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(del.is_ok(), "delete of the release must succeed: {del:?}");
+
+        // 3) Re-upload DIFFERENT bytes to the same coordinate -> the swap. MUST
+        // be blocked by the release-immutability backstop.
+        let swap = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"SWAPPED-MALICIOUS-BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(swap, Err(AppError::Conflict(_))),
+            "DELETE + re-upload of DIFFERENT bytes to a released coordinate must 409, got: {swap:?}"
+        );
+
+        // The stored content must remain the ORIGINAL (no swap occurred).
+        let remaining = sqlx::query_scalar::<_, String>(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let original_sha = ArtifactService::calculate_sha256(b"ORIGINAL-RELEASE-BYTES");
+        assert_eq!(
+            remaining.as_deref(),
+            Some(original_sha.as_str()),
+            "the released content must be unchanged after a blocked swap"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legit flow: re-uploading the IDENTICAL bytes after a DELETE is allowed
+    /// (idempotent retract + republish), and re-uploading DIFFERENT bytes to a
+    /// genuinely MUTABLE index path (a Maven `maven-metadata.xml`) is allowed.
+    #[tokio::test]
+    async fn delete_then_reupload_legit_flows_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // Admin auth so the delete guard permits deleting an immutable Maven jar.
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let auth = Some(admin);
+
+        // (a) Identical-bytes retract + republish of an immutable coordinate.
+        let path = "com/x/app/1.0.0/app-1.0.0.jar".to_string();
+        let body = Bytes::from_static(b"SAME-RELEASE-CONTENT");
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .expect("publish jar");
+        delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("admin delete jar");
+        let republish = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await;
+        assert!(
+            republish.is_ok(),
+            "identical-bytes republish after delete must be allowed: {republish:?}"
+        );
+
+        // (b) Different-bytes re-upload to a MUTABLE index path is allowed.
+        let meta = "com/x/app/maven-metadata.xml".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"<metadata>v1</metadata>"),
+        )
+        .await
+        .expect("publish metadata");
+        delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("delete metadata");
+        let rewrite = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"<metadata>v2-updated</metadata>"),
+        )
+        .await;
+        assert!(
+            rewrite.is_ok(),
+            "rewriting a mutable maven-metadata.xml after delete must be allowed: {rewrite:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DB-backed sibling for the read/visibility gate: a non-member gets NotFound

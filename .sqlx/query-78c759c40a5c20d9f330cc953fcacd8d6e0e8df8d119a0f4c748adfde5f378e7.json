@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT checksum_sha256, version FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "78c759c40a5c20d9f330cc953fcacd8d6e0e8df8d119a0f4c748adfde5f378e7"
+}
