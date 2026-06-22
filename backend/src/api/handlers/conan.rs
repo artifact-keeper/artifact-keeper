@@ -489,6 +489,233 @@ async fn search_recipes_from_remote(
     }
 }
 
+/// Parse an upstream Conan v2 revisions response body into `RecipeRevisionRow`s.
+///
+/// The upstream shape is identical to what these handlers emit:
+/// `{"revisions":[{"revision":"...","time":"..."}]}`. The `time` field is
+/// parsed as RFC3339 so merged rows can be re-sorted newest-first; an absent or
+/// unparseable `time` falls back to "now" (the row is still returned). Returns
+/// an empty `Vec` on any parse failure so a malformed upstream degrades to
+/// local-only rather than erroring.
+fn parse_recipe_revisions_json(bytes: &[u8]) -> Vec<RecipeRevisionRow> {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "conan recipe_revisions: failed to parse upstream JSON: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    parse_revisions_value(&value)
+        .into_iter()
+        .map(|(revision, created_at)| RecipeRevisionRow {
+            revision,
+            created_at,
+        })
+        .collect()
+}
+
+/// Parse an upstream Conan v2 package-revisions response body into
+/// `PackageRevisionRow`s. Same shape and degradation rules as
+/// [`parse_recipe_revisions_json`].
+fn parse_package_revisions_json(bytes: &[u8]) -> Vec<PackageRevisionRow> {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "conan package_revisions: failed to parse upstream JSON: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    parse_revisions_value(&value)
+        .into_iter()
+        .map(|(revision, created_at)| PackageRevisionRow {
+            revision,
+            created_at,
+        })
+        .collect()
+}
+
+/// Parse an upstream Conan `time` string. Conan Center emits times with a
+/// numeric `+0000` offset (e.g. `2025-12-09T12:51:39.337+0000`) which is NOT
+/// strict RFC3339 (RFC3339 requires `Z` or `+00:00`), so try RFC3339 first and
+/// fall back to the `%z` form. On any failure return `Utc::now()` so the row is
+/// still surfaced (only its sort key is approximate).
+fn parse_conan_time(t: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .or_else(|_| chrono::DateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+/// Shared extraction of the `revisions: [{revision, time}]` array, returning
+/// `(revision, created_at)` pairs. An entry without a string `revision` is
+/// skipped; an absent/unparseable `time` falls back to `Utc::now()`.
+fn parse_revisions_value(
+    value: &serde_json::Value,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    value
+        .get("revisions")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let revision = item.get("revision").and_then(|v| v.as_str())?;
+                    let created_at = item
+                        .get("time")
+                        .and_then(|v| v.as_str())
+                        .map(parse_conan_time)
+                        .unwrap_or_else(chrono::Utc::now);
+                    Some((revision.to_string(), created_at))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse an upstream Conan v2 `.../latest` response body into the single
+/// revision id. Shape: `{"revision":"...","time":"..."}`. Returns `None` on a
+/// missing/unparseable body so a Remote `/latest` falls through to 404 only
+/// when the upstream genuinely has nothing.
+fn parse_latest_revision_json(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("conan latest: failed to parse upstream JSON: {}", e);
+            return None;
+        }
+    };
+    value
+        .get("revision")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Forward a recipe-revisions list query to a remote upstream and parse the
+/// `revisions` array. Returns `Vec::new()` on any non-2xx response or parse
+/// error (mirrors [`search_recipes_from_remote`]) so a flaky/offline upstream
+/// degrades to local-only instead of erroring. The caller merges the result
+/// with local cache rows.
+#[allow(clippy::too_many_arguments)]
+async fn recipe_revisions_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+) -> Vec<RecipeRevisionRow> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions",
+        name, version, user, channel
+    );
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => parse_recipe_revisions_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan recipe_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a recipe `/latest` query to a remote upstream. Returns `None` on any
+/// non-2xx response or parse error so the caller can fall through to a 404 only
+/// when the upstream truly has no revision. Mirrors the file-download Remote arm.
+#[allow(clippy::too_many_arguments)]
+async fn recipe_latest_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+) -> Option<String> {
+    let upstream_path = format!("v2/conans/{}/{}/{}/{}/latest", name, version, user, channel);
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan recipe_latest: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            None
+        }
+    }
+}
+
+/// Forward a package-revisions list query to a remote upstream and parse the
+/// `revisions` array. Same degradation rules as [`recipe_revisions_from_remote`].
+#[allow(clippy::too_many_arguments)]
+async fn package_revisions_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+) -> Vec<PackageRevisionRow> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions",
+        name, version, user, channel, revision, package_id
+    );
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => parse_package_revisions_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan package_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a package `/latest` query to a remote upstream. Same degradation
+/// rules as [`recipe_latest_from_remote`].
+#[allow(clippy::too_many_arguments)]
+async fn package_latest_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+) -> Option<String> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/latest",
+        name, version, user, channel, revision, package_id
+    );
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan package_latest: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            None
+        }
+    }
+}
+
 async fn search(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
@@ -647,6 +874,36 @@ async fn recipe_latest(
             }
         }
         found.ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first; on a miss forward to the upstream `/latest`. Only
+        // 404 when both local cache and upstream have nothing. Mirrors the
+        // file-download Remote arm.
+        match latest_recipe_revision_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
+            .await
+            .map_err(map_db_err)?
+        {
+            Some(rev) => rev,
+            None => {
+                let remote = match (repo.upstream_url.as_deref(), state.proxy_service.as_deref()) {
+                    (Some(upstream_url), Some(proxy)) => {
+                        recipe_latest_from_remote(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &name,
+                            &version,
+                            &user,
+                            &channel,
+                        )
+                        .await
+                    }
+                    _ => None,
+                };
+                remote
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
+            }
+        }
     } else {
         latest_recipe_revision_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
             .await
@@ -748,6 +1005,34 @@ async fn recipe_revisions(
                     .await
                     .map_err(map_db_err)?;
             merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
+        }
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward upstream and merge any remote
+        // revisions, deduped by revision id and re-sorted newest-first. Mirrors
+        // the search Remote arm.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<RecipeRevisionRow> = Vec::new();
+        let local = recipe_revisions_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
+            .await
+            .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |r| r.revision.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = recipe_revisions_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         merged
@@ -1233,7 +1518,7 @@ async fn latest_package_revision_for_repo(
 
 async fn package_latest(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
+    Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
         String,
@@ -1275,6 +1560,45 @@ async fn package_latest(
         }
         found
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first; on a miss forward to the upstream package `/latest`.
+        // Only 404 when both local and upstream have nothing.
+        match latest_package_revision_for_repo(
+            &state.db,
+            repo.id,
+            &name,
+            &version,
+            &revision,
+            &package_id,
+        )
+        .await
+        .map_err(map_db_err)?
+        {
+            Some(rev) => rev,
+            None => {
+                let remote = match (repo.upstream_url.as_deref(), state.proxy_service.as_deref()) {
+                    (Some(upstream_url), Some(proxy)) => {
+                        package_latest_from_remote(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &name,
+                            &version,
+                            &user,
+                            &channel,
+                            &revision,
+                            &package_id,
+                        )
+                        .await
+                    }
+                    _ => None,
+                };
+                remote.ok_or_else(|| {
+                    (StatusCode::NOT_FOUND, "No package revisions found").into_response()
+                })?
+            }
+        }
     } else {
         latest_package_revision_for_repo(
             &state.db,
@@ -1359,7 +1683,7 @@ async fn package_revisions_for_repo(
 
 async fn package_revisions(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel, revision, package_id)): Path<(
+    Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
         String,
@@ -1392,6 +1716,36 @@ async fn package_revisions(
             .await
             .map_err(map_db_err)?;
             merge_unique_by(member_rows, &mut seen, &mut merged, |r| r.revision.clone());
+        }
+        merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward upstream and merge any remote package
+        // revisions, deduped by revision id and re-sorted newest-first.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<PackageRevisionRow> = Vec::new();
+        let local =
+            package_revisions_for_repo(&state.db, repo.id, &name, &version, &revision, &package_id)
+                .await
+                .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |r| r.revision.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = package_revisions_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+                &package_id,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |r| r.revision.clone());
         }
         merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         merged
@@ -6990,5 +7344,129 @@ mod agent2_recipe_reads {
             user_id,
         )
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream-revisions JSON parsing (Remote pull-through resolution).
+    //
+    // These cover the pure parse+row-mapping logic used by the new
+    // `*_from_remote` helpers without requiring a live upstream: a happy-path
+    // parse must yield the upstream revisions (merge-ready), and a malformed /
+    // shapeless body must degrade to an empty Vec / None so the handler
+    // returns 200 / 404 instead of 500.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_recipe_revisions_json_happy() {
+        let body = br#"{"revisions":[
+            {"revision":"rev-a","time":"2026-01-02T00:00:00Z"},
+            {"revision":"rev-b","time":"2026-01-01T00:00:00Z"}
+        ]}"#;
+        let rows = super::parse_recipe_revisions_json(body);
+        assert_eq!(rows.len(), 2);
+        let revs: Vec<&str> = rows.iter().map(|r| r.revision.as_str()).collect();
+        assert!(revs.contains(&"rev-a"));
+        assert!(revs.contains(&"rev-b"));
+        // RFC3339 time is parsed into created_at so the caller can re-sort.
+        let a = rows.iter().find(|r| r.revision == "rev-a").unwrap();
+        let b = rows.iter().find(|r| r.revision == "rev-b").unwrap();
+        assert!(a.created_at > b.created_at);
+    }
+
+    #[test]
+    fn test_parse_recipe_revisions_json_missing_time_falls_back() {
+        // No `time` field: row is still returned (created_at defaults to now).
+        let body = br#"{"revisions":[{"revision":"only"}]}"#;
+        let rows = super::parse_recipe_revisions_json(body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, "only");
+    }
+
+    #[test]
+    fn test_parse_recipe_revisions_json_unparsable_is_empty() {
+        // Garbage body -> empty Vec (degrade to local-only, no 500).
+        assert!(super::parse_recipe_revisions_json(b"not json").is_empty());
+    }
+
+    #[test]
+    fn test_parse_recipe_revisions_json_no_revisions_key_is_empty() {
+        // Valid JSON but wrong shape -> empty Vec.
+        assert!(super::parse_recipe_revisions_json(br#"{"other":1}"#).is_empty());
+    }
+
+    #[test]
+    fn test_parse_recipe_revisions_json_skips_non_string_revision() {
+        let body = br#"{"revisions":[{"revision":42},{"revision":"good"}]}"#;
+        let rows = super::parse_recipe_revisions_json(body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, "good");
+    }
+
+    #[test]
+    fn test_parse_package_revisions_json_happy() {
+        let body = br#"{"revisions":[{"revision":"prev-1","time":"2026-03-04T05:06:07Z"}]}"#;
+        let rows = super::parse_package_revisions_json(body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, "prev-1");
+    }
+
+    #[test]
+    fn test_parse_package_revisions_json_unparsable_is_empty() {
+        assert!(super::parse_package_revisions_json(b"<html>oops</html>").is_empty());
+    }
+
+    #[test]
+    fn test_parse_latest_revision_json_happy() {
+        let body = br#"{"revision":"latest-rev","time":"2026-01-01T00:00:00Z"}"#;
+        assert_eq!(
+            super::parse_latest_revision_json(body),
+            Some("latest-rev".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_latest_revision_json_missing_revision_is_none() {
+        assert_eq!(super::parse_latest_revision_json(br#"{"time":"x"}"#), None);
+    }
+
+    #[test]
+    fn test_parse_latest_revision_json_unparsable_is_none() {
+        assert_eq!(super::parse_latest_revision_json(b"502 Bad Gateway"), None);
+    }
+
+    #[test]
+    fn test_parse_revisions_value_empty_array() {
+        let v = serde_json::json!({"revisions": []});
+        assert!(super::parse_revisions_value(&v).is_empty());
+    }
+
+    #[test]
+    fn test_parse_conan_time_rfc3339() {
+        let dt = super::parse_conan_time("2025-12-09T12:51:39.337Z");
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-12-09");
+    }
+
+    #[test]
+    fn test_parse_conan_time_numeric_offset() {
+        // Conan Center's actual format: numeric +0000 offset (not RFC3339).
+        let dt = super::parse_conan_time("2025-12-09T12:51:39.337+0000");
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2025-12-09T12:51:39"
+        );
+    }
+
+    #[test]
+    fn test_parse_revisions_value_preserves_numeric_offset_ordering() {
+        // With real Conan-Center-shaped times, rows keep their true timestamps so
+        // the caller's newest-first sort is correct (not collapsed to "now").
+        let body = br#"{"revisions":[
+            {"revision":"newer","time":"2025-12-09T12:51:39.337+0000"},
+            {"revision":"older","time":"2024-01-23T08:39:53.687+0000"}
+        ]}"#;
+        let rows = super::parse_recipe_revisions_json(body);
+        let newer = rows.iter().find(|r| r.revision == "newer").unwrap();
+        let older = rows.iter().find(|r| r.revision == "older").unwrap();
+        assert!(newer.created_at > older.created_at);
     }
 }
