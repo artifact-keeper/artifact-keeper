@@ -12,7 +12,18 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "Artifact Keeper API",
-        description = "Enterprise artifact registry supporting 45+ package formats.",
+        description = "Enterprise artifact registry supporting 45+ package formats.\n\n\
+## Authentication\n\n\
+The JSON management API under `/api/v1/*` accepts **API tokens only as `Authorization: Bearer <token>`**. \
+This is the canonical scheme for programmatic access; JWTs issued by the login flow also use `Bearer`. \
+HTTP Basic credentials on `/api/v1/*` are validated *only* as a real `username:password` login — the \
+password half is **not** retried as an API token. A request to `/api/v1/*` that sends an API token in the \
+password field of Basic auth therefore returns `401 AUTH_ERROR`; switch to `Authorization: Bearer <token>`.\n\n\
+Format (package-manager) endpoints such as `/v2/*` (OCI), `/incus/*`, `/debian/*`, and the language \
+registries are intentionally more permissive for client compatibility: in addition to Bearer, they accept \
+HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
+`pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
+Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
         version = "1.2.1",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
@@ -65,7 +76,16 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-/// Adds Bearer JWT security scheme to the OpenAPI spec.
+/// Adds the supported security schemes to the OpenAPI spec.
+///
+/// `bearer_auth` is the canonical scheme for `/api/v1/*`: API tokens and
+/// login-issued JWTs are both sent as `Authorization: Bearer <token>`.
+///
+/// `basic_auth` is documented for the format (package-manager) endpoints
+/// only. Those endpoints additionally accept HTTP Basic with the API token in
+/// the password field for clients that cannot send a Bearer header. The
+/// `/api/v1/*` middleware does NOT honour the Basic-with-token fallback — see
+/// the API description for the asymmetry.
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
@@ -77,6 +97,24 @@ impl Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("JWT")
+                        .description(Some(
+                            "Canonical scheme for `/api/v1/*`. Send an API token or a \
+                             login-issued JWT as `Authorization: Bearer <token>`.",
+                        ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "basic_auth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Basic)
+                        .description(Some(
+                            "Format (package-manager) endpoints only. Accepts a \
+                             `username:password` login, or an API token in the password \
+                             field (any username) for `pip` netrc / Artifactory-style \
+                             clients. Not accepted as a token carrier on `/api/v1/*`.",
+                        ))
                         .build(),
                 ),
             );
@@ -172,6 +210,23 @@ mod tests {
             .as_ref()
             .is_some_and(|c| c.security_schemes.contains_key("bearer_auth"));
         assert!(has_bearer, "Bearer auth security scheme is missing.");
+
+        // The format-endpoint Basic scheme is documented so the auth asymmetry
+        // (Basic-with-token works on format endpoints but not /api/v1/*) is
+        // discoverable from the spec rather than only the middleware source.
+        let has_basic = spec
+            .components
+            .as_ref()
+            .is_some_and(|c| c.security_schemes.contains_key("basic_auth"));
+        assert!(has_basic, "Basic auth security scheme is missing.");
+
+        // The API description must spell out the asymmetry: Bearer is canonical
+        // for /api/v1/*, and the Basic-with-token fallback is format-only.
+        let description = spec.info.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("Bearer") && description.contains("/api/v1/*"),
+            "API description should document Bearer auth for /api/v1/*."
+        );
 
         // Verify all expected tags are present
         let tags: Vec<&str> = spec
