@@ -1260,16 +1260,47 @@ impl RepositoryService {
         Ok(usage)
     }
 
-    /// Check if upload would exceed quota
+    /// Check if an upload of `additional_bytes` would be permitted under the
+    /// repository's storage quota.
+    ///
+    /// Quota semantics (matching the convention used by `quota_usage_percentage`
+    /// and the wider artifact-registry ecosystem):
+    ///
+    /// * `quota_bytes = NULL`  -> no quota configured -> **unlimited**
+    /// * `quota_bytes <= 0`    -> non-positive sentinel -> **unlimited**
+    ///   (`0` historically meant "no limit"; persisting it as a literal
+    ///   zero-byte hard cap silently rejected *every* write to the repo,
+    ///   surfacing as a `507 QUOTA_EXCEEDED` on the very first non-empty
+    ///   upload even though the host had ample free disk.)
+    /// * `quota_bytes > 0`     -> a real, finite limit that is enforced against
+    ///   the live `SUM(size_bytes)` of non-deleted artifacts (so the accounting
+    ///   self-heals on delete and never drifts).
     pub async fn check_quota(&self, repo_id: Uuid, additional_bytes: i64) -> Result<bool> {
         let repo = self.get_by_id(repo_id).await?;
+        Ok(Self::quota_allows(
+            repo.quota_bytes,
+            // Only hit the DB for usage when a finite quota is actually set.
+            match repo.quota_bytes {
+                Some(quota) if quota > 0 => self.get_storage_usage(repo_id).await?,
+                _ => 0,
+            },
+            additional_bytes,
+        ))
+    }
 
-        match repo.quota_bytes {
-            Some(quota) => {
-                let current_usage = self.get_storage_usage(repo_id).await?;
-                Ok(current_usage + additional_bytes <= quota)
-            }
-            None => Ok(true), // No quota set
+    /// Pure quota-admission decision, factored out so it can be unit-tested
+    /// without a database. Returns `true` when the upload is permitted.
+    ///
+    /// A `None` quota, or any non-positive quota (`<= 0`), means unlimited.
+    pub(crate) fn quota_allows(
+        quota_bytes: Option<i64>,
+        current_usage: i64,
+        additional_bytes: i64,
+    ) -> bool {
+        match quota_bytes {
+            Some(quota) if quota > 0 => current_usage + additional_bytes <= quota,
+            // NULL or a non-positive sentinel (0 / negative) => unlimited.
+            _ => true,
         }
     }
 
@@ -1857,6 +1888,58 @@ mod tests {
         let threshold = 0.8;
         assert!(quota_usage_percentage(85, 100) > threshold);
         assert!(quota_usage_percentage(70, 100) <= threshold);
+    }
+
+    // -----------------------------------------------------------------------
+    // quota_allows (pure admission decision behind check_quota)
+    //
+    // Covers the two reported quota defects:
+    //   1. quota_bytes = 0 (and NULL) must mean UNLIMITED, not a literal
+    //      zero-byte hard cap that 507s every write.
+    //   2. A repo without a finite quota must never be falsely capped, while a
+    //      repo WITH a finite quota is still correctly enforced (over -> reject,
+    //      at/under -> allow), and usage that frees up (post-delete) is admitted
+    //      again -- the accounting is the live SUM passed as `current_usage`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quota_allows_table() {
+        // (label, quota_bytes, current_usage, additional_bytes, expect_allowed)
+        let cases: &[(&str, Option<i64>, i64, i64, bool)] = &[
+            // Unlimited: NULL quota always admits, regardless of size.
+            ("null_quota_empty", None, 0, 0, true),
+            ("null_quota_huge", None, 0, 1_000_000_000_000, true),
+            ("null_quota_with_usage", None, 5_000, 9_999, true),
+            // Unlimited: 0 sentinel must NOT behave as a zero-byte cap (bug #1).
+            ("zero_quota_one_byte", Some(0), 0, 1, true),
+            ("zero_quota_huge", Some(0), 123, 1_000_000_000, true),
+            // Unlimited: negative sentinel is also treated as no limit.
+            ("negative_quota", Some(-1), 0, 500, true),
+            // Finite quota, fresh repo: under and exactly-at the limit pass.
+            ("finite_under", Some(1_000), 0, 999, true),
+            ("finite_exact", Some(1_000), 0, 1_000, true),
+            // Finite quota: one byte over the limit is rejected (-> 507).
+            ("finite_over_by_one", Some(1_000), 0, 1_001, false),
+            // Finite quota with existing usage: enforced against the sum.
+            ("finite_sum_at_limit", Some(1_000), 600, 400, true),
+            ("finite_sum_over", Some(1_000), 600, 401, false),
+            // Mid-session: a repo near its finite cap rejects the next write
+            // (the genuine, intended QUOTA_EXCEEDED path) ...
+            ("finite_full_rejects", Some(1_000), 1_000, 1, false),
+            // ... and once usage is freed (e.g. after a delete shrinks the
+            // live SUM), the same write is admitted again.
+            ("finite_freed_admits", Some(1_000), 500, 500, true),
+            // A zero-byte upload is always admitted, even at a finite limit.
+            ("finite_zero_byte_upload", Some(1_000), 1_000, 0, true),
+        ];
+
+        for (label, quota, usage, additional, expected) in cases {
+            assert_eq!(
+                RepositoryService::quota_allows(*quota, *usage, *additional),
+                *expected,
+                "quota_allows mismatch for case `{label}` (quota={quota:?}, usage={usage}, add={additional})",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
