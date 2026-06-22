@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
+use crate::storage::keys::prefix_matches;
 
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
 ///
@@ -44,12 +45,15 @@ use crate::services::scheduler_service::normalize_cron_expression;
 ///
 /// `artifacts.storage_key` is still asserted to equal
 /// `'oci-manifests/' || ot.manifest_digest` as a defence-in-depth
-/// constraint. Note: this couples the cascade to the
-/// `manifest_storage_key()` invariant in `oci_v2.rs:414`. If anyone ever
-/// changes that prefix the cascade silently no-ops; #1413 tracks
-/// extracting a shared constant. The path-based predicate is the primary
-/// join key, the storage_key predicate is a secondary integrity check
-/// that protects against artifact-name/path drift.
+/// constraint. The `'oci-manifests/'` literal below is the SQL embedding of
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX), the same prefix
+/// `manifest_storage_key()` (`oci_v2.rs`) produces on writes and the storage
+/// GC orphan predicate (`storage_gc_service.rs`, `ORPHAN_PREDICATE_SQL`)
+/// matches on. Postgres cannot read the Rust constant, so the literal is
+/// pinned to it by the `const _: () = assert!(...)` below: changing the
+/// constant breaks the build until this SQL is updated to match (#1413). The
+/// path-based predicate is the primary join key; the storage_key predicate is
+/// a secondary integrity check that protects against artifact-name/path drift.
 const CASCADE_OCI_TAGS_SQL: &str = r#"
 DELETE FROM oci_tags ot
 USING artifacts a
@@ -60,6 +64,12 @@ WHERE a.is_deleted = true
   AND a.version = ot.tag
   AND ($1::UUID IS NULL OR a.repository_id = $1)
 "#;
+
+/// Compile-time guard: the `'oci-manifests/'` literal embedded in
+/// [`CASCADE_OCI_TAGS_SQL`] must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
+/// Postgres cannot reference the Rust constant directly, so this keeps the
+/// SQL literal and the write-path constant from drifting (#1413).
+const _: () = assert!(prefix_matches("oci-manifests/"));
 
 /// Scope of a lifecycle policy execution: either a specific repository or
 /// every repository in the cluster (a "global" policy with `repository_id`

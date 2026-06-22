@@ -42,6 +42,7 @@ use std::sync::Arc;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::{StorageLocation, StorageRegistry};
 
 /// Result of a backfill pass. Returned for tracing and tests.
@@ -163,7 +164,7 @@ impl BackfillCandidate {
     /// pinned by a unit test rather than only exercised by Tier-2 storage
     /// reads.
     fn storage_key(&self) -> String {
-        format!("oci-manifests/{}", self.manifest_digest)
+        format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, self.manifest_digest)
     }
 
     /// The [`StorageLocation`] used to resolve this candidate's backend.

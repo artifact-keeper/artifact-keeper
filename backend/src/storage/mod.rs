@@ -3,6 +3,7 @@
 pub mod azure;
 pub mod filesystem;
 pub mod gcs;
+pub mod keys;
 pub mod path_format;
 pub mod registry;
 pub mod s3;

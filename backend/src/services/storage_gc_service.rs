@@ -11,6 +11,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::storage::keys::prefix_matches;
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 const ABANDONED_OCI_UPLOAD_TTL_SQL: &str = "INTERVAL '24 hours'";
@@ -38,6 +39,13 @@ const OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT: i64 = 1000;
 /// two predicates is what makes a TOCTOU window real in the first place
 /// (#1180); keeping them literally identical is the cheap structural
 /// guarantee that they stay aligned.
+///
+/// The `'oci-manifests/'` literals below are the SQL embedding of
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX) — the same prefix `manifest_storage_key()`
+/// (`oci_v2.rs`) produces on writes and the lifecycle cascade
+/// (`lifecycle_service.rs`, `CASCADE_OCI_TAGS_SQL`) matches on. Postgres
+/// cannot read the Rust constant, so the literal is pinned to it by the
+/// `const _: () = assert!(...)` after this constant (#1413).
 const ORPHAN_PREDICATE_SQL: &str = r#"
 a.is_deleted = true
 AND NOT EXISTS (
@@ -90,6 +98,13 @@ AND NOT EXISTS (
       )
 )
 "#;
+
+/// Compile-time guard: the `'oci-manifests/'` literals embedded in
+/// [`ORPHAN_PREDICATE_SQL`] (both the `LIKE` filter and the `SUBSTRING`
+/// offset) must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX). Postgres cannot
+/// reference the Rust constant directly, so this keeps the SQL literal and
+/// the write-path constant from drifting (#1413).
+const _: () = assert!(prefix_matches("oci-manifests/"));
 
 /// Minimum age (seconds) a blob must reach before [`StorageGcService::run_blob_gc`]
 /// will consider it for deletion (#1408).
