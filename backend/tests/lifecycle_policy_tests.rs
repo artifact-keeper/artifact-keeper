@@ -530,6 +530,51 @@ async fn insert_oci_tag(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str, di
     .expect("failed to insert oci_tag");
 }
 
+/// Re-evaluate the storage GC orphan predicate for a single
+/// (storage_key, repository_id) tuple. This mirrors the NOT EXISTS chain in
+/// `backend/src/services/storage_gc_service.rs::ORPHAN_PREDICATE_SQL`. We
+/// deliberately scope to a single (key, repo) tuple so the parallel test
+/// isolation issue fixed in #1499 cannot affect the assertion. Shared by the
+/// #1407 cascade tests and the #1682 retention-must-not-orphan tests so they
+/// assert against the exact same orphan-detection logic.
+async fn is_storage_key_orphan(pool: &PgPool, repo_id: Uuid, storage_key: &str) -> bool {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM artifacts a
+        JOIN repositories r ON r.id = a.repository_id
+        WHERE a.storage_key = $1
+          AND a.repository_id = $2
+          AND a.is_deleted = true
+          AND NOT EXISTS (
+              SELECT 1 FROM artifacts a2
+              WHERE a2.storage_key = a.storage_key
+                AND a2.is_deleted = false
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM oci_tags ot
+              JOIN repositories otr ON otr.id = ot.repository_id
+              WHERE a.storage_key LIKE 'oci-manifests/%'
+                AND ot.manifest_digest = SUBSTRING(
+                  a.storage_key FROM LENGTH('oci-manifests/') + 1
+                )
+                AND otr.storage_backend = r.storage_backend
+                AND (
+                  r.storage_backend <> 'filesystem'
+                  OR otr.storage_path = r.storage_path
+                )
+          )
+        "#,
+    )
+    .bind(storage_key)
+    .bind(repo_id)
+    .fetch_one(pool)
+    .await
+    .expect("orphan predicate query failed");
+    row.0 > 0
+}
+
 /// Return true if an oci_tags row still exists for the given (repo, image, tag).
 async fn oci_tag_exists(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str) -> bool {
     let row: (i64,) = sqlx::query_as(
@@ -544,9 +589,15 @@ async fn oci_tag_exists(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str) ->
     row.0 > 0
 }
 
-/// Soft-deleting an OCI manifest via tag_pattern_delete must also remove the
-/// matching oci_tags row, otherwise storage GC's orphan predicate (#1144)
-/// keeps the manifest object alive in S3 forever.
+/// Soft-deleting an OCI manifest via tag_pattern_delete must remove the
+/// matching oci_tags row *only when a surviving sibling tag still protects
+/// the same manifest digest* (#1407 cascade reclamation, constrained by the
+/// #1682 last-protecting-tag guard). Here the ephemeral manifest digest is
+/// also referenced by a surviving `release-alias` tag, so pruning the
+/// matched `build-snapshot-images` tag does not orphan the manifest and the
+/// cascade legitimately fires. Without the surviving sibling the cascade
+/// would (correctly, post-#1682) retain the row — see
+/// `cascade_retains_sole_protecting_oci_tag`.
 #[tokio::test]
 #[ignore]
 async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
@@ -582,6 +633,20 @@ async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
     )
     .await;
     insert_oci_tag(&pool, repo_id, "myimg", "v1.0.0", release_digest).await;
+    // Surviving sibling tag for the SAME ephemeral digest: its backing
+    // manifest artifact is live (not matched by the delete pattern), so the
+    // ephemeral digest stays reachable after the matched tag is pruned. This
+    // is what licenses the cascade to remove `build-snapshot-images`.
+    insert_oci_manifest_artifact(
+        &pool,
+        repo_id,
+        "myimg",
+        "release-alias",
+        ephemeral_digest,
+        100,
+    )
+    .await;
+    insert_oci_tag(&pool, repo_id, "myimg", "release-alias", ephemeral_digest).await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {
@@ -623,10 +688,18 @@ async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
         "release artifact must not be touched"
     );
 
-    // Regression assertion (the bug this PR fixes).
+    // Cascade prunes the matched tag because a surviving sibling
+    // (`release-alias`) still protects the same digest (#1407 reclamation,
+    // licensed by the #1682 guard).
     assert!(
         !oci_tag_exists(&pool, repo_id, "myimg", "build-snapshot-images").await,
-        "cascade should remove oci_tags row for soft-deleted manifest"
+        "cascade should remove the oci_tags row for the soft-deleted manifest \
+         when a surviving sibling tag still protects its digest"
+    );
+    // The surviving sibling for the same digest must remain.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "release-alias").await,
+        "surviving sibling tag protecting the same digest must remain"
     );
     // Sanity: the release tag is still alive.
     assert!(
@@ -637,7 +710,9 @@ async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
     cleanup(&pool, repo_id).await;
 }
 
-/// max_age_days policy soft-deletes by age; the cascade must also fire.
+/// max_age_days policy soft-deletes by age; the cascade then prunes the
+/// matched tag *only* because a surviving fresh sibling tag still protects
+/// the same digest (#1407 reclamation, constrained by the #1682 guard).
 #[tokio::test]
 #[ignore]
 async fn test_max_age_days_cascades_oci_tags() {
@@ -652,6 +727,12 @@ async fn test_max_age_days_cascades_oci_tags() {
     let old_id =
         insert_oci_manifest_artifact(&pool, repo_id, "myimg", "old", old_digest, 100).await;
     insert_oci_tag(&pool, repo_id, "myimg", "old", old_digest).await;
+
+    // Surviving fresh sibling tag for the SAME digest: not backdated, so the
+    // age policy leaves it live and it keeps the digest reachable, licensing
+    // the cascade to prune the aged `old` tag.
+    insert_oci_manifest_artifact(&pool, repo_id, "myimg", "fresh-alias", old_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "myimg", "fresh-alias", old_digest).await;
 
     // Backdate the artifact to look 10 days old.
     sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1")
@@ -678,7 +759,11 @@ async fn test_max_age_days_cascades_oci_tags() {
     assert!(is_deleted(&pool, old_id).await);
     assert!(
         !oci_tag_exists(&pool, repo_id, "myimg", "old").await,
-        "max_age_days must also cascade oci_tags"
+        "max_age_days must cascade the aged oci_tags row when a surviving sibling protects the digest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "fresh-alias").await,
+        "the fresh sibling tag protecting the same digest must survive"
     );
 
     cleanup(&pool, repo_id).await;
@@ -707,6 +792,13 @@ async fn test_cascade_respects_repo_scope() {
     insert_oci_tag(&pool, repo_a, "img", "snapshot-images", digest).await;
     insert_oci_tag(&pool, repo_b, "img", "snapshot-images", digest).await;
 
+    // Surviving sibling in repo_a for the same digest (does not match the
+    // `-images$` pattern), so repo_a's matched tag can be pruned without
+    // orphaning the digest. The guard correlates strictly on repository_id,
+    // so repo_b's same-digest tag does NOT count as a protector for repo_a.
+    insert_oci_manifest_artifact(&pool, repo_a, "img", "keep-alias", digest, 100).await;
+    insert_oci_tag(&pool, repo_a, "img", "keep-alias", digest).await;
+
     // Mark repo_b's artifact soft-deleted with no policy involvement.
     sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
         .bind(b_id)
@@ -732,7 +824,11 @@ async fn test_cascade_respects_repo_scope() {
     assert!(is_deleted(&pool, a_id).await);
     assert!(
         !oci_tag_exists(&pool, repo_a, "img", "snapshot-images").await,
-        "tag in repo_a must be cascaded"
+        "tag in repo_a must be cascaded (a surviving same-repo sibling protects the digest)"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_a, "img", "keep-alias").await,
+        "surviving sibling tag in repo_a must remain"
     );
     assert!(
         oci_tag_exists(&pool, repo_b, "img", "snapshot-images").await,
@@ -763,6 +859,11 @@ async fn test_cascade_handles_port_in_image_name() {
     let tag = "snapshot-keep-me";
     let id = insert_oci_manifest_artifact(&pool, repo_id, image, tag, digest, 100).await;
     insert_oci_tag(&pool, repo_id, image, tag, digest).await;
+    // Surviving sibling tag for the same digest (does not match the pattern)
+    // so the matched port-in-name tag can be pruned without orphaning the
+    // manifest — this is what lets us assert the path-based join fired.
+    insert_oci_manifest_artifact(&pool, repo_id, image, "alias", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, image, "alias", digest).await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {
@@ -791,6 +892,10 @@ async fn test_cascade_handles_port_in_image_name() {
     assert!(
         !oci_tag_exists(&pool, repo_id, image, tag).await,
         "cascade must remove the oci_tags row even when the image carries a host:port prefix"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, image, "alias").await,
+        "surviving sibling tag protecting the same digest must remain"
     );
 
     cleanup(&pool, repo_id).await;
@@ -822,6 +927,11 @@ async fn test_cascade_handles_digest_reference() {
     let reference = digest; // pinned-by-digest case
     let id = insert_oci_manifest_artifact(&pool, repo_id, image, reference, digest, 200).await;
     insert_oci_tag(&pool, repo_id, image, reference, digest).await;
+    // Surviving human-tag sibling for the same digest, not backdated, so the
+    // age policy leaves it live and the digest stays reachable — this lets us
+    // assert the path-based join fired on the digest-shaped reference.
+    insert_oci_manifest_artifact(&pool, repo_id, image, "stable", digest, 200).await;
+    insert_oci_tag(&pool, repo_id, image, "stable", digest).await;
 
     // Backdate the row and run a max_age_days policy: this matches by
     // age, not by name, so we exercise the cascade SQL without depending
@@ -851,10 +961,15 @@ async fn test_cascade_handles_digest_reference() {
 
     // This is the regression assertion: the old regex extracted
     // "imgwithdigest:sha256" from "imgwithdigest:sha256:6666..." and the
-    // join failed. With the path-based predicate it succeeds.
+    // join failed. With the path-based predicate it succeeds — and because a
+    // surviving sibling protects the digest, the matched tag is pruned.
     assert!(
         !oci_tag_exists(&pool, repo_id, image, reference).await,
         "cascade must remove oci_tags row when reference is a digest (sha256:...)"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, image, "stable").await,
+        "surviving sibling tag protecting the same digest must remain"
     );
 
     cleanup(&pool, repo_id).await;
@@ -890,6 +1005,11 @@ async fn test_execute_policy_reclaims_orphan_oci_tags() {
         .execute(&pool)
         .await
         .unwrap();
+    // Surviving sibling tag for the SAME digest (live backing artifact) so
+    // the stale orphan tag can be reclaimed without orphaning the manifest
+    // (#1682 guard requires a surviving protector before pruning).
+    insert_oci_manifest_artifact(&pool, repo_id, "img", "stable", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "stable", digest).await;
 
     // Run a real policy that won't match the stale artifact (it's
     // already deleted). The cascade still runs in its own transaction
@@ -930,10 +1050,16 @@ async fn test_execute_policy_reclaims_orphan_oci_tags() {
     assert_eq!(result.artifacts_removed, 0);
 
     // The cascade tx ran after the (no-op) soft-delete tx committed.
-    // The stale tag must be gone.
+    // The stale tag must be gone (a surviving sibling protects its digest).
     assert!(
         !oci_tag_exists(&pool, repo_id, "img", "stale").await,
-        "cascade must reclaim pre-existing stale tags from prior crashed runs"
+        "cascade must reclaim pre-existing stale tags from prior crashed runs \
+         when a surviving sibling still protects the digest"
+    );
+    // The surviving sibling for the same digest must remain.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "stable").await,
+        "surviving sibling tag protecting the same digest must remain"
     );
     // The live one must survive.
     assert!(
@@ -998,6 +1124,13 @@ async fn test_cascade_picks_up_orphans_from_prior_run() {
             .execute(&pool)
             .await
             .unwrap();
+        // A surviving sibling tag for the same digest (live backing
+        // artifact) so the orphan tag can be reclaimed without orphaning the
+        // manifest (#1682 guard requires a surviving protector before
+        // pruning). The sibling tag itself is not an orphan.
+        let alias = format!("{tag}-alias");
+        insert_oci_manifest_artifact(&pool, repo_id, image, &alias, digest, 100).await;
+        insert_oci_tag(&pool, repo_id, image, &alias, digest).await;
     }
 
     // Sanity: orphans exist before the recovery run.
@@ -1039,11 +1172,19 @@ async fn test_cascade_picks_up_orphans_from_prior_run() {
     );
 
     // Every orphan tag row must be gone — tx2's filter on
-    // `a.is_deleted = true` picked them up.
+    // `a.is_deleted = true` picked them up (each digest has a surviving
+    // sibling that keeps it reachable).
     for (image, tag, _) in &orphans {
         assert!(
             !oci_tag_exists(&pool, repo_id, image, tag).await,
             "orphan {}:{} must be reclaimed by the cascade sweep",
+            image,
+            tag
+        );
+        // The surviving sibling that protected the digest must remain.
+        assert!(
+            oci_tag_exists(&pool, repo_id, image, &format!("{tag}-alias")).await,
+            "surviving sibling {}:{}-alias must remain",
             image,
             tag
         );
@@ -1157,6 +1298,18 @@ async fn test_max_versions_cascades_oci_tags() {
         .await
         .expect("failed to align names for max_versions partition");
 
+    // Surviving sibling tags for the two doomed digests, each in its OWN
+    // single-member max_versions partition (distinct names, keep=1 keeps
+    // each), so the cascade may prune the rolling-1/rolling-2 tags without
+    // orphaning those digests (#1682 guard). Inserted AFTER the
+    // name-alignment UPDATE so they are not pulled into the `img:rolling`
+    // partition. The insert helper already writes a distinct name per row
+    // ("img:alias-old", "img:alias-mid"), so no rename is needed.
+    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-old", digest_old, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "alias-old", digest_old).await;
+    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-mid", digest_mid, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "alias-mid", digest_mid).await;
+
     // Backdate so created_at ordering is deterministic.
     sqlx::query(
         "UPDATE artifacts SET created_at = NOW() - INTERVAL '3 days' WHERE storage_key = $1",
@@ -1203,6 +1356,15 @@ async fn test_max_versions_cascades_oci_tags() {
         oci_tag_exists(&pool, repo_id, "img", "rolling-3").await,
         "the kept tag must survive the cascade"
     );
+    // The surviving sibling tags protecting digest_old / digest_mid remain.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "alias-old").await,
+        "surviving sibling protecting digest_old must remain"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "alias-mid").await,
+        "surviving sibling protecting digest_mid must remain"
+    );
 
     cleanup(&pool, repo_id).await;
 }
@@ -1235,6 +1397,12 @@ async fn test_no_downloads_days_cascades_oci_tags() {
         insert_oci_manifest_artifact(&pool, repo_id, "img", "warm", warm_digest, 100).await;
     insert_oci_tag(&pool, repo_id, "img", "cold", cold_digest).await;
     insert_oci_tag(&pool, repo_id, "img", "warm", warm_digest).await;
+    // Surviving sibling tag for the SAME cold digest, recently downloaded so
+    // the no_downloads_days policy leaves it live and the cold digest stays
+    // reachable — this licenses the cascade to prune the `cold` tag (#1682).
+    let cold_alias_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "cold-alias", cold_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "cold-alias", cold_digest).await;
 
     sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
         .bind(cold_id)
@@ -1246,7 +1414,13 @@ async fn test_no_downloads_days_cascades_oci_tags() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+        .bind(cold_alias_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     record_download_days_ago(&pool, warm_id, 1).await;
+    record_download_days_ago(&pool, cold_alias_id, 1).await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {
@@ -1268,7 +1442,12 @@ async fn test_no_downloads_days_cascades_oci_tags() {
 
     assert!(
         !oci_tag_exists(&pool, repo_id, "img", "cold").await,
-        "no_downloads_days cascade must remove oci_tags for the cold manifest"
+        "no_downloads_days cascade must remove oci_tags for the cold manifest \
+         when a surviving sibling protects its digest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "cold-alias").await,
+        "the surviving (downloaded) sibling protecting the cold digest must remain"
     );
     assert!(
         oci_tag_exists(&pool, repo_id, "img", "warm").await,
@@ -1302,6 +1481,12 @@ async fn test_tag_pattern_keep_cascades_oci_tags() {
         insert_oci_manifest_artifact(&pool, repo_id, "img", "nightly", snapshot_digest, 100).await;
     insert_oci_tag(&pool, repo_id, "img", "v1.0.0", release_digest).await;
     insert_oci_tag(&pool, repo_id, "img", "nightly", snapshot_digest).await;
+    // Surviving sibling tag for the SAME snapshot digest, with a semver-shaped
+    // name that the keep-pattern (`:v`) matches, so it is retained live and
+    // keeps the snapshot digest reachable — licensing the cascade to prune the
+    // evicted `nightly` tag (#1682).
+    insert_oci_manifest_artifact(&pool, repo_id, "img", "v0.0.0-snap", snapshot_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "img", "v0.0.0-snap", snapshot_digest).await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {
@@ -1326,7 +1511,12 @@ async fn test_tag_pattern_keep_cascades_oci_tags() {
 
     assert!(
         !oci_tag_exists(&pool, repo_id, "img", "nightly").await,
-        "tag_pattern_keep cascade must remove oci_tags for the non-matching (evicted) manifest"
+        "tag_pattern_keep cascade must remove oci_tags for the non-matching (evicted) manifest \
+         when a surviving sibling protects its digest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "v0.0.0-snap").await,
+        "the surviving semver-named sibling protecting the snapshot digest must remain"
     );
     assert!(
         oci_tag_exists(&pool, repo_id, "img", "v1.0.0").await,
@@ -1351,21 +1541,27 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
     let repo_id = create_test_repo(&pool, &format!("test-cascade-sq-{}", Uuid::new_v4())).await;
     let svc = LifecycleService::new(pool.clone());
 
-    // Two manifests of 100 bytes each, quota of 100 bytes -> evict one. The
-    // never-downloaded one goes first by LRU rules.
+    // Three 100-byte manifests, quota of 200 bytes -> evict the single
+    // never-downloaded one (evict-me) by LRU. evict-alias shares evict-me's
+    // digest but is recently downloaded, so it survives and keeps the digest
+    // reachable, licensing the cascade to prune the evict-me tag (#1682).
     let evict_digest = "sha256:1407dd00000000000000000000000000000000000000000000000000000001";
     let keep_digest = "sha256:1407dd00000000000000000000000000000000000000000000000000000002";
     let evict_id =
         insert_oci_manifest_artifact(&pool, repo_id, "img", "evict-me", evict_digest, 100).await;
     let keep_id =
         insert_oci_manifest_artifact(&pool, repo_id, "img", "keep-me", keep_digest, 100).await;
+    let evict_alias_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "img", "evict-alias", evict_digest, 100).await;
     insert_oci_tag(&pool, repo_id, "img", "evict-me", evict_digest).await;
     insert_oci_tag(&pool, repo_id, "img", "keep-me", keep_digest).await;
+    insert_oci_tag(&pool, repo_id, "img", "evict-alias", evict_digest).await;
 
-    // Mark keep-me as downloaded so it ranks ahead of evict-me in LRU
-    // ordering (NULLS FIRST puts never-downloaded artifacts at the front
-    // of the eviction queue).
+    // Mark keep-me and evict-alias as downloaded so they rank ahead of
+    // evict-me in LRU ordering (NULLS FIRST puts never-downloaded artifacts
+    // at the front of the eviction queue).
     record_download(&pool, keep_id, "2026-05-29T00:00:00Z").await;
+    record_download(&pool, evict_alias_id, "2026-05-29T00:00:00Z").await;
 
     let policy = svc
         .create_policy(CreatePolicyRequest {
@@ -1373,7 +1569,7 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
             name: "Tight quota".to_string(),
             description: None,
             policy_type: "size_quota_bytes".to_string(),
-            config: serde_json::json!({"quota_bytes": 100}),
+            config: serde_json::json!({"quota_bytes": 200}),
             priority: None,
             cron_schedule: None,
         })
@@ -1384,10 +1580,16 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
     assert_eq!(result.artifacts_removed, 1);
     assert!(is_deleted(&pool, evict_id).await);
     assert!(!is_deleted(&pool, keep_id).await);
+    assert!(!is_deleted(&pool, evict_alias_id).await);
 
     assert!(
         !oci_tag_exists(&pool, repo_id, "img", "evict-me").await,
-        "size_quota_bytes cascade must remove oci_tags for the LRU-evicted manifest"
+        "size_quota_bytes cascade must remove oci_tags for the LRU-evicted manifest \
+         when a surviving sibling protects its digest"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "img", "evict-alias").await,
+        "the surviving (downloaded) sibling protecting the evicted digest must remain"
     );
     assert!(
         oci_tag_exists(&pool, repo_id, "img", "keep-me").await,
@@ -1397,20 +1599,24 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
     cleanup_with_downloads(&pool, repo_id).await;
 }
 
-/// End-to-end check of the chain the issue describes:
-///   lifecycle policy -> soft-delete artifact -> cascade oci_tags ->
-///   storage GC's orphan predicate recognises the storage key as orphan.
+/// End-to-end check that a retention sweep does NOT orphan a live image
+/// when it soft-deletes the manifest artifact whose tag is the *sole*
+/// reference keeping it reachable (#1682). This supersedes the original
+/// #1407 sole-tag expectation (cascade reclaims the lone tag): #1682
+/// establishes that retention must never be the cause of orphaning. The
+/// cascade only prunes a tag when a surviving sibling still protects the
+/// same digest; explicit `DELETE /v2/<image>/manifests/<ref>` remains the
+/// path that intentionally removes the last reference.
 ///
 /// We don't invoke the real `StorageGcService::run_gc` (it requires a
 /// `StorageRegistry` and would touch real storage backends). Instead we
 /// re-execute the exact orphan predicate from
 /// `backend/src/services/storage_gc_service.rs` (the `ORPHAN_PREDICATE_SQL`
-/// constant) against the database state the cascade leaves behind. If the
-/// cascade ever regresses (or someone weakens the join), this assertion
-/// catches it because the predicate counts the manifest as still-referenced
-/// by `oci_tags` and the test fails. Per-key assertions only — no global
-/// counter, so the test stays safe under parallel coverage runs (the
-/// pattern from #1499).
+/// constant) against the database state the cascade leaves behind. With the
+/// last-protecting-tag guard the sole `oci_tags` row survives, so the
+/// predicate must NOT mark the storage_key as orphan. Per-key assertions
+/// only — no global counter, so the test stays safe under parallel coverage
+/// runs (the pattern from #1499).
 #[tokio::test]
 #[ignore]
 async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
@@ -1430,44 +1636,9 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
     // (storage_key, repository_id) tuple. This mirrors the NOT EXISTS chain
     // in storage_gc_service.rs::ORPHAN_PREDICATE_SQL. We deliberately scope
     // to a single (key, repo) tuple so the parallel test isolation issue
-    // fixed in #1499 cannot affect this assertion.
-    async fn is_storage_key_orphan(pool: &PgPool, repo_id: Uuid, storage_key: &str) -> bool {
-        let row: (i64,) = sqlx::query_as(
-            r#"
-            SELECT COUNT(*)
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.storage_key = $1
-              AND a.repository_id = $2
-              AND a.is_deleted = true
-              AND NOT EXISTS (
-                  SELECT 1 FROM artifacts a2
-                  WHERE a2.storage_key = a.storage_key
-                    AND a2.is_deleted = false
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM oci_tags ot
-                  JOIN repositories otr ON otr.id = ot.repository_id
-                  WHERE a.storage_key LIKE 'oci-manifests/%'
-                    AND ot.manifest_digest = SUBSTRING(
-                      a.storage_key FROM LENGTH('oci-manifests/') + 1
-                    )
-                    AND otr.storage_backend = r.storage_backend
-                    AND (
-                      r.storage_backend <> 'filesystem'
-                      OR otr.storage_path = r.storage_path
-                    )
-              )
-            "#,
-        )
-        .bind(storage_key)
-        .bind(repo_id)
-        .fetch_one(pool)
-        .await
-        .expect("orphan predicate query failed");
-        row.0 > 0
-    }
+    // fixed in #1499 cannot affect this assertion. The predicate lives in
+    // the module-level `is_storage_key_orphan` helper so the #1682 retention
+    // tests can reuse the exact same orphan-detection SQL.
 
     // Backdate so a max_age_days policy will pick it up.
     sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
@@ -1502,16 +1673,210 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
     assert_eq!(result.artifacts_removed, 1);
     assert!(is_deleted(&pool, id).await);
 
-    // The cascade reclaimed the oci_tags row. Now the orphan predicate
-    // should fire — exactly the chain the issue says was broken.
+    // #1682: the cascade must NOT remove the sole oci_tags row — doing so
+    // would orphan the live image. The tag is the last reference keeping
+    // the manifest reachable, so the last-protecting-tag guard retains it.
     assert!(
-        !oci_tag_exists(&pool, repo_id, "img", "drop-me").await,
-        "cascade must have removed the oci_tags row"
+        oci_tag_exists(&pool, repo_id, "img", "drop-me").await,
+        "cascade must RETAIN the sole oci_tags row protecting the manifest (#1682)"
+    );
+    // Because the tag survives, storage GC's orphan predicate must still
+    // consider the manifest reachable — no silent data loss.
+    assert!(
+        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "post-cascade: the manifest storage_key must NOT be reclaimable while its \
+         sole protecting tag survives (#1682 — retention must not orphan a live image)"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// =============================================================================
+// #1682 — retention must not delete the sole oci_tags row protecting a live
+// image. The cascade hard-deletes oci_tags rows for soft-deleted manifest
+// artifacts; without a reachability guard, deleting the LAST tag protecting a
+// (repository_id, manifest_digest) flips the manifest into storage GC's orphan
+// set and reclaims it (silent data loss). The last-protecting-tag guard in
+// CASCADE_OCI_TAGS_SQL prunes a tag only when a SURVIVING sibling tag (same
+// repo+digest, not itself being pruned) still keeps the digest reachable.
+// =============================================================================
+
+/// EXPLOIT BLOCKED (sole-tag, N=1): one tag + its soft-deleted backing
+/// manifest artifact. The cascade must RETAIN the row (it is the sole
+/// protector), and the GC orphan predicate must remain false for the digest.
+#[tokio::test]
+#[ignore]
+async fn cascade_retains_sole_protecting_oci_tag() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-1682-sole-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let digest = "sha256:16820000000000000000000000000000000000000000000000000000000000a1";
+    let storage_key = format!("oci-manifests/{}", digest);
+    let id = insert_oci_manifest_artifact(&pool, repo_id, "app", "prod", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "app", "prod", digest).await;
+
+    // A retention rule whose regex matches the manifest artifact's name
+    // ("app:prod"): tx1 soft-deletes the manifest row, tx2 runs the cascade.
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Prune prod".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": ":prod$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(
+        result.artifacts_removed, 1,
+        "the matched manifest is soft-deleted"
+    );
+    assert!(is_deleted(&pool, id).await);
+
+    // The sole protecting tag must survive — otherwise the image is orphaned.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "app", "prod").await,
+        "cascade must RETAIN the sole oci_tags row protecting the manifest (#1682)"
+    );
+    // GC must not consider the manifest reclaimable while its tag survives.
+    assert!(
+        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "manifest must stay reachable for storage GC while its sole tag survives (#1682)"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// LEGIT STILL WORKS (redundant tag prunes): two tags for one digest, the
+/// doomed tag's backing artifact soft-deleted, the sibling's backing artifact
+/// live. The cascade must remove the doomed tag and keep the live-backed
+/// sibling; the manifest stays reachable.
+#[tokio::test]
+#[ignore]
+async fn cascade_prunes_redundant_tag_when_sibling_survives() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-1682-redundant-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let digest = "sha256:16820000000000000000000000000000000000000000000000000000000000b2";
+    let storage_key = format!("oci-manifests/{}", digest);
+    // Two tags, same digest. `stale` is pruned; `keep` is the live sibling.
+    let stale_id = insert_oci_manifest_artifact(&pool, repo_id, "app", "stale", digest, 100).await;
+    insert_oci_manifest_artifact(&pool, repo_id, "app", "keep", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "app", "stale", digest).await;
+    insert_oci_tag(&pool, repo_id, "app", "keep", digest).await;
+
+    // A prune rule matching only "stale": tx1 soft-deletes the `stale`
+    // manifest row (the `keep` row stays live), tx2 runs the cascade.
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Prune stale".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": ":stale$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(
+        result.artifacts_removed, 1,
+        "only the stale manifest is soft-deleted"
+    );
+    assert!(is_deleted(&pool, stale_id).await);
+
+    // The redundant tag is pruned; the live-backed sibling survives.
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "app", "stale").await,
+        "redundant tag must be pruned when a surviving sibling protects the digest (#1682)"
     );
     assert!(
-        is_storage_key_orphan(&pool, repo_id, &storage_key).await,
-        "post-cascade: storage GC's orphan predicate must now recognise the manifest \
-         storage_key as reclaimable (this is the issue #1407 promise)"
+        oci_tag_exists(&pool, repo_id, "app", "keep").await,
+        "the live-backed sibling tag must survive"
+    );
+    // The live sibling artifact keeps the manifest reachable.
+    assert!(
+        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "manifest must stay reachable while the live sibling tag survives"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// MULTI-TAG VARIANT (what Option A buys over the naive Option B): two tags
+/// for one digest, BOTH backing artifacts soft-deleted by the same sweep.
+/// Neither has a surviving protector, so BOTH oci_tags rows must be RETAINED
+/// (the sole-tag bug is the N=1 case of "all protecting tags pruned at once").
+#[tokio::test]
+#[ignore]
+async fn cascade_retains_all_when_every_protecting_tag_pruned() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-1682-allpruned-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let digest = "sha256:16820000000000000000000000000000000000000000000000000000000000c3";
+    let storage_key = format!("oci-manifests/{}", digest);
+    // Two tags for one digest, both matched by the same sweep.
+    let a_id = insert_oci_manifest_artifact(&pool, repo_id, "app", "prod", digest, 100).await;
+    let b_id = insert_oci_manifest_artifact(&pool, repo_id, "app", "prod-old", digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "app", "prod", digest).await;
+    insert_oci_tag(&pool, repo_id, "app", "prod-old", digest).await;
+
+    // A prune rule whose regex matches BOTH tags' artifact names
+    // ("app:prod", "app:prod-old"): tx1 soft-deletes both manifest rows,
+    // tx2 runs the cascade.
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Prune all prod".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": ":prod"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(
+        result.artifacts_removed, 2,
+        "both prod manifests are soft-deleted"
+    );
+    assert!(is_deleted(&pool, a_id).await);
+    assert!(is_deleted(&pool, b_id).await);
+
+    // A naive any-other-row guard (Option B) would delete BOTH (each sees the
+    // other as a protector). Option A's self-aware guard retains BOTH.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "app", "prod").await,
+        "all protecting tags pruned at once must be RETAINED (#1682 multi-tag variant)"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "app", "prod-old").await,
+        "all protecting tags pruned at once must be RETAINED (#1682 multi-tag variant)"
+    );
+    // The manifest must remain reachable — no orphaning.
+    assert!(
+        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "manifest must stay reachable when every protecting tag is retained (#1682)"
     );
 
     cleanup(&pool, repo_id).await;

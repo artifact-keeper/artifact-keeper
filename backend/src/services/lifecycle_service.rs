@@ -50,6 +50,34 @@ use crate::services::scheduler_service::normalize_cron_expression;
 /// extracting a shared constant. The path-based predicate is the primary
 /// join key, the storage_key predicate is a secondary integrity check
 /// that protects against artifact-name/path drift.
+///
+/// **Last-protecting-tag guard (#1682).** A retention sweep is not an
+/// explicit user delete: it must never be the thing that orphans a live
+/// image. The storage GC orphan predicate
+/// (`storage_gc_service.rs` `ORPHAN_PREDICATE_SQL`) treats a manifest as
+/// reachable while *any* `oci_tags` row carries its `manifest_digest`. So
+/// if the cascade deletes the *last* `oci_tags` row protecting a
+/// `(repository_id, manifest_digest)`, the manifest flips into the GC
+/// orphan set and its blobs are reclaimed — silent data loss.
+///
+/// The guard therefore prunes an `oci_tags` row only when a **surviving
+/// sibling** row keeps the same `(repository_id, manifest_digest)`
+/// reachable after this sweep — i.e. another `oci_tags` row for the same
+/// repo+digest, with a different `id`, that is NOT itself being pruned
+/// (its backing manifest artifact is not soft-deleted under the same
+/// join shape). The inner `NOT EXISTS` must be self-aware: the sole-tag
+/// bug is just the `N=1` case of "all protecting tags pruned at once", so
+/// a naive any-other-row check would let two doomed tags for one digest
+/// each treat the other as a protector and delete both, re-orphaning the
+/// image. With the surviving-sibling guard, when every tag for a digest
+/// matches a single sweep none of them satisfy the `EXISTS`, so all are
+/// retained and the image stays reachable.
+///
+/// This is a pure WHERE-tightening: it deletes strictly fewer rows than
+/// before (never anything previously retained), so no migration is
+/// needed. Explicit `DELETE /v2/<image>/manifests/<ref>` is unchanged and
+/// still removes the sole tag intentionally; GC's index-child clause still
+/// governs per-arch children of live indexes.
 const CASCADE_OCI_TAGS_SQL: &str = r#"
 DELETE FROM oci_tags ot
 USING artifacts a
@@ -59,6 +87,27 @@ WHERE a.is_deleted = true
   AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
   AND a.version = ot.tag
   AND ($1::UUID IS NULL OR a.repository_id = $1)
+  -- #1682: never delete the sole oci_tags row protecting a live manifest.
+  -- Only prune this tag if SOME OTHER oci_tags row keeps the same
+  -- (repository_id, manifest_digest) reachable after this sweep — i.e. a
+  -- sibling tag that is NOT itself being soft-deleted/pruned. A sibling is
+  -- "surviving" when no soft-deleted manifest artifact joins to it.
+  AND EXISTS (
+      SELECT 1
+      FROM oci_tags keep
+      WHERE keep.repository_id = ot.repository_id
+        AND keep.manifest_digest = ot.manifest_digest
+        AND keep.id <> ot.id
+        AND NOT EXISTS (
+            SELECT 1
+            FROM artifacts ka
+            WHERE ka.is_deleted = true
+              AND ka.repository_id = keep.repository_id
+              AND ka.storage_key = 'oci-manifests/' || keep.manifest_digest
+              AND ka.path = 'v2/' || keep.name || '/manifests/' || keep.tag
+              AND ka.version = keep.tag
+        )
+  )
 "#;
 
 /// Scope of a lifecycle policy execution: either a specific repository or
@@ -662,9 +711,11 @@ impl LifecycleService {
         Ok(removed)
     }
 
-    /// Execute all enabled policies (called by scheduled background task).
-    pub async fn execute_all_enabled(&self) -> Result<Vec<PolicyExecutionResult>> {
-        let policies = sqlx::query_as::<_, LifecyclePolicy>(
+    /// Load every enabled policy, highest priority first. Shared by the
+    /// scheduled `execute_all_enabled` and the cron-aware `execute_due_policies`
+    /// entry points so the selection query lives in one place.
+    async fn load_enabled_policies(&self) -> Result<Vec<LifecyclePolicy>> {
+        sqlx::query_as::<_, LifecyclePolicy>(
             r#"
             SELECT id, repository_id, name, description, enabled,
                    policy_type, config, priority, last_run_at,
@@ -676,29 +727,45 @@ impl LifecycleService {
         )
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Run one policy and fold the outcome into `results`, converting an error
+    /// into a failed `PolicyExecutionResult` (logged) rather than aborting the
+    /// whole batch. Shared by both scheduled entry points.
+    async fn run_policy_into(
+        &self,
+        policy: LifecyclePolicy,
+        results: &mut Vec<PolicyExecutionResult>,
+    ) {
+        match self.execute_policy(policy.id, false).await {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to execute lifecycle policy '{}': {}",
+                    policy.name,
+                    e
+                );
+                results.push(PolicyExecutionResult {
+                    policy_id: policy.id,
+                    policy_name: policy.name,
+                    dry_run: false,
+                    artifacts_matched: 0,
+                    artifacts_removed: 0,
+                    bytes_freed: 0,
+                    errors: vec![e.to_string()],
+                });
+            }
+        }
+    }
+
+    /// Execute all enabled policies (called by scheduled background task).
+    pub async fn execute_all_enabled(&self) -> Result<Vec<PolicyExecutionResult>> {
+        let policies = self.load_enabled_policies().await?;
 
         let mut results = Vec::new();
         for policy in policies {
-            match self.execute_policy(policy.id, false).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to execute lifecycle policy '{}': {}",
-                        policy.name,
-                        e
-                    );
-                    results.push(PolicyExecutionResult {
-                        policy_id: policy.id,
-                        policy_name: policy.name,
-                        dry_run: false,
-                        artifacts_matched: 0,
-                        artifacts_removed: 0,
-                        bytes_freed: 0,
-                        errors: vec![e.to_string()],
-                    });
-                }
-            }
+            self.run_policy_into(policy, &mut results).await;
         }
 
         Ok(results)
@@ -707,19 +774,7 @@ impl LifecycleService {
     /// Execute only those enabled policies that are currently due, based on each
     /// policy's `cron_schedule` (or a default 6-hour cadence when unset).
     pub async fn execute_due_policies(&self) -> Result<Vec<PolicyExecutionResult>> {
-        let policies = sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            SELECT id, repository_id, name, description, enabled,
-                   policy_type, config, priority, last_run_at,
-                   last_run_items_removed, cron_schedule, created_at, updated_at
-            FROM lifecycle_policies
-            WHERE enabled = true
-            ORDER BY priority DESC
-            "#,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let policies = self.load_enabled_policies().await?;
 
         let now = Utc::now();
         let default_cadence = chrono::Duration::hours(6);
@@ -737,25 +792,7 @@ impl LifecycleService {
                 continue;
             }
 
-            match self.execute_policy(policy.id, false).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to execute lifecycle policy '{}': {}",
-                        policy.name,
-                        e
-                    );
-                    results.push(PolicyExecutionResult {
-                        policy_id: policy.id,
-                        policy_name: policy.name,
-                        dry_run: false,
-                        artifacts_matched: 0,
-                        artifacts_removed: 0,
-                        bytes_freed: 0,
-                        errors: vec![e.to_string()],
-                    });
-                }
-            }
+            self.run_policy_into(policy, &mut results).await;
         }
 
         Ok(results)
@@ -1048,50 +1085,9 @@ impl LifecycleService {
     ) -> Result<PolicyExecutionResult> {
         let pattern =
             parse_pattern_field(&policy.config, PolicyType::TagPatternKeep.as_wire_str())?;
-
-        let repo_filter = policy.repository_id;
-
-        // Inverse of tag_pattern_delete: find artifacts that do NOT match the pattern
-        let matched = sqlx::query_as::<_, CountBytes>(
-            r#"
-            SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
-            FROM artifacts a
-            WHERE a.is_deleted = false
-              AND ($1::UUID IS NULL OR a.repository_id = $1)
-              AND a.name !~ $2
-            "#,
-        )
-        .bind(repo_filter)
-        .bind(&pattern)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let mut removed = 0i64;
-        if !dry_run && matched.count > 0 {
-            let result = sqlx::query(
-                r#"
-                UPDATE artifacts SET is_deleted = true
-                WHERE is_deleted = false
-                  AND ($1::UUID IS NULL OR repository_id = $1)
-                  AND name !~ $2
-                "#,
-            )
-            .bind(repo_filter)
-            .bind(&pattern)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            removed = result.rows_affected() as i64;
-        }
-
-        Ok(Self::build_execution_result(
-            policy,
-            dry_run,
-            matched.count,
-            removed,
-            matched.bytes,
-        ))
+        // Inverse of tag_pattern_delete: soft-delete artifacts that do NOT
+        // match the pattern (operator `!~`).
+        Self::execute_tag_pattern(conn, policy, dry_run, &pattern, "!~").await
     }
 
     async fn execute_tag_pattern_delete(
@@ -1101,36 +1097,51 @@ impl LifecycleService {
     ) -> Result<PolicyExecutionResult> {
         let pattern =
             parse_pattern_field(&policy.config, PolicyType::TagPatternDelete.as_wire_str())?;
+        // Soft-delete artifacts that DO match the pattern (operator `~`).
+        Self::execute_tag_pattern(conn, policy, dry_run, &pattern, "~").await
+    }
 
+    /// Shared body for the two regex-pattern policies. `op` is the Postgres
+    /// regex operator: `~` (tag_pattern_delete: remove matches) or `!~`
+    /// (tag_pattern_keep: remove non-matches). The operator is a fixed literal
+    /// chosen by the caller (never user input), so interpolating it into the
+    /// SQL text is safe; the pattern itself is always a bound parameter.
+    async fn execute_tag_pattern(
+        conn: &mut sqlx::PgConnection,
+        policy: &LifecyclePolicy,
+        dry_run: bool,
+        pattern: &str,
+        op: &str,
+    ) -> Result<PolicyExecutionResult> {
         let repo_filter = policy.repository_id;
 
-        let matched = sqlx::query_as::<_, CountBytes>(
+        let matched = sqlx::query_as::<_, CountBytes>(&format!(
             r#"
             SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
             FROM artifacts a
             WHERE a.is_deleted = false
               AND ($1::UUID IS NULL OR a.repository_id = $1)
-              AND a.name ~ $2
-            "#,
-        )
+              AND a.name {op} $2
+            "#
+        ))
         .bind(repo_filter)
-        .bind(&pattern)
+        .bind(pattern)
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
-            let result = sqlx::query(
+            let result = sqlx::query(&format!(
                 r#"
                 UPDATE artifacts SET is_deleted = true
                 WHERE is_deleted = false
                   AND ($1::UUID IS NULL OR repository_id = $1)
-                  AND name ~ $2
-                "#,
-            )
+                  AND name {op} $2
+                "#
+            ))
             .bind(repo_filter)
-            .bind(&pattern)
+            .bind(pattern)
             .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2695,6 +2706,43 @@ mod tests {
         );
         assert!(CASCADE_OCI_TAGS_SQL.contains("a.version = ot.tag"));
         assert!(CASCADE_OCI_TAGS_SQL.contains("$1::UUID IS NULL OR a.repository_id = $1"));
+    }
+
+    #[test]
+    fn test_cascade_sql_has_last_protecting_tag_guard() {
+        // #1682: a tag may only be pruned when a SURVIVING sibling oci_tags
+        // row (same repo+digest, different id, NOT itself being pruned) still
+        // protects the manifest. The guard is an EXISTS over `oci_tags keep`
+        // with a self-aware inner NOT EXISTS on soft-deleted backing
+        // artifacts. Drifting any of these reopens the data-loss bug.
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("FROM oci_tags keep"),
+            "missing surviving-sibling EXISTS subquery (#1682 guard)"
+        );
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("keep.repository_id = ot.repository_id"),
+            "sibling guard must correlate on repository_id (per-repo scoping)"
+        );
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("keep.manifest_digest = ot.manifest_digest"),
+            "sibling guard must correlate on manifest_digest (reachability key)"
+        );
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("keep.id <> ot.id"),
+            "sibling guard must exclude the row being pruned"
+        );
+        // The self-aware inner NOT EXISTS (Option A over Option B): a sibling
+        // counts as a protector only if its backing manifest artifact is NOT
+        // itself soft-deleted. Without this, two doomed tags for one digest
+        // each treat the other as a protector and both get deleted.
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("FROM artifacts ka"),
+            "sibling guard must verify the sibling's backing artifact is not soft-deleted (#1682 Option A)"
+        );
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("ka.is_deleted = true"),
+            "inner NOT EXISTS must key on a soft-deleted backing artifact"
+        );
     }
 
     // The cascade now runs inside the execute_policy transaction (no
