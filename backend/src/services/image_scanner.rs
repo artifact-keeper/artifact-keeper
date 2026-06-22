@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, ScanOutput, Scanner, VersionCache,
+    cached_trivy_cli_version, ScanOutput, ScanTarget, Scanner, VersionCache,
 };
 
 #[cfg(test)]
@@ -128,6 +128,33 @@ impl ImageScanner {
             crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
         Some(crate::services::scanner_service::join_oci_image_ref(
             name, reference,
+        ))
+    }
+
+    /// Build the fully-qualified `<host>/<repo_key>/<name><sep><reference>`
+    /// image ref that `trivy image` must pull from Artifact Keeper's own
+    /// registry (#1964).
+    ///
+    /// The bare `<name>:<tag>` produced by [`extract_image_ref`] resolves
+    /// against Docker Hub, which silently returns 0 findings for internal-only
+    /// images (a false-clean) or scans an unrelated public image that happens
+    /// to share the name. Stored OCI artifact paths intentionally omit the
+    /// repository key (`v2/<image>/manifests/<reference>`), while the external
+    /// Artifact Keeper route is `/v2/<repo_key>/<image>/manifests/<reference>`,
+    /// so the owning repository key from scanner orchestration is prepended.
+    ///
+    /// Mirrors `GrypeScanner::build_registry_image_ref_for_repo` and shares its
+    /// host resolver so both scanners target the same registry endpoint.
+    /// `<sep>` is `:` for tags and `@` for digest references via
+    /// `join_oci_image_ref`.
+    fn extract_image_ref_for_repo(artifact: &Artifact, repository_key: &str) -> Option<String> {
+        let (name, reference) =
+            crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+        let host = crate::services::grype_scanner::resolve_registry_host();
+        let qualified_name = format!("{}/{}/{}", host, repository_key, name);
+        Some(crate::services::scanner_service::join_oci_image_ref(
+            &qualified_name,
+            reference,
         ))
     }
 
@@ -297,6 +324,43 @@ impl ImageScanner {
     pub(crate) fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
         convert_trivy_findings(report, "trivy")
     }
+
+    /// Run a Trivy image scan against an already-built image ref. Shared by
+    /// the legacy [`Scanner::scan`] path (bare ref) and the repository-aware
+    /// [`Scanner::scan_target`] path (registry-qualified ref) so health
+    /// checking, invocation, and reporting behave identically regardless of
+    /// how the ref was constructed.
+    async fn scan_image_ref(&self, image_ref: &str) -> Result<ScanOutput> {
+        // Check if Trivy server is healthy. If it is not reachable we must
+        // surface an error so the scan record is marked FAILED. Returning
+        // Ok(vec![]) here would silently mark the scan COMPLETED with zero
+        // findings even though no scanning ever happened (issue #888).
+        if let Err(e) = self.check_trivy_health().await {
+            return Err(AppError::BadGateway(format!(
+                "Trivy image scan failed for {}: {}",
+                image_ref, e
+            )));
+        }
+
+        info!("Starting Trivy scan for image: {}", image_ref);
+
+        let report = self.scan_with_trivy(image_ref).await?;
+        // Source label is intentionally "trivy" (not "trivy-image") to
+        // preserve back-compat with dashboards / filters that group
+        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
+        // the same string. Changing it here would silently drop
+        // existing image-scanner rows from any operator filter.
+        let output = ScanOutput::from_trivy_report(&report, "trivy");
+
+        info!(
+            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
+            image_ref,
+            output.findings.len(),
+            output.packages.len()
+        );
+
+        Ok(output)
+    }
 }
 
 #[async_trait]
@@ -352,35 +416,40 @@ impl Scanner for ImageScanner {
             }
         };
 
-        // Check if Trivy server is healthy. If it is not reachable we must
-        // surface an error so the scan record is marked FAILED. Returning
-        // Ok(vec![]) here would silently mark the scan COMPLETED with zero
-        // findings even though no scanning ever happened (issue #888).
-        if let Err(e) = self.check_trivy_health().await {
-            return Err(AppError::BadGateway(format!(
-                "Trivy image scan failed for {}: {}",
-                image_ref, e
-            )));
-        }
+        self.scan_image_ref(&image_ref).await
+    }
 
-        info!("Starting Trivy scan for image: {}", image_ref);
-
-        let report = self.scan_with_trivy(&image_ref).await?;
-        // Source label is intentionally "trivy" (not "trivy-image") to
-        // preserve back-compat with dashboards / filters that group
-        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
-        // the same string. Changing it here would silently drop
-        // existing image-scanner rows from any operator filter.
-        let output = ScanOutput::from_trivy_report(&report, "trivy");
-
-        info!(
-            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
-            image_ref,
-            output.findings.len(),
-            output.packages.len()
+    /// Repository-aware scan entrypoint. The orchestrator calls this with the
+    /// owning repository routing key so the Trivy target is qualified with
+    /// Artifact Keeper's own registry host and repo key
+    /// (`<host>/<repo_key>/<name>:<ref>`) instead of the bare `<name>:<tag>`
+    /// the trait-default `scan_target` would inherit. That bare ref resolves
+    /// against Docker Hub, producing a silent false-clean for internal-only
+    /// images and scanning the wrong image when names collide (#1964). This
+    /// mirrors `GrypeScanner::scan_target`.
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        _metadata: Option<&ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> Result<ScanOutput> {
+        let artifact = target.artifact;
+        debug_assert!(
+            Self::is_container_image(artifact),
+            "ImageScanner::scan_target called on a non-container artifact; the orchestrator must gate on is_applicable first"
         );
 
-        Ok(output)
+        let image_ref = match Self::extract_image_ref_for_repo(artifact, target.repository_key) {
+            Some(r) => r,
+            None => {
+                return Err(AppError::Internal(format!(
+                    "Could not extract repository-qualified image reference from artifact path: {}",
+                    artifact.path
+                )));
+            }
+        };
+
+        self.scan_image_ref(&image_ref).await
     }
 }
 
@@ -477,6 +546,70 @@ mod tests {
     fn test_extract_image_ref_invalid_path() {
         let artifact = make_test_artifact("some/random/path", "application/json");
         assert_eq!(ImageScanner::extract_image_ref(&artifact), None);
+    }
+
+    /// Regression test for issue #1964. The repository-aware ref builder must
+    /// prepend the registry host AND the owning repository key so `trivy
+    /// image` pulls the stored artifact from Artifact Keeper instead of
+    /// resolving the bare `<name>:<tag>` against Docker Hub (a silent
+    /// false-clean for internal-only images). The stored path omits the repo
+    /// key, so it is supplied by scanner orchestration.
+    #[test]
+    fn test_extract_image_ref_for_repo_prepends_host_and_repo_key() {
+        let artifact = make_test_artifact(
+            "v2/myapp/manifests/v1.0.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        let bare = ImageScanner::extract_image_ref(&artifact).unwrap();
+        assert_eq!(bare, "myapp:v1.0.0", "sanity: bare ref is unqualified");
+
+        let qualified =
+            ImageScanner::extract_image_ref_for_repo(&artifact, "docker-local").unwrap();
+        assert_ne!(
+            qualified, bare,
+            "repository-qualified ref must not equal the Docker Hub-resolving bare ref"
+        );
+        // Host is env-dependent (defaults to localhost:8080), so assert on the
+        // structural suffix rather than the exact host.
+        assert!(
+            qualified.ends_with("/docker-local/myapp:v1.0.0"),
+            "qualified ref must contain <repo_key>/<name>:<tag>, got {}",
+            qualified
+        );
+        assert!(
+            !qualified.starts_with("docker-local/"),
+            "qualified ref must be prefixed with a registry host, got {}",
+            qualified
+        );
+    }
+
+    /// Digest-pinned manifests must use the `name@sha256:...` separator in the
+    /// repository-qualified ref too (the #1483 separator rule), otherwise the
+    /// Trivy CLI rejects the reference. A `docker buildx push` produces digest
+    /// manifests for every platform, so this is the common case.
+    #[test]
+    fn test_extract_image_ref_for_repo_digest_uses_at_separator() {
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        let qualified = ImageScanner::extract_image_ref_for_repo(&artifact, "oci-prod").unwrap();
+        assert!(
+            qualified.ends_with(
+                "/oci-prod/org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+            ),
+            "digest refs must use '@' and keep the repo key, got {}",
+            qualified
+        );
+    }
+
+    #[test]
+    fn test_extract_image_ref_for_repo_rejects_malformed_path() {
+        let artifact = make_test_artifact("some/random/path", "application/json");
+        assert_eq!(
+            ImageScanner::extract_image_ref_for_repo(&artifact, "docker-local"),
+            None
+        );
     }
 
     #[test]
