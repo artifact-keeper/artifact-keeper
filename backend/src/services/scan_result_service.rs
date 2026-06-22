@@ -58,6 +58,21 @@ pub fn clamp_stuck_scan_reap_limit(value: i64) -> i64 {
 /// than the user-input `details(...)` path.
 const STUCK_SCAN_AUDIT_ACTOR: &str = "system:stuck_scan_janitor";
 
+/// Stable 32-bit hash of a scan_type string, used as the second key of the
+/// per-`(artifact_id, scan_type)` advisory lock in
+/// [`ScanResultService::prepare_scan_placeholder`] (#1935). Deterministic
+/// across processes (FNV-1a, not `DefaultHasher` which is randomized), so
+/// concurrent backend replicas hash the same scan_type to the same key.
+pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
+    // 32-bit FNV-1a.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in scan_type.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash as i32
+}
+
 /// Postgres advisory-lock key for the stuck-scan janitor (PR #1212 audit,
 /// finding H3). The janitor takes `pg_try_advisory_lock(STUCK_SCAN_LOCK_ID)`
 /// for the duration of one sweep so only one replica fires per tick;
@@ -696,6 +711,152 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
+    }
+
+    /// Atomically resolve the placeholder row for one scanner of one
+    /// artifact, returning the scan_result id to surface to the caller and
+    /// whether that id is a freshly-inserted placeholder.
+    ///
+    /// This closes the check-then-act race in the #1373 short-circuit
+    /// (#1935): the old `prepare_artifact_scan` loop did a bare SELECT
+    /// (`find_existing_scan_for_artifact`) followed by a separate INSERT
+    /// (`create_scan_result_with_checksum`). With no lock, no constraint and
+    /// no transaction, N concurrent triggers on the same fresh artifact all
+    /// observed "no completed row" and each inserted its own `running`
+    /// placeholder, so every trigger ran a full redundant scan and the
+    /// artifact ended with N completed rows for one logical scan.
+    ///
+    /// Here the whole decide-then-insert is serialized per
+    /// `(artifact_id, scan_type)` with a transaction-scoped advisory lock
+    /// (`pg_advisory_xact_lock`, auto-released on commit/rollback) and run
+    /// inside a single transaction. Holding the lock we:
+    ///
+    /// 1. Re-check for a reusable *completed* row (the #1373 happy path) —
+    ///    short-circuit to its id with `inserted = false`.
+    /// 2. Otherwise re-check for an in-flight (`running`) placeholder for the
+    ///    same artifact + bytes + scan_type. The lock guarantees we now see
+    ///    any placeholder a racing prepare already committed, so we reuse its
+    ///    id (`inserted = false`) instead of adding a duplicate.
+    /// 3. Otherwise insert a fresh `running` placeholder and return its id
+    ///    with `inserted = true`.
+    ///
+    /// Uses unchecked `sqlx::query`/`query_as` (mirroring the advisory-lock
+    /// pattern in `main.rs`) so no new compile-time-verified query is added
+    /// and offline `cargo sqlx prepare` is not required.
+    ///
+    /// Returns `(scan_result_id, inserted)`.
+    pub async fn prepare_scan_placeholder(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+        zero_findings_ttl_days: i32,
+    ) -> Result<(Uuid, bool)> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Serialize concurrent preparers for this (artifact_id, scan_type)
+        // so the re-check below sees any placeholder a racing caller has
+        // already committed. Transaction-scoped lock is released on commit
+        // or rollback. Two i32 keys avoid collisions across scan_types for
+        // the same artifact while keeping the lock granular.
+        let lock_key_a = (artifact_id.as_u128() as u64) as i64;
+        let lock_key_b = i64::from(stable_lock_key(scan_type));
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(lock_key_a)
+            .bind(lock_key_b)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 1. Reusable completed scan for these exact bytes (the #1373 path).
+        let completed: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT id
+            FROM scan_results
+            WHERE artifact_id = $1
+              AND checksum_sha256 = $2
+              AND scan_type = $3
+              AND status = 'completed'
+              AND completed_at > NOW() - (
+                  CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
+              )::interval
+            ORDER BY completed_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(ttl_days.to_string())
+        .bind(zero_findings_ttl_days.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some((id,)) = completed {
+            tx.commit()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            return Ok((id, false));
+        }
+
+        // 2. In-flight placeholder for the same artifact + bytes + scan_type
+        //    committed by a racing prepare. Reuse it instead of inserting a
+        //    duplicate; the worker that owns it will run the scan once.
+        let running: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT id
+            FROM scan_results
+            WHERE artifact_id = $1
+              AND checksum_sha256 = $2
+              AND scan_type = $3
+              AND status = 'running'
+            ORDER BY started_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some((id,)) = running {
+            tx.commit()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            return Ok((id, false));
+        }
+
+        // 3. No reusable or in-flight row: insert a fresh placeholder.
+        let (id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO scan_results
+                (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)
+            VALUES ($1, $2, $3, 'running', NOW(), $4)
+            RETURNING id
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(repository_id)
+        .bind(scan_type)
+        .bind(checksum_sha256)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok((id, true))
     }
 
     /// Copy scan results from a source scan to a new artifact.
@@ -1792,6 +1953,24 @@ impl ScanResultService {
 mod tests {
     use super::*;
     use crate::models::security::{Grade, RawFinding, ScanFinding, ScanResult, Severity};
+
+    // =======================================================================
+    // stable_lock_key (#1935 advisory-lock key)
+    // =======================================================================
+
+    #[test]
+    fn test_stable_lock_key_is_deterministic() {
+        // Must be stable across calls/processes so concurrent replicas hash
+        // the same scan_type to the same advisory-lock key.
+        assert_eq!(stable_lock_key("dependency"), stable_lock_key("dependency"));
+        assert_eq!(stable_lock_key("image"), stable_lock_key("image"));
+    }
+
+    #[test]
+    fn test_stable_lock_key_differs_per_scan_type() {
+        assert_ne!(stable_lock_key("dependency"), stable_lock_key("image"));
+        assert_ne!(stable_lock_key("image"), stable_lock_key("openscap"));
+    }
 
     // =======================================================================
     // compute_security_score (extracted pure function)

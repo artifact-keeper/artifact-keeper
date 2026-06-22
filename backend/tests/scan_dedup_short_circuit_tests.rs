@@ -447,3 +447,85 @@ async fn test_find_existing_returns_most_recent_when_multiple_completed_exist() 
 
     cleanup(&pool, repo_id).await;
 }
+
+// ---------------------------------------------------------------------------
+// #1935: concurrent prepare must not create duplicate placeholders
+// ---------------------------------------------------------------------------
+//
+// Regression for the check-then-act race in the #1373 short-circuit. The old
+// `prepare_artifact_scan` did a bare SELECT followed by a separate INSERT with
+// no lock/constraint/transaction, so N concurrent triggers on one fresh
+// artifact each saw "no completed row" and each inserted its own `running`
+// placeholder (issue reproducer: 10 concurrent triggers -> 10 completed rows
+// for one scan_type). `prepare_scan_placeholder` serializes the decide-then-
+// insert under a per-(artifact_id, scan_type) advisory lock, so the loser of
+// the race reuses the winner's in-flight row.
+//
+// DB-backed: runtime-skips (does NOT fail) when DATABASE_URL is absent.
+
+#[tokio::test]
+async fn test_concurrent_prepare_creates_single_placeholder() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("DATABASE_URL not set; skipping DB-backed concurrency test");
+        return;
+    };
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool).await;
+    let artifact_id = insert_artifact(&pool, repo_id, "concurrent.tgz", CHECKSUM_A).await;
+
+    // Fire many concurrent preparers for the same artifact + scan_type, as a
+    // burst of concurrent scan triggers would. Each task gets its own service
+    // over a clone of the shared pool, mirroring independent request handlers.
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let svc = ScanResultService::new(pool.clone());
+        handles.push(tokio::spawn(async move {
+            svc.prepare_scan_placeholder(artifact_id, repo_id, CHECKSUM_A, "dependency", 30, 30)
+                .await
+        }));
+    }
+
+    let mut ids = Vec::new();
+    let mut inserted_count = 0;
+    for h in handles {
+        let (id, inserted) = h
+            .await
+            .expect("task panicked")
+            .expect("prepare must not error");
+        ids.push(id);
+        if inserted {
+            inserted_count += 1;
+        }
+    }
+
+    // Exactly one caller actually inserted a placeholder; all others reused it.
+    assert_eq!(
+        inserted_count, 1,
+        "exactly one concurrent prepare must insert a placeholder; the rest reuse it"
+    );
+
+    // Every caller surfaced the same scan id.
+    let first = ids[0];
+    assert!(
+        ids.iter().all(|id| *id == first),
+        "all concurrent preparers must return the same scan id, got: {ids:?}"
+    );
+
+    // And the database holds exactly one row for this artifact + scan_type.
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1 AND scan_type = 'dependency'",
+    )
+    .bind(artifact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count query must not error");
+    assert_eq!(
+        row_count, 1,
+        "concurrent prepare must leave exactly one scan_results row, found {row_count}"
+    );
+
+    cleanup(&pool, repo_id).await;
+}

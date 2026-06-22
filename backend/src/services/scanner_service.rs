@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, ScanResult, Severity};
+use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -445,45 +445,13 @@ pub(crate) fn is_within_dedup_ttl(
     completed_at >= cutoff
 }
 
-/// Outcome of consulting `find_existing_scan_for_artifact` for a single
-/// scanner inside `prepare_artifact_scan`.
-///
-/// Captures the branch the DB-bound caller must take after the query:
-/// either short-circuit and reuse the existing scan id in the trigger
-/// response (no new placeholder, no fresh scan), or fall through to
-/// inserting a new `running` placeholder. Splitting this out makes the
-/// branch unit-testable without a database and pins the contract that
-/// the existing-scan id (not a newly minted UUID) is what gets surfaced
-/// to clients on the dedup path.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ShortCircuitDecision {
-    /// Reuse the existing scan's id directly. No placeholder row, no
-    /// fresh scan: the artifact already has a completed scan for these
-    /// bytes and this scanner.
-    UseExisting(Uuid),
-    /// No usable existing scan; the caller must insert a fresh
-    /// placeholder and queue the scan normally.
-    InsertPlaceholder,
-}
-
-/// Decide whether to short-circuit the prepare step for one scanner.
-///
-/// Wraps the `Option<&ScanResult>` returned by
-/// `ScanResultService::find_existing_scan_for_artifact`. Pulled out so
-/// the actual SQL stays thin (integration-tested) and the decision
-/// logic stays pure (unit-tested).
-///
-/// Pre-#1373, this branch did not exist: every prepare iteration
-/// inserted a placeholder unconditionally, which is what produced the
-/// duplicate completed rows the release gate caught.
-pub(crate) fn decide_short_circuit_from_existing(
-    existing: Option<&ScanResult>,
-) -> ShortCircuitDecision {
-    match existing {
-        Some(scan) => ShortCircuitDecision::UseExisting(scan.id),
-        None => ShortCircuitDecision::InsertPlaceholder,
-    }
-}
+// The check-then-act decision that used to live here (the
+// `ShortCircuitDecision` enum + `decide_short_circuit_from_existing`) was
+// removed in #1935: the SELECT-existing/INSERT-placeholder branch it modeled
+// raced under concurrent triggers. The decision is now made atomically inside
+// `ScanResultService::prepare_scan_placeholder`, under a per-(artifact_id,
+// scan_type) advisory lock, so there is no longer a database-free branch to
+// unit-test in isolation.
 
 /// Outcome of the same-artifact branch inside `scan_artifact_inner` when
 /// `find_reusable_scan` returns a row whose `artifact_id` matches the
@@ -2614,43 +2582,45 @@ impl ScannerService {
         // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            // When the caller asked to bypass dedup, skip the lookup entirely
-            // and always insert a fresh placeholder. We deliberately don't
-            // even SELECT here so the explicit-rescan path can't accidentally
-            // be diverted by a row that happens to satisfy the TTL.
-            let existing = if bypass_dedup {
-                None
-            } else {
-                self.scan_result_service
-                    .find_existing_scan_for_artifact(
+            if bypass_dedup {
+                // When the caller asked to bypass dedup, skip the dedup
+                // lookup entirely and always insert a fresh placeholder. We
+                // deliberately don't even SELECT here so the explicit-rescan
+                // path can't accidentally be diverted by a row that happens
+                // to satisfy the TTL.
+                let row = self
+                    .scan_result_service
+                    .create_scan_result_with_checksum(
                         artifact_id,
-                        &artifact.checksum_sha256,
+                        artifact.repository_id,
                         scanner.scan_type(),
-                        DEDUP_TTL_DAYS,
-                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        Some(&artifact.checksum_sha256),
                     )
-                    .await
-                    .ok()
-                    .flatten()
-            };
-
-            match decide_short_circuit_from_existing(existing.as_ref()) {
-                ShortCircuitDecision::UseExisting(id) => {
-                    prepared.push((scanner.scan_type().to_string(), id));
-                }
-                ShortCircuitDecision::InsertPlaceholder => {
-                    let row = self
-                        .scan_result_service
-                        .create_scan_result_with_checksum(
-                            artifact_id,
-                            artifact.repository_id,
-                            scanner.scan_type(),
-                            Some(&artifact.checksum_sha256),
-                        )
-                        .await?;
-                    prepared.push((scanner.scan_type().to_string(), row.id));
-                }
+                    .await?;
+                prepared.push((scanner.scan_type().to_string(), row.id));
+                continue;
             }
+
+            // #1935: the dedup check (look up existing scan) and the
+            // placeholder insert must be atomic. `prepare_scan_placeholder`
+            // serializes both under a per-(artifact_id, scan_type) advisory
+            // lock so concurrent triggers on the same fresh artifact can no
+            // longer each insert a duplicate `running` placeholder. It
+            // short-circuits to an existing completed scan (the #1373 path)
+            // or to an in-flight placeholder committed by a racing prepare,
+            // and only inserts when neither exists.
+            let (id, _inserted) = self
+                .scan_result_service
+                .prepare_scan_placeholder(
+                    artifact_id,
+                    artifact.repository_id,
+                    &artifact.checksum_sha256,
+                    scanner.scan_type(),
+                    DEDUP_TTL_DAYS,
+                    ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                )
+                .await?;
+            prepared.push((scanner.scan_type().to_string(), id));
         }
 
         Ok(prepared)
@@ -9575,7 +9545,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // #1373 short-circuit predicates: is_within_dedup_ttl,
-    // decide_short_circuit_from_existing, decide_same_artifact_action.
+    // decide_same_artifact_action.
     //
     // These are the pure decision helpers underpinning the same-artifact
     // dedup short-circuit. The DB-coupled wrappers
@@ -9584,32 +9554,6 @@ mod tests {
     // `backend/tests/scan_dedup_short_circuit_tests.rs`; this section
     // pins the logic that does not need a database.
     // -----------------------------------------------------------------------
-
-    /// Build a minimal ScanResult for predicate tests. Only fields the
-    /// decision functions inspect are meaningful; everything else is
-    /// zero/default.
-    fn fake_scan_result(id: Uuid) -> ScanResult {
-        ScanResult {
-            id,
-            artifact_id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            scan_type: "trivy".to_string(),
-            status: "completed".to_string(),
-            findings_count: 0,
-            critical_count: 0,
-            high_count: 0,
-            medium_count: 0,
-            low_count: 0,
-            info_count: 0,
-            scanner_version: None,
-            error_message: None,
-            started_at: None,
-            completed_at: Some(Utc::now()),
-            created_at: Utc::now(),
-            is_reused: false,
-            source_scan_id: None,
-        }
-    }
 
     #[test]
     fn test_is_within_dedup_ttl_just_completed_is_within() {
@@ -9692,35 +9636,6 @@ mod tests {
         let now = Utc::now();
         let future = now + chrono::Duration::minutes(5);
         assert!(is_within_dedup_ttl(Some(future), now, 30));
-    }
-
-    #[test]
-    fn test_decide_short_circuit_from_existing_some_returns_use_existing() {
-        let id = Uuid::new_v4();
-        let scan = fake_scan_result(id);
-        let decision = decide_short_circuit_from_existing(Some(&scan));
-        assert_eq!(decision, ShortCircuitDecision::UseExisting(id));
-    }
-
-    #[test]
-    fn test_decide_short_circuit_from_existing_none_returns_insert_placeholder() {
-        let decision = decide_short_circuit_from_existing(None);
-        assert_eq!(decision, ShortCircuitDecision::InsertPlaceholder);
-    }
-
-    #[test]
-    fn test_decide_short_circuit_uses_scan_id_not_artifact_id() {
-        // Regression: the decision must surface the SCAN id, not the
-        // artifact id. Pre-#1373 the trigger response leaked a fresh
-        // placeholder UUID; the fix is meaningless if we ever return
-        // the wrong field here.
-        let scan_id = Uuid::new_v4();
-        let artifact_id = Uuid::new_v4();
-        let mut scan = fake_scan_result(scan_id);
-        scan.artifact_id = artifact_id;
-        assert_ne!(scan_id, artifact_id);
-        let decision = decide_short_circuit_from_existing(Some(&scan));
-        assert_eq!(decision, ShortCircuitDecision::UseExisting(scan_id));
     }
 
     #[test]
@@ -9808,21 +9723,6 @@ mod tests {
         let action =
             decide_same_artifact_action(&PreparedScanAction::Reuse(Uuid::nil()), Uuid::nil());
         assert_eq!(action, SameArtifactAction::NoOp);
-    }
-
-    #[test]
-    fn test_short_circuit_decision_distinct_ids_are_distinct() {
-        // Sanity: two different scans short-circuit to different
-        // decisions. Catches an accidental `_` -> always-same-id
-        // pattern in a future refactor.
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let s1 = fake_scan_result(id1);
-        let s2 = fake_scan_result(id2);
-        assert_ne!(
-            decide_short_circuit_from_existing(Some(&s1)),
-            decide_short_circuit_from_existing(Some(&s2)),
-        );
     }
 
     #[test]
