@@ -120,6 +120,7 @@ impl FilesystemStorage {
 
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
+    #[tracing::instrument(skip(self, content), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let path = self.key_to_path(key);
 
@@ -164,6 +165,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
         let content = fs::read(&path).await.map_err(|e| {
@@ -184,11 +186,13 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(content))
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let path = self.key_to_path(key);
         Ok(path.exists())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
         fs::remove_file(&path).await.map_err(|e| {
@@ -204,6 +208,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let source_path = self.key_to_path(source);
         let dest_path = self.key_to_path(dest);
@@ -251,6 +256,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
@@ -262,6 +268,9 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    // The span covers GET initiation (time-to-first-byte); the body transfer
+    // happens later as the caller polls the returned stream.
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
         let file = fs::File::open(&path).await.map_err(|e| {
@@ -286,6 +295,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Box::pin(mapped))
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -324,6 +334,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(out))
     }
 
+    #[tracing::instrument(skip(self, stream), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
