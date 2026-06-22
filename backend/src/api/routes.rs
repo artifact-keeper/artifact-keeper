@@ -568,17 +568,32 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // Search routes with optional auth and dedicated rate limiting (300 req/min)
+        // Search routes with optional auth and dedicated rate limiting (300 req/min).
+        //
+        // Layer ORDER matters: Tower applies the LAST `.layer()` as the
+        // OUTERMOST wrapper (it runs first on the request path). The rate-limit
+        // middleware keys authenticated callers by `user:<id>` and falls back to
+        // `ip:<addr>` only when no `AuthExtension` is present. For that per-user
+        // keying to work, `optional_auth_middleware` must run BEFORE the limiter
+        // so the auth extension is populated when the limiter reads it.
+        //
+        // Therefore the limiter is applied FIRST here (making it the inner layer)
+        // and the auth middleware LAST (the outer layer). The previous order had
+        // them reversed, so the limiter ran before auth was set and keyed EVERY
+        // search request by source IP — collapsing all callers (authenticated and
+        // anonymous alike) behind a shared egress IP into a single 300/min bucket
+        // and defeating the per-user design (a fleet-wide search outage under
+        // load). See `search_rate_limit_layer_runs_after_auth`.
         .nest(
             "/search",
             handlers::search::router()
                 .layer(middleware::from_fn_with_state(
-                    auth_service.clone(),
-                    optional_auth_middleware,
-                ))
-                .layer(middleware::from_fn_with_state(
                     search_rate_limit_state,
                     rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
                 )),
         )
         // Peer instance routes with auth middleware

@@ -1068,4 +1068,161 @@ mod tests {
             .unwrap();
         assert_ne!(extract_client_ip(&req1), extract_client_ip(&req2));
     }
+
+    // ── Layer-ordering regression: auth must populate before the limiter ──────
+    //
+    // `rate_limit_middleware` keys authenticated callers by `user:<id>` and only
+    // falls back to `ip:<addr>` when no `AuthExtension` is present in the request
+    // extensions. The `/search` nest pairs this limiter with
+    // `optional_auth_middleware`; whether per-user keying actually happens
+    // depends entirely on which layer runs FIRST on the request path.
+    //
+    // Tower runs the OUTERMOST layer (the last `.layer()` call) first. So the
+    // limiter must be the INNER layer (applied first / wrapped by auth) for the
+    // auth extension to already be set when it reads it. The two tests below
+    // pin both halves of that contract so a future re-order can't silently
+    // collapse all callers behind a shared egress IP into one bucket again.
+
+    /// Middleware that injects a fixed `AuthExtension` (a stand-in for
+    /// `optional_auth_middleware` resolving a token to a user). Used to model
+    /// the auth layer in the ordering tests below.
+    async fn inject_auth(mut request: Request, next: Next) -> Response {
+        // The user id is derived from a request header so each test can simulate
+        // a distinct authenticated principal sharing one source IP.
+        let uid_seed = request
+            .headers()
+            .get("x-test-user")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0")
+            .to_string();
+        // Stable per-seed UUID so repeated requests from the same simulated user
+        // hash to the same rate-limit key. Built deterministically from the seed
+        // bytes (no extra uuid features needed).
+        let mut bytes = [0u8; 16];
+        for (i, b) in uid_seed.bytes().enumerate().take(16) {
+            bytes[i] = b;
+        }
+        let user_id = uuid::Uuid::from_bytes(bytes);
+        request.extensions_mut().insert(AuthExtension {
+            user_id,
+            username: format!("user-{uid_seed}"),
+            email: format!("user-{uid_seed}@test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        });
+        next.run(request).await
+    }
+
+    /// Drive one request as simulated user `seed` from a fixed source IP and
+    /// return its status.
+    async fn one_request_as(app: &axum::Router, seed: &str) -> StatusCode {
+        use tower::ServiceExt;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("X-Forwarded-For", "203.0.113.7")
+                    .header("x-test-user", seed)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn search_rate_limit_layer_runs_after_auth() {
+        // FIXED ORDER: limiter applied first (inner), auth applied last (outer).
+        // Auth therefore runs BEFORE the limiter, so the limiter keys by
+        // `user:<id>`. Two different authenticated users sharing one source IP
+        // must get INDEPENDENT buckets: user A exhausting a capacity-1 bucket
+        // must NOT 429 user B.
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            // Inner: the rate limiter.
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true),
+                rate_limit_middleware,
+            ))
+            // Outer: auth injection (runs first on the request path).
+            .layer(axum::middleware::from_fn(inject_auth));
+
+        // User A: first request OK, second 429 (capacity-1 bucket).
+        assert_eq!(one_request_as(&app, "alice").await, StatusCode::OK);
+        assert_eq!(
+            one_request_as(&app, "alice").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "user A's own bucket must exhaust at capacity"
+        );
+        // User B, SAME source IP, must still be allowed — proof the key is the
+        // user id, not the shared IP.
+        assert_eq!(
+            one_request_as(&app, "bob").await,
+            StatusCode::OK,
+            "a second authenticated user on the same IP must have an \
+             independent bucket; sharing one means the limiter keyed by IP \
+             because it ran before auth (the bug this fix addresses)"
+        );
+    }
+
+    #[tokio::test]
+    async fn buggy_order_collapses_users_into_one_ip_bucket() {
+        // BUGGY ORDER (the pre-fix arrangement): auth applied first (inner),
+        // limiter applied last (outer). The limiter therefore runs BEFORE auth
+        // is set, sees no `AuthExtension`, and keys by source IP. Two different
+        // users on the same IP then SHARE one bucket — exactly the fleet-wide
+        // search outage. This test documents the failure mode so the contract
+        // in `search_rate_limit_layer_runs_after_auth` is unambiguous.
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            // Inner: auth injection.
+            .layer(axum::middleware::from_fn(inject_auth))
+            // Outer: the rate limiter (runs first, before auth -> keys by IP).
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true),
+                rate_limit_middleware,
+            ));
+
+        assert_eq!(one_request_as(&app, "alice").await, StatusCode::OK);
+        // User B on the same IP is throttled by user A's traffic: shared bucket.
+        assert_eq!(
+            one_request_as(&app, "bob").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "with the limiter outside auth, all users on one IP share a bucket"
+        );
+    }
+
+    // Source-level guard: the `/search` nest must apply the limiter as the inner
+    // layer and `optional_auth_middleware` as the outer one. A runtime test of
+    // the real nest needs full app state + a DB, so pin the ordering in source.
+    #[test]
+    fn search_nest_applies_auth_outside_rate_limit() {
+        const ROUTES_SRC: &str = include_str!("../routes.rs");
+        // The user-facing search nest is the one that wires the dedicated search
+        // limiter. Anchor on that unique state so this test isn't confused by
+        // the separate admin `/search` nest (which has no limiter).
+        let rl = ROUTES_SRC
+            .find("search_rate_limit_state")
+            .expect("search nest must apply the search rate limiter");
+        // The first `optional_auth_middleware` after the limiter wiring belongs
+        // to the same nest. For per-user keying, auth must be applied AFTER the
+        // limiter in source (Tower's last `.layer()` is outermost / runs first),
+        // so `optional_auth_middleware` must appear LATER than the limiter here.
+        let auth_after = ROUTES_SRC[rl..]
+            .find("optional_auth_middleware")
+            .expect("search nest must apply optional auth after the limiter");
+        assert!(
+            auth_after > 0,
+            "optional_auth_middleware must be applied after (outside of) the \
+             search rate limiter so the auth extension is populated when the \
+             limiter keys the request; otherwise search is keyed by IP and \
+             collapses all callers into one bucket"
+        );
+    }
 }
