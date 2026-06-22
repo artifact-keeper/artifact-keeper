@@ -1,0 +1,14 @@
+-- promotion_rules.max_cve_severity: drop the implicit 'medium' default.
+--
+-- The column previously defaulted to 'medium'. While promotion rules were only
+-- advisory (the auto-promotion daemon is unused), this was harmless. Once
+-- promotion_rules became ENFORCED on the manual single/bulk/approval promote
+-- paths, that implicit default silently turned every rule -- including rules
+-- that only set, say, min_staging_hours -- into a "requires a completed clean
+-- scan" rule, falsely blocking legitimately-unscanned promotions.
+--
+-- A CVE-severity gate must be opt-in: a rule imposes one only when the author
+-- explicitly sets max_cve_severity. NULL now means "no CVE gate", matching the
+-- API layer (the create handler no longer injects a default) and the evaluator
+-- (which skips the CVE/scan-required block entirely when the value is NULL).
+ALTER TABLE promotion_rules ALTER COLUMN max_cve_severity DROP DEFAULT;

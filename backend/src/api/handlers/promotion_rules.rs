@@ -46,7 +46,14 @@ pub struct CreateRuleRequest {
     pub target_repo_id: Uuid,
     #[serde(default = "default_true")]
     pub is_enabled: bool,
-    #[serde(default = "default_max_cve_severity")]
+    // No serde default: omitting `max_cve_severity` leaves it unset (None / SQL
+    // NULL) so the rule does NOT impose a CVE-severity gate. Previously this
+    // defaulted to Some("medium"), which silently turned every rule (e.g. a
+    // staging-hours-only rule) into a "requires a clean, completed scan" rule
+    // once promotion_rules became enforced — falsely blocking legitimately
+    // unscanned promotions. A CVE bound is now enforced only when the caller
+    // explicitly sets one.
+    #[serde(default)]
     pub max_cve_severity: Option<String>,
     pub allowed_licenses: Option<Vec<String>>,
     #[serde(default)]
@@ -126,10 +133,6 @@ pub struct ArtifactEvalEntry {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_max_cve_severity() -> Option<String> {
-    Some("medium".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +422,9 @@ mod tests {
         assert_eq!(req.name, "staging-to-prod");
         assert!(req.is_enabled);
         assert!(req.auto_promote);
-        assert_eq!(req.max_cve_severity, Some("medium".to_string()));
+        // Omitting max_cve_severity leaves it unset so the rule imposes no CVE
+        // gate (a staging-hours-only rule must not silently require a scan).
+        assert!(req.max_cve_severity.is_none());
         assert!(!req.require_signature);
         assert!(req.allowed_licenses.is_none());
         assert!(req.min_staging_hours.is_none());

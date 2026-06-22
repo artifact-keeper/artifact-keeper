@@ -84,6 +84,11 @@ pub struct ApprovalListResponse {
 pub struct ReviewRequest {
     /// Optional reviewer notes
     pub notes: Option<String>,
+    /// Admin break-glass override: skip promotion_rules enforcement at approve
+    /// time. Mirrors `skip_policy_check` on the single/bulk promote endpoints so
+    /// the approval-execute path has the same documented escape hatch.
+    #[serde(default)]
+    pub skip_policy_check: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -555,6 +560,41 @@ pub async fn approve_promotion(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
+
+    // Enforce the per-pair promotion_rules (min_staging_hours, require_signature,
+    // min_health_score, max_cve_severity, ...) BEFORE copying/inserting. This is
+    // the same gate the single and bulk REST promote handlers apply; the approval
+    // workflow is just a third promote path, and `promote_artifact` FORCES
+    // approval-required repos through it, so without this check governance-ruled
+    // repos (exactly the ones likely to carry rules) bypass the gate entirely.
+    // Reuses the same evaluator as the advisory /evaluate dry-run so enforcement
+    // and dry-run cannot diverge. Honors the `skip_policy_check` admin override.
+    //
+    // Unlike the REST handlers (which return 200 + promoted:false), the approval
+    // execute path returns 403 with the violations: a rule-blocked approval must
+    // NOT execute the copy/insert, so it fails like a rejected promotion.
+    if !req.skip_policy_check {
+        let rule_service =
+            crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
+        let failing = rule_service
+            .evaluate_for_promotion(approval.artifact_id, source_repo.id, target_repo.id)
+            .await?;
+        if !failing.is_empty() {
+            let detail = failing
+                .iter()
+                .flat_map(|e| {
+                    e.violations
+                        .iter()
+                        .map(move |v| format!("{}: {}", e.rule_name, v))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::Authorization(format!(
+                "Promotion blocked by promotion rule violations: {}",
+                detail
+            )));
+        }
+    }
 
     // Copy storage content
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
