@@ -667,5 +667,143 @@ mod tests {
                 .execute(&pool)
                 .await;
         }
+
+        /// Build a DELETE request (no body); test_db_helpers has no delete
+        /// helper, so construct it inline.
+        fn delete_req(uri: String) -> axum::http::Request<axum::body::Body> {
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("build DELETE request")
+        }
+
+        #[tokio::test]
+        async fn test_add_label_admin_allowed_and_persists() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                admin_auth("admin"),
+            );
+            let body = axum::body::Bytes::from(r#"{"value":"us-east"}"#.as_bytes().to_vec());
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/labels/region", peer_id),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "owner-admin single-label add must succeed"
+            );
+            assert_eq!(
+                label_count(&pool, peer_id).await,
+                1,
+                "admin add should persist the label"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_delete_label_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            // Seed a label directly so the non-admin DELETE has something to
+            // (illegitimately) target; the rejection must leave it in place.
+            let label_svc =
+                crate::services::peer_instance_label_service::PeerInstanceLabelService::new(
+                    pool.clone(),
+                );
+            label_svc
+                .add_label(peer_id, "region", "us-east")
+                .await
+                .expect("seed label");
+
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                non_admin_auth("victor.user"),
+            );
+            let (status, _) =
+                tdh::send(app, delete_req(format!("/{}/labels/region", peer_id))).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin single-label delete must be rejected (BOLA)"
+            );
+            assert_eq!(
+                label_count(&pool, peer_id).await,
+                1,
+                "the rejected delete must not have removed the label"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_delete_label_admin_allowed_and_removes() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            let label_svc =
+                crate::services::peer_instance_label_service::PeerInstanceLabelService::new(
+                    pool.clone(),
+                );
+            label_svc
+                .add_label(peer_id, "region", "us-east")
+                .await
+                .expect("seed label");
+            assert_eq!(label_count(&pool, peer_id).await, 1);
+
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                admin_auth("admin"),
+            );
+            let (status, _) =
+                tdh::send(app, delete_req(format!("/{}/labels/region", peer_id))).await;
+
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "owner-admin single-label delete must succeed (204)"
+            );
+            assert_eq!(
+                label_count(&pool, peer_id).await,
+                0,
+                "admin delete should remove the label"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
     }
 }
