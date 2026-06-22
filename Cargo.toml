@@ -114,7 +114,7 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 tonic = "0.12"
 tonic-reflection = "0.12"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 tonic-build = "0.12"
 
 # URL parsing and resolution
