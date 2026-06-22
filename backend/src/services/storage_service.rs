@@ -1148,6 +1148,68 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ── facade-trait presign defaults (#1555) ──────────────────────────────
+    // The redirect fast path is gated on the FACADE trait
+    // (`storage_service::StorageBackend`) methods, not the inner
+    // `crate::storage::StorageBackend`. The facade `FilesystemBackend` does
+    // NOT override `supports_redirect`/`get_presigned_url`, so it inherits the
+    // `false`/`None` defaults — which is exactly what makes a filesystem (or
+    // any non-presigning) deployment fall through to streaming instead of
+    // emitting a 302. These tests pin that default on the facade handle.
+
+    #[test]
+    fn test_facade_filesystem_does_not_support_redirect() {
+        let backend = FilesystemBackend::new(std::path::PathBuf::from("/tmp/test-artifacts"));
+        // Through the FACADE trait specifically (the one the redirect path uses).
+        assert!(
+            !StorageBackend::supports_redirect(&backend),
+            "filesystem facade must report no redirect support so the proxy \
+             cache path falls through to streaming (#1555)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_facade_filesystem_presigned_url_returns_none() {
+        let backend = FilesystemBackend::new(std::path::PathBuf::from("/tmp/test-artifacts"));
+        let result = StorageBackend::get_presigned_url(
+            &backend,
+            "proxy-cache/repo/pkg/__content__",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "filesystem facade must never presign — forces the streaming fallback (#1555)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_backend_handle_is_non_presigning_on_filesystem() {
+        // `cache_storage_backend()` returns `StorageService::backend()`. On a
+        // filesystem-backed service that handle must report no redirect support
+        // and yield no presigned URL, so `try_proxy_cache_redirect` returns
+        // None and the caller streams. This is the core non-regression
+        // guarantee for non-S3 deployments (the rig) (#1555).
+        let (storage, _temp) = create_test_storage();
+        let handle = storage.backend();
+        assert!(
+            !handle.supports_redirect(),
+            "filesystem StorageService backend handle must not support redirect"
+        );
+        let presigned = handle
+            .get_presigned_url(
+                "proxy-cache/repo/pkg/__content__",
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+        assert!(
+            presigned.is_none(),
+            "filesystem StorageService backend handle must not presign"
+        );
+    }
+
     #[test]
     fn test_mock_presigned_inner_supports_redirect() {
         let backend = MockPresignedInner;

@@ -3872,6 +3872,48 @@ mod tests {
         assert!(parse_http_date("").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // #1555 proxy-cache key discrimination
+    //
+    // `is_proxy_cache_key` decides whether a storage key must be presigned
+    // through the no-prefix proxy backend (`cache_storage_backend`) instead of
+    // the prefixed repo handle. Hosted/content-addressed artifacts MUST keep
+    // the prefixed handle, so the predicate must match ONLY the
+    // `proxy-cache/` layout — getting this wrong reintroduces the prefix bug
+    // (signing a key the object store has no object for) or, worse, routes
+    // hosted artifacts through the wrong handle.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_proxy_cache_key_matches_proxy_cache_layout() {
+        assert!(ProxyService::is_proxy_cache_key(
+            "proxy-cache/pypi-remote/pkg/pkg-1.0.0-py3-none-any.whl/__content__"
+        ));
+        assert!(ProxyService::is_proxy_cache_key(
+            "proxy-cache/repo/p/__content__"
+        ));
+        // Bare prefix (defensive): still classified as proxy-cache.
+        assert!(ProxyService::is_proxy_cache_key("proxy-cache/"));
+    }
+
+    #[test]
+    fn test_is_proxy_cache_key_rejects_hosted_and_prefixed_keys() {
+        // Content-addressed hosted artifact under the global prefix — must NOT
+        // be treated as proxy-cache (keeps the prefixed repo handle).
+        assert!(!ProxyService::is_proxy_cache_key(
+            "artifact-keeper/cas/ab/cdef0123456789"
+        ));
+        // A prefixed key that merely *contains* `proxy-cache/` later in the
+        // path must not match: the cache layout is always at the root.
+        assert!(!ProxyService::is_proxy_cache_key(
+            "artifact-keeper/proxy-cache/repo/pkg/__content__"
+        ));
+        assert!(!ProxyService::is_proxy_cache_key("cas/deadbeef"));
+        assert!(!ProxyService::is_proxy_cache_key(""));
+        // Substring, not a path segment prefix — must not match.
+        assert!(!ProxyService::is_proxy_cache_key("not-proxy-cache/x"));
+    }
+
     #[test]
     fn test_legacy_sidecar_without_quarantine_deserializes_to_none() {
         // A sidecar written before the quarantine field existed (and before

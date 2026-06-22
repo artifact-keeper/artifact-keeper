@@ -4322,6 +4322,126 @@ mod tests {
         assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
     }
 
+    // A redirect-capable facade backend whose presign returns `Ok(None)`
+    // (e.g. a presign-disabled S3 handle): the helper must fall through to
+    // streaming. Covers the `Ok(None)` arm of `try_proxy_cache_redirect`.
+    struct NonePresignStorage;
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for NonePresignStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::from_static(b"body"))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            _key: &str,
+            _expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            Ok(None)
+        }
+    }
+
+    // A redirect-capable facade backend whose presign ERRORS (transient signing
+    // failure): the helper must warn + fall through to streaming, never panic.
+    // Covers the `Err(e)` warn-and-fall-back arm of `try_proxy_cache_redirect`.
+    struct ErrPresignStorage;
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for ErrPresignStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::from_static(b"body"))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            _key: &str,
+            _expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            Err(crate::error::AppError::Storage(
+                "transient presign failure".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_returns_none_when_presign_yields_none() {
+        // #1555: a redirect-capable backend that declines to presign this key
+        // (Ok(None)) must fall through to streaming, not error.
+        let storage = NonePresignStorage;
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "Ok(None) presign must fall through to streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_returns_none_when_presign_errors() {
+        // #1555: a presign error must be swallowed (warn + fall back), never
+        // surfaced as a hard failure — the caller still streams the body.
+        let storage = ErrPresignStorage;
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "presign Err must warn and fall through to streaming"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_cached_or_refetch_refetches_and_writes_back_when_storage_missing() {
         let Some(pool) = db_helpers::try_pool().await else {
@@ -6429,6 +6549,85 @@ mod tests {
 
         db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;
         db_helpers::cleanup(&pool, member_id, Uuid::nil()).await;
+    }
+
+    /// #1555 filesystem fallthrough: `local_fetch_or_redirect` on a proxy-cache
+    /// key (`is_proxy_cache_key(...) == true`) must select the proxy's
+    /// no-prefix `cache_storage_backend()` handle, attempt a presigned
+    /// redirect, and — because that handle is filesystem-backed and reports
+    /// `supports_redirect() == false` — fall through to STREAMING a 200 with
+    /// the body. This is the core non-regression guarantee on the rig / any
+    /// non-S3 deployment: the new proxy-cache handle-selection branch must not
+    /// break filesystem serving. DB-gated (runs in CI where Postgres exists).
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_proxy_cache_key_streams_on_filesystem_1555() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        // Presigned ENABLED + a filesystem-backed proxy service whose
+        // cache_storage_backend() reports supports_redirect() == false.
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state =
+            tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy.clone());
+        let repo_info = tdh::make_repo_info(
+            fx.repo_id,
+            &fx.repo_key,
+            &fx.storage_dir,
+            "remote",
+            Some("https://upstream.example.test"),
+        );
+
+        // Seed a proxy-cache artifact: the storage_key starts with
+        // `proxy-cache/`, so is_proxy_cache_key() is true and the no-prefix
+        // handle branch is taken.
+        let body: &[u8] = b"cached-fs";
+        let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
+        let storage_key = format!("proxy-cache/{}/{}", fx.repo_key, artifact_path);
+        assert!(crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key));
+
+        super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
+            .await
+            .expect("seed proxy-cache payload on disk");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(fx.repo_id)
+        .bind(artifact_path)
+        .bind("foo")
+        .bind("1.0")
+        .bind(body.len() as i64)
+        .bind("test-foo")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed proxy-cache artifact row");
+
+        let location = repo_info.storage_location();
+        let result =
+            super::local_fetch_or_redirect(&fx.pool, &state, fx.repo_id, &location, artifact_path)
+                .await;
+
+        // Clean up before asserting so a panic still leaves the DB clean.
+        fx.teardown().await;
+
+        let resp = result.expect("filesystem proxy-cache fetch must succeed by streaming");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "filesystem proxy-cache key must stream a 200 (no 302) on non-S3 (#1555)"
+        );
+        assert!(
+            resp.headers().get("location").is_none(),
+            "filesystem backend must NOT emit a redirect Location header (#1555)"
+        );
     }
 
     // ── #1804: per-member authorization for virtual repos ───────────────

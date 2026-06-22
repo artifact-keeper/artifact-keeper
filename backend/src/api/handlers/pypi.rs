@@ -5243,6 +5243,64 @@ mod tests {
         );
     }
 
+    // Behavioral coverage for `pypi_proxy_cache_redirect` (#1555). The two
+    // short-circuit guards both return BEFORE any DB access, so these run
+    // DB-free on a lazy pool: (1) presigned disabled, and (2) a filesystem
+    // proxy backend that does not support redirects — both must yield None so
+    // `serve_file` falls through to the streaming path on the rig / non-S3.
+    #[tokio::test]
+    async fn test_pypi_proxy_cache_redirect_none_when_presigned_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let storage_path = std::env::temp_dir()
+            .join(format!("pypi-presign-off-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
+        // Default config: presigned_downloads_enabled = false.
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+
+        let result = super::pypi_proxy_cache_redirect(
+            &state,
+            proxy.as_ref(),
+            "pypi-remote",
+            "simple/foo/foo-1.0-py3-none-any.whl",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "presigned disabled must short-circuit before any redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pypi_proxy_cache_redirect_none_when_backend_no_redirect_support() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let storage_path = std::env::temp_dir()
+            .join(format!("pypi-presign-fs-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
+        // Presigned ENABLED, but the filesystem proxy backend reports
+        // supports_redirect() == false, so the helper must still return None
+        // without touching the DB (the is_cache_fresh probe is never reached).
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+
+        let result = super::pypi_proxy_cache_redirect(
+            &state,
+            proxy.as_ref(),
+            "pypi-remote",
+            "simple/foo/foo-1.0-py3-none-any.whl",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "filesystem (non-redirect) backend must yield None → stream fallback (#1555)"
+        );
+    }
+
     #[tokio::test]
     async fn test_build_streaming_file_response_headers() {
         use futures::stream;
