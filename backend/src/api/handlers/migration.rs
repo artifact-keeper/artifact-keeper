@@ -929,6 +929,35 @@ async fn list_migrations(
     }))
 }
 
+/// PostgreSQL SQLSTATE for a foreign-key violation.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// FK constraint that fires when `migration_jobs.source_connection_id` does not
+/// reference an existing row in `source_connections`.
+const MIGRATION_JOB_CONNECTION_FK: &str = "migration_jobs_source_connection_id_fkey";
+
+/// Allowed values for the `migration_jobs.job_type` CHECK constraint
+/// (see migration `020_migration_tables.sql`).
+const VALID_JOB_TYPES: [&str; 3] = ["full", "incremental", "assessment"];
+
+/// Map an `INSERT` error from `migration_jobs` to an [`AppError`].
+///
+/// A foreign-key violation means the supplied `source_connection_id` does not
+/// reference an existing connection; this is a client error and must surface as
+/// [`AppError::NotFound`] (HTTP 404) rather than an opaque
+/// [`AppError::Sqlx`] (HTTP 500 DATABASE_ERROR). All other database errors fall
+/// through to the default `sqlx::Error -> AppError` conversion (HTTP 500).
+fn map_create_migration_error(err: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.code().as_deref() == Some(PG_FOREIGN_KEY_VIOLATION)
+            && db_err.constraint() == Some(MIGRATION_JOB_CONNECTION_FK)
+        {
+            return AppError::NotFound("Source connection not found".to_string());
+        }
+    }
+    AppError::from(err)
+}
+
 /// Create a new migration job
 #[utoipa::path(
     post,
@@ -938,6 +967,8 @@ async fn list_migrations(
     request_body = CreateMigrationRequest,
     responses(
         (status = 201, description = "Migration job created successfully", body = MigrationJobResponse),
+        (status = 400, description = "Invalid request (e.g. unknown job_type)"),
+        (status = 404, description = "Source connection not found"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -947,8 +978,26 @@ async fn create_migration(
     Json(req): Json<CreateMigrationRequest>,
 ) -> Result<(StatusCode, Json<MigrationJobResponse>)> {
     let job_type = req.job_type.unwrap_or_else(|| "full".to_string());
+
+    // Validate job_type against the DB CHECK constraint up-front. Without this,
+    // an unknown value triggers a Postgres check-constraint violation that
+    // surfaces as an opaque 500 DATABASE_ERROR; reject it as a 400 instead.
+    if !VALID_JOB_TYPES.contains(&job_type.as_str()) {
+        return Err(AppError::Validation(format!(
+            "Invalid job_type '{}'; expected one of: {}",
+            job_type,
+            VALID_JOB_TYPES.join(", ")
+        )));
+    }
+
     let config_json = serde_json::to_value(&req.config)?;
 
+    // The migration_jobs.source_connection_id FK had no application-level
+    // pre-check, so an unknown connection id raised a bare Postgres FK
+    // violation that propagated as HTTP 500 DATABASE_ERROR on every such call.
+    // Map that specific violation to 404 so callers get an actionable error and
+    // the write path stops looking like a server fault (mirrors the federation
+    // assign-repo fix in #1954).
     let job: MigrationJobRow = sqlx::query_as(
         r#"
         INSERT INTO migration_jobs (source_connection_id, job_type, config)
@@ -962,7 +1011,8 @@ async fn create_migration(
     .bind(&job_type)
     .bind(&config_json)
     .fetch_one(&state.db)
-    .await?;
+    .await
+    .map_err(map_create_migration_error)?;
 
     Ok((StatusCode::CREATED, Json(job.into())))
 }
@@ -2258,6 +2308,230 @@ mod tests {
         assert_eq!(req.auth_type, "api_token");
         assert_eq!(req.credentials.token.as_deref(), Some("abc123"));
         assert!(req.source_type.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // map_create_migration_error tests (FK violation -> 404, others -> 500)
+    //
+    // Regression for the 1.2.2 "migration write 500" finding: creating a
+    // migration job with a `source_connection_id` that does not exist raised a
+    // bare Postgres FK violation that surfaced as HTTP 500 DATABASE_ERROR on
+    // every call. These tests pin the mapping without needing a live database
+    // (mirrors the federation assign-repo fix in #1954).
+    // -----------------------------------------------------------------------
+
+    use sqlx::error::{DatabaseError, ErrorKind};
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    /// Minimal in-memory `DatabaseError` for unit-testing the error mapper
+    /// without a Postgres connection.
+    #[derive(Debug)]
+    struct MockDbError {
+        message: String,
+        code: Option<String>,
+        constraint: Option<String>,
+    }
+
+    impl fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl StdError for MockDbError {}
+
+    impl DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.as_deref().map(Cow::Borrowed)
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint.as_deref()
+        }
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::ForeignKeyViolation
+        }
+    }
+
+    #[test]
+    fn test_map_create_migration_error_fk_violation_returns_not_found() {
+        let err = sqlx::Error::Database(Box::new(MockDbError {
+            message: "insert or update on table \"migration_jobs\" violates foreign key \
+                      constraint \"migration_jobs_source_connection_id_fkey\""
+                .to_string(),
+            code: Some(PG_FOREIGN_KEY_VIOLATION.to_string()),
+            constraint: Some(MIGRATION_JOB_CONNECTION_FK.to_string()),
+        }));
+        let mapped = map_create_migration_error(err);
+        match mapped {
+            AppError::NotFound(msg) => assert!(
+                msg.contains("Source connection not found"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected NotFound (404), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_create_migration_error_other_fk_constraint_stays_database() {
+        // An FK violation on some *other* constraint must not be masked as a
+        // connection-not-found 404; it should remain a 500 DATABASE_ERROR.
+        let err = sqlx::Error::Database(Box::new(MockDbError {
+            message: "violates foreign key constraint \"migration_jobs_created_by_fkey\""
+                .to_string(),
+            code: Some(PG_FOREIGN_KEY_VIOLATION.to_string()),
+            constraint: Some("migration_jobs_created_by_fkey".to_string()),
+        }));
+        let mapped = map_create_migration_error(err);
+        assert!(
+            matches!(mapped, AppError::Sqlx(_)),
+            "unrelated FK constraint should stay a DB error, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn test_map_create_migration_error_non_db_error_stays_database() {
+        let mapped = map_create_migration_error(sqlx::Error::PoolClosed);
+        assert!(
+            matches!(mapped, AppError::Sqlx(_)),
+            "non-database sqlx errors should stay DB errors, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_job_types_contains_full() {
+        // job_type validation guards against a CHECK-constraint 500.
+        assert!(VALID_JOB_TYPES.contains(&"full"));
+        assert!(VALID_JOB_TYPES.contains(&"incremental"));
+        assert!(VALID_JOB_TYPES.contains(&"assessment"));
+        assert!(!VALID_JOB_TYPES.contains(&"bogus"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed tests: valid create persists; unknown connection id -> 404.
+    //
+    // These run only when DATABASE_URL is set (a migrated throwaway Postgres);
+    // they skip cleanly otherwise so offline `cargo test` / CI without a DB do
+    // not fail. The harness verifies them against a throwaway DB on :5513.
+    // -----------------------------------------------------------------------
+
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn test_create_migration_job_persists_with_valid_connection() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // Seed a source connection to reference.
+        let conn_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type)
+            VALUES ($1, $2, 'basic_auth', $3, 'nexus')
+            RETURNING id
+            "#,
+        )
+        .bind(format!("test-conn-{}", Uuid::new_v4()))
+        .bind("http://nexus.local:8081")
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed connection");
+
+        // Insert a job exactly as the handler does and verify it persists.
+        let config_json = serde_json::json!({});
+        let job: MigrationJobRow = sqlx::query_as(
+            r#"
+            INSERT INTO migration_jobs (source_connection_id, job_type, config)
+            VALUES ($1, $2, $3)
+            RETURNING id, source_connection_id, status, job_type, config, total_items,
+                      completed_items, failed_items, skipped_items, total_bytes,
+                      transferred_bytes, started_at, finished_at, created_at, created_by,
+                      error_summary
+            "#,
+        )
+        .bind(conn_id)
+        .bind("full")
+        .bind(&config_json)
+        .fetch_one(&pool)
+        .await
+        .map_err(map_create_migration_error)
+        .expect("valid create must succeed");
+
+        assert_eq!(job.source_connection_id, conn_id);
+        assert_eq!(job.status, "pending");
+
+        // Confirm the row is actually in the table.
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM migration_jobs WHERE id = $1)")
+                .bind(job.id)
+                .fetch_one(&pool)
+                .await
+                .expect("existence check");
+        assert!(exists, "job row must be persisted");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_migration_job_unknown_connection_maps_to_not_found() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        let missing = Uuid::new_v4();
+        let config_json = serde_json::json!({});
+        let result: std::result::Result<MigrationJobRow, sqlx::Error> = sqlx::query_as(
+            r#"
+            INSERT INTO migration_jobs (source_connection_id, job_type, config)
+            VALUES ($1, $2, $3)
+            RETURNING id, source_connection_id, status, job_type, config, total_items,
+                      completed_items, failed_items, skipped_items, total_bytes,
+                      transferred_bytes, started_at, finished_at, created_at, created_by,
+                      error_summary
+            "#,
+        )
+        .bind(missing)
+        .bind("full")
+        .bind(&config_json)
+        .fetch_one(&pool)
+        .await;
+
+        let err = result.expect_err("unknown connection id must fail the FK");
+        match map_create_migration_error(err) {
+            AppError::NotFound(_) => {}
+            other => panic!("expected NotFound (404) for unknown connection, got {other:?}"),
+        }
     }
 }
 
