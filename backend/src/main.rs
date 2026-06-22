@@ -947,9 +947,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let http_shutdown_token = shutdown_token.clone();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-        .await?;
+    // Install `ConnectInfo<SocketAddr>` so the TCP peer address is available
+    // in request extensions. Without it, `extract_client_ip_addr` never sees
+    // a peer and the per-IP rate-limit key degenerates to the constant
+    // `ip:unknown` bucket for every unauthenticated request (direct-to-backend
+    // topology with no X-Forwarded-For), collapsing the login limiter into a
+    // single global counter that 429s every account at once.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
+    .await?;
 
     tracing::info!("HTTP server shut down");
 

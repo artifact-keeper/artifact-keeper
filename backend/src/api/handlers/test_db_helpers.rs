@@ -112,6 +112,8 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_api_per_window: 5000,
         rate_limit_search_per_window: 300,
         rate_limit_presign_per_window: 30,
+
+        rate_limit_login_global_per_window: 8192,
         rate_limit_password_change_per_window: 5,
         rate_limit_password_change_window_secs: 900,
         rate_limit_window_secs: 60,

@@ -380,6 +380,17 @@ pub struct Config {
     /// the storage backend the attacker can drive in parallel. See
     /// #1053. Env var: `RATE_LIMIT_PRESIGN_PER_MIN`. Default: 30.
     pub rate_limit_presign_per_window: u32,
+    /// Global backstop cap on unauthenticated login attempts per
+    /// `rate_limit_window_secs`, shared across ALL `(username, source-IP)`
+    /// keys. The login limiter partitions its budget per-`(username, ip)` so
+    /// a junk flood against one identity/origin cannot lock out other
+    /// accounts; this backstop bounds the total login volume (and therefore
+    /// the size of the per-key map) so a username-cycling attacker cannot
+    /// exhaust memory via unbounded distinct keys. Sized far above any
+    /// legitimate concurrent-login volume so real users never reach it; it
+    /// sheds rather than starves. Env var:
+    /// `RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW`. Default: 8192.
+    pub rate_limit_login_global_per_window: u32,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -554,6 +565,7 @@ redacted_debug!(Config {
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
+    show rate_limit_login_global_per_window,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -646,6 +658,7 @@ impl Default for Config {
             rate_limit_api_per_window: 10000,
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
+            rate_limit_login_global_per_window: 8192,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -831,6 +844,10 @@ impl Config {
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
             rate_limit_presign_per_window: env_parse("RATE_LIMIT_PRESIGN_PER_MIN", 30),
+            rate_limit_login_global_per_window: env_parse(
+                "RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW",
+                8192,
+            ),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,

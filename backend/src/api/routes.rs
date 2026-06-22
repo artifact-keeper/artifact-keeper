@@ -22,8 +22,8 @@ use super::middleware::auth::{
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::rate_limit::{
-    rate_limit_by_ip_middleware, rate_limit_middleware, RateLimitExemptions, RateLimitState,
-    RateLimiter,
+    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
+    LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
@@ -301,6 +301,16 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_presign_per_window,
         state.config.rate_limit_window_secs,
     ));
+    // Global shedding backstop for the login path. The login limiter keys
+    // per-(username, IP); this single-bucket backstop bounds the total login
+    // volume per window (and therefore the size of the per-key map) so a
+    // username-cycling attacker cannot exhaust memory via unbounded distinct
+    // keys. Sized far above any legitimate concurrent-login volume so real
+    // users never reach it; it sheds rather than starves.
+    let login_global_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_login_global_per_window,
+        state.config.rate_limit_window_secs,
+    ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
@@ -324,6 +334,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&auth_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+    };
+    // Login-only state: keys the shared auth limiter per-(username, IP) and
+    // gates it behind the global shedding backstop. Applied only to /login so
+    // /logout and /refresh keep the plain IP-keyed limiter.
+    let login_rate_limit_state = LoginRateLimitState {
+        inner: RateLimitState {
+            limiter: Arc::clone(&auth_rate_limiter),
+            exemptions: Arc::clone(&exemptions),
+            enabled: rate_limit_enabled,
+        },
+        backstop: Arc::clone(&login_global_rate_limiter),
     };
     // Separate state for the unauthenticated TOTP second-factor endpoint
     // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
@@ -361,6 +382,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let api_cleanup = Arc::clone(&api_rate_limiter);
         let search_cleanup = Arc::clone(&search_rate_limiter);
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
+        let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -370,6 +392,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 api_cleanup.cleanup_expired().await;
                 search_cleanup.cleanup_expired().await;
                 presign_cleanup.cleanup_expired().await;
+                login_global_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
             }
         });
@@ -393,7 +416,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
-        // Auth routes - split into public and protected (rate limited)
+        // Auth routes - split into login / public / protected (rate limited).
+        // /login carries the per-(username, IP) login limiter so a junk flood
+        // against one identity/origin cannot lock out other accounts; /logout
+        // and /refresh (no `username` field) keep the plain IP-keyed limiter.
+        .nest(
+            "/auth",
+            handlers::auth::login_router().layer(middleware::from_fn_with_state(
+                login_rate_limit_state,
+                login_rate_limit_middleware,
+            )),
+        )
         .nest(
             "/auth",
             handlers::auth::public_router().layer(middleware::from_fn_with_state(

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
+    body::Body,
     extract::{Request, State},
     http::{header::HeaderValue, StatusCode},
     middleware::Next,
@@ -15,6 +16,12 @@ use axum::{
 };
 
 use super::auth::AuthExtension;
+
+/// Maximum login request body we will buffer to peek the `username` for
+/// per-account rate-limit keying. Login payloads are tiny (`{"username":...,
+/// "password":...}`); anything larger is not a legitimate login and is keyed
+/// by IP alone (it still passes through to the handler, which rejects it).
+const LOGIN_BODY_PEEK_LIMIT: usize = 64 * 1024;
 
 /// A parsed CIDR range used for IP-based rate-limit exemption (#969).
 ///
@@ -159,6 +166,70 @@ pub fn rate_limiting_active(enabled: bool) -> bool {
     enabled
 }
 
+/// Pull an `AuthExtension` out of request extensions, whether it was inserted
+/// directly (required-auth middleware) or as an `Option` (optional-auth
+/// middleware). Shared by every rate-limit middleware.
+fn auth_from_request(request: &Request) -> Option<AuthExtension> {
+    request
+        .extensions()
+        .get::<AuthExtension>()
+        .cloned()
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<Option<AuthExtension>>()
+                .and_then(|opt| opt.clone())
+        })
+}
+
+/// Run the username/service-account and trusted-CIDR exemption checks shared by
+/// every rate-limit middleware (#969). Returns `Some(tag)` with the
+/// `X-RateLimit-Exempt` header value when the request is exempt (the caller then
+/// runs `next` and tags the response), or `None` so the caller proceeds to keyed
+/// limiting.
+fn check_rate_limit_exemptions(
+    exemptions: &RateLimitExemptions,
+    auth: Option<&AuthExtension>,
+    request: &Request,
+) -> Option<&'static str> {
+    // User/service-account exemption.
+    if let Some(auth) = auth {
+        if exemptions.is_exempt(auth) {
+            return Some("true");
+        }
+    }
+    // Trusted-CIDR exemption (#969): applies to authed and unauthed alike.
+    if !exemptions.trusted_cidrs.is_empty() {
+        if let Some(ip) = extract_client_ip_addr(request) {
+            if exemptions.is_trusted_cidr(ip) {
+                return Some("trusted-cidr");
+            }
+        }
+    }
+    None
+}
+
+/// Tag a response as rate-limit-exempt and return it.
+fn tag_exempt(mut response: Response, tag: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(tag) {
+        response.headers_mut().insert("X-RateLimit-Exempt", value);
+    }
+    response
+}
+
+/// Attach the `X-RateLimit-Limit` / `X-RateLimit-Remaining` headers to an
+/// allowed response.
+fn tag_allowed(mut response: Response, max_requests: u32, remaining: u32) -> Response {
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&max_requests.to_string()) {
+        headers.insert("X-RateLimit-Limit", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
+        headers.insert("X-RateLimit-Remaining", value);
+    }
+    response
+}
+
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
 ///
 /// This limiter is **not shared across replicas**. Each application instance
@@ -254,42 +325,11 @@ pub async fn rate_limit_middleware(
     }
 
     // Extract auth from extensions (required or optional middleware)
-    let auth = request
-        .extensions()
-        .get::<AuthExtension>()
-        .cloned()
-        .or_else(|| {
-            request
-                .extensions()
-                .get::<Option<AuthExtension>>()
-                .and_then(|opt| opt.clone())
-        });
+    let auth = auth_from_request(&request);
 
-    // User/service-account exemptions
-    if let Some(ref auth) = auth {
-        if state.exemptions.is_exempt(auth) {
-            let mut response = next.run(request).await;
-            if let Ok(value) = HeaderValue::from_str("true") {
-                response.headers_mut().insert("X-RateLimit-Exempt", value);
-            }
-            return response;
-        }
-    }
-
-    // Trusted-CIDR exemption (#969). Applies to authed and unauthed
-    // requests alike: a sidecar probe or in-cluster CI runner calling
-    // /api/v1/auth/login from a known internal range bypasses the
-    // limiter so concurrent test pods don't exhaust the auth bucket.
-    if !state.exemptions.trusted_cidrs.is_empty() {
-        if let Some(ip) = extract_client_ip_addr(&request) {
-            if state.exemptions.is_trusted_cidr(ip) {
-                let mut response = next.run(request).await;
-                if let Ok(value) = HeaderValue::from_str("trusted-cidr") {
-                    response.headers_mut().insert("X-RateLimit-Exempt", value);
-                }
-                return response;
-            }
-        }
+    // Username/service-account + trusted-CIDR exemptions (#969).
+    if let Some(tag) = check_rate_limit_exemptions(&state.exemptions, auth.as_ref(), &request) {
+        return tag_exempt(next.run(request).await, tag);
     }
 
     // Determine the rate limit key
@@ -302,46 +342,14 @@ pub async fn rate_limit_middleware(
 
     // Check rate limit
     match state.limiter.check_rate_limit(&key).await {
-        Ok(remaining) => {
-            let mut response = next.run(request).await;
-
-            // Add rate limit headers to successful responses
-            let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
-                headers.insert("X-RateLimit-Limit", value);
-            }
-            if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
-                headers.insert("X-RateLimit-Remaining", value);
-            }
-
-            response
-        }
+        Ok(remaining) => tag_allowed(
+            next.run(request).await,
+            state.limiter.max_requests,
+            remaining,
+        ),
         Err(retry_after) => {
-            tracing::debug!(
-                key = %key,
-                retry_after = retry_after,
-                "rate limit exceeded"
-            );
-
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded. Please try again later.",
-            )
-                .into_response();
-
-            // Add Retry-After header
-            let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.insert("Retry-After", value);
-            }
-            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
-                headers.insert("X-RateLimit-Limit", value);
-            }
-            if let Ok(value) = HeaderValue::from_str("0") {
-                headers.insert("X-RateLimit-Remaining", value);
-            }
-
-            response
+            tracing::debug!(key = %key, retry_after, "rate limit exceeded");
+            too_many_requests(retry_after, state.limiter.max_requests)
         }
     }
 }
@@ -368,42 +376,12 @@ pub async fn rate_limit_by_ip_middleware(
         return next.run(request).await;
     }
 
-    // Username / service-account exemption: legitimate batch downloads
-    // by admin / CI bots should not be throttled even when they
-    // originate from a single egress IP.
-    let auth = request
-        .extensions()
-        .get::<AuthExtension>()
-        .cloned()
-        .or_else(|| {
-            request
-                .extensions()
-                .get::<Option<AuthExtension>>()
-                .and_then(|opt| opt.clone())
-        });
-    if let Some(ref auth) = auth {
-        if state.exemptions.is_exempt(auth) {
-            let mut response = next.run(request).await;
-            if let Ok(value) = HeaderValue::from_str("true") {
-                response.headers_mut().insert("X-RateLimit-Exempt", value);
-            }
-            return response;
-        }
-    }
-
-    // Trusted-CIDR exemption (#969): sidecar probes / in-cluster CI
-    // runners / service-mesh nodes that originate from a known
-    // internal range bypass the limiter regardless of auth.
-    if !state.exemptions.trusted_cidrs.is_empty() {
-        if let Some(ip) = extract_client_ip_addr(&request) {
-            if state.exemptions.is_trusted_cidr(ip) {
-                let mut response = next.run(request).await;
-                if let Ok(value) = HeaderValue::from_str("trusted-cidr") {
-                    response.headers_mut().insert("X-RateLimit-Exempt", value);
-                }
-                return response;
-            }
-        }
+    // Username/service-account + trusted-CIDR exemptions (#969). Legitimate
+    // batch downloads by admin / CI bots (or trusted internal ranges) should
+    // not be throttled even when they share a single egress IP.
+    let auth = auth_from_request(&request);
+    if let Some(tag) = check_rate_limit_exemptions(&state.exemptions, auth.as_ref(), &request) {
+        return tag_exempt(next.run(request).await, tag);
     }
 
     // The whole point of this variant: key by IP, not user_id. An
@@ -412,41 +390,168 @@ pub async fn rate_limit_by_ip_middleware(
     let key = extract_client_ip(&request);
 
     match state.limiter.check_rate_limit(&key).await {
-        Ok(remaining) => {
-            let mut response = next.run(request).await;
-            let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
-                headers.insert("X-RateLimit-Limit", value);
-            }
-            if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
-                headers.insert("X-RateLimit-Remaining", value);
-            }
-            response
-        }
+        Ok(remaining) => tag_allowed(
+            next.run(request).await,
+            state.limiter.max_requests,
+            remaining,
+        ),
         Err(retry_after) => {
-            tracing::debug!(
-                key = %key,
-                retry_after = retry_after,
-                "presign-mint rate limit exceeded"
-            );
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded. Please try again later.",
-            )
-                .into_response();
-            let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.insert("Retry-After", value);
-            }
-            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
-                headers.insert("X-RateLimit-Limit", value);
-            }
-            if let Ok(value) = HeaderValue::from_str("0") {
-                headers.insert("X-RateLimit-Remaining", value);
-            }
-            response
+            tracing::debug!(key = %key, retry_after, "presign-mint rate limit exceeded");
+            too_many_requests(retry_after, state.limiter.max_requests)
         }
     }
+}
+
+/// State for the login-only rate-limit middleware.
+///
+/// Wraps the standard [`RateLimitState`] (the shared auth limiter, exemptions,
+/// and master switch — used here so the login path honors exactly the same
+/// username/service-account exemptions, trusted-CIDR exemptions (#969), and
+/// master off-switch (#1602) as [`rate_limit_middleware`]) and adds a global
+/// backstop limiter. The auth limiter is keyed per-`(username, source-IP)` so a
+/// junk flood against one identity/origin cannot exhaust the budget for other
+/// accounts; the backstop bounds the total login volume (and the size of the
+/// per-key map) so a username-cycling attacker cannot drive unbounded distinct
+/// keys.
+#[derive(Debug, Clone)]
+pub struct LoginRateLimitState {
+    /// Per-`(username, ip)` auth limiter + exemptions + master switch.
+    pub inner: RateLimitState,
+    /// Global shedding backstop, keyed on a single constant bucket. Capacity is
+    /// sized far above any legitimate concurrent-login volume.
+    pub backstop: Arc<RateLimiter>,
+}
+
+/// Build the login rate-limit key from a username and the request's client IP.
+///
+/// Extracted as a pure function so the keyspace contract (one bucket per
+/// `(username, ip)` pair) is unit-testable without constructing middleware.
+/// Login is case-sensitive at the auth layer (the `WHERE username = $1` lookup
+/// uses no `LOWER`/`ILIKE`), so the username is used verbatim to match the auth
+/// identity 1:1.
+pub fn login_rate_limit_key(username: &str, client_ip: &str) -> String {
+    format!("login:{}|{}", username, client_ip)
+}
+
+/// Login-only rate-limit middleware.
+///
+/// Variant of [`rate_limit_middleware`] for the unauthenticated `POST
+/// /auth/login` route. It buffers the (tiny) login JSON, extracts `username`,
+/// and keys the auth limiter per-`(username, source-IP)` instead of per-IP, so
+/// a junk flood against one identity/origin exhausts only its own bucket and
+/// correct logins by other users — or the same user from another IP — are
+/// unaffected, while per-account brute-force caps still hold.
+///
+/// A global backstop limiter (keyed on one constant bucket) sheds once total
+/// login volume per window exceeds its high ceiling, bounding the per-key map
+/// against a username-cycling attacker.
+///
+/// Username/service-account exemptions, trusted-CIDR exemptions (#969), and the
+/// master off-switch (#1602) are honored identically to [`rate_limit_middleware`].
+pub async fn login_rate_limit_middleware(
+    State(state): State<LoginRateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let inner = &state.inner;
+
+    // Master off switch (#1602): bypass the limiter entirely.
+    if !rate_limiting_active(inner.enabled) {
+        return next.run(request).await;
+    }
+
+    // Username/service-account + trusted-CIDR exemptions (#969). /login is
+    // unauthenticated, but optional-auth middleware could populate an
+    // AuthExtension upstream; honor the same exemption contract as
+    // rate_limit_middleware for parity.
+    let auth = auth_from_request(&request);
+    if let Some(tag) = check_rate_limit_exemptions(&inner.exemptions, auth.as_ref(), &request) {
+        return tag_exempt(next.run(request).await, tag);
+    }
+
+    // Resolve the client IP before consuming the body.
+    let client_ip = extract_client_ip(&request);
+
+    // Buffer the (small) login body so we can peek `username`, then re-attach
+    // it unchanged for the handler's custom Json extractor.
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, LOGIN_BODY_PEEK_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            // Body too large or unreadable: not a legitimate login. Reconstruct
+            // an empty-bodied request keyed by IP and let the handler reject it.
+            let request = Request::from_parts(parts, Body::empty());
+            return run_login_with_key(&state, &client_ip, request, next).await;
+        }
+    };
+
+    // Best-effort username extraction; on any parse failure fall back to an
+    // IP-only key (the body is still forwarded unchanged for the handler).
+    let username = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("username")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+        });
+
+    let key = match username {
+        Some(name) => login_rate_limit_key(&name, &client_ip),
+        None => client_ip.clone(),
+    };
+
+    // Reattach the buffered body unchanged (Content-Type/headers in `parts`
+    // are preserved) so the login handler's extractor sees the original body.
+    let request = Request::from_parts(parts, Body::from(bytes));
+    run_login_with_key(&state, &key, request, next).await
+}
+
+/// Apply the global backstop, then the per-key login limiter, then run the
+/// request. Shared tail of [`login_rate_limit_middleware`] so both the
+/// normal and the oversized-body paths key and shed identically.
+async fn run_login_with_key(
+    state: &LoginRateLimitState,
+    key: &str,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Global backstop first: sheds (rather than starves) once total login
+    // volume per window exceeds its high ceiling.
+    if let Err(retry_after) = state.backstop.check_rate_limit("login:global").await {
+        return too_many_requests(retry_after, state.backstop.max_requests);
+    }
+
+    match state.inner.limiter.check_rate_limit(key).await {
+        Ok(remaining) => tag_allowed(
+            next.run(request).await,
+            state.inner.limiter.max_requests,
+            remaining,
+        ),
+        Err(retry_after) => {
+            tracing::debug!(key = %key, retry_after, "login rate limit exceeded");
+            too_many_requests(retry_after, state.inner.limiter.max_requests)
+        }
+    }
+}
+
+/// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers.
+fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "Rate limit exceeded. Please try again later.",
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        headers.insert("Retry-After", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&max_requests.to_string()) {
+        headers.insert("X-RateLimit-Limit", value);
+    }
+    if let Ok(value) = HeaderValue::from_str("0") {
+        headers.insert("X-RateLimit-Remaining", value);
+    }
+    response
 }
 
 /// Extract the client IP address from the request.
@@ -1224,5 +1329,248 @@ mod tests {
              limiter keys the request; otherwise search is keyed by IP and \
              collapses all callers into one bucket"
         );
+    }
+
+    // ── Login per-(username, IP) limiter (login-ratelimit-global-dos) ─────────
+
+    #[test]
+    fn test_login_rate_limit_key_partitions_by_user_and_ip() {
+        // The key must combine username and IP: same user different IP, and
+        // same IP different user, must all be distinct buckets.
+        let a = login_rate_limit_key("alice", "ip:10.0.0.1");
+        let b = login_rate_limit_key("bob", "ip:10.0.0.1"); // same IP, diff user
+        let c = login_rate_limit_key("alice", "ip:10.0.0.2"); // same user, diff IP
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        // Stable for the same (user, ip).
+        assert_eq!(a, login_rate_limit_key("alice", "ip:10.0.0.1"));
+    }
+
+    #[test]
+    fn test_login_rate_limit_key_is_case_sensitive() {
+        // Login is case-sensitive at the auth layer, so the key must be too.
+        assert_ne!(
+            login_rate_limit_key("Admin", "ip:10.0.0.1"),
+            login_rate_limit_key("admin", "ip:10.0.0.1")
+        );
+    }
+
+    /// Build a login middleware app with the given per-key and backstop caps.
+    fn login_app(per_key: u32, backstop: u32) -> axum::Router {
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(per_key, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+            },
+            backstop: Arc::new(RateLimiter::new(backstop, 60)),
+        };
+        axum::Router::new()
+            .route("/login", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    /// Drive one login request for `username` from source IP `xff`.
+    async fn login_once(app: &axum::Router, username: &str, xff: &str) -> StatusCode {
+        use tower::ServiceExt;
+        let body = format!(r#"{{"username":"{username}","password":"x"}}"#);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", xff)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_login_flood_on_one_identity_does_not_lock_out_others() {
+        // The finding's exact claim: a flood on (user=x, ip=A) 429s, while
+        // (user=y, ip=B) and (user=y, ip=A) stay non-429.
+        let app = login_app(3, 10_000);
+
+        // Exhaust (x, A): first 3 OK, then 429.
+        assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(
+            login_once(&app, "x", "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "(x, A) must exhaust its own bucket"
+        );
+
+        // (y, B) and (y, A) must be unaffected by the (x, A) flood.
+        assert_eq!(
+            login_once(&app, "y", "10.0.0.2").await,
+            StatusCode::OK,
+            "different user on a different IP must have an independent bucket"
+        );
+        assert_eq!(
+            login_once(&app, "y", "10.0.0.1").await,
+            StatusCode::OK,
+            "different user on the SAME IP must have an independent bucket"
+        );
+        // The same victim user x from another IP is also fine.
+        assert_eq!(
+            login_once(&app, "x", "10.0.0.9").await,
+            StatusCode::OK,
+            "the same user from another IP must have an independent bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_global_backstop_sheds_with_retry_after() {
+        // Backstop capacity 2, huge per-key cap: distinct (user, ip) keys never
+        // hit their own bucket but the global backstop trips after 2 attempts.
+        let app = login_app(10_000, 2);
+        assert_eq!(login_once(&app, "u1", "10.0.0.1").await, StatusCode::OK);
+        assert_eq!(login_once(&app, "u2", "10.0.0.2").await, StatusCode::OK);
+
+        use tower::ServiceExt;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", "10.0.0.3")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"username":"u3","password":"x"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key("Retry-After"),
+            "backstop 429 must carry Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_middleware_preserves_body_for_handler() {
+        // A valid login through the middleware must reach the handler with its
+        // body intact (the handler here echoes the parsed username back).
+        use axum::routing::post;
+        use tower::ServiceExt;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(100, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/login",
+                post(|body: axum::body::Bytes| async move {
+                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    v.get("username").unwrap().as_str().unwrap().to_string()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", "10.0.0.1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"username":"carol","password":"secret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            &bytes[..],
+            b"carol",
+            "handler must receive the original body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_middleware_master_switch_bypasses() {
+        // With the master switch off (#1602), the login middleware must never
+        // 429 even past the per-key capacity.
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(1, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: false,
+            },
+            backstop: Arc::new(RateLimiter::new(1, 60)),
+        };
+        let app = axum::Router::new()
+            .route("/login", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ));
+        for _ in 0..5 {
+            assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_login_middleware_username_exemption_bypasses() {
+        // A username on the exemption list bypasses the login limiter even
+        // when an AuthExtension was populated upstream.
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(1, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(vec!["ci-bot".into()], false)),
+                enabled: true,
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+        };
+        let app = axum::Router::new()
+            .route("/login", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ))
+            // Outer: inject an exempt principal (models optional auth resolving).
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    request.extensions_mut().insert(AuthExtension {
+                        user_id: uuid::Uuid::new_v4(),
+                        username: "ci-bot".to_string(),
+                        email: "ci-bot@test".to_string(),
+                        is_admin: false,
+                        is_api_token: false,
+                        is_service_account: false,
+                        scopes: None,
+                        allowed_repo_ids: None,
+                    });
+                    next.run(request).await
+                },
+            ));
+        for _ in 0..5 {
+            assert_eq!(login_once(&app, "ci-bot", "10.0.0.1").await, StatusCode::OK);
+        }
     }
 }

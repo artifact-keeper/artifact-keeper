@@ -66,10 +66,22 @@ fn login_response(
     response
 }
 
-/// Create public auth routes (no auth required)
+/// Create the login route (no auth required).
+///
+/// Split out from [`public_router`] so the login path can carry the
+/// per-`(username, IP)` `login_rate_limit_middleware` while `/logout` and
+/// `/refresh` — which carry no `username` field — keep the unchanged IP-keyed
+/// `rate_limit_middleware`.
+pub fn login_router() -> Router<SharedState> {
+    Router::new().route("/login", post(login))
+}
+
+/// Create public auth routes (no auth required).
+///
+/// `/login` is intentionally NOT included here; it is wired separately via
+/// [`login_router`] so only it gets the username-peeking login limiter.
 pub fn public_router() -> Router<SharedState> {
     Router::new()
-        .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
 }
