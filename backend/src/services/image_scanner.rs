@@ -123,11 +123,23 @@ impl ImageScanner {
     /// `:` for tags per the OCI distribution spec (#1483). Using `:` for
     /// digest refs produces a string the Trivy CLI rejects with
     /// "could not parse reference".
-    fn extract_image_ref(artifact: &Artifact) -> Option<String> {
+    /// `body` is the in-hand manifest body the orchestrator already loaded.
+    /// For a multi-arch image index it is used to resolve a concrete scannable
+    /// child-platform digest before the join (#1971); for single-arch /
+    /// malformed / absent bodies the reference is unchanged (passthrough).
+    /// Applicability gating has no body and passes `None`, so it stays
+    /// path-only. The resolved digest flows through both `scan_with_trivy` and
+    /// the HTTP-Twirp fallback `scan_with_trivy_http` unchanged.
+    fn extract_image_ref(artifact: &Artifact, body: Option<&[u8]>) -> Option<String> {
         let (name, reference) =
             crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+        let resolved = crate::services::scanner_service::resolve_scan_reference(
+            body.unwrap_or_default(),
+            reference,
+        )
+        .into_reference();
         Some(crate::services::scanner_service::join_oci_image_ref(
-            name, reference,
+            name, &resolved,
         ))
     }
 
@@ -330,7 +342,7 @@ impl Scanner for ImageScanner {
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
-        _content: &Bytes,
+        content: &Bytes,
     ) -> Result<ScanOutput> {
         debug_assert!(
             Self::is_container_image(artifact),
@@ -342,7 +354,10 @@ impl Scanner for ImageScanner {
         // That is a real error, not a "not applicable" case: surface it as
         // a failed scan so the operator sees error_message rather than a
         // silent completed-with-zero-findings row (issue #994).
-        let image_ref = match Self::extract_image_ref(artifact) {
+        // #1971: pass the in-hand manifest body so a multi-arch image index is
+        // resolved to a concrete scannable child digest before trivy (CLI or
+        // the HTTP-Twirp fallback) sees it.
+        let image_ref = match Self::extract_image_ref(artifact, Some(content)) {
             Some(r) => r,
             None => {
                 return Err(AppError::Internal(format!(
@@ -434,7 +449,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some("myapp:v1.0.0".to_string())
         );
     }
@@ -446,7 +461,7 @@ mod tests {
             "application/vnd.docker.distribution.manifest.v2+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some("org/myapp:v1.0.0".to_string())
         );
     }
@@ -465,7 +480,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some(
                 "org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
                     .to_string()
@@ -476,7 +491,50 @@ mod tests {
     #[test]
     fn test_extract_image_ref_invalid_path() {
         let artifact = make_test_artifact("some/random/path", "application/json");
-        assert_eq!(ImageScanner::extract_image_ref(&artifact), None);
+        assert_eq!(ImageScanner::extract_image_ref(&artifact, None), None);
+    }
+
+    /// #1971: an image-index body threaded into extract_image_ref resolves the
+    /// tag ref to a concrete child digest (name@sha256:<child>), so Trivy (CLI
+    /// or the HTTP-Twirp fallback) scans a real image rather than relying on a
+    /// default platform pick that can produce an empty SBOM.
+    #[test]
+    fn test_extract_image_ref_resolves_index_to_child_digest() {
+        let child = match crate::services::scanner_service::runner_arch() {
+            "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        };
+        let index_body = r#"{"manifests":[
+             {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
+             {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
+           ]}"#;
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/latest",
+            "application/vnd.oci.image.index.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(index_body.as_bytes())),
+            Some(format!("org/myapp@{}", child))
+        );
+    }
+
+    /// #1971 regression: a single-arch image body leaves the tag ref unchanged
+    /// (passthrough) — identical to the no-body path.
+    #[test]
+    fn test_extract_image_ref_single_arch_body_is_unchanged() {
+        let single_arch = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/v1.0.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
+            ImageScanner::extract_image_ref(&artifact, None),
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
+            Some("org/myapp:v1.0.0".to_string())
+        );
     }
 
     #[test]

@@ -208,6 +208,177 @@ pub fn is_oci_digest_reference(reference: &str) -> bool {
     }
 }
 
+/// Normalize the host CPU architecture to the OCI `platform.architecture`
+/// token used in image-index child descriptors (`amd64`, `arm64`, ...).
+///
+/// `std::env::consts::ARCH` reports the Rust target triple's arch (`x86_64`,
+/// `aarch64`), which does not match the OCI/Go `GOARCH` vocabulary an image
+/// index uses. We only map the two architectures Artifact Keeper actually
+/// runs on; anything else passes through unchanged so an exotic runner still
+/// gets a deterministic (if non-matching) token and falls back to the first
+/// linux child during resolution rather than panicking. Pure + host-stable so
+/// it can anchor the resolution unit tests (#1971).
+pub fn runner_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Outcome of resolving a scan reference against an in-hand manifest body.
+///
+/// Distinct variants make the three behaviors testable without inspecting the
+/// returned string: a single-arch / unparseable body is a no-op
+/// (`Passthrough`), an image index that yields a concrete scannable child
+/// rewrites the reference to that child digest (`ResolvedIndexChild`), and an
+/// index whose only children are attestation/unknown/empty manifests cannot be
+/// scanned at all (`UnresolvableIndex`, reference left unchanged so the caller
+/// still attempts the index ref rather than skipping the scan). See #1971.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanReferenceResolution {
+    /// Body is not an image index (single-arch image, malformed, or empty):
+    /// the reference is returned unchanged. The dominant single-arch path
+    /// (and digest-pinned #1483 refs) must hit this branch byte-for-byte.
+    Passthrough(String),
+    /// Body is an image index and a concrete scannable child platform manifest
+    /// was selected; the reference now addresses that child by digest.
+    ResolvedIndexChild(String),
+    /// Body is an image index but every child is attestation/unknown/empty, so
+    /// no scannable child digest exists. The reference is returned unchanged.
+    UnresolvableIndex(String),
+}
+
+impl ScanReferenceResolution {
+    /// The (possibly rewritten) reference to hand to the builders.
+    pub fn into_reference(self) -> String {
+        match self {
+            ScanReferenceResolution::Passthrough(r)
+            | ScanReferenceResolution::ResolvedIndexChild(r)
+            | ScanReferenceResolution::UnresolvableIndex(r) => r,
+        }
+    }
+}
+
+/// Whether an image-index child descriptor is an attestation / non-runnable
+/// manifest that must never be selected as a scan target. Selecting one
+/// re-introduces the empty-inventory bug (#1971), because attestation
+/// manifests carry no installed packages.
+///
+/// A child is excluded when ANY of the following hold:
+///   * `platform.os` or `platform.architecture` is `unknown` (the conventional
+///     marker `docker buildx` stamps onto attestation children),
+///   * `annotations["vnd.docker.reference.type"]` is `attestation-manifest`,
+///   * `artifactType` contains `in-toto` (SLSA/provenance attestations).
+fn is_excluded_index_child(child: &serde_json::Value) -> bool {
+    let platform = child.get("platform");
+    let os = platform
+        .and_then(|p| p.get("os"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let arch = platform
+        .and_then(|p| p.get("architecture"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if os.eq_ignore_ascii_case("unknown") || arch.eq_ignore_ascii_case("unknown") {
+        return true;
+    }
+    if child
+        .get("annotations")
+        .and_then(|a| a.get("vnd.docker.reference.type"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("attestation-manifest"))
+    {
+        return true;
+    }
+    if child
+        .get("artifactType")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.to_ascii_lowercase().contains("in-toto"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Resolve a scan `reference` against the manifest `body` the orchestrator
+/// already loaded for this artifact (#1971).
+///
+/// When `body` is an OCI / Docker image **index** (manifest list), grype and
+/// trivy would otherwise rely on their own default platform pick; if no child
+/// matches the runner platform — or the only match is an attestation/empty
+/// manifest — the scan catalogs zero packages and the SBOM is empty. To avoid
+/// that, we select a concrete scannable child-platform manifest digest from
+/// the body and rewrite the reference to address it directly, so the scanner
+/// enumerates a real image. Selection order:
+///
+/// 1. the child whose `platform.architecture` matches [`runner_arch`] (and
+///    `platform.os == "linux"`),
+/// 2. else the first `linux` child,
+/// 3. else the first remaining candidate.
+///
+/// Attestation/unknown children are excluded up front (see
+/// [`is_excluded_index_child`]).
+///
+/// For any body that is not an image index (single-arch image, malformed,
+/// empty, or missing the `manifests` array) the reference is returned
+/// unchanged ([`ScanReferenceResolution::Passthrough`]) so the dominant
+/// single-arch and digest-pinned (#1483) paths are byte-for-byte untouched.
+/// This is a pure parse + string rewrite: no network, fully unit-testable.
+pub fn resolve_scan_reference(body: &[u8], reference: &str) -> ScanReferenceResolution {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ScanReferenceResolution::Passthrough(reference.to_string());
+    };
+    let Some(manifests) = json.get("manifests").and_then(|m| m.as_array()) else {
+        // Not an image index (single-arch image manifest or other): no-op.
+        return ScanReferenceResolution::Passthrough(reference.to_string());
+    };
+
+    // Candidate = scannable child with a digest, excluding attestation/unknown.
+    let candidates: Vec<&serde_json::Value> = manifests
+        .iter()
+        .filter(|child| {
+            child
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .is_some_and(|d| !d.is_empty())
+                && !is_excluded_index_child(child)
+        })
+        .collect();
+
+    let child_os = |c: &serde_json::Value| -> String {
+        c.get("platform")
+            .and_then(|p| p.get("os"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let child_arch = |c: &serde_json::Value| -> String {
+        c.get("platform")
+            .and_then(|p| p.get("architecture"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let selected = candidates
+        .iter()
+        .find(|c| child_os(c) == "linux" && child_arch(c) == runner_arch())
+        .or_else(|| candidates.iter().find(|c| child_os(c) == "linux"))
+        .or_else(|| candidates.first());
+
+    match selected {
+        Some(child) => {
+            let digest = child
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            ScanReferenceResolution::ResolvedIndexChild(digest.to_string())
+        }
+        None => ScanReferenceResolution::UnresolvableIndex(reference.to_string()),
+    }
+}
+
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
 /// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
 /// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
@@ -11068,6 +11239,170 @@ mod tests {
             "digest ref must not use ':' between name and digest: {}",
             joined
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1971: resolve_scan_reference — OCI image-index → concrete child digest.
+    // Pure JSON parse + reference rewrite; no DB, no network, host-stable via
+    // runner_arch().
+    // -----------------------------------------------------------------------
+
+    const SHA_AMD64: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const SHA_ARM64: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const SHA_ATTEST: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn index_two_arch() -> String {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+                "manifests":[
+                  {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"amd64"}}}},
+                  {{"digest":"{SHA_ARM64}","platform":{{"os":"linux","architecture":"arm64"}}}}
+                ]}}"#
+        )
+    }
+
+    /// (1) An index with both runner-relevant arches resolves to the
+    /// runner-arch child digest (host-stable via runner_arch()).
+    #[test]
+    fn test_resolve_scan_reference_index_picks_runner_arch() {
+        let body = index_two_arch();
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        let expected = match runner_arch() {
+            "amd64" => SHA_AMD64,
+            "arm64" => SHA_ARM64,
+            // On an exotic runner neither linux child matches the arch, so the
+            // first linux child wins; assert it is one of the two real digests.
+            _ => SHA_AMD64,
+        };
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(expected.to_string())
+        );
+        // The joined builder form is name@sha256:... — assert via join.
+        assert_eq!(
+            join_oci_image_ref("host/repo/app", &res.into_reference()),
+            format!("host/repo/app@{}", expected)
+        );
+    }
+
+    /// (2) An index missing the runner arch falls back to the first linux
+    /// child (never empty / never UnresolvableIndex).
+    #[test]
+    fn test_resolve_scan_reference_index_falls_back_to_first_linux_child() {
+        // Single child whose arch is deliberately not the runner arch.
+        let other_arch = if runner_arch() == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{other_arch}"}}}}
+               ]}}"#
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (3) An index with an attestation child plus one real child selects the
+    /// real child, never the attestation digest.
+    #[test]
+    fn test_resolve_scan_reference_excludes_attestation_child() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","platform":{{"os":"unknown","architecture":"unknown"}},
+                   "annotations":{{"vnd.docker.reference.type":"attestation-manifest"}}}},
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{arch}"}}}}
+               ]}}"#,
+            arch = runner_arch()
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string()),
+            "must never select the attestation child"
+        );
+        assert_ne!(res.into_reference(), SHA_ATTEST);
+    }
+
+    /// (3b) artifactType in-toto and os=unknown are independently excluding.
+    #[test]
+    fn test_resolve_scan_reference_excludes_in_toto_artifact_type() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","artifactType":"application/vnd.in-toto+json"}},
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{arch}"}}}}
+               ]}}"#,
+            arch = runner_arch()
+        );
+        assert_eq!(
+            resolve_scan_reference(body.as_bytes(), "latest"),
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (4) An index whose only children are attestation/empty → Unresolvable;
+    /// reference is returned unchanged.
+    #[test]
+    fn test_resolve_scan_reference_attestation_only_index_is_unresolvable() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","platform":{{"os":"unknown","architecture":"unknown"}}}},
+                 {{"platform":{{"os":"linux","architecture":"amd64"}}}}
+               ]}}"#
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::UnresolvableIndex("latest".to_string())
+        );
+        assert_eq!(res.into_reference(), "latest");
+    }
+
+    /// (5) REGRESSION: a normal single-arch image manifest body (config, no
+    /// manifests[]) is passthrough — reference byte-for-byte unchanged.
+    #[test]
+    fn test_resolve_scan_reference_single_arch_is_passthrough() {
+        let body = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        assert_eq!(
+            resolve_scan_reference(body, "v1.0.0"),
+            ScanReferenceResolution::Passthrough("v1.0.0".to_string())
+        );
+        // Digest-pinned single manifest (#1483) also passes through unchanged.
+        assert_eq!(
+            resolve_scan_reference(body, SHA_AMD64),
+            ScanReferenceResolution::Passthrough(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (5b) REGRESSION: malformed / empty bodies are passthrough.
+    #[test]
+    fn test_resolve_scan_reference_malformed_body_is_passthrough() {
+        for body in [&b""[..], &b"not json"[..], &br#"{"schemaVersion":2}"#[..]] {
+            assert_eq!(
+                resolve_scan_reference(body, "latest"),
+                ScanReferenceResolution::Passthrough("latest".to_string())
+            );
+        }
+    }
+
+    /// (6) runner_arch() maps the two architectures Artifact Keeper runs on.
+    #[test]
+    fn test_runner_arch_maps_known_architectures() {
+        // Pure, deterministic on the current host.
+        match std::env::consts::ARCH {
+            "x86_64" => assert_eq!(runner_arch(), "amd64"),
+            "aarch64" => assert_eq!(runner_arch(), "arm64"),
+            other => assert_eq!(runner_arch(), other),
+        }
+        // The returned token must be a non-empty OCI arch token.
+        assert!(!runner_arch().is_empty());
     }
 
     struct ContextOnlyScanner;
