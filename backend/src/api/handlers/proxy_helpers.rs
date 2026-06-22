@@ -2865,6 +2865,31 @@ pub async fn serve_local_artifact(
     content_type: &str,
     content_disposition_filename: Option<&str>,
 ) -> Result<Response, Response> {
+    serve_local_artifact_redirectable(
+        state,
+        repo,
+        artifact_id,
+        storage_key,
+        content_type,
+        content_disposition_filename,
+        true,
+    )
+    .await
+}
+
+/// Like `serve_local_artifact`, but `allow_redirect` lets a format opt out of
+/// the presigned-download redirect and keep streaming. HuggingFace opts out:
+/// its client reads `X-Linked-Etag` / `X-Linked-Size` off the `/resolve/`
+/// response, which a bare 302 to object storage cannot carry.
+pub async fn serve_local_artifact_redirectable(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    storage_key: &str,
+    content_type: &str,
+    content_disposition_filename: Option<&str>,
+    allow_redirect: bool,
+) -> Result<Response, Response> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -2872,6 +2897,26 @@ pub async fn serve_local_artifact(
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
         .await
         .map_err(|e| e.into_response())?;
+
+    // Redirect to a presigned storage URL when enabled, so clients pull the
+    // artifact directly from object storage instead of streaming through the
+    // backend. Falls back to streaming when redirects are unsupported (e.g.
+    // filesystem) or the caller opted out. Used by rubygems, hex, cran, helm,
+    // puppet, ansible; huggingface opts out (allow_redirect = false).
+    if allow_redirect && state.config.presigned_downloads_enabled {
+        let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
+        if let Some(redirect) =
+            try_presigned_redirect(storage.as_ref(), storage_key, true, expiry).await
+        {
+            let _ = sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+            )
+            .bind(artifact_id)
+            .execute(&state.db)
+            .await;
+            return Ok(redirect);
+        }
+    }
 
     let content = storage
         .get(storage_key)
