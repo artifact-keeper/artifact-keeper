@@ -17,8 +17,14 @@
 //! that has been granted ALL of the following permissions, or SBOM submission
 //! will silently 401/403 and DT will stay empty even when scans look green:
 //!
-//! - `PROJECT_CREATION_UPLOAD` -- required by [`Self::create_project`]
-//!   (`PUT /api/v1/project`).
+//! - `PORTFOLIO_MANAGEMENT` -- required by [`Self::create_project`]
+//!   (`PUT /api/v1/project`). The explicit project-creation path AK uses
+//!   (look up, then create) is gated on this permission, not
+//!   `PROJECT_CREATION_UPLOAD`. See [`Self::get_or_create_project`].
+//! - `PROJECT_CREATION_UPLOAD` -- gates DT's *implicit* auto-create path
+//!   (`PUT /api/v1/bom` with `autoCreate=true`, one round trip). AK does not
+//!   currently use that path, but the permission is listed for operators who
+//!   switch the integration to it.
 //! - `BOM_UPLOAD` -- required by [`Self::upload_sbom`]
 //!   (`PUT /api/v1/bom`).
 //! - `VIEW_PORTFOLIO` -- required by [`Self::find_project`],
@@ -31,7 +37,7 @@
 //! permissions. The bundled [`docker/init-dtrack.sh`](../../../docker/init-dtrack.sh)
 //! bootstrap script grants them after creating the API key. Operators who
 //! bring their own DT instance (or set `dependencyTrack.existingApiKeySecret`
-//! in the Helm chart) must grant the four permissions out of band, either
+//! in the Helm chart) must grant the five permissions out of band, either
 //! via the DT UI (Administration -> Teams -> permissions tab) or via
 //! `POST /api/v1/permission/{perm}/team/{uuid}`.
 //!
@@ -89,8 +95,8 @@ fn dt_transport_err(operation: &str, err: reqwest::Error) -> AppError {
 pub(crate) const DT_PERMISSIONS_HINT: &str =
     "Dependency-Track rejected the request (auth/permission failure). \
      The API key's team must have ALL of: BOM_UPLOAD, PROJECT_CREATION_UPLOAD, \
-     VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default 'Automation' team has \
-     none of these; grant them via the DT UI \
+     PORTFOLIO_MANAGEMENT, VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default \
+     'Automation' team has none of these; grant them via the DT UI \
      (Administration -> Teams -> permissions) or \
      POST /api/v1/permission/{permission}/team/{uuid}.";
 
@@ -122,7 +128,7 @@ fn dt_upstream_status_err(
             status = status.as_u16(),
             body = truncated,
             permissions_required =
-                "BOM_UPLOAD, PROJECT_CREATION_UPLOAD, VIEW_PORTFOLIO, VIEW_VULNERABILITY",
+                "BOM_UPLOAD, PROJECT_CREATION_UPLOAD, PORTFOLIO_MANAGEMENT, VIEW_PORTFOLIO, VIEW_VULNERABILITY",
             "Dependency-Track rejected request with auth/permission failure -- \
              check that the API key's team has the required permissions"
         );
@@ -672,7 +678,16 @@ impl DependencyTrackService {
         }
     }
 
-    /// Get or create a project for a repository
+    /// Get or create a project for a repository.
+    ///
+    /// This takes DT's *explicit* two-step path: look the project up
+    /// ([`Self::find_project`]) and, if absent, create it via
+    /// `PUT /api/v1/project` ([`Self::create_project`]). DT gates that explicit
+    /// create on the `PORTFOLIO_MANAGEMENT` team permission. The alternative
+    /// *implicit* path -- `PUT /api/v1/bom` with `autoCreate=true`, which
+    /// creates the project as a side effect of the BOM upload -- is gated on
+    /// `PROJECT_CREATION_UPLOAD` instead. AK uses the explicit path, so
+    /// `PORTFOLIO_MANAGEMENT` is the permission that matters here.
     pub async fn get_or_create_project(
         &self,
         name: &str,
@@ -2579,6 +2594,11 @@ mod tests {
             msg
         );
         assert!(
+            msg.contains("PORTFOLIO_MANAGEMENT"),
+            "missing PORTFOLIO_MANAGEMENT hint in: {}",
+            msg
+        );
+        assert!(
             msg.contains("VIEW_PORTFOLIO"),
             "missing VIEW_PORTFOLIO hint in: {}",
             msg
@@ -2642,6 +2662,13 @@ mod tests {
         assert!(
             msg.contains("PROJECT_CREATION_UPLOAD"),
             "missing PROJECT_CREATION_UPLOAD hint in: {}",
+            msg
+        );
+        // The explicit `PUT /api/v1/project` path AK takes is gated on
+        // PORTFOLIO_MANAGEMENT; the hint must name it or operators under-provision.
+        assert!(
+            msg.contains("PORTFOLIO_MANAGEMENT"),
+            "missing PORTFOLIO_MANAGEMENT hint in: {}",
             msg
         );
         assert!(
