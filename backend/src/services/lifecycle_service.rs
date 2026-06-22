@@ -92,6 +92,24 @@ impl CascadeScope {
     }
 }
 
+/// Whether a policy type can only operate against a single repository.
+///
+/// `max_versions` keeps the latest N versions *per package within one repo*,
+/// and `size_quota_bytes` enforces a *per-repo* storage budget; both
+/// `execute_*` implementations hard-require `policy.repository_id` and fail
+/// at runtime if it is NULL (see `execute_max_versions` /
+/// `execute_size_quota`). The other four types (`max_age_days`,
+/// `no_downloads_days`, `tag_pattern_keep`, `tag_pattern_delete`) gate on
+/// `($1::UUID IS NULL OR a.repository_id = $1)` and run cluster-wide when
+/// `repository_id` is NULL, so a global policy of those types is legitimate.
+///
+/// This is the single source of truth used by create/update validation to
+/// reject an unusable repo-scoped policy at creation time (#1850) rather than
+/// letting it silently fail on every execution.
+pub(crate) fn policy_type_requires_repository_id(policy_type: &str) -> bool {
+    matches!(policy_type, "max_versions" | "size_quota_bytes")
+}
+
 impl From<Option<Uuid>> for CascadeScope {
     fn from(value: Option<Uuid>) -> Self {
         match value {
@@ -326,6 +344,17 @@ impl LifecycleService {
             )));
         }
 
+        // Reject repo-scoped policy types created without a repository_id.
+        // These (`max_versions`, `size_quota_bytes`) require a repository_id
+        // at execute time and would otherwise fail on every run (#1850).
+        if req.repository_id.is_none() && policy_type_requires_repository_id(&req.policy_type) {
+            return Err(AppError::Validation(format!(
+                "policy_type '{}' is repository-scoped and requires a 'repository_id'; \
+                 it cannot be created as a global policy",
+                req.policy_type
+            )));
+        }
+
         self.validate_policy_config(&req.policy_type, &req.config)?;
 
         if let Some(ref cron_expr) = req.cron_schedule {
@@ -413,6 +442,20 @@ impl LifecycleService {
         let config = req.config.unwrap_or(existing.config);
         let priority = req.priority.unwrap_or(existing.priority);
         let cron_schedule = req.cron_schedule.or(existing.cron_schedule);
+
+        // Mirror the create-time guard (#1850): a repo-scoped policy type
+        // (`max_versions`, `size_quota_bytes`) must have a repository_id.
+        // `repository_id` and `policy_type` are immutable via update, so this
+        // only rejects updates to pre-existing unusable global policies.
+        if existing.repository_id.is_none()
+            && policy_type_requires_repository_id(&existing.policy_type)
+        {
+            return Err(AppError::Validation(format!(
+                "policy_type '{}' is repository-scoped and requires a 'repository_id'; \
+                 it cannot exist as a global policy",
+                existing.policy_type
+            )));
+        }
 
         self.validate_policy_config(&existing.policy_type, &config)?;
 
@@ -1510,6 +1553,87 @@ mod tests {
         let svc = make_service_for_validation();
         let config = json!({});
         assert!(svc.validate_policy_config("unknown_type", &config).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1850: repository_id required at create for repo-scoped policy types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_type_requires_repository_id_classification() {
+        // Repo-scoped types: execute_* hard-require a repository_id.
+        assert!(policy_type_requires_repository_id("max_versions"));
+        assert!(policy_type_requires_repository_id("size_quota_bytes"));
+        // Genuinely-global types: run cluster-wide with NULL repo filter.
+        assert!(!policy_type_requires_repository_id("max_age_days"));
+        assert!(!policy_type_requires_repository_id("no_downloads_days"));
+        assert!(!policy_type_requires_repository_id("tag_pattern_keep"));
+        assert!(!policy_type_requires_repository_id("tag_pattern_delete"));
+        // Unknown types are not repo-scoped (caught earlier by type validation).
+        assert!(!policy_type_requires_repository_id("unknown_type"));
+    }
+
+    // The create guard returns before any DB query, so the lazy pool helper
+    // is sufficient to exercise the rejection path without a live database.
+
+    #[tokio::test]
+    async fn test_create_max_versions_without_repository_id_rejected() {
+        let svc = make_service_for_validation();
+        let req = CreatePolicyRequest {
+            repository_id: None,
+            name: "global-max-versions".to_string(),
+            description: None,
+            policy_type: "max_versions".to_string(),
+            config: json!({"keep": 5}),
+            priority: None,
+            cron_schedule: None,
+        };
+        let err = svc.create_policy(req).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("repository_id"));
+    }
+
+    #[tokio::test]
+    async fn test_create_size_quota_without_repository_id_rejected() {
+        let svc = make_service_for_validation();
+        let req = CreatePolicyRequest {
+            repository_id: None,
+            name: "global-size-quota".to_string(),
+            description: None,
+            policy_type: "size_quota_bytes".to_string(),
+            config: json!({"quota_bytes": 1024}),
+            priority: None,
+            cron_schedule: None,
+        };
+        let err = svc.create_policy(req).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("repository_id"));
+    }
+
+    #[tokio::test]
+    async fn test_create_global_type_without_repository_id_passes_repo_guard() {
+        // A genuinely-global policy type (max_age_days) without a
+        // repository_id must NOT be rejected by the #1850 repo guard. It
+        // proceeds past the guard and config validation; the only thing that
+        // would fail here is the INSERT (no live DB), which surfaces as a
+        // Database error, never a Validation error about repository_id.
+        let svc = make_service_for_validation();
+        let req = CreatePolicyRequest {
+            repository_id: None,
+            name: "global-max-age".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: json!({"days": 90}),
+            priority: None,
+            cron_schedule: None,
+        };
+        match svc.create_policy(req).await {
+            // No live DB in the unit harness: INSERT fails as a Database error.
+            Err(AppError::Database(_)) => {}
+            // If a DB were wired up, success is equally acceptable.
+            Ok(_) => {}
+            other => panic!("expected to pass the repo guard, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
