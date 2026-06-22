@@ -1,0 +1,96 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id, repository_id, package_name, package_version,\n                upstream_published_at, status, requested_at,\n                reviewed_by, reviewed_at, review_reason,\n                request_count, last_requested_at,\n                NULL::text as repository_key\n            FROM age_gate_reviews\n            WHERE repository_id = $1 AND package_name = $2 AND package_version = $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "package_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "package_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "upstream_published_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "reviewed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "reviewed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "review_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "request_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "repository_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "53b6fb0dd94cf2e96ec3def1d85312361a257168d0f9f82d3ae9a431b3975f66"
+}

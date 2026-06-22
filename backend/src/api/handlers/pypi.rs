@@ -36,6 +36,9 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::upstream_metadata::metadata_http_client;
+use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -604,11 +607,36 @@ async fn simple_project(
                 )
                 .await?;
 
-                // Rewrite absolute download URLs to route through our proxy
                 let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
                 let body = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
-                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    let mut rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    if let Some(svc) = state.age_gate_service.as_ref() {
+                        let params = proxy_helpers::age_gate_params(&repo);
+                        if AgeGateService::is_applicable(&params) {
+                            if let Ok(client) = metadata_http_client() {
+                                if let Ok(times) = svc
+                                    .metadata_cache()
+                                    .fetch_pypi_publish_times(
+                                        &client,
+                                        repo.id,
+                                        &effective_upstream,
+                                        &project,
+                                    )
+                                    .await
+                                {
+                                    if let Ok(filtered) = svc
+                                        .filter_pypi_simple_index(
+                                            &params, &project, &times, &rewritten,
+                                        )
+                                        .await
+                                    {
+                                        rewritten = filtered;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Body::from(rewritten)
                 } else {
                     Body::from(content)
@@ -1060,6 +1088,79 @@ async fn download_or_metadata(
     serve_file(&state, &repo, &repo_key, &project, &filename).await
 }
 
+fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
+    artifact_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(artifact_path)
+        .to_string()
+}
+
+fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> String {
+    format!("simple/{}/{}", normalized_project, filename)
+}
+
+async fn apply_pypi_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &str,
+    filename: &str,
+) -> Result<Option<String>, Response> {
+    let svc = match state.age_gate_service.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(None);
+    }
+
+    let info = PypiHandler::parse_filename(filename)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+    let version = info.version.ok_or_else(|| {
+        AppError::Validation("Missing version in filename".to_string()).into_response()
+    })?;
+
+    let published_at =
+        if let (Some(upstream_url), Ok(client)) = (&repo.upstream_url, metadata_http_client()) {
+            svc.metadata_cache()
+                .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+                .await
+                .ok()
+                .and_then(|times| times.get(&version).copied())
+        } else {
+            None
+        };
+
+    match svc
+        .check(&params, project, &version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id: _,
+            last_known_good: Some(lkg),
+        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
+            &lkg.artifact_path,
+        ))),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                project,
+                &version,
+                repo.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1092,14 +1193,53 @@ async fn serve_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    let normalized = PypiHandler::normalize_name(project);
+
+                    if let Some(lkg_filename) =
+                        apply_pypi_download_age_gate(state, repo, project, filename).await?
+                    {
+                        let lkg_cache_path =
+                            build_pypi_proxy_cache_path(&normalized, &lkg_filename);
+                        if let Some((content, _ct)) =
+                            proxy_helpers::proxy_check_cache(proxy, repo_key, &lkg_cache_path).await
+                        {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, pypi_content_type(&lkg_filename))
+                                .header(
+                                    "Content-Disposition",
+                                    format!("attachment; filename=\"{}\"", lkg_filename),
+                                )
+                                .body(Body::from(content))
+                                .unwrap());
+                        }
+                        let content = fetch_from_pypi_remote(
+                            proxy,
+                            repo.id,
+                            repo_key,
+                            upstream_url,
+                            project,
+                            &lkg_filename,
+                        )
+                        .await?;
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, pypi_content_type(&lkg_filename))
+                            .header(
+                                "Content-Disposition",
+                                format!("attachment; filename=\"{}\"", lkg_filename),
+                            )
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+
                     // Try the proxy cache first using a predictable local
                     // path. This avoids fetching the simple index from upstream
                     // just to rediscover the download URL when the file is
                     // already cached from a previous request. Streamed straight
                     // from storage (#895): buffering cached multi-hundred-MiB
                     // wheels per request OOM-killed memory-constrained pods.
-                    let normalized = PypiHandler::normalize_name(project);
-                    let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                    let local_cache_path = build_pypi_proxy_cache_path(&normalized, filename);
 
                     if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                         proxy,
@@ -1220,7 +1360,8 @@ async fn serve_file(
                             // simple index from upstream when the file is already
                             // cached from a previous request through this member.
                             let normalized = PypiHandler::normalize_name(project);
-                            let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                            let local_cache_path =
+                                build_pypi_proxy_cache_path(&normalized, filename);
 
                             if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                                 proxy,
@@ -2161,6 +2302,22 @@ mod tests {
     // -----------------------------------------------------------------------
     // pypi_upstream_url_and_path (#1130)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn pypi_lkg_filename_from_artifact_path_takes_basename() {
+        assert_eq!(
+            pypi_lkg_filename_from_artifact_path("pkg/1.0.0/wheel.whl"),
+            "wheel.whl"
+        );
+    }
+
+    #[test]
+    fn build_pypi_proxy_cache_path_format() {
+        assert_eq!(
+            build_pypi_proxy_cache_path("requests", "requests-2.31.0.tar.gz"),
+            "simple/requests/requests-2.31.0.tar.gz"
+        );
+    }
 
     #[test]
     fn test_pypi_upstream_strips_trailing_simple() {

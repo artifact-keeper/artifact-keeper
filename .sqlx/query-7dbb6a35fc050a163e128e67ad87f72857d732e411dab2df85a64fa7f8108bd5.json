@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE repositories\n            SET age_gate_enabled = $2, age_gate_min_age_days = $3, updated_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7dbb6a35fc050a163e128e67ad87f72857d732e411dab2df85a64fa7f8108bd5"
+}

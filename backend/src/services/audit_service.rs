@@ -73,6 +73,11 @@ pub enum AuditAction {
 
     // Scanning / janitors
     ScanReaped,
+
+    // Age gate
+    AgeGateQueued,
+    AgeGateApproved,
+    AgeGateRejected,
 }
 
 impl AuditAction {
@@ -118,6 +123,9 @@ impl AuditAction {
             AuditAction::SbomGenerated => "SBOM_GENERATED",
             AuditAction::SbomRead => "SBOM_READ",
             AuditAction::ScanReaped => "SCAN_REAPED",
+            AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
+            AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
+            AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
         }
     }
 }

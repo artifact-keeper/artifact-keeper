@@ -1,28 +1,28 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+  "query": "\n            SELECT id, package_version, status\n            FROM age_gate_reviews\n            WHERE repository_id = $1 AND package_name = $2\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "repository_id",
+        "name": "id",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "bytes_received",
-        "type_info": "Int8"
+        "name": "package_version",
+        "type_info": "Text"
       },
       {
         "ordinal": 2,
-        "name": "storage_temp_key",
+        "name": "status",
         "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -31,5 +31,5 @@
       false
     ]
   },
-  "hash": "85538eff744b81172f106545e6a4e58c353def584cff50f193acfa60954f213b"
+  "hash": "db4acd3e1f52d3da23359a512b78b819d892cd632a550488f5e6b4ae32ccb8be"
 }

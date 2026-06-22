@@ -56,6 +56,9 @@ pub enum WebhookEvent {
     BuildStarted,
     BuildCompleted,
     BuildFailed,
+    AgeGateQueued,
+    AgeGateApproved,
+    AgeGateRejected,
 }
 
 impl std::fmt::Display for WebhookEvent {
@@ -70,6 +73,9 @@ impl std::fmt::Display for WebhookEvent {
             WebhookEvent::BuildStarted => write!(f, "build_started"),
             WebhookEvent::BuildCompleted => write!(f, "build_completed"),
             WebhookEvent::BuildFailed => write!(f, "build_failed"),
+            WebhookEvent::AgeGateQueued => write!(f, "age_gate_queued"),
+            WebhookEvent::AgeGateApproved => write!(f, "age_gate_approved"),
+            WebhookEvent::AgeGateRejected => write!(f, "age_gate_rejected"),
         }
     }
 }
