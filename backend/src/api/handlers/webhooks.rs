@@ -43,6 +43,89 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/deliveries/:delivery_id/redeliver", post(redeliver))
 }
 
+/// Pure authorization decision for a webhook, given the two ownership
+/// anchors stored on the row (`created_by`, `repository_id`) and whether the
+/// caller can access that repository.
+///
+/// A caller may act on a webhook iff they are an admin, they created it
+/// (`created_by == user_id`), or it is attached to a repository they can
+/// access (`repo_accessible == true`, as decided by
+/// `RepositoryService::user_can_access_repo`). A webhook with no
+/// `repository_id` (e.g. a global/system webhook) is reachable only by an
+/// admin or its creator — closing the cross-user/cross-tenant BOLA where any
+/// authenticated principal could act on any webhook by id.
+///
+/// This is factored out as a pure function so the authorization invariant
+/// can be regression-tested without standing up a Postgres harness; the
+/// async wrapper supplies the row and the repo-access bit from the DB.
+pub fn webhook_access_allowed(
+    is_admin: bool,
+    user_id: Uuid,
+    created_by: Option<Uuid>,
+    repository_id: Option<Uuid>,
+    repo_accessible: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if created_by == Some(user_id) {
+        return true;
+    }
+    repository_id.is_some() && repo_accessible
+}
+
+/// Authorize the caller to act on a specific webhook.
+///
+/// Webhooks are not globally accessible: the isolation boundary is the
+/// repository (per-repo `role_assignments`) plus resource ownership
+/// (`created_by`), the same model the repository handlers enforce. See
+/// [`webhook_access_allowed`] for the decision.
+///
+/// Denials (and missing rows) return `NotFound` rather than `Forbidden` so
+/// the endpoint does not leak the existence of other principals' webhooks,
+/// matching the existence-hiding convention used elsewhere.
+async fn authorize_webhook_access(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<()> {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT created_by, repository_id FROM webhooks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+
+    let created_by: Option<Uuid> = row.get("created_by");
+    let repository_id: Option<Uuid> = row.get("repository_id");
+
+    // Only consult the (DB-backed) repo-access check when the cheaper
+    // admin/owner checks have not already settled the decision.
+    let repo_accessible = if auth.is_admin || created_by == Some(auth.user_id) {
+        false
+    } else if let Some(repo_id) = repository_id {
+        let repo_service = state.create_repository_service();
+        repo_service
+            .user_can_access_repo(repo_id, auth.user_id)
+            .await?
+    } else {
+        false
+    };
+
+    if webhook_access_allowed(
+        auth.is_admin,
+        auth.user_id,
+        created_by,
+        repository_id,
+        repo_accessible,
+    ) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Webhook not found".to_string()))
+    }
+}
+
 /// Webhook event types
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +266,7 @@ pub struct WebhookListResponse {
 )]
 pub async fn list_webhooks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListWebhooksQuery>,
 ) -> Result<Json<WebhookListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
@@ -191,7 +275,37 @@ pub async fn list_webhooks(
 
     use sqlx::Row;
 
-    let webhooks = sqlx::query(
+    // Scope the listing to webhooks the caller is authorized to see. Admins
+    // see everything; non-admins see only webhooks they created or that are
+    // attached to a repository they can access (mirrors
+    // `user_can_access_repo`, including the global `repository_id IS NULL`
+    // role grant). `$5` is NULL for admins, which disables the predicate.
+    let scope_user: Option<Uuid> = if auth.is_admin {
+        None
+    } else {
+        Some(auth.user_id)
+    };
+
+    // The scope predicate is parameterized on a single user id whose
+    // position differs between the list query ($5) and the count query ($3).
+    // It is NULL for admins, which disables the predicate entirely.
+    fn scope_sql(user_param: &str) -> String {
+        format!(
+            "({u}::uuid IS NULL \
+             OR created_by = {u} \
+             OR repository_id IN ( \
+                 SELECT repository_id FROM role_assignments \
+                 WHERE user_id = {u} AND repository_id IS NOT NULL \
+             ) \
+             OR EXISTS ( \
+                 SELECT 1 FROM role_assignments \
+                 WHERE user_id = {u} AND repository_id IS NULL \
+             ))",
+            u = user_param
+        )
+    }
+
+    let webhooks = sqlx::query(&format!(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
                payload_template, event_schema_version, secret_digest,
@@ -199,29 +313,35 @@ pub async fn list_webhooks(
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND {scope}
         ORDER BY name
         OFFSET $3
         LIMIT $4
         "#,
-    )
+        scope = scope_sql("$5"),
+    ))
     .bind(query.repository_id)
     .bind(query.enabled)
     .bind(offset)
     .bind(per_page as i64)
+    .bind(scope_user)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total_row = sqlx::query(
+    let total_row = sqlx::query(&format!(
         r#"
         SELECT COUNT(*) as count
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND {scope}
         "#,
-    )
+        scope = scope_sql("$3"),
+    ))
     .bind(query.repository_id)
     .bind(query.enabled)
+    .bind(scope_user)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -278,7 +398,7 @@ pub async fn list_webhooks(
 )]
 pub async fn create_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateWebhookRequest>,
 ) -> Result<Json<WebhookSecretCreatedResponse>> {
     // Validate URL (SSRF prevention)
@@ -317,8 +437,8 @@ pub async fn create_webhook(
         r#"
         INSERT INTO webhooks
             (name, url, events, repository_id, headers, payload_template,
-             secret_encrypted, secret_digest, event_schema_version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             secret_encrypted, secret_digest, event_schema_version, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, name, url, events, is_enabled, repository_id, headers,
                   payload_template, event_schema_version, secret_digest,
                   secret_previous_expires_at, last_triggered_at, created_at
@@ -333,6 +453,7 @@ pub async fn create_webhook(
     .bind(prepared.encrypted.as_deref())
     .bind(prepared.digest.as_deref())
     .bind(&event_version)
+    .bind(auth.user_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -454,8 +575,11 @@ fn prepare_secret_for_storage(
 )]
 pub async fn get_webhook(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WebhookResponse>> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     use sqlx::Row;
 
     let webhook = sqlx::query(
@@ -512,9 +636,11 @@ pub async fn get_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     let result = sqlx::query!("DELETE FROM webhooks WHERE id = $1", id)
         .execute(&state.db)
         .await
@@ -560,9 +686,10 @@ async fn set_webhook_enabled(state: &SharedState, id: Uuid, enabled: bool) -> Re
 )]
 pub async fn enable_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
     set_webhook_enabled(&state, id, true).await
 }
 
@@ -583,9 +710,10 @@ pub async fn enable_webhook(
 )]
 pub async fn disable_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    authorize_webhook_access(&state, &auth, id).await?;
     set_webhook_enabled(&state, id, false).await
 }
 
@@ -614,9 +742,11 @@ pub struct TestWebhookResponse {
 )]
 pub async fn test_webhook(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestWebhookResponse>> {
+    authorize_webhook_access(&state, &auth, id).await?;
+
     use sqlx::Row;
 
     let webhook = sqlx::query(
@@ -744,9 +874,13 @@ pub struct DeliveryListResponse {
 )]
 pub async fn list_deliveries(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(webhook_id): Path<Uuid>,
     Query(query): Query<ListDeliveriesQuery>,
 ) -> Result<Json<DeliveryListResponse>> {
+    // Deliveries inherit the authorization of their parent webhook.
+    authorize_webhook_access(&state, &auth, webhook_id).await?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -823,9 +957,11 @@ pub async fn list_deliveries(
 )]
 pub async fn redeliver(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((webhook_id, delivery_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeliveryResponse>> {
+    authorize_webhook_access(&state, &auth, webhook_id).await?;
+
     // Get original delivery
     let delivery = sqlx::query!(
         r#"
@@ -992,10 +1128,12 @@ fn rotation_guard_allows(
 )]
 pub async fn rotate_webhook_secret(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
+
+    authorize_webhook_access(&state, &auth, id).await?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1695,6 +1833,90 @@ pub struct WebhooksApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // webhook_access_allowed — object-level authorization invariant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_access_admin_always_allowed() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Admin reaches a webhook they neither own nor share a repo with.
+        assert!(webhook_access_allowed(
+            true,
+            me,
+            Some(other),
+            Some(Uuid::new_v4()),
+            false
+        ));
+        // ...including a global (repository-less) webhook.
+        assert!(webhook_access_allowed(true, me, Some(other), None, false));
+    }
+
+    #[test]
+    fn test_webhook_access_creator_allowed() {
+        let me = Uuid::new_v4();
+        // Creator of a global webhook may act on it.
+        assert!(webhook_access_allowed(false, me, Some(me), None, false));
+        // Creator of a repo-attached webhook may act on it even without repo access.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            Some(me),
+            Some(Uuid::new_v4()),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_webhook_access_repo_member_allowed_only_when_accessible() {
+        let me = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        // Non-owner with repo access to the webhook's repository is allowed.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            Some(owner),
+            Some(repo),
+            true
+        ));
+        // Same caller, no repo access -> denied.
+        assert!(!webhook_access_allowed(
+            false,
+            me,
+            Some(owner),
+            Some(repo),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_webhook_access_global_webhook_denied_to_stranger() {
+        let me = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        // The BOLA: a non-admin, non-owner cannot reach a global
+        // (repository_id = NULL) webhook regardless of any repo access bit.
+        assert!(!webhook_access_allowed(false, me, Some(owner), None, true));
+        assert!(!webhook_access_allowed(false, me, Some(owner), None, false));
+    }
+
+    #[test]
+    fn test_webhook_access_legacy_null_owner_denied_to_nonadmin() {
+        let me = Uuid::new_v4();
+        // Legacy rows (created_by = NULL) with no repository are reachable
+        // only by admins, never by an arbitrary authenticated caller.
+        assert!(!webhook_access_allowed(false, me, None, None, false));
+        // A legacy repo-attached row still honors repo access.
+        assert!(webhook_access_allowed(
+            false,
+            me,
+            None,
+            Some(Uuid::new_v4()),
+            true
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // WebhookEvent Display

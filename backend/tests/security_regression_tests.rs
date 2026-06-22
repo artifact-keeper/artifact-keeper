@@ -13,6 +13,7 @@
 
 use artifact_keeper_backend::api::handlers::goproxy::is_sumdb_host_allowed;
 use artifact_keeper_backend::api::handlers::maven::{escape_like_literal, snapshot_like_pattern};
+use artifact_keeper_backend::api::handlers::webhooks::webhook_access_allowed;
 use artifact_keeper_backend::api::middleware::auth::require_auth_basic;
 use artifact_keeper_backend::api::validation::validate_outbound_url;
 
@@ -249,6 +250,88 @@ fn regression_ghsa_m597_h769_6qgp_gitlfs_list_locks_auth() {
         challenge.contains("git-lfs"),
         "challenge must echo the realm passed by the caller; got {challenge}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bug — Cross-user / cross-tenant BOLA on webhook resources.
+// Class:  Broken object-level authorization (IDOR) on webhook endpoints.
+// Seam:   `webhooks::webhook_access_allowed` — the pure decision every
+//         per-webhook handler (get/delete/enable/disable/test/rotate/
+//         redeliver/list-deliveries) routes through before touching a row.
+// What:   Webhook handlers acted on the global `webhooks` table by id with no
+//         owner or repository scoping, so any authenticated principal could
+//         read, disable, test, rotate, or delete any other user's (or any
+//         other tenant's) webhook. The decision now requires admin, creator
+//         ownership (`created_by`), or access to the webhook's repository.
+// Asserts: a non-admin, non-creator cannot reach a global (repository-less)
+//         webhook even with a repo-access bit set; repo access only grants
+//         when the webhook is actually attached to a repository; admins and
+//         creators always pass; legacy NULL-owner rows are admin-only.
+// ---------------------------------------------------------------------------
+#[test]
+fn regression_webhook_object_level_authorization() {
+    use uuid::Uuid;
+    let attacker = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Uuid::new_v4();
+
+    // The exact BOLA: a stranger targeting another principal's GLOBAL webhook
+    // (repository_id = NULL). Must be denied regardless of any repo-access bit.
+    assert!(
+        !webhook_access_allowed(false, attacker, Some(owner), None, true),
+        "non-admin non-creator must NOT reach a global webhook (the BOLA)"
+    );
+    assert!(!webhook_access_allowed(
+        false,
+        attacker,
+        Some(owner),
+        None,
+        false
+    ));
+
+    // Legacy rows (created_by = NULL) with no repository are admin-only.
+    assert!(!webhook_access_allowed(false, attacker, None, None, false));
+
+    // Admin bypass: full cross-repo / cross-tenant access (matches repo handlers).
+    assert!(webhook_access_allowed(
+        true,
+        attacker,
+        Some(owner),
+        None,
+        false
+    ));
+
+    // Creator owns their webhook (global or repo-attached).
+    assert!(webhook_access_allowed(
+        false,
+        owner,
+        Some(owner),
+        None,
+        false
+    ));
+    assert!(webhook_access_allowed(
+        false,
+        owner,
+        Some(owner),
+        Some(repo),
+        false
+    ));
+
+    // Repo member: allowed iff the webhook is attached to a repo they can access.
+    assert!(webhook_access_allowed(
+        false,
+        attacker,
+        Some(owner),
+        Some(repo),
+        true
+    ));
+    assert!(!webhook_access_allowed(
+        false,
+        attacker,
+        Some(owner),
+        Some(repo),
+        false
+    ));
 }
 
 // ---------------------------------------------------------------------------
