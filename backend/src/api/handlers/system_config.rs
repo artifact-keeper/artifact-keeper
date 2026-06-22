@@ -629,4 +629,151 @@ mod tests {
         assert!(obj.contains_key("permissions"));
         assert!(obj.contains_key("plugin_signing"));
     }
+
+    // ---- Handler-level disclosure tests ----
+    //
+    // The tests above only exercise the *serialization* of a hand-built
+    // `SystemConfigResponse`. These call `get_system_config` directly with each
+    // auth state so the handler's own tiering logic (the `is_admin` decision,
+    // the anonymous/non-admin early return, and the admin branch that builds
+    // the full posture) is exercised. They use the in-crate DB scaffolding and
+    // no-op when `DATABASE_URL` is unset, so they run in CI (which seeds
+    // Postgres) without being `#[ignore]`d.
+
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::AuthExtension;
+    use axum::{extract::State, Extension};
+
+    /// Drive `get_system_config` and return the serialized JSON object the
+    /// handler produced for the given auth state.
+    async fn call_handler(
+        state: crate::api::SharedState,
+        auth: Option<AuthExtension>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let Json(response) = get_system_config(State(state), Extension(auth)).await;
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        parsed.as_object().unwrap().clone()
+    }
+
+    /// Anonymous caller (no `AuthExtension`): the handler must take the
+    /// non-admin early-return branch — public-safe fields present, every
+    /// security-posture field omitted.
+    #[tokio::test]
+    async fn test_handler_anonymous_redacts_security_posture() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/sysconfig-anon");
+
+        let obj = call_handler(state, None).await;
+
+        // Public-safe fields are always returned so the login UI works.
+        assert!(obj.contains_key("max_upload_size_bytes"));
+        assert!(obj.contains_key("demo_mode"));
+        assert!(obj.contains_key("guest_access_enabled"));
+        assert!(obj.contains_key("auth"));
+
+        // Security-posture fields must be omitted for an anonymous caller.
+        assert!(!obj.contains_key("scanners"), "scanners leaked to anon");
+        assert!(
+            !obj.contains_key("search_engine"),
+            "search_engine leaked to anon"
+        );
+        assert!(
+            !obj.contains_key("storage_backend"),
+            "storage_backend leaked to anon"
+        );
+        assert!(
+            !obj.contains_key("permissions"),
+            "permissions leaked to anon"
+        );
+        assert!(
+            !obj.contains_key("plugin_signing"),
+            "plugin_signing leaked to anon"
+        );
+    }
+
+    /// Authenticated non-admin caller: same redaction as anonymous — the
+    /// `is_admin == false` path still drops the security-posture fields.
+    #[tokio::test]
+    async fn test_handler_non_admin_redacts_security_posture() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/sysconfig-nonadmin");
+
+        // `tdh::make_auth` builds a non-admin (`is_admin: false`) extension.
+        let auth = tdh::make_auth(uuid::Uuid::new_v4(), "non-admin-tester");
+        assert!(!auth.is_admin, "fixture auth must be non-admin");
+
+        let obj = call_handler(state, Some(auth)).await;
+
+        assert!(obj.contains_key("auth"));
+        assert!(
+            !obj.contains_key("scanners"),
+            "scanners leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("search_engine"),
+            "search_engine leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("storage_backend"),
+            "storage_backend leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("permissions"),
+            "permissions leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("plugin_signing"),
+            "plugin_signing leaked to non-admin"
+        );
+    }
+
+    /// Authenticated admin caller: the handler takes the admin branch and
+    /// returns the full security posture. This also exercises the
+    /// `permissions` DB query against the seeded Postgres.
+    #[tokio::test]
+    async fn test_handler_admin_includes_security_posture() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/sysconfig-admin");
+
+        let mut auth = tdh::make_auth(uuid::Uuid::new_v4(), "admin-tester");
+        auth.is_admin = true;
+
+        let obj = call_handler(state, Some(auth)).await;
+
+        // Public-safe fields remain present.
+        assert!(obj.contains_key("max_upload_size_bytes"));
+        assert!(obj.contains_key("auth"));
+
+        // Full security posture is disclosed to the admin.
+        assert!(obj.contains_key("scanners"), "scanners missing for admin");
+        assert!(
+            obj.contains_key("search_engine"),
+            "search_engine missing for admin"
+        );
+        assert!(
+            obj.contains_key("storage_backend"),
+            "storage_backend missing for admin"
+        );
+        assert!(
+            obj.contains_key("permissions"),
+            "permissions missing for admin"
+        );
+        assert!(
+            obj.contains_key("plugin_signing"),
+            "plugin_signing missing for admin"
+        );
+
+        // The test config wires no scanners / opensearch, so the admin view
+        // should reflect the default disabled posture (admin branch values).
+        assert_eq!(obj["search_engine"], "database");
+        assert_eq!(obj["scanners"]["trivy_enabled"], false);
+        assert_eq!(obj["permissions"]["enforcement_enabled"], true);
+    }
 }
