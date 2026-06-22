@@ -221,11 +221,13 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
 /// The release-immutability guard uses this to tell "a genuinely mutable index
 /// the format legitimately republishes in place" (allow re-upload of different
 /// bytes) apart from "an unrecognised path in a default-format repo such as
-/// `Generic`/`Nuget`/`Conan`" (a stored artifact coordinate that must be
-/// protected against a delete + re-upload content swap). For formats whose
-/// classifier has real arms, a non-immutable result here means a real index
-/// file; for the default formats there are no such index files, so this is
-/// always `false` and every coordinate is treated as a release coordinate.
+/// `Generic`/`Nuget`" (a stored artifact coordinate that must be
+/// protected against a delete + re-upload content swap). Conan is a special
+/// case: its revision-file coordinates are legitimately rewritten in place
+/// within a revision, so it is always reported as a mutable index. For formats
+/// whose classifier has real arms, a non-immutable result here means a real
+/// index file; for the default formats there are no such index files, so this
+/// is always `false` and every coordinate is treated as a release coordinate.
 pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> bool {
     let path = path.trim_start_matches('/');
     let lower = path.to_ascii_lowercase();
@@ -251,9 +253,19 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         | RepositoryFormat::HelmOci
         | RepositoryFormat::Cargo => !classify(format, &lower).is_immutable(),
 
-        // Default-format families (Generic, Nuget, Conan, Composer, Go, Rpm,
-        // Debian, Helm, ...) have no in-place index files at artifact
-        // coordinates: every stored path is a release coordinate.
+        // Conan revision-file coordinates
+        // (`.../revisions/{rev}/files/{file}`) are legitimately rewritten in
+        // place during an upload: a recipe/package file may be re-pushed with
+        // different bytes within the SAME revision (deduplication is by
+        // revision, not by file content). They therefore behave like a format's
+        // in-place index — every conan path is freely re-uploadable and is
+        // treated as a mutable coordinate so the release-immutability swap guard
+        // is a no-op for conan (matching the conan upload handlers' intent).
+        RepositoryFormat::Conan => true,
+
+        // Default-format families (Generic, Nuget, Composer, Go, Rpm, Debian,
+        // Helm, ...) have no in-place index files at artifact coordinates:
+        // every stored path is a release coordinate.
         _ => false,
     }
 }
@@ -407,9 +419,16 @@ mod tests {
             &Npm,
             "left-pad/-/left-pad-1.0.0.tgz"
         ));
+        // Conan revision-file coordinates are rewritten in place within a
+        // revision (re-upload of different bytes is legitimate), so they are
+        // treated as mutable -> true (the swap guard is a no-op for conan).
+        assert!(is_explicitly_mutable_index(
+            &Conan,
+            "relib/1.0/_/_/revisions/rev1/files/conanfile.py"
+        ));
         // Default-format families have NO in-place index at a coordinate; every
         // stored path is a release coordinate -> always false (protected).
-        for f in [Generic, Nuget, Conan, Composer, Go, Rpm, Debian, Helm] {
+        for f in [Generic, Nuget, Composer, Go, Rpm, Debian, Helm] {
             assert!(
                 !is_explicitly_mutable_index(&f, "anything/1.0.0/file.bin"),
                 "{f:?} coordinates must be treated as release coordinates"
