@@ -103,6 +103,17 @@ pub(crate) fn validate_expiry_days(days: Option<i64>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `auth` may read or revoke a token whose owning user is
+/// `created_by_user_id`.
+///
+/// A global admin may manage any token. Otherwise the caller must be the
+/// token's creator. A `NULL` owner (legacy rows that predate
+/// `created_by_user_id`, migration 057) is owned by nobody, so a non-admin is
+/// denied — a safe deny-by-default that still lets an admin clean them up.
+fn caller_owns_token(auth: &AuthExtension, created_by_user_id: Option<Uuid>) -> bool {
+    auth.is_admin || created_by_user_id == Some(auth.user_id)
+}
+
 /// Require that the caller is authenticated and has write scope on repos
 /// (or is a global admin).
 fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -179,6 +190,10 @@ struct TokenRow {
     revoked_at: Option<DateTime<Utc>>,
     description: Option<String>,
     created_by_username: Option<String>,
+    /// Owning user (the token's creator). `NULL` for legacy rows that
+    /// predate `created_by_user_id` — treated as owned by nobody, so only a
+    /// global admin may read/revoke them.
+    created_by_user_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +220,7 @@ pub async fn list_repo_tokens(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepoTokenListResponse>> {
-    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
+    let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     let rows: Vec<TokenRow> = sqlx::query_as(
         r#"
@@ -219,7 +234,8 @@ pub async fn list_repo_tokens(
             t.created_at,
             t.revoked_at,
             t.description,
-            u.username AS created_by_username
+            u.username AS created_by_username,
+            t.created_by_user_id
         FROM api_tokens t
         INNER JOIN api_token_repositories atr ON atr.token_id = t.id
         LEFT JOIN users u ON u.id = t.created_by_user_id
@@ -232,8 +248,13 @@ pub async fn list_repo_tokens(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Per-token ownership filter: repo access is shared by every same-tenant
+    // member with `write:repositories`, so without this a peer could enumerate
+    // (and via the detail/revoke endpoints, act on) another member's tokens.
+    // Non-admins only see the tokens they created; admins see all (CWE-639).
     let items = rows
         .into_iter()
+        .filter(|r| caller_owns_token(&auth, r.created_by_user_id))
         .map(|r| RepoTokenResponse {
             id: r.id,
             name: r.name,
@@ -357,7 +378,7 @@ pub async fn get_repo_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, token_id)): Path<(String, Uuid)>,
 ) -> Result<Json<RepoTokenResponse>> {
-    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
+    let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     let row: TokenRow = sqlx::query_as(
         r#"
@@ -371,7 +392,8 @@ pub async fn get_repo_token(
             t.created_at,
             t.revoked_at,
             t.description,
-            u.username AS created_by_username
+            u.username AS created_by_username,
+            t.created_by_user_id
         FROM api_tokens t
         INNER JOIN api_token_repositories atr ON atr.token_id = t.id
         LEFT JOIN users u ON u.id = t.created_by_user_id
@@ -384,6 +406,16 @@ pub async fn get_repo_token(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Token not found on this repository".to_string()))?;
+
+    // Per-token ownership gate (CWE-639). Repo access is shared by every member
+    // with `write:repositories`, so the repo-level check above is not enough to
+    // read another member's token. Return the same existence-hiding 404 as a
+    // missing token so this does not become an owner-probing oracle.
+    if !caller_owns_token(&auth, row.created_by_user_id) {
+        return Err(AppError::NotFound(
+            "Token not found on this repository".to_string(),
+        ));
+    }
 
     Ok(Json(RepoTokenResponse {
         id: row.id,
@@ -426,7 +458,7 @@ pub async fn revoke_repo_token(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, token_id)): Path<(String, Uuid)>,
 ) -> Result<axum::http::StatusCode> {
-    let (_auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
+    let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
     // Verify the token belongs to this repository
     let exists: Option<(Uuid,)> = sqlx::query_as(
@@ -444,13 +476,28 @@ pub async fn revoke_repo_token(
         ));
     }
 
-    // Look up the owning user_id so we can revoke through the standard path
-    let owner: (Uuid,) = sqlx::query_as("SELECT user_id FROM api_tokens WHERE id = $1")
-        .bind(token_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Token not found".to_string()))?;
+    // Look up the owning user_id so we can revoke through the standard path,
+    // and the creator so we can enforce per-token ownership. `user_id` is the
+    // token's auth principal; `created_by_user_id` is the creator that owns
+    // management of the token.
+    let owner: (Uuid, Option<Uuid>) =
+        sqlx::query_as("SELECT user_id, created_by_user_id FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Token not found".to_string()))?;
+
+    // Per-token ownership gate (CWE-639). Without this, any same-tenant member
+    // with repo access could silently revoke a peer's token (a DoS), since the
+    // revoke below self-supplies the token's own owner to satisfy
+    // `revoke_api_token`'s owner filter. Same existence-hiding 404 as a missing
+    // token so this is not an owner-probing oracle.
+    if !caller_owns_token(&auth, owner.1) {
+        return Err(AppError::NotFound(
+            "Token not found on this repository".to_string(),
+        ));
+    }
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, owner.0).await?;
@@ -577,6 +624,36 @@ mod tests {
     #[test]
     fn test_require_repo_write_none_rejected() {
         assert!(require_repo_write(None).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // caller_owns_token (per-token ownership gate, CWE-639)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_caller_owns_token_creator_allowed() {
+        let auth = make_auth(false, None);
+        assert!(caller_owns_token(&auth, Some(auth.user_id)));
+    }
+
+    #[test]
+    fn test_caller_owns_token_peer_denied() {
+        let auth = make_auth(false, None);
+        let peer = Uuid::new_v4();
+        assert!(!caller_owns_token(&auth, Some(peer)));
+    }
+
+    #[test]
+    fn test_caller_owns_token_admin_allowed_for_any_owner() {
+        let auth = make_auth(true, None);
+        assert!(caller_owns_token(&auth, Some(Uuid::new_v4())));
+        assert!(caller_owns_token(&auth, None));
+    }
+
+    #[test]
+    fn test_caller_owns_token_null_owner_denied_for_non_admin() {
+        let auth = make_auth(false, None);
+        assert!(!caller_owns_token(&auth, None));
     }
 
     // -----------------------------------------------------------------------
@@ -772,6 +849,7 @@ mod tests {
             revoked_at: None,
             description: None,
             created_by_username: None,
+            created_by_user_id: None,
         };
         let debug = format!("{:?}", row);
         assert!(debug.contains("debug-test"));
@@ -985,5 +1063,276 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id, &repo_key).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-token ownership gate tests (CWE-639 / BOLA)
+//
+// Repository-scoped token GET/DELETE and list-detail were authorized only via
+// `authorize_repo_for_tokens` (repo-level access), which every same-tenant
+// member with `write:repositories` passes. These tests prove the per-token
+// ownership gate: a peer cannot read, enumerate, or revoke another member's
+// repo token; the creator and global admins still can.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ownership_gate_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    /// Build the repo-tokens router scoped to a single caller's auth, matching
+    /// the production `Option<AuthExtension>` extractor shape.
+    fn app_as(state: SharedState, auth: AuthExtension) -> axum::Router {
+        repo_tokens_router()
+            .with_state(state)
+            .layer(AxumExtension::<Option<AuthExtension>>(Some(auth)))
+    }
+
+    /// A non-admin caller with the delegatable `write:repositories` scope (so
+    /// it clears `require_repo_write`).
+    fn member_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        let mut auth = tdh::make_auth(user_id, username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+        auth
+    }
+
+    /// Seed a repo token owned by `creator` via the real create handler, so the
+    /// `created_by_user_id`/`api_token_repositories` wiring matches production.
+    /// Returns the new token id.
+    async fn create_token_as(state: &SharedState, creator: AuthExtension, repo_key: &str) -> Uuid {
+        let body = json!({"name": "victors-token", "scopes": ["read:artifacts"]}).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, bytes) = tdh::send(app_as(state.clone(), creator), req).await;
+        assert_eq!(status, StatusCode::OK, "seed create must succeed");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        Uuid::parse_str(v["id"].as_str().unwrap()).unwrap()
+    }
+
+    fn get_token_req(repo_key: &str, token_id: Uuid) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens/{}", repo_key, token_id))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn delete_token_req(repo_key: &str, token_id: Uuid) -> Request<Body> {
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", repo_key, token_id))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn list_tokens_req(repo_key: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}/tokens", repo_key))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn revoked_at(pool: &sqlx::PgPool, token_id: Uuid) -> Option<DateTime<Utc>> {
+        let row: (Option<DateTime<Utc>>,) =
+            sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch revoked_at");
+        row.0
+    }
+
+    /// Full public-repo setup with two members (victor=creator, sam=peer) and a
+    /// token seeded on the repo by victor. The repo is public so the #1783
+    /// private-repo gate is satisfied and the gate under test is purely
+    /// per-token, not visibility.
+    struct Fixture {
+        pool: sqlx::PgPool,
+        state: SharedState,
+        repo_key: String,
+        repo_id: Uuid,
+        victor: Uuid,
+        sam: Uuid,
+        token_id: Uuid,
+    }
+
+    async fn fixture() -> Option<Fixture> {
+        let pool = tdh::try_pool().await?;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        let (victor, victor_name) = tdh::create_user(&pool).await;
+        let (sam, _sam_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let token_id = create_token_as(&state, member_auth(victor, &victor_name), &repo_key).await;
+        Some(Fixture {
+            pool,
+            state,
+            repo_key,
+            repo_id,
+            victor,
+            sam,
+            token_id,
+        })
+    }
+
+    async fn teardown(f: &Fixture) {
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE repo_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE created_by_user_id = $1")
+            .bind(f.victor)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        for u in [f.victor, f.sam] {
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(u)
+                .execute(&f.pool)
+                .await;
+        }
+    }
+
+    /// (1) A peer GET of another member's token returns 404 (was 200).
+    #[tokio::test]
+    async fn peer_get_token_is_404() {
+        let Some(f) = fixture().await else { return };
+        let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
+        let (status, _) = tdh::send(app, get_token_req(&f.repo_key, f.token_id)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "peer GET must 404");
+        teardown(&f).await;
+    }
+
+    /// (2) A peer DELETE returns 404 and the token is NOT revoked.
+    #[tokio::test]
+    async fn peer_delete_token_is_404_and_not_revoked() {
+        let Some(f) = fixture().await else { return };
+        let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
+        let (status, _) = tdh::send(app, delete_token_req(&f.repo_key, f.token_id)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "peer DELETE must 404");
+        assert!(
+            revoked_at(&f.pool, f.token_id).await.is_none(),
+            "peer DELETE must NOT revoke the token"
+        );
+        teardown(&f).await;
+    }
+
+    /// (3) The creator can GET their own token.
+    #[tokio::test]
+    async fn creator_get_own_token_is_200() {
+        let Some(f) = fixture().await else { return };
+        let app = app_as(f.state.clone(), member_auth(f.victor, "victor"));
+        let (status, _) = tdh::send(app, get_token_req(&f.repo_key, f.token_id)).await;
+        assert_eq!(status, StatusCode::OK, "creator GET must 200");
+        teardown(&f).await;
+    }
+
+    /// (4) The creator can DELETE their own token; revoked_at is set.
+    #[tokio::test]
+    async fn creator_delete_own_token_is_204_and_revoked() {
+        let Some(f) = fixture().await else { return };
+        let app = app_as(f.state.clone(), member_auth(f.victor, "victor"));
+        let (status, _) = tdh::send(app, delete_token_req(&f.repo_key, f.token_id)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "creator DELETE must 204");
+        assert!(
+            revoked_at(&f.pool, f.token_id).await.is_some(),
+            "creator DELETE must revoke the token"
+        );
+        teardown(&f).await;
+    }
+
+    /// (5) A global admin can GET and DELETE a peer's token.
+    #[tokio::test]
+    async fn admin_get_and_delete_peer_token() {
+        let Some(f) = fixture().await else { return };
+        let mut admin = tdh::make_auth(f.sam, "admin");
+        admin.is_admin = true;
+
+        let (status, _) = tdh::send(
+            app_as(f.state.clone(), admin.clone()),
+            get_token_req(&f.repo_key, f.token_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin GET peer token must 200");
+
+        let (status, _) = tdh::send(
+            app_as(f.state.clone(), admin),
+            delete_token_req(&f.repo_key, f.token_id),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "admin DELETE peer token must 204"
+        );
+        assert!(
+            revoked_at(&f.pool, f.token_id).await.is_some(),
+            "admin DELETE must revoke"
+        );
+        teardown(&f).await;
+    }
+
+    /// (6) The list omits a peer's token for a non-admin, but an admin sees all.
+    #[tokio::test]
+    async fn list_scopes_to_owner_for_non_admin_and_all_for_admin() {
+        let Some(f) = fixture().await else { return };
+
+        // Peer sees no items (victor's token is filtered out).
+        let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
+        let (status, bytes) = tdh::send(app, list_tokens_req(&f.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let peer_ids: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !peer_ids.contains(&f.token_id.to_string().as_str()),
+            "peer list must not contain victor's token"
+        );
+
+        // Creator sees their own token.
+        let app = app_as(f.state.clone(), member_auth(f.victor, "victor"));
+        let (_s, bytes) = tdh::send(app, list_tokens_req(&f.repo_key)).await;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            1,
+            "creator list must contain their token"
+        );
+
+        // Admin sees all tokens on the repo.
+        let mut admin = tdh::make_auth(f.sam, "admin");
+        admin.is_admin = true;
+        let (_s, bytes) =
+            tdh::send(app_as(f.state.clone(), admin), list_tokens_req(&f.repo_key)).await;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            1,
+            "admin list must contain the token"
+        );
+
+        teardown(&f).await;
     }
 }
