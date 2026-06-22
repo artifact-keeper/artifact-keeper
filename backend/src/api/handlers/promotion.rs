@@ -436,6 +436,65 @@ fn ensure_promotion_authorized(is_admin: bool) -> Result<()> {
     Ok(())
 }
 
+/// Pure tenant-ownership decision for one repository in a promotion.
+///
+/// A promotion crosses a tenant boundary when the caller is authorized for one
+/// tenant's repositories but names another tenant's repository as the source or
+/// target. The codebase models tenancy as per-repository role-assignment
+/// membership (see [`RepositoryService::user_can_access_repo`] and the
+/// `require_repo_write_access` write gate): a caller "owns" a private repo only
+/// if they hold a role assignment scoped to it (direct) or a global,
+/// NULL-scoped assignment (the genuine super-admin seeded in migration 002).
+///
+/// Unlike `require_repo_write_access`, this check does NOT blanket-bypass on the
+/// global `is_admin` flag. The `is_admin` boolean is a capability flag, not a
+/// tenant identity: in a multi-tenant deployment each tenant has admin-capable
+/// principals, and the cross-tenant promote-injection finding (campaign-#4
+/// systemic authz pattern) was reproduced by exactly such a principal promoting
+/// a corp artifact into a globex repository. Defense-in-depth therefore demands
+/// the tenant-ownership check be enforced independent of the admin flag: a
+/// genuine super-admin still passes via their NULL-scoped grant, while a
+/// tenant-scoped admin is rejected for a repository in a tenant they do not own.
+///
+/// Public repositories carry no tenant boundary, so they always pass — mirroring
+/// the public-repo short-circuit in `require_repo_write_access` / `require_visible`.
+///
+/// Split out as a pure boolean so the allow/deny decision is unit-testable
+/// without a database; the DB lookup lives in [`require_promotion_tenant_access`].
+fn promotion_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> bool {
+    repo_is_public || has_repo_grant
+}
+
+/// Enforce tenant ownership on BOTH the source and target repositories of a
+/// promotion before any copy/insert happens.
+///
+/// Rejects cross-tenant promotion (e.g. a corp-tenant artifact promoted into a
+/// globex-tenant repository) with HTTP 403. Applied to every promote path —
+/// single, bulk, and the approval-execute path — so the governance workflow
+/// cannot be used to launder an artifact across the tenant boundary.
+///
+/// The denial is an `Authorization` error (403) rather than `NotFound` because
+/// the caller, being admin-capable, already proved knowledge of the repository
+/// keys via the source/target lookups; the 403 names which repository is out of
+/// the caller's tenant so legitimate operators get an actionable message.
+pub(crate) async fn require_promotion_tenant_access(
+    repo_service: &RepositoryService,
+    user_id: Uuid,
+    source: &crate::models::repository::Repository,
+    target: &crate::models::repository::Repository,
+) -> Result<()> {
+    for repo in [source, target] {
+        let has_grant = repo_service.user_can_access_repo(repo.id, user_id).await?;
+        if !promotion_tenant_access_allowed(repo.is_public, has_grant) {
+            return Err(AppError::Authorization(format!(
+                "You are not authorized to promote into the '{}' repository's tenant",
+                repo.key
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
         promoted: false,
@@ -505,6 +564,13 @@ pub async fn promote_artifact(
     enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
 
     let target_repo = repo_service.get_by_key(&target_key).await?;
+
+    // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
+    // check above does NOT bind the caller to a tenant; without this, an
+    // admin-capable corp principal could promote into a globex repository. Reject
+    // cross-tenant promotion on either the source or target repo with 403.
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &target_repo)
+        .await?;
 
     // Look up the artifact first. The artifact lookup is keyed by the source
     // repository id, not by repository type, so it works even when the source
@@ -783,6 +849,12 @@ pub async fn promote_artifacts_bulk(
 
     let target_repo = repo_service.get_by_key(&target_key).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
+
+    // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
+    // whole batch since source/target are fixed across all items; rejects a
+    // cross-tenant bulk promotion (corp artifacts -> globex repo) with 403.
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &target_repo)
+        .await?;
 
     let mut results = Vec::new();
     let mut promoted = 0;
@@ -1510,6 +1582,35 @@ mod tests {
         // the approval workflow's approve/reject endpoints.
         assert!(matches!(err, AppError::Authorization(_)));
         assert!(err.to_string().contains("admin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // promotion_tenant_access_allowed (cross-tenant promote-target gate)
+    //
+    // Pure decision behind require_promotion_tenant_access. A repo passes the
+    // tenant-ownership gate when it is public OR the caller holds a grant on it
+    // (per-repo or global NULL-scoped). The is_admin capability flag is NOT a
+    // tenant identity, so it is intentionally absent here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tenant_access_public_repo_always_allowed() {
+        // Public repos carry no tenant boundary, so they pass even without a grant.
+        assert!(promotion_tenant_access_allowed(true, false));
+        assert!(promotion_tenant_access_allowed(true, true));
+    }
+
+    #[test]
+    fn test_tenant_access_private_with_grant_allowed() {
+        // A genuine super-admin (NULL-scoped grant) or a same-tenant operator
+        // holds a grant on the private repo -> allowed.
+        assert!(promotion_tenant_access_allowed(false, true));
+    }
+
+    #[test]
+    fn test_tenant_access_private_without_grant_denied() {
+        // The cross-tenant case: private repo in another tenant, no grant -> deny.
+        assert!(!promotion_tenant_access_allowed(false, false));
     }
 
     // -----------------------------------------------------------------------
@@ -2915,7 +3016,56 @@ mod tests {
             .execute(pool)
             .await
             .expect("insert user");
+            // Grant a global (NULL-scoped) admin role assignment, mirroring the
+            // genuine super-admin seeded by migration 002. The promotion
+            // tenant-ownership gate requires a grant on the source/target repos;
+            // a NULL-scoped assignment satisfies it for every repository, which is
+            // exactly what a real cross-tenant super-admin holds.
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id) \
+                 SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("grant global admin role");
             id
+        }
+
+        /// Create a non-super-admin user that is admin-capable (the `is_admin`
+        /// capability flag is true) but tenant-scoped: it holds NO global,
+        /// NULL-scoped role assignment, only the per-repo grants explicitly added
+        /// via `grant_repo`. This models a tenant admin (e.g. a corp admin) in a
+        /// multi-tenant deployment for the cross-tenant promotion tests.
+        async fn make_tenant_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert tenant admin");
+            id
+        }
+
+        /// Grant `user` the `developer` role scoped to a single repository,
+        /// mirroring the owner auto-grant in `RepositoryService::create`. Used to
+        /// place a tenant admin inside one tenant's repositories only.
+        async fn grant_repo(pool: &PgPool, user: Uuid, repo: Uuid) {
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                 ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+            )
+            .bind(user)
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("grant per-repo developer role");
         }
 
         fn admin_ext(user_id: Uuid) -> AuthExtension {
@@ -3046,10 +3196,150 @@ mod tests {
                     .execute(pool)
                     .await;
             }
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
             let _ = sqlx::query("DELETE FROM users WHERE id = $1")
                 .bind(user)
                 .execute(pool)
                 .await;
+        }
+
+        // ---- tenant-ownership gate on promote target (xtenant) ---------------
+        //
+        // A promotion crosses a tenant boundary when an admin-capable principal
+        // authorized for one tenant's repos names another tenant's repo as the
+        // target. `require_promotion_tenant_access` rejects this with 403 on
+        // every promote path. These tests drive a tenant-scoped admin (per-repo
+        // grants only, NO global NULL-scoped assignment) across the single, bulk,
+        // and approval-execute paths.
+
+        /// Cross-tenant SINGLE promote: tenant admin owns the SOURCE (corp) but
+        /// not the TARGET (globex) -> 403, no copy.
+        #[tokio::test]
+        async fn test_single_promote_cross_tenant_target_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-xt-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-xt-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "xt-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "xt-globex-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "xt-corp").await;
+            // corp admin owns only the source (corp) repo, NOT the globex target.
+            grant_repo(&pool, corp_admin, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "xt").await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("cross-tenant single promote must be rejected");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "cross-tenant promote must be a 403 Authorization error; got {:?}",
+                err
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "xt").await,
+                "a cross-tenant single promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        /// Same-tenant SINGLE promote: tenant admin owns BOTH repos -> succeeds.
+        #[tokio::test]
+        async fn test_single_promote_same_tenant_allowed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-st-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-st-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "st-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "st-corp-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "st-corp").await;
+            // corp admin owns BOTH the corp source and corp target.
+            grant_repo(&pool, corp_admin, src).await;
+            grant_repo(&pool, corp_admin, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "st").await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("same-tenant single promote must succeed");
+            assert!(res.0.promoted, "same-tenant single promote must promote");
+            assert!(target_has_artifact(&pool, tgt, "st").await);
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.
+        #[tokio::test]
+        async fn test_bulk_promote_cross_tenant_target_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-xtb-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-xtb-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "xtb-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "xtb-globex-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "xtb-corp").await;
+            grant_repo(&pool, corp_admin, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "xtb").await;
+
+            let err = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("cross-tenant bulk promote must be rejected");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "cross-tenant bulk promote must be a 403; got {:?}",
+                err
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "xtb").await,
+                "a cross-tenant bulk promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
         }
 
         // ---- single-promote handler: rule-MET promotes -----------------------
