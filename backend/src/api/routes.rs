@@ -376,10 +376,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     }
 
     Router::new()
-        // Public system configuration (no auth required)
-        .route(
-            "/system/config",
-            get(handlers::system_config::get_system_config),
+        // System configuration. The endpoint is reachable without auth so
+        // frontends can discover login/upload affordances pre-authentication,
+        // but it runs through `optional_auth_middleware` so the handler can
+        // tell whether the caller is an admin. Security-posture fields
+        // (scanner/auth-provider/permission/plugin-signing/storage state) are
+        // redacted for anonymous and non-admin callers and only returned to
+        // admins — anonymous callers should not be able to fingerprint the
+        // instance's defensive configuration.
+        .nest(
+            "/system",
+            handlers::system_config::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                optional_auth_middleware,
+            )),
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())

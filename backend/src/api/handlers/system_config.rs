@@ -1,15 +1,28 @@
-//! Public runtime configuration endpoint.
+//! Runtime configuration endpoint.
 //!
-//! Exposes non-sensitive configuration values so that frontends and clients can
-//! discover upload limits, enabled integrations, and feature flags without
-//! hardcoding assumptions.
+//! Reachable without authentication so frontends and clients can discover
+//! pre-login affordances (upload limits, guest access, available login
+//! providers). Security-posture values (scanner / auth-provider / permission /
+//! plugin-signing / storage configuration) are disclosed **only to
+//! authenticated admins** so an unauthenticated attacker cannot fingerprint the
+//! deployment's defensive configuration. Secrets, credentials, and internal
+//! connection strings are never returned to anyone.
 
-use axum::{extract::State, Json};
+use axum::{extract::State, routing::get, Extension, Json, Router};
 use serde::Serialize;
 use sqlx;
 use utoipa::{OpenApi, ToSchema};
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+
+/// Router for the system configuration endpoint.
+///
+/// Mounted under `/system` behind `optional_auth_middleware` so the handler
+/// receives an `Option<AuthExtension>` and can decide how much to disclose.
+pub fn router() -> Router<SharedState> {
+    Router::new().route("/config", get(get_system_config))
+}
 
 /// Fine-grained permissions enforcement status.
 #[derive(Serialize, ToSchema)]
@@ -61,10 +74,22 @@ pub struct AuthConfig {
     pub sso_enabled: bool,
 }
 
-/// Public runtime configuration values.
+/// Runtime configuration values.
 ///
 /// This response intentionally omits all secrets, credentials, and internal
-/// connection strings. Only values useful for UI/client behavior are included.
+/// connection strings.
+///
+/// Disclosure is tiered (see `get_system_config`):
+///
+/// * **Public-safe fields** are always present — they only describe UI/client
+///   affordances a caller needs *before* authenticating (upload limit, demo
+///   mode, whether guest access and which login providers are available).
+/// * **Security-posture fields** (`scanners`, `search_engine`,
+///   `storage_backend`, `permissions`, `plugin_signing`) describe the
+///   instance's defensive configuration. They are returned **only to
+///   authenticated admins** and are omitted for anonymous / non-admin callers,
+///   so the deployment's security posture cannot be fingerprinted by an
+///   unauthenticated attacker.
 #[derive(Serialize, ToSchema)]
 pub struct SystemConfigResponse {
     /// Maximum upload size in bytes (0 means no limit).
@@ -77,42 +102,87 @@ pub struct SystemConfigResponse {
     /// hide UI affordances that imply public access (e.g. the "public repo"
     /// toggle) and redirect unauthenticated users to the login page.
     pub guest_access_enabled: bool,
-    /// Scanner availability.
-    pub scanners: ScannersConfig,
-    /// Search engine type: "opensearch" when configured, "database" otherwise.
-    pub search_engine: String,
-    /// Storage backend type (e.g. "filesystem", "s3", "gcs", "azure").
-    pub storage_backend: String,
-    /// Authentication provider availability.
+    /// Authentication provider availability. Needed by the login UI before the
+    /// user authenticates, so this is public-safe.
     pub auth: AuthConfig,
     /// OIDC issuer URL, if configured. This is public information needed by
     /// clients to initiate the OIDC flow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
+    /// Scanner availability. Admin-only (security posture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanners: Option<ScannersConfig>,
+    /// Search engine type: "opensearch" when configured, "database" otherwise.
+    /// Admin-only (security posture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_engine: Option<String>,
+    /// Storage backend type (e.g. "filesystem", "s3", "gcs", "azure").
+    /// Admin-only (security posture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_backend: Option<String>,
     /// Fine-grained permissions enforcement status. Permission rules can be
     /// managed via /api/v1/permissions and are actively enforced.
-    pub permissions: PermissionsConfig,
+    /// Admin-only (security posture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionsConfig>,
     /// Plugin signature-verification (supply-chain) policy status.
-    pub plugin_signing: PluginSigningConfig,
+    /// Admin-only (security posture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_signing: Option<PluginSigningConfig>,
 }
 
-/// Return public runtime configuration.
+/// Return runtime configuration.
 ///
-/// No authentication required. This endpoint exposes only non-sensitive
-/// configuration values that help frontends adapt their behavior (e.g.
-/// showing upload limits, conditionally rendering scanner UI, initiating
-/// OIDC flows).
+/// Reachable without authentication so frontends can discover pre-login
+/// affordances (upload limits, guest access, available login providers). The
+/// security-posture fields (scanner/auth-provider/permission/plugin-signing/
+/// storage configuration) are returned **only to authenticated admins**; for
+/// anonymous and non-admin callers they are omitted so the instance's
+/// defensive configuration cannot be fingerprinted by an unauthenticated
+/// attacker.
 #[utoipa::path(
     get,
     path = "/config",
     context_path = "/api/v1/system",
     tag = "system",
     responses(
-        (status = 200, description = "Public runtime configuration", body = SystemConfigResponse),
+        (status = 200, description = "Runtime configuration (security-posture fields admin-only)", body = SystemConfigResponse),
     )
 )]
-pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemConfigResponse> {
+pub async fn get_system_config(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+) -> Json<SystemConfigResponse> {
     let config = &state.config;
+    let is_admin = auth.as_ref().map(|a| a.is_admin).unwrap_or(false);
+
+    // Public-safe fields: always returned. Login UI needs to know which
+    // providers are available before the user authenticates.
+    let auth_config = AuthConfig {
+        oidc_enabled: config.oidc_issuer.is_some(),
+        ldap_enabled: config.ldap_url.is_some(),
+        sso_enabled: config.oidc_issuer.is_some(),
+    };
+
+    // Non-admin / anonymous callers receive only the public-safe subset. The
+    // sensitive security-posture fields stay `None` and are dropped from the
+    // JSON by `skip_serializing_if`.
+    if !is_admin {
+        return Json(SystemConfigResponse {
+            max_upload_size_bytes: config.max_upload_size_bytes,
+            demo_mode: config.demo_mode,
+            guest_access_enabled: config.guest_access_enabled,
+            auth: auth_config,
+            oidc_issuer: config.oidc_issuer.clone(),
+            scanners: None,
+            search_engine: None,
+            storage_backend: None,
+            permissions: None,
+            plugin_signing: None,
+        });
+    }
+
+    // Admin caller: include the full security posture.
 
     // Dependency-Track is considered enabled only when the service was
     // actually wired into application state at startup. That requires both
@@ -128,12 +198,6 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         trivy_enabled: config.trivy_url.is_some(),
         openscap_enabled: config.openscap_url.is_some(),
         dependency_track_enabled: state.dependency_track.is_some(),
-    };
-
-    let auth = AuthConfig {
-        oidc_enabled: config.oidc_issuer.is_some(),
-        ldap_enabled: config.ldap_url.is_some(),
-        sso_enabled: config.oidc_issuer.is_some(),
     };
 
     let search_engine = if config.opensearch_url.is_some() {
@@ -168,13 +232,13 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         max_upload_size_bytes: config.max_upload_size_bytes,
         demo_mode: config.demo_mode,
         guest_access_enabled: config.guest_access_enabled,
-        scanners,
-        search_engine,
-        storage_backend: config.storage_backend.clone(),
-        auth,
+        auth: auth_config,
         oidc_issuer: config.oidc_issuer.clone(),
-        permissions,
-        plugin_signing,
+        scanners: Some(scanners),
+        search_engine: Some(search_engine),
+        storage_backend: Some(config.storage_backend.clone()),
+        permissions: Some(permissions),
+        plugin_signing: Some(plugin_signing),
     })
 }
 
@@ -195,33 +259,48 @@ pub struct SystemConfigApiDoc;
 mod tests {
     use super::*;
 
-    /// Build a response from a config with all integrations disabled.
+    /// Build an admin-tier response from a config with all integrations
+    /// disabled (security-posture fields present, all `false`/default).
     fn minimal_response() -> SystemConfigResponse {
         SystemConfigResponse {
             max_upload_size_bytes: 10_737_418_240,
             demo_mode: false,
             guest_access_enabled: true,
-            scanners: ScannersConfig {
+            scanners: Some(ScannersConfig {
                 trivy_enabled: false,
                 openscap_enabled: false,
                 dependency_track_enabled: false,
-            },
-            search_engine: "database".to_string(),
-            storage_backend: "filesystem".to_string(),
+            }),
+            search_engine: Some("database".to_string()),
+            storage_backend: Some("filesystem".to_string()),
             auth: AuthConfig {
                 oidc_enabled: false,
                 ldap_enabled: false,
                 sso_enabled: false,
             },
             oidc_issuer: None,
-            permissions: PermissionsConfig {
+            permissions: Some(PermissionsConfig {
                 rules_exist: false,
                 enforcement_enabled: false,
-            },
-            plugin_signing: PluginSigningConfig {
+            }),
+            plugin_signing: Some(PluginSigningConfig {
                 required: true,
                 trusted_key_configured: false,
-            },
+            }),
+        }
+    }
+
+    /// Build the redacted (anonymous / non-admin) response from the same
+    /// config as `minimal_response`: public-safe fields present, every
+    /// security-posture field `None`.
+    fn redacted_response() -> SystemConfigResponse {
+        SystemConfigResponse {
+            scanners: None,
+            search_engine: None,
+            storage_backend: None,
+            permissions: None,
+            plugin_signing: None,
+            ..minimal_response()
         }
     }
 
@@ -254,27 +333,27 @@ mod tests {
             max_upload_size_bytes: 21_474_836_480,
             demo_mode: true,
             guest_access_enabled: false,
-            scanners: ScannersConfig {
+            scanners: Some(ScannersConfig {
                 trivy_enabled: true,
                 openscap_enabled: true,
                 dependency_track_enabled: true,
-            },
-            search_engine: "opensearch".to_string(),
-            storage_backend: "s3".to_string(),
+            }),
+            search_engine: Some("opensearch".to_string()),
+            storage_backend: Some("s3".to_string()),
             auth: AuthConfig {
                 oidc_enabled: true,
                 ldap_enabled: true,
                 sso_enabled: true,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
-            permissions: PermissionsConfig {
+            permissions: Some(PermissionsConfig {
                 rules_exist: true,
                 enforcement_enabled: true,
-            },
-            plugin_signing: PluginSigningConfig {
+            }),
+            plugin_signing: Some(PluginSigningConfig {
                 required: true,
                 trusted_key_configured: true,
-            },
+            }),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -422,10 +501,10 @@ mod tests {
         // plugin_signing must expose exactly {required, trusted_key_configured}
         // and never leak any key material.
         let response = SystemConfigResponse {
-            plugin_signing: PluginSigningConfig {
+            plugin_signing: Some(PluginSigningConfig {
                 required: true,
                 trusted_key_configured: true,
-            },
+            }),
             ..minimal_response()
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -453,15 +532,101 @@ mod tests {
     #[test]
     fn test_system_config_permissions_rules_exist_and_enforced() {
         let response = SystemConfigResponse {
-            permissions: PermissionsConfig {
+            permissions: Some(PermissionsConfig {
                 rules_exist: true,
                 enforcement_enabled: true,
-            },
+            }),
             ..minimal_response()
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["permissions"]["rules_exist"], true);
         assert_eq!(parsed["permissions"]["enforcement_enabled"], true);
+    }
+
+    // ---- Redaction (anonymous / non-admin disclosure) tests ----
+    //
+    // These cover the 1.2.2 fix: the security-posture fields must be present
+    // for admins (the `minimal_response`/all-enabled tests above) and absent
+    // for anonymous / non-admin callers (the `redacted_response` below).
+
+    #[test]
+    fn test_redacted_response_omits_security_posture_fields() {
+        // Anonymous / non-admin: scanners, search_engine, storage_backend,
+        // permissions and plugin_signing must NOT appear in the JSON at all.
+        let json = serde_json::to_string(&redacted_response()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        assert!(
+            !obj.contains_key("scanners"),
+            "scanners leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("search_engine"),
+            "search_engine leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("storage_backend"),
+            "storage_backend leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("permissions"),
+            "permissions leaked to non-admin"
+        );
+        assert!(
+            !obj.contains_key("plugin_signing"),
+            "plugin_signing leaked to non-admin"
+        );
+
+        // None of the sensitive sub-field names should appear either.
+        for needle in [
+            "trivy_enabled",
+            "openscap_enabled",
+            "dependency_track_enabled",
+            "rules_exist",
+            "enforcement_enabled",
+            "trusted_key_configured",
+            "filesystem",
+        ] {
+            assert!(
+                !json.contains(needle),
+                "field `{needle}` leaked to non-admin"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redacted_response_keeps_public_safe_fields() {
+        // The login/upload affordances a frontend needs before authenticating
+        // remain present even when redacted.
+        let json = serde_json::to_string(&redacted_response()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        assert!(obj.contains_key("max_upload_size_bytes"));
+        assert!(obj.contains_key("demo_mode"));
+        assert!(obj.contains_key("guest_access_enabled"));
+        // `auth` (which login providers exist) is public-safe and retained.
+        assert!(obj.contains_key("auth"));
+        assert!(obj["auth"]
+            .as_object()
+            .unwrap()
+            .contains_key("oidc_enabled"));
+    }
+
+    #[test]
+    fn test_admin_response_includes_security_posture_fields() {
+        // The admin tier (modeled by minimal_response) still carries the full
+        // posture, so admins keep their operational visibility.
+        let json = serde_json::to_string(&minimal_response()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        assert!(obj.contains_key("scanners"));
+        assert!(obj.contains_key("search_engine"));
+        assert!(obj.contains_key("storage_backend"));
+        assert!(obj.contains_key("permissions"));
+        assert!(obj.contains_key("plugin_signing"));
     }
 }
