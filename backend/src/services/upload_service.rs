@@ -101,11 +101,25 @@ pub enum UploadError {
 
     #[error("total_size {size} exceeds maximum allowed upload size {max}")]
     TooLarge { size: i64, max: u64 },
+
+    #[error("artifact_path is too long: {len} characters (maximum {max})")]
+    PathTooLong { len: usize, max: usize },
 }
 
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+/// Maximum permitted artifact-path length, in characters.
+///
+/// The `artifacts.path` column is `VARCHAR(2048)` (see migration
+/// `004_artifacts.sql`). An over-length path used to reach the INSERT and
+/// surface the Postgres length/constraint violation as an opaque HTTP 500
+/// `DATABASE_ERROR`. Rejecting up front in `validate_artifact_path` turns
+/// that into a clear HTTP 400, and protects every upload entry point that
+/// routes through this validator (URL-path variant, multipart-with-path,
+/// chunked sessions, replication).
+pub const MAX_ARTIFACT_PATH_LEN: usize = 2048;
 
 /// Validate that an artifact path is safe (no traversal, not empty).
 pub fn validate_artifact_path(path: &str) -> Result<(), UploadError> {
@@ -113,6 +127,15 @@ pub fn validate_artifact_path(path: &str) -> Result<(), UploadError> {
         return Err(UploadError::InvalidChunk(
             "artifact_path cannot be empty".into(),
         ));
+    }
+
+    // Reject paths longer than the backing column before they reach the
+    // INSERT, where the length violation would surface as an opaque 500.
+    if path.len() > MAX_ARTIFACT_PATH_LEN {
+        return Err(UploadError::PathTooLong {
+            len: path.len(),
+            max: MAX_ARTIFACT_PATH_LEN,
+        });
     }
 
     // Reject null bytes (could bypass C-level path checks)
@@ -1695,6 +1718,39 @@ mod tests {
     fn test_validate_path_valid_dots_in_filename() {
         // Filenames with dots that aren't traversal should be fine
         assert!(validate_artifact_path("my.app.v1.2.3.tar.gz").is_ok());
+    }
+
+    // --- over-length artifact paths (robustness: 400, never 500) ---
+
+    #[test]
+    fn test_validate_path_length_boundaries() {
+        // Table-driven so the length cap maps to a 4xx rejection (a clear
+        // PathTooLong) rather than reaching the INSERT and surfacing the
+        // Postgres VARCHAR(2048) violation as an opaque 500 DATABASE_ERROR.
+        let cases: &[(usize, bool)] = &[
+            (1, true),                          // trivially fine
+            (MAX_ARTIFACT_PATH_LEN - 1, true),  // just under the cap
+            (MAX_ARTIFACT_PATH_LEN, true),      // exactly at the cap
+            (MAX_ARTIFACT_PATH_LEN + 1, false), // one over -> reject
+            (5000, false),                      // the reported red-team payload
+        ];
+        for &(len, should_pass) in cases {
+            let path = "a".repeat(len);
+            let result = validate_artifact_path(&path);
+            assert_eq!(
+                result.is_ok(),
+                should_pass,
+                "path of length {len} expected pass={should_pass}, got {result:?}"
+            );
+            if !should_pass {
+                // Must be the dedicated PathTooLong variant (-> HTTP 400),
+                // not a generic/DB error.
+                assert!(
+                    matches!(result, Err(UploadError::PathTooLong { .. })),
+                    "length {len} should yield PathTooLong, got {result:?}"
+                );
+            }
+        }
     }
 
     #[test]

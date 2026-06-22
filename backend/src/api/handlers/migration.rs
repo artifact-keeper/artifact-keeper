@@ -176,6 +176,26 @@ pub struct MigrationReportRow {
 
 // ============ Request/Response DTOs ============
 
+/// Auth-type values accepted by the `source_connections.auth_type` column,
+/// per the `source_connections_auth_type_check` CHECK constraint in migration
+/// `020_migration_tables.sql`.
+const ALLOWED_CONNECTION_AUTH_TYPES: [&str; 2] = ["api_token", "basic_auth"];
+
+/// Reject any `auth_type` the database CHECK constraint would refuse, mapping
+/// it to a clear HTTP 400 (`AppError::Validation`) instead of letting the
+/// constraint violation surface as an opaque 500 DATABASE_ERROR.
+fn validate_connection_auth_type(auth_type: &str) -> Result<()> {
+    if ALLOWED_CONNECTION_AUTH_TYPES.contains(&auth_type) {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "invalid auth_type '{}'; must be one of: {}",
+            auth_type,
+            ALLOWED_CONNECTION_AUTH_TYPES.join(", ")
+        )))
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConnectionRequest {
     pub name: String,
@@ -494,6 +514,13 @@ async fn create_connection(
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
     // Validate URL to prevent SSRF when migration fetches from this source
     validate_outbound_url(&req.url, "Migration source URL")?;
+
+    // Validate auth_type against the values permitted by the
+    // `source_connections_auth_type_check` CHECK constraint (migration
+    // 020_migration_tables.sql). Without this, any other string reached the
+    // INSERT and surfaced the constraint violation as an opaque HTTP 500
+    // DATABASE_ERROR instead of a clear 400.
+    validate_connection_auth_type(&req.auth_type)?;
 
     // Encrypt credentials before storing
     let credentials_json = serde_json::to_string(&req.credentials)?;
@@ -1784,6 +1811,37 @@ mod tests {
         assert_eq!(response.auth_type, "api_token");
         assert_eq!(response.source_type, "artifactory");
         assert!(response.verified_at.is_some());
+    }
+
+    #[test]
+    fn test_validate_connection_auth_type() {
+        // Table-driven: accepted values must pass; anything the
+        // source_connections_auth_type_check CHECK constraint would refuse
+        // must map to a Validation error (HTTP 400), never reach the INSERT
+        // and surface as an opaque 500 DATABASE_ERROR.
+        let cases: &[(&str, bool)] = &[
+            ("api_token", true),
+            ("basic_auth", true),
+            ("basic", false), // the persona's body shape -> previously 500
+            ("token", false),
+            ("", false),
+            ("API_TOKEN", false), // case-sensitive
+            ("' OR 1=1--", false),
+        ];
+        for &(auth_type, should_pass) in cases {
+            let result = validate_connection_auth_type(auth_type);
+            assert_eq!(
+                result.is_ok(),
+                should_pass,
+                "auth_type {auth_type:?} expected pass={should_pass}, got {result:?}"
+            );
+            if !should_pass {
+                assert!(
+                    matches!(result, Err(AppError::Validation(_))),
+                    "auth_type {auth_type:?} should yield Validation (400), got {result:?}"
+                );
+            }
+        }
     }
 
     #[test]

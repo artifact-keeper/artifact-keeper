@@ -792,6 +792,7 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::InvalidChunk(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::InvalidChunkSize => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+        UploadError::PathTooLong { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::InvalidStatus(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::ChecksumMismatch { .. } => (StatusCode::CONFLICT, e.to_string()),
         UploadError::IncompleteChunks { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
