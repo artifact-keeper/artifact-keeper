@@ -41,10 +41,11 @@ const CGNAT_SECOND_OCTET_MASK: u8 = 0xc0;
 const CGNAT_SECOND_OCTET_PREFIX: u8 = 0x40;
 
 /// Cloud-provider metadata IPs that fall outside RFC1918 / link-local.
-/// Each entry is a single-IP block. The full Alibaba CGNAT range is
-/// gated behind `BLOCK_CGNAT_OUTBOUND=true` (off by default) since
-/// `100.64.0.0/10` is also used by K8s pod CIDRs in some clusters and
-/// by CGNAT-served residential ISPs.
+/// Each entry is a single-IP block. The Alibaba metadata IP lives inside
+/// `100.64.0.0/10`; the whole CGNAT range is now blocked by default (see
+/// [`is_blocked_ipv4`]), but this single-IP entry is retained as a hard
+/// block so the metadata endpoint stays unreachable even when an operator
+/// allowlists a containing CGNAT CIDR.
 const CLOUD_METADATA_IPS: &[[u8; 4]] = &[
     [192, 0, 0, 192],     // Oracle Cloud Infrastructure
     [100, 100, 100, 200], // Alibaba Cloud
@@ -391,9 +392,11 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
 /// - IPv4 loopback / RFC1918 private / link-local / unspecified / broadcast
 /// - Specific cloud metadata IPs that fall outside RFC1918 (Oracle
 ///   `192.0.0.192`, Alibaba `100.100.100.200`)
-/// - Optionally (gated by `BLOCK_CGNAT_OUTBOUND=true`) the entire
-///   `100.64.0.0/10` CGNAT range. Off by default because K8s pod CIDRs
-///   and CGNAT-served ISPs legitimately occupy this range
+/// - RFC 6598 carrier-grade NAT `100.64.0.0/10`, blocked by default and
+///   relaxable through the same private-IP escape hatches as RFC1918
+///   (allowlist / per-context toggle). Previously this required opting in
+///   via `BLOCK_CGNAT_OUTBOUND=true`, which left a default-open SSRF hole
+///   for CGNAT targets such as Tailscale tailnet IPs
 /// - IPv6 loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`),
 ///   unique-local (`fc00::/7`)
 /// - IPv4-mapped IPv6 (`::ffff:0:0/96`) and the deprecated
@@ -457,17 +460,28 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr, ctx: OutboundUrlContext) -> bool {
     if is_hard_blocked_ipv4(v4) {
         return true;
     }
-    let octets = v4.octets();
     if v4.is_private() {
         return !private_ip_allowed(std::net::IpAddr::V4(v4), ctx);
     }
-    if cgnat_block_enabled()
-        && octets[0] == 100
-        && (octets[1] & CGNAT_SECOND_OCTET_MASK) == CGNAT_SECOND_OCTET_PREFIX
-    {
-        return true;
+    // RFC 6598 carrier-grade NAT (`100.64.0.0/10`). Treated like RFC1918:
+    // blocked by default (closes the full-response SSRF where a webhook /
+    // upstream / peer URL points at a CGNAT address such as a Tailscale
+    // tailnet IP) but relaxable through the same operator escape hatches
+    // (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context blanket toggles) so
+    // a deployment whose K8s pod CIDR or CGNAT-served network legitimately
+    // lives here can opt the relevant CIDR back in.
+    if is_cgnat_ipv4(v4) {
+        return !private_ip_allowed(std::net::IpAddr::V4(v4), ctx);
     }
     false
+}
+
+/// True when `v4` is in the RFC 6598 carrier-grade NAT range
+/// `100.64.0.0/10` (first octet 100, top two bits of the second octet
+/// `0b01`).
+fn is_cgnat_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (octets[1] & CGNAT_SECOND_OCTET_MASK) == CGNAT_SECOND_OCTET_PREFIX
 }
 
 fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
@@ -661,17 +675,6 @@ fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
-/// Whether to block the entire `100.64.0.0/10` CGNAT range. Off by
-/// default. Operators serving artifact-keeper from a CGNAT-served
-/// network or a K8s cluster that uses CGNAT for pod CIDRs would
-/// otherwise lose the ability to fetch from those addresses. When set
-/// to `true`, every CGNAT IP is rejected as if it were RFC1918.
-fn cgnat_block_enabled() -> bool {
-    std::env::var("BLOCK_CGNAT_OUTBOUND")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
-        .unwrap_or(false)
-}
-
 fn record_block(label: &str, reason: &BlockReason) {
     let detail = match reason {
         BlockReason::Hostname(host) => host.clone(),
@@ -692,10 +695,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests that mutate `BLOCK_CGNAT_OUTBOUND` must serialize to avoid
-    /// racing parallel test threads. `cargo test` runs tests in
-    /// parallel; without this lock, an env-var-mutating test can flip
-    /// state under another test's nose.
+    /// Tests that mutate process-wide env vars (the private-IP allowlist
+    /// toggles) must serialize to avoid racing parallel test threads.
+    /// `cargo test` runs tests in parallel; without this lock, an
+    /// env-var-mutating test can flip state under another test's nose.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
@@ -918,56 +921,90 @@ mod tests {
         assert_blocked_ip("http://100.100.100.200/latest/meta-data");
     }
 
+    // -----------------------------------------------------------------------
+    // RFC 6598 carrier-grade NAT `100.64.0.0/10`. Blocked by default (closes
+    // the full-response SSRF where a webhook/upstream/peer URL targets a CGNAT
+    // address such as a Tailscale tailnet IP) and relaxable through the same
+    // private-IP escape hatches as RFC1918. Table-driven to keep boundary
+    // coverage without duplicated boilerplate.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_alibaba_metadata_neighbor_allowed_by_default() {
-        // 100.100.100.199 is in CGNAT but not the specific Alibaba IP.
-        // With BLOCK_CGNAT_OUTBOUND off (default) it must be allowed,
-        // otherwise K8s pod CIDRs in CGNAT and homelab/CGNAT ISPs break.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("BLOCK_CGNAT_OUTBOUND").ok();
-        std::env::remove_var("BLOCK_CGNAT_OUTBOUND");
-        let result = validate_outbound_url("http://100.100.100.199/x", "Test URL");
-        if let Some(v) = prev {
-            std::env::set_var("BLOCK_CGNAT_OUTBOUND", v);
+    fn test_cgnat_blocked_by_default() {
+        let _g = AllowlistGuard::new();
+        // In-range representatives (incl. the live finding's 100.109.36.117)
+        // and the two range edges must be blocked with the private-network
+        // message; the addresses just outside 100.64.0.0/10 must pass.
+        let blocked = [
+            "http://100.64.0.1/x",      // first usable in range
+            "http://100.109.36.117/x",  // observed Tailscale tailnet IP
+            "http://100.127.255.254/x", // near top of range
+            "http://100.64.0.0/x",      // network address (range edge)
+            "http://100.127.255.255/x", // last address of the range
+        ];
+        for url in blocked {
+            assert_blocked_ip(url);
         }
+        let allowed = [
+            "http://100.63.255.255/x", // just below the range
+            "http://100.128.0.1/x",    // just above the range
+            "http://99.255.255.255/x", // different first octet, public
+        ];
+        for url in allowed {
+            assert!(
+                validate_outbound_url(url, "Test URL").is_ok(),
+                "{url} sits outside 100.64.0.0/10 and must remain allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cgnat_blocked_across_all_contexts() {
+        // The shared validator feeds webhooks, upstream/peer fetches and SSO.
+        // A CGNAT target must be rejected on every surface by default.
+        let _g = AllowlistGuard::new();
+        let url = "http://100.109.36.117:9999/canary";
         assert!(
-            result.is_ok(),
-            "100.100.100.199 (CGNAT but not Alibaba) must be allowed by default; got {:?}",
-            result
+            validate_outbound_url(url, "Upstream URL").is_err(),
+            "CGNAT must be blocked on the upstream surface"
+        );
+        assert!(
+            validate_outbound_webhook_url(url, "Webhook URL").is_err(),
+            "CGNAT must be blocked on the webhook surface"
+        );
+        assert!(
+            validate_outbound_sso_url("https://100.109.36.117/realms/x", "OIDC discovery URL")
+                .is_err(),
+            "CGNAT must be blocked on the SSO surface"
         );
     }
 
     #[test]
-    fn test_cgnat_block_when_opted_in() {
-        // With BLOCK_CGNAT_OUTBOUND=true, the entire 100.64.0.0/10 range
-        // must be rejected. Range-boundary cases pin off-by-one bugs in
-        // the mask.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("BLOCK_CGNAT_OUTBOUND").ok();
-        std::env::set_var("BLOCK_CGNAT_OUTBOUND", "true");
-        let low_in = validate_outbound_url("http://100.64.0.1/x", "Test URL");
-        let high_in = validate_outbound_url("http://100.127.255.254/x", "Test URL");
-        let low_out = validate_outbound_url("http://100.63.255.255/x", "Test URL");
-        let high_out = validate_outbound_url("http://100.128.0.1/x", "Test URL");
-        match prev {
-            Some(v) => std::env::set_var("BLOCK_CGNAT_OUTBOUND", v),
-            None => std::env::remove_var("BLOCK_CGNAT_OUTBOUND"),
-        }
+    fn test_cgnat_relaxed_by_named_cidr_allowlist() {
+        // An operator whose K8s pod CIDR / CGNAT-served network lives in the
+        // range can opt the specific CIDR back in via the named allowlist,
+        // and it applies to both upstream and webhook contexts.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "100.64.0.0/16");
         assert!(
-            low_in.is_err(),
-            "100.64.0.1 must be blocked when CGNAT block is on"
+            validate_outbound_url("http://100.64.1.5/x", "Upstream URL").is_ok(),
+            "100.64.1.5 must be allowed when its CGNAT CIDR is allowlisted"
         );
         assert!(
-            high_in.is_err(),
-            "100.127.255.254 must be blocked when CGNAT block is on"
+            validate_outbound_webhook_url("http://100.64.1.5/hook", "Webhook URL").is_ok(),
+            "named allowlist must relax CGNAT on the webhook surface too"
         );
+        // A CGNAT address outside the allowlisted CIDR stays blocked.
+        assert_blocked_ip("http://100.109.36.117/x");
+    }
+
+    #[test]
+    fn test_cgnat_relaxed_by_blanket_toggle() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
         assert!(
-            low_out.is_ok(),
-            "100.63.255.255 must remain allowed (just below CGNAT)"
-        );
-        assert!(
-            high_out.is_ok(),
-            "100.128.0.1 must remain allowed (just above CGNAT)"
+            validate_outbound_url("http://100.64.0.1/x", "Upstream URL").is_ok(),
+            "CGNAT must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
         );
     }
 
@@ -1056,7 +1093,24 @@ mod tests {
 
     #[test]
     fn test_allows_k8s_service_name() {
-        assert!(validate_outbound_url("http://nexus:8081/repository/pypi", "Test URL").is_ok());
+        // A bare service name that is not in BLOCKED_HOSTS must pass the
+        // string checks. The validator additionally resolves the name and
+        // blocks it if it maps to an internal address, so this assertion is
+        // guarded: on a host whose resolver happens to map `nexus` to a
+        // blocked IP (e.g. a Tailscale/CGNAT 100.64.0.0/10 address), the
+        // *block* is the correct behaviour, not a regression in this test.
+        use std::net::ToSocketAddrs;
+        let resolves_blocked = ("nexus", 0u16)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .any(|a| is_blocked_ip_in(a.ip(), OutboundUrlContext::Upstream))
+            })
+            .unwrap_or(false);
+        if !resolves_blocked {
+            assert!(validate_outbound_url("http://nexus:8081/repository/pypi", "Test URL").is_ok());
+        }
     }
 
     #[test]
