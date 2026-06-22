@@ -328,6 +328,29 @@ impl GrypeScanner {
         Some(join_oci_image_ref(&qualified_name, reference))
     }
 
+    /// Single source of truth for the OCI `registry:` image ref used by the
+    /// production scan dispatch (`is_applicable_for_target` and
+    /// `scan_target`).
+    ///
+    /// This intentionally delegates to the **repository-scoped** builder, not
+    /// the legacy path-only `build_registry_image_ref`. Stored OCI artifact
+    /// paths omit the routing key (`v2/<image>/manifests/<ref>`), but the
+    /// external `/v2/` route that Grype pulls from is
+    /// `/v2/<repo_key>/<image>/manifests/<ref>` (see `oci_v2::resolve_repo`,
+    /// which splits the first path segment as the repository key). Issue #1903:
+    /// dispatching through the path-only builder produced
+    /// `<host>/<image>:<tag>`, which Grype resolved to `/v2/<image>/manifests/...`
+    /// and the registry rejected with `NAME_UNKNOWN` because no repository
+    /// named `<image>` exists. Threading the owning repository key restores a
+    /// routable `<host>/<repo_key>/<image>:<tag>` ref.
+    fn oci_registry_target(artifact: &Artifact, target: &ScanTarget<'_>) -> Option<String> {
+        Self::build_registry_image_ref_for_repo(
+            artifact,
+            target.repository_key,
+            target.repository_type,
+        )
+    }
+
     async fn scan_oci_registry_ref(
         &self,
         artifact: &Artifact,
@@ -712,12 +735,7 @@ impl Scanner for GrypeScanner {
             // Production OCI applicability is repository-aware: stored
             // artifact paths omit the routing key, so Grype must validate that
             // a ref can be built with the owning repository key restored.
-            return Self::build_registry_image_ref_for_repo(
-                artifact,
-                target.repository_key,
-                target.repository_type,
-            )
-            .is_some();
+            return Self::oci_registry_target(artifact, target).is_some();
         }
         self.is_applicable(artifact)
     }
@@ -810,12 +828,7 @@ impl Scanner for GrypeScanner {
     ) -> Result<ScanOutput> {
         let artifact = target.artifact;
         if is_oci_image_artifact(artifact) {
-            let image_ref = Self::build_registry_image_ref_for_repo(
-                artifact,
-                target.repository_key,
-                target.repository_type,
-            )
-            .ok_or_else(|| {
+            let image_ref = Self::oci_registry_target(artifact, target).ok_or_else(|| {
                 AppError::Internal(
                     "Grype OCI scan: failed to reconstruct repository-qualified registry image ref \
                      (is_applicable_for_target should have rejected this artifact)"
@@ -1130,6 +1143,88 @@ mod tests {
                 path
             );
         }
+    }
+
+    /// Regression test for issue #1903 ("Cannot run Grype OCI scan on images
+    /// in docker repo" / `NAME_UNKNOWN`).
+    ///
+    /// The production scan dispatch (`scan_target` / `is_applicable_for_target`)
+    /// must build the OCI `registry:` ref through the repository-scoped
+    /// builder so the ref carries the owning repository key. The exact #1903
+    /// scenario: an image pushed to docker repo `docker-repo1` is stored at
+    /// `v2/sa-backend/manifests/release-1.4.0` (the routing key is stripped on
+    /// store). Grype must be pointed at `/v2/docker-repo1/sa-backend/...`
+    /// (host/`<repo_key>`/`<image>`:`<tag>`), because `oci_v2::resolve_repo`
+    /// splits the first path segment as the repository key. With the bug, the
+    /// path-only ref `<host>/sa-backend:release-1.4.0` made Grype request
+    /// `/v2/sa-backend/manifests/...`, which the registry rejected with
+    /// `NAME_UNKNOWN: repository not found: sa-backend`.
+    #[test]
+    fn test_scan_dispatch_uses_repo_scoped_ref_for_docker_repo_issue_1903() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "sa-backend",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/sa-backend/manifests/release-1.4.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+        };
+
+        // The scan dispatch resolves a routable, repository-scoped ref.
+        let dispatched =
+            GrypeScanner::oci_registry_target(&artifact, &target).expect("ref must build");
+        assert_eq!(
+            dispatched, "localhost:8080/docker-repo1/sa-backend:release-1.4.0",
+            "scan dispatch must thread the owning repository key into the OCI ref"
+        );
+
+        // Guard: the ref Grype receives must contain the repo key and must NOT
+        // be the path-only form that triggered NAME_UNKNOWN in #1903.
+        assert!(
+            dispatched.contains("/docker-repo1/sa-backend:"),
+            "dispatched ref must be repo-scoped (<repo>/<image>): {dispatched}"
+        );
+        let path_only = GrypeScanner::build_registry_image_ref(&artifact)
+            .expect("legacy builder also resolves the path");
+        assert_eq!(
+            path_only, "localhost:8080/sa-backend:release-1.4.0",
+            "sanity: the legacy path-only builder is exactly the broken #1903 ref"
+        );
+        assert_ne!(
+            dispatched, path_only,
+            "scan dispatch must NOT fall back to the path-only ref that caused #1903"
+        );
+    }
+
+    /// Companion to the dispatch test: applicability for a docker-repo OCI
+    /// artifact is also computed via the repository-scoped builder, so an
+    /// applicable artifact never gets routed to a non-routable scan.
+    #[test]
+    fn test_is_applicable_for_target_oci_docker_repo_is_repo_scoped_issue_1903() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "sa-backend",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/sa-backend/manifests/release-1.4.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+        };
+        assert!(
+            grype().is_applicable_for_target(&target),
+            "an OCI image in a docker repo must be applicable for Grype registry scanning"
+        );
+        // And the ref applicability validated is the repo-scoped one.
+        assert_eq!(
+            GrypeScanner::oci_registry_target(&artifact, &target),
+            GrypeScanner::build_registry_image_ref_for_repo(&artifact, "docker-repo1", "local"),
+            "applicability and dispatch must agree on the repo-scoped ref"
+        );
     }
 
     #[test]
