@@ -2414,6 +2414,29 @@ async fn download_package(
         .await
         .map_err(|e| e.into_response())?;
 
+    // Redirect to a presigned storage URL when enabled, so the client pulls the
+    // package directly from object storage instead of streaming through the
+    // backend (conda/mamba verify against repodata.json, not response headers).
+    if state.config.presigned_downloads_enabled {
+        let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
+        if let Some(redirect) = crate::api::download_response::try_presigned_redirect(
+            storage.as_ref(),
+            &artifact.storage_key,
+            true,
+            expiry,
+        )
+        .await
+        {
+            let _ = sqlx::query!(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+                artifact.id
+            )
+            .execute(&state.db)
+            .await;
+            return Ok(redirect);
+        }
+    }
+
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
