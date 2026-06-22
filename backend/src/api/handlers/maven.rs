@@ -3776,4 +3776,358 @@ mod tests {
                 .await;
         }
     }
+
+    // ── Coverage for fetch_maven_metadata_bytes (the centralized resolver) ──
+    //
+    // These DB-backed tests drive the `download` handler through the actual
+    // axum extractors so they exercise `fetch_maven_metadata_bytes` for every
+    // repo type. They guard the load-bearing invariant of the refactor:
+    //
+    //   the `.sha1`/`.sha256` served for `maven-metadata.xml` must equal the
+    //   checksum of the metadata XML bytes that the SAME URL serves.
+    //
+    // Before #1922 the checksum path and the metadata path diverged (the
+    // checksum was computed from a stored sidecar, the body was generated /
+    // merged dynamically), so a virtual or merged repo could serve a `.sha1`
+    // that did not match its own `maven-metadata.xml`. Centralizing both on
+    // `fetch_maven_metadata_bytes` closes that gap; these tests pin it shut.
+    //
+    // All skip cleanly when `DATABASE_URL` is unset (the `try_pool`
+    // convention). The CI coverage job (`cargo llvm-cov --lib` with a seeded
+    // Postgres) runs them, so the resolver's new lines are instrumented.
+
+    /// Insert an `artifacts` + `artifact_metadata` row so a hosted repo's
+    /// `generate_metadata_for_artifact` query (and any version-sort) finds the
+    /// version under `group_id`/`artifact_id`.
+    async fn seed_maven_version(
+        pool: &PgPool,
+        repo_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        group_id: &str,
+        artifact_id: &str,
+        version: &str,
+    ) {
+        let aid = uuid::Uuid::new_v4();
+        let path = format!(
+            "{}/{}/{}/{}-{}.jar",
+            group_id.replace('.', "/"),
+            artifact_id,
+            version,
+            artifact_id,
+            version
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, repository_id, path, name, version, size_bytes,
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted)
+            VALUES ($1, $2, $3, $4, $5, 1, $6, 'application/java-archive', $7, $8, false)
+            "#,
+        )
+        .bind(aid)
+        .bind(repo_id)
+        .bind(&path)
+        .bind(artifact_id)
+        .bind(version)
+        .bind("ab".repeat(32))
+        .bind(format!("maven/{}", path))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', jsonb_build_object(
+                'groupId', $2::text, 'artifactId', $3::text,
+                'version', $4::text, 'extension', 'jar'
+            ))
+            "#,
+        )
+        .bind(aid)
+        .bind(group_id)
+        .bind(artifact_id)
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("seed artifact_metadata row");
+    }
+
+    /// Drive `download` for `<repo_key>/<meta_path>` and its `.<ext>` checksum
+    /// sibling, returning `(metadata_bytes, served_checksum_string)`.
+    async fn served_metadata_and_checksum(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        meta_path: &str,
+        ext: &str,
+    ) -> (bytes::Bytes, String) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let meta_resp = download(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((repo_key.to_string(), meta_path.to_string())),
+        )
+        .await
+        .expect("metadata download must succeed");
+        assert_eq!(
+            meta_resp.status(),
+            axum::http::StatusCode::OK,
+            "metadata GET must be 200"
+        );
+        let meta_bytes = axum::body::to_bytes(meta_resp.into_body(), 1 << 20)
+            .await
+            .expect("read metadata body");
+
+        let csum_resp = download(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((repo_key.to_string(), format!("{}.{}", meta_path, ext))),
+        )
+        .await
+        .expect("checksum download must succeed");
+        assert_eq!(
+            csum_resp.status(),
+            axum::http::StatusCode::OK,
+            "checksum GET must be 200"
+        );
+        let csum_bytes = axum::body::to_bytes(csum_resp.into_body(), 1 << 20)
+            .await
+            .expect("read checksum body");
+        let csum = String::from_utf8(csum_bytes.to_vec()).expect("checksum is utf-8");
+        (meta_bytes, csum.trim().to_string())
+    }
+
+    /// LOCAL repo: the served `.sha1`/`.sha256` for `maven-metadata.xml` must
+    /// equal the checksum of the served (dynamically-generated) metadata bytes.
+    #[tokio::test]
+    async fn test_resolver_local_metadata_checksum_matches_body_1922() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let group_id = "com.example.cov1922local";
+        let artifact_id = "lib";
+        seed_maven_version(&pool, repo_id, user_id, group_id, artifact_id, "1.0.0").await;
+        seed_maven_version(&pool, repo_id, user_id, group_id, artifact_id, "1.1.0").await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let meta_path = format!(
+            "{}/{}/maven-metadata.xml",
+            group_id.replace('.', "/"),
+            artifact_id
+        );
+
+        let (sha1_body, sha1) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, &meta_path, "sha1").await;
+        let (sha256_body, sha256) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, &meta_path, "sha256").await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The generated metadata must actually carry the versions we seeded.
+        let body_str = String::from_utf8_lossy(&sha1_body);
+        assert!(
+            body_str.contains("1.0.0") && body_str.contains("1.1.0"),
+            "local metadata must list seeded versions; got: {}",
+            body_str
+        );
+        assert_eq!(
+            sha1,
+            compute_checksum(&sha1_body, ChecksumType::Sha1),
+            "local .sha1 must equal sha1 of the served metadata body (#1922)"
+        );
+        assert_eq!(
+            sha256,
+            compute_checksum(&sha256_body, ChecksumType::Sha256),
+            "local .sha256 must equal sha256 of the served metadata body (#1922)"
+        );
+    }
+
+    /// VIRTUAL repo over two LOCAL members: the served checksum must match the
+    /// MERGED metadata body. This is the case the refactor most directly fixes
+    /// — the merged body is generated on the fly, so a stored sidecar could
+    /// never have matched it.
+    #[tokio::test]
+    async fn test_resolver_virtual_merged_metadata_checksum_matches_body_1922() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (member_a, _ka, dir_a) = tdh::create_repo(&pool, "local", "maven").await;
+        let (member_b, _kb, dir_b) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let group_id = "com.example.cov1922virt";
+        let artifact_id = "lib";
+        // Each member carries a DISJOINT version so the merge is observable.
+        seed_maven_version(&pool, member_a, user_id, group_id, artifact_id, "1.0.0").await;
+        seed_maven_version(&pool, member_b, user_id, group_id, artifact_id, "2.0.0").await;
+
+        // Virtual repo with both locals as members.
+        let virtual_id = uuid::Uuid::new_v4();
+        let virtual_key = format!("v-cov1922-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("cov1922-virt-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(virtual_dir.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+        for (i, m) in [member_a, member_b].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(m)
+            .bind(i as i32)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let meta_path = format!(
+            "{}/{}/maven-metadata.xml",
+            group_id.replace('.', "/"),
+            artifact_id
+        );
+
+        let (sha1_body, sha1) =
+            served_metadata_and_checksum(&state, &auth, &virtual_key, &meta_path, "sha1").await;
+        let (sha256_body, sha256) =
+            served_metadata_and_checksum(&state, &auth, &virtual_key, &meta_path, "sha256").await;
+
+        // cleanup (members cascade; explicit deletes for the extras).
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, member_a, user_id).await;
+        tdh::cleanup(&pool, member_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        // The merged body must contain BOTH members' versions — proving the
+        // merge path (not a single-member shortcut) produced these bytes.
+        let body_str = String::from_utf8_lossy(&sha1_body);
+        assert!(
+            body_str.contains("1.0.0") && body_str.contains("2.0.0"),
+            "virtual metadata must merge both members' versions; got: {}",
+            body_str
+        );
+        assert_eq!(
+            sha1,
+            compute_checksum(&sha1_body, ChecksumType::Sha1),
+            "virtual .sha1 must equal sha1 of the merged metadata body (#1922)"
+        );
+        assert_eq!(
+            sha256,
+            compute_checksum(&sha256_body, ChecksumType::Sha256),
+            "virtual .sha256 must equal sha256 of the merged metadata body (#1922)"
+        );
+    }
+
+    /// REMOTE repo: the served checksum must match the upstream metadata body
+    /// the resolver proxied (the resolver computes the checksum from the same
+    /// bytes it serves, so an upstream that ships a mismatched `.sha1` no
+    /// longer leaks through). Uses a wiremock upstream — no real egress.
+    #[tokio::test]
+    async fn test_resolver_remote_metadata_checksum_matches_body_1922() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let group_id = "com.example.cov1922remote";
+        let artifact_id = "lib";
+        let meta_path = format!(
+            "{}/{}/maven-metadata.xml",
+            group_id.replace('.', "/"),
+            artifact_id
+        );
+        // The upstream serves a real metadata document for the .xml request.
+        let upstream_meta = generate_metadata_xml(
+            group_id,
+            artifact_id,
+            &["1.0.0".to_string(), "1.1.0".to_string()],
+            "1.1.0",
+            Some("1.1.0"),
+        );
+
+        let mock = MockServer::start().await;
+        // Upstream deliberately serves a WRONG sidecar `.sha1` to prove the
+        // resolver recomputes from the body rather than forwarding it.
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml\.sha1$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("0000bogussha1value0000"))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta.clone()))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, remote_id, user_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+
+        let (sha1_body, sha1) =
+            served_metadata_and_checksum(&state, &auth, &remote_key, &meta_path, "sha1").await;
+
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            String::from_utf8_lossy(&sha1_body),
+            upstream_meta,
+            "remote metadata body must be the proxied upstream document"
+        );
+        assert_eq!(
+            sha1,
+            compute_checksum(&sha1_body, ChecksumType::Sha1),
+            "remote .sha1 must be recomputed from the served body, NOT the \
+             upstream's (bogus) sidecar (#1922)"
+        );
+        assert_ne!(
+            sha1, "0000bogussha1value0000",
+            "resolver must not forward the upstream's mismatched sidecar"
+        );
+    }
 }
