@@ -93,6 +93,19 @@ pub struct HeartbeatRequest {
     pub status: Option<String>,
 }
 
+/// Parse a textual `replication_mode` (case-insensitive) into a
+/// [`ReplicationMode`]. Returns `None` for an unrecognized value so the caller
+/// can decide how to surface the error (the assign handler maps it to 400).
+fn parse_replication_mode(s: &str) -> Option<ReplicationMode> {
+    match s.to_lowercase().as_str() {
+        "push" => Some(ReplicationMode::Push),
+        "pull" => Some(ReplicationMode::Pull),
+        "mirror" => Some(ReplicationMode::Mirror),
+        "none" => Some(ReplicationMode::None),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
@@ -557,7 +570,8 @@ pub async fn get_assigned_repos(
     request_body = AssignRepoRequest,
     responses(
         (status = 200, description = "Repository assigned successfully"),
-        (status = 404, description = "Peer instance not found"),
+        (status = 400, description = "Invalid replication_mode"),
+        (status = 404, description = "Peer instance or repository not found"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -569,17 +583,19 @@ pub async fn assign_repo(
     Json(payload): Json<AssignRepoRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    let replication_mode =
-        payload
-            .replication_mode
-            .as_ref()
-            .and_then(|s| match s.to_lowercase().as_str() {
-                "push" => Some(ReplicationMode::Push),
-                "pull" => Some(ReplicationMode::Pull),
-                "mirror" => Some(ReplicationMode::Mirror),
-                "none" => Some(ReplicationMode::None),
-                _ => None,
-            });
+    // An omitted `replication_mode` is valid and falls back to the column
+    // default (`pull`) in the service layer. A *present but unrecognized* value
+    // is a client error and must surface as 400, not be silently dropped (which
+    // previously produced a NULL insert and an opaque 500 DATABASE_ERROR).
+    let replication_mode = match payload.replication_mode.as_deref() {
+        Some(s) => Some(parse_replication_mode(s).ok_or_else(|| {
+            crate::error::AppError::Validation(format!(
+                "invalid replication_mode '{}' (expected one of: push, pull, mirror, none)",
+                s
+            ))
+        })?),
+        None => None,
+    };
 
     let service = PeerInstanceService::new(state.db.clone());
     service
@@ -1126,25 +1142,34 @@ mod tests {
 
     #[test]
     fn test_replication_mode_parsing() {
-        let parse_mode = |s: &str| -> Option<ReplicationMode> {
-            match s.to_lowercase().as_str() {
-                "push" => Some(ReplicationMode::Push),
-                "pull" => Some(ReplicationMode::Pull),
-                "mirror" => Some(ReplicationMode::Mirror),
-                "none" => Some(ReplicationMode::None),
-                _ => None,
-            }
-        };
-        assert!(matches!(parse_mode("push"), Some(ReplicationMode::Push)));
-        assert!(matches!(parse_mode("pull"), Some(ReplicationMode::Pull)));
         assert!(matches!(
-            parse_mode("mirror"),
+            parse_replication_mode("push"),
+            Some(ReplicationMode::Push)
+        ));
+        assert!(matches!(
+            parse_replication_mode("pull"),
+            Some(ReplicationMode::Pull)
+        ));
+        assert!(matches!(
+            parse_replication_mode("mirror"),
             Some(ReplicationMode::Mirror)
         ));
-        assert!(matches!(parse_mode("none"), Some(ReplicationMode::None)));
-        assert!(matches!(parse_mode("PUSH"), Some(ReplicationMode::Push)));
-        assert!(parse_mode("invalid").is_none());
-        assert!(parse_mode("").is_none());
+        assert!(matches!(
+            parse_replication_mode("none"),
+            Some(ReplicationMode::None)
+        ));
+        // Case-insensitive.
+        assert!(matches!(
+            parse_replication_mode("PUSH"),
+            Some(ReplicationMode::Push)
+        ));
+        assert!(matches!(
+            parse_replication_mode("Mirror"),
+            Some(ReplicationMode::Mirror)
+        ));
+        // Unrecognized values yield None so the handler can return 400.
+        assert!(parse_replication_mode("invalid").is_none());
+        assert!(parse_replication_mode("").is_none());
     }
 
     // -----------------------------------------------------------------------

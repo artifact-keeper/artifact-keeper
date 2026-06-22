@@ -87,6 +87,42 @@ pub struct RegisterPeerInstanceRequest {
     pub api_key: String,
 }
 
+/// PostgreSQL SQLSTATE for a foreign-key violation.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// FK constraint that fires when `repository_id` does not reference an existing
+/// row in `repositories`.
+const PEER_REPO_SUBSCRIPTION_REPO_FK: &str = "peer_repo_subscriptions_repository_id_fkey";
+
+/// FK constraint that fires when `peer_instance_id` does not reference an
+/// existing row in `peer_instances`.
+const PEER_REPO_SUBSCRIPTION_PEER_FK: &str = "peer_repo_subscriptions_peer_instance_id_fkey";
+
+/// Map an `INSERT`/`UPSERT` error from `peer_repo_subscriptions` to an
+/// [`AppError`].
+///
+/// A foreign-key violation means the supplied `repository_id` or
+/// `peer_instance_id` does not exist; this is a client error and must surface
+/// as [`AppError::NotFound`] (HTTP 404) rather than an opaque
+/// [`AppError::Database`] (HTTP 500). All other database errors fall through to
+/// [`AppError::Database`].
+fn map_assign_repository_error(err: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.code().as_deref() == Some(PG_FOREIGN_KEY_VIOLATION) {
+            match db_err.constraint() {
+                Some(PEER_REPO_SUBSCRIPTION_REPO_FK) => {
+                    return AppError::NotFound("Repository not found".to_string());
+                }
+                Some(PEER_REPO_SUBSCRIPTION_PEER_FK) => {
+                    return AppError::NotFound("Peer instance not found".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    AppError::Database(err.to_string())
+}
+
 /// Peer instance service
 pub struct PeerInstanceService {
     db: PgPool,
@@ -377,6 +413,11 @@ impl PeerInstanceService {
         replication_schedule: Option<String>,
         replication_filter: Option<serde_json::Value>,
     ) -> Result<()> {
+        // `peer_repo_subscriptions.replication_mode` is NOT NULL. A caller that
+        // omits the mode must not produce a constraint violation surfaced as an
+        // opaque 500 -- fall back to the same default the column declares
+        // (`'pull'`).
+        let replication_mode = replication_mode.unwrap_or(ReplicationMode::Pull);
         sqlx::query!(
             r#"
             INSERT INTO peer_repo_subscriptions
@@ -391,13 +432,13 @@ impl PeerInstanceService {
             peer_instance_id,
             repository_id,
             sync_enabled,
-            replication_mode as Option<ReplicationMode>,
+            replication_mode as ReplicationMode,
             replication_schedule,
             replication_filter
         )
         .execute(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(map_assign_repository_error)?;
 
         Ok(())
     }
@@ -883,6 +924,138 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+    }
+
+    /// Connect to the test database when `DATABASE_URL` is set and reachable;
+    /// otherwise return `None` so the DB-backed tests skip silently and
+    /// `cargo test --lib` still passes without a running Postgres. CI's
+    /// integration job sets `DATABASE_URL` and exercises these branches.
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::PgPool::connect(&url).await.ok()
+    }
+
+    async fn insert_test_repo(pool: &sqlx::PgPool, suffix: &Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', $1) RETURNING id",
+        )
+        .bind(format!("assign-repo-{suffix}"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn register_test_peer(svc: &PeerInstanceService, suffix: &Uuid) -> Uuid {
+        svc.register(RegisterPeerInstanceRequest {
+            name: format!("assign-peer-{suffix}"),
+            endpoint_url: "http://127.0.0.1:65535".to_string(),
+            region: None,
+            cache_size_bytes: 0,
+            sync_filter: None,
+            api_key: "k".to_string(),
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn cleanup_assign(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {
+        // peer_repo_subscriptions cascades from both peer and repo deletes.
+        sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// DB-backed regression for the 1.2.2 federation fix: assigning a valid
+    /// repository to a peer with NO `replication_mode` supplied must succeed
+    /// (defaulting to `pull`) and persist a subscription. Previously this wrote
+    /// a NULL into the NOT NULL `replication_mode` column and surfaced as an
+    /// opaque 500 DATABASE_ERROR for every such call.
+    #[tokio::test]
+    async fn assign_repository_without_mode_defaults_to_pull_and_persists() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+
+        // No replication_mode -> must NOT error.
+        svc.assign_repository(peer_id, repo_id, true, None, None, None)
+            .await
+            .expect("assignment without replication_mode must succeed");
+
+        // Persisted with the column default.
+        let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(sub.repository_id, repo_id);
+        assert_eq!(sub.replication_mode.as_deref(), Some("pull"));
+        assert!(sub.sync_enabled);
+
+        // Idempotent upsert: a second assign with an explicit mode updates,
+        // not errors.
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Mirror),
+            None,
+            None,
+        )
+        .await
+        .expect("re-assign (upsert) must succeed");
+        let sub2 = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(sub2.replication_mode.as_deref(), Some("mirror"));
+        assert_eq!(
+            sub2.id, sub.id,
+            "upsert must reuse the same subscription row"
+        );
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    /// DB-backed: assigning a non-existent repository must map the FK violation
+    /// to NotFound (404), not an opaque 500 DATABASE_ERROR.
+    #[tokio::test]
+    async fn assign_repository_with_missing_repo_returns_not_found() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let bogus_repo = Uuid::new_v4();
+
+        let err = svc
+            .assign_repository(
+                peer_id,
+                bogus_repo,
+                true,
+                Some(ReplicationMode::Pull),
+                None,
+                None,
+            )
+            .await
+            .expect_err("assigning a non-existent repo must error");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for missing repository, got {err:?}"
+        );
+
+        // Cleanup peer (no subscription was created).
+        sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     // -----------------------------------------------------------------------
