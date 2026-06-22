@@ -1351,6 +1351,26 @@ async fn npm_local_fetch(
     })
 }
 
+/// Returns a `302` redirect to a presigned object-storage URL for a hosted
+/// download when `PRESIGNED_DOWNLOADS_ENABLED` is set and the storage backend
+/// supports redirects; otherwise `None`, so the caller falls back to streaming
+/// the bytes through the backend. Kept free of state/DB so it is unit-testable
+/// with a mock `StorageBackend`.
+async fn presigned_download_redirect(
+    config: &crate::config::Config,
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+) -> Option<Response> {
+    let expiry = std::time::Duration::from_secs(config.presigned_download_expiry_secs);
+    crate::api::download_response::try_presigned_redirect(
+        storage,
+        storage_key,
+        config.presigned_downloads_enabled,
+        expiry,
+    )
+    .await
+}
+
 async fn serve_tarball(
     state: &SharedState,
     repo_key: &str,
@@ -1498,24 +1518,16 @@ async fn serve_tarball(
     // Redirect to a presigned storage URL when enabled, so the client pulls the
     // tarball directly from object storage instead of streaming it through the
     // backend. Falls back to streaming when redirects are unsupported.
-    if state.config.presigned_downloads_enabled {
-        let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
-        if let Some(redirect) = crate::api::download_response::try_presigned_redirect(
-            storage.as_ref(),
-            &artifact.storage_key,
-            true,
-            expiry,
+    if let Some(redirect) =
+        presigned_download_redirect(&state.config, storage.as_ref(), &artifact.storage_key).await
+    {
+        let _ = sqlx::query!(
+            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+            artifact.id
         )
-        .await
-        {
-            let _ = sqlx::query!(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-                artifact.id
-            )
-            .execute(&state.db)
-            .await;
-            return Ok(redirect);
-        }
+        .execute(&state.db)
+        .await;
+        return Ok(redirect);
     }
     let stream = storage
         .get_stream(&artifact.storage_key)
@@ -4880,5 +4892,112 @@ mod tests {
                 "/-/ping must not be treated as package lookup, got: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod presign_redirect_tests {
+    use crate::error::Result as StorageResult;
+    use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend};
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    /// Storage backend that supports presigned URLs (e.g. S3).
+    struct RedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for RedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> StorageResult<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: Duration,
+        ) -> StorageResult<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: format!("https://s3.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    /// Storage backend that does not support presigned URLs (e.g. filesystem).
+    struct NoRedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for NoRedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    fn config(presigned_downloads_enabled: bool) -> crate::config::Config {
+        crate::config::Config {
+            presigned_downloads_enabled,
+            presigned_download_expiry_secs: 300,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_when_enabled_and_supported() {
+        let resp = super::presigned_download_redirect(
+            &config(true),
+            &RedirectBackend,
+            "@scope/pkg/-/pkg-1.0.0.tgz",
+        )
+        .await
+        .expect("should redirect when enabled and backend supports it");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("s3.example.com"));
+        assert!(location.contains("pkg-1.0.0.tgz"));
+    }
+
+    #[tokio::test]
+    async fn streams_when_feature_disabled() {
+        let resp = super::presigned_download_redirect(
+            &config(false),
+            &RedirectBackend,
+            "@scope/pkg/-/pkg-1.0.0.tgz",
+        )
+        .await;
+        assert!(resp.is_none(), "must stream when feature flag is off");
+    }
+
+    #[tokio::test]
+    async fn streams_when_backend_unsupported() {
+        let resp = super::presigned_download_redirect(
+            &config(true),
+            &NoRedirectBackend,
+            "@scope/pkg/-/pkg-1.0.0.tgz",
+        )
+        .await;
+        assert!(resp.is_none(), "must stream when backend cannot presign");
     }
 }
