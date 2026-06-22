@@ -699,26 +699,11 @@ mod tests {
         use super::super::map_peer_connection_error;
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::error::AppError;
-        use crate::services::peer_instance_service::{
-            PeerInstanceService, RegisterPeerInstanceRequest,
-        };
         use sqlx::PgPool;
         use uuid::Uuid;
 
         async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
-            let svc = PeerInstanceService::new(pool.clone());
-            let id = Uuid::new_v4();
-            svc.register(RegisterPeerInstanceRequest {
-                name: format!("map-err-{}-{}", tag, &id.to_string()[..8]),
-                endpoint_url: "https://peer.example.test".to_string(),
-                region: Some("us-east".to_string()),
-                cache_size_bytes: 1024,
-                sync_filter: None,
-                api_key: "k".to_string(),
-            })
-            .await
-            .expect("register peer")
-            .id
+            tdh::register_test_peer(pool, "map-err", tag).await
         }
 
         /// Attempt a `peer_connections` INSERT and return the raw `sqlx::Error`.

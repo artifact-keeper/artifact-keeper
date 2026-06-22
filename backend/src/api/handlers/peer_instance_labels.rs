@@ -487,28 +487,65 @@ mod tests {
     mod authz_db {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::middleware::auth::AuthExtension;
-        use crate::services::peer_instance_service::{
-            PeerInstanceService, RegisterPeerInstanceRequest,
-        };
         use axum::http::StatusCode;
         use sqlx::PgPool;
         use uuid::Uuid;
 
         /// Insert a peer instance via the real service and return its id.
         async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
-            let svc = PeerInstanceService::new(pool.clone());
-            let id = Uuid::new_v4();
-            svc.register(RegisterPeerInstanceRequest {
-                name: format!("labels-authz-{}-{}", tag, &id.to_string()[..8]),
-                endpoint_url: "https://peer.example.test".to_string(),
-                region: Some("us-east".to_string()),
-                cache_size_bytes: 1024,
-                sync_filter: None,
-                api_key: "k".to_string(),
-            })
-            .await
-            .expect("register peer")
-            .id
+            tdh::register_test_peer(pool, "labels-authz", tag).await
+        }
+
+        /// Drive `PUT /{peer_id}/labels` with the given principal and JSON body;
+        /// return the response status.
+        async fn put_labels(
+            state: crate::api::SharedState,
+            auth: AuthExtension,
+            peer_id: Uuid,
+            json: &str,
+        ) -> StatusCode {
+            let app = tdh::router_with_auth_ext(super::super::peer_labels_router(), state, auth);
+            let body = axum::body::Bytes::from(json.as_bytes().to_vec());
+            let (status, _) =
+                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+            status
+        }
+
+        /// Drive `POST /{peer_id}/labels/{key}` (single-label add) with the
+        /// given principal and JSON body; return the response status.
+        async fn add_label_req(
+            state: crate::api::SharedState,
+            auth: AuthExtension,
+            peer_id: Uuid,
+            key: &str,
+            json: &str,
+        ) -> StatusCode {
+            let app = tdh::router_with_auth_ext(super::super::peer_labels_router(), state, auth);
+            let body = axum::body::Bytes::from(json.as_bytes().to_vec());
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/labels/{}", peer_id, key),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+            status
+        }
+
+        /// Drive `DELETE /{peer_id}/labels/{key}` with the given principal;
+        /// return the response status.
+        async fn delete_label_req(
+            state: crate::api::SharedState,
+            auth: AuthExtension,
+            peer_id: Uuid,
+            key: &str,
+        ) -> StatusCode {
+            let app = tdh::router_with_auth_ext(super::super::peer_labels_router(), state, auth);
+            let (status, _) =
+                tdh::send(app, delete_req(format!("/{}/labels/{}", peer_id, key))).await;
+            status
         }
 
         fn admin_auth(username: &str) -> AuthExtension {
@@ -542,16 +579,13 @@ mod tests {
             let peer_id = make_peer(&pool, "corp").await;
 
             // victor.user: a regular (non-admin) corp account.
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
+            let status = put_labels(
                 state,
                 non_admin_auth("victor.user"),
-            );
-            let body = axum::body::Bytes::from(
-                r#"{"labels":[{"key":"env","value":"prod"}]}"#.as_bytes().to_vec(),
-            );
-            let (status, _) =
-                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+                peer_id,
+                r#"{"labels":[{"key":"env","value":"prod"}]}"#,
+            )
+            .await;
 
             assert_eq!(
                 status,
@@ -574,16 +608,13 @@ mod tests {
             let peer_id = make_peer(&pool, "corp").await;
 
             // glen.globex: a non-admin from a *different* tenant.
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
+            let status = put_labels(
                 state,
                 non_admin_auth("glen.globex"),
-            );
-            let body = axum::body::Bytes::from(
-                r#"{"labels":[{"key":"owned","value":"globex"}]}"#.as_bytes().to_vec(),
-            );
-            let (status, _) =
-                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+                peer_id,
+                r#"{"labels":[{"key":"owned","value":"globex"}]}"#,
+            )
+            .await;
 
             assert_eq!(
                 status,
@@ -601,18 +632,13 @@ mod tests {
             let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
             let peer_id = make_peer(&pool, "corp").await;
 
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
+            let status = put_labels(
                 state,
                 admin_auth("admin"),
-            );
-            let body = axum::body::Bytes::from(
-                r#"{"labels":[{"key":"env","value":"prod"},{"key":"tier","value":"1"}]}"#
-                    .as_bytes()
-                    .to_vec(),
-            );
-            let (status, _) =
-                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+                peer_id,
+                r#"{"labels":[{"key":"env","value":"prod"},{"key":"tier","value":"1"}]}"#,
+            )
+            .await;
 
             assert_eq!(
                 status,
@@ -640,19 +666,12 @@ mod tests {
             let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
             let peer_id = make_peer(&pool, "corp").await;
 
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
+            let status = add_label_req(
                 state,
                 non_admin_auth("victor.user"),
-            );
-            let body = axum::body::Bytes::from(r#"{"value":"x"}"#.as_bytes().to_vec());
-            let (status, _) = tdh::send(
-                app,
-                tdh::post(
-                    format!("/{}/labels/region", peer_id),
-                    "application/json",
-                    body,
-                ),
+                peer_id,
+                "region",
+                r#"{"value":"x"}"#,
             )
             .await;
             assert_eq!(
@@ -686,19 +705,12 @@ mod tests {
             let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
             let peer_id = make_peer(&pool, "corp").await;
 
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
+            let status = add_label_req(
                 state,
                 admin_auth("admin"),
-            );
-            let body = axum::body::Bytes::from(r#"{"value":"us-east"}"#.as_bytes().to_vec());
-            let (status, _) = tdh::send(
-                app,
-                tdh::post(
-                    format!("/{}/labels/region", peer_id),
-                    "application/json",
-                    body,
-                ),
+                peer_id,
+                "region",
+                r#"{"value":"us-east"}"#,
             )
             .await;
 
@@ -738,13 +750,8 @@ mod tests {
                 .await
                 .expect("seed label");
 
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
-                state,
-                non_admin_auth("victor.user"),
-            );
-            let (status, _) =
-                tdh::send(app, delete_req(format!("/{}/labels/region", peer_id))).await;
+            let status =
+                delete_label_req(state, non_admin_auth("victor.user"), peer_id, "region").await;
 
             assert_eq!(
                 status,
@@ -781,13 +788,7 @@ mod tests {
                 .expect("seed label");
             assert_eq!(label_count(&pool, peer_id).await, 1);
 
-            let app = tdh::router_with_auth_ext(
-                super::super::peer_labels_router(),
-                state,
-                admin_auth("admin"),
-            );
-            let (status, _) =
-                tdh::send(app, delete_req(format!("/{}/labels/region", peer_id))).await;
+            let status = delete_label_req(state, admin_auth("admin"), peer_id, "region").await;
 
             assert_eq!(
                 status,

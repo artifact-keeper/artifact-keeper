@@ -974,28 +974,13 @@ mod tests {
     // -----------------------------------------------------------------------
     mod probe_db {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::peer_instance_service::{
-            PeerInstanceService, RegisterPeerInstanceRequest,
-        };
         use axum::http::StatusCode;
         use axum::Router;
         use sqlx::PgPool;
         use uuid::Uuid;
 
         async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
-            let svc = PeerInstanceService::new(pool.clone());
-            let id = Uuid::new_v4();
-            svc.register(RegisterPeerInstanceRequest {
-                name: format!("probe-{}-{}", tag, &id.to_string()[..8]),
-                endpoint_url: "https://peer.example.test".to_string(),
-                region: Some("us-east".to_string()),
-                cache_size_bytes: 1024,
-                sync_filter: None,
-                api_key: "k".to_string(),
-            })
-            .await
-            .expect("register peer")
-            .id
+            tdh::register_test_peer(pool, "probe", tag).await
         }
 
         fn probe_app(state: crate::api::SharedState) -> Router {
@@ -1003,6 +988,33 @@ mod tests {
             // /:id/connections.
             let router = Router::new().nest("/:id/connections", super::super::peer_router());
             tdh::router_with_auth(router, state, tdh::make_auth(Uuid::new_v4(), "fed.admin"))
+        }
+
+        /// Drive the probe handler: POST `{target_peer_id, latency_ms}` to
+        /// `/{src}/connections/probe` on a fresh router and return the status.
+        async fn probe(
+            state: crate::api::SharedState,
+            src: Uuid,
+            target: Uuid,
+            latency: i64,
+        ) -> StatusCode {
+            let body = axum::body::Bytes::from(
+                format!(
+                    r#"{{"target_peer_id":"{}","latency_ms":{}}}"#,
+                    target, latency
+                )
+                .into_bytes(),
+            );
+            let (status, _) = tdh::send(
+                probe_app(state),
+                tdh::post(
+                    format!("/{}/connections/probe", src),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+            status
         }
 
         #[tokio::test]
@@ -1013,19 +1025,7 @@ mod tests {
             let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-probe");
             let peer_id = make_peer(&pool, "self").await;
 
-            let app = probe_app(state);
-            let body = axum::body::Bytes::from(
-                format!(r#"{{"target_peer_id":"{}","latency_ms":5}}"#, peer_id).into_bytes(),
-            );
-            let (status, _) = tdh::send(
-                app,
-                tdh::post(
-                    format!("/{}/connections/probe", peer_id),
-                    "application/json",
-                    body,
-                ),
-            )
-            .await;
+            let status = probe(state, peer_id, peer_id, 5).await;
 
             assert_eq!(
                 status,
@@ -1048,19 +1048,7 @@ mod tests {
             let peer_id = make_peer(&pool, "src").await;
             let missing = Uuid::new_v4();
 
-            let app = probe_app(state);
-            let body = axum::body::Bytes::from(
-                format!(r#"{{"target_peer_id":"{}","latency_ms":5}}"#, missing).into_bytes(),
-            );
-            let (status, _) = tdh::send(
-                app,
-                tdh::post(
-                    format!("/{}/connections/probe", peer_id),
-                    "application/json",
-                    body,
-                ),
-            )
-            .await;
+            let status = probe(state, peer_id, missing, 5).await;
 
             assert_eq!(
                 status,
@@ -1083,19 +1071,7 @@ mod tests {
             let src = make_peer(&pool, "src").await;
             let dst = make_peer(&pool, "dst").await;
 
-            let app = probe_app(state);
-            let body = axum::body::Bytes::from(
-                format!(r#"{{"target_peer_id":"{}","latency_ms":12}}"#, dst).into_bytes(),
-            );
-            let (status, _) = tdh::send(
-                app,
-                tdh::post(
-                    format!("/{}/connections/probe", src),
-                    "application/json",
-                    body,
-                ),
-            )
-            .await;
+            let status = probe(state, src, dst, 12).await;
 
             assert_eq!(
                 status,
