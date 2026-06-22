@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::auth::set_auth_cookies;
-use crate::api::validation::validate_outbound_url;
+use crate::api::validation::validate_outbound_sso_url;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -40,14 +40,21 @@ pub fn router() -> Router<SharedState> {
         .route("/exchange", post(exchange_code))
 }
 
-/// Re-validate an OIDC endpoint URL against the shared outbound-URL SSRF
-/// guard immediately before the server fetches it as a first hop. The
-/// shared HTTP client's redirect policy only guards redirect hops, never
-/// the initial request, so each server-side fetch target (discovery,
-/// token, JWKS) is checked here. Uses the `Upstream` context, so internal
-/// IdPs are reachable when `UPSTREAM_ALLOW_PRIVATE_IPS` is set.
+/// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
+/// immediately before the server fetches it as a first hop. The shared
+/// HTTP client's redirect policy only guards redirect hops, never the
+/// initial request, so each server-side fetch target (discovery, token,
+/// JWKS) is checked here.
+///
+/// Uses the dedicated `SsoDiscovery` context (issue #1891) so a configured,
+/// trusted IdP at a private/internal address (e.g. an in-cluster Keycloak)
+/// can be reached by setting `AK_SSRF_ALLOW_PRIVATE_CIDRS` to the IdP
+/// host/CIDR (preferred) or `SSO_ALLOW_PRIVATE_IPS=true`, without relaxing
+/// the upstream-proxy or webhook SSRF guards. Cloud-metadata, loopback and
+/// link-local targets remain hard-blocked. When blocked for a private IP,
+/// the error names the knobs so the failure is actionable.
 fn validate_oidc_fetch_url(url: &str, label: &str) -> Result<()> {
-    validate_outbound_url(url, label)
+    validate_outbound_sso_url(url, label)
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1202,23 @@ mod tests {
             "OIDC discovery URL"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn test_validate_oidc_fetch_url_private_block_is_actionable() {
+        // Issue #1891: the private-IP block (the reported regression) must
+        // surface the operator-fixable config knobs, not an opaque error.
+        // No env mutation needed — SSO private IPs are off by default, and
+        // this asserts the message wording only.
+        let err = validate_oidc_fetch_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "msg: {msg}");
+        assert!(msg.contains("SSO_ALLOW_PRIVATE_IPS"), "msg: {msg}");
     }
 
     // -----------------------------------------------------------------------

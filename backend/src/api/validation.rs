@@ -96,17 +96,28 @@ impl BlockReason {
 ///   fetches a package on behalf of a client" path.
 /// - [`OutboundUrlContext::Webhook`] reads `WEBHOOK_ALLOW_PRIVATE_IPS`.
 ///   Use for webhook delivery target URLs.
+/// - [`OutboundUrlContext::SsoDiscovery`] reads `SSO_ALLOW_PRIVATE_IPS`.
+///   Use for OIDC discovery / token / JWKS / userinfo fetches against a
+///   *configured, trusted* identity provider. Kept separate (issue #1891)
+///   so a deployment with an internal Keycloak at an RFC1918 address can
+///   reach its IdP without also relaxing the upstream-proxy or webhook
+///   SSRF guards, which take arbitrary client-influenced URLs.
 ///
 /// The named-CIDR allowlist (`AK_SSRF_ALLOW_PRIVATE_CIDRS`) is shared
-/// across both contexts because it is a positive allowlist that operators
+/// across all contexts because it is a positive allowlist that operators
 /// curate explicitly; widening it is an opt-in action, not a per-surface
-/// relaxation.
+/// relaxation. For SSO this is the preferred, narrowest knob: scope it to
+/// the IdP host/CIDR (e.g. `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32`)
+/// rather than enabling the blanket `SSO_ALLOW_PRIVATE_IPS` toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundUrlContext {
     /// Remote-proxy / upstream fetch path.
     Upstream,
     /// Webhook delivery target path.
     Webhook,
+    /// OIDC/SSO discovery, token, JWKS and userinfo fetch path against a
+    /// configured identity provider.
+    SsoDiscovery,
 }
 
 impl OutboundUrlContext {
@@ -116,6 +127,7 @@ impl OutboundUrlContext {
         match self {
             OutboundUrlContext::Upstream => "UPSTREAM_ALLOW_PRIVATE_IPS",
             OutboundUrlContext::Webhook => "WEBHOOK_ALLOW_PRIVATE_IPS",
+            OutboundUrlContext::SsoDiscovery => "SSO_ALLOW_PRIVATE_IPS",
         }
     }
 }
@@ -145,6 +157,43 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
 /// proxy upstream URLs (and vice versa).
 pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
     validate_outbound_url_with(url_str, label, OutboundUrlContext::Webhook)
+}
+
+/// Validate an OIDC/SSO endpoint URL (discovery, token, JWKS, userinfo)
+/// for a *configured, trusted* identity provider (anti-SSRF). Reads
+/// `SSO_ALLOW_PRIVATE_IPS` for the private-IP relaxation toggle, and also
+/// honors the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist.
+///
+/// Split out in issue #1891: the SSRF hardening in #1832 validated these
+/// fetches with the `Upstream` context, so an internal-Keycloak / private
+/// IdP deployment could only log in by setting `UPSTREAM_ALLOW_PRIVATE_IPS`
+/// — which also reopens the remote-proxy upstream surface to arbitrary
+/// private IPs. This dedicated context lets the configured IdP at a private
+/// address be reachable without that side effect. The metadata / loopback /
+/// link-local hard-blocks still apply (see [`is_hard_blocked_ipv4`]).
+///
+/// When a request is blocked because the target resolved to a private /
+/// internal address, the returned error names the config knobs the
+/// operator can use, so the failure is actionable instead of opaque.
+pub fn validate_outbound_sso_url(url_str: &str, label: &str) -> Result<()> {
+    match validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery) {
+        Ok(()) => Ok(()),
+        // Only the private/internal-IP block is operator-fixable via an
+        // allowlist knob; surface guidance for it. Hostname blocks (cloud
+        // metadata service names) and loopback are deliberate hard-blocks
+        // and must not advertise a bypass.
+        Err(AppError::Validation(msg)) if msg.contains("private/internal network") => {
+            Err(AppError::Validation(format!(
+                "{msg}. The identity provider resolves to a private/internal \
+                 address. If this IdP is trusted, allow it by setting \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS to the IdP host/CIDR (preferred, \
+                 e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32) or \
+                 SSO_ALLOW_PRIVATE_IPS=true to allow all private IPs for SSO. \
+                 Cloud metadata, loopback and link-local addresses stay blocked."
+            )))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Validate an LDAP server URL (`ldap://` or `ldaps://`) against the SSRF
@@ -507,6 +556,13 @@ pub fn upstream_allow_private_ips_enabled() -> bool {
 /// surface (issue #1435).
 pub fn webhook_allow_private_ips_enabled() -> bool {
     allow_private_ips_enabled(OutboundUrlContext::Webhook)
+}
+
+/// True when `SSO_ALLOW_PRIVATE_IPS` is set to a truthy value. Mirror of
+/// [`upstream_allow_private_ips_enabled`] for the OIDC/SSO discovery
+/// surface (issue #1891).
+pub fn sso_allow_private_ips_enabled() -> bool {
+    allow_private_ips_enabled(OutboundUrlContext::SsoDiscovery)
 }
 
 /// Context-aware truthy-env parse. Single source of truth for the
@@ -1059,6 +1115,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
         prev_webhook: Option<String>,
+        prev_sso: Option<String>,
         prev_list: Option<String>,
         prev_ssrf: Option<String>,
     }
@@ -1070,11 +1127,13 @@ mod tests {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
                 prev_webhook: std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").ok(),
+                prev_sso: std::env::var("SSO_ALLOW_PRIVATE_IPS").ok(),
                 prev_list: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
                 prev_ssrf: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
             };
             std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
             std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("SSO_ALLOW_PRIVATE_IPS");
             std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
             std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
             g
@@ -1090,6 +1149,10 @@ mod tests {
             match &self.prev_webhook {
                 Some(v) => std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", v),
                 None => std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS"),
+            }
+            match &self.prev_sso {
+                Some(v) => std::env::set_var("SSO_ALLOW_PRIVATE_IPS", v),
+                None => std::env::remove_var("SSO_ALLOW_PRIVATE_IPS"),
             }
             match &self.prev_list {
                 Some(v) => std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", v),
@@ -1600,6 +1663,180 @@ mod tests {
         assert!(webhook_allow_private_ips_enabled());
         std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "maybe");
         assert!(!webhook_allow_private_ips_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1891: dedicated SSO/OIDC discovery context. A configured,
+    // trusted IdP at a private IP must be reachable WITHOUT relaxing the
+    // upstream-proxy or webhook SSRF guards, and without unblocking
+    // metadata / loopback / link-local.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sso_blocks_private_idp_by_default() {
+        // Reproduces the regression in #1891: a private-IP IdP is blocked
+        // out of the box, with the standard private-network message.
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_sso_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[test]
+    fn test_sso_error_names_the_config_knobs() {
+        // The failure must be actionable: name the allowlist knobs so the
+        // operator is not left with an opaque VALIDATION_ERROR.
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_sso_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "error must mention the preferred CIDR knob: {msg}"
+        );
+        assert!(
+            msg.contains("SSO_ALLOW_PRIVATE_IPS"),
+            "error must mention the SSO blanket knob: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sso_blanket_toggle_unblocks_private_idp() {
+        // SSO_ALLOW_PRIVATE_IPS=true allows the configured private IdP.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url(
+                "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+                "OIDC discovery URL",
+            )
+            .is_ok(),
+            "10.10.0.8 must be allowed for SSO when SSO_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_sso_cidr_allowlist_scopes_to_idp_host() {
+        // Preferred narrow knob: only the IdP /32 is exempted; another
+        // private IP outside the CIDR is still blocked for SSO.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.10.0.8/32");
+        assert!(
+            validate_outbound_sso_url("https://10.10.0.8/realms/x", "OIDC discovery URL").is_ok(),
+            "configured IdP /32 must be allowed via AK_SSRF_ALLOW_PRIVATE_CIDRS"
+        );
+        assert!(
+            validate_outbound_sso_url("https://10.10.0.9/realms/x", "OIDC discovery URL").is_err(),
+            "a private IP outside the allowlisted CIDR must stay blocked for SSO"
+        );
+    }
+
+    #[test]
+    fn test_sso_toggle_does_not_relax_upstream_or_webhook() {
+        // The whole point of the separate context: enabling SSO private
+        // IPs must NOT reopen the upstream-proxy or webhook SSRF surfaces.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_url("http://10.10.0.8/upstream", "Upstream URL").is_err(),
+            "SSO toggle must not relax the upstream context"
+        );
+        assert!(
+            validate_outbound_webhook_url("http://10.10.0.8/hook", "Webhook URL").is_err(),
+            "SSO toggle must not relax the webhook context"
+        );
+    }
+
+    #[test]
+    fn test_upstream_and_webhook_toggles_do_not_relax_sso() {
+        // Inverse direction: relaxing the other surfaces must not silently
+        // open the SSO surface to arbitrary private IdPs.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url("http://10.10.0.8/realms/x", "OIDC discovery URL").is_err(),
+            "upstream/webhook toggles must not relax the SSO context"
+        );
+    }
+
+    #[test]
+    fn test_sso_toggle_still_blocks_metadata_loopback_linklocal() {
+        // Hard blocks must hold even with the blanket SSO toggle on.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url(
+                "http://169.254.169.254/latest/meta-data",
+                "OIDC discovery URL"
+            )
+            .is_err(),
+            "AWS metadata IP must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://[::ffff:169.254.169.254]/", "OIDC discovery URL")
+                .is_err(),
+            "IPv4-mapped metadata IP must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://127.0.0.1/realms/x", "OIDC discovery URL").is_err(),
+            "loopback must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://[::1]/realms/x", "OIDC discovery URL").is_err(),
+            "IPv6 loopback must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://169.254.5.5/realms/x", "OIDC discovery URL").is_err(),
+            "link-local must stay blocked for SSO"
+        );
+    }
+
+    #[test]
+    fn test_sso_cidr_allowlist_still_blocks_metadata() {
+        // Even if an operator over-broadly allowlists a range that contains
+        // a metadata IP, the metadata hard-block fires first.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "169.254.0.0/16");
+        assert!(
+            validate_outbound_sso_url(
+                "http://169.254.169.254/latest/meta-data",
+                "OIDC discovery URL"
+            )
+            .is_err(),
+            "metadata IP must stay blocked for SSO even if its range is allowlisted"
+        );
+    }
+
+    #[test]
+    fn test_sso_allows_public_idp() {
+        let _g = AllowlistGuard::new();
+        assert!(
+            validate_outbound_sso_url(
+                "https://keycloak.example.com/realms/x/.well-known/openid-configuration",
+                "OIDC discovery URL",
+            )
+            .is_ok(),
+            "public IdP must be allowed without any toggle"
+        );
+    }
+
+    #[test]
+    fn test_sso_allow_private_ips_enabled_helper() {
+        let _g = AllowlistGuard::new();
+        assert!(!sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "1");
+        assert!(sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "maybe");
+        assert!(!sso_allow_private_ips_enabled());
     }
 
     // -----------------------------------------------------------------------

@@ -10,16 +10,21 @@ use sqlx::{FromRow, PgPool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::api::validation::validate_outbound_url;
+use crate::api::validation::validate_outbound_sso_url;
 use crate::error::{AppError, Result};
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 
-/// Validate an OIDC `issuer_url` against the shared outbound-URL SSRF guard
-/// before it is persisted. Mirrors the upstream-URL validation in
-/// `repository_service` so the SSO surface enforces the same policy
-/// (honors `UPSTREAM_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS`).
+/// Validate an OIDC `issuer_url` against the SSO outbound-URL SSRF guard
+/// before it is persisted. Uses the dedicated `SsoDiscovery` context
+/// (issue #1891) so a configured, trusted IdP at a private/internal
+/// address can be saved when the operator allows it via
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` (preferred) or `SSO_ALLOW_PRIVATE_IPS`,
+/// without relaxing the upstream-proxy / webhook SSRF guards. This must
+/// stay consistent with the request-time `validate_oidc_fetch_url` check
+/// in the SSO handler, otherwise a config could save but never log in
+/// (or vice versa).
 fn validate_oidc_issuer(url: &str) -> Result<()> {
-    validate_outbound_url(url, "OIDC issuer URL")
+    validate_outbound_sso_url(url, "OIDC issuer URL")
 }
 
 // ---------------------------------------------------------------------------
