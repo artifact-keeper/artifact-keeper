@@ -1605,15 +1605,31 @@ impl AuthConfigService {
 /// Outcome of reconciling an env-managed provider against the DB on boot.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReconcileAction {
+    /// No providers exist yet: seed the env-managed provider.
     Create,
+    /// A provider with the env-managed name exists: reconcile it in place.
     Update(Uuid),
+    /// Providers exist but none matches the env-managed name: do nothing and
+    /// warn, so a pre-existing (e.g. UI-created) provider is not duplicated.
+    /// Carries the name of an existing provider for the warning message.
+    Skip(String),
 }
 
-/// Select the env-managed provider by name; UI-created providers with other
-/// names are ignored.
+/// Decide how to reconcile the env-managed provider against existing providers.
+///
+/// - If a provider with `desired_name` exists, update it (env stays in control
+///   of that provider). UI-created providers with other names are untouched.
+/// - If no providers exist at all, create the env-managed provider.
+/// - If other providers exist but none is named `desired_name`, skip creation
+///   to avoid duplicating a provider an operator already configured (e.g. via
+///   the admin UI). Restores the "seed only when empty" guarantee from #1486
+///   while keeping #1656's reconcile-on-update for the env-managed provider.
 pub fn plan_provider_reconcile(desired_name: &str, existing: &[(Uuid, String)]) -> ReconcileAction {
-    match existing.iter().find(|(_, name)| name == desired_name) {
-        Some((id, _)) => ReconcileAction::Update(*id),
+    if let Some((id, _)) = existing.iter().find(|(_, name)| name == desired_name) {
+        return ReconcileAction::Update(*id);
+    }
+    match existing.first() {
+        Some((_, name)) => ReconcileAction::Skip(name.clone()),
         None => ReconcileAction::Create,
     }
 }
@@ -2444,12 +2460,30 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_reconcile_create_ignores_other_named_providers() {
+    fn test_plan_reconcile_skip_when_only_other_named_providers() {
+        // A provider exists (e.g. created via the admin UI) but none is named
+        // `default`: bootstrap must skip rather than create a duplicate (#1887).
         let other = Uuid::new_v4();
         let existing = vec![(other, "Corporate SSO".to_string())];
         assert_eq!(
             plan_provider_reconcile("default", &existing),
-            ReconcileAction::Create
+            ReconcileAction::Skip("Corporate SSO".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plan_reconcile_update_when_name_matches_among_others() {
+        // The env-managed provider is still reconciled even when other
+        // providers coexist.
+        let other = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let existing = vec![
+            (other, "Corporate SSO".to_string()),
+            (target, "default".to_string()),
+        ];
+        assert_eq!(
+            plan_provider_reconcile("default", &existing),
+            ReconcileAction::Update(target)
         );
     }
 

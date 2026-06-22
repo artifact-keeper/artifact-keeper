@@ -1130,10 +1130,13 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
     Ok(id)
 }
 
-/// Bootstrap an OIDC provider from environment variables when the database
-/// has no OIDC configs yet.  This lets operators configure OIDC entirely via
-/// env vars (OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, etc.) without
-/// needing admin API access first.
+/// Bootstrap an OIDC provider from environment variables.  This lets operators
+/// configure OIDC entirely via env vars (OIDC_ISSUER, OIDC_CLIENT_ID,
+/// OIDC_CLIENT_SECRET, etc.) without needing admin API access first.
+///
+/// The provider named by OIDC_NAME (default `default`) is reconciled on every
+/// boot. If providers already exist but none carries that name, bootstrap skips
+/// creation and warns rather than duplicating a pre-existing provider.
 async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     use artifact_keeper_backend::services::auth_config_service::{
         plan_provider_reconcile, AuthConfigService, ReconcileAction,
@@ -1167,6 +1170,17 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
                 "Reconciled env-managed OIDC provider '{}' (id={}) from environment variables",
                 name,
                 cfg.id
+            );
+        }
+        ReconcileAction::Skip(existing_name) => {
+            tracing::warn!(
+                "OIDC_* env set but an OIDC provider ('{}') already exists and none is named \
+                 '{}'; env bootstrap skipped to avoid creating a duplicate. Set OIDC_NAME to the \
+                 existing provider's name (or rename it to '{}') to let env vars manage it, or \
+                 unset OIDC_*.",
+                existing_name,
+                req.name,
+                req.name
             );
         }
     }
@@ -1255,10 +1269,14 @@ fn build_oidc_request_from_values(
     })
 }
 
-/// Bootstrap an LDAP provider from environment variables when the database
-/// has no LDAP configs yet.  This lets operators configure LDAP entirely via
-/// env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN, etc.) without needing admin
-/// API access first.  Mirrors `bootstrap_oidc_from_env` (fixes #1434).
+/// Bootstrap an LDAP provider from environment variables.  This lets operators
+/// configure LDAP entirely via env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN,
+/// etc.) without needing admin API access first.  Mirrors
+/// `bootstrap_oidc_from_env` (fixes #1434).
+///
+/// The provider named by LDAP_NAME (default `default`) is reconciled on every
+/// boot. If providers already exist but none carries that name, bootstrap skips
+/// creation and warns rather than duplicating a pre-existing provider (#1887).
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
     use artifact_keeper_backend::services::auth_config_service::{
         plan_provider_reconcile, AuthConfigService, ReconcileAction,
@@ -1294,6 +1312,17 @@ async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
                 cfg.id
             );
         }
+        ReconcileAction::Skip(existing_name) => {
+            tracing::warn!(
+                "LDAP_* env set but an LDAP provider ('{}') already exists and none is named \
+                 '{}'; env bootstrap skipped to avoid creating a duplicate. Set LDAP_NAME to the \
+                 existing provider's name (or rename it to '{}') to let env vars manage it, or \
+                 unset LDAP_*.",
+                existing_name,
+                req.name,
+                req.name
+            );
+        }
     }
 
     Ok(())
@@ -1302,6 +1331,7 @@ async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
 /// Raw LDAP environment variable values for bootstrap.
 #[derive(Default)]
 struct LdapEnvVars {
+    name: Option<String>,
     url: Option<String>,
     base_dn: Option<String>,
     bind_dn: Option<String>,
@@ -1322,6 +1352,7 @@ struct LdapEnvVars {
 fn build_ldap_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
     build_ldap_request_from_values(LdapEnvVars {
+        name: std::env::var("LDAP_NAME").ok(),
         url: std::env::var("LDAP_URL").ok(),
         base_dn: std::env::var("LDAP_BASE_DN").ok(),
         bind_dn: std::env::var("LDAP_BIND_DN").ok(),
@@ -1349,13 +1380,18 @@ fn build_ldap_request_from_values(
     let server_url = env.url.filter(|v| !v.is_empty())?;
     let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
 
+    let name = env
+        .name
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
     let use_starttls = env
         .use_starttls
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
     Some(CreateLdapConfigRequest {
-        name: "default".to_string(),
+        name,
         server_url,
         bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
         bind_password: env.bind_password.filter(|v| !v.is_empty()),
@@ -2259,6 +2295,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ldap_bootstrap_request_name_override() {
+        // LDAP_NAME lets operators point the env-managed provider at an
+        // existing one, mirroring OIDC_NAME (#1887).
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            name: Some("Corporate AD".to_string()),
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(req.name, "Corporate AD");
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_name_defaults() {
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            name: Some("".to_string()),
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(req.name, "default");
+    }
+
+    #[test]
     fn test_ldap_bootstrap_request_missing_url() {
         let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
         assert!(req.is_none());
@@ -2286,6 +2348,7 @@ mod tests {
     fn test_ldap_bootstrap_request_full_active_directory_config() {
         // Mirrors the Active Directory example from issue #1434.
         let req = build_ldap_request_from_values(LdapEnvVars {
+            name: None,
             url: Some("ldap://dc.local:389".to_string()),
             base_dn: Some("DC=domain,DC=local".to_string()),
             bind_dn: Some("user@domain".to_string()),
