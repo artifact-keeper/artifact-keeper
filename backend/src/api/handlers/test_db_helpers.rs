@@ -232,6 +232,23 @@ pub fn router_anon(router: Router<SharedState>, state: SharedState) -> Router {
         .layer(Extension::<Option<AuthExtension>>(None))
 }
 
+/// Like [`router_with_auth`] but also injects the **non-Option**
+/// `Extension<AuthExtension>`, exactly as the production `auth_middleware`
+/// does (it inserts both `Some(ext)` and `ext`). Handlers that extract
+/// `Extension<AuthExtension>` directly (e.g. the admin-gated peer-label
+/// handlers) require this raw copy to be present, otherwise the extractor
+/// fails with a 500 before the in-handler authorization check ever runs.
+pub fn router_with_auth_ext(
+    router: Router<SharedState>,
+    state: SharedState,
+    auth: AuthExtension,
+) -> Router {
+    router
+        .with_state(state)
+        .layer(Extension::<AuthExtension>(auth.clone()))
+        .layer(Extension::<Option<AuthExtension>>(Some(auth)))
+}
+
 pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();
@@ -381,6 +398,18 @@ pub fn put(uri: String, body: Bytes) -> Request<Body> {
         .uri(uri)
         .body(Body::from(body))
         .expect("build PUT request")
+}
+
+/// Build a PUT request carrying a JSON body (sets `content-type` so the
+/// `Json` extractor accepts it; the raw [`put`] helper omits it, which yields
+/// a 415 for handlers that extract `Json<_>`).
+pub fn put_json(uri: String, body: Bytes) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("build PUT JSON request")
 }
 
 /// Bundles all the per-test scaffolding so each handler test body is a

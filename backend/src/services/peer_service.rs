@@ -9,6 +9,41 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+/// SQLSTATE for a foreign-key violation.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+/// SQLSTATE for a check-constraint violation.
+const PG_CHECK_VIOLATION: &str = "23514";
+/// CHECK constraint forbidding a peer from linking to itself.
+const PEER_CONNECTION_NO_SELF_LINK: &str = "peer_connections_no_self_link";
+
+/// Map a database error from `peer_connections` writes to an [`AppError`].
+///
+/// A foreign-key violation means the supplied `source_peer_id` or
+/// `target_peer_id` does not name an existing peer instance — a client error
+/// that must surface as [`AppError::NotFound`] (HTTP 404), not an opaque
+/// [`AppError::Database`] (HTTP 500). A self-link CHECK violation is a client
+/// error too and surfaces as [`AppError::Validation`] (HTTP 400) as a
+/// defensive fallback (the handler also rejects self-probes up front). All
+/// other database errors fall through to [`AppError::Database`].
+fn map_peer_connection_error(err: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        match db_err.code().as_deref() {
+            Some(PG_FOREIGN_KEY_VIOLATION) => {
+                return AppError::NotFound("Peer instance not found".to_string());
+            }
+            Some(PG_CHECK_VIOLATION)
+                if db_err.constraint() == Some(PEER_CONNECTION_NO_SELF_LINK) =>
+            {
+                return AppError::Validation(
+                    "target_peer_id must differ from the source peer id".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    AppError::Database(err.to_string())
+}
+
 /// Peer connection status
 #[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "peer_status", rename_all = "lowercase")]
@@ -153,7 +188,7 @@ impl PeerService {
         )
         .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(map_peer_connection_error)?;
 
         Ok(peer)
     }

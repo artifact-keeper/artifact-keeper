@@ -150,15 +150,23 @@ async fn list_labels(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Labels updated", body = PeerLabelsListResponse),
+        (status = 403, description = "Admin access required"),
         (status = 404, description = "Peer instance not found")
     )
 )]
 async fn set_labels(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<SetPeerLabelsRequest>,
 ) -> Result<Json<PeerLabelsListResponse>> {
+    // Mutating a peer's labels is a federation-administration action, exactly
+    // like every other peer write (register/delete/assign-repo/sync-policy).
+    // Without this gate any authenticated principal — including a non-admin in
+    // another tenant — could overwrite labels on a peer they do not own (BOLA /
+    // cross-tenant write). Peer instances are global, so the admin role is the
+    // single authorization boundary used across the peers surface.
+    auth.require_admin()?;
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -193,15 +201,17 @@ async fn set_labels(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Label added/updated", body = PeerLabelResponse),
+        (status = 403, description = "Admin access required"),
         (status = 404, description = "Peer instance not found")
     )
 )]
 async fn add_label(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, label_key)): Path<(Uuid, String)>,
     Json(payload): Json<AddPeerLabelRequest>,
 ) -> Result<Json<PeerLabelResponse>> {
+    auth.require_admin()?;
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -228,14 +238,16 @@ async fn add_label(
     security(("bearer_auth" = [])),
     responses(
         (status = 204, description = "Label removed"),
+        (status = 403, description = "Admin access required"),
         (status = 404, description = "Peer instance or label not found")
     )
 )]
 async fn delete_label(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, label_key)): Path<(Uuid, String)>,
 ) -> Result<axum::http::StatusCode> {
+    auth.require_admin()?;
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -455,5 +467,205 @@ mod tests {
         assert_eq!(resp.value, label.label_value);
         assert_eq!(resp.id, label.id);
         assert_eq!(resp.peer_instance_id, label.peer_instance_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed authorization tests for the mutating label handlers.
+    //
+    // Before this fix, `PUT /peers/{id}/labels` (and the single add/delete
+    // variants) performed NO authorization, so any authenticated principal —
+    // including a non-admin in another tenant — could overwrite the labels on
+    // a peer they do not own (BOLA / cross-tenant write). These drive the real
+    // router end to end through `auth.require_admin()`:
+    //   * non-admin (same-tenant)  -> 403
+    //   * non-admin (cross-tenant) -> 403
+    //   * owner-admin              -> 200 (and the write actually persists)
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`), mirroring
+    // the in-`src` DB-test pattern used elsewhere in this crate.
+    // -----------------------------------------------------------------------
+    mod authz_db {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest,
+        };
+        use axum::http::StatusCode;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// Insert a peer instance via the real service and return its id.
+        async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
+            let svc = PeerInstanceService::new(pool.clone());
+            let id = Uuid::new_v4();
+            svc.register(RegisterPeerInstanceRequest {
+                name: format!("labels-authz-{}-{}", tag, &id.to_string()[..8]),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: Some("us-east".to_string()),
+                cache_size_bytes: 1024,
+                sync_filter: None,
+                api_key: "k".to_string(),
+            })
+            .await
+            .expect("register peer")
+            .id
+        }
+
+        fn admin_auth(username: &str) -> AuthExtension {
+            AuthExtension {
+                is_admin: true,
+                ..tdh::make_auth(Uuid::new_v4(), username)
+            }
+        }
+
+        fn non_admin_auth(username: &str) -> AuthExtension {
+            // `make_auth` already builds a non-admin principal.
+            tdh::make_auth(Uuid::new_v4(), username)
+        }
+
+        async fn label_count(pool: &PgPool, peer_id: Uuid) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM peer_instance_labels WHERE peer_instance_id = $1",
+            )
+            .bind(peer_id)
+            .fetch_one(pool)
+            .await
+            .expect("count labels")
+        }
+
+        #[tokio::test]
+        async fn test_put_labels_non_admin_same_tenant_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            // victor.user: a regular (non-admin) corp account.
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                non_admin_auth("victor.user"),
+            );
+            let body = axum::body::Bytes::from(
+                r#"{"labels":[{"key":"env","value":"prod"}]}"#.as_bytes().to_vec(),
+            );
+            let (status, _) =
+                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin PUT labels must be rejected (BOLA)"
+            );
+            assert_eq!(
+                label_count(&pool, peer_id).await,
+                0,
+                "no labels should have been written by the rejected request"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_put_labels_cross_tenant_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            // glen.globex: a non-admin from a *different* tenant.
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                non_admin_auth("glen.globex"),
+            );
+            let body = axum::body::Bytes::from(
+                r#"{"labels":[{"key":"owned","value":"globex"}]}"#.as_bytes().to_vec(),
+            );
+            let (status, _) =
+                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "cross-tenant non-admin PUT labels must be rejected"
+            );
+            assert_eq!(label_count(&pool, peer_id).await, 0);
+        }
+
+        #[tokio::test]
+        async fn test_put_labels_admin_allowed_and_persists() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                admin_auth("admin"),
+            );
+            let body = axum::body::Bytes::from(
+                r#"{"labels":[{"key":"env","value":"prod"},{"key":"tier","value":"1"}]}"#
+                    .as_bytes()
+                    .to_vec(),
+            );
+            let (status, _) =
+                tdh::send(app, tdh::put_json(format!("/{}/labels", peer_id), body)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "owner-admin PUT labels must succeed"
+            );
+            assert_eq!(
+                label_count(&pool, peer_id).await,
+                2,
+                "admin write should persist both labels"
+            );
+
+            // cleanup
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_add_and_delete_label_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-labels-authz");
+            let peer_id = make_peer(&pool, "corp").await;
+
+            let app = tdh::router_with_auth_ext(
+                super::super::peer_labels_router(),
+                state,
+                non_admin_auth("victor.user"),
+            );
+            let body = axum::body::Bytes::from(r#"{"value":"x"}"#.as_bytes().to_vec());
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/labels/region", peer_id),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin single-label add must be rejected"
+            );
+            assert_eq!(label_count(&pool, peer_id).await, 0);
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
     }
 }

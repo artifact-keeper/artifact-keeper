@@ -219,6 +219,8 @@ async fn discover_peers(
     request_body = ProbeBody,
     responses(
         (status = 200, description = "Probe result recorded", body = PeerResponse),
+        (status = 400, description = "target_peer_id equals the source peer id"),
+        (status = 404, description = "Source or target peer instance not found"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -227,6 +229,17 @@ async fn probe_peer(
     Path(peer_id): Path<Uuid>,
     Json(body): Json<ProbeBody>,
 ) -> Result<Json<PeerResponse>> {
+    // A peer cannot probe a connection to itself. The `peer_connections`
+    // table enforces this with a CHECK (`source_peer_id != target_peer_id`),
+    // which previously surfaced as an opaque 500 DATABASE_ERROR. Reject it up
+    // front as a 400 client error. (Non-existent source/target peers are
+    // mapped to 404 in the service layer's FK handling.)
+    if body.target_peer_id == peer_id {
+        return Err(crate::error::AppError::Validation(
+            "target_peer_id must differ from the source peer id".to_string(),
+        ));
+    }
+
     let service = PeerService::new(state.db.clone());
     let peer = service
         .upsert_probe_result(
@@ -944,5 +957,156 @@ mod tests {
         };
         let filter = query.status.as_ref().and_then(|s| parse_peer_status(s));
         assert!(filter.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed probe tests (POST /peers/{id}/connections/probe).
+    //
+    // Before this fix, a self-referential probe (`target_peer_id == path id`)
+    // tripped the `peer_connections_no_self_link` CHECK constraint and surfaced
+    // as an opaque 500 DATABASE_ERROR; a probe at a non-existent target tripped
+    // the FK and also 500'd. Both are client errors and are now mapped to 4xx:
+    //   * self-referential probe -> 400
+    //   * non-existent target    -> 404
+    //   * valid probe            -> 200
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`).
+    // -----------------------------------------------------------------------
+    mod probe_db {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest,
+        };
+        use axum::http::StatusCode;
+        use axum::Router;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        async fn make_peer(pool: &PgPool, tag: &str) -> Uuid {
+            let svc = PeerInstanceService::new(pool.clone());
+            let id = Uuid::new_v4();
+            svc.register(RegisterPeerInstanceRequest {
+                name: format!("probe-{}-{}", tag, &id.to_string()[..8]),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: Some("us-east".to_string()),
+                cache_size_bytes: 1024,
+                sync_filter: None,
+                api_key: "k".to_string(),
+            })
+            .await
+            .expect("register peer")
+            .id
+        }
+
+        fn probe_app(state: crate::api::SharedState) -> Router {
+            // Mirror the production mount point: peer_router() lives under
+            // /:id/connections.
+            let router = Router::new().nest("/:id/connections", super::super::peer_router());
+            tdh::router_with_auth(router, state, tdh::make_auth(Uuid::new_v4(), "fed.admin"))
+        }
+
+        #[tokio::test]
+        async fn test_probe_self_reference_is_400_not_500() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-probe");
+            let peer_id = make_peer(&pool, "self").await;
+
+            let app = probe_app(state);
+            let body = axum::body::Bytes::from(
+                format!(r#"{{"target_peer_id":"{}","latency_ms":5}}"#, peer_id).into_bytes(),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/connections/probe", peer_id),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "self-referential probe must be a 400, not a 500 DATABASE_ERROR"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_probe_nonexistent_target_is_404_not_500() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-probe");
+            let peer_id = make_peer(&pool, "src").await;
+            let missing = Uuid::new_v4();
+
+            let app = probe_app(state);
+            let body = axum::body::Bytes::from(
+                format!(r#"{{"target_peer_id":"{}","latency_ms":5}}"#, missing).into_bytes(),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/connections/probe", peer_id),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "probe at a non-existent target must be a 404, not a 500"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_probe_valid_target_succeeds() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-probe");
+            let src = make_peer(&pool, "src").await;
+            let dst = make_peer(&pool, "dst").await;
+
+            let app = probe_app(state);
+            let body = axum::body::Bytes::from(
+                format!(r#"{{"target_peer_id":"{}","latency_ms":12}}"#, dst).into_bytes(),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/connections/probe", src),
+                    "application/json",
+                    body,
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a probe between two distinct, existing peers must still succeed"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+                .bind(vec![src, dst])
+                .execute(&pool)
+                .await;
+        }
     }
 }
