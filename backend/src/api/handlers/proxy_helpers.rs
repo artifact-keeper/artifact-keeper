@@ -854,6 +854,34 @@ pub async fn proxy_fetch_with_cache_key(
     .await
 }
 
+/// Variant of [`proxy_fetch_with_cache_key`] that also forwards an `Accept`
+/// header to the upstream. The PyPI simple-index proxy uses this to request
+/// the PEP 691 JSON representation while keying the cache on a format-qualified
+/// `cache_path`, so the JSON and HTML forms of the same index never collide in
+/// the proxy cache.
+pub async fn proxy_fetch_with_cache_key_and_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_and_accept(&repo, fetch_path, cache_path, accept)
+                .await
+        },
+    )
+    .await
+}
+
 /// Streaming sibling of [`proxy_fetch_with_cache_key`] (#895 OOM relief for
 /// format handlers whose upstream download URL differs from the canonical
 /// artifact path). Fetches `fetch_path` from the upstream but keys the proxy
