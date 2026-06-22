@@ -2852,6 +2852,32 @@ pub async fn record_artifact_metadata(
 
 /// Serve an artifact from local storage with quarantine + statistics.
 ///
+/// Returns a `302` redirect to a presigned object-storage URL for a hosted
+/// download when `allow_redirect` is set, `PRESIGNED_DOWNLOADS_ENABLED` is on,
+/// and the storage backend supports redirects; otherwise `None`, so the caller
+/// streams the bytes through the backend. HuggingFace passes `allow_redirect =
+/// false` because its client reads `X-Linked-Etag` / `X-Linked-Size` off the
+/// `/resolve/` response, which a bare 302 cannot carry. Kept free of state/DB
+/// so it is unit-testable with a mock `StorageBackend`.
+async fn presigned_download_redirect(
+    allow_redirect: bool,
+    config: &crate::config::Config,
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+) -> Option<Response> {
+    if !allow_redirect {
+        return None;
+    }
+    let expiry = std::time::Duration::from_secs(config.presigned_download_expiry_secs);
+    try_presigned_redirect(
+        storage,
+        storage_key,
+        config.presigned_downloads_enabled,
+        expiry,
+    )
+    .await
+}
+
 /// Performs the standard hit-path tail used by every format download handler:
 /// quarantine check, storage load, download-statistics insert, and a 200
 /// response with the supplied content type and optional `Content-Disposition`.
@@ -2903,19 +2929,17 @@ pub async fn serve_local_artifact_redirectable(
     // backend. Falls back to streaming when redirects are unsupported (e.g.
     // filesystem) or the caller opted out. Used by rubygems, hex, cran, helm,
     // puppet, ansible; huggingface opts out (allow_redirect = false).
-    if allow_redirect && state.config.presigned_downloads_enabled {
-        let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
-        if let Some(redirect) =
-            try_presigned_redirect(storage.as_ref(), storage_key, true, expiry).await
-        {
-            let _ = sqlx::query(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-            )
-            .bind(artifact_id)
-            .execute(&state.db)
-            .await;
-            return Ok(redirect);
-        }
+    if let Some(redirect) =
+        presigned_download_redirect(allow_redirect, &state.config, storage.as_ref(), storage_key)
+            .await
+    {
+        let _ = sqlx::query(
+            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+        )
+        .bind(artifact_id)
+        .execute(&state.db)
+        .await;
+        return Ok(redirect);
     }
 
     let content = storage
@@ -6570,5 +6594,129 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+}
+
+#[cfg(test)]
+mod presign_redirect_tests {
+    use crate::error::Result as StorageResult;
+    use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend};
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    /// Storage backend that supports presigned URLs (e.g. S3).
+    struct RedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for RedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> StorageResult<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: Duration,
+        ) -> StorageResult<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: format!("https://s3.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    /// Storage backend that does not support presigned URLs (e.g. filesystem).
+    struct NoRedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for NoRedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    fn config(presigned_downloads_enabled: bool) -> crate::config::Config {
+        crate::config::Config {
+            presigned_downloads_enabled,
+            presigned_download_expiry_secs: 300,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_when_allowed_enabled_and_supported() {
+        let resp = super::presigned_download_redirect(
+            true,
+            &config(true),
+            &RedirectBackend,
+            "gems/rack-3.0.0.gem",
+        )
+        .await
+        .expect("should redirect when allowed, enabled and backend supports it");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("s3.example.com"));
+        assert!(location.contains("rack-3.0.0.gem"));
+    }
+
+    #[tokio::test]
+    async fn streams_when_caller_opts_out() {
+        // HuggingFace opt-out: allow_redirect = false must always stream,
+        // even when the feature is enabled and the backend can presign.
+        let resp = super::presigned_download_redirect(
+            false,
+            &config(true),
+            &RedirectBackend,
+            "models/m/resolve/main/model.safetensors",
+        )
+        .await;
+        assert!(resp.is_none(), "allow_redirect = false must never redirect");
+    }
+
+    #[tokio::test]
+    async fn streams_when_feature_disabled() {
+        let resp = super::presigned_download_redirect(
+            true,
+            &config(false),
+            &RedirectBackend,
+            "gems/rack-3.0.0.gem",
+        )
+        .await;
+        assert!(resp.is_none(), "must stream when feature flag is off");
+    }
+
+    #[tokio::test]
+    async fn streams_when_backend_unsupported() {
+        let resp = super::presigned_download_redirect(
+            true,
+            &config(true),
+            &NoRedirectBackend,
+            "gems/rack-3.0.0.gem",
+        )
+        .await;
+        assert!(resp.is_none(), "must stream when backend cannot presign");
     }
 }
