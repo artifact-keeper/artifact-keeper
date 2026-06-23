@@ -421,9 +421,7 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
 /// every state-changing API surface stays gated until the flag is cleared.
 fn path_exempt_from_password_change(path: &str) -> bool {
     let path = path.strip_suffix('/').unwrap_or(path);
-    path.ends_with("/me")
-        || path.ends_with("/password")
-        || path.ends_with("/auth/logout")
+    path.ends_with("/me") || path.ends_with("/password") || path.ends_with("/auth/logout")
 }
 
 /// 428 Precondition Required: the principal must rotate their password before
@@ -4292,10 +4290,7 @@ mod tests {
 
         // The current-user self lookup (`/me`, stripped form) the mandatory
         // change screen calls to render IS reachable while flagged (#1948).
-        let resp = app()
-            .oneshot(mk_req("/me", &flagged_bearer))
-            .await
-            .unwrap();
+        let resp = app().oneshot(mk_req("/me", &flagged_bearer)).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::OK,
