@@ -2638,5 +2638,222 @@ mod tests {
             cleanup(&pool, &[src, tgt], corp_admin).await;
             cleanup_user(&pool, requester).await;
         }
+
+        // -------------------------------------------------------------------
+        // require_and_consume_approval / try_consume_approval /
+        // count_pending_approvals (promotion-approval-gate-bypass).
+        //
+        // These exercise the new DB-backed consume gate directly: the
+        // single-row `SET consumed_at` claim, its `consumed_at IS NULL` guard,
+        // and the pending-vs-absent classification that builds the 409. Each
+        // test runs the real SQL against Postgres; they runtime-skip without
+        // DATABASE_URL (NOT `#[ignore]`, so the coverage instrument sees the
+        // consume path). Shared per-test scaffolding lives in `consume_setup`
+        // so the body of each test is one setup call followed by assertions.
+        // -------------------------------------------------------------------
+
+        /// Insert an `approved` + unconsumed approval row for the exact pair.
+        /// Mirrors what the approve path leaves behind for a request whose
+        /// promotion has NOT yet been executed via /promote.
+        async fn make_approved_approval(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            source: Uuid,
+            target: Uuid,
+            requested_by: Uuid,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO promotion_approvals (id, artifact_id, source_repo_id, target_repo_id, \
+                 requested_by, status, skip_policy_check, reviewed_at, consumed_at) \
+                 VALUES ($1, $2, $3, $4, $5, 'approved', false, NOW(), NULL)",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(source)
+            .bind(target)
+            .bind(requested_by)
+            .execute(pool)
+            .await
+            .expect("insert approved approval");
+            id
+        }
+
+        /// Whether `id`'s approval row has been consumed (`consumed_at` set).
+        async fn is_consumed(pool: &PgPool, id: Uuid) -> bool {
+            let (consumed,): (Option<DateTime<Utc>>,) =
+                sqlx::query_as("SELECT consumed_at FROM promotion_approvals WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read consumed_at");
+            consumed.is_some()
+        }
+
+        /// Per-test scaffolding for the consume-gate tests: a source + target
+        /// repo, an admin principal, and a seeded artifact in the source. Keeps
+        /// each test body to a single setup call plus assertions (dup-low).
+        struct ConsumeSetup {
+            pool: PgPool,
+            src: Uuid,
+            tgt: Uuid,
+            user: Uuid,
+            requester: Uuid,
+            artifact: Uuid,
+        }
+
+        async fn consume_setup(tag: &str) -> Option<ConsumeSetup> {
+            let pool = tdh::try_pool().await?;
+            let sdir = std::env::temp_dir().join(format!("pr2006-{}-s-{}", tag, Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr2006-{}-t-{}", tag, Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, &format!("{}-s", tag), &sdir).await;
+            let tgt_key = make_repo_key(&pool, &format!("{}-t", tag), &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, tag).await;
+            let requester = make_requester(&pool, tag).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, tag).await;
+            Some(ConsumeSetup {
+                pool,
+                src,
+                tgt,
+                user,
+                requester,
+                artifact,
+            })
+        }
+
+        async fn consume_teardown(s: &ConsumeSetup) {
+            cleanup(&s.pool, &[s.src, s.tgt], s.user).await;
+            cleanup_user(&s.pool, s.requester).await;
+        }
+
+        /// Allow path: an APPROVED + unconsumed row -> consume succeeds once and
+        /// the row is marked consumed.
+        #[tokio::test]
+        async fn test_consume_allows_approved_then_marks_consumed() {
+            let Some(s) = consume_setup("allow").await else {
+                return;
+            };
+            let approval =
+                make_approved_approval(&s.pool, s.artifact, s.src, s.tgt, s.requester).await;
+            assert!(!is_consumed(&s.pool, approval).await, "starts unconsumed");
+
+            let res = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            assert!(res.is_ok(), "an approved+unconsumed row must be consumable");
+            assert!(
+                is_consumed(&s.pool, approval).await,
+                "a consumed approval must have consumed_at stamped"
+            );
+
+            consume_teardown(&s).await;
+        }
+
+        /// Reuse path: a second consume of the same (already-spent) approval is
+        /// denied with a 409 — single-use enforcement.
+        #[tokio::test]
+        async fn test_consume_second_use_denied() {
+            let Some(s) = consume_setup("reuse").await else {
+                return;
+            };
+            let _approval =
+                make_approved_approval(&s.pool, s.artifact, s.src, s.tgt, s.requester).await;
+
+            let first = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            assert!(first.is_ok(), "first consume must succeed");
+
+            let second = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            match second {
+                Err(AppError::Conflict(_)) => {}
+                other => panic!(
+                    "replay of a spent approval must be a 409 Conflict, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+
+            consume_teardown(&s).await;
+        }
+
+        /// Pending-only path: no approved row but a pending request exists ->
+        /// denied with a 409 whose message says the request is still pending.
+        #[tokio::test]
+        async fn test_consume_pending_only_denied_with_pending_message() {
+            let Some(s) = consume_setup("pending").await else {
+                return;
+            };
+            let _pending =
+                make_pending_approval(&s.pool, s.artifact, s.src, s.tgt, s.requester).await;
+            assert_eq!(
+                count_pending_approvals(&s.pool, s.artifact, s.src, s.tgt)
+                    .await
+                    .expect("count pending"),
+                1,
+                "the seeded pending request must be counted"
+            );
+
+            let res = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            match res {
+                Err(AppError::Conflict(msg)) => assert!(
+                    msg.contains("pending"),
+                    "a pending-only deny must mention pending; got: {msg}"
+                ),
+                other => panic!(
+                    "a pending-only promotion must be a 409 Conflict, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+
+            consume_teardown(&s).await;
+        }
+
+        /// Absent path: neither approved nor pending row for the pair -> denied
+        /// with a 409.
+        #[tokio::test]
+        async fn test_consume_absent_denied() {
+            let Some(s) = consume_setup("absent").await else {
+                return;
+            };
+            assert_eq!(
+                count_pending_approvals(&s.pool, s.artifact, s.src, s.tgt)
+                    .await
+                    .expect("count pending"),
+                0,
+                "no approval exists for this pair"
+            );
+
+            let res = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            assert!(
+                matches!(res, Err(AppError::Conflict(_))),
+                "an absent approval must be a 409 Conflict"
+            );
+
+            consume_teardown(&s).await;
+        }
+
+        /// Wrong-target path: an approved row exists for (artifact, src, OTHER
+        /// target), so a consume for a DIFFERENT target finds nothing and is
+        /// denied. Proves the claim is bound to the exact pair.
+        #[tokio::test]
+        async fn test_consume_wrong_target_denied() {
+            let Some(s) = consume_setup("wrongtgt").await else {
+                return;
+            };
+            // Approve the artifact for `src` -> `src` (a target that is not the
+            // `tgt` we will attempt to promote into). The exact-pair filter must
+            // therefore find no consumable row for (artifact, src, tgt).
+            let other_target = s.src;
+            let _approval =
+                make_approved_approval(&s.pool, s.artifact, s.src, other_target, s.requester).await;
+
+            let res = require_and_consume_approval(&s.pool, s.artifact, s.src, s.tgt).await;
+            assert!(
+                matches!(res, Err(AppError::Conflict(_))),
+                "an approval for a different target must NOT authorize this pair"
+            );
+
+            consume_teardown(&s).await;
+        }
     }
 }
