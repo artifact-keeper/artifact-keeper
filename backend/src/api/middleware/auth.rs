@@ -402,18 +402,28 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
 /// [`auth_middleware`]); this allowlist is the narrow set of endpoints that
 /// let them recover without admin intervention:
 ///
+///   * the current-user self lookup (`.../me`, i.e. `GET /api/v1/auth/me`) —
+///     a read-only call the mandatory first-login change screen makes to
+///     render (who is logged in / which account is being rotated),
 ///   * the self password-change route (`.../password`, e.g.
 ///     `POST /api/v1/users/:id/password`) — clears the flag, and
 ///   * logout (`.../auth/logout`) — lets the client end the session.
 ///
-/// Matching is by suffix so it is robust to the `/api/v1` (or any future)
-/// nest prefix the middleware observes on `request.uri().path()`. The
-/// admin reset / force-change routes (`.../password/reset`,
-/// `.../force-password-change`) deliberately do NOT match — they sit behind
-/// `admin_middleware`, not this one, and would not be self-recoverable.
+/// Matching is by stripped suffix, NOT the full request path: this middleware
+/// is layered *inside* the `/api/v1` + `/auth` nests, so axum strips those
+/// prefixes before `request.uri().path()` reaches it. The middleware therefore
+/// observes `/me`, `/tokens`, `/users/:id/password`, etc. — never the full
+/// `/api/v1/auth/me`. Suffix matching keeps the allowlist robust to the nest
+/// prefix (and to any future prefix change). The admin reset / force-change
+/// routes (`.../password/reset`, `.../force-password-change`) deliberately do
+/// NOT match — they sit behind `admin_middleware`, not this one, and would not
+/// be self-recoverable. Only read-only / self-recovery endpoints are exempt;
+/// every state-changing API surface stays gated until the flag is cleared.
 fn path_exempt_from_password_change(path: &str) -> bool {
     let path = path.strip_suffix('/').unwrap_or(path);
-    path.ends_with("/password") || path.ends_with("/auth/logout")
+    path.ends_with("/me")
+        || path.ends_with("/password")
+        || path.ends_with("/auth/logout")
 }
 
 /// 428 Precondition Required: the principal must rotate their password before
@@ -4113,8 +4123,15 @@ mod tests {
 
     #[test]
     fn test_path_exempt_from_password_change_allowlist() {
-        // Recovery routes: self password-change and logout (with or without a
-        // trailing slash, with or without the nest prefix).
+        // Recovery / change-screen routes: the current-user self lookup, the
+        // self password-change route, and logout (with or without a trailing
+        // slash, with or without the nest prefix). The middleware is layered
+        // inside the `/api/v1` + `/auth` nests, so it actually observes the
+        // STRIPPED suffix form (e.g. `/me`, not `/api/v1/auth/me`); both shapes
+        // are asserted to document that suffix matching covers them.
+        assert!(path_exempt_from_password_change("/me"));
+        assert!(path_exempt_from_password_change("/api/v1/auth/me"));
+        assert!(path_exempt_from_password_change("/me/"));
         assert!(path_exempt_from_password_change(
             "/api/v1/users/4040201f-c67a-4719-a292-79ec66a7bd2d/password"
         ));
@@ -4123,8 +4140,9 @@ mod tests {
         assert!(path_exempt_from_password_change("/auth/logout/"));
 
         // Everything else is gated, including the admin reset / force-change
-        // routes (which live behind admin_middleware, not this one) and any
-        // route that merely contains "password" elsewhere.
+        // routes (which live behind admin_middleware, not this one), the
+        // token-management routes, and any route that merely contains
+        // "password" elsewhere.
         assert!(!path_exempt_from_password_change(
             "/api/v1/users/abc/password/reset"
         ));
@@ -4132,8 +4150,10 @@ mod tests {
             "/api/v1/users/abc/force-password-change"
         ));
         assert!(!path_exempt_from_password_change("/api/v1/repositories"));
-        assert!(!path_exempt_from_password_change("/api/v1/auth/me"));
         assert!(!path_exempt_from_password_change("/api/v1/auth/tokens"));
+        // Stripped forms the middleware actually sees for token management.
+        assert!(!path_exempt_from_password_change("/tokens"));
+        assert!(!path_exempt_from_password_change("/tokens/abc"));
     }
 
     /// Build a flagged/unflagged non-admin `User` row and mint a real JWT for it
@@ -4208,12 +4228,18 @@ mod tests {
             make_test_config_for_middleware(),
         ));
 
+        // The change screen's supporting calls reach this middleware as the
+        // STRIPPED suffix forms (`/me`, `/tokens`, ...), because the live
+        // router layers `auth_middleware` inside the `/api/v1` + `/auth` nests.
+        // Routes are registered in those stripped shapes to mirror that.
         let app = || {
             Router::new()
                 .route(
                     "/api/v1/repositories",
                     any(|| async { (StatusCode::OK, "repos") }),
                 )
+                .route("/me", any(|| async { (StatusCode::OK, "me") }))
+                .route("/tokens", any(|| async { (StatusCode::OK, "tokens") }))
                 .route(
                     "/api/v1/users/:id/password",
                     any(|| async { (StatusCode::OK, "pw") }),
@@ -4250,6 +4276,30 @@ mod tests {
             resp.status(),
             StatusCode::PRECONDITION_REQUIRED,
             "flagged principal must be 428'd on a normal route"
+        );
+
+        // Token management is state-changing and stays gated even though the
+        // change screen runs while flagged (#1948 must not over-broaden).
+        let resp = app()
+            .oneshot(mk_req("/tokens", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PRECONDITION_REQUIRED,
+            "flagged principal must still be 428'd on token management"
+        );
+
+        // The current-user self lookup (`/me`, stripped form) the mandatory
+        // change screen calls to render IS reachable while flagged (#1948).
+        let resp = app()
+            .oneshot(mk_req("/me", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flagged principal must reach the current-user self lookup"
         );
 
         // The self password-change recovery route is still reachable.
