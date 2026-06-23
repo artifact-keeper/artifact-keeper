@@ -150,10 +150,12 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// (handlers/promotion.rs), which does NOT go through the HTTP upload handlers,
 /// so promotions are unaffected by this check.
 ///
-/// Admins are exempt: they can still publish directly (e.g. for break-glass /
-/// bootstrap), so the gate only constrains non-admin direct uploads.
-pub fn promotion_only_blocks_direct_upload(promotion_only: bool, is_admin: bool) -> bool {
-    promotion_only && !is_admin
+/// ALL direct uploads to a `promotion_only` repository are rejected (including
+/// admin tokens). Artifacts may only enter such a repository via the promotion
+/// workflow (quality gates + approval + provenance); a direct upload would
+/// bypass every one of those controls, so there is no admin exemption.
+pub fn promotion_only_blocks_direct_upload(promotion_only: bool, _is_admin: bool) -> bool {
+    promotion_only
 }
 
 /// 409 plain-text response for a rejected direct upload to a `promotion_only`
@@ -3016,9 +3018,11 @@ mod tests {
     }
 
     #[test]
-    fn test_promotion_only_admin_is_exempt() {
-        // Admins may still publish directly to a promotion_only repo.
-        assert!(!promotion_only_blocks_direct_upload(true, true));
+    fn test_promotion_only_blocks_admin_too() {
+        // Admins are no longer exempt: a direct upload to a promotion_only repo
+        // is blocked regardless of admin status (artifacts must enter via the
+        // promotion workflow).
+        assert!(promotion_only_blocks_direct_upload(true, true));
     }
 
     #[test]
@@ -3036,8 +3040,10 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_direct_upload_if_promotion_only_allows_admin_and_normal() {
-        assert!(reject_direct_upload_if_promotion_only(true, true).is_ok());
+    fn test_reject_direct_upload_if_promotion_only_blocks_admin_allows_normal() {
+        // Admin direct upload to a promotion_only repo is now rejected too.
+        assert!(reject_direct_upload_if_promotion_only(true, true).is_err());
+        // Normal (non-promotion_only) repos are never blocked.
         assert!(reject_direct_upload_if_promotion_only(false, false).is_ok());
     }
 
@@ -4040,87 +4046,65 @@ mod tests {
         assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
     }
 
+    // Redirect-capable facade backends used to exercise the `Ok(None)` and
+    // `Err(e)` arms of `try_proxy_cache_redirect`. They share the same trivial
+    // StorageBackend surface and differ only in what `get_presigned_url`
+    // returns, so generate them from one macro to avoid copy-paste mocks.
+    macro_rules! presign_mock {
+        ($name:ident, $presign:expr) => {
+            struct $name;
+
+            #[async_trait::async_trait]
+            impl crate::services::storage_service::StorageBackend for $name {
+                async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                    Ok(())
+                }
+                async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                    Ok(Bytes::from_static(b"body"))
+                }
+                async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                    Ok(true)
+                }
+                async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                    Ok(())
+                }
+                async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+                    Ok(Vec::new())
+                }
+                async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+                    Ok(())
+                }
+                async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+                    Ok(0)
+                }
+                fn supports_redirect(&self) -> bool {
+                    true
+                }
+                async fn get_presigned_url(
+                    &self,
+                    _key: &str,
+                    _expires_in: std::time::Duration,
+                ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+                    $presign
+                }
+            }
+        };
+    }
+
     // A redirect-capable facade backend whose presign returns `Ok(None)`
     // (e.g. a presign-disabled S3 handle): the helper must fall through to
     // streaming. Covers the `Ok(None)` arm of `try_proxy_cache_redirect`.
-    struct NonePresignStorage;
-
-    #[async_trait::async_trait]
-    impl crate::services::storage_service::StorageBackend for NonePresignStorage {
-        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
-            Ok(Bytes::from_static(b"body"))
-        }
-        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-            Ok(true)
-        }
-        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
-            Ok(0)
-        }
-        fn supports_redirect(&self) -> bool {
-            true
-        }
-        async fn get_presigned_url(
-            &self,
-            _key: &str,
-            _expires_in: std::time::Duration,
-        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
-            Ok(None)
-        }
-    }
+    presign_mock!(NonePresignStorage, Ok(None));
 
     // A redirect-capable facade backend whose presign ERRORS (transient signing
     // failure): the helper must warn + fall through to streaming, never panic.
     // Covers the `Err(e)` warn-and-fall-back arm of `try_proxy_cache_redirect`.
-    struct ErrPresignStorage;
-
-    #[async_trait::async_trait]
-    impl crate::services::storage_service::StorageBackend for ErrPresignStorage {
-        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
-            Ok(Bytes::from_static(b"body"))
-        }
-        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-            Ok(true)
-        }
-        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
-            Ok(0)
-        }
-        fn supports_redirect(&self) -> bool {
-            true
-        }
-        async fn get_presigned_url(
-            &self,
-            _key: &str,
-            _expires_in: std::time::Duration,
-        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
-            Err(crate::error::AppError::Storage(
-                "transient presign failure".to_string(),
-            ))
-        }
-    }
+    presign_mock!(
+        ErrPresignStorage,
+        Err(crate::error::AppError::Storage(
+            "transient presign failure".to_string(),
+        ))
+    );
 
     #[tokio::test]
     async fn test_try_proxy_cache_redirect_returns_none_when_presign_yields_none() {

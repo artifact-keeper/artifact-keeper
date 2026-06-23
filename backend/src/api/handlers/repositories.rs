@@ -3453,15 +3453,15 @@ pub async fn upload_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
 
-    // Reject direct uploads to promotion-only repositories (non-admins). Such
-    // repos accept artifacts only via the promotion path (staging -> promotion
-    // -> approval); the promotion service writes through its own path and is
-    // unaffected.
+    // Reject direct uploads to promotion-only repositories. Such repos accept
+    // artifacts only via the promotion path (staging -> promotion -> approval);
+    // the promotion service writes through its own path and is unaffected. This
+    // applies to all callers including admins.
     if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_upload(
         repo.promotion_only,
         auth.is_admin,
     ) {
-        return Err(AppError::Conflict(
+        return Err(AppError::Authorization(
             "Direct uploads are disabled for this repository; publish via promotion".to_string(),
         ));
     }
@@ -11393,6 +11393,67 @@ mod tests {
             matches!(err, AppError::Validation(_)),
             "traversal path must surface as Validation (400), got {err:?}",
         );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_artifact_admin_blocked_on_promotion_only_repo_403() {
+        // Regression for the promotion_only direct-upload bypass: an admin
+        // direct PUT to a promotion_only repository must be rejected with 403
+        // (AppError::Authorization). Artifacts may only enter such a repo via
+        // the promotion workflow. A normal (non-promotion_only) repo continues
+        // to accept the same admin upload (201). Skips gracefully when no
+        // DATABASE_URL is configured.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        // Flip the fixture repo to promotion_only.
+        sqlx::query("UPDATE repositories SET promotion_only = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set promotion_only");
+
+        // Build an ADMIN auth for the fixture user (the realistic actor that
+        // previously bypassed the gate via the `&& !is_admin` exemption).
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        let blocked = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth.clone())),
+            Path((fx.repo_key.clone(), "foo/bar.txt".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"directwrite"),
+        )
+        .await;
+
+        let err = blocked.expect_err("admin direct upload to promotion_only repo must be blocked");
+        // AppError::Authorization maps to 403 Forbidden (see error.rs).
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "admin direct upload to promotion_only repo must surface as Authorization (403), got {err:?}",
+        );
+
+        // Legit path: revert to a normal repo and the same admin upload succeeds.
+        sqlx::query("UPDATE repositories SET promotion_only = false WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("clear promotion_only");
+
+        let (status, _) = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), "foo/bar.txt".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"directwrite"),
+        )
+        .await
+        .expect("admin upload to a normal repo must succeed");
+        assert_eq!(status, StatusCode::CREATED);
 
         fx.teardown().await;
     }

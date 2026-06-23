@@ -246,10 +246,10 @@ async fn create_session(
     //
     // This is enforced INDEPENDENTLY of the RBAC permission-rule check below: a
     // promotion_only repo with no explicit permission rules must still be blocked
-    // for non-admin direct uploads. The promotion service writes through its own
-    // RAW SQL INSERT path (handlers/promotion.rs), which does not pass through
-    // these HTTP handlers, so promotions remain unaffected. Admins are exempt
-    // (break-glass / bootstrap), matching the direct path.
+    // for direct uploads. The promotion service writes through its own RAW SQL
+    // INSERT path (handlers/promotion.rs), which does not pass through these HTTP
+    // handlers, so promotions remain unaffected. All direct uploads (including
+    // admins) are blocked, matching the direct path.
     if let Some(rejection) = reject_session_if_promotion_only(repo_promotion_only, auth.is_admin) {
         return Err(rejection);
     }
@@ -850,9 +850,9 @@ fn upload_write_decision(
 /// `promotion_only` repository, or `None` if the upload is permitted.
 ///
 /// Mirrors the direct artifact-write path (`repositories::upload_artifact`):
-/// non-admin direct uploads to a promotion-only repo are blocked (`403`) so the
-/// chunked upload-session API cannot be used to sidestep promotion/approval.
-/// Admins are exempt (break-glass / bootstrap), and normal (non-promotion_only)
+/// direct uploads to a promotion-only repo are blocked (`403`) so the chunked
+/// upload-session API cannot be used to sidestep promotion/approval. All direct
+/// uploads (including admin tokens) are blocked; normal (non-promotion_only)
 /// repositories are never blocked here. The promotion service writes through its
 /// own raw-SQL path and does not pass through this handler, so promotions are
 /// unaffected.
@@ -1210,9 +1210,12 @@ mod tests {
     }
 
     #[test]
-    fn test_promotion_only_session_admin_allowed() {
-        // Admins are exempt (break-glass / bootstrap): no rejection.
-        assert!(reject_session_if_promotion_only(true, true).is_none());
+    fn test_promotion_only_session_blocks_admin_too() {
+        // Admins are no longer exempt: an upload-session create against a
+        // promotion_only repo is rejected (403) regardless of admin status.
+        let rejection = reject_session_if_promotion_only(true, true)
+            .expect("admin direct upload session to promotion_only repo must be rejected");
+        assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
