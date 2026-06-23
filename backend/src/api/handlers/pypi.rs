@@ -117,23 +117,59 @@ pub(crate) fn normalize_pep503(name: &str) -> String {
 /// `flask/`, `flask/Flask-3.0.0-py3-none-any.whl`). Callers must NOT include
 /// the leading `simple/` themselves.
 ///
+/// `index_path` controls how the prefix is built (issue #1546):
+/// - `"simple"` (default) — standard PEP 503 layout: prepends `simple/` to `tail`.
+/// - `""` (empty) — flat CDN layout (e.g. PyTorch wheel CDN): emits `tail` with
+///   no prefix, so `torch/` maps directly to `{upstream}/torch/`.
+/// - any other non-empty value — custom prefix: emits `{index_path}/{tail}`.
+///
+/// The `/simple`-dedup logic (#1130) is only applied when `index_path` is
+/// `"simple"` — for flat or custom indexes the upstream URL is used verbatim.
+///
 /// Returns `(adjusted_upstream_url, upstream_path)`. The URL has any trailing
 /// `/simple` or `/simple/` stripped so [`crate::services::proxy_service::ProxyService::build_upstream_url`]
 /// (which trims one trailing slash on the base and joins with `/`) produces
 /// a single `simple/` segment in the final outbound URL.
-fn pypi_upstream_url_and_path(upstream_url: &str, tail: &str) -> (String, String) {
+fn pypi_upstream_url_and_path(
+    upstream_url: &str,
+    tail: &str,
+    index_path: &str,
+) -> (String, String) {
     let trimmed_url = upstream_url.trim_end_matches('/');
     let tail = tail.trim_start_matches('/');
-    if let Some(base) = trimmed_url.strip_suffix("/simple") {
-        let normalized = if base.is_empty() {
-            "/".to_string()
-        } else {
-            base.to_string()
-        };
-        (normalized, format!("simple/{}", tail))
-    } else {
-        (upstream_url.to_string(), format!("simple/{}", tail))
+    if index_path == "simple" {
+        if let Some(base) = trimmed_url.strip_suffix("/simple") {
+            let normalized = if base.is_empty() {
+                "/".to_string()
+            } else {
+                base.to_string()
+            };
+            return (normalized, format!("simple/{}", tail));
+        }
     }
+    if index_path.is_empty() {
+        (upstream_url.to_string(), tail.to_string())
+    } else {
+        (upstream_url.to_string(), format!("{}/{}", index_path, tail))
+    }
+}
+
+/// Fetch the `pypi_upstream_index_path` config value for a repository.
+///
+/// Returns `"simple"` (the PEP 503 default) when no override is configured.
+/// An empty string signals a flat CDN layout (no `simple/` prefix); any other
+/// non-empty string is used as-is as the index path prefix.
+async fn fetch_pypi_upstream_index_path(db: &PgPool, repo_id: uuid::Uuid) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind("pypi_upstream_index_path")
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "simple".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +329,8 @@ async fn fetch_remote_simple_root(
     let upstream = upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
 
-    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "", &index_path);
     let (content, _content_type) = match proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,
@@ -602,8 +639,12 @@ async fn simple_project(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (effective_upstream, upstream_path) =
-                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+                let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+                let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
+                    upstream_url,
+                    &format!("{}/", normalized),
+                    &index_path,
+                );
 
                 let (content, content_type) = if wants_json {
                     // Request the PEP 691 JSON form from upstream, cached under a
@@ -764,8 +805,12 @@ async fn simple_project(
                     continue;
                 };
 
-                let (effective_upstream, upstream_path) =
-                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+                let member_index_path = fetch_pypi_upstream_index_path(&state.db, member.id).await;
+                let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
+                    upstream_url,
+                    &format!("{}/", normalized),
+                    &member_index_path,
+                );
                 let result = if wants_json {
                     proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
@@ -1205,6 +1250,7 @@ async fn serve_file(
 
                     // Cache miss: use PyPI-specific fetch logic, streaming the
                     // package file from upstream while teeing it into the cache.
+                    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
                     let result = fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
@@ -1212,6 +1258,7 @@ async fn serve_file(
                         upstream_url,
                         project,
                         filename,
+                        &index_path,
                     )
                     .await?;
 
@@ -1343,6 +1390,8 @@ async fn serve_file(
                                 return Ok(build_streaming_file_response(filename, result));
                             }
 
+                            let member_index_path =
+                                fetch_pypi_upstream_index_path(&state.db, member.id).await;
                             match fetch_from_pypi_remote_streaming(
                                 proxy,
                                 member.id,
@@ -1350,6 +1399,7 @@ async fn serve_file(
                                 upstream_url,
                                 project,
                                 filename,
+                                &member_index_path,
                             )
                             .await
                             {
@@ -1390,6 +1440,7 @@ async fn serve_file(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
             get_remote_cached_or_refetch_stream(
                 storage.clone(),
                 &artifact.storage_key,
@@ -1401,6 +1452,7 @@ async fn serve_file(
                         upstream_url,
                         project,
                         filename,
+                        &index_path,
                     )
                     .await
                 },
@@ -1618,21 +1670,22 @@ async fn resolve_pypi_remote_fetch_target(
     upstream_url: &str,
     project: &str,
     filename: &str,
+    index_path: &str,
 ) -> Result<PypiRemoteFetchTarget, Response> {
     let normalized = PypiHandler::normalize_name(project);
 
-    // Strip a trailing `/simple` from the configured upstream URL so we do
-    // not produce `https://pypi.org/simple/simple/{project}/` when the user
-    // copies the canonical Simple-API base verbatim into the repo config
-    // (issue #1130).
-    let (effective_upstream, index_path) =
-        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+    // Build the upstream index URL using the configured index_path.
+    // When `index_path` is "simple" (the default), the existing /simple-dedup
+    // logic from #1130 applies. When empty, the CDN flat-index layout is used
+    // (no prefix). Any other non-empty value is used verbatim as the prefix.
+    let (effective_upstream, upstream_index_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), index_path);
     let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
-        &index_path,
+        &upstream_index_path,
     )
     .await?;
 
@@ -1646,8 +1699,11 @@ async fn resolve_pypi_remote_fetch_target(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
 
     let fallback = || {
-        let (base, path) =
-            pypi_upstream_url_and_path(upstream_url, &format!("{}/{}", normalized, filename));
+        let (base, path) = pypi_upstream_url_and_path(
+            upstream_url,
+            &format!("{}/{}", normalized, filename),
+            index_path,
+        );
         (base, path)
     };
 
@@ -1749,10 +1805,18 @@ async fn fetch_from_pypi_remote_streaming(
     upstream_url: &str,
     project: &str,
     filename: &str,
+    index_path: &str,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
-    let target =
-        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
-            .await?;
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path,
+    )
+    .await?;
 
     proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
@@ -2574,21 +2638,22 @@ mod tests {
 
     #[test]
     fn test_pypi_upstream_strips_trailing_simple() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/");
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_strips_trailing_simple_no_slash() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_keeps_non_simple_url() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
@@ -2596,15 +2661,18 @@ mod tests {
     #[test]
     fn test_pypi_upstream_keeps_devpi_path() {
         let (url, path) =
-            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/");
+            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/", "simple");
         assert_eq!(url, "https://devpi.example.com/root/pypi");
         assert_eq!(path, "simple/numpy/");
     }
 
     #[test]
     fn test_pypi_upstream_trailing_simple_with_file() {
-        let (url, path) =
-            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/Flask-3.0.0.tar.gz");
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://pypi.org/simple/",
+            "flask/Flask-3.0.0.tar.gz",
+            "simple",
+        );
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/Flask-3.0.0.tar.gz");
     }
@@ -2614,14 +2682,14 @@ mod tests {
         // Edge case: configured upstream is literally "/simple" — strip the
         // suffix and substitute "/" so build_upstream_url has a non-empty
         // base to operate on. Exercises the `if base.is_empty()` branch.
-        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/", "simple");
         assert_eq!(url, "/");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_bare_simple_with_trailing_slash_collapses_to_root() {
-        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/", "simple");
         assert_eq!(url, "/");
         assert_eq!(path, "simple/flask/");
     }
@@ -2641,7 +2709,7 @@ mod tests {
     #[test]
     fn test_pypi_upstream_strips_leading_slash_from_tail() {
         // Tail with a stray leading slash should not produce `simple//flask/`.
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
@@ -2650,8 +2718,11 @@ mod tests {
     fn test_pypi_upstream_simple_substring_not_stripped() {
         // `simple-index` ends with `simple` substring but NOT the `/simple`
         // path segment, so it must not be stripped.
-        let (url, path) =
-            pypi_upstream_url_and_path("https://mirror.example.com/pypi-simple-index", "flask/");
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://mirror.example.com/pypi-simple-index",
+            "flask/",
+            "simple",
+        );
         assert_eq!(url, "https://mirror.example.com/pypi-simple-index");
         assert_eq!(path, "simple/flask/");
     }
@@ -2660,9 +2731,74 @@ mod tests {
     fn test_pypi_upstream_multiple_trailing_slashes_handled() {
         // trim_end_matches('/') strips all trailing slashes; the resulting
         // URL must still strip the `/simple` segment correctly.
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/");
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
+    }
+
+    // -----------------------------------------------------------------------
+    // pypi_upstream_url_and_path — flat CDN index (#1546)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_upstream_flat_index_pytorch_cdn() {
+        // PyTorch CDN: packages live directly under the upstream root.
+        // index_path="" means no prefix: torch/ → {upstream}/torch/
+        let (url, path) =
+            pypi_upstream_url_and_path("https://download.pytorch.org/whl/cpu", "torch/", "");
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_strips_leading_slash_from_tail() {
+        // Stray leading slash on tail must not produce `//torch/` on flat layout.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://download.pytorch.org/whl/cpu", "/torch/", "");
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_with_filename() {
+        // File download on flat layout: tail includes the filename.
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://download.pytorch.org/whl/cpu",
+            "torch/torch-2.2.0+cpu-cp311-cp311-linux_x86_64.whl",
+            "",
+        );
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/torch-2.2.0+cpu-cp311-cp311-linux_x86_64.whl");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_url_ending_in_simple_not_stripped() {
+        // When index_path is empty the /simple de-dup logic is intentionally
+        // skipped. A URL that happens to end in `/simple` is used verbatim.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://cdn.example.com/simple", "numpy/", "");
+        assert_eq!(url, "https://cdn.example.com/simple");
+        assert_eq!(path, "numpy/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_custom_index_path() {
+        // Custom prefix other than "simple" (e.g. a private mirror's layout).
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.corp/pypi", "requests/", "packages");
+        assert_eq!(url, "https://mirror.corp/pypi");
+        assert_eq!(path, "packages/requests/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_custom_index_no_dedup_for_non_simple_prefix() {
+        // Even if the upstream URL ends in "/simple", the de-dup logic is
+        // skipped when index_path != "simple". The URL is used as-is.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.corp/simple", "numpy/", "packages");
+        assert_eq!(url, "https://mirror.corp/simple");
+        assert_eq!(path, "packages/numpy/");
     }
 
     // -----------------------------------------------------------------------
@@ -5924,6 +6060,7 @@ mod tests {
             &server.uri(),
             "numpy",
             "numpy-2.0.0-py3-none-any.whl",
+            "simple",
         )
         .await
         .expect("streaming fetch via fallback path must succeed");

@@ -408,6 +408,17 @@ pub struct CreateRepositoryRequest {
     /// the sparse index but `https://crates.io` for tarball downloads).
     /// Stored in `repository_config` under the key `index_upstream_url`.
     pub index_upstream_url: Option<String>,
+    /// Override the PyPI simple-index prefix for upstreams that do not follow
+    /// the standard PEP 503 `/simple/` layout (issue #1546).
+    ///
+    /// - Omit or `"simple"` — standard PEP 503 (pypi.org, devpi, Nexus). Default.
+    /// - `""` (empty) — flat CDN (e.g. `https://download.pytorch.org/whl/cpu`):
+    ///   package files are served directly under the upstream root with no prefix.
+    /// - Any other non-empty string — custom index prefix.
+    ///
+    /// Stored in `repository_config` under `pypi_upstream_index_path`.
+    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    pub pypi_upstream_index_path: Option<String>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
@@ -460,6 +471,11 @@ pub struct UpdateRepositoryRequest {
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
+    /// Update the PyPI simple-index prefix (stored in `repository_config` under
+    /// `pypi_upstream_index_path`). Pass `""` for flat CDN layout, `"simple"` to
+    /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
+    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    pub pypi_upstream_index_path: Option<String>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
     /// Stored in `repository_config` under `quarantine_enabled`.
@@ -1406,6 +1422,10 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
+    if let Some(ref index_path) = payload.pypi_upstream_index_path {
+        upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
     // Add virtual repository members. Post-#1444, the validator accepts
     // `member_repos == None` (deferred-population pattern: caller will
     // POST /members later) and only rejects `Some(empty_vec)`. Treat the
@@ -1595,6 +1615,10 @@ pub async fn update_repository(
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
+    }
+
+    if let Some(ref index_path) = payload.pypi_upstream_index_path {
+        upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
