@@ -73,6 +73,23 @@ pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
     hash as i32
 }
 
+/// Fold a 128-bit artifact UUID down to a single 32-bit key, used as the
+/// first key of the per-`(artifact_id, scan_type)` advisory lock in
+/// [`ScanResultService::prepare_scan_placeholder`] (#1935).
+///
+/// The two-argument Postgres advisory-lock functions
+/// (`pg_advisory_xact_lock(key1 int4, key2 int4)`) take two 32-bit keys;
+/// there is no `(int8, int8)` overload. We XOR-fold the UUID's four 32-bit
+/// lanes so the whole identifier contributes to the key and the result is
+/// deterministic across processes (so concurrent backend replicas lock the
+/// same artifact to the same key).
+pub(crate) fn fold_uuid_to_lock_key(id: Uuid) -> i32 {
+    let bits = id.as_u128();
+    let folded =
+        (bits as u32) ^ ((bits >> 32) as u32) ^ ((bits >> 64) as u32) ^ ((bits >> 96) as u32);
+    folded as i32
+}
+
 /// Postgres advisory-lock key for the stuck-scan janitor (PR #1212 audit,
 /// finding H3). The janitor takes `pg_try_advisory_lock(STUCK_SCAN_LOCK_ID)`
 /// for the duration of one sweep so only one replica fires per tick;
@@ -763,10 +780,14 @@ impl ScanResultService {
         // Serialize concurrent preparers for this (artifact_id, scan_type)
         // so the re-check below sees any placeholder a racing caller has
         // already committed. Transaction-scoped lock is released on commit
-        // or rollback. Two i32 keys avoid collisions across scan_types for
-        // the same artifact while keeping the lock granular.
-        let lock_key_a = (artifact_id.as_u128() as u64) as i64;
-        let lock_key_b = i64::from(stable_lock_key(scan_type));
+        // or rollback. The two-key advisory lock takes two `int4` (i32)
+        // arguments (there is no `pg_advisory_xact_lock(int8, int8)`
+        // overload), so both keys must be i32: fold the artifact UUID's 128
+        // bits into an i32 for key A and use the 32-bit scan_type hash for
+        // key B. Two keys keep the lock granular per (artifact_id, scan_type)
+        // while avoiding collisions across scan_types for the same artifact.
+        let lock_key_a = fold_uuid_to_lock_key(artifact_id);
+        let lock_key_b = stable_lock_key(scan_type);
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(lock_key_a)
             .bind(lock_key_b)
@@ -1970,6 +1991,31 @@ mod tests {
     fn test_stable_lock_key_differs_per_scan_type() {
         assert_ne!(stable_lock_key("dependency"), stable_lock_key("image"));
         assert_ne!(stable_lock_key("image"), stable_lock_key("openscap"));
+    }
+
+    #[test]
+    fn test_fold_uuid_to_lock_key_is_deterministic() {
+        // Must be stable across calls/processes so concurrent replicas lock
+        // the same artifact to the same advisory-lock key.
+        let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_eq!(fold_uuid_to_lock_key(id), fold_uuid_to_lock_key(id));
+    }
+
+    #[test]
+    fn test_fold_uuid_to_lock_key_mixes_all_lanes() {
+        // Every 32-bit lane of the UUID must contribute to the key, so a
+        // change confined to any single lane changes the key. (Advisory-lock
+        // keys may still collide across distinct UUIDs -- that is safe, the
+        // re-check filters by exact artifact_id -- but the key must not be
+        // derived from only the low lane the way the old truncation was.)
+        let base = Uuid::from_u128(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        let key = fold_uuid_to_lock_key(base);
+        // Flip a bit in the high lane only; the folded key must change.
+        let high_flip = Uuid::from_u128(0x0123_4567_89ab_cdee_0011_2233_4455_6677);
+        assert_ne!(key, fold_uuid_to_lock_key(high_flip));
+        // Flip a bit in the low lane only; the folded key must also change.
+        let low_flip = Uuid::from_u128(0x0123_4567_89ab_cdef_0011_2233_4455_6676);
+        assert_ne!(key, fold_uuid_to_lock_key(low_flip));
     }
 
     // =======================================================================
