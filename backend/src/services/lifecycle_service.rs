@@ -4,7 +4,16 @@
 //! - max_age_days: delete artifacts older than N days
 //! - max_versions: keep only the last N versions per package
 //! - no_downloads_days: delete artifacts not downloaded in N days
-//! - tag_pattern_keep: keep artifacts matching a regex pattern
+//! - tag_pattern_keep: delete artifacts whose name does NOT match a regex
+//!   pattern (the SQL inverse of `tag_pattern_delete`). Despite the "keep"
+//!   name this is a *deletion* policy, NOT a protection rule: it does not
+//!   mark matching artifacts as protected and does not stop other lifecycle
+//!   policies from deleting artifacts it preserved. Each policy emits an
+//!   independent `UPDATE artifacts SET is_deleted = true` with no shared
+//!   notion of "protected", so pairing `tag_pattern_keep` with a
+//!   `tag_pattern_delete` (or any other deletion policy) on the same
+//!   repository can still empty the repository. The wire string stays
+//!   `tag_pattern_keep` for backward compatibility. See issue #1905.
 //! - tag_pattern_delete: delete artifacts matching a regex pattern
 //! - size_quota_bytes: enforce per-repo storage quotas
 
@@ -17,6 +26,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
+use crate::storage::keys::prefix_matches;
 
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
 ///
@@ -44,12 +54,15 @@ use crate::services::scheduler_service::normalize_cron_expression;
 ///
 /// `artifacts.storage_key` is still asserted to equal
 /// `'oci-manifests/' || ot.manifest_digest` as a defence-in-depth
-/// constraint. Note: this couples the cascade to the
-/// `manifest_storage_key()` invariant in `oci_v2.rs:414`. If anyone ever
-/// changes that prefix the cascade silently no-ops; #1413 tracks
-/// extracting a shared constant. The path-based predicate is the primary
-/// join key, the storage_key predicate is a secondary integrity check
-/// that protects against artifact-name/path drift.
+/// constraint. The `'oci-manifests/'` literal below is the SQL embedding of
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX), the same prefix
+/// `manifest_storage_key()` (`oci_v2.rs`) produces on writes and the storage
+/// GC orphan predicate (`storage_gc_service.rs`, `ORPHAN_PREDICATE_SQL`)
+/// matches on. Postgres cannot read the Rust constant, so the literal is
+/// pinned to it by the `const _: () = assert!(...)` below: changing the
+/// constant breaks the build until this SQL is updated to match (#1413). The
+/// path-based predicate is the primary join key; the storage_key predicate is
+/// a secondary integrity check that protects against artifact-name/path drift.
 const CASCADE_OCI_TAGS_SQL: &str = r#"
 DELETE FROM oci_tags ot
 USING artifacts a
@@ -60,6 +73,12 @@ WHERE a.is_deleted = true
   AND a.version = ot.tag
   AND ($1::UUID IS NULL OR a.repository_id = $1)
 "#;
+
+/// Compile-time guard: the `'oci-manifests/'` literal embedded in
+/// [`CASCADE_OCI_TAGS_SQL`] must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
+/// Postgres cannot reference the Rust constant directly, so this keeps the
+/// SQL literal and the write-path constant from drifting (#1413).
+const _: () = assert!(prefix_matches("oci-manifests/"));
 
 /// Scope of a lifecycle policy execution: either a specific repository or
 /// every repository in the cluster (a "global" policy with `repository_id`
@@ -130,6 +149,11 @@ pub(crate) enum PolicyType {
     MaxAgeDays,
     MaxVersions,
     NoDownloadsDays,
+    /// Deletes artifacts whose name does NOT match the configured regex (the
+    /// inverse of `TagPatternDelete`). The "keep" in the wire name refers to
+    /// which artifacts survive *this* policy's pass; it is NOT a protection
+    /// rule and does not shield matching artifacts from other deletion
+    /// policies. See the module-level docs and issue #1905.
     TagPatternKeep,
     TagPatternDelete,
     SizeQuotaBytes,
@@ -1051,7 +1075,10 @@ impl LifecycleService {
 
         let repo_filter = policy.repository_id;
 
-        // Inverse of tag_pattern_delete: find artifacts that do NOT match the pattern
+        // Inverse of tag_pattern_delete: find artifacts that do NOT match the
+        // pattern and soft-delete them. NOTE: this is a deletion pass, not a
+        // protection mark — artifacts matching the pattern survive only this
+        // policy and remain deletable by other lifecycle policies (#1905).
         let matched = sqlx::query_as::<_, CountBytes>(
             r#"
             SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes

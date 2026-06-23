@@ -3904,4 +3904,115 @@ mod tests {
             "resolver must not forward the upstream's mismatched sidecar"
         );
     }
+
+    /// #1562: a virtual repo must serve an artifact that one of its REMOTE
+    /// members can proxy-fetch on first request, even when no local member
+    /// holds it (e.g. a remote-only parent POM like `io.confluent:common`).
+    /// Reproduces the reported 404: a `.pom` that the remote member serves
+    /// 200 directly must also resolve 200 through the virtual, with a
+    /// non-remote (local) member listed at higher priority that does NOT
+    /// hold the artifact.
+    ///
+    /// The `serve_artifact` virtual branch routes Remote members through
+    /// `resolve_virtual_download_from_members` ->
+    /// `ProxyService::fetch_artifact_streaming` — the same helper the direct
+    /// Remote path uses — so the fall-through to the remote member must
+    /// stream the upstream POM rather than 404. This test pins that
+    /// behaviour so the buffered-helper regression cannot return.
+    #[tokio::test]
+    async fn test_virtual_serves_remote_only_pom_through_local_priority_member_1562() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Remote-only artifact path (a parent POM not cached anywhere local).
+        let pom_path = "io/confluent/common/5.3.1/common-5.3.1.pom";
+        let pom_body = "<project><artifactId>common</artifactId></project>";
+
+        // Upstream serves the POM for the exact path; 404 for anything else.
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pom_body))
+            .mount(&mock)
+            .await;
+
+        // Remote member pointed at the mock. Deliberately PRIVATE to mirror a
+        // proxy of an upstream that the operator has not marked public; the
+        // direct-read middleware still allows an authenticated caller via the
+        // looser `is_public || has_auth` model.
+        let (remote_id, _remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = false WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+
+        // Local member that does NOT hold the artifact, listed at higher
+        // priority than the remote so the loop must fall through to it.
+        let (local_id, _local_key, _ldir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("make local member public");
+
+        // Virtual repo with [local (prio 1), remote (prio 2)].
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1), ($1, $3, 2)",
+        )
+        .bind(virtual_id)
+        .bind(local_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("link local (prio 1) and remote (prio 2) as virtual members");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        // An ordinary authenticated caller (JWT/session: not repo-scoped).
+        let auth = tdh::make_auth(uuid::Uuid::new_v4(), "ph-1562-user");
+
+        // The caller through the virtual must resolve 200 from the remote
+        // member (the artifact lives only there).
+        let resp = download(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Path((virtual_key.clone(), pom_path.to_string())),
+        )
+        .await;
+
+        // cleanup (members cascade on repo delete).
+        for id in [virtual_id, remote_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let resp = resp.expect("virtual must serve the remote-only POM, not 404 (#1562)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "virtual repo must proxy the remote-only POM with 200 (#1562)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        assert_eq!(
+            &body[..],
+            pom_body.as_bytes(),
+            "virtual must return the upstream POM bytes (#1562)"
+        );
+    }
 }
