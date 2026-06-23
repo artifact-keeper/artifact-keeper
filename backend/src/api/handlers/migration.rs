@@ -7,7 +7,7 @@
 //! - Assessment and reporting
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{sse::Event, IntoResponse, Sse},
     routing::{get, post},
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::migration::MigrationConfig;
@@ -105,6 +106,20 @@ pub fn router() -> Router<SharedState> {
 }
 
 // ============ Database Row Types ============
+
+/// Column list selected into [`MigrationJobRow`]. Centralised so the many
+/// `SELECT ... FROM migration_jobs` / `... RETURNING ...` statements stay in
+/// lock-step with the struct (and so the identical column list is not
+/// copy-pasted across every handler).
+const MIGRATION_JOB_COLUMNS: &str =
+    "id, source_connection_id, status, job_type, config, total_items, completed_items, \
+     failed_items, skipped_items, total_bytes, transferred_bytes, started_at, \
+     finished_at, created_at, created_by, error_summary";
+
+/// Column list selected into [`SourceConnectionRow`]. Centralised for the same
+/// reason as [`MIGRATION_JOB_COLUMNS`].
+const SOURCE_CONNECTION_COLUMNS: &str =
+    "id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at";
 
 #[derive(Debug, FromRow, ToSchema)]
 pub struct SourceConnectionRow {
@@ -445,6 +460,138 @@ pub struct RepositoryAssessment {
     pub warnings: Vec<String>,
 }
 
+// ============ Ownership Scoping ============
+//
+// The migration router is mounted under `auth_middleware`, so every request
+// here is authenticated, but until now the handlers queried
+// `source_connections` / `migration_jobs` by primary key only — any
+// authenticated user could read or mutate any other user's (or tenant's) rows
+// (BOLA). We scope every access to the calling user via the `created_by`
+// columns that already exist on both tables (migration `020_migration_tables`),
+// mirroring the per-user ownership model used by `repo_tokens.rs` (#1974) and
+// `service_accounts.rs`: admins retain full cross-user visibility/control.
+//
+// Pre-fix rows have `created_by = NULL` (creation never stamped it); those are
+// owned by nobody and therefore invisible/untouchable to non-admins
+// (fail-closed). Admins can see and clean them up. Denials use
+// `AppError::NotFound` (there is no `Forbidden` variant; this matches the
+// `repo_tokens` idiom and avoids disclosing other tenants' resource existence).
+
+/// Whether `auth` may access a row created by `created_by`.
+///
+/// Admins may access any row. A non-admin may access only rows they created;
+/// rows with `created_by = NULL` (predating ownership stamping) are owned by
+/// nobody and are therefore inaccessible to non-admins.
+fn caller_owns(auth: &AuthExtension, created_by: Option<Uuid>) -> bool {
+    auth.is_admin || created_by == Some(auth.user_id)
+}
+
+/// Load a source connection by id, enforcing per-user ownership.
+///
+/// Returns `AppError::NotFound` both when the row does not exist and when it
+/// exists but the caller does not own it (and is not an admin), so cross-owner
+/// probing cannot distinguish "missing" from "not yours".
+async fn load_connection_owned(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<SourceConnectionRow> {
+    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+        "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+
+    if !caller_owns(auth, connection.created_by) {
+        return Err(AppError::NotFound("Source connection not found".into()));
+    }
+    Ok(connection)
+}
+
+/// Load a migration job by id, enforcing per-user ownership.
+///
+/// Returns `AppError::NotFound` when the row is missing or owned by another
+/// user (non-admin caller). Used to gate the job sub-resources
+/// (items/report/assessment/stream) on the parent job's owner.
+async fn load_job_owned(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<MigrationJobRow> {
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Migration job not found".into()))?;
+
+    if !caller_owns(auth, job.created_by) {
+        return Err(AppError::NotFound("Migration job not found".into()));
+    }
+    Ok(job)
+}
+
+/// Build the [`WorkerConfig`] for `job` from its `config` JSON and spawn a
+/// background [`MigrationWorker`] to run (or resume) it. Shared by
+/// `start_migration` and `resume_migration`, which previously duplicated this
+/// entire spawn block verbatim apart from the worker entrypoint. On worker
+/// error the job is marked `failed` with the error summary (best-effort).
+fn spawn_migration_worker(
+    state: &SharedState,
+    job: &MigrationJobRow,
+    client: Arc<dyn SourceRegistry>,
+    resume: bool,
+) {
+    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
+    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
+    let cancel_token = CancellationToken::new();
+
+    let worker_config = WorkerConfig {
+        concurrency: config.concurrent_transfers.max(1) as usize,
+        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
+        dry_run: config.dry_run,
+        // Honor the user's `verify_checksums` preference from MigrationConfig
+        // so the documented API flag actually disables verification
+        // (issue #856).
+        verify_checksums: config.verify_checksums,
+        // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
+        // rather than the pod's ephemeral `/tmp` (issue #1608).
+        staging_path: state.config.storage_path.clone(),
+        ..Default::default()
+    };
+
+    let db = state.db.clone();
+    let storage_registry = state.storage_registry.clone();
+    let fail_db = state.db.clone();
+    let job_id = job.id;
+    tokio::spawn(async move {
+        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
+        let outcome = if resume {
+            worker
+                .resume_job(job_id, client, conflict_resolution, None)
+                .await
+        } else {
+            worker
+                .process_job(job_id, client, conflict_resolution, None)
+                .await
+        };
+        if let Err(e) = outcome {
+            let phase = if resume { "resume" } else { "worker" };
+            tracing::error!(job_id = %job_id, error = %e, "Migration {phase} failed");
+            let _ = sqlx::query(
+                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
+            )
+            .bind(job_id)
+            .bind(e.to_string())
+            .execute(&fail_db)
+            .await;
+        }
+    });
+}
+
 // ============ Handler Implementations ============
 
 /// List all source connections for the current user
@@ -461,6 +608,7 @@ pub struct RepositoryAssessment {
 )]
 async fn list_connections(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<ListResponse<ConnectionResponse>>> {
     // Check if table exists
     let table_exists: bool = sqlx::query_scalar(
@@ -477,13 +625,13 @@ async fn list_connections(
         }));
     }
 
-    let connections: Vec<SourceConnectionRow> = sqlx::query_as(
-        r#"
-        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
-        FROM source_connections
-        ORDER BY created_at DESC
-        "#,
-    )
+    // Non-admins see only the connections they created; admins see all.
+    let connections: Vec<SourceConnectionRow> = sqlx::query_as(&format!(
+        "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections \
+         WHERE ($1 OR created_by = $2) ORDER BY created_at DESC"
+    ))
+    .bind(auth.is_admin)
+    .bind(auth.user_id)
     .fetch_all(&state.db)
     .await?;
 
@@ -510,6 +658,7 @@ async fn list_connections(
 )]
 async fn create_connection(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
     // Validate URL to prevent SSRF when migration fetches from this source
@@ -527,18 +676,19 @@ async fn create_connection(
     let encryption_key = migration_encryption_key()?;
     let credentials_enc = encrypt_credentials(&credentials_json, &encryption_key);
 
-    let connection: SourceConnectionRow = sqlx::query_as(
-        r#"
-        INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
-        "#,
-    )
+    // Stamp `created_by` with the calling user so ownership is recorded and the
+    // owner-scoped reads/writes below can match. Without this the column stayed
+    // NULL and any owner filter would be useless.
+    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+        "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SOURCE_CONNECTION_COLUMNS}"
+    ))
     .bind(&req.name)
     .bind(&req.url)
     .bind(&req.auth_type)
     .bind(&credentials_enc)
     .bind(req.source_type.as_deref().unwrap_or("artifactory"))
+    .bind(auth.user_id)
     .fetch_one(&state.db)
     .await?;
 
@@ -563,20 +713,10 @@ async fn create_connection(
 )]
 async fn get_connection(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConnectionResponse>> {
-    let connection: SourceConnectionRow = sqlx::query_as(
-        r#"
-        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
-        FROM source_connections
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
-
+    let connection = load_connection_owned(&state, &auth, id).await?;
     Ok(Json(connection.into()))
 }
 
@@ -598,8 +738,14 @@ async fn get_connection(
 )]
 async fn delete_connection(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
+    // Enforce ownership before touching anything: a non-owner (non-admin) must
+    // get the same 404 as a missing connection, and must not trigger the
+    // cascade delete below. This also makes a repeat delete return 404.
+    load_connection_owned(&state, &auth, id).await?;
+
     // A connection is the parent resource for its migration jobs. The
     // migration_jobs.source_connection_id FK has no ON DELETE clause (it
     // defaults to NO ACTION), so a raw DELETE on a connection that still has
@@ -651,19 +797,10 @@ async fn delete_connection(
 )]
 async fn test_connection(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConnectionTestResult>> {
-    let connection: SourceConnectionRow = sqlx::query_as(
-        r#"
-        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
-        FROM source_connections
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+    let connection = load_connection_owned(&state, &auth, id).await?;
 
     // Create source registry client
     let client = match create_source_client(&connection) {
@@ -823,20 +960,11 @@ fn create_artifactory_client(
 )]
 async fn list_source_repositories(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ListResponse<SourceRepository>>> {
-    // Fetch connection
-    let connection: SourceConnectionRow = sqlx::query_as(
-        r#"
-        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
-        FROM source_connections
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+    // Fetch connection (owner-scoped)
+    let connection = load_connection_owned(&state, &auth, id).await?;
 
     // Create source registry client
     let client = create_source_client(&connection)
@@ -880,6 +1008,7 @@ async fn list_source_repositories(
 )]
 async fn list_migrations(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListMigrationsQuery>,
 ) -> Result<Json<ListResponse<MigrationJobResponse>>> {
     // Check if table exists
@@ -906,44 +1035,43 @@ async fn list_migrations(
     let per_page = query.per_page.unwrap_or(20);
     let offset = (page - 1) * per_page;
 
+    // Non-admins see only jobs they created; admins see all. The
+    // `($1 OR created_by = $2)` predicate keeps both branches single-statement
+    // and the count consistent with the listed rows.
     let jobs: Vec<MigrationJobRow> = if let Some(status) = &query.status {
-        sqlx::query_as(
-            r#"
-            SELECT id, source_connection_id, status, job_type, config, total_items, completed_items,
-                   failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                   finished_at, created_at, created_by, error_summary
-            FROM migration_jobs
-            WHERE status = $1
-            ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
+        sqlx::query_as(&format!(
+            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
+             WHERE ($1 OR created_by = $2) AND status = $3 \
+             ORDER BY created_at DESC LIMIT $4 OFFSET $5"
+        ))
+        .bind(auth.is_admin)
+        .bind(auth.user_id)
         .bind(status)
         .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await?
     } else {
-        sqlx::query_as(
-            r#"
-            SELECT id, source_connection_id, status, job_type, config, total_items, completed_items,
-                   failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                   finished_at, created_at, created_by, error_summary
-            FROM migration_jobs
-            ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
-            "#,
-        )
+        sqlx::query_as(&format!(
+            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
+             WHERE ($1 OR created_by = $2) \
+             ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+        ))
+        .bind(auth.is_admin)
+        .bind(auth.user_id)
         .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await?
     };
 
-    // Get total count
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM migration_jobs")
-        .fetch_one(&state.db)
-        .await?;
+    // Get total count, scoped to the same ownership filter as the listing.
+    let total: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM migration_jobs WHERE ($1 OR created_by = $2)")
+            .bind(auth.is_admin)
+            .bind(auth.user_id)
+            .fetch_one(&state.db)
+            .await?;
 
     Ok(Json(ListResponse {
         items: jobs.into_iter().map(Into::into).collect(),
@@ -1002,6 +1130,7 @@ fn map_create_migration_error(err: sqlx::Error) -> AppError {
 )]
 async fn create_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateMigrationRequest>,
 ) -> Result<(StatusCode, Json<MigrationJobResponse>)> {
     let job_type = req.job_type.unwrap_or_else(|| "full".to_string());
@@ -1019,24 +1148,26 @@ async fn create_migration(
 
     let config_json = serde_json::to_value(&req.config)?;
 
+    // A job may only be created against a connection the caller owns (admins:
+    // any). This both prevents launching a job on another tenant's connection
+    // and returns the same 404 as an unknown connection for cross-owner ids.
+    load_connection_owned(&state, &auth, req.source_connection_id).await?;
+
     // The migration_jobs.source_connection_id FK had no application-level
     // pre-check, so an unknown connection id raised a bare Postgres FK
     // violation that propagated as HTTP 500 DATABASE_ERROR on every such call.
     // Map that specific violation to 404 so callers get an actionable error and
     // the write path stops looking like a server fault (mirrors the federation
-    // assign-repo fix in #1954).
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        INSERT INTO migration_jobs (source_connection_id, job_type, config)
-        VALUES ($1, $2, $3)
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    // assign-repo fix in #1954). `created_by` is stamped with the caller so the
+    // owner-scoped reads/writes below can match (previously left NULL).
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "INSERT INTO migration_jobs (source_connection_id, job_type, config, created_by) \
+         VALUES ($1, $2, $3, $4) RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(req.source_connection_id)
     .bind(&job_type)
     .bind(&config_json)
+    .bind(auth.user_id)
     .fetch_one(&state.db)
     .await
     .map_err(map_create_migration_error)?;
@@ -1062,22 +1193,10 @@ async fn create_migration(
 )]
 async fn get_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MigrationJobResponse>> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        SELECT id, source_connection_id, status, job_type, config, total_items, completed_items,
-               failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-               finished_at, created_at, created_by, error_summary
-        FROM migration_jobs
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Migration job not found".into()))?;
-
+    let job = load_job_owned(&state, &auth, id).await?;
     Ok(Json(job.into()))
 }
 
@@ -1099,12 +1218,19 @@ async fn get_migration(
 )]
 async fn delete_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
-    let result = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    // Fold ownership into the DELETE so it stays a single atomic statement:
+    // a non-owner (non-admin) deletes zero rows and gets the same 404 as a
+    // missing job.
+    let result =
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1 AND ($2 OR created_by = $3)")
+            .bind(id)
+            .bind(auth.is_admin)
+            .bind(auth.user_id)
+            .execute(&state.db)
+            .await?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Migration job not found".into()));
@@ -1132,18 +1258,17 @@ async fn delete_migration(
 )]
 async fn start_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MigrationJobResponse>> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        UPDATE migration_jobs
-        SET status = 'running', started_at = NOW()
-        WHERE id = $1 AND status IN ('pending', 'ready')
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    // Gate the job by owner first so a cross-owner start returns 404 (not a
+    // 409 that would leak the job's existence/state) and never spawns a worker.
+    load_job_owned(&state, &auth, id).await?;
+
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "UPDATE migration_jobs SET status = 'running', started_at = NOW() \
+         WHERE id = $1 AND status IN ('pending', 'ready') RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1152,9 +1277,9 @@ async fn start_migration(
     })?;
 
     // Fetch connection to create Artifactory client
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
+    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+        "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
+    ))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
@@ -1163,48 +1288,8 @@ async fn start_migration(
     let client = create_source_client(&connection)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
-    // Parse migration config for conflict resolution
-    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
-    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-
-    // Create cancellation token for this job
-    let cancel_token = CancellationToken::new();
-
-    // Create and spawn the migration worker
-    let worker_config = WorkerConfig {
-        concurrency: config.concurrent_transfers.max(1) as usize,
-        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
-        dry_run: config.dry_run,
-        // Honor the user's `verify_checksums` preference from MigrationConfig
-        // so the documented API flag actually disables verification
-        // (issue #856).
-        verify_checksums: config.verify_checksums,
-        // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
-        // rather than the pod's ephemeral `/tmp` (issue #1608).
-        staging_path: state.config.storage_path.clone(),
-        ..Default::default()
-    };
-
-    let db = state.db.clone();
-    let storage_registry = state.storage_registry.clone();
-    let fail_db = state.db.clone();
-    let job_id = job.id;
-    tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
-        if let Err(e) = worker
-            .process_job(job_id, client, conflict_resolution, None)
-            .await
-        {
-            tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
-            let _ = sqlx::query(
-                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-            )
-            .bind(job_id)
-            .bind(e.to_string())
-            .execute(&fail_db)
-            .await;
-        }
-    });
+    // Create and spawn the migration worker (shared with resume).
+    spawn_migration_worker(&state, &job, client, false);
 
     Ok(Json(job.into()))
 }
@@ -1227,18 +1312,15 @@ async fn start_migration(
 )]
 async fn pause_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MigrationJobResponse>> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        UPDATE migration_jobs
-        SET status = 'paused'
-        WHERE id = $1 AND status = 'running'
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    load_job_owned(&state, &auth, id).await?;
+
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "UPDATE migration_jobs SET status = 'paused' \
+         WHERE id = $1 AND status = 'running' RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1267,18 +1349,15 @@ async fn pause_migration(
 )]
 async fn resume_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MigrationJobResponse>> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        UPDATE migration_jobs
-        SET status = 'running'
-        WHERE id = $1 AND status = 'paused'
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    load_job_owned(&state, &auth, id).await?;
+
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "UPDATE migration_jobs SET status = 'running' \
+         WHERE id = $1 AND status = 'paused' RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1287,9 +1366,9 @@ async fn resume_migration(
     })?;
 
     // Fetch connection and spawn worker (same as start)
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
+    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+        "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
+    ))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
@@ -1298,45 +1377,8 @@ async fn resume_migration(
     let client = create_source_client(&connection)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
-    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
-    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-
-    let cancel_token = CancellationToken::new();
-
-    let worker_config = WorkerConfig {
-        concurrency: config.concurrent_transfers.max(1) as usize,
-        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
-        dry_run: config.dry_run,
-        // Honor the user's `verify_checksums` preference from MigrationConfig
-        // so the documented API flag actually disables verification
-        // (issue #856).
-        verify_checksums: config.verify_checksums,
-        // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
-        // rather than the pod's ephemeral `/tmp` (issue #1608).
-        staging_path: state.config.storage_path.clone(),
-        ..Default::default()
-    };
-
-    let db = state.db.clone();
-    let storage_registry = state.storage_registry.clone();
-    let fail_db = state.db.clone();
-    let job_id = job.id;
-    tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
-        if let Err(e) = worker
-            .resume_job(job_id, client, conflict_resolution, None)
-            .await
-        {
-            tracing::error!(job_id = %job_id, error = %e, "Migration resume failed");
-            let _ = sqlx::query(
-                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-            )
-            .bind(job_id)
-            .bind(e.to_string())
-            .execute(&fail_db)
-            .await;
-        }
-    });
+    // Spawn the worker in resume mode (shared with start).
+    spawn_migration_worker(&state, &job, client, true);
 
     Ok(Json(job.into()))
 }
@@ -1359,18 +1401,16 @@ async fn resume_migration(
 )]
 async fn cancel_migration(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MigrationJobResponse>> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        UPDATE migration_jobs
-        SET status = 'cancelled', finished_at = NOW()
-        WHERE id = $1 AND status IN ('pending', 'ready', 'running', 'paused', 'assessing')
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    load_job_owned(&state, &auth, id).await?;
+
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "UPDATE migration_jobs SET status = 'cancelled', finished_at = NOW() \
+         WHERE id = $1 AND status IN ('pending', 'ready', 'running', 'paused', 'assessing') \
+         RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1411,22 +1451,12 @@ async fn cancel_migration(
 )]
 async fn stream_migration_progress(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    // Verify job exists
-    let _job: MigrationJobRow = sqlx::query_as(
-        r#"
-        SELECT id, source_connection_id, status, job_type, config, total_items, completed_items,
-               failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-               finished_at, created_at, created_by, error_summary
-        FROM migration_jobs
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Migration job not found".into()))?;
+    // Verify the job exists AND the caller owns it (admins: any) before
+    // streaming; a cross-owner subscription returns 404 like a missing job.
+    load_job_owned(&state, &auth, id).await?;
 
     let db = state.db.clone();
 
@@ -1522,9 +1552,13 @@ async fn stream_migration_progress(
 )]
 async fn list_migration_items(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Query(query): Query<ListItemsQuery>,
 ) -> Result<Json<ListResponse<MigrationItemResponse>>> {
+    // Items are scoped to their parent job; gate on the job's owner.
+    load_job_owned(&state, &auth, id).await?;
+
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50);
     let offset = (page - 1) * per_page;
@@ -1582,9 +1616,13 @@ async fn list_migration_items(
 )]
 async fn get_migration_report(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Query(query): Query<ReportQuery>,
 ) -> Result<impl IntoResponse> {
+    // The report belongs to its parent job; gate on the job's owner.
+    load_job_owned(&state, &auth, id).await?;
+
     let report: MigrationReportRow = sqlx::query_as(
         r#"
         SELECT id, job_id, generated_at, summary, warnings, errors, recommendations
@@ -1632,18 +1670,15 @@ async fn get_migration_report(
 )]
 async fn run_assessment(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<MigrationJobResponse>)> {
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        UPDATE migration_jobs
-        SET status = 'assessing', job_type = 'assessment'
-        WHERE id = $1 AND status = 'pending'
-        RETURNING id, source_connection_id, status, job_type, config, total_items, completed_items,
-                  failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-                  finished_at, created_at, created_by, error_summary
-        "#,
-    )
+    load_job_owned(&state, &auth, id).await?;
+
+    let job: MigrationJobRow = sqlx::query_as(&format!(
+        "UPDATE migration_jobs SET status = 'assessing', job_type = 'assessment' \
+         WHERE id = $1 AND status = 'pending' RETURNING {MIGRATION_JOB_COLUMNS}"
+    ))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1652,9 +1687,9 @@ async fn run_assessment(
     })?;
 
     // Fetch source connection to create client
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
+    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+        "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
+    ))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
@@ -1713,22 +1748,11 @@ async fn run_assessment(
 )]
 async fn get_assessment(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AssessmentResult>> {
-    // Verify job exists and is an assessment
-    let job: MigrationJobRow = sqlx::query_as(
-        r#"
-        SELECT id, source_connection_id, status, job_type, config, total_items, completed_items,
-               failed_items, skipped_items, total_bytes, transferred_bytes, started_at,
-               finished_at, created_at, created_by, error_summary
-        FROM migration_jobs
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Migration job not found".into()))?;
+    // Verify the job exists, is owned by the caller (admins: any), and load it.
+    let job = load_job_owned(&state, &auth, id).await?;
 
     // Extract assessment results from the job's config JSON (saved by save_assessment)
     let assessment_json = job.config.get("assessment");
@@ -2590,6 +2614,417 @@ mod tests {
             AppError::NotFound(_) => {}
             other => panic!("expected NotFound (404) for unknown connection, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ownership predicate (pure logic, no DB).
+    // -----------------------------------------------------------------------
+
+    fn auth_for(user_id: Uuid, is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: "u".to_string(),
+            email: "u@test.local".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_caller_owns_own_row() {
+        let me = Uuid::new_v4();
+        let auth = auth_for(me, false);
+        assert!(caller_owns(&auth, Some(me)));
+    }
+
+    #[test]
+    fn test_caller_owns_other_row_denied_for_non_admin() {
+        let auth = auth_for(Uuid::new_v4(), false);
+        assert!(!caller_owns(&auth, Some(Uuid::new_v4())));
+    }
+
+    #[test]
+    fn test_caller_owns_null_owner_invisible_to_non_admin() {
+        // Pre-fix rows have created_by = NULL: owned by nobody -> fail-closed.
+        let auth = auth_for(Uuid::new_v4(), false);
+        assert!(!caller_owns(&auth, None));
+    }
+
+    #[test]
+    fn test_caller_owns_admin_sees_everything() {
+        let auth = auth_for(Uuid::new_v4(), true);
+        assert!(caller_owns(&auth, Some(Uuid::new_v4())));
+        assert!(caller_owns(&auth, None));
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed BOLA tests for the migration subsystem.
+    //
+    // These run only when DATABASE_URL points at a migrated throwaway Postgres
+    // (the harness provisions one on :5513); they skip cleanly otherwise so
+    // offline `cargo test` does not fail. They exercise the real handlers
+    // through an axum Router with the bare `Extension<AuthExtension>` injected
+    // exactly as the production `auth_middleware` does.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+
+    /// Build the migration router with `state` and an injected bare
+    /// `Extension<AuthExtension>` (migration handlers extract the non-Option
+    /// form, as `auth_middleware` provides). `router_with_auth_ext` also injects
+    /// the `Option<AuthExtension>` copy to match production exactly.
+    fn app_as(state: SharedState, auth: AuthExtension) -> axum::Router {
+        tdh::router_with_auth_ext(router(), state, auth)
+    }
+
+    /// Seed a source connection owned by `owner` and return its id.
+    async fn seed_connection(pool: &sqlx::PgPool, owner: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by)
+            VALUES ($1, 'http://src.local', 'basic_auth', $2, 'nexus', $3)
+            RETURNING id
+            "#,
+        )
+        .bind(format!("bola-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("seed connection")
+    }
+
+    /// Seed a migration job owned by `owner` against `conn` and return its id.
+    async fn seed_job(pool: &sqlx::PgPool, conn: Uuid, owner: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO migration_jobs (source_connection_id, job_type, config, created_by)
+            VALUES ($1, 'full', '{}'::jsonb, $2)
+            RETURNING id
+            "#,
+        )
+        .bind(conn)
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("seed job")
+    }
+
+    async fn cleanup_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        // migration_jobs/source_connections created_by FK + jobs reference
+        // connections; delete jobs first, then connections, then the user.
+        let _ = sqlx::query(
+            "DELETE FROM migration_jobs WHERE created_by = $1 OR source_connection_id IN \
+             (SELECT id FROM source_connections WHERE created_by = $1)",
+        )
+        .bind(user_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE created_by = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_user_get_connection_returns_404() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (victor, victor_name) = tdh::create_user(&pool).await;
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let victor_conn = seed_connection(&pool, victor).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/connections/{victor_conn}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "marco must not read victor's connection"
+        );
+
+        let _ = victor_name;
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_user_delete_connection_returns_404() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (victor, _) = tdh::create_user(&pool).await;
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let victor_conn = seed_connection(&pool, victor).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/connections/{victor_conn}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Victor's connection must still exist (not cascade-deleted).
+        let still: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM source_connections WHERE id = $1)")
+                .bind(victor_conn)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(still, "cross-user delete must not remove the row");
+
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_user_get_and_start_job_returns_404() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (glen, _) = tdh::create_user(&pool).await;
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let glen_conn = seed_connection(&pool, glen).await;
+        let glen_job = seed_job(&pool, glen_conn, glen).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let (get_status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{glen_job}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(get_status, StatusCode::NOT_FOUND);
+
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (start_status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{glen_job}/start"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            start_status,
+            StatusCode::NOT_FOUND,
+            "marco must not start glen's job"
+        );
+
+        // Glen's job must remain in its original 'pending' state.
+        let status: String = sqlx::query_scalar("SELECT status FROM migration_jobs WHERE id = $1")
+            .bind(glen_job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "cross-user start must not run the job");
+
+        cleanup_user(&pool, glen).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_isolates_per_user() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (victor, _) = tdh::create_user(&pool).await;
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let _victor_conn = seed_connection(&pool, victor).await;
+        let marco_conn = seed_connection(&pool, marco).await;
+        let _marco_job = seed_job(&pool, marco_conn, marco).await;
+        let victor_conn2 = seed_connection(&pool, victor).await;
+        let _victor_job = seed_job(&pool, victor_conn2, victor).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Connections list: only marco's one connection.
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/connections")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "marco must see only his own connection");
+        assert_eq!(items[0]["id"], marco_conn.to_string());
+
+        // Jobs list: only marco's one job.
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            1,
+            "marco must see only his own job"
+        );
+        assert_eq!(v["pagination"]["total"], 1, "count must be owner-scoped");
+
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_self_create_then_access_stamps_owner() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Marco creates a connection via the handler.
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let create_body = serde_json::json!({
+            "name": format!("marco-conn-{}", Uuid::new_v4()),
+            "url": "http://src.local",
+            "auth_type": "basic_auth",
+            "credentials": {"username": "u", "password": "p"},
+            "source_type": "nexus",
+        });
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/connections")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let conn_id: Uuid = v["id"].as_str().unwrap().parse().unwrap();
+
+        // created_by must be stamped to marco.
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT created_by FROM source_connections WHERE id = $1")
+                .bind(conn_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, Some(marco), "create must stamp created_by");
+
+        // Marco can GET his own connection.
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/connections/{conn_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "owner must read his own connection");
+
+        // Marco can DELETE his own connection.
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/connections/{conn_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "owner must delete his own connection"
+        );
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_admin_sees_and_gets_across_users() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (victor, _) = tdh::create_user(&pool).await;
+        let victor_conn = seed_connection(&pool, victor).await;
+        let victor_job = seed_job(&pool, victor_conn, victor).await;
+
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let mut admin_auth = tdh::make_auth(admin_id, &admin_name);
+        admin_auth.is_admin = true;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Admin can GET victor's connection.
+        let app = app_as(state.clone(), admin_auth.clone());
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/connections/{victor_conn}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin must read any connection");
+
+        // Admin can GET victor's job.
+        let app = app_as(state, admin_auth);
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{victor_job}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin must read any job");
+
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, admin_id).await;
     }
 }
 
