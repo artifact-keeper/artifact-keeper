@@ -88,6 +88,26 @@ cargo test --workspace --lib
 - Add tests for new functionality
 - Update documentation if your change affects user-facing behavior
 
+### Offloading CPU-bound work with `spawn_blocking`
+
+Request handlers run on the shared Tokio runtime workers. A long
+synchronous computation on a worker stalls every other task scheduled on
+that thread, so CPU-bound work over caller-controlled input must be moved
+off the async path with `tokio::task::spawn_blocking`.
+
+Wrap a parse/compute step in `spawn_blocking` when **both** are true:
+
+- it is synchronous and CPU-bound (regex scans, XML/JSON deserialization,
+  archive extraction, hashing, key generation), and
+- the input size is attacker- or client-controlled and can exceed ~1 MiB
+  (proxied upstream index/metadata bodies, uploaded manifests, SBOMs).
+
+Pair the offload with an explicit size cap and reject oversized bodies
+before parsing, as the PEP 503 simple-index proxy does
+(`api/handlers/pypi.rs`: `MAX_SIMPLE_ROOT_BODY_BYTES` + `spawn_blocking`).
+Small, bounded inputs (a single coordinate string, a short header) do not
+need offloading.
+
 ## Regression-test contract for bug fixes
 
 Every PR that fixes a bug must land with a regression test that fails on

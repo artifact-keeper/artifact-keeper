@@ -2010,6 +2010,9 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        // Escape the apostrophe so the helper is safe in single-quoted
+        // attribute contexts too, matching html_escape_pep503 in formats/pypi.rs.
+        .replace('\'', "&#39;")
 }
 
 // ---------------------------------------------------------------------------
@@ -2397,6 +2400,15 @@ mod tests {
     #[test]
     fn test_html_escape_quotes() {
         assert_eq!(html_escape("a \"b\" c"), "a &quot;b&quot; c");
+    }
+
+    #[test]
+    fn test_html_escape_apostrophe() {
+        assert_eq!(html_escape("O'Reilly"), "O&#39;Reilly");
+        assert_eq!(
+            html_escape("' onload='alert(1)"),
+            "&#39; onload=&#39;alert(1)"
+        );
     }
 
     #[test]
