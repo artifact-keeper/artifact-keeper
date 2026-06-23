@@ -1440,11 +1440,14 @@ async fn serve_file(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
             get_remote_cached_or_refetch_stream(
                 storage.clone(),
                 &artifact.storage_key,
                 || async move {
+                    // Fetched lazily inside the closure: this path serves
+                    // cache hits straight from storage, and the index_path is
+                    // only needed on a cache miss when we re-fetch upstream.
+                    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
                     fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
