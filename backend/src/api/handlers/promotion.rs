@@ -625,28 +625,24 @@ pub async fn promote_artifact(
 
     // Ordering note (#1382 review): quality-gate block precedes
     // approval-required. A gate-violating artifact in an approval-required
-    // repository returns 409 (gate block) rather than the 200 "approval
-    // required" response. This is intentional: a gate-blocked artifact will
-    // never be promotable until the underlying violations are resolved, so
-    // routing it through the approval workflow would only produce an
-    // approval request that is guaranteed to fail re-evaluation. Security
-    // and policy enforcement therefore take precedence over the approval UX
-    // hint. See `test_gate_block_precedes_approval_required` for the
-    // regression pin.
-    if super::approval::check_approval_required(&state.db, source_repo.id).await? {
-        return Ok(Json(PromotionResponse {
-            promoted: false,
-            source: format!("{}/{}", repo_key, artifact_id),
-            target: target_key.clone(),
-            promotion_id: None,
-            policy_violations: vec![],
-            message: Some(
-                "This repository requires approval for promotions. \
-                 Use POST /api/v1/approval/request to submit an approval request."
-                    .to_string(),
-            ),
-        }));
-    }
+    // repository returns 409 (gate block) rather than the approval-required
+    // response. This is intentional: a gate-blocked artifact will never be
+    // promotable until the underlying violations are resolved, so routing it
+    // through the approval workflow would only produce an approval request that
+    // is guaranteed to fail re-evaluation. Security and policy enforcement
+    // therefore take precedence over the approval requirement. See
+    // `test_gate_block_precedes_approval_required` for the regression pin.
+    //
+    // Couple the /promote route to the approval workflow: when the source repo
+    // requires approval, the promotion is only authorized by an APPROVED +
+    // unconsumed `promotion_approvals` row for the exact (artifact, source,
+    // target) pair. We record the requirement here (after the gate-block early
+    // return) but defer the atomic consume to just before the byte copy below so
+    // a later policy/rule rejection does not spend the approval. Without this an
+    // admin could promote directly while a request sits unconsumed, bypassing
+    // the gate (the promotion-approval-gate-bypass finding).
+    let approval_required =
+        super::approval::check_approval_required(&state.db, source_repo.id).await?;
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
     let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
@@ -722,6 +718,23 @@ pub async fn promote_artifact(
                 message: v.message,
             });
         }
+    }
+
+    // Approval gate (promotion-approval-gate-bypass): when the source requires
+    // approval, atomically consume an APPROVED + unconsumed approval row for this
+    // exact (artifact, source, target) pair before copying any bytes. A single-row
+    // UPDATE ... SET consumed_at claim is the concurrency boundary: a miss (no
+    // approval, only a pending request, or a concurrent double-spend) returns 409
+    // and the target is constrained to the approved pair. Done after the
+    // gate/policy/rule checks so a rejected promotion never spends the approval.
+    if approval_required {
+        super::approval::require_and_consume_approval(
+            &state.db,
+            artifact_id,
+            source_repo.id,
+            target_repo.id,
+        )
+        .await?;
     }
 
     let new_artifact_id = Uuid::new_v4();
@@ -856,6 +869,15 @@ pub async fn promote_artifacts_bulk(
     require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &target_repo)
         .await?;
 
+    // Approval gate (promotion-approval-gate-bypass). When the source requires
+    // approval, each artifact must independently consume its own APPROVED +
+    // unconsumed approval row for this (artifact, source, target) pair before its
+    // bytes are copied; a missing/used approval fails that item per-batch (the
+    // others remain promotable). The require_approval flag is per-source so it is
+    // resolved once for the whole batch.
+    let approval_required =
+        super::approval::check_approval_required(&state.db, source_repo.id).await?;
+
     let mut results = Vec::new();
     let mut promoted = 0;
     let mut failed = 0;
@@ -936,6 +958,29 @@ pub async fn promote_artifacts_bulk(
                     ));
                     continue;
                 }
+            }
+        }
+
+        // Approval gate (promotion-approval-gate-bypass): consume this item's
+        // own APPROVED + unconsumed approval row before copying. Runs after the
+        // rule check so a rule-blocked item never spends an approval, and fails
+        // the item (not the batch) when no consumable approval exists.
+        if approval_required {
+            if let Err(e) = super::approval::require_and_consume_approval(
+                &state.db,
+                *artifact_id,
+                source_repo.id,
+                target_repo.id,
+            )
+            .await
+            {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    e.to_string(),
+                ));
+                continue;
             }
         }
 
@@ -2158,22 +2203,29 @@ mod tests {
     ///
     /// We assert this structurally on the handler source: the `Block` early
     /// return must appear before the `check_approval_required` call.
+    /// Slice the source text of a handler body, bounded by its `pub async fn`
+    /// signature and the next `pub async fn`. Shared by the structural tests so
+    /// the handler-bounding boilerplate lives in one place.
+    fn handler_source_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("handler not found: {signature}"));
+        let after = &src[start + 1..];
+        let next = after
+            .find("pub async fn ")
+            .expect("expected a following pub async fn to bound the handler scope");
+        &src[start..start + 1 + next]
+    }
+
     #[test]
     fn test_gate_block_precedes_approval_required() {
         let src = include_str!("promotion.rs");
-        let handler_start = src
-            .find("pub async fn promote_artifact(")
-            .expect("promote_artifact handler must exist");
-        let after_handler = &src[handler_start + 1..];
-        let next_pub_async = after_handler
-            .find("pub async fn ")
-            .expect("expected a following pub async fn to bound the handler scope");
-        let handler_body = &src[handler_start..handler_start + 1 + next_pub_async];
+        let body = handler_source_body(src, "pub async fn promote_artifact(");
 
-        let gate_block_idx = handler_body
+        let gate_block_idx = body
             .find("GateOutcome::Block")
             .expect("handler must early-return on GateOutcome::Block");
-        let approval_idx = handler_body
+        let approval_idx = body
             .find("check_approval_required(")
             .expect("handler must call check_approval_required");
 
@@ -2183,6 +2235,48 @@ mod tests {
              Reordering this changes the documented precedence (#1382): a \
              gate-blocked artifact in an approval-required repo returns 409, \
              not the 200 approval-required hint."
+        );
+    }
+
+    /// promotion-approval-gate-bypass: when the source requires approval the
+    /// /promote route must require AND consume an approved approval row before
+    /// copying. We assert structurally that `promote_artifact` calls
+    /// `require_and_consume_approval` and that the call sits AFTER both the
+    /// `GateOutcome::Block` early return and the `check_approval_required`
+    /// lookup (so the gate-block precedence and the approval gate both hold).
+    #[test]
+    fn test_promote_consumes_approval_after_gate_and_check() {
+        let src = include_str!("promotion.rs");
+        let body = handler_source_body(src, "pub async fn promote_artifact(");
+
+        let gate_block_idx = body
+            .find("GateOutcome::Block")
+            .expect("handler must early-return on GateOutcome::Block");
+        let check_idx = body
+            .find("check_approval_required(")
+            .expect("handler must call check_approval_required");
+        let consume_idx = body
+            .find("require_and_consume_approval(")
+            .expect("handler must consume an approved approval row when required");
+
+        assert!(
+            gate_block_idx < consume_idx && check_idx < consume_idx,
+            "the approval consume must run after the gate-block early return and \
+             after the check_approval_required lookup"
+        );
+    }
+
+    /// promotion-approval-gate-bypass: the bulk promote path must also consume an
+    /// approval per item when the source requires approval.
+    #[test]
+    fn test_bulk_promote_consumes_approval() {
+        let src = include_str!("promotion.rs");
+        let body = handler_source_body(src, "pub async fn promote_artifacts_bulk(");
+
+        assert!(
+            body.contains("check_approval_required(")
+                && body.contains("require_and_consume_approval("),
+            "bulk promote must require and consume an approval per item when required"
         );
     }
 

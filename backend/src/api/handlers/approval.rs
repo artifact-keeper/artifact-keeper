@@ -185,6 +185,159 @@ pub async fn check_approval_required(db: &sqlx::PgPool, repo_id: Uuid) -> Result
     Ok(row.map(|(v,)| v).unwrap_or(false))
 }
 
+/// Outcome of looking for an approved, unconsumed approval that authorizes a
+/// promotion of `(artifact, source, target)`.
+///
+/// Split out as a pure enum so the classify decision (which 409 message to
+/// produce) is unit-testable without a DB.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalConsumeOutcome {
+    /// An approved + unconsumed row exists and is ready to be consumed.
+    Ready,
+    /// No approved row exists, but a pending request is outstanding.
+    Pending,
+    /// No approved (or pending) row exists for this exact pair.
+    Absent,
+}
+
+/// Classify the lookup result for an approval-required promotion into the
+/// outcome used to build the 409 response. Pure so it is unit-testable.
+///
+/// `approved_unconsumed` is the count of APPROVED + not-yet-consumed rows for the
+/// exact `(artifact, source, target)` pair; `pending` is the count of still
+/// outstanding (pending) requests for the same pair.
+pub(crate) fn classify_approval_consume(
+    approved_unconsumed: i64,
+    pending: i64,
+) -> ApprovalConsumeOutcome {
+    if approved_unconsumed > 0 {
+        ApprovalConsumeOutcome::Ready
+    } else if pending > 0 {
+        ApprovalConsumeOutcome::Pending
+    } else {
+        ApprovalConsumeOutcome::Absent
+    }
+}
+
+/// Build the 409 error for an approval-required promotion that has no consumable
+/// approved row. Pure so the message wording is unit-testable.
+pub(crate) fn approval_required_conflict(outcome: &ApprovalConsumeOutcome) -> AppError {
+    let msg = match outcome {
+        ApprovalConsumeOutcome::Ready => {
+            // Caller should have consumed the row; this branch is only reached on
+            // a concurrent double-spend (the claim UPDATE lost the race).
+            "This approved promotion request has already been used. \
+             Submit a new approval request via POST /api/v1/approval/request."
+                .to_string()
+        }
+        ApprovalConsumeOutcome::Pending => {
+            "This repository requires approval for promotions and a request for this \
+             artifact and target is still pending review. It must be approved via \
+             POST /api/v1/approval/{id}/approve before the artifact can be promoted."
+                .to_string()
+        }
+        ApprovalConsumeOutcome::Absent => {
+            "This repository requires approval for promotions. Submit a request via \
+             POST /api/v1/approval/request and have it approved before promoting."
+                .to_string()
+        }
+    };
+    AppError::Conflict(msg)
+}
+
+/// Atomically claim (consume) an APPROVED + unconsumed approval row for the exact
+/// `(artifact, source, target)` pair, stamping `consumed_at = NOW()`.
+///
+/// Returns the number of rows claimed. The single-row UPDATE with the
+/// `consumed_at IS NULL` guard is the concurrency boundary: at most one
+/// concurrent promotion can win the claim, so an approved request is spent
+/// exactly once and cannot be replayed. Callers MUST treat a return of `0` as
+/// "no consumable approval" (deny) and `1` as "claimed" (proceed).
+pub(crate) async fn try_consume_approval(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE promotion_approvals
+        SET consumed_at = NOW()
+        WHERE id = (
+            SELECT id FROM promotion_approvals
+            WHERE artifact_id = $1
+              AND source_repo_id = $2
+              AND target_repo_id = $3
+              AND status = 'approved'
+              AND consumed_at IS NULL
+            ORDER BY reviewed_at DESC NULLS LAST
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(source_repo_id)
+    .bind(target_repo_id)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(result.rows_affected())
+}
+
+/// Count outstanding PENDING approval requests for the exact pair, used to make
+/// the 409 message actionable (pending-vs-absent) when no approved row is
+/// consumable.
+pub(crate) async fn count_pending_approvals(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::BIGINT FROM promotion_approvals
+        WHERE artifact_id = $1
+          AND source_repo_id = $2
+          AND target_repo_id = $3
+          AND status = 'pending'
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(source_repo_id)
+    .bind(target_repo_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(count)
+}
+
+/// Require and consume an approved approval for an approval-required promotion.
+///
+/// Called from the /promote routes (single + bulk) only inside the
+/// `check_approval_required == true` branch. Atomically consumes one APPROVED +
+/// unconsumed row for the exact `(artifact, source, target)` pair; on a miss
+/// (no approval, only a pending request, or a concurrent double-spend) returns a
+/// 409 whose wording distinguishes pending vs absent. On success the row is spent
+/// and cannot be replayed.
+pub(crate) async fn require_and_consume_approval(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+) -> Result<()> {
+    let claimed = try_consume_approval(db, artifact_id, source_repo_id, target_repo_id).await?;
+    if claimed == 1 {
+        return Ok(());
+    }
+    // Nothing claimed: distinguish pending vs absent for an actionable message.
+    let pending = count_pending_approvals(db, artifact_id, source_repo_id, target_repo_id).await?;
+    let outcome = classify_approval_consume(0, pending);
+    Err(approval_required_conflict(&outcome))
+}
+
 const SELECT_APPROVAL: &str = r#"
     SELECT
         pa.id,
@@ -717,12 +870,16 @@ pub async fn approve_promotion(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Update approval status
+    // Update approval status. Stamp `consumed_at = NOW()` in the same UPDATE so
+    // the approve path's own copy/insert above spends the row: an approved
+    // request whose promotion was executed here cannot then be re-promoted via
+    // the /promote routes (which require an APPROVED + unconsumed row).
     let now = Utc::now();
     sqlx::query(
         r#"
         UPDATE promotion_approvals
-        SET status = 'approved', reviewed_by = $1, reviewed_at = $2, review_notes = $3
+        SET status = 'approved', reviewed_by = $1, reviewed_at = $2, review_notes = $3,
+            consumed_at = NOW()
         WHERE id = $4
         "#,
     )
@@ -1013,6 +1170,109 @@ mod tests {
         let requester = Uuid::new_v4();
         let approver = Uuid::new_v4();
         assert!(approval_separation_of_duties_ok(requester, approver));
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval consume gate (promotion-approval-gate-bypass)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_approval_consume_ready() {
+        // An approved + unconsumed row beats any pending count.
+        assert_eq!(
+            classify_approval_consume(1, 0),
+            ApprovalConsumeOutcome::Ready
+        );
+        assert_eq!(
+            classify_approval_consume(2, 3),
+            ApprovalConsumeOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn test_classify_approval_consume_pending() {
+        // No approved row, but a pending request -> Pending (actionable message).
+        assert_eq!(
+            classify_approval_consume(0, 1),
+            ApprovalConsumeOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn test_classify_approval_consume_absent() {
+        // Neither approved nor pending -> Absent.
+        assert_eq!(
+            classify_approval_consume(0, 0),
+            ApprovalConsumeOutcome::Absent
+        );
+    }
+
+    #[test]
+    fn test_approval_required_conflict_pending_mentions_pending() {
+        // The pending-vs-absent distinction must surface in the 409 wording so a
+        // caller knows a request is awaiting review (not that none exists).
+        let err = approval_required_conflict(&ApprovalConsumeOutcome::Pending);
+        match err {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("pending"), "pending message: {msg}");
+            }
+            other => panic!("expected Conflict (409), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_approval_required_conflict_absent_is_409() {
+        let err = approval_required_conflict(&ApprovalConsumeOutcome::Absent);
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn test_approval_required_conflict_reused_mentions_used() {
+        // A lost concurrent claim race surfaces the single-use exhaustion.
+        let err = approval_required_conflict(&ApprovalConsumeOutcome::Ready);
+        match err {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("already been used"), "reuse message: {msg}");
+            }
+            other => panic!("expected Conflict (409), got {other:?}"),
+        }
+    }
+
+    /// Structural: the approve path must stamp `consumed_at` in the same UPDATE
+    /// that sets `status = 'approved'`, so an approved request's own executed
+    /// promotion spends the row and cannot be re-promoted via /promote.
+    #[test]
+    fn test_approve_path_consumes_row() {
+        let source = include_str!("approval.rs");
+        let start = source
+            .find("pub async fn approve_promotion(")
+            .expect("approve_promotion not found");
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("status = 'approved'") && body.contains("consumed_at = NOW()"),
+            "approve_promotion must set consumed_at = NOW() alongside status = 'approved'"
+        );
+    }
+
+    /// Structural: the consume claim must guard on `consumed_at IS NULL` so an
+    /// already-spent approved row cannot be claimed twice (single-use).
+    #[test]
+    fn test_consume_claim_guards_unconsumed() {
+        let source = include_str!("approval.rs");
+        let start = source
+            .find("pub(crate) async fn try_consume_approval(")
+            .expect("try_consume_approval not found");
+        let rest = &source[start..];
+        let end = rest.find("\npub(crate) async fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("status = 'approved'")
+                && body.contains("consumed_at IS NULL")
+                && body.contains("SET consumed_at = NOW()"),
+            "try_consume_approval must claim an approved+unconsumed row via SET consumed_at"
+        );
     }
 
     // -----------------------------------------------------------------------
