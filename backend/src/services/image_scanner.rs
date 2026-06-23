@@ -123,11 +123,23 @@ impl ImageScanner {
     /// `:` for tags per the OCI distribution spec (#1483). Using `:` for
     /// digest refs produces a string the Trivy CLI rejects with
     /// "could not parse reference".
-    fn extract_image_ref(artifact: &Artifact) -> Option<String> {
+    /// `body` is the in-hand manifest body the orchestrator already loaded.
+    /// For a multi-arch image index it is used to resolve a concrete scannable
+    /// child-platform digest before the join (#1971); for single-arch /
+    /// malformed / absent bodies the reference is unchanged (passthrough).
+    /// Applicability gating has no body and passes `None`, so it stays
+    /// path-only. The resolved digest flows through both `scan_with_trivy` and
+    /// the HTTP-Twirp fallback `scan_with_trivy_http` unchanged.
+    fn extract_image_ref(artifact: &Artifact, body: Option<&[u8]>) -> Option<String> {
         let (name, reference) =
             crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+        let resolved = crate::services::scanner_service::resolve_scan_reference(
+            body.unwrap_or_default(),
+            reference,
+        )
+        .into_reference();
         Some(crate::services::scanner_service::join_oci_image_ref(
-            name, reference,
+            name, &resolved,
         ))
     }
 
@@ -142,13 +154,31 @@ impl ImageScanner {
     /// scan target the stored artifact. Host comes from the shared
     /// `grype_scanner::resolve_registry_host` (AK_GRYPE_REGISTRY_HOST /
     /// PEER_PUBLIC_ENDPOINT / `localhost:8080`).
-    fn extract_image_ref_for_repo(artifact: &Artifact, repository_key: &str) -> Option<String> {
+    ///
+    /// `body` is the in-hand manifest body the orchestrator already loaded.
+    /// For a multi-arch image index it is resolved to a concrete scannable
+    /// child-platform digest before the ref is joined (#1971); for single-arch
+    /// / malformed / absent bodies the reference is unchanged (passthrough).
+    /// This keeps the repository-qualified scan path (#1965) and the
+    /// index-resolution behavior (#1971) composed: the ref is first qualified
+    /// with the owning repository key, then the index is resolved to a child
+    /// platform so a no-matching-child index does not yield an empty SBOM.
+    fn extract_image_ref_for_repo(
+        artifact: &Artifact,
+        repository_key: &str,
+        body: Option<&[u8]>,
+    ) -> Option<String> {
         let (name, reference) =
             crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
         let host = crate::services::grype_scanner::resolve_registry_host();
         let qualified = format!("{}/{}/{}", host, repository_key, name);
+        let resolved = crate::services::scanner_service::resolve_scan_reference(
+            body.unwrap_or_default(),
+            reference,
+        )
+        .into_reference();
         Some(crate::services::scanner_service::join_oci_image_ref(
-            &qualified, reference,
+            &qualified, &resolved,
         ))
     }
 
@@ -386,7 +416,7 @@ impl Scanner for ImageScanner {
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
-        _content: &Bytes,
+        content: &Bytes,
     ) -> Result<ScanOutput> {
         debug_assert!(
             Self::is_container_image(artifact),
@@ -398,7 +428,16 @@ impl Scanner for ImageScanner {
         // key. The orchestrator calls `scan_target` (below), which restores
         // the key so Trivy pulls AK's own artifact rather than a Docker Hub
         // image of the same name.
-        let image_ref = match Self::extract_image_ref(artifact) {
+        //
+        // Image reference extraction can still fail even on an applicable
+        // (content-type-matching) artifact when the path is malformed.
+        // That is a real error, not a "not applicable" case: surface it as
+        // a failed scan so the operator sees error_message rather than a
+        // silent completed-with-zero-findings row (issue #994).
+        // #1971: pass the in-hand manifest body so a multi-arch image index is
+        // resolved to a concrete scannable child digest before trivy (CLI or
+        // the HTTP-Twirp fallback) sees it.
+        let image_ref = match Self::extract_image_ref(artifact, Some(content)) {
             Some(r) => r,
             None => {
                 return Err(AppError::Internal(format!(
@@ -423,19 +462,23 @@ impl Scanner for ImageScanner {
         &self,
         target: &ScanTarget<'_>,
         _metadata: Option<&ArtifactMetadata>,
-        _content: &Bytes,
+        content: &Bytes,
     ) -> Result<ScanOutput> {
         debug_assert!(
             Self::is_container_image(target.artifact),
             "ImageScanner::scan_target called on a non-container artifact; the orchestrator must gate on is_applicable first"
         );
-        let image_ref = Self::extract_image_ref_for_repo(target.artifact, target.repository_key)
-            .ok_or_else(|| {
-                AppError::Internal(format!(
-                    "Could not extract image reference from artifact path: {}",
-                    target.artifact.path
-                ))
-            })?;
+        // #1971: pass the in-hand manifest body so a multi-arch image index is
+        // resolved to a concrete scannable child digest after the ref is
+        // qualified with the owning repository key (#1965).
+        let image_ref =
+            Self::extract_image_ref_for_repo(target.artifact, target.repository_key, Some(content))
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "Could not extract image reference from artifact path: {}",
+                        target.artifact.path
+                    ))
+                })?;
         self.run_image_scan(&image_ref).await
     }
 }
@@ -490,7 +533,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some("myapp:v1.0.0".to_string())
         );
     }
@@ -502,7 +545,7 @@ mod tests {
             "application/vnd.docker.distribution.manifest.v2+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some("org/myapp:v1.0.0".to_string())
         );
     }
@@ -521,7 +564,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
         );
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact),
+            ImageScanner::extract_image_ref(&artifact, None),
             Some(
                 "org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
                     .to_string()
@@ -532,7 +575,50 @@ mod tests {
     #[test]
     fn test_extract_image_ref_invalid_path() {
         let artifact = make_test_artifact("some/random/path", "application/json");
-        assert_eq!(ImageScanner::extract_image_ref(&artifact), None);
+        assert_eq!(ImageScanner::extract_image_ref(&artifact, None), None);
+    }
+
+    /// #1971: an image-index body threaded into extract_image_ref resolves the
+    /// tag ref to a concrete child digest (name@sha256:<child>), so Trivy (CLI
+    /// or the HTTP-Twirp fallback) scans a real image rather than relying on a
+    /// default platform pick that can produce an empty SBOM.
+    #[test]
+    fn test_extract_image_ref_resolves_index_to_child_digest() {
+        let child = match crate::services::scanner_service::runner_arch() {
+            "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        };
+        let index_body = r#"{"manifests":[
+             {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
+             {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
+           ]}"#;
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/latest",
+            "application/vnd.oci.image.index.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(index_body.as_bytes())),
+            Some(format!("org/myapp@{}", child))
+        );
+    }
+
+    /// #1971 regression: a single-arch image body leaves the tag ref unchanged
+    /// (passthrough) — identical to the no-body path.
+    #[test]
+    fn test_extract_image_ref_single_arch_body_is_unchanged() {
+        let single_arch = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/v1.0.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
+            ImageScanner::extract_image_ref(&artifact, None),
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
+            Some("org/myapp:v1.0.0".to_string())
+        );
     }
 
     #[test]
@@ -764,7 +850,7 @@ mod tests {
             "v2/library/nginx/manifests/latest",
             "application/vnd.oci.image.manifest.v1+json",
         );
-        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "docker-local")
+        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "docker-local", None)
             .expect("ref must build for a valid OCI manifest path");
         assert!(
             r.ends_with("/docker-local/library/nginx:latest"),
@@ -781,7 +867,7 @@ mod tests {
             "v2/org/app/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
             "application/vnd.oci.image.manifest.v1+json",
         );
-        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "oci-prod")
+        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "oci-prod", None)
             .expect("ref must build for a digest-pinned manifest");
         assert!(
             r.ends_with(
@@ -792,6 +878,37 @@ mod tests {
         assert!(
             !r.contains("org/app:sha256:"),
             "digest ref must not use ':' between name and digest: {r}"
+        );
+    }
+
+    /// #1971 + #1965 composed: the repository-qualified scan target must also
+    /// resolve a multi-arch image index to a concrete child-platform digest.
+    /// The result keeps the owning repository key (qualification) AND points at
+    /// a real child manifest (`@sha256:<child>`) rather than the index tag, so a
+    /// no-matching-child index never yields an empty SBOM.
+    #[test]
+    fn test_extract_image_ref_for_repo_resolves_index_to_child_digest() {
+        let child = match crate::services::scanner_service::runner_arch() {
+            "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        };
+        let index_body = r#"{"manifests":[
+             {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
+             {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
+           ]}"#;
+        let artifact = make_test_artifact(
+            "v2/library/nginx/manifests/latest",
+            "application/vnd.oci.image.index.v1+json",
+        );
+        let r = ImageScanner::extract_image_ref_for_repo(
+            &artifact,
+            "docker-local",
+            Some(index_body.as_bytes()),
+        )
+        .expect("ref must build for a valid OCI index path");
+        assert!(
+            r.ends_with(&format!("/docker-local/library/nginx@{}", child)),
+            "index scan target must be repository-qualified AND resolved to a child digest: {r}"
         );
     }
 
@@ -806,7 +923,7 @@ mod tests {
             "v2/library/nginx/manifests/latest",
             "application/vnd.oci.image.manifest.v1+json",
         );
-        let r = ImageScanner::extract_image_ref(&artifact).expect("legacy ref must build");
+        let r = ImageScanner::extract_image_ref(&artifact, None).expect("legacy ref must build");
         assert_eq!(
             r, "library/nginx:latest",
             "legacy ref must remain a bare name:tag without host or repository key"
