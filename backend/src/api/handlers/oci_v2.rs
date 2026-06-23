@@ -36,6 +36,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
 // ---------------------------------------------------------------------------
 // OCI error helpers
@@ -482,16 +483,18 @@ fn blob_storage_key(digest: &str) -> String {
     format!("oci-blobs/{}", digest)
 }
 
-/// Storage key prefix for OCI manifest objects.
+/// Storage key for an OCI manifest object: [`OCI_MANIFEST_STORAGE_PREFIX`]
+/// followed by the manifest digest. This is the source of truth on writes.
 ///
-/// WARNING: the `oci-manifests/` prefix is also hard-coded in the
-/// lifecycle cascade SQL (`backend/src/services/lifecycle_service.rs`,
+/// WARNING: the `oci-manifests/` prefix is also embedded as a SQL literal in
+/// the lifecycle cascade (`backend/src/services/lifecycle_service.rs`,
 /// `CASCADE_OCI_TAGS_SQL`) and in the storage GC orphan predicate
-/// (`backend/src/services/storage_gc_service.rs`). Changing this
-/// function alone will silently break both. Tracked in #1413 for
-/// extracting a shared constant.
+/// (`backend/src/services/storage_gc_service.rs`, `ORPHAN_PREDICATE_SQL`).
+/// Postgres cannot read the Rust constant, so those sites pin the literal to
+/// [`OCI_MANIFEST_STORAGE_PREFIX`] with compile-time assertions; changing the
+/// constant forces those assertions (and the SQL) to be updated in lockstep.
 fn manifest_storage_key(digest: &str) -> String {
-    format!("oci-manifests/{}", digest)
+    format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, digest)
 }
 
 fn upload_storage_key(uuid: &Uuid) -> String {

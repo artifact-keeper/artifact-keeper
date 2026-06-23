@@ -90,15 +90,39 @@ pub struct FacetCount {
 
 /// Build a PostgreSQL full-text search query from a free-text input.
 ///
-/// Each whitespace-separated word gets a `:*` prefix-match suffix and words
-/// are joined with `&` (AND).  Returns None if the input is None.
+/// Each whitespace-separated word is sanitized to a bare lexeme, gets a `:*`
+/// prefix-match suffix, and words are joined with `&` (AND).  Returns None if
+/// the input is None.
+///
+/// The resulting string is fed to the strict `to_tsquery('english', $1)`, which
+/// treats `& | ! ( ) : *` as operators and raises a SQL error on any malformed
+/// expression.  Because the input is free user text, each token is reduced to an
+/// allowlisted lexeme (ASCII alphanumeric plus the package-name characters
+/// `_ - . @ / +`) before the `:*` prefix marker is appended.  Tokens that
+/// sanitize to empty are dropped.  This guarantees the bound `$1` is always a
+/// syntactically valid (or empty) tsquery, so `to_tsquery` never raises and an
+/// all-metacharacter input returns an empty match instead of an HTTP 500.
 pub(crate) fn build_tsquery_filter(q: Option<&str>) -> Option<String> {
     q.map(|q| {
         q.split_whitespace()
+            .map(sanitize_tsquery_lexeme)
+            .filter(|w| !w.is_empty())
             .map(|w| format!("{}:*", w))
             .collect::<Vec<_>>()
             .join(" & ")
     })
+}
+
+/// Reduce a single whitespace-delimited token to a bare tsquery lexeme by
+/// keeping only allowlisted characters: ASCII alphanumeric plus the
+/// package-name characters `_ - . @ / +`.  Every tsquery metacharacter
+/// (`& | ! ( ) : *` and others) is stripped, so the result can never sit in
+/// operator position and break `to_tsquery`.
+fn sanitize_tsquery_lexeme(token: &str) -> String {
+    token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '/' | '+'))
+        .collect()
 }
 
 /// Convert a user-facing wildcard name filter (using `*`) to a SQL ILIKE
@@ -693,6 +717,72 @@ mod tests {
             build_tsquery_filter(Some("  foo   bar  ")).as_deref(),
             Some("foo:* & bar:*")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tsquery_filter robustness (#1890): free text containing tsquery
+    // metacharacters must produce a valid/empty tsquery, never a malformed one
+    // that makes the strict to_tsquery raise -> AppError::Database -> HTTP 500.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tsquery_filter_all_operators_yields_empty() {
+        // Every token is pure metacharacters -> sanitizes to empty -> dropped.
+        assert_eq!(build_tsquery_filter(Some("& | ! ( )")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_prefix_marker_token() {
+        assert_eq!(build_tsquery_filter(Some(":*")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_open_paren() {
+        assert_eq!(build_tsquery_filter(Some("(")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_strips_inline_operators() {
+        // Trailing ":* &" and bare "bar" both sanitize to bare lexemes.
+        assert_eq!(
+            build_tsquery_filter(Some("foo:* & bar")).as_deref(),
+            Some("foo:* & bar:*")
+        );
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_ampersand_inside_token() {
+        // "a&b" -> "ab" (metachar dropped), one prefix token.
+        assert_eq!(build_tsquery_filter(Some("a&b")).as_deref(), Some("ab:*"));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_keeps_package_name_chars() {
+        // Allowlisted punctuation in real package names is preserved.
+        assert_eq!(
+            build_tsquery_filter(Some("spring-boot.v2")).as_deref(),
+            Some("spring-boot.v2:*")
+        );
+        assert_eq!(
+            build_tsquery_filter(Some("@scope/pkg")).as_deref(),
+            Some("@scope/pkg:*")
+        );
+        assert_eq!(
+            build_tsquery_filter(Some("1.2.0+build")).as_deref(),
+            Some("1.2.0+build:*")
+        );
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_metachars_produce_no_operators() {
+        // General contract: an all-metacharacter input contains no parens,
+        // no negation, and no dangling operator in the output.
+        let out = build_tsquery_filter(Some("!(a:* | b) & ((")).unwrap();
+        // Sanitized tokens: "a", "b" -> "a:* & b:*". No raw parens / "!".
+        assert!(!out.contains('('));
+        assert!(!out.contains(')'));
+        assert!(!out.contains('!'));
+        assert_eq!(out, "a:* & b:*");
     }
 
     // -----------------------------------------------------------------------

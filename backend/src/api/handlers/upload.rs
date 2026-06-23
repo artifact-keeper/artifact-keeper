@@ -646,7 +646,17 @@ async fn complete(
 
     // Create artifact record
     let artifact_name = completed_artifact_name(&session);
-    let artifact_version = completed_artifact_version(&session);
+    // #1975 (stopgap for #1846): chunked uploads to FORMAT repositories must
+    // carry a non-empty `version`, otherwise format index generators that key on
+    // `version` silently drop the artifact (e.g. incus `streams_images` skips any
+    // row with `version IS NULL`, so a chunked-uploaded image never appears in
+    // `images.json`). Single-shot/format-native uploads always set a version; the
+    // generic chunked path only set it from the optional create-session field.
+    // For a format repo with no explicit version, derive one from the artifact
+    // path so the artifact remains retrievable with correct coordinates. Generic
+    // repositories keep their existing behaviour (version may be NULL).
+    let derived_version = completed_format_artifact_version(&session, &repo.format);
+    let artifact_version = derived_version.as_deref();
     let artifact_id: Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -875,6 +885,61 @@ fn completed_artifact_version(session: &upload_service::UploadSession) -> Option
         .artifact_version
         .as_deref()
         .filter(|version| !version.is_empty())
+}
+
+/// Whether a repository format requires a non-empty artifact `version` for the
+/// artifact to surface correctly through its format index/read paths.
+///
+/// Generic repositories serve artifacts by raw path and never key on `version`,
+/// so they keep the legacy chunked-upload behaviour (version may be NULL). Every
+/// other (format-native) repository runs a finalizer/index generator that keys
+/// on `version`; a NULL there silently drops the artifact (#1975 / #1846).
+fn format_repo_requires_version(format: &crate::models::repository::RepositoryFormat) -> bool {
+    !matches!(format, crate::models::repository::RepositoryFormat::Generic)
+}
+
+/// Derive a version segment from an artifact path laid out as
+/// `<product>/<version>/<filename>` (the shape the format-native paths build,
+/// e.g. incus `build_artifact_path`). Returns the middle segment when the path
+/// has at least three non-empty components, otherwise `None`.
+fn version_from_artifact_path(path: &str) -> Option<&str> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 3 {
+        // second-to-last segment is the version in `<product>/<version>/<file>`
+        segments.get(segments.len() - 2).copied()
+    } else {
+        None
+    }
+}
+
+/// Resolve the `version` to persist for a completed chunked upload, accounting
+/// for the target repository format (#1975, stopgap for #1846).
+///
+/// * Generic repositories keep the existing behaviour: the explicit
+///   create-session `artifact_version` (or `None`).
+/// * Format repositories must not persist a NULL/empty version (their index
+///   generators drop such rows). Prefer the explicit create-session version;
+///   otherwise derive it from the `<product>/<version>/<filename>` path layout;
+///   as a last resort fall back to the upload checksum prefix so the artifact is
+///   still retrievable with stable, non-null coordinates instead of being
+///   silently dropped.
+fn completed_format_artifact_version(
+    session: &upload_service::UploadSession,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Option<String> {
+    if let Some(explicit) = completed_artifact_version(session) {
+        return Some(explicit.to_string());
+    }
+    if !format_repo_requires_version(format) {
+        return None;
+    }
+    if let Some(derived) = version_from_artifact_path(&session.artifact_path) {
+        return Some(derived.to_string());
+    }
+    // Deterministic, non-empty fallback so the row is never dropped.
+    let checksum = &session.checksum_sha256;
+    let suffix = &checksum[..12.min(checksum.len())];
+    Some(format!("sha256-{}", suffix))
 }
 
 fn completed_package_catalog_entry(
@@ -1283,6 +1348,81 @@ mod tests {
             test_upload_session("large-check/20260603T082854Z/large-160m.bin", None, None);
 
         assert_eq!(completed_package_catalog_entry(&session), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // completed_format_artifact_version (#1975 stopgap for #1846)
+    // -----------------------------------------------------------------------
+
+    use crate::models::repository::RepositoryFormat;
+
+    #[test]
+    fn test_version_from_artifact_path_three_segments() {
+        assert_eq!(
+            version_from_artifact_path("ubuntu/20240215/disk.qcow2"),
+            Some("20240215")
+        );
+        assert_eq!(version_from_artifact_path("p/v/a/b/file.bin"), Some("b"));
+    }
+
+    #[test]
+    fn test_version_from_artifact_path_too_short() {
+        assert_eq!(version_from_artifact_path("file.bin"), None);
+        assert_eq!(version_from_artifact_path("dir/file.bin"), None);
+        assert_eq!(version_from_artifact_path(""), None);
+    }
+
+    #[test]
+    fn test_format_repo_requires_version() {
+        assert!(!format_repo_requires_version(&RepositoryFormat::Generic));
+        assert!(format_repo_requires_version(&RepositoryFormat::Incus));
+        assert!(format_repo_requires_version(&RepositoryFormat::Debian));
+    }
+
+    #[test]
+    fn test_completed_format_version_generic_keeps_none() {
+        // Generic repo: no derivation, version stays NULL (legacy behaviour).
+        let session = test_upload_session("images/vm.ova", None, None);
+        assert_eq!(
+            completed_format_artifact_version(&session, &RepositoryFormat::Generic),
+            None
+        );
+    }
+
+    #[test]
+    fn test_completed_format_version_prefers_explicit() {
+        // An explicit create-session version wins for every format.
+        let session = test_upload_session("ubuntu/20240215/disk.qcow2", None, Some("2026.06.03"));
+        assert_eq!(
+            completed_format_artifact_version(&session, &RepositoryFormat::Incus),
+            Some("2026.06.03".to_string())
+        );
+        assert_eq!(
+            completed_format_artifact_version(&session, &RepositoryFormat::Generic),
+            Some("2026.06.03".to_string())
+        );
+    }
+
+    #[test]
+    fn test_completed_format_version_derives_from_path() {
+        // Format repo, no explicit version: derive from <product>/<version>/<file>.
+        let session = test_upload_session("ubuntu/20240215/disk.qcow2", None, None);
+        assert_eq!(
+            completed_format_artifact_version(&session, &RepositoryFormat::Incus),
+            Some("20240215".to_string())
+        );
+    }
+
+    #[test]
+    fn test_completed_format_version_falls_back_to_checksum() {
+        // Format repo, no explicit version and path too shallow to derive one:
+        // fall back to a deterministic non-null version so the row is not dropped.
+        let mut session = test_upload_session("flat.bin", None, None);
+        session.checksum_sha256 = "abcdef0123456789".to_string();
+        assert_eq!(
+            completed_format_artifact_version(&session, &RepositoryFormat::Incus),
+            Some("sha256-abcdef012345".to_string())
+        );
     }
 
     fn request_with_replication_metadata() -> CreateSessionRequest {

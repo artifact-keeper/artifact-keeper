@@ -25,6 +25,7 @@ use std::sync::Arc;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::{StorageLocation, StorageRegistry};
 
 /// Result of a backfill pass. Returned for tracing and tests.
@@ -174,7 +175,7 @@ async fn process_candidate(
         .backend_for(&location)
         .map_err(|e| format!("resolve storage backend: {}", e))?;
 
-    let storage_key = format!("oci-manifests/{}", candidate.parent_digest);
+    let storage_key = format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, candidate.parent_digest);
     let body = storage
         .get(&storage_key)
         .await
