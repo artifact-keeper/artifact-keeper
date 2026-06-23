@@ -49,6 +49,9 @@ jobs:
           output: 'backend-trivy.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
+          # have no fixed tool release yet (justified per-CVE in .trivyignore).
+          trivyignores: '.trivyignore'
           exit-code: '0'
           skip-setup-trivy: true
 
@@ -61,6 +64,7 @@ jobs:
           output: 'openscap-trivy.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          trivyignores: '.trivyignore'
           exit-code: '0'
           skip-setup-trivy: true
 
@@ -73,6 +77,7 @@ jobs:
           output: 'backend-alpine-trivy.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          trivyignores: '.trivyignore'
           exit-code: '0'
           skip-setup-trivy: true
 

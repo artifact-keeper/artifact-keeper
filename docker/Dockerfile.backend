@@ -66,12 +66,22 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 
 # Install only essential runtime libraries into a clean rootfs.
-# --refresh forces fresh repo metadata and the follow-up upgrade pulls
-# z-stream errata (e.g. jq el9_7 security fixes) that the install step
-# alone may miss when the cache is stale. The reposdir override is
-# required on the upgrade step because once the installroot has a
-# populated /etc, dnf reads repos from inside it (which is empty)
-# instead of falling back to the host's /etc/yum.repos.d.
+# --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls
+# the latest RHEL 9 z-stream security errata for every installed package
+# (curl-minimal/libcurl, jq, glibc*, tar, bzip2-libs, openssl-libs, xz-libs,
+# zlib, zstd) that the install step alone may miss when the metadata cache is
+# stale. This guarantees the rootfs is rebuilt against current errata on every
+# image build. The reposdir override is required on the upgrade step because
+# once the installroot has a populated /etc, dnf reads repos from inside it
+# (which is empty) instead of falling back to the host's /etc/yum.repos.d.
+#
+# NOTE on residual base-OS CVEs: `upgrade -y` can only pull a *fixed* package
+# once Red Hat ships errata for it. Trivy currently reports MEDIUM CVEs in
+# these UBI 9.8 packages that Red Hat has marked "Affected" or "Will not fix"
+# (no fixed RPM exists yet) — those cannot be cleared here and are reported by
+# CI with `ignore-unfixed: true`, so they do not produce code-scanning alerts.
+# When Red Hat publishes the errata, the next rebuild picks the fixes up
+# automatically with no Dockerfile change. See the linked hardening issue.
 RUN mkdir -p /mnt/rootfs && \
     dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
         --setopt=reposdir=/etc/yum.repos.d/ \
@@ -146,7 +156,16 @@ RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
-FROM ghcr.io/aquasecurity/trivy:0.71.0 AS trivy-bin
+# Trivy is pinned to the latest release (0.71.2). The bump from 0.71.0 clears
+# the golang.org/x/net (CVE-2026-25680/25681/27136/39821/42502/42506) and Go
+# stdlib (CVE-2026-27145/42504/42507) CVEs that Trivy 0.71.0's binary carried,
+# including the deps behind the code-scanning grpc finding. Residual containerd
+# CVEs that 0.71.2 has not yet rebuilt against are documented in /.trivyignore.
+FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy-bin
+# Grype is pinned to v0.114.0, which is the latest upstream release. There is no
+# newer Grype build that picks up fixed versions of its bundled Go deps
+# (docker, containerd, stdlib), so its residual CVEs are upstream-unfixable for
+# now and are documented/suppressed in /.trivyignore rather than "bumped away".
 FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------

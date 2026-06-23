@@ -47,7 +47,16 @@ RUN if [ -n "${APP_VERSION}" ]; then \
     cargo build --release --features "$FEATURES" --bin artifact-keeper
 
 # ---------- Stage 4: Copy scanner CLIs from official images ----------
-FROM ghcr.io/aquasecurity/trivy:0.71.0 AS trivy-bin
+# Trivy is pinned to the latest release (0.71.2). The bump from 0.71.0 clears
+# the golang.org/x/net (CVE-2026-25680/25681/27136/39821/42502/42506) and Go
+# stdlib (CVE-2026-27145/42504/42507) CVEs in the Trivy binary, including the
+# deps behind the code-scanning grpc finding. Residual containerd CVEs that
+# 0.71.2 has not yet rebuilt against are documented in /.trivyignore.
+FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy-bin
+# Grype is pinned to v0.114.0, the latest upstream release. No newer Grype build
+# picks up fixed versions of its bundled Go deps (docker, containerd, stdlib),
+# so its residual CVEs are upstream-unfixable for now and are documented/
+# suppressed in /.trivyignore rather than "bumped away".
 FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
@@ -63,8 +72,13 @@ RUN mkdir -p /grype-db && grype db update && grype db status
 # ---------- Stage 5: Alpine runtime ----------
 FROM alpine:3.24
 
-# Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
-RUN apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
+# Refresh the whole base first so the alpine:3.24 layer picks up the latest
+# APK security errata, then install the runtime deps (no libssl needed -
+# OpenSSL is vendored/static). `apk upgrade --no-cache` rebuilds against
+# current errata on every image build; the targeted `add` keeps the install
+# set explicit.
+RUN apk upgrade --no-cache && \
+    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 

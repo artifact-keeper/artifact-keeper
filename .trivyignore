@@ -1,0 +1,68 @@
+# .trivyignore — residual CVEs in the BUNDLED scanner CLI binaries only.
+#
+# Scope and honesty notes (read before adding anything here):
+#
+# * Every entry below is a Go-dependency CVE compiled INTO one of the two
+#   vendored scanner CLIs that the backend ships and invokes for OFFLINE
+#   artifact scanning:
+#     - /usr/local/bin/trivy  (ghcr.io/aquasecurity/trivy:0.71.2)
+#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.114.0)
+#   These are short-lived CLI subprocesses the server shells out to. They are
+#   NOT part of the network-reachable service surface (axum HTTP :8080 /
+#   gRPC :9090). The vulnerable code paths (docker/containerd client libs,
+#   golang.org/x/net HTTP/2 server, etc.) are not exercised by how the backend
+#   drives these tools.
+#
+# * These are deliberately NOT suppressed in the backend service binary or in
+#   the UBI/Alpine base OS packages. Only vendored-scanner-binary CVEs that have
+#   no fixed *tool release* are listed here.
+#
+# * We are already on the latest upstream releases of both tools:
+#     - trivy 0.71.2 (bumped from 0.71.0 in this change — cleared the
+#       golang.org/x/net + Go stdlib CVEs the 0.71.0 binary carried).
+#     - grype v0.114.0 (latest; no newer build exists yet).
+#   For the CVEs below, either no fixed tool release exists yet, or the upstream
+#   dependency fix has not landed in a tagged release of the tool. They will
+#   drop off automatically when we bump the tool to a release that rebuilds
+#   against the fixed dependency — re-evaluate on every scanner bump.
+#
+# * CI scans with `ignore-unfixed: true`, so the genuinely no-fix-available
+#   entries below already don't alert; they are listed for completeness and so
+#   future maintainers see the full residual set in one place.
+#
+# Trivy tracker: https://github.com/aquasecurity/trivy/releases
+# Grype tracker: https://github.com/anchore/grype/releases
+
+# ---------------------------------------------------------------------------
+# trivy 0.71.2 binary — github.com/containerd/containerd/v2 @ v2.3.1
+# containerd has fixed releases (2.3.2) but trivy 0.71.2 has not yet rebuilt
+# against them. Code path: trivy's container image inspection client; not used
+# in a way reachable by the backend's offline artifact scans.
+CVE-2026-47262
+CVE-2026-50195
+CVE-2026-53488
+CVE-2026-53489
+CVE-2026-53492
+
+# ---------------------------------------------------------------------------
+# grype v0.114.0 binary — github.com/docker/docker @ v28.5.2+incompatible
+# CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
+# (Trivy/Grype both report FixedVersion=none). CVE-2026-33997 / -34040 are
+# fixed in docker 29.3.1 but grype v0.114.0 (latest) has not rebuilt against
+# it. Code path: grype's Docker engine client for `docker:` image sources; the
+# backend invokes grype against on-disk artifacts/SBOMs, not the Docker daemon.
+CVE-2026-33997
+CVE-2026-34040
+CVE-2026-41567
+CVE-2026-41568
+CVE-2026-42306
+
+# ---------------------------------------------------------------------------
+# grype v0.114.0 binary — Go stdlib @ go1.26.3
+# Fixed in Go 1.26.4 / 1.25.11. trivy 0.71.2 already ships a fixed stdlib (so
+# these are gone from the trivy binary); grype v0.114.0 (latest) is still built
+# with the older toolchain. Drops off when grype ships a release rebuilt on
+# Go >= 1.26.4.
+CVE-2026-27145
+CVE-2026-42504
+CVE-2026-42507

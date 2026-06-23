@@ -19,6 +19,12 @@ RUN ARCH=$(uname -m) && \
 # (which is empty) instead of falling back to the host's /etc/yum.repos.d.
 # Mirrors the rootfs-builder upgrade step in Dockerfile.backend. See
 # artifact-keeper#1544 (weekly container scan findings).
+#
+# NOTE on residual base-OS CVEs: `upgrade -y` can only pull a *fixed* package
+# once Red Hat ships errata for it. CVEs that Red Hat has marked "Affected" or
+# "Will not fix" (no fixed RPM exists yet) cannot be cleared here; CI scans
+# with `ignore-unfixed: true`, so those do not produce code-scanning alerts.
+# The next rebuild picks up fixes automatically once errata are published.
 RUN mkdir -p /mnt/rootfs && \
     dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
         --setopt=reposdir=/etc/yum.repos.d/ \
