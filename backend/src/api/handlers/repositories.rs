@@ -730,6 +730,22 @@ pub async fn set_cache_ttl(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
 
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. Cache TTL is a pull-through proxy supply-chain control on the
+    // same administrative tier as delete/update, so the tenant write gate above
+    // is not sufficient on its own.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to change the cache TTL of this repository".to_string(),
+            ));
+        }
+    }
+
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
     // The explicit `repo.repo_type != RepositoryType::Remote` comparison
@@ -8334,6 +8350,103 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    /// DB-backed: a non-admin member that holds write access (developer role)
+    /// on a Remote repo but NO `repository:admin` grant is DENIED on
+    /// `set_cache_ttl` (the pull-through proxy cache-TTL is an administrative
+    /// supply-chain control, same tier as delete/update). Granting
+    /// `repository:admin` lets the same user through, and a global admin is
+    /// always allowed. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn set_cache_ttl_requires_repo_admin_grant_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // Remote repo: the only repo_type set_cache_ttl accepts writes on.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        // Grant developer (write) access so the user passes require_repo_write_access.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let ext = tdh::make_auth(user_id, &username);
+        let req = || SetCacheTtlRequest {
+            cache_ttl_seconds: 1,
+        };
+
+        // Deny: write access alone is not enough without repository:admin.
+        let denied = set_cache_ttl(
+            State(state.clone()),
+            Extension(Some(ext.clone())),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        match denied {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("Insufficient permissions"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Authorization denial without repository:admin, got: {other:?}")
+            }
+        }
+
+        // Allow: grant the user repository:admin on this repo. A fresh state
+        // avoids the per-process permission cache from the deny lookup above.
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository:admin");
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_cache_ttl(
+            State(state2),
+            Extension(Some(ext.clone())),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "non-admin WITH repository:admin must be allowed: {allowed:?}"
+        );
+
+        // Allow: a global admin is always allowed (is_admin short-circuit).
+        let admin_ext = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let state3 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin_ok = set_cache_ttl(
+            State(state3),
+            Extension(Some(admin_ext)),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        assert!(
+            admin_ok.is_ok(),
+            "global admin must be allowed: {admin_ok:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
     /// Issue #913 binding test:
