@@ -4,7 +4,7 @@
 //! to release repositories when all configured policies pass.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::models::promotion::PromotionRule;
@@ -61,7 +62,11 @@ pub struct CreateRuleRequest {
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
-    #[serde(default = "default_true")]
+    // Safe default: a request that omits `auto_promote` parses to `false`. This
+    // rule governs the auto-flow gate from staging to release, so it must never
+    // be silently turned on by an omitted field — auto-promotion is enabled only
+    // when the caller explicitly opts in.
+    #[serde(default)]
     pub auto_promote: bool,
 }
 
@@ -133,6 +138,29 @@ pub struct ArtifactEvalEntry {
 
 fn default_true() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// Authorization
+// ---------------------------------------------------------------------------
+
+/// Gate for authoring/mutating promotion rules.
+///
+/// Promotion rules govern the auto-flow gate from staging to release, so only
+/// admins may create, update, or delete them. Mirrors the admin gate on direct
+/// promotion (`promotion::ensure_promotion_authorized`) and on the approval
+/// workflow's approve/reject handlers. Non-admins still keep read and dry-run
+/// access (list/get/evaluate).
+///
+/// Split into a pure helper so the decision is shared by all three mutating
+/// handlers and can be unit tested without a DB or storage.
+fn ensure_rule_management_authorized(is_admin: bool) -> Result<()> {
+    if !is_admin {
+        return Err(crate::error::AppError::Authorization(
+            "Only admins can manage promotion rules".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +240,10 @@ async fn list_rules(
 )]
 async fn create_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CreateRuleRequest>,
 ) -> Result<Json<PromotionRuleResponse>> {
+    ensure_rule_management_authorized(auth.is_admin)?;
     let service = PromotionRuleService::new(state.db.clone());
     let input = CreatePromotionRuleInput {
         name: body.name,
@@ -274,9 +304,11 @@ async fn get_rule(
 )]
 async fn update_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateRuleRequest>,
 ) -> Result<Json<PromotionRuleResponse>> {
+    ensure_rule_management_authorized(auth.is_admin)?;
     let service = PromotionRuleService::new(state.db.clone());
     let input = UpdatePromotionRuleInput {
         name: body.name,
@@ -310,8 +342,10 @@ async fn update_rule(
 )]
 async fn delete_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    ensure_rule_management_authorized(auth.is_admin)?;
     let service = PromotionRuleService::new(state.db.clone());
     service.delete(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -421,7 +455,9 @@ mod tests {
         let req: CreateRuleRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "staging-to-prod");
         assert!(req.is_enabled);
-        assert!(req.auto_promote);
+        // Safe default: an omitted `auto_promote` must parse to false so a rule
+        // is never silently created with auto-promotion enabled.
+        assert!(!req.auto_promote);
         // Omitting max_cve_severity leaves it unset so the rule imposes no CVE
         // gate (a staging-hours-only rule must not silently require a scan).
         assert!(req.max_cve_severity.is_none());
@@ -639,5 +675,19 @@ mod tests {
         assert_eq!(resp.rule_name, "eval-test");
         assert!(!resp.passed);
         assert_eq!(resp.violations.len(), 2);
+    }
+
+    #[test]
+    fn test_ensure_rule_management_authorized_admin_ok() {
+        assert!(ensure_rule_management_authorized(true).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_rule_management_authorized_non_admin_denied() {
+        let err = ensure_rule_management_authorized(false).unwrap_err();
+        // Non-admin rule management is an authorization failure (HTTP 403),
+        // matching the direct-promotion and approve/reject admin gates.
+        assert!(matches!(err, crate::error::AppError::Authorization(_)));
+        assert!(err.to_string().contains("admin"));
     }
 }
