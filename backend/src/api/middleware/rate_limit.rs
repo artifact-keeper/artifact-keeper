@@ -1573,4 +1573,114 @@ mod tests {
             assert_eq!(login_once(&app, "ci-bot", "10.0.0.1").await, StatusCode::OK);
         }
     }
+
+    // ── ConnectInfo per-source-IP keying (global-ratelimit-keying) ────────────
+    //
+    // The general (api, 10000/window) and download (presign, 30/window) limiters
+    // key unauthenticated callers by `extract_client_ip`, whose PRIMARY source is
+    // the TCP peer in `ConnectInfo<SocketAddr>`. That extension is only populated
+    // because the server is served with `into_make_service_with_connect_info`
+    // (main.rs). Without a real peer key these limiters collapse to one shared
+    // `ip:unknown` bucket and a single client's flood 429s the whole instance.
+    //
+    // The tests below drive requests carrying a real `ConnectInfo` (not an XFF
+    // header) so they exercise the same key path the wired server uses, and pin
+    // that a flood from source IP A does NOT 429 a request from source IP B —
+    // for BOTH `rate_limit_middleware` (general) and `rate_limit_by_ip_middleware`
+    // (download). A regression that drops the ConnectInfo wiring (or re-collapses
+    // the bucket) makes B share A's bucket and these tests fail.
+
+    /// Build a request whose `ConnectInfo<SocketAddr>` peer is `peer` (no XFF
+    /// header), modelling a direct-to-backend connection from that source IP.
+    fn req_from_peer(peer: &str) -> Request {
+        let addr: std::net::SocketAddr = peer.parse().unwrap();
+        let mut request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        request
+    }
+
+    /// Drive `n` requests from ConnectInfo peer `peer` through `app` and return
+    /// how many returned 429.
+    async fn count_429s_from_peer(app: &axum::Router, peer: &str, n: usize) -> usize {
+        use tower::ServiceExt;
+        let mut limited = 0;
+        for _ in 0..n {
+            let resp = app.clone().oneshot(req_from_peer(peer)).await.unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited += 1;
+            }
+        }
+        limited
+    }
+
+    #[tokio::test]
+    async fn general_limiter_flood_from_one_peer_does_not_429_another_peer() {
+        // The general limiter (rate_limit_middleware) on an anonymous request
+        // keys by the ConnectInfo peer. A flood from peer A must exhaust only
+        // A's bucket; peer B must still be served.
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true), // capacity-1 limiter, enabled, no exemptions
+                rate_limit_middleware,
+            ));
+
+        // Flood from peer A until it 429s (capacity-1 => 1 OK then 429s).
+        assert!(
+            count_429s_from_peer(&app, "203.0.113.10:5000", 5).await > 0,
+            "peer A's flood must exhaust A's own bucket"
+        );
+        // Peer B, distinct source IP, must NOT be rate-limited by A's flood —
+        // proof the limiter keys per source IP, not one shared bucket.
+        let resp_b = {
+            use tower::ServiceExt;
+            app.clone()
+                .oneshot(req_from_peer("198.51.100.20:6000"))
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            resp_b.status(),
+            StatusCode::OK,
+            "a flood from peer A must not 429 a fresh request from peer B; \
+             sharing a bucket means ConnectInfo keying is broken (the whole-\
+             instance DoS this fix addresses)"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_limiter_flood_from_one_peer_does_not_429_another_peer() {
+        // The download/presign limiter (rate_limit_by_ip_middleware) ALWAYS keys
+        // by the ConnectInfo peer. Same property: A's flood must not 429 B.
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state_with(true),
+                rate_limit_by_ip_middleware,
+            ));
+
+        assert!(
+            count_429s_from_peer(&app, "203.0.113.30:7000", 5).await > 0,
+            "peer A's download flood must exhaust A's own bucket"
+        );
+        let resp_b = {
+            use tower::ServiceExt;
+            app.clone()
+                .oneshot(req_from_peer("198.51.100.40:8000"))
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            resp_b.status(),
+            StatusCode::OK,
+            "a download flood from peer A must not 429 a download from peer B"
+        );
+    }
 }
