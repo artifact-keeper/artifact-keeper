@@ -384,6 +384,7 @@ impl MigrationService {
     pub async fn create_repository(
         &self,
         config: &RepositoryMigrationConfig,
+        storage_base: &str,
     ) -> Result<Uuid, MigrationError> {
         // Check compatibility
         if config.format_compatibility == FormatCompatibility::Unsupported {
@@ -405,8 +406,9 @@ impl MigrationService {
         // The repositories table schema has no `metadata`, `display_name`, or
         // `repository_type` columns. The corresponding columns are `name` and
         // `repo_type`, and `storage_path` is NOT NULL — so the INSERT must
-        // supply it. We default storage_path to the repository key, matching
-        // how local repos are typically named by the storage backend.
+        // supply it. storage_path is stored absolute (under STORAGE_PATH),
+        // matching the HTTP create-repo handler.
+        let storage_path = format!("{}/{}", storage_base, config.target_key);
         let repo_id: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO repositories (key, name, description, format, repo_type, storage_path)
@@ -419,7 +421,7 @@ impl MigrationService {
         .bind(&config.description)
         .bind(&format)
         .bind(repo_type)
-        .bind(&config.target_key) // storage_path defaults to key
+        .bind(&storage_path)
         .fetch_one(&self.db)
         .await?;
 
