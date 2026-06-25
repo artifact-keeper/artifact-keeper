@@ -345,6 +345,39 @@ impl PermissionService {
 
         Ok(rows.into_iter().map(|(action,)| action).collect())
     }
+
+    /// Build a SQL EXISTS predicate that checks whether a user has any
+    /// permission grant on a target, consulting both direct
+    /// (`principal_type = 'user'`) and group-based (`principal_type = 'group'`
+    /// resolved through `user_group_members`) grants.
+    ///
+    /// The returned fragment is designed to be embedded in a WHERE clause when
+    /// listing resources, so callers can combine it with other conditions
+    /// (e.g. `is_public` or legacy `role_assignments`) via OR.
+    ///
+    /// # Parameters
+    /// - `target_type` — the type of target resource (e.g. `"repository"`, `"group"`)
+    /// - `target_id_expr` — SQL expression for the target's ID column (e.g. `"r.id"`, `"$3"`)
+    /// - `user_param` — SQL bind-parameter placeholder for the caller's user ID (e.g. `"$2"`)
+    pub fn build_visibility_predicate(
+        target_type: &str,
+        target_id_expr: &str,
+        user_param: &str,
+    ) -> String {
+        format!(
+            r#"EXISTS (
+                SELECT 1 FROM permissions p
+                WHERE p.target_type = '{target_type}'
+                  AND p.target_id = {target_id_expr}
+                  AND (
+                    (p.principal_type = 'user' AND p.principal_id = {user_param})
+                    OR (p.principal_type = 'group' AND p.principal_id IN (
+                        SELECT group_id FROM user_group_members WHERE user_id = {user_param}
+                    ))
+                  )
+            )"#
+        )
+    }
 }
 
 #[cfg(test)]

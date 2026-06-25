@@ -14,6 +14,7 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
+use crate::services::permission_service::PermissionService;
 
 /// Request to create a new repository
 #[derive(Debug)]
@@ -215,6 +216,11 @@ pub(crate) fn build_visibility_clause_for(
         RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
+            let permission_check = PermissionService::build_visibility_predicate(
+                "repository",
+                &format!("{table_alias}.id"),
+                &format!("${user_param}"),
+            );
             let clause = format!(
                 r#"(
                 is_public = true
@@ -223,6 +229,7 @@ pub(crate) fn build_visibility_clause_for(
                     WHERE ra.user_id = ${user_param}
                       AND (ra.repository_id = {table_alias}.id OR ra.repository_id IS NULL)
                 )
+                OR {permission_check}
             )"#
             );
             (clause, VisibilityBind::User(Some(*user_id)))
@@ -672,18 +679,22 @@ impl RepositoryService {
     /// short-circuiting the cases this method does NOT cover: admins bypass it
     /// entirely and public repositories are accessible to everyone.
     pub async fn user_can_access_repo(&self, repo_id: Uuid, user_id: Uuid) -> Result<bool> {
-        let granted: bool = sqlx::query_scalar(
+        let permission_predicate =
+            PermissionService::build_visibility_predicate("repository", "$2", "$1");
+        let sql = format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM role_assignments ra \
                  WHERE ra.user_id = $1 \
                    AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-             )",
-        )
-        .bind(user_id)
-        .bind(repo_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+             ) \
+             OR {permission_predicate}"
+        );
+        let granted: bool = sqlx::query_scalar(&sql)
+            .bind(user_id)
+            .bind(repo_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(granted)
     }
 

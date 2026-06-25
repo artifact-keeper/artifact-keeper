@@ -22,6 +22,7 @@
 #   storage-gc  - Storage garbage collection tests
 #   curation    - Curation policy E2E tests (RPM/DEB with mock upstream)
 #   smoke       - Smoke tests only (pypi, npm, cargo)
+#   permission-visibility - Permission visibility tests (issue #1996)
 #   all         - All native client tests
 
 services:
@@ -105,7 +106,7 @@ services:
       retries: 30
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness", "permission-visibility"]
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
@@ -395,6 +396,27 @@ services:
     networks:
       - e2e-test-network
     profiles: ["hex", "all"]
+
+  # ==========================================================================
+  # PERMISSION VISIBILITY TESTS (issue #1996)
+  # ==========================================================================
+
+  permission-visibility-test:
+    image: docker.io/alpine:3.19
+    container_name: e2e-test-permission-visibility
+    depends_on:
+      setup:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      ADMIN_PASS: TestRunner!2026secure
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-permission-visibility.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["permission-visibility", "all"]
 
   # ==========================================================================
   # PROXY + VIRTUAL REPOSITORY TESTS
