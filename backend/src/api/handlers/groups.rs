@@ -14,6 +14,7 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::permission_service::PermissionService;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 
 /// Require that the request is authenticated, returning an error if not.
@@ -42,20 +43,13 @@ fn group_read_unscoped(is_admin: bool) -> bool {
 /// caller's user id (e.g. `$2`). Kept as a single helper so the list SELECT,
 /// list COUNT, and get_group queries share one definition.
 fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
+    let permission_check =
+        PermissionService::build_visibility_predicate("group", group_id_expr, user_param);
     format!(
         "({group_id_expr} IN (
             SELECT group_id FROM user_group_members WHERE user_id = {user_param}
          )
-         OR EXISTS (
-            SELECT 1 FROM permissions p
-            WHERE p.target_type = 'group' AND p.target_id = {group_id_expr}
-              AND (
-                (p.principal_type = 'user' AND p.principal_id = {user_param})
-                OR (p.principal_type = 'group' AND p.principal_id IN (
-                    SELECT group_id FROM user_group_members WHERE user_id = {user_param}
-                ))
-              )
-         ))"
+         OR {permission_check})"
     )
 }
 

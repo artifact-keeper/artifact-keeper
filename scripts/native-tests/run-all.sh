@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run all native client tests
 # Usage: ./run-all.sh [profile]
-# Profiles: smoke (default), all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, proxy, health-probes, curation
+# Profiles: smoke (default), all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, proxy, health-probes, curation, permission-visibility
 set -euo pipefail
 
 PROFILE="${1:-smoke}"
@@ -13,7 +13,7 @@ echo "=============================================="
 
 # Define test sets
 SMOKE_TESTS=(pypi npm cargo)
-ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf incus hex proxy-virtual health-probes tag-replication curation)
+ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf incus hex proxy-virtual health-probes tag-replication curation permission-visibility)
 
 # Select tests based on profile
 case "$PROFILE" in
@@ -26,12 +26,12 @@ case "$PROFILE" in
     proxy)
         TESTS=("proxy-virtual")
         ;;
-    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|proxy-virtual|health-probes|tag-replication|curation)
+    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|hex|proxy-virtual|health-probes|tag-replication|curation|permission-visibility)
         TESTS=("$PROFILE")
         ;;
     *)
         echo "ERROR: Unknown profile: $PROFILE"
-        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, proxy, tag-replication, curation"
+        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, hex, proxy, tag-replication, curation, permission-visibility"
         exit 1
         ;;
 esac
