@@ -19,6 +19,7 @@ backend/src/grpc/generated/*.bin
 # IDE
 .idea/
 .vscode/
+.opencode/
 *.swp
 *.swo
 *~
@@ -107,3 +108,6 @@ scripts/sso-e2e/sso-config-ids.env
 
 # Superpowers brainstorming artifacts (Claude Code)
 docs/superpowers/
+
+
+openspec/
