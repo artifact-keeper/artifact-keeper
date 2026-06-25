@@ -350,7 +350,7 @@ impl MigrationWorker {
             } else {
                 match self
                     .migration_service
-                    .create_repository(&migration_config)
+                    .create_repository(&migration_config, &self.config.staging_path)
                     .await
                 {
                     Ok(_) => {
