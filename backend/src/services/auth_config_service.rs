@@ -2973,5 +2973,219 @@ mod tests {
                 "session must report the provider_id it was minted with so callback handlers can compare it against the URL path"
             );
         }
+
+        // -------------------------------------------------------------------
+        // SAML use_absolute_acs_url column (migration 138). These pin every
+        // SQL path that touches the new column — defaults on create, explicit
+        // create, get / get_decrypted SELECT, update preserve-existing,
+        // update explicit flip, list, toggle.
+        // -------------------------------------------------------------------
+
+        /// Build a CreateSamlConfigRequest with a unique name suffix so
+        /// parallel DB tests do not collide on the UNIQUE constraint. The
+        /// helper is intentionally minimal (no certificate cryptography);
+        /// the SQL paths only care that the columns round-trip.
+        fn make_saml_create_req(suffix: &str) -> CreateSamlConfigRequest {
+            CreateSamlConfigRequest {
+                name: format!("saml-acs-test-{suffix}"),
+                entity_id: format!("https://idp.example.com/{suffix}"),
+                sso_url: "https://idp.example.com/sso".to_string(),
+                slo_url: None,
+                certificate: format!(
+                    "-----BEGIN CERTIFICATE-----\nfake-{suffix}\n-----END CERTIFICATE-----"
+                ),
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: Some(true),
+                use_absolute_acs_url: None,
+            }
+        }
+
+        async fn cleanup_saml(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM saml_configs WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_create_saml_defaults_use_absolute_acs_url_to_false() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let req = make_saml_create_req("default");
+            let resp = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(
+                !resp.use_absolute_acs_url,
+                "omitted use_absolute_acs_url must default to false (migration 138 invariant)"
+            );
+            cleanup_saml(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_create_saml_honors_explicit_use_absolute_acs_url_true() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("explicit-true");
+            req.use_absolute_acs_url = Some(true);
+            let resp = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(resp.use_absolute_acs_url);
+            cleanup_saml(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_get_saml_round_trips_use_absolute_acs_url() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("get-roundtrip");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            let fetched = AuthConfigService::get_saml(&pool, created.id)
+                .await
+                .expect("get_saml");
+            assert_eq!(fetched.id, created.id);
+            assert!(fetched.use_absolute_acs_url);
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_get_saml_decrypted_returns_use_absolute_acs_url() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("get-decrypted");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            let row = AuthConfigService::get_saml_decrypted(&pool, created.id)
+                .await
+                .expect("get_saml_decrypted");
+            assert!(row.use_absolute_acs_url);
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_saml_preserves_use_absolute_acs_url_when_not_in_request() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("update-preserve");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            // Update a different field; the flag must survive.
+            let update = UpdateSamlConfigRequest {
+                name: Some(format!("renamed-{}", created.id)),
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: None,
+            };
+            let updated = AuthConfigService::update_saml(&pool, created.id, update)
+                .await
+                .expect("update_saml");
+            assert!(
+                updated.use_absolute_acs_url,
+                "use_absolute_acs_url must survive an update that does not mention it"
+            );
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_saml_flips_use_absolute_acs_url() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("update-flip");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            let update = UpdateSamlConfigRequest {
+                name: None,
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: Some(false),
+            };
+            let updated = AuthConfigService::update_saml(&pool, created.id, update)
+                .await
+                .expect("update_saml");
+            assert!(!updated.use_absolute_acs_url);
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_list_saml_includes_use_absolute_acs_url() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("list-flag-on");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            let listed = AuthConfigService::list_saml(&pool)
+                .await
+                .expect("list_saml");
+            let found = listed
+                .iter()
+                .find(|r| r.id == created.id)
+                .expect("created row must appear in list_saml");
+            assert!(found.use_absolute_acs_url);
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_toggle_saml_preserves_use_absolute_acs_url() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("toggle-preserve");
+            req.use_absolute_acs_url = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            let toggled =
+                AuthConfigService::toggle_saml(&pool, created.id, ToggleRequest { enabled: false })
+                    .await
+                    .expect("toggle_saml");
+            assert!(!toggled.is_enabled);
+            assert!(
+                toggled.use_absolute_acs_url,
+                "toggle must not zero out the new column (the RETURNING field list pins this)"
+            );
+            cleanup_saml(&pool, created.id).await;
+        }
     }
 }
