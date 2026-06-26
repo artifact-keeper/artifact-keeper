@@ -610,6 +610,29 @@ pub async fn ldap_login(
 // SAML login + ACS
 // ---------------------------------------------------------------------------
 
+/// Build the AssertionConsumerService URL the SP embeds in the
+/// AuthnRequest and verifies on the ACS callback.
+///
+/// When `use_absolute` is false (the default, matching the codebase's
+/// pre-138 behaviour), the historical relative path is returned so existing
+/// SAML providers see no wire-format change on upgrade. When true, the URL is
+/// rebased onto `base_url` — needed for stricter IdPs that reject a relative
+/// `AssertionConsumerServiceURL` in the AuthnRequest. Any trailing slash on
+/// `base_url` is dropped before concatenation so the result has exactly one
+/// `/` between origin and path regardless of how the operator configured
+/// `AK_EXTERNAL_URL` or how a reverse proxy normalises `X-Forwarded-Host`.
+fn build_saml_acs_url(use_absolute: bool, base_url: &str, id: Uuid) -> String {
+    if use_absolute {
+        format!(
+            "{}/api/v1/auth/sso/saml/{}/acs",
+            base_url.trim_end_matches('/'),
+            id
+        )
+    } else {
+        format!("/api/v1/auth/sso/saml/{}/acs", id)
+    }
+}
+
 /// Initiate SAML login redirect
 #[utoipa::path(
     get,
@@ -627,6 +650,7 @@ pub async fn ldap_login(
 pub async fn saml_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    base_url: RequestBaseUrl,
 ) -> Result<Redirect> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
@@ -634,8 +658,8 @@ pub async fn saml_login(
     // Create SSO session for CSRF
     let _session = AuthConfigService::create_sso_session(&state.db, "saml", id).await?;
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Build ACS URL — per-provider opt-in to absolute form (migration 138).
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, base_url.as_str(), id);
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -685,13 +709,15 @@ pub struct SamlAcsForm {
 pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    base_url: RequestBaseUrl,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Response> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Build ACS URL — must agree with the value bound into the AuthnRequest
+    // in `saml_login` so the IdP-asserted Destination/Recipient matches.
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, base_url.as_str(), id);
 
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
@@ -2536,5 +2562,83 @@ mod tests {
             cleanup_groups(&pool, &[gid]).await;
             cleanup_user(&pool, user_id).await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_saml_acs_url (migration 138 — per-provider opt-in to absolute
+    // ACS URLs for IdPs that reject the historical relative form)
+    // -----------------------------------------------------------------------
+
+    /// Regression: when the per-provider flag is OFF (the default and the
+    /// pre-138 behaviour), the SP MUST keep emitting the historical relative
+    /// ACS path. Any divergence here changes the AuthnRequest wire format on
+    /// every existing SAML deployment and would break IdPs that have stored
+    /// the relative path as the registered ACS.
+    #[test]
+    fn test_build_saml_acs_url_relative_when_flag_off() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let url = build_saml_acs_url(false, "https://pkg.sup-any.com", id);
+        assert_eq!(
+            url,
+            "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000001/acs"
+        );
+    }
+
+    /// Regression: with the flag OFF, the result is invariant under the
+    /// resolved `base_url`. This pins the zero-behavioural-change guarantee
+    /// so a future refactor cannot quietly start mixing the request host
+    /// into the relative form.
+    #[test]
+    fn test_build_saml_acs_url_relative_ignores_base_url_when_flag_off() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let url_a = build_saml_acs_url(false, "https://pkg.sup-any.com", id);
+        let url_b = build_saml_acs_url(false, "http://localhost:8080", id);
+        let url_c = build_saml_acs_url(false, "https://other.example.com/", id);
+        assert_eq!(url_a, url_b);
+        assert_eq!(url_b, url_c);
+        assert!(url_a.starts_with('/'));
+    }
+
+    /// With the flag ON, the ACS URL is rebased onto the resolved base URL.
+    #[test]
+    fn test_build_saml_acs_url_absolute_uses_base_url() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let url = build_saml_acs_url(true, "https://pkg.sup-any.com", id);
+        assert_eq!(
+            url,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000003/acs"
+        );
+    }
+
+    /// Trailing slashes on the base URL are dropped so there is exactly one
+    /// `/` between the origin and the API path. Operators set
+    /// `AK_EXTERNAL_URL=https://pkg.example.com/` and reverse proxies normalise
+    /// `X-Forwarded-Host` inconsistently, so this normalises on the SP side.
+    #[test]
+    fn test_build_saml_acs_url_absolute_trims_trailing_slash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        let url = build_saml_acs_url(true, "https://pkg.sup-any.com/", id);
+        assert_eq!(
+            url,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
+        );
+        let url2 = build_saml_acs_url(true, "https://pkg.sup-any.com///", id);
+        assert_eq!(
+            url2,
+            "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
+        );
+    }
+
+    /// Reverse-proxy subpath deployments: the base URL may end with a
+    /// non-root path. The ACS path is appended verbatim with one boundary
+    /// slash.
+    #[test]
+    fn test_build_saml_acs_url_absolute_handles_subpath_base() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap();
+        let url = build_saml_acs_url(true, "https://example.com/ak", id);
+        assert_eq!(
+            url,
+            "https://example.com/ak/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000005/acs"
+        );
     }
 }

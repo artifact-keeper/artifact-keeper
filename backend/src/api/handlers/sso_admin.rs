@@ -967,6 +967,7 @@ mod tests {
             require_signed_assertions: true,
             admin_group: Some("admin-group".to_string()),
             is_enabled: false,
+            use_absolute_acs_url: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
