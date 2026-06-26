@@ -2179,6 +2179,20 @@ impl ProxyService {
                             // unimplemented setting fails loudly, not silently.
                             self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
                                 .await;
+
+                            // #1999: index the newly-cached Maven artifact into
+                            // the package catalog (packages/package_versions
+                            // only — never the artifacts table, preserving
+                            // #1278). Best-effort: failures are swallowed and
+                            // never fail the client's proxy fetch.
+                            let checksum = StorageService::calculate_hash(&resp.content);
+                            self.index_cached_package(
+                                repo.id,
+                                cache_path,
+                                resp.content.len() as i64,
+                                Some(&checksum),
+                            )
+                            .await;
                         }
 
                         // Package Age Policy (#1770): hold the just-fetched
@@ -2555,6 +2569,20 @@ impl ProxyService {
         // setting is observable in logs rather than silently doing nothing.
         self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
             .await;
+
+        // #1999: index the newly-cached Maven artifact into the package
+        // catalog (packages/package_versions only — never the artifacts
+        // table, preserving #1278). The streaming tee computes the checksum
+        // only after the body is fully written, so it is unknown here; pass
+        // the upstream Content-Length when advertised (0 otherwise) and no
+        // checksum. Best-effort: failures never fail the client's fetch.
+        self.index_cached_package(
+            repo.id,
+            cache_path,
+            upstream.content_length.unwrap_or(0) as i64,
+            None,
+        )
+        .await;
 
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
@@ -3708,6 +3736,90 @@ impl ProxyService {
         }
     }
 
+    /// Index a newly proxy-cached artifact into the `packages` /
+    /// `package_versions` catalog (#1999).
+    ///
+    /// Proxy-cached artifacts are deliberately NOT written to the `artifacts`
+    /// table (#1278 / #1280): doing so reintroduced a doubled-prefix storage
+    /// bug on filesystem backends, and the contract is pinned by the meta-test
+    /// `test_cache_artifact_does_not_insert_into_artifacts_table`. As a result
+    /// the package catalog — populated only by the local-upload handlers via
+    /// [`PackageService::try_create_or_update_from_artifact`] — stayed empty for
+    /// remote/proxy repositories, so `GET /api/v1/packages` and Maven component
+    /// grouping returned nothing for cached artifacts (#1999, regression in
+    /// 1.2.1).
+    ///
+    /// This best-effort helper closes that gap WITHOUT touching the `artifacts`
+    /// table: it writes ONLY `packages` / `package_versions` rows (idempotent
+    /// `ON CONFLICT` upsert), so a second pull of the same GAV (cache hit) does
+    /// not double the catalog and the #1278 meta-test stays green.
+    ///
+    /// Invariants:
+    /// * Called ONLY on the new-cache branch (the same gated spot as
+    ///   [`Self::warn_if_proxy_scan_unsupported`]), so it fires once per new
+    ///   write and never on cache hits.
+    /// * Maven checksum sidecars (`.sha1` / `.md5`) and `maven-metadata.xml`
+    ///   are skipped — they are not packages.
+    /// * A path with no extractable version yields no row.
+    /// * Indexing failure must NOT fail the client's proxy fetch:
+    ///   [`PackageService::try_create_or_update_from_artifact`] swallows + logs.
+    ///
+    /// The repository format is resolved from the DB by `repository_id` rather
+    /// than taken from the caller: the proxy fetch path operates on a synthetic
+    /// `Repository` whose `format` is always `Generic`
+    /// (`proxy_helpers::build_remote_repo`), so trusting it would skip every
+    /// real Maven repo.
+    async fn index_cached_package(
+        &self,
+        repository_id: Uuid,
+        artifact_path: &str,
+        size_bytes: i64,
+        checksum_sha256: Option<&str>,
+    ) {
+        // Resolve the real repository format (the synthetic proxy `Repository`
+        // carries `Generic`, not the configured format). A read failure or
+        // unparseable format degrades to "not indexed" (best-effort).
+        let format_text: Option<String> =
+            sqlx::query_scalar(r#"SELECT format::text FROM repositories WHERE id = $1"#)
+                .bind(repository_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+        let Some(repo_format) = catalog_indexable_format(format_text.as_deref()) else {
+            // Only Maven-family proxy repos populate the catalog for now
+            // (#1999). Other formats keep the pre-fix behavior until their
+            // grouping/listing paths are taught to read from the catalog too.
+            return;
+        };
+
+        let Some(name) = maven_proxy_package_name(artifact_path) else {
+            return;
+        };
+        let Some(version) = extract_version_from_path(&repo_format, artifact_path) else {
+            return;
+        };
+
+        // The streaming tee computes the checksum only after the body is fully
+        // written, so it is unknown at this gated spot; fall back to an empty
+        // string. The buffered path passes the real digest. Either way the
+        // catalog row exists; a later buffered pull refreshes the digest.
+        let checksum = checksum_sha256.unwrap_or("");
+
+        let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repository_id,
+                &name,
+                &version,
+                size_bytes,
+                checksum,
+                None,
+                None,
+            )
+            .await;
+    }
+
     /// Attempt to retrieve a cached artifact even if it has expired.
     /// Used as a fallback when upstream is unavailable.
     ///
@@ -3738,6 +3850,56 @@ impl ProxyService {
     }
 }
 
+/// Derive the package-catalog name (`groupId:artifactId`) for a Maven-family
+/// proxy-cached artifact path (#1999), or `None` if the path is not a Maven
+/// package asset that should be indexed.
+///
+/// Skip rules (these are not packages):
+/// * Maven checksum sidecars — `*.sha1`, `*.md5`, `*.sha256`, `*.sha512`, `*.asc`.
+/// * `maven-metadata.xml` (and its own checksum sidecars).
+/// * Any path that does not parse as Maven coordinates
+///   (`groupId/artifactId/version/filename`).
+///
+/// Using `groupId:artifactId` (rather than the bare `artifactId` that the
+/// local-upload path stores) keeps proxy package names globally unambiguous and
+/// lets the remote component-grouping branch reconstruct the `groupId` /
+/// `artifactId` split without consulting the storage path.
+pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let lower = filename.to_ascii_lowercase();
+
+    // Checksum / signature sidecars are not packages.
+    const SKIP_SUFFIXES: [&str; 5] = [".sha1", ".md5", ".sha256", ".sha512", ".asc"];
+    if SKIP_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return None;
+    }
+
+    // Maven metadata index files are not packages.
+    if lower == "maven-metadata.xml" || lower.starts_with("maven-metadata.xml.") {
+        return None;
+    }
+
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    Some(format!("{}:{}", coords.group_id, coords.artifact_id))
+}
+
+/// Map a repository `format::text` value to the [`RepositoryFormat`] whose
+/// proxy-cached artifacts are indexed into the package catalog (#1999).
+///
+/// Only the Maven family is indexed for now; every other format (including a
+/// missing/unknown value) returns `None`, leaving the pre-fix behavior intact.
+/// Factored out of [`ProxyService::index_cached_package`] so the eligibility
+/// decision is unit-testable without a database round-trip.
+pub(crate) fn catalog_indexable_format(format_text: Option<&str>) -> Option<RepositoryFormat> {
+    match format_text {
+        Some("maven") => Some(RepositoryFormat::Maven),
+        Some("gradle") => Some(RepositoryFormat::Gradle),
+        Some("sbt") => Some(RepositoryFormat::Sbt),
+        _ => None,
+    }
+}
+
 /// Extract version from an artifact path based on the repository format.
 ///
 /// Each package format encodes the version differently in the path. This
@@ -3745,12 +3907,9 @@ impl ProxyService {
 /// for metadata files, index pages, or paths where the version cannot be
 /// determined.
 ///
-/// Currently unused: the previous caller in `cache_artifact` was removed
-/// when proxy-cached items stopped being inserted into the `artifacts`
-/// table (issue #1278). Kept around because the version-extraction logic
-/// is broadly useful and tests still exercise it; if a future cache
-/// listing/UX feature wants per-version metadata it should call this.
-#[allow(dead_code)]
+/// Called by [`ProxyService::index_cached_package`] (#1999) to populate the
+/// package catalog for proxy-cached Maven artifacts, and exercised directly by
+/// the unit tests below.
 pub(crate) fn extract_version_from_path(format: &RepositoryFormat, path: &str) -> Option<String> {
     let path = path.trim_start_matches('/');
 
@@ -5438,6 +5597,119 @@ SHA256:
             extract_version_from_path(&RepositoryFormat::Maven, "org/junit/maven-metadata.xml");
         // parse_coordinates requires 4 segments, so this returns None
         assert!(version.is_none());
+    }
+
+    // =======================================================================
+    // maven_proxy_package_name — package-catalog name derivation + skip logic
+    // for proxy-cached Maven artifacts (#1999)
+    // =======================================================================
+
+    #[test]
+    fn test_maven_proxy_package_name_jar() {
+        assert_eq!(
+            maven_proxy_package_name(
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+            )
+            .as_deref(),
+            Some("org.apache.commons:commons-lang3")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_pom() {
+        assert_eq!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_leading_slash() {
+        // The cache_path may arrive with a leading slash; it must be trimmed.
+        assert_eq!(
+            maven_proxy_package_name("/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_sha1() {
+        // Checksum sidecars are not packages and must NOT create a row.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_md5() {
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom.md5")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_signature_and_other_checksums() {
+        for path in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.asc",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha256",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha512",
+        ] {
+            assert!(
+                maven_proxy_package_name(path).is_none(),
+                "expected {path} to be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_maven_metadata() {
+        // Version-level maven-metadata.xml (and its checksums) are index files.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml").is_none()
+        );
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_unparseable_path() {
+        // Too few segments to be a GAV → no package.
+        assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_maven_family() {
+        assert_eq!(
+            catalog_indexable_format(Some("maven")),
+            Some(RepositoryFormat::Maven)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("gradle")),
+            Some(RepositoryFormat::Gradle)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("sbt")),
+            Some(RepositoryFormat::Sbt)
+        );
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_other_formats_not_indexed() {
+        for f in ["npm", "pypi", "docker", "generic", "cargo", "nuget"] {
+            assert!(
+                catalog_indexable_format(Some(f)).is_none(),
+                "{f} must not be catalog-indexed yet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_missing_value() {
+        assert!(catalog_indexable_format(None).is_none());
     }
 
     #[test]
