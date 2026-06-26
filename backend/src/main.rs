@@ -1275,6 +1275,7 @@ fn build_oidc_request_from_values(
         auto_create_users: Some(true),
         pkce_enabled: None,
         map_groups_to_groups: None,
+        allow_legacy_rsa_keys: None,
     })
 }
 
