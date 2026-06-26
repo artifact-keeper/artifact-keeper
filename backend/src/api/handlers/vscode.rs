@@ -290,6 +290,7 @@ async fn publish_extension(
     let user_id = require_auth_basic(auth, "vscode")?.user_id;
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
@@ -821,6 +822,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.storage_path, "/data/vscode-local");
         assert_eq!(repo.repo_type, "hosted");
@@ -838,6 +840,7 @@ mod tests {
             upstream_url: Some(
                 "https://marketplace.visualstudio.com/_apis/public/gallery".to_string(),
             ),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());

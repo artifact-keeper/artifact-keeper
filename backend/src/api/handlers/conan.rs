@@ -1344,6 +1344,7 @@ async fn recipe_file_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
@@ -2115,6 +2116,7 @@ async fn package_file_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = package_artifact_path(
         &name,

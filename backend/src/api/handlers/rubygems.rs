@@ -281,6 +281,7 @@ async fn push_gem(
     let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty gem file").into_response());
@@ -810,6 +811,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://rubygems.org".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");

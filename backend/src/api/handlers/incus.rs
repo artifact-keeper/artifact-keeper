@@ -543,7 +543,7 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
 async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     use sqlx::Row;
     let repo = sqlx::query(
-        r#"SELECT id, key, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, upstream_url
+        r#"SELECT id, key, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, upstream_url, promotion_only
         FROM repositories WHERE key = $1"#,
     )
     .bind(repo_key)
@@ -572,6 +572,7 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         storage_backend: repo.get("storage_backend"),
         repo_type: repo.get("repo_type"),
         upstream_url: repo.get("upstream_url"),
+        promotion_only: repo.try_get("promotion_only").unwrap_or(false),
     })
 }
 
@@ -831,6 +832,7 @@ async fn upload_image(
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = build_artifact_path(&product, &version, &filename);
     IncusHandler::parse_path(&artifact_path).map_err(|e| {
@@ -956,6 +958,7 @@ async fn delete_image(
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = build_artifact_path(&product, &version, &filename);
 
@@ -1047,6 +1050,7 @@ async fn start_chunked_upload(
     let prefix = mount_prefix_from_uri(&original_uri);
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = build_artifact_path(&product, &version, &filename);
     IncusHandler::parse_path(&artifact_path).map_err(|e| {
@@ -2362,6 +2366,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -2377,6 +2382,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://images.linuxcontainers.org".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -3649,6 +3655,7 @@ mod streaming_pipeline_regression_tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         finalize_upload(

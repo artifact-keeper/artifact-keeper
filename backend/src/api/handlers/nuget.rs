@@ -905,6 +905,7 @@ async fn push_package(
     };
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // The body may be multipart/form-data or raw binary .nupkg.
     let nupkg_bytes = extract_nupkg_bytes(&headers, body)?;
@@ -1652,6 +1653,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

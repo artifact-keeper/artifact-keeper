@@ -516,6 +516,7 @@ async fn upload_module(
     let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
     let module_name = format!("{}/{}/{}", namespace, name, provider);
 
     // Check for duplicate
@@ -929,6 +930,7 @@ async fn upload_provider(
     let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
     let provider_name = format!("{}/{}", namespace, type_name);
     let platform = format!("{}_{}", os, arch);
 
@@ -1701,6 +1703,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://registry.terraform.io".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.storage_path, "/data/terraform");
@@ -1720,6 +1723,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert!(info.upstream_url.is_none());
     }

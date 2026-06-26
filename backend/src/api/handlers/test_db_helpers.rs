@@ -351,6 +351,7 @@ pub fn make_repo_info(
         storage_backend: "filesystem".to_string(),
         repo_type: repo_type.to_string(),
         upstream_url: upstream_url.map(|s| s.to_string()),
+        promotion_only: false,
     }
 }
 
@@ -475,6 +476,18 @@ impl Fixture {
             storage_dir,
             state,
         })
+    }
+
+    /// Flag the fixture repository as `promotion_only` (or clear the flag).
+    /// Used by the format-native publish-gate tests to assert that a direct
+    /// upload to a promotion_only repository is rejected.
+    pub async fn set_promotion_only(&self, value: bool) {
+        sqlx::query("UPDATE repositories SET promotion_only = $1 WHERE id = $2")
+            .bind(value)
+            .bind(self.repo_id)
+            .execute(&self.pool)
+            .await
+            .expect("set promotion_only");
     }
 
     /// Build a `RepoInfo` matching this fixture's repository. Mirrors the

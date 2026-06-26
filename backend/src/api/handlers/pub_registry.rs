@@ -415,6 +415,7 @@ async fn upload_package(
     let user_id = require_auth_basic(auth, "pub")?.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract the tar.gz file from multipart form data
     let mut file_bytes: Option<bytes::Bytes> = None;

@@ -2465,6 +2465,7 @@ async fn upload_package_put(
     let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if !is_conda_package(&filename) {
         return Err((
@@ -2492,6 +2493,7 @@ async fn upload_post(
     let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Determine subdir and filename from headers
     let subdir = headers
@@ -2534,6 +2536,7 @@ async fn upload_package_put_with_token(
 
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if !is_conda_package(&filename) {
         return Err((
@@ -2564,6 +2567,7 @@ async fn upload_post_with_token(
 
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let subdir = headers
         .get("X-Conda-Subdir")

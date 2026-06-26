@@ -956,6 +956,7 @@ async fn upload(
     let user_id = require_auth_basic_scope(auth, "composer", "write")?.user_id;
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // The body should be a zip archive containing composer.json
     if body.is_empty() {
@@ -1167,6 +1168,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://packagist.org".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");

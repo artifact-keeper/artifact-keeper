@@ -1721,6 +1721,7 @@ async fn pool_upload(
     let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let upload = prepare_debian_upload(&component, &path, &body)?;
     persist_debian_upload(
@@ -1763,6 +1764,7 @@ async fn upload_raw(
     let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract filename from X-Filename or Content-Disposition header
     let filename = headers

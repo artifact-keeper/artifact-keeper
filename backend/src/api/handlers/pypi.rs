@@ -1734,6 +1734,7 @@ async fn upload(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Parse multipart form data
     let mut action: Option<String> = None;
@@ -3899,6 +3900,64 @@ mod tests {
             .execute(&fx.pool)
             .await;
         fx.teardown().await;
+    }
+
+    /// #2022: a direct `twine upload` to a `promotion_only` repository must be
+    /// rejected with 409 CONFLICT; the same upload to a normal repository must
+    /// still succeed. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_upload_blocked_on_promotion_only_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let project = "ak-pypi-promotion-gate";
+        let version = "0.1.0";
+        let filename = "ak_pypi_promotion_gate-0.1.0-py3-none-any.whl";
+
+        // Flag the repo promotion_only -> direct upload is rejected with 409.
+        fx.set_promotion_only(true).await;
+        let (content_type, body) = pypi_upload_multipart(
+            project,
+            version,
+            filename,
+            b"fake-wheel-bytes",
+            "promotion gate test",
+            ">=3.8",
+        );
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+        let (blocked_status, _) = tdh::send(app, req).await;
+
+        // Clear the flag -> the same upload succeeds.
+        fx.set_promotion_only(false).await;
+        let (content_type, body) = pypi_upload_multipart(
+            project,
+            version,
+            filename,
+            b"fake-wheel-bytes",
+            "promotion gate test",
+            ">=3.8",
+        );
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+        let (allowed_status, allowed_body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::CONFLICT,
+            "promotion_only direct upload must return 409"
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::OK,
+            "upload to a normal repo must still succeed; body: {}",
+            String::from_utf8_lossy(&allowed_body)
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -40,6 +40,7 @@ pub struct RepoInfo {
     pub storage_backend: String,
     pub repo_type: String,
     pub upstream_url: Option<String>,
+    pub promotion_only: bool,
 }
 
 impl RepoInfo {
@@ -48,6 +49,17 @@ impl RepoInfo {
             backend: self.storage_backend.clone(),
             path: self.storage_path.clone(),
         }
+    }
+
+    /// Reject a direct upload when this repository is flagged `promotion_only`.
+    ///
+    /// Delegates to [`reject_direct_upload_if_promotion_only`] so that every
+    /// format handler enforces the gate identically. There is no admin
+    /// exemption (the `is_admin` argument is accepted for signature parity but
+    /// has no effect — see [`promotion_only_blocks_direct_upload`]).
+    #[allow(clippy::result_large_err)]
+    pub fn reject_if_promotion_only(&self, is_admin: bool) -> Result<(), Response> {
+        reject_direct_upload_if_promotion_only(self.promotion_only, is_admin)
     }
 }
 
@@ -68,7 +80,7 @@ pub async fn resolve_repo_by_key(
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url \
+         repo_type::text as repo_type, upstream_url, promotion_only \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -103,6 +115,7 @@ pub async fn resolve_repo_by_key(
         storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
         upstream_url: repo.try_get("upstream_url").ok(),
+        promotion_only: repo.try_get("promotion_only").unwrap_or(false),
     })
 }
 
@@ -3047,6 +3060,46 @@ mod tests {
         assert!(reject_direct_upload_if_promotion_only(false, false).is_ok());
     }
 
+    fn promo_repo_info(promotion_only: bool) -> RepoInfo {
+        RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "gate-test".to_string(),
+            storage_path: "/data/gate-test".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+            promotion_only,
+        }
+    }
+
+    #[test]
+    fn test_repoinfo_reject_if_promotion_only_blocks_when_true() {
+        // A promotion_only RepoInfo rejects direct uploads with 409 CONFLICT,
+        // matching the wired maven/generic sites. The shared method is what the
+        // format-native publish handlers now call.
+        let repo = promo_repo_info(true);
+        let err = repo
+            .reject_if_promotion_only(false)
+            .expect_err("promotion_only repo must reject direct upload");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_repoinfo_reject_if_promotion_only_no_admin_exemption() {
+        // There is no admin break-glass: the is_admin flag does not change the
+        // outcome for a promotion_only repo.
+        let repo = promo_repo_info(true);
+        assert!(repo.reject_if_promotion_only(true).is_err());
+    }
+
+    #[test]
+    fn test_repoinfo_reject_if_promotion_only_allows_normal_repo() {
+        // A normal (promotion_only = false) repo is a no-op for any caller.
+        let repo = promo_repo_info(false);
+        assert!(repo.reject_if_promotion_only(false).is_ok());
+        assert!(repo.reject_if_promotion_only(true).is_ok());
+    }
+
     // ── LocalLookup dispatch tests ──────────────────────────────────
 
     #[test]
@@ -3530,6 +3583,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -5285,6 +5339,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -5434,6 +5489,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -5468,6 +5524,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://upstream.example.test".to_string()),
+            promotion_only: false,
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -5503,6 +5560,7 @@ mod tests {
             // Force the Remote branch but with upstream_url = None.
             repo_type: "remote".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -5539,6 +5597,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())

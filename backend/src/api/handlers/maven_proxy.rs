@@ -487,6 +487,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         Some((pool, state, repo_id, repo, user_id))
     }
