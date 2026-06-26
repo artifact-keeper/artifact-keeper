@@ -10,9 +10,11 @@
 //! - `/healthz` - alias for `/health`
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
@@ -418,18 +420,83 @@ pub async fn liveness_check() -> impl IntoResponse {
     })
 }
 
-/// Verify storage backend connectivity.
+/// How long a storage-health result is reused before the disk/network probe
+/// is performed again. `/health` and `/healthz` are polled frequently (k8s
+/// probes plus dashboards); re-running the probe on every request causes
+/// needless disk churn for the filesystem backend and needless network
+/// round-trips for object stores. A short TTL keeps a genuinely-broken
+/// backend detected within a few seconds while collapsing bursts of polling
+/// into a single probe.
+const STORAGE_HEALTH_TTL: Duration = Duration::from_secs(5);
+
+/// Process-wide cache of the most recent storage-health probe result.
 ///
-/// Filesystem: write/read/delete a probe file.
+/// Stored as `(probed_at, status)`. Guarded by a `tokio::sync::Mutex` so the
+/// short critical section never blocks the async runtime. The first poll after
+/// a TTL expiry refreshes it; concurrent pollers that arrive while a fresh
+/// entry exists return the cached value without touching the disk.
+static STORAGE_HEALTH_CACHE: Lazy<Mutex<Option<(Instant, CheckStatus)>>> =
+    Lazy::new(|| Mutex::new(None));
+
+impl Clone for CheckStatus {
+    fn clone(&self) -> Self {
+        CheckStatus {
+            status: self.status.clone(),
+            message: self.message.clone(),
+        }
+    }
+}
+
+/// Verify storage backend connectivity, behind a short-TTL cache.
+///
+/// The actual probe lives in [`probe_storage_health`]; this wrapper collapses
+/// frequent `/health` polling into one probe per [`STORAGE_HEALTH_TTL`] window
+/// so the endpoint does not hammer the disk (filesystem) or the remote API
+/// (object stores) on every request. A genuinely-broken backend is still
+/// surfaced within the TTL once the cached entry expires.
+async fn check_storage_health(
+    config: &crate::config::Config,
+    storage: &Arc<dyn StorageBackend>,
+) -> CheckStatus {
+    {
+        let cache = STORAGE_HEALTH_CACHE.lock().await;
+        if let Some((probed_at, ref status)) = *cache {
+            if probed_at.elapsed() < STORAGE_HEALTH_TTL {
+                return status.clone();
+            }
+        }
+    }
+
+    let status = probe_storage_health(config, storage).await;
+
+    {
+        let mut cache = STORAGE_HEALTH_CACHE.lock().await;
+        *cache = Some((Instant::now(), status.clone()));
+    }
+
+    status
+}
+
+/// Perform the actual storage backend connectivity probe (uncached).
+///
+/// Filesystem: write a probe file to a UNIQUE per-call path and best-effort
+/// remove it. A successful write proves every writability failure mode a
+/// liveness probe cares about (read-only / full / unmounted volume, missing
+/// permissions); those all surface as a write error. The path is unique per
+/// call (`.health-probe-{uuid}`) so concurrent probes never share a file -
+/// previously a fixed `.health-probe` path let one request's cleanup delete
+/// the file another request was reading (spurious ENOENT) or let interleaved
+/// writes corrupt the read-back (spurious mismatch), each yielding a bogus
+/// 503 under concurrency.
+///
 /// S3, GCS, Azure: perform a real API call via the storage backend's
 /// `health_check()` method, with a 5-second timeout.
-async fn check_storage_health(
+async fn probe_storage_health(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
 ) -> CheckStatus {
     match config.storage_backend.as_str() {
         "filesystem" => {
-            // Use a fixed probe filename to avoid path injection concerns.
             // storage_path is from server config, not user input, but we
             // canonicalize and verify the probe stays under the base dir.
             let storage_base = match std::path::Path::new(&config.storage_path).canonicalize() {
@@ -441,31 +508,27 @@ async fn check_storage_health(
                     };
                 }
             };
-            let probe_path = storage_base.join(".health-probe");
+            // Unique per-call probe filename so concurrent /health requests
+            // never share a file (which previously caused spurious 503s).
+            let probe_path = storage_base.join(format!(".health-probe-{}", uuid::Uuid::new_v4()));
             if !probe_path.starts_with(&storage_base) {
                 return CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some("Storage probe path escaped base directory".to_string()),
                 };
             }
+            // A write-only probe proves the writability failure modes that
+            // matter (RO/full/unmounted/perms). Read-back is intentionally
+            // dropped: it added nothing a liveness probe needs and was the
+            // source of the cross-request data dependency.
             match tokio::fs::write(&probe_path, b"ok").await {
-                Ok(()) => match tokio::fs::read(&probe_path).await {
-                    Ok(data) if data == b"ok" => {
-                        let _ = tokio::fs::remove_file(&probe_path).await;
-                        CheckStatus {
-                            status: STATUS_HEALTHY.to_string(),
-                            message: None,
-                        }
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(&probe_path).await;
+                    CheckStatus {
+                        status: STATUS_HEALTHY.to_string(),
+                        message: None,
                     }
-                    Ok(_) => CheckStatus {
-                        status: STATUS_UNHEALTHY.to_string(),
-                        message: Some("Storage read-back mismatch".to_string()),
-                    },
-                    Err(e) => CheckStatus {
-                        status: STATUS_UNHEALTHY.to_string(),
-                        message: Some(format!("Storage read failed: {}", e)),
-                    },
-                },
+                }
                 Err(e) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!("Storage write failed: {}", e)),
@@ -1040,7 +1103,7 @@ mod tests {
     async fn test_check_storage_health_gcs_healthy() {
         let config = test_config("gcs");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "healthy");
     }
 
@@ -1048,7 +1111,7 @@ mod tests {
     async fn test_check_storage_health_gcs_unhealthy() {
         let config = test_config("gcs");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unhealthy");
         assert!(status.message.unwrap().contains("connection refused"));
     }
@@ -1057,7 +1120,7 @@ mod tests {
     async fn test_check_storage_health_s3_healthy() {
         let config = test_config("s3");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "healthy");
     }
 
@@ -1065,7 +1128,7 @@ mod tests {
     async fn test_check_storage_health_s3_unhealthy() {
         let config = test_config("s3");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unhealthy");
         assert!(status.message.unwrap().contains("connection refused"));
     }
@@ -1074,7 +1137,7 @@ mod tests {
     async fn test_check_storage_health_azure_healthy() {
         let config = test_config("azure");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "healthy");
     }
 
@@ -1082,7 +1145,7 @@ mod tests {
     async fn test_check_storage_health_unknown_backend() {
         let config = test_config("ftp");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
-        let status = check_storage_health(&config, &storage).await;
+        let status = probe_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unknown");
         assert!(status.message.unwrap().contains("Unknown backend: ftp"));
     }
@@ -1141,5 +1204,197 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("\"commit\""));
         assert!(!json.contains("\"dirty\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Filesystem storage-probe tests (issue #2019).
+    //
+    // These exercise `probe_storage_health` (the uncached inner probe) so they
+    // are deterministic regardless of execution order; the process-wide TTL
+    // cache is covered separately in `test_check_storage_health_ttl_cache`.
+    // -----------------------------------------------------------------------
+
+    fn fs_config(dir: &std::path::Path) -> crate::config::Config {
+        crate::config::Config {
+            storage_backend: "filesystem".to_string(),
+            storage_path: dir.to_string_lossy().into_owned(),
+            ..crate::config::Config::test_config()
+        }
+    }
+
+    /// A healthy filesystem backend reports healthy, and the probe leaves no
+    /// `.health-probe*` files behind (best-effort cleanup ran).
+    #[tokio::test]
+    async fn test_probe_storage_health_filesystem_healthy_no_leftover_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fs_config(dir.path());
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+
+        let status = probe_storage_health(&config, &storage).await;
+        assert_eq!(status.status, STATUS_HEALTHY);
+        assert!(status.message.is_none());
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".health-probe"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "probe left files behind: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    /// An unwritable filesystem backend reports unhealthy. The probe directory
+    /// is made read-only so the write fails (the failure mode k8s cares about:
+    /// RO mount / missing permissions).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_probe_storage_health_filesystem_unwritable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = fs_config(dir.path());
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+
+        // Drop write permission on the storage dir so the probe write fails.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let status = probe_storage_health(&config, &storage).await;
+
+        // Restore permissions so the tempdir can be cleaned up.
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+
+        assert_eq!(status.status, STATUS_UNHEALTHY);
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Storage write failed"),
+            "unexpected message: {:?}",
+            status.message
+        );
+    }
+
+    /// Regression guard for #2019: 40 concurrent filesystem probes against the
+    /// same storage dir must ALL report healthy. On the old fixed-path code
+    /// (`.health-probe` shared across calls with write -> read-back -> delete)
+    /// this races - one call's `remove_file` deletes the file another call is
+    /// reading (spurious ENOENT) or interleaved writes corrupt the read-back -
+    /// producing spurious "unhealthy" results. The unique-per-call path removes
+    /// the shared file, so every probe is independent.
+    #[tokio::test]
+    async fn test_probe_storage_health_filesystem_concurrent_all_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(fs_config(dir.path()));
+
+        let mut handles = Vec::new();
+        for _ in 0..40 {
+            let config = Arc::clone(&config);
+            handles.push(tokio::spawn(async move {
+                let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+                probe_storage_health(&config, &storage).await
+            }));
+        }
+
+        let mut unhealthy = Vec::new();
+        for h in handles {
+            let status = h.await.unwrap();
+            if status.status != STATUS_HEALTHY {
+                unhealthy.push(status.message);
+            }
+        }
+        assert!(
+            unhealthy.is_empty(),
+            "{} of 40 concurrent probes were not healthy: {:?}",
+            unhealthy.len(),
+            unhealthy
+        );
+
+        // No probe files should remain after the burst.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".health-probe"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "{} probe files left behind after concurrent burst",
+            leftovers.len()
+        );
+    }
+
+    /// The process-wide TTL cache returns a previously-cached result without
+    /// re-probing, then refreshes after the entry expires. We seed the cache
+    /// with a known value via `check_storage_health`, then mutate the cache's
+    /// timestamp to simulate expiry and confirm a fresh probe runs.
+    ///
+    /// This test is `#[serial]`-free by construction: it owns the cache for the
+    /// duration by clearing it first; other tests use `probe_storage_health`
+    /// (uncached) so they cannot race this one through the shared cache.
+    #[tokio::test]
+    async fn test_check_storage_health_ttl_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fs_config(dir.path());
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+
+        // Start from a clean cache so we control its contents.
+        *STORAGE_HEALTH_CACHE.lock().await = None;
+
+        // First call populates the cache.
+        let first = check_storage_health(&config, &storage).await;
+        assert_eq!(first.status, STATUS_HEALTHY);
+        {
+            let cache = STORAGE_HEALTH_CACHE.lock().await;
+            assert!(
+                cache.is_some(),
+                "first call should have populated the cache"
+            );
+        }
+
+        // Overwrite the cache with a fresh-but-unhealthy sentinel; the next
+        // call must return it WITHOUT re-probing (the probe would say healthy).
+        {
+            let mut cache = STORAGE_HEALTH_CACHE.lock().await;
+            *cache = Some((
+                Instant::now(),
+                CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some("cached sentinel".to_string()),
+                },
+            ));
+        }
+        let cached = check_storage_health(&config, &storage).await;
+        assert_eq!(
+            cached.status, STATUS_UNHEALTHY,
+            "fresh cache entry must be served without re-probing"
+        );
+        assert_eq!(cached.message.as_deref(), Some("cached sentinel"));
+
+        // Expire the cached entry by backdating its timestamp; the next call
+        // must re-probe and return the real (healthy) status.
+        {
+            let mut cache = STORAGE_HEALTH_CACHE.lock().await;
+            let stale_at = Instant::now()
+                .checked_sub(STORAGE_HEALTH_TTL + Duration::from_secs(1))
+                .expect("test clock");
+            if let Some((ref mut at, _)) = *cache {
+                *at = stale_at;
+            }
+        }
+        let refreshed = check_storage_health(&config, &storage).await;
+        assert_eq!(
+            refreshed.status, STATUS_HEALTHY,
+            "expired cache entry must trigger a fresh probe"
+        );
+
+        // Leave the cache clean for any other consumer.
+        *STORAGE_HEALTH_CACHE.lock().await = None;
     }
 }
