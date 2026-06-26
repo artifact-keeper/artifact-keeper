@@ -49,6 +49,12 @@ pub struct OidcConfigRow {
     /// Artifact Keeper group memberships (auto-creating groups on first
     /// sight). Otherwise legacy role mapping is used.
     pub map_groups_to_groups: bool,
+    /// Opt-in compatibility flag (migration 144): when true, ID tokens
+    /// signed with RSA keys shorter than 2048 bits are accepted via a
+    /// manual `rsa` + `sha2` PKCS#1 v1.5 path, restricted to RS256/384/512.
+    /// Defaults to false; intended only for legacy IdPs (e.g. Lark
+    /// AnyCross) whose JWKS still publishes a 1024-bit RSA key.
+    pub allow_legacy_rsa_keys: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -153,6 +159,11 @@ pub struct OidcConfigResponse {
     pub auto_create_users: bool,
     pub pkce_enabled: bool,
     pub map_groups_to_groups: bool,
+    /// Opt-in compatibility flag (migration 144): when true the OIDC
+    /// provider accepts ID tokens signed with RSA keys shorter than
+    /// 2048 bits via a restricted RS256/384/512 PKCS#1 v1.5 path.
+    /// Below the OWASP ASVS 4.0 baseline; only enable for legacy IdPs.
+    pub allow_legacy_rsa_keys: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -225,6 +236,12 @@ pub struct CreateOidcConfigRequest {
     /// group memberships (auto-creating groups on first sight). Defaults to
     /// `false` to preserve legacy role-mapping behavior.
     pub map_groups_to_groups: Option<bool>,
+    /// Opt-in compatibility flag (migration 144): when `true` the provider
+    /// accepts ID tokens signed with RSA keys shorter than 2048 bits via a
+    /// restricted RS256/384/512 PKCS#1 v1.5 fallback path. Defaults to
+    /// `false`. Below the OWASP ASVS 4.0 baseline; only enable for legacy
+    /// IdPs such as Lark AnyCross.
+    pub allow_legacy_rsa_keys: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -248,6 +265,7 @@ pub struct UpdateOidcConfigRequest {
     pub auto_create_users: Option<bool>,
     pub pkce_enabled: Option<bool>,
     pub map_groups_to_groups: Option<bool>,
+    pub allow_legacy_rsa_keys: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -467,7 +485,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
-                   pkce_enabled, map_groups_to_groups,
+                   pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                    created_at, updated_at
             FROM oidc_configs
             ORDER BY name
@@ -485,7 +503,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
-                   pkce_enabled, map_groups_to_groups,
+                   pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -506,7 +524,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
-                   pkce_enabled, map_groups_to_groups,
+                   pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -546,16 +564,17 @@ impl AuthConfigService {
         let auto_create_users = req.auto_create_users.unwrap_or(true);
         let pkce_enabled = req.pkce_enabled.unwrap_or(true);
         let map_groups_to_groups = req.map_groups_to_groups.unwrap_or(false);
+        let allow_legacy_rsa_keys = req.allow_legacy_rsa_keys.unwrap_or(false);
 
         let row = sqlx::query_as::<_, OidcConfigRow>(
             r#"
             INSERT INTO oidc_configs (id, name, issuer_url, client_id, client_secret_encrypted,
                                       scopes, attribute_mapping, is_enabled, auto_create_users,
-                                      pkce_enabled, map_groups_to_groups)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                      pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
-                      pkce_enabled, map_groups_to_groups,
+                      pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                       created_at, updated_at
             "#,
         )
@@ -570,6 +589,7 @@ impl AuthConfigService {
         .bind(auto_create_users)
         .bind(pkce_enabled)
         .bind(map_groups_to_groups)
+        .bind(allow_legacy_rsa_keys)
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create OIDC config: {e}")))?;
@@ -586,7 +606,7 @@ impl AuthConfigService {
             r#"
             SELECT id, name, issuer_url, client_id, client_secret_encrypted,
                    scopes, attribute_mapping, is_enabled, auto_create_users,
-                   pkce_enabled, map_groups_to_groups,
+                   pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                    created_at, updated_at
             FROM oidc_configs
             WHERE id = $1
@@ -616,6 +636,9 @@ impl AuthConfigService {
         let map_groups_to_groups = req
             .map_groups_to_groups
             .unwrap_or(existing.map_groups_to_groups);
+        let allow_legacy_rsa_keys = req
+            .allow_legacy_rsa_keys
+            .unwrap_or(existing.allow_legacy_rsa_keys);
 
         // Preserve existing encrypted secret if not provided
         let secret_hex = if let Some(new_secret) = &req.client_secret {
@@ -630,12 +653,12 @@ impl AuthConfigService {
             UPDATE oidc_configs
             SET name = $1, issuer_url = $2, client_id = $3, client_secret_encrypted = $4,
                 scopes = $5, attribute_mapping = $6, is_enabled = $7, auto_create_users = $8,
-                pkce_enabled = $9, map_groups_to_groups = $10,
+                pkce_enabled = $9, map_groups_to_groups = $10, allow_legacy_rsa_keys = $11,
                 updated_at = NOW()
-            WHERE id = $11
+            WHERE id = $12
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
-                      pkce_enabled, map_groups_to_groups,
+                      pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                       created_at, updated_at
             "#,
         )
@@ -649,6 +672,7 @@ impl AuthConfigService {
         .bind(auto_create_users)
         .bind(pkce_enabled)
         .bind(map_groups_to_groups)
+        .bind(allow_legacy_rsa_keys)
         .bind(id)
         .fetch_one(pool)
         .await
@@ -681,7 +705,7 @@ impl AuthConfigService {
             WHERE id = $2
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
-                      pkce_enabled, map_groups_to_groups,
+                      pkce_enabled, map_groups_to_groups, allow_legacy_rsa_keys,
                       created_at, updated_at
             "#,
         )
@@ -708,6 +732,7 @@ impl AuthConfigService {
             auto_create_users: row.auto_create_users,
             pkce_enabled: row.pkce_enabled,
             map_groups_to_groups: row.map_groups_to_groups,
+            allow_legacy_rsa_keys: row.allow_legacy_rsa_keys,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -1714,6 +1739,7 @@ impl From<CreateOidcConfigRequest> for UpdateOidcConfigRequest {
             auto_create_users: c.auto_create_users,
             pkce_enabled: c.pkce_enabled,
             map_groups_to_groups: c.map_groups_to_groups,
+            allow_legacy_rsa_keys: c.allow_legacy_rsa_keys,
         }
     }
 }
@@ -1829,6 +1855,7 @@ mod tests {
             auto_create_users: false,
             pkce_enabled: true,
             map_groups_to_groups: false,
+            allow_legacy_rsa_keys: false,
             created_at: now,
             updated_at: now,
         }
@@ -2096,6 +2123,7 @@ mod tests {
             auto_create_users: false,
             pkce_enabled: true,
             map_groups_to_groups: false,
+            allow_legacy_rsa_keys: false,
             created_at: now,
             updated_at: now,
         };
@@ -2567,6 +2595,7 @@ mod tests {
             auto_create_users: None,
             pkce_enabled: None,
             map_groups_to_groups: None,
+            allow_legacy_rsa_keys: None,
         };
         let u: UpdateOidcConfigRequest = c.into();
         assert_eq!(u.issuer_url, Some("https://idp".to_string()));
@@ -2633,6 +2662,7 @@ mod tests {
                 auto_create_users: Some(true),
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                allow_legacy_rsa_keys: None,
             }
         }
 
@@ -2790,6 +2820,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
                 .await
@@ -2833,6 +2864,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
                 .await
@@ -2870,6 +2902,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: Some(false),
                 map_groups_to_groups: Some(true),
+                allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
                 .await
@@ -2904,6 +2937,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
                 .await
