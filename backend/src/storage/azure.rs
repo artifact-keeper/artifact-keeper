@@ -1116,6 +1116,7 @@ impl AzureBackend {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_put(&url, key, &content).await?;
@@ -1132,6 +1133,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let response = self.authorized_get(&url).await?;
@@ -1181,6 +1183,7 @@ impl StorageBackend for AzureBackend {
         Ok(bytes)
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1212,6 +1215,9 @@ impl StorageBackend for AzureBackend {
         )))
     }
 
+    // The span covers GET initiation (time-to-first-byte); the body transfer
+    // happens later as the caller polls the returned stream.
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let mut response = self.authorized_get(&url).await?;
@@ -1255,6 +1261,7 @@ impl StorageBackend for AzureBackend {
         Ok(Box::pin(stream))
     }
 
+    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1329,6 +1336,7 @@ impl StorageBackend for AzureBackend {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let size = match self.size(source).await {
             Ok(size) => size,
@@ -1374,6 +1382,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1403,6 +1412,7 @@ impl StorageBackend for AzureBackend {
         Ok(false)
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_delete(&url, key).await?;
@@ -1425,6 +1435,7 @@ impl StorageBackend for AzureBackend {
     /// revalidation. Returns `Ok(None)` for a missing blob or for a
     /// response without an `ETag` header so the freshness probe can fall
     /// through to the slow path without surfacing a backend error.
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1451,6 +1462,7 @@ impl StorageBackend for AzureBackend {
         self.config.redirect_downloads && !self.is_rbac()
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1486,6 +1498,7 @@ impl StorageBackend for AzureBackend {
     /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
     /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
     /// not O(file_size).
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::BufReader;
@@ -1561,6 +1574,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
