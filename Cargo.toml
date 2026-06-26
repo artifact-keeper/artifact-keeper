@@ -96,7 +96,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
 wasmtime = { version = "36.0.11", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.11"
+wasmtime-wasi = "42.0.2"
 
 # Git operations
 git2 = "0.20"
