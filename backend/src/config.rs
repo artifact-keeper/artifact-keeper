@@ -11,6 +11,35 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Parse a comma-separated list of CIDR ranges from env var `key`.
+///
+/// Whitespace around each entry is trimmed and empty entries are dropped.
+/// Individual entries that fail to parse are logged at warn level and skipped
+/// (rather than aborting startup), so one typo never takes down the whole
+/// list. An unset or empty var yields an empty list. Shared by the
+/// rate-limit exemption (`RATE_LIMIT_TRUSTED_CIDRS`) and trusted-proxy
+/// (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`) lists so both honor the same syntax.
+fn parse_cidr_list_env(key: &str) -> Vec<crate::api::middleware::rate_limit::CidrRange> {
+    env::var(key)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .filter_map(
+                    |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
+                        Ok(cidr) => Some(cidr),
+                        Err(e) => {
+                            tracing::warn!("Ignoring invalid CIDR in {}: {}", key, e);
+                            None
+                        }
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse an opt-in boolean flag from an optional env value.
 ///
 /// Returns `true` only for `"true"` / `"1"` (case-insensitive, trimmed);
@@ -415,6 +444,22 @@ pub struct Config {
     /// Example: `10.0.0.0/8,fc00::/7,127.0.0.1/32`.
     pub rate_limit_trusted_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
 
+    /// Comma-separated list of CIDR ranges identifying *trusted reverse
+    /// proxies*. The `X-Forwarded-For` header is consulted to resolve the
+    /// real client IP for rate-limit keying **only** when the immediate TCP
+    /// peer (from `ConnectInfo`) falls within one of these ranges. When empty
+    /// (the default), `X-Forwarded-For` is never trusted and keying always
+    /// tracks the real TCP peer, so a spoofed/rotating `XFF` from an untrusted
+    /// client cannot steer or multiply its rate-limit budget.
+    ///
+    /// This is distinct from `rate_limit_trusted_cidrs`, which exempts IPs
+    /// from rate limiting entirely; this field only governs whether `XFF` is
+    /// believed for client-IP resolution.
+    ///
+    /// Env var: `RATE_LIMIT_TRUSTED_PROXY_CIDRS`. Default: empty.
+    /// Example (single reverse proxy on loopback): `127.0.0.0/8`.
+    pub rate_limit_trusted_proxy_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
+
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
     pub account_lockout_threshold: u32,
@@ -665,6 +710,7 @@ impl Default for Config {
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
+            rate_limit_trusted_proxy_cidrs: Vec::new(),
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -870,27 +916,8 @@ impl Config {
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")
             ),
-            rate_limit_trusted_cidrs: env::var("RATE_LIMIT_TRUSTED_CIDRS")
-                .ok()
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|c| !c.is_empty())
-                        .filter_map(
-                            |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
-                                Ok(cidr) => Some(cidr),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Ignoring invalid CIDR in RATE_LIMIT_TRUSTED_CIDRS: {}",
-                                        e
-                                    );
-                                    None
-                                }
-                            },
-                        )
-                        .collect()
-                })
-                .unwrap_or_default(),
+            rate_limit_trusted_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_CIDRS"),
+            rate_limit_trusted_proxy_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_PROXY_CIDRS"),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
             quarantine_enabled: matches!(
