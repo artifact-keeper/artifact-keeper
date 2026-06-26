@@ -283,6 +283,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_trusted_cidrs.clone(),
     ));
 
+    // Trusted reverse-proxy CIDRs (#2023). `X-Forwarded-For` is believed for
+    // client-IP resolution only when the immediate TCP peer falls within one
+    // of these ranges; empty (the default) means XFF is never trusted and the
+    // real TCP peer is always the rate-limit key. Shared by every limiter
+    // state so the policy is uniform across endpoints.
+    let trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+
     let auth_rate_limiter = Arc::new(RateLimiter::new(
         state.config.rate_limit_auth_per_window,
         state.config.rate_limit_window_secs,
@@ -334,6 +341,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&auth_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
     // Login-only state: keys the shared auth limiter per-(username, IP) and
     // gates it behind the global shedding backstop. Applied only to /login so
@@ -343,6 +351,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             limiter: Arc::clone(&auth_rate_limiter),
             exemptions: Arc::clone(&exemptions),
             enabled: rate_limit_enabled,
+            trusted_proxies: Arc::clone(&trusted_proxies),
         },
         backstop: Arc::clone(&login_global_rate_limiter),
     };
@@ -353,26 +362,31 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&auth_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
     let api_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&api_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
     let search_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&search_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
     let presign_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&presign_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
     let password_change_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&password_change_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
