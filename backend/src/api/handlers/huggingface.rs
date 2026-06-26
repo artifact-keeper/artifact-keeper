@@ -269,13 +269,17 @@ async fn download_file(
         }
     };
 
-    proxy_helpers::serve_local_artifact(
+    // Opt out of the presigned redirect: huggingface_hub reads X-Linked-Etag /
+    // X-Linked-Size off the /resolve/ response, which a bare 302 to object
+    // storage cannot carry, so keep streaming for this format.
+    proxy_helpers::serve_local_artifact_redirectable(
         &state,
         &repo,
         artifact.id,
         &artifact.storage_key,
         "application/octet-stream",
         Some(filename),
+        false,
     )
     .await
 }
