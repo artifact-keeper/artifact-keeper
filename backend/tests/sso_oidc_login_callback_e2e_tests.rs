@@ -289,6 +289,7 @@ async fn create_provider_with(pool: &PgPool, idp: &MockIdp, opts: ProviderOpts) 
             auto_create_users: Some(opts.auto_create_users),
             pkce_enabled: Some(true),
             map_groups_to_groups: Some(opts.map_groups_to_groups),
+            allow_legacy_rsa_keys: None,
         },
     )
     .await
