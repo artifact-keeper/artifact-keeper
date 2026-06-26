@@ -113,6 +113,18 @@ impl NexusClient {
         Ok(Self { client, config })
     }
 
+    /// Send an authenticated GET. Returns the raw response so the caller can
+    /// map success/failure to its own error type and extract the body shape
+    /// it needs (JSON, bytes, streaming).
+    async fn send_authenticated(&self, url: String) -> Result<reqwest::Response, ArtifactoryError> {
+        self.client
+            .get(&url)
+            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
+            .send()
+            .await
+            .map_err(ArtifactoryError::from)
+    }
+
     /// Build an authenticated GET request
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ArtifactoryError> {
         if self.config.throttle_delay_ms > 0 {
@@ -120,12 +132,7 @@ impl NexusClient {
         }
 
         let url = format!("{}{}", self.config.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
-            .send()
-            .await?;
+        let response = self.send_authenticated(url).await?;
 
         let status = response.status();
         if status.is_success() {
@@ -227,6 +234,7 @@ impl NexusClient {
                             component.version.as_deref().unwrap_or("0")
                         )
                     });
+                    let path_str = path_str.trim_start_matches('/').to_string();
                     let (dir, name) = match path_str.rsplit_once('/') {
                         Some((d, n)) => (d.to_string(), n.to_string()),
                         None => (".".to_string(), path_str),
@@ -281,12 +289,7 @@ impl NexusClient {
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
         let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
-        let response = self
-            .client
-            .get(&url)
-            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
-            .send()
-            .await?;
+        let response = self.send_authenticated(url).await?;
 
         let status = response.status();
         if status.is_success() {
@@ -320,12 +323,7 @@ impl NexusClient {
         use futures::StreamExt;
 
         let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
-        let response = self
-            .client
-            .get(&url)
-            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
-            .send()
-            .await?;
+        let response = self.send_authenticated(url).await?;
 
         let status = response.status();
         if status.is_success() {
@@ -418,6 +416,32 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn setup_nexus_mock(
+        server_path: &str,
+        response: ResponseTemplate,
+    ) -> (MockServer, NexusClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(server_path))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+        })
+        .unwrap();
+        (server, client)
+    }
 
     #[test]
     fn test_nexus_config_default() {
@@ -694,29 +718,15 @@ mod tests {
     #[tokio::test]
     async fn test_download_artifact_stream_yields_chunks() {
         use futures::StreamExt;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let body_size: usize = 64 * 1024 * 1024;
         let body = vec![0xABu8; body_size];
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repository/raw-local/big.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&server)
-            .await;
-
-        let client = NexusClient::new(NexusClientConfig {
-            base_url: server.uri(),
-            auth: NexusAuth {
-                username: "u".into(),
-                password: "p".into(),
-            },
-            timeout_secs: 30,
-            throttle_delay_ms: 0,
-        })
-        .unwrap();
+        let (_server, client) = setup_nexus_mock(
+            "/repository/raw-local/big.bin",
+            ResponseTemplate::new(200).set_body_bytes(body.clone()),
+        )
+        .await;
 
         let mut stream = client
             .download_artifact_stream("raw-local", "big.bin")
@@ -755,29 +765,15 @@ mod tests {
     #[tokio::test]
     async fn test_download_artifact_stream_matches_buffered() {
         use futures::StreamExt;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         // Mix of byte values so a byte-shift bug surfaces clearly.
         let body: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repository/raw-local/mixed.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&server)
-            .await;
-
-        let client = NexusClient::new(NexusClientConfig {
-            base_url: server.uri(),
-            auth: NexusAuth {
-                username: "u".into(),
-                password: "p".into(),
-            },
-            timeout_secs: 30,
-            throttle_delay_ms: 0,
-        })
-        .unwrap();
+        let (_server, client) = setup_nexus_mock(
+            "/repository/raw-local/mixed.bin",
+            ResponseTemplate::new(200).set_body_bytes(body.clone()),
+        )
+        .await;
 
         let mut stream = client
             .download_artifact_stream("raw-local", "mixed.bin")
@@ -802,31 +798,16 @@ mod tests {
     async fn test_source_registry_stream_keeps_memory_bounded() {
         use crate::services::source_registry::SourceRegistry;
         use futures::StreamExt;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let body_size: usize = 32 * 1024 * 1024; // 32 MiB
         let body = vec![0x5Au8; body_size];
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repository/raw-local/large.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&server)
-            .await;
-
-        let client: std::sync::Arc<dyn SourceRegistry> = std::sync::Arc::new(
-            NexusClient::new(NexusClientConfig {
-                base_url: server.uri(),
-                auth: NexusAuth {
-                    username: "u".into(),
-                    password: "p".into(),
-                },
-                timeout_secs: 30,
-                throttle_delay_ms: 0,
-            })
-            .unwrap(),
-        );
+        let (_server, client) = setup_nexus_mock(
+            "/repository/raw-local/large.bin",
+            ResponseTemplate::new(200).set_body_bytes(body.clone()),
+        )
+        .await;
+        let client: std::sync::Arc<dyn SourceRegistry> = std::sync::Arc::new(client);
 
         let mut stream = client
             .download_artifact_stream("raw-local", "large.bin")
@@ -856,5 +837,88 @@ mod tests {
             "peak in-flight chunk {peak_in_flight} approaches full body {body_size}; \
              streaming is buffering"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_strips_leading_slash_from_nexus_paths() {
+        let nexus_response = serde_json::json!({
+            "items": [{
+                "id": "comp-1",
+                "repository": "maven-releases",
+                "format": "maven2",
+                "group": "cglib",
+                "name": "cglib-nodep",
+                "version": "3.2.5",
+                "assets": [
+                    {
+                        "id": "a-jar",
+                        "path": "/cglib/cglib-nodep/3.2.5/cglib-nodep-3.2.5.jar",
+                        "downloadUrl": "https://nexus.example.com/repository/maven-releases/cglib/cglib-nodep/3.2.5/cglib-nodep-3.2.5.jar",
+                        "checksum": {"sha256": "h1", "sha1": "h2", "md5": "h3"},
+                        "contentType": "application/java-archive",
+                        "fileSize": 1024
+                    },
+                    {
+                        "id": "a-sources",
+                        "path": "/cglib/cglib-nodep/3.2.5/cglib-nodep-3.2.5-sources.jar",
+                        "downloadUrl": "https://nexus.example.com/repository/maven-releases/cglib/cglib-nodep/3.2.5/cglib-nodep-3.2.5-sources.jar",
+                        "checksum": {"sha256": "h4", "sha1": "h5", "md5": "h6"},
+                        "contentType": "application/java-archive",
+                        "fileSize": 2048
+                    },
+                    {
+                        "id": "a-root",
+                        "path": "/top-level.bin",
+                        "downloadUrl": "https://nexus.example.com/repository/raw-local/top-level.bin",
+                        "checksum": {"sha256": "h7", "sha1": "h8", "md5": "h9"},
+                        "contentType": "application/octet-stream",
+                        "fileSize": 16
+                    }
+                ]
+            }],
+            "continuationToken": null
+        })
+        .to_string();
+
+        let (_server, client) = setup_nexus_mock(
+            "/service/rest/v1/components",
+            ResponseTemplate::new(200).set_body_string(nexus_response),
+        )
+        .await;
+
+        let page = client
+            .list_artifacts("maven-releases", 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.results.len(), 3, "expected all three assets");
+
+        for r in &page.results {
+            assert!(
+                !r.path.starts_with('/'),
+                "AqlResult.path must be relative, got {:?}",
+                r.path
+            );
+            assert!(
+                !r.name.is_empty(),
+                "name must not be empty, got {:?} for path {:?}",
+                r.name,
+                r.path
+            );
+        }
+
+        let jar = page
+            .results
+            .iter()
+            .find(|r| r.name == "cglib-nodep-3.2.5.jar")
+            .expect("jar asset");
+        assert_eq!(jar.path, "cglib/cglib-nodep/3.2.5");
+        assert_eq!(jar.repo, "maven-releases");
+
+        let root = page
+            .results
+            .iter()
+            .find(|r| r.name == "top-level.bin")
+            .expect("root asset");
+        assert_eq!(root.path, ".");
     }
 }
