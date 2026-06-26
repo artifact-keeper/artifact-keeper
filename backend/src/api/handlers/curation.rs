@@ -3,7 +3,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{get, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use crate::services::curation_service::CurationService;
     paths(
         list_rules,
         create_rule,
+        get_rule,
         update_rule,
         delete_rule,
         list_packages,
@@ -54,7 +55,10 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Rules
         .route("/rules", get(list_rules).post(create_rule))
-        .route("/rules/{id}", put(update_rule).delete(delete_rule))
+        .route(
+            "/rules/:id",
+            get(get_rule).put(update_rule).delete(delete_rule),
+        )
         // Packages
         .route("/packages", get(list_packages))
         .route("/packages/{id}", get(get_package))
@@ -72,6 +76,7 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = CurationCreateRuleRequest)]
 pub struct CreateRuleRequest {
     pub staging_repo_id: Option<Uuid>,
     pub package_pattern: String,
@@ -94,6 +99,7 @@ fn default_priority() -> i32 {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = CurationUpdateRuleRequest)]
 pub struct UpdateRuleRequest {
     pub package_pattern: String,
     #[serde(default = "default_wildcard")]
@@ -243,6 +249,26 @@ async fn create_rule(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(rule_to_response(rule))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/curation/rules/{id}",
+    operation_id = "get_curation_rule",
+    params(("id" = Uuid, Path, description = "Rule ID")),
+    responses(
+        (status = 200, body = RuleResponse),
+        (status = 404, description = "Rule not found")
+    ),
+    tag = "Curation"
+)]
+async fn get_rule(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RuleResponse>, AppError> {
+    let svc = CurationService::new(state.db.clone());
+    let rule = svc.get_rule(id).await?;
+    Ok(Json(rule_to_response(rule)))
 }
 
 #[utoipa::path(
@@ -555,5 +581,117 @@ mod tests {
             AppError::Authorization(msg) => assert_eq!(msg, "Admin access required"),
             other => panic!("Expected Authorization error, got: {:?}", other),
         }
+    }
+
+    // -- OpenAPI contract (#2020) --------------------------------------------
+    //
+    // The curation create/update DTOs must export distinct component names so
+    // they no longer collide with promotion_rules' bare `CreateRuleRequest`
+    // (which the merged spec previously let win). Each curation endpoint must
+    // document its own struct with the genuinely-required curation fields.
+
+    fn curation_spec_json() -> serde_json::Value {
+        serde_json::to_value(CurationApiDoc::openapi()).expect("serialize curation openapi")
+    }
+
+    #[test]
+    fn test_openapi_curation_schema_has_distinct_component_names() {
+        let spec = curation_spec_json();
+        let schemas = &spec["components"]["schemas"];
+        assert!(
+            schemas.get("CurationCreateRuleRequest").is_some(),
+            "expected CurationCreateRuleRequest component"
+        );
+        assert!(
+            schemas.get("CurationUpdateRuleRequest").is_some(),
+            "expected CurationUpdateRuleRequest component"
+        );
+        // The bare collision names must NOT be emitted by the curation doc.
+        assert!(
+            schemas.get("CreateRuleRequest").is_none(),
+            "curation doc must not emit bare CreateRuleRequest"
+        );
+        assert!(
+            schemas.get("UpdateRuleRequest").is_none(),
+            "curation doc must not emit bare UpdateRuleRequest"
+        );
+    }
+
+    #[test]
+    fn test_openapi_curation_create_required_fields() {
+        let spec = curation_spec_json();
+        let required = spec["components"]["schemas"]["CurationCreateRuleRequest"]["required"]
+            .as_array()
+            .expect("CurationCreateRuleRequest.required array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for field in ["package_pattern", "action", "reason"] {
+            assert!(
+                required.contains(&field),
+                "expected {field} in required, got {required:?}"
+            );
+        }
+        // Defaulted/optional fields must not be required.
+        for field in [
+            "staging_repo_id",
+            "version_constraint",
+            "architecture",
+            "priority",
+        ] {
+            assert!(
+                !required.contains(&field),
+                "{field} must not be required, got {required:?}"
+            );
+        }
+        // `name` belongs to promotion rules, not curation.
+        assert!(
+            !required.contains(&"name"),
+            "curation create must not require name"
+        );
+    }
+
+    #[test]
+    fn test_openapi_curation_create_request_body_refs_curation_schema() {
+        let spec = curation_spec_json();
+        let schema_ref = spec["paths"]["/api/v1/curation/rules"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str()
+            .expect("curation create requestBody $ref");
+        assert!(
+            schema_ref.ends_with("CurationCreateRuleRequest"),
+            "expected $ref to CurationCreateRuleRequest, got {schema_ref}"
+        );
+    }
+
+    #[test]
+    fn test_openapi_curation_get_by_id_route_present() {
+        let spec = curation_spec_json();
+        assert!(
+            spec["paths"]["/api/v1/curation/rules/{id}"]
+                .get("get")
+                .is_some(),
+            "expected GET /api/v1/curation/rules/{{id}} in spec"
+        );
+    }
+
+    #[test]
+    fn test_create_rule_request_serde_round_trip() {
+        // The 3-field body the corrected contract documents must deserialize and
+        // apply the documented defaults for the omitted optional fields.
+        let body = serde_json::json!({
+            "package_pattern": "evil-*",
+            "action": "block",
+            "reason": "qa"
+        });
+        let req: CreateRuleRequest =
+            serde_json::from_value(body).expect("deserialize 3-field curation create body");
+        assert_eq!(req.package_pattern, "evil-*");
+        assert_eq!(req.action, "block");
+        assert_eq!(req.reason, "qa");
+        assert_eq!(req.version_constraint, "*");
+        assert_eq!(req.architecture, "*");
+        assert_eq!(req.priority, 100);
+        assert!(req.staging_repo_id.is_none());
     }
 }

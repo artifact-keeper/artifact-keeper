@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::error::AppError;
 use crate::models::curation::{CurationPackage, CurationRule};
 
 /// Result of evaluating a package against curation rules.
@@ -150,6 +151,16 @@ impl CurationService {
         }
     }
 
+    /// Fetch a single rule by id. Returns `NotFound` when the id is unknown.
+    pub async fn get_rule(&self, rule_id: Uuid) -> Result<CurationRule, AppError> {
+        let rule: Option<CurationRule> =
+            sqlx::query_as("SELECT * FROM curation_rules WHERE id = $1")
+                .bind(rule_id)
+                .fetch_optional(&self.db)
+                .await?;
+        rule.ok_or_else(|| AppError::NotFound("Curation rule not found".to_string()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn update_rule(
         &self,
@@ -161,8 +172,8 @@ impl CurationService {
         priority: i32,
         reason: &str,
         enabled: bool,
-    ) -> Result<CurationRule, sqlx::Error> {
-        sqlx::query_as(
+    ) -> Result<CurationRule, AppError> {
+        let rule: Option<CurationRule> = sqlx::query_as(
             r#"UPDATE curation_rules SET
                package_pattern = $2, version_constraint = $3, architecture = $4,
                action = $5, priority = $6, reason = $7, enabled = $8, updated_at = now()
@@ -177,15 +188,19 @@ impl CurationService {
         .bind(priority)
         .bind(reason)
         .bind(enabled)
-        .fetch_one(&self.db)
-        .await
+        .fetch_optional(&self.db)
+        .await?;
+        rule.ok_or_else(|| AppError::NotFound("Curation rule not found".to_string()))
     }
 
-    pub async fn delete_rule(&self, rule_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM curation_rules WHERE id = $1")
+    pub async fn delete_rule(&self, rule_id: Uuid) -> Result<(), AppError> {
+        let result = sqlx::query("DELETE FROM curation_rules WHERE id = $1")
             .bind(rule_id)
             .execute(&self.db)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound("Curation rule not found".to_string()));
+        }
         Ok(())
     }
 
@@ -758,5 +773,56 @@ mod tests {
         );
         assert_eq!(eval.action, "review");
         assert!(eval.reason.contains("review"));
+    }
+
+    // -- by-id not-found mapping (#2020) --------------------------------------
+    //
+    // get_rule / update_rule / delete_rule must surface an unknown id as
+    // `AppError::NotFound` (HTTP 404), not a masked 204 (delete) or a 500 from
+    // `RowNotFound` (update). These tests are DB-backed and skip silently when
+    // `DATABASE_URL` is unset so offline `cargo test --lib` stays usable.
+    async fn try_service() -> Option<CurationService> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        Some(CurationService::new(pool))
+    }
+
+    #[tokio::test]
+    async fn test_get_rule_missing_id_returns_not_found() {
+        let Some(svc) = try_service().await else {
+            return;
+        };
+        let err = svc.get_rule(Uuid::new_v4()).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_rule_missing_id_returns_not_found() {
+        let Some(svc) = try_service().await else {
+            return;
+        };
+        let err = svc.delete_rule(Uuid::new_v4()).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_rule_missing_id_returns_not_found() {
+        let Some(svc) = try_service().await else {
+            return;
+        };
+        let err = svc
+            .update_rule(Uuid::new_v4(), "pkg-*", "*", "*", "block", 100, "qa", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 }
