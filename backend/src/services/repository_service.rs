@@ -178,6 +178,45 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
     query.map(|q| format!("%{}%", q.to_lowercase()))
 }
 
+/// SQL fragment: true when the user bound at `$user_param` holds a non-empty
+/// fine-grained `permissions` grant on `target_type = 'repository'` /
+/// `target_id = repo_id_expr`, either directly (`principal_type = 'user'`) or via
+/// a group they belong to (`principal_type = 'group'`, resolved through
+/// `user_group_members`).
+///
+/// This mirrors [`crate::services::permission_service::PermissionService`]'s
+/// `query_actions` predicate exactly (same principal/group UNION semantics,
+/// same target scoping), so repository *visibility* stays consistent with the
+/// data-plane permission check that already governs uploads/updates.
+///
+/// `repo_id_expr` is a SQL expression naming the repository id in the caller's
+/// query (e.g. `"r.id"` for a joined listing, or `"$2"` for a single-repo
+/// lookup). `user_param` is the 1-based positional bind index (`$N`) of the
+/// `user_id` value; this fragment introduces NO new bind — it reuses the same
+/// `user_id` the caller already binds for the role-assignment predicate.
+///
+/// `actions <> '{}'` keeps the fragment failing CLOSED for rows that exist but
+/// carry no actions, matching the data plane's "rules present but empty =>
+/// denied" rule. The repository scoping deliberately excludes any
+/// `target_type = 'system'` arm so visibility never widens beyond what the data
+/// plane honours for repository access.
+fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
+    format!(
+        r#"EXISTS (
+            SELECT 1 FROM permissions p
+            WHERE p.target_type = 'repository'
+              AND p.target_id = {repo_id_expr}
+              AND p.actions <> '{{}}'
+              AND (
+                  (p.principal_type = 'user' AND p.principal_id = ${user_param})
+                  OR (p.principal_type = 'group' AND p.principal_id IN (
+                      SELECT group_id FROM user_group_members WHERE user_id = ${user_param}
+                  ))
+              )
+        )"#
+    )
+}
+
 /// Build the SQL visibility clause and optional user_id bind value for
 /// repository listing queries.
 ///
@@ -215,6 +254,12 @@ pub(crate) fn build_visibility_clause_for(
         RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
+            // Visibility honours BOTH authz stores: the legacy `role_assignments`
+            // grant (creator auto-grant + seeded admin) AND fine-grained
+            // `permissions` grants written by `POST /api/v1/permissions`
+            // (including group grants). The shared fragment reuses the same
+            // `$user_param` bind, so no extra bind is introduced for any caller.
+            let perms = permissions_grant_exists(&format!("{table_alias}.id"), user_param);
             let clause = format!(
                 r#"(
                 is_public = true
@@ -223,6 +268,7 @@ pub(crate) fn build_visibility_clause_for(
                     WHERE ra.user_id = ${user_param}
                       AND (ra.repository_id = {table_alias}.id OR ra.repository_id IS NULL)
                 )
+                OR {perms}
             )"#
             );
             (clause, VisibilityBind::User(Some(*user_id)))
@@ -672,13 +718,18 @@ impl RepositoryService {
     /// short-circuiting the cases this method does NOT cover: admins bypass it
     /// entirely and public repositories are accessible to everyone.
     pub async fn user_can_access_repo(&self, repo_id: Uuid, user_id: Uuid) -> Result<bool> {
-        let granted: bool = sqlx::query_scalar(
+        // Access is granted via EITHER authz store, in a single round trip:
+        // the legacy `role_assignments` predicate OR a fine-grained
+        // `permissions` grant (direct or via group), mirroring the
+        // `RepoVisibility::User` listing arm so direct GET and listing agree.
+        let granted: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM role_assignments ra \
                  WHERE ra.user_id = $1 \
                    AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-             )",
-        )
+             ) OR {}",
+            permissions_grant_exists("$2", 1)
+        ))
         .bind(user_id)
         .bind(repo_id)
         .fetch_one(&self.db)
@@ -2053,6 +2104,56 @@ mod tests {
     }
 
     #[test]
+    fn test_visibility_user_clause_consults_permissions_and_groups() {
+        // #1996: the User listing arm must also honour fine-grained
+        // `permissions` grants (direct + group via user_group_members) while
+        // still honouring the legacy `role_assignments` store.
+        let uid = Uuid::new_v4();
+        let (clause, _) = build_visibility_clause(&RepoVisibility::User(uid));
+        assert!(clause.contains("permissions"), "must consult permissions");
+        assert!(
+            clause.contains("user_group_members"),
+            "must resolve group grants via user_group_members"
+        );
+        assert!(
+            clause.contains("role_assignments"),
+            "must still honour the legacy role_assignments store"
+        );
+        // Scoped to repository targets only, failing closed on empty actions.
+        assert!(clause.contains("p.target_type = 'repository'"));
+        assert!(clause.contains("p.actions <> '{}'"));
+        // No system-wide widening (would over-grant beyond the data plane).
+        assert!(
+            !clause.contains("'system'"),
+            "visibility must not widen via system-scoped grants"
+        );
+        // The permissions predicate reuses the SAME user bind ($3); no new bind.
+        assert!(clause.contains("p.principal_id = $3"));
+    }
+
+    #[test]
+    fn test_visibility_ids_public_all_do_not_consult_permissions() {
+        // The repo-scoped token (`Ids`, #1783) and the `PublicOnly`/`All` arms
+        // must stay strict — they must NOT pick up the permissions predicate.
+        for v in [
+            RepoVisibility::Ids(vec![Uuid::new_v4()]),
+            RepoVisibility::Ids(vec![]),
+            RepoVisibility::PublicOnly,
+            RepoVisibility::All,
+        ] {
+            let (clause, _) = build_visibility_clause(&v);
+            assert!(
+                !clause.contains("permissions"),
+                "{v:?} clause must not consult permissions: {clause}"
+            );
+            assert!(
+                !clause.contains("user_group_members"),
+                "{v:?} clause must not consult user_group_members: {clause}"
+            );
+        }
+    }
+
+    #[test]
     fn test_visibility_ids_restricts_to_id_set_only() {
         // Repo-scoped token: the clause must filter strictly on the allowed id
         // set ($3 = uuid[]) and must NOT widen to public repos or role grants.
@@ -2769,6 +2870,218 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             for uid in [owner_id, other_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #1996: `user_can_access_repo` must also honour a fine-grained
+        /// `permissions` grant (the table written by `POST /api/v1/permissions`),
+        /// not only `role_assignments`. A non-empty user-scoped repository grant
+        /// restores access; a row with empty `actions '{}'` must fail closed.
+        #[tokio::test]
+        async fn test_user_can_access_repo_permissions_grant_direct() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (grantee_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            // No grant of any kind -> denied.
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, grantee_id)
+                    .await
+                    .expect("no-grant access check"),
+                "ungranted user must NOT access a private repo"
+            );
+
+            // A permissions row with EMPTY actions must fail closed.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, '{}')",
+            )
+            .bind(grantee_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("insert empty-actions permission");
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, grantee_id)
+                    .await
+                    .expect("empty-actions access check"),
+                "empty-actions permission must not grant access"
+            );
+
+            // Populate the actions -> access via the permissions store.
+            sqlx::query(
+                "UPDATE permissions SET actions = ARRAY['read'] \
+                 WHERE principal_type = 'user' AND principal_id = $1 \
+                   AND target_type = 'repository' AND target_id = $2",
+            )
+            .bind(grantee_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("populate permission actions");
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, grantee_id)
+                    .await
+                    .expect("permissions-grant access check"),
+                "user with a non-empty permissions grant must have access"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+            for uid in [owner_id, grantee_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #1996 (group path): a `permissions` grant to a GROUP the user belongs
+        /// to (resolved via `user_group_members`) must also grant access — and
+        /// removing the membership revokes it.
+        #[tokio::test]
+        async fn test_user_can_access_repo_permissions_grant_via_group() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (member_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            let group_id: Uuid =
+                sqlx::query_scalar("INSERT INTO groups (name) VALUES ($1) RETURNING id")
+                    .bind(format!("grp-{suffix}"))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create group");
+
+            // Group holds the grant, but the user is not yet a member -> denied.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('group', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(group_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("insert group permission");
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, member_id)
+                    .await
+                    .expect("non-member access check"),
+                "non-member must NOT inherit a group grant"
+            );
+
+            // Add the user to the group -> access via the group grant.
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(member_id)
+                .bind(group_id)
+                .execute(&pool)
+                .await
+                .expect("add group member");
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, member_id)
+                    .await
+                    .expect("group-member access check"),
+                "group member must inherit the group's repository grant"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+            let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(group_id)
+                .execute(&pool)
+                .await;
+            for uid in [owner_id, member_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #1996: `list(RepoVisibility::User(..))` must return a private repo the
+        /// user can reach ONLY through a `permissions` grant (no role_assignment),
+        /// and must still exclude a private repo they hold no grant for.
+        #[tokio::test]
+        async fn test_list_user_visibility_includes_permissions_grant() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (grantee_id, _) = tdh::create_user(&pool).await;
+
+            let tag = format!("{}", uuid::Uuid::new_v4().simple());
+            // repo_granted: grantee gets a permissions grant only.
+            let mut req_g = make_create_req(&format!("{tag}g"), RepositoryFormat::Pypi);
+            req_g.created_by = Some(owner_id);
+            let repo_granted = service.create(req_g).await.expect("create granted repo");
+            // repo_other: grantee has no grant at all.
+            let mut req_o = make_create_req(&format!("{tag}o"), RepositoryFormat::Npm);
+            req_o.created_by = Some(owner_id);
+            let repo_other = service.create(req_o).await.expect("create other repo");
+
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(grantee_id)
+            .bind(repo_granted.id)
+            .execute(&pool)
+            .await
+            .expect("insert permissions grant");
+
+            let search = Some(format!("acs-repo-{tag}"));
+            let (repos, total) = service
+                .list(
+                    0,
+                    50,
+                    None,
+                    None,
+                    RepoVisibility::User(grantee_id),
+                    search.as_deref(),
+                )
+                .await
+                .expect("grantee list");
+
+            assert_eq!(total, 1, "grantee should see only the granted private repo");
+            assert_eq!(repos.len(), 1);
+            assert_eq!(repos[0].id, repo_granted.id);
+            assert!(
+                !repos.iter().any(|r| r.id == repo_other.id),
+                "ungranted private repo must not leak into the listing"
+            );
+
+            cleanup_repo(&pool, repo_granted.id).await;
+            cleanup_repo(&pool, repo_other.id).await;
+            for uid in [owner_id, grantee_id] {
                 let _ = sqlx::query("DELETE FROM users WHERE id = $1")
                     .bind(uid)
                     .execute(&pool)
