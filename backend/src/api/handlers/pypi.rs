@@ -554,6 +554,15 @@ async fn simple_project(
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
     let normalized = normalize_pep503(&project);
 
+    // PEP 691 content negotiation also governs the proxy path: a JSON client
+    // must get the upstream's JSON representation (which carries PEP 700
+    // `upload-time`), not its HTML index (which never does).
+    let wants_json = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .contains(PEP691_JSON_CONTENT_TYPE);
+
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
     let artifacts = sqlx::query!(
@@ -595,17 +604,50 @@ async fn simple_project(
             {
                 let (effective_upstream, upstream_path) =
                     pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
-                let (content, content_type) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    &effective_upstream,
-                    &upstream_path,
-                )
-                .await?;
+
+                let (content, content_type) = if wants_json {
+                    // Request the PEP 691 JSON form from upstream, cached under a
+                    // format-qualified key so it never collides with the HTML index.
+                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        &effective_upstream,
+                        &upstream_path,
+                        &format!("{}index.v1+json", upstream_path),
+                        Some(PEP691_JSON_CONTENT_TYPE),
+                    )
+                    .await?
+                } else {
+                    proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        &effective_upstream,
+                        &upstream_path,
+                    )
+                    .await?
+                };
+
+                let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+                // When the client asked for JSON and upstream honoured it, rewrite
+                // the JSON download URLs and serve PEP 691 — preserving PEP 700
+                // `upload-time`. Upstreams that ignore the Accept header return
+                // HTML and fall through to the HTML rewrite below.
+                if wants_json && ct.contains("json") {
+                    if let Some(json) =
+                        rewrite_upstream_simple_json(&content, &repo_key, &normalized)
+                    {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
+                            .body(Body::from(json))
+                            .unwrap());
+                    }
+                }
 
                 // Rewrite absolute download URLs to route through our proxy
-                let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
                 let body = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
@@ -722,14 +764,27 @@ async fn simple_project(
 
                 let (effective_upstream, upstream_path) =
                     pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
-                let result = proxy_helpers::proxy_fetch(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    &effective_upstream,
-                    &upstream_path,
-                )
-                .await;
+                let result = if wants_json {
+                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        &effective_upstream,
+                        &upstream_path,
+                        &format!("{}index.v1+json", upstream_path),
+                        Some(PEP691_JSON_CONTENT_TYPE),
+                    )
+                    .await
+                } else {
+                    proxy_helpers::proxy_fetch(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        &effective_upstream,
+                        &upstream_path,
+                    )
+                    .await
+                };
 
                 match result {
                     Ok((content, content_type)) => {
@@ -772,6 +827,27 @@ async fn simple_project(
                 }
                 (_, Some((content, content_type))) => {
                     let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+                    // JSON client + JSON upstream: rewrite the upstream download
+                    // URLs and splice in local entries, preserving PEP 700
+                    // `upload-time` on both. Upstreams that returned HTML despite
+                    // the JSON request fall through to the HTML merge below.
+                    if wants_json && ct.contains("json") {
+                        if let Some(json) = merge_local_into_remote_simple_json(
+                            &content,
+                            &repo_key,
+                            &normalized,
+                            &local_artifacts,
+                            &tracks,
+                        ) {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
+                                .body(Body::from(json))
+                                .unwrap());
+                        }
+                    }
+
                     let body = if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
@@ -2155,6 +2231,175 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
         .into_owned()
 }
 
+/// PEP 691 JSON simple-index media type.
+const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+
+/// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
+/// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
+/// for the HTML form, and strip the PEP 658/714 metadata signals the proxy
+/// cannot serve (`core-metadata`, `data-dist-info-metadata`). PEP 700
+/// `upload-time` and every other field are preserved untouched.
+fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normalized: &str) {
+    let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
+        return;
+    };
+    for file in files.iter_mut() {
+        let Some(filename) = file
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(obj) = file.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "url".to_owned(),
+            serde_json::Value::String(format!(
+                "/pypi/{}/simple/{}/{}",
+                repo_key, normalized, filename
+            )),
+        );
+        // The proxy cannot serve `.metadata` for distributions it has not
+        // cached, so drop the PEP 658/714 metadata signals — the JSON analogue
+        // of the `data-*-metadata` stripping in `rewrite_upstream_urls`.
+        obj.remove("core-metadata");
+        obj.remove("data-dist-info-metadata");
+    }
+}
+
+/// Rewrite a proxied upstream PEP 691 JSON simple-index response so download
+/// URLs route through the proxy endpoint. Returns `None` when the body is not
+/// valid PEP 691 JSON, so the caller can fall back to treating the upstream
+/// response as HTML.
+fn rewrite_upstream_simple_json(json: &[u8], repo_key: &str, normalized: &str) -> Option<String> {
+    let mut doc: serde_json::Value = serde_json::from_slice(json).ok()?;
+    if !doc.get("files").map(|f| f.is_array()).unwrap_or(false) {
+        return None;
+    }
+    rewrite_simple_json_files(&mut doc, repo_key, normalized);
+    serde_json::to_string(&doc).ok()
+}
+
+/// Splice local-member distributions into a proxied upstream PEP 691 JSON
+/// simple index so the union is visible through a virtual repo, mirroring
+/// `merge_local_into_remote_simple_html`. Upstream `files[].url`s are rewritten
+/// through the proxy; local entries already present upstream (matched by
+/// filename) are skipped. Local `versions` are unioned and operator `tracks`
+/// are surfaced under `meta.tracks`. Returns `None` when the upstream body is
+/// not valid PEP 691 JSON.
+fn merge_local_into_remote_simple_json(
+    json: &[u8],
+    repo_key: &str,
+    normalized: &str,
+    local: &[SimpleProjectArtifact],
+    tracks: &[String],
+) -> Option<String> {
+    let mut doc: serde_json::Value = serde_json::from_slice(json).ok()?;
+    if !doc.get("files").map(|f| f.is_array()).unwrap_or(false) {
+        return None;
+    }
+    rewrite_simple_json_files(&mut doc, repo_key, normalized);
+
+    // Filenames already present upstream — skip locals that duplicate them, so
+    // the union is idempotent when the same file exists in both members.
+    let existing: std::collections::HashSet<String> = doc
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| {
+                    f.get("filename")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut local_versions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut appended: Vec<serde_json::Value> = Vec::new();
+    for a in local {
+        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(filename) {
+            continue;
+        }
+        if let Some(v) = &a.version {
+            local_versions.insert(v.clone());
+        }
+        let mut file = serde_json::json!({
+            "filename": filename,
+            "url": format!("/pypi/{}/simple/{}/{}", repo_key, normalized, filename),
+            "hashes": { "sha256": &a.checksum_sha256 },
+            "size": a.size_bytes,
+        });
+        if let Some(rp) = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pkg_info"))
+            .and_then(|pi| pi.get("requires_python"))
+            .and_then(|v| v.as_str())
+        {
+            file["requires-python"] = serde_json::Value::String(rp.to_owned());
+        }
+        if let Some(ut) = a.upload_time {
+            file["upload-time"] =
+                serde_json::Value::String(ut.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+        appended.push(file);
+    }
+
+    if let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) {
+        files.extend(appended);
+    }
+
+    // Union the local distributions' versions into the advertised list.
+    if !local_versions.is_empty() {
+        let mut versions: std::collections::BTreeSet<String> = doc
+            .get("versions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        versions.extend(local_versions);
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "versions".to_owned(),
+                serde_json::Value::Array(
+                    versions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    // PEP 708: surface operator `tracks` under `meta.tracks`, mirroring the
+    // local emission and the HTML merge.
+    if !tracks.is_empty() {
+        if let Some(meta) = doc.get_mut("meta").and_then(|m| m.as_object_mut()) {
+            meta.insert(
+                "tracks".to_owned(),
+                serde_json::Value::Array(
+                    tracks
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    serde_json::to_string(&doc).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2719,6 +2964,184 @@ mod tests {
 
         // Structure should be preserved
         assert!(result.contains("<h1>Links for six</h1>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PEP 691 JSON proxy: upstream URL rewriting + upload-time preservation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_upload_time_strips_metadata() {
+        // Shape mirrors a real pypi.org PEP 691 JSON file object.
+        let upstream = r#"{
+            "meta": {"api-version": "1.1"},
+            "name": "requests",
+            "versions": ["2.31.0"],
+            "files": [
+                {
+                    "filename": "requests-2.31.0-py3-none-any.whl",
+                    "url": "https://files.pythonhosted.org/packages/aa/bb/requests-2.31.0-py3-none-any.whl",
+                    "hashes": {"sha256": "deadbeef"},
+                    "requires-python": ">=3.7",
+                    "size": 62574,
+                    "upload-time": "2023-05-22T15:12:42.313790Z",
+                    "core-metadata": {"sha256": "abc"},
+                    "data-dist-info-metadata": {"sha256": "abc"}
+                }
+            ]
+        }"#;
+        let out =
+            rewrite_upstream_simple_json(upstream.as_bytes(), "pypi-proxy", "requests").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let file = &json["files"][0];
+
+        // Download URL routes through the proxy, not the upstream CDN.
+        assert_eq!(
+            file["url"],
+            "/pypi/pypi-proxy/simple/requests/requests-2.31.0-py3-none-any.whl"
+        );
+        assert!(!out.contains("files.pythonhosted.org"));
+
+        // PEP 700 upload-time (the whole point) plus size/hashes/requires-python preserved.
+        assert_eq!(file["upload-time"], "2023-05-22T15:12:42.313790Z");
+        assert_eq!(file["size"], 62574);
+        assert_eq!(file["hashes"]["sha256"], "deadbeef");
+        assert_eq!(file["requires-python"], ">=3.7");
+
+        // PEP 658/714 metadata signals stripped — the proxy can't serve `.metadata`.
+        assert!(file.get("core-metadata").is_none());
+        assert!(file.get("data-dist-info-metadata").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_upstream_simple_json_returns_none_for_non_json() {
+        assert!(rewrite_upstream_simple_json(b"<!DOCTYPE html><html></html>", "r", "p").is_none());
+    }
+
+    #[test]
+    fn test_merge_local_into_remote_simple_json_appends_local_and_unions_versions() {
+        let upstream = r#"{
+            "meta": {"api-version": "1.1"},
+            "name": "mypkg",
+            "versions": ["1.0.0"],
+            "files": [
+                {"filename": "mypkg-1.0.0-py3-none-any.whl",
+                 "url": "https://files.pythonhosted.org/packages/aa/mypkg-1.0.0-py3-none-any.whl",
+                 "hashes": {"sha256": "remotehash"}, "size": 100}
+            ]
+        }"#;
+        let upload_time = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let local = vec![SimpleProjectArtifact {
+            path: "packages/mypkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 222,
+            checksum_sha256: "localhash".to_string(),
+            metadata: None,
+            upload_time: Some(upload_time),
+        }];
+
+        let out = merge_local_into_remote_simple_json(
+            upstream.as_bytes(),
+            "pypi-proxy",
+            "mypkg",
+            &local,
+            &[],
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "remote rewritten + local appended");
+
+        // Upstream entry rewritten through the proxy.
+        let remote_file = files
+            .iter()
+            .find(|f| f["filename"] == "mypkg-1.0.0-py3-none-any.whl")
+            .unwrap();
+        assert_eq!(
+            remote_file["url"],
+            "/pypi/pypi-proxy/simple/mypkg/mypkg-1.0.0-py3-none-any.whl"
+        );
+
+        // Local entry appended with upload-time + size + hash.
+        let local_file = files
+            .iter()
+            .find(|f| f["filename"] == "mypkg-2.0.0-py3-none-any.whl")
+            .unwrap();
+        assert_eq!(
+            local_file["url"],
+            "/pypi/pypi-proxy/simple/mypkg/mypkg-2.0.0-py3-none-any.whl"
+        );
+        assert_eq!(local_file["hashes"]["sha256"], "localhash");
+        assert_eq!(local_file["size"], 222);
+        assert_eq!(local_file["upload-time"], "2026-01-02T03:04:05Z");
+
+        // Versions unioned across members.
+        let versions: Vec<&str> = json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(versions.contains(&"1.0.0"));
+        assert!(versions.contains(&"2.0.0"));
+    }
+
+    #[test]
+    fn test_merge_local_into_remote_simple_json_skips_filename_already_upstream() {
+        let upstream = r#"{"meta":{"api-version":"1.1"},"name":"p","versions":["1.0.0"],
+            "files":[{"filename":"p-1.0.0.tar.gz","url":"https://x/p-1.0.0.tar.gz","hashes":{"sha256":"r"}}]}"#;
+        let local = vec![SimpleProjectArtifact {
+            path: "p-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1,
+            checksum_sha256: "l".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let out = merge_local_into_remote_simple_json(upstream.as_bytes(), "v", "p", &local, &[])
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            json["files"].as_array().unwrap().len(),
+            1,
+            "filename already upstream must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn test_merge_local_into_remote_simple_json_includes_requires_python_and_tracks() {
+        let upstream = r#"{"meta":{"api-version":"1.1"},"name":"pkg","versions":[],"files":[]}"#;
+        let metadata = serde_json::json!({"pkg_info": {"requires_python": ">=3.9"}});
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg-1.2.3-py3-none-any.whl".to_string(),
+            version: Some("1.2.3".to_string()),
+            size_bytes: 9,
+            checksum_sha256: "h".to_string(),
+            metadata: Some(metadata),
+            upload_time: None,
+        }];
+        let tracks = vec!["https://pypi.org/simple/pkg/".to_string()];
+
+        let out =
+            merge_local_into_remote_simple_json(upstream.as_bytes(), "v", "pkg", &local, &tracks)
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        // requires-python carried over from pkg_info metadata; no upload-time emitted.
+        assert_eq!(json["files"][0]["requires-python"], ">=3.9");
+        assert!(json["files"][0].get("upload-time").is_none());
+
+        // PEP 708 tracks surfaced under meta.tracks.
+        let meta_tracks: Vec<&str> = json["meta"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(meta_tracks, vec!["https://pypi.org/simple/pkg/"]);
     }
 
     #[test]

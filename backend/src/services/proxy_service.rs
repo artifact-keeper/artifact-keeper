@@ -2063,11 +2063,13 @@ impl ProxyService {
             .await
     }
 
-    /// Inner variant of [`Self::fetch_artifact_with_cache_path`] that also
-    /// forwards an optional `Accept` header to the upstream request. Used by
-    /// callers that need OCI content negotiation (manifest GETs). Pass
-    /// `None` to preserve the buffered-fetch behaviour exactly.
-    async fn fetch_artifact_with_cache_path_and_accept(
+    /// Variant of [`Self::fetch_artifact_with_cache_path`] that also forwards
+    /// an optional `Accept` header to the upstream request. Used by callers
+    /// that need content negotiation: OCI manifest GETs, and the PyPI
+    /// simple-index proxy requesting the PEP 691 JSON representation under a
+    /// format-qualified `cache_path`. Pass `None` to preserve the buffered
+    /// fetch behaviour exactly.
+    pub async fn fetch_artifact_with_cache_path_and_accept(
         &self,
         repo: &Repository,
         fetch_path: &str,
