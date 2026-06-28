@@ -3695,21 +3695,17 @@ impl ScannerService {
             )));
         }
 
-        Self::stage_from_storage(
-            storage,
-            &artifact.storage_key,
-            &self.scan_workspace_path,
-        )
-        .await
-        .map_err(|e| match e {
-            // Preserve the validation/size-cap variant; only wrap raw
-            // storage/stream-open failures with artifact context.
-            AppError::Storage(msg) => AppError::Storage(format!(
-                "Failed to stage artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, msg
-            )),
-            other => other,
-        })
+        Self::stage_from_storage(storage, &artifact.storage_key, &self.scan_workspace_path)
+            .await
+            .map_err(|e| match e {
+                // Preserve the validation/size-cap variant; only wrap raw
+                // storage/stream-open failures with artifact context.
+                AppError::Storage(msg) => AppError::Storage(format!(
+                    "Failed to stage artifact {} (key={}): {}",
+                    artifact.id, artifact.storage_key, msg
+                )),
+                other => other,
+            })
     }
 
     /// Open a streaming read from `storage` for `key` and stage it for scanning.

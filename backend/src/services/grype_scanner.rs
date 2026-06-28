@@ -306,10 +306,7 @@ fn digest_hex(digest: &str) -> Result<&str> {
             digest
         ))
     })?;
-    if hex.is_empty()
-        || hex.len() != 64
-        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if hex.is_empty() || hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::Internal(format!(
             "Invalid sha256 digest for Grype OCI local layout: {}",
             digest
@@ -654,13 +651,15 @@ impl GrypeScanner {
         .map_err(|e| AppError::Storage(format!("Failed to write OCI layout marker: {}", e)))?;
 
         let manifest_path = blob_dir.join(digest_hex(&manifest_digest)?);
-        tokio::fs::write(&manifest_path, content).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to write OCI manifest blob {}: {}",
-                manifest_path.display(),
-                e
-            ))
-        })?;
+        tokio::fs::write(&manifest_path, content)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to write OCI manifest blob {}: {}",
+                    manifest_path.display(),
+                    e
+                ))
+            })?;
 
         for blob in blobs {
             let out_path = blob_dir.join(digest_hex(&blob.digest)?);
@@ -1144,10 +1143,7 @@ impl Scanner for GrypeScanner {
     ) -> Result<ScanOutput> {
         let artifact = target.artifact;
         if is_oci_image_artifact(artifact) {
-            if let Some(output) = self
-                .scan_oci_layout_dir(artifact, target, content)
-                .await?
-            {
+            if let Some(output) = self.scan_oci_layout_dir(artifact, target, content).await? {
                 return Ok(output);
             }
 
@@ -1659,7 +1655,10 @@ mod tests {
 
         fx.state
             .storage
-            .put(&config_key, Bytes::from_static(br#"{"architecture":"arm64"}"#))
+            .put(
+                &config_key,
+                Bytes::from_static(br#"{"architecture":"arm64"}"#),
+            )
             .await
             .expect("write config blob");
         fx.state
