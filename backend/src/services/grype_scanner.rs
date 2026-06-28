@@ -1763,6 +1763,130 @@ mod tests {
         fx.teardown().await;
     }
 
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_returns_none_without_db_context() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 =
+            "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068".to_string();
+        let scanner = GrypeScanner::new(
+            fx.storage_dir
+                .join("grype-layout-test-no-db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: Some(fx.state.storage.as_ref()),
+        };
+
+        let manifest = Bytes::from_static(
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
+        );
+
+        assert!(scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout preparation should not error")
+            .is_none());
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_returns_none_without_storage_context() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        let config_digest =
+            "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
+        let layer_digest =
+            "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+        let manifest_digest = format!("sha256:{manifest_hex}");
+        let config_key = format!("oci-blobs/{config_digest}");
+        let layer_key = format!("oci-blobs/{layer_digest}");
+
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(fx.repo_id)
+        .bind(config_digest)
+        .bind(24_i64)
+        .bind(&config_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert config blob row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(fx.repo_id)
+        .bind(layer_digest)
+        .bind(11_i64)
+        .bind(&layer_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert layer blob row");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
+        )
+        .bind(&manifest_digest)
+        .bind(config_digest)
+        .bind(fx.repo_id)
+        .bind(layer_digest)
+        .execute(&fx.pool)
+        .await
+        .expect("insert manifest blob refs");
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = manifest_hex.to_string();
+        let scanner = GrypeScanner::new(
+            fx.storage_dir
+                .join("grype-layout-test-no-storage")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: None,
+        };
+        let manifest = Bytes::from_static(
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
+        );
+
+        assert!(scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout preparation should not error")
+            .is_none());
+
+        fx.teardown().await;
+    }
+
     #[test]
     fn test_is_applicable_accepts_npm_tarball() {
         // The happy path: Grype's existing fs scan does work on lockfiles,
