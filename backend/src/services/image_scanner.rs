@@ -947,6 +947,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         let result = scanner.scan_target(&target, None, &Bytes::new()).await;

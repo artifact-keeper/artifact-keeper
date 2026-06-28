@@ -1400,10 +1400,15 @@ fn extract_tar_gz_safe(content: &[u8], target: &Path) -> Result<()> {
 /// `Artifact::path` is repository-internal. Scanners that need an externally
 /// routable identity (currently Grype's OCI `registry:` mode) must use the
 /// repository fields from this context instead of guessing from the path.
+/// Scanners may also use the optional database/storage handles to inspect
+/// repository-local artifact state without re-entering the public registry
+/// route.
 pub struct ScanTarget<'a> {
     pub artifact: &'a Artifact,
     pub repository_key: &'a str,
     pub repository_type: &'a str,
+    pub db: Option<&'a PgPool>,
+    pub storage: Option<&'a dyn StorageBackend>,
 }
 
 /// A pluggable vulnerability scanner.
@@ -2902,7 +2907,10 @@ impl ScannerService {
         // Load content from storage (we need the storage key)
         // NOTE: The orchestrator is called with content already available in
         // upload/proxy paths. For on-demand scans, we fetch from DB metadata.
-        let content = self.fetch_artifact_content(&artifact).await?;
+        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
+        let content = self
+            .fetch_artifact_content_from_storage(&artifact, storage.as_ref())
+            .await?;
 
         // Load metadata if available
         let metadata = sqlx::query_as!(
@@ -2925,6 +2933,8 @@ impl ScannerService {
             artifact: &artifact,
             repository_key: &repository_key,
             repository_type: &repository_type,
+            db: Some(&self.db),
+            storage: Some(storage.as_ref()),
         };
 
         for scanner in &self.scanners {
@@ -3670,7 +3680,11 @@ impl ScannerService {
     /// streaming reads for those backends is tracked separately by #1430 and
     /// #1431 (GCS `get_stream`); this fix deliberately does not expand into
     /// that work.
-    async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
+    async fn fetch_artifact_content_from_storage(
+        &self,
+        artifact: &Artifact,
+        storage: &dyn StorageBackend,
+    ) -> Result<Bytes> {
         // Early reject using the recorded size before we open the stream. The
         // streaming loop below re-checks against the same ceiling because
         // `size_bytes` can be stale or wrong for proxied/upstream content.
@@ -3681,9 +3695,8 @@ impl ScannerService {
             )));
         }
 
-        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
         Self::stage_from_storage(
-            storage.as_ref(),
+            storage,
             &artifact.storage_key,
             &self.scan_workspace_path,
         )
@@ -11381,6 +11394,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11402,6 +11417,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));

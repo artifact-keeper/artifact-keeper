@@ -19,8 +19,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Deserializer};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 use crate::error::{AppError, Result};
@@ -31,6 +33,7 @@ use crate::services::scanner_service::{
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
     validate_trivy_purl, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
 };
+use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Grype JSON output structures
@@ -282,6 +285,132 @@ pub struct GrypeScanner {
     cached_version: VersionCache,
 }
 
+struct LocalOciBlob {
+    digest: String,
+    storage_key: String,
+}
+
+fn artifact_digest(checksum_sha256: &str) -> String {
+    let trimmed = checksum_sha256.trim();
+    if trimmed.starts_with("sha256:") {
+        trimmed.to_string()
+    } else {
+        format!("sha256:{}", trimmed)
+    }
+}
+
+fn digest_hex(digest: &str) -> Result<&str> {
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        AppError::Internal(format!(
+            "Grype OCI local layout only supports sha256 digests, got {}",
+            digest
+        ))
+    })?;
+    if hex.is_empty()
+        || hex.len() != 64
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(AppError::Internal(format!(
+            "Invalid sha256 digest for Grype OCI local layout: {}",
+            digest
+        )));
+    }
+    Ok(hex)
+}
+
+async fn fetch_local_oci_blobs(
+    target: &ScanTarget<'_>,
+    manifest_digest: &str,
+) -> Result<Vec<LocalOciBlob>> {
+    let Some(db) = target.db else {
+        tracing::debug!(
+            artifact_id = %target.artifact.id,
+            "No database context available for Grype OCI local layout; falling back to registry scan"
+        );
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT mbr.blob_digest, ob.storage_key
+        FROM manifest_blob_refs mbr
+        JOIN oci_blobs ob
+          ON ob.repository_id = mbr.repository_id
+         AND ob.digest = mbr.blob_digest
+        WHERE mbr.repository_id = $1
+          AND mbr.manifest_digest = $2
+        ORDER BY
+          CASE mbr.kind WHEN 'config' THEN 0 WHEN 'layer' THEN 1 ELSE 2 END,
+          mbr.blob_digest
+        "#,
+    )
+    .bind(target.artifact.repository_id)
+    .bind(manifest_digest)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        AppError::Database(format!(
+            "Failed to load OCI blob refs for manifest {}: {}",
+            manifest_digest, e
+        ))
+    })?;
+
+    rows.into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            Ok(LocalOciBlob {
+                digest: row.try_get("blob_digest").map_err(|e| {
+                    AppError::Database(format!("Invalid OCI blob digest row: {}", e))
+                })?,
+                storage_key: row.try_get("storage_key").map_err(|e| {
+                    AppError::Database(format!("Invalid OCI blob storage key row: {}", e))
+                })?,
+            })
+        })
+        .collect()
+}
+
+async fn copy_storage_object_to_file(
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+    path: &Path,
+) -> Result<()> {
+    let mut stream = storage.get_stream(storage_key).await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to open OCI blob stream for key {}: {}",
+            storage_key, e
+        ))
+    })?;
+    let mut file = tokio::fs::File::create(path).await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to create OCI blob file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            AppError::Storage(format!(
+                "Stream error while materializing OCI blob {}: {}",
+                storage_key, e
+            ))
+        })?;
+        file.write_all(&chunk).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to write OCI blob file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+    }
+    file.flush().await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to flush OCI blob file {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
         Self {
@@ -411,6 +540,159 @@ impl GrypeScanner {
             packages,
             scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
         })
+    }
+
+    async fn scan_oci_layout_dir(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        content: &Bytes,
+    ) -> Result<Option<ScanOutput>> {
+        let Some(layout_dir) = self
+            .prepare_local_oci_layout(artifact, target, content)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
+        info!("Grype OCI local layout scan target: {}", grype_target);
+        let result = match self.run_grype_target(&grype_target).await {
+            Ok(report) => {
+                let findings = Self::convert_findings(&report);
+                let packages = Self::convert_packages(&report);
+                info!(
+                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components",
+                    artifact.name,
+                    findings.len(),
+                    packages.len()
+                );
+                Ok(ScanOutput {
+                    findings,
+                    packages,
+                    scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+                })
+            }
+            Err(e) => Err(fail_scan(
+                "Grype OCI local layout scan",
+                artifact,
+                &e,
+                &self.scan_workspace,
+                None,
+            )
+            .await),
+        };
+
+        if let Err(e) = tokio::fs::remove_dir_all(&layout_dir).await {
+            tracing::warn!(
+                path = %layout_dir.display(),
+                "Failed to clean up Grype OCI layout workspace: {}",
+                e
+            );
+        }
+
+        result.map(Some)
+    }
+
+    async fn prepare_local_oci_layout(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        content: &Bytes,
+    ) -> Result<Option<PathBuf>> {
+        let (image_name, reference) = parse_oci_manifest_path(&artifact.path).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Grype OCI local layout: invalid OCI manifest path {}",
+                artifact.path
+            ))
+        })?;
+        let manifest_digest = artifact_digest(&artifact.checksum_sha256);
+        let blobs = fetch_local_oci_blobs(target, &manifest_digest).await?;
+        if blobs.is_empty() {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                manifest_digest = %manifest_digest,
+                "No local OCI blob refs available for Grype; falling back to registry scan"
+            );
+            return Ok(None);
+        }
+        let Some(storage) = target.storage else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                "No storage context available for Grype OCI local layout; falling back to registry scan"
+            );
+            return Ok(None);
+        };
+
+        let layout_dir = PathBuf::from(&self.scan_workspace)
+            .join("grype-oci")
+            .join(artifact.id.to_string());
+        if tokio::fs::metadata(&layout_dir).await.is_ok() {
+            tokio::fs::remove_dir_all(&layout_dir).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to reset Grype OCI layout workspace {}: {}",
+                    layout_dir.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let blob_dir = layout_dir.join("blobs").join("sha256");
+        tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to create Grype OCI layout workspace {}: {}",
+                blob_dir.display(),
+                e
+            ))
+        })?;
+
+        tokio::fs::write(
+            layout_dir.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .await
+        .map_err(|e| AppError::Storage(format!("Failed to write OCI layout marker: {}", e)))?;
+
+        let manifest_path = blob_dir.join(digest_hex(&manifest_digest)?);
+        tokio::fs::write(&manifest_path, content).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to write OCI manifest blob {}: {}",
+                manifest_path.display(),
+                e
+            ))
+        })?;
+
+        for blob in blobs {
+            let out_path = blob_dir.join(digest_hex(&blob.digest)?);
+            copy_storage_object_to_file(storage, &blob.storage_key, &out_path).await?;
+        }
+
+        let mut descriptor = serde_json::json!({
+            "mediaType": artifact.content_type,
+            "digest": manifest_digest,
+            "size": content.len(),
+            "annotations": {
+                "org.opencontainers.image.ref.name": reference,
+                "io.artifact-keeper.repository": target.repository_key,
+                "io.artifact-keeper.image": image_name,
+            }
+        });
+        if artifact.content_type.is_empty() {
+            descriptor
+                .as_object_mut()
+                .and_then(|o| o.remove("mediaType"));
+        }
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [descriptor],
+        });
+        let index_bytes = serde_json::to_vec(&index)
+            .map_err(|e| AppError::Internal(format!("Failed to encode OCI index: {}", e)))?;
+        tokio::fs::write(layout_dir.join("index.json"), index_bytes)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to write OCI index: {}", e)))?;
+
+        Ok(Some(layout_dir))
     }
 
     /// Run grype against the workspace directory.
@@ -862,6 +1144,13 @@ impl Scanner for GrypeScanner {
     ) -> Result<ScanOutput> {
         let artifact = target.artifact;
         if is_oci_image_artifact(artifact) {
+            if let Some(output) = self
+                .scan_oci_layout_dir(artifact, target, content)
+                .await?
+            {
+                return Ok(output);
+            }
+
             // #1971: thread the in-hand manifest body for index→child resolution.
             let image_ref =
                 Self::oci_registry_target(artifact, target, Some(content)).ok_or_else(|| {
@@ -1275,6 +1564,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-repo1",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -1318,6 +1609,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-repo1",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -1334,6 +1627,141 @@ mod tests {
             ),
             "applicability and dispatch must agree on the repo-scoped ref"
         );
+    }
+
+    #[test]
+    fn test_digest_hex_accepts_only_canonical_sha256() {
+        let digest = "sha256:d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        assert_eq!(
+            digest_hex(digest).expect("valid digest"),
+            "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068"
+        );
+        assert!(digest_hex("sha512:abc").is_err());
+        assert!(digest_hex("sha256:not-hex").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_materializes_manifest_and_blobs() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        let config_digest =
+            "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
+        let layer_digest =
+            "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+        let manifest_digest = format!("sha256:{manifest_hex}");
+        let config_key = format!("oci-blobs/{config_digest}");
+        let layer_key = format!("oci-blobs/{layer_digest}");
+
+        fx.state
+            .storage
+            .put(&config_key, Bytes::from_static(br#"{"architecture":"arm64"}"#))
+            .await
+            .expect("write config blob");
+        fx.state
+            .storage
+            .put(&layer_key, Bytes::from_static(b"layer bytes"))
+            .await
+            .expect("write layer blob");
+
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(fx.repo_id)
+        .bind(config_digest)
+        .bind(24_i64)
+        .bind(&config_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert config blob row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(fx.repo_id)
+        .bind(layer_digest)
+        .bind(11_i64)
+        .bind(&layer_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert layer blob row");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
+        )
+        .bind(&manifest_digest)
+        .bind(config_digest)
+        .bind(fx.repo_id)
+        .bind(layer_digest)
+        .execute(&fx.pool)
+        .await
+        .expect("insert manifest blob refs");
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = manifest_hex.to_string();
+        let manifest = Bytes::from_static(
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
+        );
+        let workspace = fx
+            .storage_dir
+            .join("grype-layout-test")
+            .to_string_lossy()
+            .into_owned();
+        let scanner = GrypeScanner::new(workspace);
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: Some(fx.state.storage.as_ref()),
+        };
+
+        let layout = scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout materialization should succeed")
+            .expect("local blob refs should produce an OCI layout");
+
+        assert!(layout.join("oci-layout").exists());
+        assert!(layout.join("index.json").exists());
+        assert_eq!(
+            tokio::fs::read(layout.join("blobs/sha256").join(manifest_hex))
+                .await
+                .expect("read manifest"),
+            manifest.to_vec()
+        );
+        assert_eq!(
+            tokio::fs::read(
+                layout
+                    .join("blobs/sha256")
+                    .join(config_digest.trim_start_matches("sha256:"))
+            )
+            .await
+            .expect("read config"),
+            br#"{"architecture":"arm64"}"#
+        );
+        assert_eq!(
+            tokio::fs::read(
+                layout
+                    .join("blobs/sha256")
+                    .join(layer_digest.trim_start_matches("sha256:"))
+            )
+            .await
+            .expect("read layer"),
+            b"layer bytes"
+        );
+
+        tokio::fs::remove_dir_all(&layout)
+            .await
+            .expect("cleanup layout");
+        fx.teardown().await;
     }
 
     #[test]
