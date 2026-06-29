@@ -13,6 +13,8 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
+use wiremock::matchers::{method, path as wm_path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn connect_db() -> PgPool {
     let url = std::env::var("DATABASE_URL")
@@ -327,5 +329,180 @@ async fn metadata_filter_debounces_request_count() {
     assert_eq!(
         count, 1,
         "request_count must be debounced (not bumped on the second listing within the window)"
+    );
+}
+
+// ===========================================================================
+// Listing-path filtering against a mock upstream (hermetic, no internet).
+//
+// These exercise the metadata *listing* path end to end with realistic
+// upstream payloads and deliberately controlled publish times (one version a
+// day old, one ten years old), so they are reproducible without depending on
+// real-world package release dates. The PyPI case in particular reproduces the
+// `#sha256=` hash-fragment anchor that made `filter_pypi_simple_index` a silent
+// no-op before the fragment-stripping fix.
+// ===========================================================================
+
+async fn create_remote_pypi_repo(
+    pool: &PgPool,
+    suffix: &str,
+    upstream_url: &str,
+    min_age_days: i32,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let key = format!("age-gate-pypi-{suffix}-{id}");
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, age_gate_enabled, age_gate_min_age_days)
+         VALUES ($1, $2, $2, $3, 'remote', 'pypi', $4, true, $5)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(format!("/tmp/test-artifacts/{id}"))
+    .bind(upstream_url)
+    .bind(min_age_days)
+    .execute(pool)
+    .await
+    .expect("insert pypi repo");
+    id
+}
+
+fn pypi_repo_params(id: Uuid, min_age_days: i32) -> AgeGateRepoParams {
+    AgeGateRepoParams::from_parts(
+        id,
+        "age-gate-pypi",
+        RepositoryType::Remote,
+        RepositoryFormat::Pypi,
+        true,
+        min_age_days,
+    )
+}
+
+/// A PEP 503 simple-index page exactly as the proxy serves it after rewriting:
+/// repo-relative hrefs **carrying the `#sha256=` hash fragment**. The fragment
+/// is the detail that made the filter a silent no-op — a fragment-less href (as
+/// the parser's unit test used) parses fine, so only a realistic anchor catches
+/// the regression.
+fn pypi_simple_index_html(repo_key: &str, pkg: &str, versions: &[&str]) -> String {
+    let mut body = String::from("<!DOCTYPE html><html><body>\n");
+    for v in versions {
+        let file = format!("{pkg}-{v}-py3-none-any.whl");
+        body.push_str(&format!(
+            "<a href=\"/pypi/{repo_key}/simple/{pkg}/{file}#sha256=deadbeefcafe\">{file}</a>\n"
+        ));
+    }
+    body.push_str("</body></html>\n");
+    body
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn pypi_simple_index_withholds_young_version_via_real_anchors() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+
+    let pkg = "agegatepkg";
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let old = (Utc::now() - Duration::days(3650)).to_rfc3339();
+
+    // Mock the PyPI JSON metadata endpoint the gate consults for publish times.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/pypi/{pkg}/json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "info": { "version": "9.9.9" },
+            "releases": {
+                "1.0.0": [{ "upload_time_iso_8601": old }],
+                "9.9.9": [{ "upload_time_iso_8601": young }],
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let repo_id = create_remote_pypi_repo(&pool, "listing", &server.uri(), 7).await;
+    let params = pypi_repo_params(repo_id, 7);
+
+    // Fetch publish times from the mock upstream exactly as the handler does,
+    // then filter a realistic (rewritten, hash-fragmented) simple index.
+    let client = reqwest::Client::new();
+    let times = svc
+        .metadata_cache()
+        .fetch_pypi_publish_times(&client, repo_id, &server.uri(), pkg)
+        .await
+        .expect("fetch publish times");
+    assert_eq!(times.len(), 2, "mock upstream should yield two publish times");
+
+    let html = pypi_simple_index_html("age-gate-pypi", pkg, &["1.0.0", "9.9.9"]);
+    let filtered = svc
+        .filter_pypi_simple_index(&params, pkg, &times, &html)
+        .await
+        .expect("filter simple index");
+
+    assert!(
+        !filtered.contains(&format!("{pkg}-9.9.9-")),
+        "young version must be withheld from the simple index (regression: #sha256 fragment)"
+    );
+    assert!(
+        filtered.contains(&format!("{pkg}-1.0.0-")),
+        "aged version must remain listed"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, pkg, "9.9.9").await,
+        "pending",
+        "the withheld young version must be queued for review"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn npm_packument_withholds_young_keeps_old_and_reconciles_tags() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_npm_repo(&pool, "listing", 7).await;
+    let params = npm_repo_params(repo_id, 7);
+
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let old = (Utc::now() - Duration::days(3650)).to_rfc3339();
+    let pkg = "agegatepkg";
+
+    // npm carries publish times inline in the packument `time` map, so the
+    // listing filter needs no upstream fetch — the document is self-contained.
+    let mut packument = serde_json::json!({
+        "name": pkg,
+        "dist-tags": { "latest": "9.9.9", "stable": "1.0.0" },
+        "versions": {
+            "1.0.0": { "name": pkg, "version": "1.0.0" },
+            "9.9.9": { "name": pkg, "version": "9.9.9" },
+        },
+        "time": {
+            "created": old,
+            "modified": young,
+            "1.0.0": old,
+            "9.9.9": young,
+        }
+    });
+
+    svc.filter_npm_packument(&params, pkg, &mut packument)
+        .await
+        .expect("filter packument");
+
+    assert!(
+        packument["versions"].get("9.9.9").is_none(),
+        "young version must be withheld from the packument"
+    );
+    assert!(
+        packument["versions"].get("1.0.0").is_some(),
+        "aged version must remain in the packument"
+    );
+    assert_eq!(
+        packument["dist-tags"]["latest"],
+        serde_json::json!("1.0.0"),
+        "dist-tags.latest must be repointed to the newest surviving version"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, pkg, "9.9.9").await,
+        "pending",
+        "the withheld young version must be queued for review"
     );
 }
