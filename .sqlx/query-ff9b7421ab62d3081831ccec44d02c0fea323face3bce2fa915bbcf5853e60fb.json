@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE age_gate_reviews\n            SET status = 'rejected', reviewed_by = $2, reviewed_at = NOW(),\n                review_reason = $3\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff9b7421ab62d3081831ccec44d02c0fea323face3bce2fa915bbcf5853e60fb"
+}

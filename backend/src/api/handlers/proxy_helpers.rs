@@ -39,8 +39,11 @@ pub struct RepoInfo {
     pub storage_path: String,
     pub storage_backend: String,
     pub repo_type: String,
+    pub format: String,
     pub upstream_url: Option<String>,
     pub promotion_only: bool,
+    pub age_gate_enabled: bool,
+    pub age_gate_min_age_days: i32,
 }
 
 impl RepoInfo {
@@ -80,7 +83,8 @@ pub async fn resolve_repo_by_key(
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url, promotion_only \
+         repo_type::text as repo_type, upstream_url, promotion_only, \
+         age_gate_enabled, age_gate_min_age_days \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -114,8 +118,11 @@ pub async fn resolve_repo_by_key(
         storage_path: repo.try_get("storage_path").unwrap_or_default(),
         storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
+        format: fmt,
         upstream_url: repo.try_get("upstream_url").ok(),
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
+        age_gate_enabled: repo.try_get("age_gate_enabled").unwrap_or(false),
+        age_gate_min_age_days: repo.try_get("age_gate_min_age_days").unwrap_or(7),
     })
 }
 
@@ -1431,6 +1438,7 @@ pub async fn fetch_virtual_members(
             r.replication_priority as "replication_priority: ReplicationPriority",
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
+            r.age_gate_enabled, r.age_gate_min_age_days,
             r.created_at, r.updated_at
         FROM repositories r
         INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -2929,6 +2937,61 @@ pub(crate) fn build_download_response(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
+/// Build age-gate params from a resolved repository descriptor.
+pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
+    use crate::models::repository::{RepositoryFormat, RepositoryType};
+    use crate::services::age_gate_service::AgeGateRepoParams;
+
+    let repo_type = match info.repo_type.as_str() {
+        "remote" => RepositoryType::Remote,
+        "virtual" => RepositoryType::Virtual,
+        "staging" => RepositoryType::Staging,
+        _ => RepositoryType::Local,
+    };
+    let format = match info.format.to_lowercase().as_str() {
+        "npm" => RepositoryFormat::Npm,
+        "pypi" => RepositoryFormat::Pypi,
+        other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
+            RepositoryFormat::Npm
+        }
+        other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
+        _ => RepositoryFormat::Generic,
+    };
+
+    AgeGateRepoParams::from_parts(
+        info.id,
+        repo_type,
+        format,
+        info.age_gate_enabled,
+        info.age_gate_min_age_days,
+    )
+}
+
+/// HTTP 451 response when a package version is blocked by the age gate with no LKG.
+pub fn age_gate_blocked_response(
+    review_id: uuid::Uuid,
+    package: &str,
+    version: &str,
+    min_age_days: i32,
+    requested_age_days: Option<i64>,
+) -> Response {
+    let body = serde_json::json!({
+        "error": "age_gate_blocked",
+        "review_id": review_id,
+        "package": package,
+        "version": version,
+        "min_age_days": min_age_days,
+        "requested_age_days": requested_age_days,
+        "message": "Package version is younger than the configured age threshold and is pending review"
+    });
+    (
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 ///
 /// Visible to other handler modules so they can construct a stand-in
@@ -2956,6 +3019,8 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         curation_default_action: "allow".to_string(),
         curation_sync_interval_secs: 3600,
         curation_auto_fetch: false,
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -3583,7 +3648,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -5340,7 +5408,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -5490,7 +5561,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let opts = DownloadResponseOpts {
@@ -5525,7 +5599,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://upstream.example.test".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -5561,7 +5638,10 @@ mod tests {
             // Force the Remote branch but with upstream_url = None.
             repo_type: "remote".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let opts = DownloadResponseOpts {
@@ -5598,7 +5678,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())

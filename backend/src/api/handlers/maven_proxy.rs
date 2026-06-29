@@ -487,7 +487,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         Some((pool, state, repo_id, repo, user_id))
     }

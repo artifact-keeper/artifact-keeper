@@ -573,6 +573,9 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         repo_type: repo.get("repo_type"),
         upstream_url: repo.get("upstream_url"),
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
+        format: "generic".to_string(),
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     })
 }
 
@@ -2366,7 +2369,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -2382,7 +2388,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://images.linuxcontainers.org".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -3654,8 +3663,11 @@ mod streaming_pipeline_regression_tests {
             storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
+            format: "generic".to_string(),
             upstream_url: None,
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         finalize_upload(
