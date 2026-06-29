@@ -11,8 +11,10 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::config::Config;
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::analytics_service::AnalyticsService;
 use crate::services::backup_service::{BackupService, BackupType, CreateBackupRequest};
+use crate::services::event_bus::EventBus;
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
@@ -51,6 +53,7 @@ pub fn spawn_all(
     _primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
+    event_bus: Arc<EventBus>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -691,8 +694,43 @@ pub fn spawn_all(
         });
     }
 
+    // Age-gate auto-approval sweep (every 5 minutes).
+    //
+    // The npm packument / PyPI simple-index filters intentionally do NOT flip a
+    // pending review to `approved` when its version crosses the age threshold —
+    // that would be a write on a cacheable metadata GET. Instead this sweep does
+    // the bookkeeping off the request path: one UPDATE per tick approves every
+    // pending review whose version has aged past its repo's threshold. Serving is
+    // unaffected in the interim (the filters decide directly from the publish
+    // timestamp), so this only keeps the review queue's persisted status accurate.
+    // The UPDATE is idempotent and row-locked, so running it on multiple replicas
+    // is safe; startup jitter de-synchronizes replicas' first tick.
+    {
+        let db = db.clone();
+        let event_bus = event_bus.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(75)).await;
+            let service = AgeGateService::new(db, event_bus);
+            let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                match service.auto_approve_aged_reviews().await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Age-gate sweep: auto-approved {} aged review(s)", n);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Age-gate auto-approval sweep failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval"
     );
 }
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.repository_id, r.package_name, r.package_version,\n                r.upstream_published_at, r.status, r.requested_at,\n                r.reviewed_by, r.reviewed_at, r.review_reason,\n                r.request_count, r.last_requested_at,\n                repo.key as repository_key\n            FROM age_gate_reviews r\n            INNER JOIN repositories repo ON repo.id = r.repository_id\n            WHERE ($1::text IS NULL OR repo.key = $1)\n              AND ($2::text IS NULL OR r.status = $2)\n            ORDER BY r.last_requested_at DESC\n            OFFSET $3 LIMIT $4\n            ",
+  "query": "\n            SELECT\n                r.id, r.repository_id, r.package_name, r.package_version,\n                r.upstream_published_at, r.status, r.requested_at,\n                r.reviewed_by, r.reviewed_at, r.review_reason,\n                r.request_count, r.last_requested_at,\n                repo.key as repository_key\n            FROM age_gate_reviews r\n            INNER JOIN repositories repo ON repo.id = r.repository_id\n            WHERE ($1::text IS NULL OR repo.key = $1)\n              AND ($2::text[] IS NULL OR r.status = ANY($2))\n            ORDER BY r.last_requested_at DESC\n            OFFSET $3 LIMIT $4\n            ",
   "describe": {
     "columns": [
       {
@@ -72,7 +72,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text",
+        "TextArray",
         "Int8",
         "Int8"
       ]
@@ -93,5 +93,5 @@
       false
     ]
   },
-  "hash": "d248f4eeb4ef0e309d7b09a2bc43f2481ec6094984dd2ebd21569a18ae95e950"
+  "hash": "9976822f68b8add4c577ed02f809bca84867a23878282048e6d8bf3bb3405680"
 }

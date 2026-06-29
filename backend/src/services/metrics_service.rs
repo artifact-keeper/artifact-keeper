@@ -57,6 +57,26 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
     .increment(1);
 }
 
+/// Record a download request blocked by the age gate. Incremented once per
+/// blocked HTTP request (a client asking for one specific artifact version),
+/// never per version in a metadata document, so packument/simple-index
+/// fan-out cannot inflate the counter. Labels are bounded to repository and
+/// format; package name and version are deliberately NOT labels (their
+/// cardinality is unbounded).
+pub fn record_age_gate_blocked_request(repo_key: &str, format: &str) {
+    counter!("ak_age_gate_blocked_requests_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
+}
+
+/// Record a metadata listing fetch (npm packument / PyPI simple index) from
+/// which the age gate withheld at least one version. Incremented once per
+/// affected fetch — not once per withheld version — so it stays a
+/// request-rate signal (how often listings are filtered) rather than a
+/// version-volume signal. Same bounded-label contract as
+/// [`record_age_gate_blocked_request`].
+pub fn record_age_gate_filtered_metadata(repo_key: &str, format: &str) {
+    counter!("ak_age_gate_filtered_metadata_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
+}
+
 /// Record a backup event.
 pub fn record_backup(backup_type: &str, success: bool, duration_secs: f64) {
     let status = if success { "success" } else { "failure" };
@@ -274,6 +294,18 @@ mod tests {
     #[test]
     fn test_record_artifact_download_does_not_panic() {
         record_artifact_download("my-repo", "npm");
+    }
+
+    #[test]
+    fn test_record_age_gate_blocked_request_does_not_panic() {
+        record_age_gate_blocked_request("npm-remote", "npm");
+        record_age_gate_blocked_request("pypi-remote", "pypi");
+    }
+
+    #[test]
+    fn test_record_age_gate_filtered_metadata_does_not_panic() {
+        record_age_gate_filtered_metadata("npm-remote", "npm");
+        record_age_gate_filtered_metadata("pypi-remote", "pypi");
     }
 
     #[test]

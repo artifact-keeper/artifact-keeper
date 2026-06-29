@@ -3999,6 +3999,7 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
 
     AgeGateRepoParams::from_parts(
         info.id,
+        info.key.clone(),
         repo_type,
         format,
         info.age_gate_enabled,
