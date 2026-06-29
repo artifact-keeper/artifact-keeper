@@ -9,7 +9,7 @@ use artifact_keeper_backend::services::age_gate_service::{
     AgeGateDecision, AgeGateRepoParams, AgeGateService, AUTO_APPROVE_REASON,
 };
 use artifact_keeper_backend::services::event_bus::EventBus;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -24,7 +24,10 @@ async fn connect_db() -> PgPool {
 
 async fn create_remote_npm_repo(pool: &PgPool, suffix: &str, min_age_days: i32) -> Uuid {
     let id = Uuid::new_v4();
-    let key = format!("age-gate-npm-{suffix}");
+    // Include the random id so the unique `repositories.key` constraint does not
+    // collide with rows left behind by a previous (uncleaned) test run, keeping
+    // these `--ignored` integration tests repeatable.
+    let key = format!("age-gate-npm-{suffix}-{id}");
     sqlx::query(
         "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, age_gate_enabled, age_gate_min_age_days)
          VALUES ($1, $2, $2, $3, 'remote', 'npm', 'https://registry.npmjs.org', true, $4)",
@@ -39,29 +42,74 @@ async fn create_remote_npm_repo(pool: &PgPool, suffix: &str, min_age_days: i32) 
     id
 }
 
-async fn create_reviewer(pool: &PgPool, suffix: &str) -> Uuid {
+fn npm_repo_params(id: Uuid, min_age_days: i32) -> AgeGateRepoParams {
+    AgeGateRepoParams::from_parts(
+        id,
+        "age-gate-npm",
+        RepositoryType::Remote,
+        RepositoryFormat::Npm,
+        true,
+        min_age_days,
+    )
+}
+
+async fn create_reviewer(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
+    let username = format!("age-gate-reviewer-{id}");
+    let email = format!("{username}@test.local");
     sqlx::query(
-        "INSERT INTO users (id, username, email, password_hash, is_admin)
-         VALUES ($1, $2, $3, 'x', true)",
+        "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+         VALUES ($1, $2, $3, 'unused', 'local', true, true)",
     )
     .bind(id)
-    .bind(format!("age-gate-reviewer-{suffix}"))
-    .bind(format!("age-gate-reviewer-{suffix}@example.test"))
+    .bind(&username)
+    .bind(&email)
     .execute(pool)
     .await
     .expect("insert reviewer");
     id
 }
 
-fn npm_repo_params(id: Uuid, min_age_days: i32) -> AgeGateRepoParams {
-    AgeGateRepoParams::from_parts(
-        id,
-        RepositoryType::Remote,
-        RepositoryFormat::Npm,
-        true,
-        min_age_days,
+async fn insert_pending_review(
+    pool: &PgPool,
+    repo_id: Uuid,
+    package: &str,
+    version: &str,
+    published_at: Option<DateTime<Utc>>,
+) {
+    sqlx::query(
+        "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, upstream_published_at, status)
+         VALUES ($1, $2, $3, $4, 'pending')",
     )
+    .bind(repo_id)
+    .bind(package)
+    .bind(version)
+    .bind(published_at)
+    .execute(pool)
+    .await
+    .expect("insert pending review");
+}
+
+async fn review_status(pool: &PgPool, repo_id: Uuid, package: &str, version: &str) -> String {
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM age_gate_reviews WHERE repository_id = $1 AND package_name = $2 AND package_version = $3",
+    )
+    .bind(repo_id)
+    .bind(package)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .expect("review status");
+    status
+}
+
+fn young_packument(version: &str, published_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "debounce-pkg",
+        "dist-tags": { "latest": version },
+        "versions": { version: { "name": "debounce-pkg", "version": version } },
+        "time": { version: published_at },
+    })
 }
 
 #[tokio::test]
@@ -146,7 +194,7 @@ async fn rejected_review_stays_blocked_after_threshold() {
         AgeGateDecision::Allow => panic!("expected block"),
     };
 
-    let reviewer = create_reviewer(&pool, "reject").await;
+    let reviewer = create_reviewer(&pool).await;
     svc.reject(review_id, reviewer, Some("too risky"))
         .await
         .expect("reject");
@@ -187,4 +235,97 @@ async fn per_repo_threshold_is_respected() {
         .expect("repo15"),
         AgeGateDecision::Block { .. }
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn scheduler_sweep_auto_approves_only_aged_pending_reviews() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_npm_repo(&pool, "sweep", 7).await;
+
+    // Aged pending review: the sweep should approve it.
+    insert_pending_review(
+        &pool,
+        repo_id,
+        "aged-pkg",
+        "1.0.0",
+        Some(Utc::now() - Duration::days(30)),
+    )
+    .await;
+    // Young pending review: still under threshold, must stay pending.
+    insert_pending_review(
+        &pool,
+        repo_id,
+        "young-pkg",
+        "2.0.0",
+        Some(Utc::now() - Duration::days(1)),
+    )
+    .await;
+    // No upstream timestamp: age cannot be proven, must stay pending (fail closed).
+    insert_pending_review(&pool, repo_id, "notime-pkg", "3.0.0", None).await;
+
+    let approved = svc.auto_approve_aged_reviews().await.expect("sweep");
+    assert!(
+        approved >= 1,
+        "expected the sweep to approve at least the aged review"
+    );
+
+    assert_eq!(
+        review_status(&pool, repo_id, "aged-pkg", "1.0.0").await,
+        "approved"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, "young-pkg", "2.0.0").await,
+        "pending"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, "notime-pkg", "3.0.0").await,
+        "pending"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn metadata_filter_debounces_request_count() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_npm_repo(&pool, "debounce", 7).await;
+    let params = npm_repo_params(repo_id, 7);
+
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+
+    // First listing creates the pending review (request_count = 1) and withholds 1.0.0.
+    let mut p1 = young_packument("1.0.0", &young);
+    svc.filter_npm_packument(&params, "debounce-pkg", &mut p1)
+        .await
+        .expect("filter 1");
+    assert!(
+        p1["versions"].get("1.0.0").is_none(),
+        "young version must be withheld from the listing"
+    );
+
+    // Second listing within the debounce window must NOT re-bump request_count.
+    let mut p2 = young_packument("1.0.0", &young);
+    svc.filter_npm_packument(&params, "debounce-pkg", &mut p2)
+        .await
+        .expect("filter 2");
+    assert!(
+        p2["versions"].get("1.0.0").is_none(),
+        "young version must still be withheld"
+    );
+
+    let count: i32 = sqlx::query_scalar(
+        "SELECT request_count FROM age_gate_reviews WHERE repository_id = $1 AND package_name = 'debounce-pkg' AND package_version = '1.0.0'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request_count");
+    assert_eq!(
+        count, 1,
+        "request_count must be debounced (not bumped on the second listing within the window)"
+    );
 }
