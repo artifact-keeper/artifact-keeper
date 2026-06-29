@@ -1203,7 +1203,15 @@ async fn serve_file(
                         if let Some((content, _ct)) =
                             proxy_helpers::proxy_check_cache(proxy, repo_key, &lkg_cache_path).await
                         {
-                            return Ok(build_file_response(&lkg_filename, content));
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, pypi_content_type(&lkg_filename))
+                                .header(
+                                    "Content-Disposition",
+                                    format!("attachment; filename=\"{}\"", lkg_filename),
+                                )
+                                .body(Body::from(content))
+                                .unwrap());
                         }
                         let content = fetch_from_pypi_remote(
                             proxy,
@@ -1214,7 +1222,15 @@ async fn serve_file(
                             &lkg_filename,
                         )
                         .await?;
-                        return Ok(build_file_response(&lkg_filename, content));
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, pypi_content_type(&lkg_filename))
+                            .header(
+                                "Content-Disposition",
+                                format!("attachment; filename=\"{}\"", lkg_filename),
+                            )
+                            .body(Body::from(content))
+                            .unwrap());
                     }
 
                     // Try the proxy cache first using a predictable local

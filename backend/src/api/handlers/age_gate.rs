@@ -359,7 +359,10 @@ pub async fn update_repo_age_gate(
             AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
                 .user(auth.user_id)
                 .resource(repo.id)
-                .details(build_repo_config_audit_details(body.enabled, body.min_age_days)),
+                .details(build_repo_config_audit_details(
+                    body.enabled,
+                    body.min_age_days,
+                )),
         )
         .await;
 
