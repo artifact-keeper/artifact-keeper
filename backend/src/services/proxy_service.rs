@@ -3192,6 +3192,52 @@ impl ProxyService {
         storage_key.starts_with("proxy-cache/")
     }
 
+    /// Purge every proxy-cache object for a repository from the global default
+    /// storage backend, returning the number of keys deleted.
+    ///
+    /// Proxy-cached content is keyed by the repository *key* (not its id) and
+    /// is intentionally NOT recorded in the `artifacts` table (#1278), so the
+    /// repository-delete path that purges `artifacts`-backed objects never sees
+    /// these blobs. Left behind, the whole `proxy-cache/<repo_key>/` subtree
+    /// outlives the repository; a later repository created with the same key
+    /// derives the same cache keys and would serve the deleted repository's
+    /// stale upstream content instead of fetching from its own upstream (#2047,
+    /// a content-integrity / supply-chain hazard).
+    ///
+    /// This lists the entire `proxy-cache/<repo_key>/` prefix on the same
+    /// global-default backend the cache writer uses (`self.storage`) and deletes
+    /// every returned key. Listing the raw keys (rather than reconstructing
+    /// logical paths via [`Self::cached_artifact_paths`]) is deliberate: it
+    /// covers the `__content__` body, the `__cache_meta__.json` sidecar, AND
+    /// negative-cache sidecars that exist with no `__content__` companion, so a
+    /// previously cached 404 is re-evaluated against the new upstream too.
+    ///
+    /// Best-effort: a listing failure yields a no-op (logged by the caller via
+    /// the returned `Result`), and individual `NotFound` deletes are tolerated
+    /// so a concurrent eviction does not turn the purge into an error. The
+    /// prefix is repo-key scoped, so calling this for a hosted repository (which
+    /// has no proxy cache) is a harmless empty list.
+    pub async fn purge_repo_cache(&self, repo_key: &str) -> Result<usize> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = self.storage.list(Some(&prefix)).await?;
+        let mut deleted = 0usize;
+        for key in keys {
+            match self.storage.delete(&key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        repo_key = %repo_key,
+                        storage_key = %key,
+                        error = %e,
+                        "failed to purge proxy-cache object on repository delete"
+                    );
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.metadata)
@@ -6404,6 +6450,166 @@ SHA256:
             deletes.is_empty(),
             "no delete should be issued on path-traversal: {:?}",
             deletes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // purge_repo_cache (#2047)
+    //
+    // Repository delete must purge the whole `proxy-cache/<repo_key>/` subtree
+    // from the global default backend so a later repo created with the same key
+    // cannot serve the deleted repo's stale upstream content. The helper is
+    // storage-only (list + delete), so a recording mock that serves a fixed key
+    // set from `list` and captures every `delete` pins the contract.
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that serves a fixed key set from `list(prefix)` (filtered
+    /// by prefix) and captures every `delete()` call, with a configurable
+    /// listing failure to exercise the best-effort error path.
+    struct PrefixListDeleteStorage {
+        keys: Vec<String>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
+        list_fails: bool,
+    }
+
+    impl PrefixListDeleteStorage {
+        fn new(keys: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                keys: keys.into_iter().map(String::from).collect(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: false,
+            })
+        }
+        fn failing_list() -> Arc<Self> {
+            Arc::new(Self {
+                keys: Vec::new(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: true,
+            })
+        }
+        async fn deletes_snapshot(&self) -> Vec<String> {
+            self.deletes.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PrefixListDeleteStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            let p = prefix.unwrap_or("");
+            Ok(self
+                .keys
+                .iter()
+                .filter(|k| k.starts_with(p))
+                .cloned()
+                .collect())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_deletes_entire_repo_key_subtree() {
+        // Two cached entries (body + sidecar each) plus a negative-cache
+        // sidecar with no `__content__` companion, all under the target repo
+        // key, and an unrelated repo's entry that must be left untouched.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            // Negative-cache sidecar: a previously-404'd path, sidecar only.
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+            // Different repo that happens to share a key prefix substring:
+            // must NOT be purged (prefix is slash-terminated).
+            "proxy-cache/rpm-remote-other/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("rpm-remote")
+            .await
+            .expect("purge should succeed");
+
+        let deletes = storage.deletes_snapshot().await;
+        assert_eq!(deleted, 5, "should report 5 purged keys, got {:?}", deletes);
+        // Every object under the target repo key — content, sidecar, AND the
+        // negative-cache-only sidecar — must be gone.
+        for k in [
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+        ] {
+            assert!(deletes.iter().any(|d| d == k), "expected delete of {k}");
+        }
+        // A different repo's cache must survive.
+        assert!(
+            !deletes
+                .iter()
+                .any(|d| d.starts_with("proxy-cache/rpm-remote-other/")),
+            "must not purge a sibling repo's cache: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_empty_for_repo_with_no_cache() {
+        // A hosted repo (or a remote that was never fetched) has no
+        // proxy-cache objects: the helper must be a clean no-op, not an error.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/some-other-repo/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("hosted-repo")
+            .await
+            .expect("purge should succeed");
+
+        assert_eq!(
+            deleted, 0,
+            "no keys should be purged for a repo with no cache"
+        );
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when nothing matches the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_propagates_list_failure() {
+        // A listing failure surfaces as Err so the caller can log it; the
+        // caller (delete_repository) swallows it so the delete still proceeds.
+        let storage = PrefixListDeleteStorage::failing_list();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service.purge_repo_cache("rpm-remote").await;
+
+        assert!(result.is_err(), "list failure should surface as Err");
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when listing failed"
         );
     }
 
