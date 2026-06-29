@@ -1114,6 +1114,16 @@ mod tests {
     use crate::models::repository::ReplicationPriority;
     use chrono::{Duration, TimeZone};
 
+    async fn try_db_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()
+    }
+
     fn lazy_pool() -> sqlx::PgPool {
         sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not contact the database")
@@ -1149,6 +1159,124 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    async fn create_age_gate_repo(
+        pool: &sqlx::PgPool,
+        format: RepositoryFormat,
+        min_age_days: i32,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("age-gate-lib-{}-{}", format_label(&format), id);
+        let format_sql = match format {
+            RepositoryFormat::Npm => "npm",
+            RepositoryFormat::Pypi => "pypi",
+            _ => "generic",
+        };
+        sqlx::query(
+            "INSERT INTO repositories (
+                id, key, name, storage_path, repo_type, format, upstream_url,
+                age_gate_enabled, age_gate_min_age_days
+             )
+             VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, $5, true, $6)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/age-gate-lib/{id}"))
+        .bind(format_sql)
+        .bind("https://upstream.example.test")
+        .bind(min_age_days)
+        .execute(pool)
+        .await
+        .expect("create age-gate repo");
+        (id, key)
+    }
+
+    async fn create_reviewer(pool: &sqlx::PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("age-gate-reviewer-{id}");
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+             VALUES ($1, $2, $3, 'unused', 'local', true, true)",
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(pool)
+        .await
+        .expect("create reviewer");
+        id
+    }
+
+    async fn insert_review_row(
+        pool: &sqlx::PgPool,
+        repository_id: Uuid,
+        package_name: &str,
+        version: &str,
+        status: &str,
+        published_at: Option<DateTime<Utc>>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews (
+                repository_id, package_name, package_version, upstream_published_at, status
+             )
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id",
+        )
+        .bind(repository_id)
+        .bind(package_name)
+        .bind(version)
+        .bind(published_at)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("insert review row")
+    }
+
+    async fn insert_artifact(
+        pool: &sqlx::PgPool,
+        repository_id: Uuid,
+        package_name: &str,
+        version: &str,
+        path: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+             )
+             VALUES ($1, $2, $3, $4, 128, $5, 'application/octet-stream', $2, false)",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .bind(package_name)
+        .bind(version)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .expect("insert artifact");
+    }
+
+    fn npm_params(id: Uuid, key: String, min_age_days: i32) -> AgeGateRepoParams {
+        AgeGateRepoParams::from_parts(
+            id,
+            key,
+            RepositoryType::Remote,
+            RepositoryFormat::Npm,
+            true,
+            min_age_days,
+        )
+    }
+
+    fn pypi_params(id: Uuid, key: String, min_age_days: i32) -> AgeGateRepoParams {
+        AgeGateRepoParams::from_parts(
+            id,
+            key,
+            RepositoryType::Remote,
+            RepositoryFormat::Pypi,
+            true,
+            min_age_days,
+        )
     }
 
     #[test]
@@ -1234,6 +1362,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unchanged, html);
+    }
+
+    #[tokio::test]
+    async fn db_check_review_crud_lkg_and_config_paths() {
+        let Some(pool) = try_db_pool().await else {
+            return;
+        };
+        let bus = Arc::new(EventBus::new(64));
+        let svc = AgeGateService::new(pool.clone(), bus);
+        let (repo_id, repo_key) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 7).await;
+        let params = npm_params(repo_id, repo_key.clone(), 7);
+        let reviewer = create_reviewer(&pool).await;
+
+        insert_artifact(&pool, repo_id, "pkg", "1.0.0", "pkg/-/pkg-1.0.0.tgz").await;
+
+        let young = Utc::now() - Duration::days(1);
+        let decision = svc
+            .check(&params, "pkg", "2.0.0", Some(young))
+            .await
+            .expect("young version should create pending review");
+        let pending_id = match decision {
+            AgeGateDecision::Block {
+                review_id,
+                last_known_good,
+            } => {
+                let lkg = last_known_good.expect("old cached artifact is last-known-good");
+                assert_eq!(lkg.version, "1.0.0");
+                assert_eq!(lkg.artifact_path, "pkg/-/pkg-1.0.0.tgz");
+                review_id
+            }
+            AgeGateDecision::Allow => panic!("young version should be blocked"),
+        };
+
+        let pending = svc
+            .get_review_by_id(pending_id)
+            .await
+            .expect("pending review");
+        assert_eq!(pending.repository_key.as_deref(), Some(repo_key.as_str()));
+        let (items, total) = svc
+            .list_reviews(Some(&repo_key), Some(&["pending".to_string()]), 0, 10)
+            .await
+            .expect("list reviews");
+        assert!(total >= 1);
+        assert!(items.iter().any(|r| r.id == pending_id));
+
+        let approved = svc
+            .approve(pending_id, reviewer, Some("unit test approval"))
+            .await
+            .expect("approve pending review");
+        assert_eq!(approved.status, "approved");
+        assert_eq!(
+            approved.review_reason.as_deref(),
+            Some("unit test approval")
+        );
+        assert!(matches!(
+            svc.check(&params, "pkg", "2.0.0", Some(young))
+                .await
+                .expect("approved review allows"),
+            AgeGateDecision::Allow
+        ));
+
+        let reject_id =
+            insert_review_row(&pool, repo_id, "pkg", "3.0.0", "pending", Some(young)).await;
+        let rejected = svc
+            .reject(reject_id, reviewer, Some("unit test rejection"))
+            .await
+            .expect("reject pending review");
+        assert_eq!(rejected.status, "rejected");
+        assert!(matches!(
+            svc.check(
+                &params,
+                "pkg",
+                "3.0.0",
+                Some(Utc::now() - Duration::days(30))
+            )
+            .await
+            .expect("rejected review stays blocked"),
+            AgeGateDecision::Block { .. }
+        ));
+
+        insert_review_row(
+            &pool,
+            repo_id,
+            "pkg",
+            "4.0.0",
+            "pending",
+            Some(Utc::now() - Duration::days(30)),
+        )
+        .await;
+        assert!(matches!(
+            svc.check(
+                &params,
+                "pkg",
+                "4.0.0",
+                Some(Utc::now() - Duration::days(30))
+            )
+            .await
+            .expect("old pending auto-approves"),
+            AgeGateDecision::Allow
+        ));
+
+        svc.update_repo_config(repo_id, false, 14)
+            .await
+            .expect("update repo config");
+        let min_age_days: i32 =
+            sqlx::query_scalar("SELECT age_gate_min_age_days FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("config row");
+        assert_eq!(min_age_days, 14);
+
+        assert!(svc.get_review_by_id(Uuid::new_v4()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn db_metadata_filters_batch_reviews_and_sweep() {
+        let Some(pool) = try_db_pool().await else {
+            return;
+        };
+        let bus = Arc::new(EventBus::new(64));
+        let svc = AgeGateService::new(pool.clone(), bus);
+        let (npm_id, npm_key) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 7).await;
+        let (pypi_id, pypi_key) = create_age_gate_repo(&pool, RepositoryFormat::Pypi, 7).await;
+        let npm = npm_params(npm_id, npm_key, 7);
+        let pypi = pypi_params(pypi_id, pypi_key, 7);
+
+        let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let old = (Utc::now() - Duration::days(30)).to_rfc3339();
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": { "name": "batch-pkg", "version": "1.0.0" },
+                "2.0.0": { "name": "batch-pkg", "version": "2.0.0" }
+            },
+            "time": {
+                "1.0.0": old,
+                "2.0.0": young
+            }
+        });
+        svc.filter_npm_packument(&npm, "batch-pkg", &mut packument)
+            .await
+            .expect("filter npm packument");
+        assert!(packument["versions"].get("1.0.0").is_some());
+        assert!(packument["versions"].get("2.0.0").is_none());
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("1.0.0"));
+
+        let request_count: i32 = sqlx::query_scalar(
+            "SELECT request_count FROM age_gate_reviews
+             WHERE repository_id = $1 AND package_name = 'batch-pkg' AND package_version = '2.0.0'",
+        )
+        .bind(npm_id)
+        .fetch_one(&pool)
+        .await
+        .expect("batch review row");
+        assert_eq!(request_count, 1);
+
+        let old_ts = Utc::now() - Duration::days(30);
+        let young_ts = Utc::now() - Duration::days(1);
+        let times = std::collections::HashMap::from([
+            ("1.0.0".to_string(), old_ts),
+            ("9.9.9".to_string(), young_ts),
+        ]);
+        let html = r#"<html><body>
+<a href="/packages/demo-1.0.0.tar.gz#sha256=old">demo-1.0.0.tar.gz</a>
+<a href="/packages/demo-9.9.9-py3-none-any.whl#sha256=young">demo-9.9.9-py3-none-any.whl</a>
+</body></html>"#;
+        let filtered = svc
+            .filter_pypi_simple_index(&pypi, "demo", &times, html)
+            .await
+            .expect("filter pypi simple index");
+        assert!(filtered.contains("demo-1.0.0.tar.gz"));
+        assert!(!filtered.contains("demo-9.9.9"));
+
+        insert_review_row(&pool, pypi_id, "sweep", "1.0.0", "pending", Some(old_ts)).await;
+        insert_review_row(&pool, pypi_id, "sweep", "2.0.0", "pending", Some(young_ts)).await;
+        let approved = svc
+            .auto_approve_aged_reviews()
+            .await
+            .expect("sweep aged reviews");
+        assert!(approved >= 1);
     }
 
     #[test]
