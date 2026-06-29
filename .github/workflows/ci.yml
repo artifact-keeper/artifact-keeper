@@ -87,21 +87,16 @@ jobs:
         run: ./scripts/ci/check-token-mint-surface.sh
 
       - name: Run Clippy
-        # Cap parallel rustc invocations so the lib-test compile doesn't OOM
-        # the ARC runner pod ("sccache: Compile terminated by signal 9",
-        # #1515/#1594). Lowered 4 → 2 (#1679), then 2 → 1 (#2062): clippy-driver
-        # uses ~2-3x the peak RSS of rustc for the same crate, so even two
-        # parallel clippy-drivers on the lib-test target exceeded the 8Gi pod
-        # limit (forcing admin-merges of #2046/#2054/#2055/#2059). Serializing
-        # to a single clippy-driver keeps peak to one driver (~5-6Gi), which fits
-        # — the Backend Unit Tests job compiles the same lib-test crate on the
-        # same runner at jobs=4 (rustc) and passes, confirming the crate itself
-        # fits; only clippy's higher per-process RSS needed the extra cap. If a
-        # single driver ever exceeds 8Gi, move this job to ak-beefy-runners (16Gi).
-        # CARGO_INCREMENTAL=0 disables incremental codegen (useless in CI's clean
-        # checkout, inflates peak memory). Lint set is unchanged.
+        # Cap parallel rustc invocations to bound peak RSS on the ARC runner.
+        # History: 4 → 2 (#1679) then the real fix in #2062 — the ak-ci-runners
+        # pod memory limit was raised 8Gi → 16Gi (iac arc-ci-runners-values.yaml).
+        # clippy-driver uses ~2-3x rustc's RSS, so two parallel drivers on the
+        # backend lib-test crate (~12Gi) OOM-killed the old 8Gi pod (signal 9),
+        # forcing admin-merges of #2046/#2054/#2055/#2059. With 16Gi, jobs=2 fits
+        # comfortably and runs parallel again. CARGO_INCREMENTAL=0 disables
+        # incremental codegen (useless in CI's clean checkout, inflates peak RSS).
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
