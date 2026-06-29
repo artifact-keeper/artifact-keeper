@@ -1336,6 +1336,7 @@ async fn apply_npm_download_age_gate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_and_respond_with_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1359,6 +1360,7 @@ async fn rewrite_and_respond_with_age_gate(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_and_respond_with_age_gate_params(
     state: &SharedState,
     params: &crate::services::age_gate_service::AgeGateRepoParams,

@@ -430,7 +430,11 @@ async fn pypi_simple_index_withholds_young_version_via_real_anchors() {
         .fetch_pypi_publish_times(&client, repo_id, &server.uri(), pkg)
         .await
         .expect("fetch publish times");
-    assert_eq!(times.len(), 2, "mock upstream should yield two publish times");
+    assert_eq!(
+        times.len(),
+        2,
+        "mock upstream should yield two publish times"
+    );
 
     let html = pypi_simple_index_html("age-gate-pypi", pkg, &["1.0.0", "9.9.9"]);
     let filtered = svc

@@ -394,6 +394,33 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    fn auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "age-gate-admin".to_string(),
+            email: "age-gate-admin@example.invalid".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn routers_build_admin_and_repo_config_routes() {
+        let _admin = admin_router();
+        let _repo = repo_config_routes();
+    }
+
+    #[test]
+    fn require_auth_accepts_present_auth_and_rejects_missing() {
+        let present = auth(false);
+        let accepted = require_auth(Some(present.clone())).expect("auth should pass through");
+        assert_eq!(accepted.user_id, present.user_id);
+        assert!(require_auth(None).is_err());
+    }
+
     #[test]
     fn parse_status_filter_splits_and_trims() {
         assert_eq!(
