@@ -1882,6 +1882,30 @@ pub async fn delete_repository(
     // (#1551). Best-effort: never blocks the delete.
     purge_repo_artifact_objects(&state, repo.id, &repo.storage_location()).await;
 
+    // Purge this repo's proxy-cache subtree from the global default storage
+    // backend. Proxy-cached blobs are keyed by the repo KEY and are not tracked
+    // in `artifacts` (#1278), so the purge above never reaches them; left
+    // behind, a new repository created with the same key would serve the deleted
+    // repo's stale upstream content (#2047). Best-effort: never blocks the
+    // delete. Hosted repos have no proxy cache, so this is a no-op for them.
+    if let Some(proxy) = state.proxy_service.as_ref() {
+        match proxy.purge_repo_cache(&repo.key).await {
+            Ok(purged) if purged > 0 => tracing::info!(
+                repo_id = %repo.id,
+                repo_key = %repo.key,
+                purged,
+                "Purged proxy-cache storage objects for deleted repository"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                repo_id = %repo.id,
+                repo_key = %repo.key,
+                error = %e,
+                "Failed to list proxy-cache objects to purge before repository delete"
+            ),
+        }
+    }
+
     service.delete(repo.id).await?;
 
     // Remove the deleted repo from the in-memory cache.
