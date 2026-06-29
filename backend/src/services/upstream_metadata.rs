@@ -184,6 +184,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parse_npm_publish_times_skips_meta_keys() {
@@ -289,5 +291,73 @@ mod tests {
             Duration::from_secs(61),
             Duration::from_secs(60)
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_pypi_publish_times_fetches_and_reuses_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/demo/json"))
+            .and(header("Accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "releases": {
+                    "1.0.0": [
+                        { "upload_time_iso_8601": "2024-01-02T00:00:00.000Z" },
+                        { "upload_time_iso_8601": "2024-01-01T00:00:00.000Z" }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = UpstreamMetadataCache::new();
+        let client = reqwest::Client::new();
+        let repo_id = Uuid::new_v4();
+        let first = cache
+            .fetch_pypi_publish_times(&client, repo_id, &server.uri(), "demo")
+            .await
+            .expect("fetch pypi metadata");
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first.get("1.0.0").unwrap().to_rfc3339(),
+            "2024-01-01T00:00:00+00:00"
+        );
+
+        let second = cache
+            .fetch_pypi_publish_times(&client, repo_id, &server.uri(), "Demo")
+            .await
+            .expect("cache hit");
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn fetch_pypi_publish_times_reports_status_and_json_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/missing/json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/bad-json/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("not json")
+                    .insert_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let cache = UpstreamMetadataCache::new();
+        let client = metadata_http_client().expect("metadata client");
+        assert!(cache
+            .fetch_pypi_publish_times(&client, Uuid::new_v4(), &server.uri(), "missing")
+            .await
+            .is_err());
+        assert!(cache
+            .fetch_pypi_publish_times(&client, Uuid::new_v4(), &server.uri(), "bad-json")
+            .await
+            .is_err());
     }
 }
