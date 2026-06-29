@@ -68,7 +68,7 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls
 # the latest RHEL 9 z-stream security errata for every installed package
-# (curl-minimal/libcurl, jq, glibc*, tar, bzip2-libs, openssl-libs, xz-libs,
+# (curl-minimal/libcurl, glibc*, tar, openssl-libs, xz-libs,
 # zlib, zstd) that the install step alone may miss when the metadata cache is
 # stale. This guarantees the rootfs is rebuilt against current errata on every
 # image build. The reposdir override is required on the upgrade step because
@@ -91,9 +91,7 @@ RUN mkdir -p /mnt/rootfs && \
         openssl-libs \
         zlib \
         xz-libs \
-        bzip2-libs \
         curl-minimal \
-        jq \
         tar \
         gzip \
         zstd \
@@ -155,13 +153,27 @@ RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
 # Remove any leftover cache/tmp artifacts
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
+# Strip residual setuid/setgid bits (shadow-utils chage/gpasswd/newgrp etc. are
+# pulled transitively and are never used by a non-root, no-login container) and
+# drop interpreters/shells the runtime does not need. The CMD (`artifact-keeper`)
+# and the curl healthcheck do not invoke bash/gawk/sed; jq is referenced only in
+# code comments and never spawned. Removing them shrinks attack surface and
+# clears jq's MEDIUM-CVE load. /bin/sh (coreutils-supplied) is intentionally
+# left in place.
+RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
+    rm -f /mnt/rootfs/usr/bin/bash \
+          /mnt/rootfs/usr/bin/gawk \
+          /mnt/rootfs/usr/bin/sed \
+          /mnt/rootfs/usr/bin/bashbug*
+
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
-# Trivy is pinned to the latest release (0.71.2). The bump from 0.71.0 clears
-# the golang.org/x/net (CVE-2026-25680/25681/27136/39821/42502/42506) and Go
-# stdlib (CVE-2026-27145/42504/42507) CVEs that Trivy 0.71.0's binary carried,
-# including the deps behind the code-scanning grpc finding. Residual containerd
-# CVEs that 0.71.2 has not yet rebuilt against are documented in /.trivyignore.
-FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy-bin
+# The trivy CLI is intentionally NOT bundled in the runtime image. The backend
+# drives Trivy in server mode against the trivy sidecar (TRIVY_URL) and falls
+# back to the pure-HTTP Twirp endpoint (`scan_with_trivy_http`) when the CLI is
+# absent, so the in-image binary is dead weight. Dropping it removes the trivy
+# binary's HIGH-severity Go-dependency CVEs and ~150 MB of image size with no
+# functional loss. See issue #1544.
+#
 # Grype is pinned to v0.114.0, which is the latest upstream release. There is no
 # newer Grype build that picks up fixed versions of its bundled Go deps
 # (docker, containerd, stdlib), so its residual CVEs are upstream-unfixable for
@@ -187,8 +199,8 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
 
-# Copy scanner CLIs from official images
-COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+# Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
+# deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=grype-bin /grype /usr/local/bin/
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
@@ -196,6 +208,19 @@ COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
+
+# Remove the bash shell that the ubi-micro BASE layer ships (the rootfs-builder
+# strip only affects the copied rootfs, not files already present in the base).
+# On ubi-micro `/bin/sh` and `/usr/bin/sh` are symlinks to bash, so dropping
+# bash removes the only interactive shell. Nothing at runtime needs it: the
+# binary spawns its subprocesses (tar/chmod/grype) directly via Command::new
+# (no `sh -c`), CMD is exec-form `["artifact-keeper"]`, and the HEALTHCHECK is
+# exec-form curl. Done with the real coreutils `rm` (exec-form RUN) so it does
+# not depend on the shell being deleted. See issue #1544.
+RUN ["/usr/bin/rm", "-f", \
+     "/usr/bin/bash", "/bin/bash", \
+     "/usr/bin/sh", "/bin/sh", \
+     "/usr/bin/bashbug", "/usr/bin/bashbug-64"]
 
 WORKDIR /app
 USER 1001

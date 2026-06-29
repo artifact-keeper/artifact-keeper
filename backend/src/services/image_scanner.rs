@@ -294,7 +294,7 @@ impl ImageScanner {
     /// Scan an image reference using the Trivy CLI with server mode.
     async fn scan_with_trivy(&self, image_ref: &str) -> Result<TrivyReport> {
         // Use tokio::process to call trivy CLI with server mode
-        let output = tokio::process::Command::new("trivy")
+        let spawn_result = tokio::process::Command::new("trivy")
             .args([
                 "image",
                 "--server",
@@ -311,8 +311,27 @@ impl ImageScanner {
                 image_ref,
             ])
             .output()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Trivy: {}", e)))?;
+            .await;
+
+        // If the trivy CLI is not present in the image at all, spawning it
+        // fails with ErrorKind::NotFound. The runtime image no longer bundles
+        // the trivy binary (#1544) — image scans run through the trivy sidecar
+        // (TRIVY_URL), so degrade gracefully to the HTTP/Twirp endpoint instead
+        // of failing the scan. Other spawn errors (e.g. permission) are real
+        // and still surface.
+        let output = match spawn_result {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!("Trivy CLI not installed, falling back to HTTP API");
+                return self.scan_with_trivy_http(image_ref).await;
+            }
+            Err(e) => {
+                return Err(AppError::Internal(format!(
+                    "Failed to execute Trivy: {}",
+                    e
+                )))
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -731,6 +750,53 @@ mod tests {
             "error message should describe the health-check failure, got: {}",
             msg
         );
+    }
+
+    /// #1544: the runtime image no longer bundles the trivy CLI; image scans
+    /// must succeed via the HTTP/Twirp fallback against the trivy sidecar.
+    /// This exercises `scan_with_trivy_http` (the fallback target that
+    /// `scan_with_trivy` routes to when the CLI is absent) end-to-end against a
+    /// mock Twirp server and asserts the report is parsed correctly.
+    #[tokio::test]
+    async fn test_scan_with_trivy_http_fallback_parses_report() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let report = serde_json::json!({
+            "Results": [{
+                "Target": "myapp:latest (alpine 3.19)",
+                "Class": "os-pkgs",
+                "Type": "alpine",
+                "Vulnerabilities": [{
+                    "VulnerabilityID": "CVE-2026-0001",
+                    "PkgName": "openssl",
+                    "InstalledVersion": "3.1.0",
+                    "FixedVersion": "3.1.1",
+                    "Severity": "HIGH",
+                    "Title": "test vuln",
+                    "Description": "desc",
+                    "PrimaryURL": "https://example.test/cve"
+                }]
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/twirp/trivy.scanner.v1.Scanner/Scan"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(report))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = scanner.scan_with_trivy_http("myapp:latest").await;
+
+        let report = result.expect("HTTP/Twirp fallback should return a parsed report");
+        assert_eq!(report.results.len(), 1);
+        let vulns = report.results[0]
+            .vulnerabilities
+            .as_ref()
+            .expect("results should carry the mocked vulnerability");
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].vulnerability_id, "CVE-2026-0001");
     }
 
     /// `check_trivy_health` retries before declaring failure so a brief
