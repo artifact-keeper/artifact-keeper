@@ -1111,7 +1111,45 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::repository::ReplicationPriority;
     use chrono::{Duration, TimeZone};
+
+    fn lazy_pool() -> sqlx::PgPool {
+        sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not contact the database")
+    }
+
+    fn test_repo(
+        format: RepositoryFormat,
+        repo_type: RepositoryType,
+    ) -> crate::models::repository::Repository {
+        let now = Utc::now();
+        crate::models::repository::Repository {
+            id: Uuid::new_v4(),
+            key: "age-gate-test".to_string(),
+            name: "Age Gate Test".to_string(),
+            description: Some("unit test repository".to_string()),
+            format,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/age-gate-test".to_string(),
+            upstream_url: Some("https://example.invalid".to_string()),
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::OnDemand,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: true,
+            age_gate_min_age_days: 14,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn package_age_days_at_threshold() {
@@ -1130,6 +1168,72 @@ mod tests {
     fn missing_timestamp_does_not_meet_threshold() {
         let now = Utc::now();
         assert!(!AgeGateService::meets_age_threshold(None, 7, now));
+    }
+
+    #[tokio::test]
+    async fn service_constructs_and_exposes_metadata_cache() {
+        let svc = AgeGateService::new(lazy_pool(), Arc::new(EventBus::new(4)));
+        let packument = serde_json::json!({
+            "time": { "1.0.0": "2024-01-01T00:00:00.000Z" }
+        });
+
+        let _cache = svc.metadata_cache();
+        let parsed = UpstreamMetadataCache::parse_npm_publish_times(&packument);
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn repo_params_from_repository_copies_age_gate_fields() {
+        let repo = test_repo(RepositoryFormat::Pypi, RepositoryType::Remote);
+        let params = AgeGateRepoParams::from_repository(&repo);
+        assert_eq!(params.id, repo.id);
+        assert_eq!(params.key, repo.key);
+        assert_eq!(params.repo_type, RepositoryType::Remote);
+        assert_eq!(params.format, RepositoryFormat::Pypi);
+        assert!(params.age_gate_enabled);
+        assert_eq!(params.age_gate_min_age_days, 14);
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unsupported_filters_return_without_db_access() {
+        let svc = AgeGateService::new(lazy_pool(), Arc::new(EventBus::new(4)));
+        let disabled = AgeGateRepoParams::from_parts(
+            Uuid::new_v4(),
+            "npm-disabled",
+            RepositoryType::Remote,
+            RepositoryFormat::Npm,
+            false,
+            7,
+        );
+        let cargo = AgeGateRepoParams::from_parts(
+            Uuid::new_v4(),
+            "cargo-remote",
+            RepositoryType::Remote,
+            RepositoryFormat::Cargo,
+            true,
+            7,
+        );
+
+        assert_eq!(
+            svc.check(&disabled, "pkg", "1.0.0", None).await.unwrap(),
+            AgeGateDecision::Allow
+        );
+
+        let mut packument = serde_json::json!({
+            "versions": { "1.0.0": {} },
+            "time": { "1.0.0": "2024-01-01T00:00:00.000Z" }
+        });
+        svc.filter_npm_packument(&disabled, "pkg", &mut packument)
+            .await
+            .unwrap();
+        assert!(packument["versions"].get("1.0.0").is_some());
+
+        let html = "<a href=\"pkg-1.0.0.tar.gz\">pkg-1.0.0.tar.gz</a>";
+        let unchanged = svc
+            .filter_pypi_simple_index(&cargo, "pkg", &std::collections::HashMap::new(), html)
+            .await
+            .unwrap();
+        assert_eq!(unchanged, html);
     }
 
     #[test]
@@ -1311,6 +1415,18 @@ mod tests {
     }
 
     #[test]
+    fn collect_and_apply_npm_handles_missing_shapes() {
+        let mut packument = serde_json::json!({ "name": "empty" });
+        let blocked = std::collections::HashSet::from(["1.0.0".to_string()]);
+        assert!(
+            collect_npm_packument_versions(&packument, &std::collections::HashMap::new())
+                .is_empty()
+        );
+        assert!(apply_npm_packument_blocks(&mut packument, &blocked).is_empty());
+        assert_eq!(packument["name"], "empty");
+    }
+
+    #[test]
     fn parse_and_rebuild_pypi_simple_index() {
         let html = r#"<html><body>
 <a href="/pkg/requests-1.0.0.tar.gz">1.0.0</a>
@@ -1329,6 +1445,32 @@ mod tests {
 
         attach_pypi_publish_times(&mut versions, &std::collections::HashMap::new());
         assert!(versions.iter().all(|(_, ts)| ts.is_none()));
+    }
+
+    #[test]
+    fn parse_pypi_simple_index_dedupes_and_attaches_publish_times() {
+        let html = r#"<a href="/pkg/demo-1.0.0.tar.gz">sdist</a>
+<a href="/pkg/demo-1.0.0-py3-none-any.whl#sha256=abc">wheel</a>
+<a href="">empty</a>
+<a href="/pkg/demo-2.0.0.tar.gz">missing close"#;
+        let (spans, mut versions) = parse_pypi_simple_index_anchors(html);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+
+        let published = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        attach_pypi_publish_times(
+            &mut versions,
+            &std::collections::HashMap::from([("1.0.0".to_string(), published)]),
+        );
+        assert_eq!(versions[0].1, Some(published));
+
+        let rebuilt = rebuild_pypi_simple_index_html(
+            html,
+            &spans,
+            &std::collections::HashSet::from(["1.0.0".to_string()]),
+        );
+        assert!(!rebuilt.contains("demo-1.0.0"));
+        assert!(rebuilt.contains("missing close"));
     }
 
     #[test]

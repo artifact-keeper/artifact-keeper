@@ -4773,8 +4773,11 @@ mod tests {
             storage_path: "/data/gate-test".to_string(),
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
+            format: "generic".to_string(),
             upstream_url: None,
             promotion_only,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         }
     }
 
@@ -8833,6 +8836,7 @@ mod tests {
             repo_type: "remote".to_string(),
             format: "npm".to_string(),
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            promotion_only: false,
             age_gate_enabled: true,
             age_gate_min_age_days: 14,
         };
