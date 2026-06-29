@@ -484,6 +484,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/repositories",
             handlers::repositories::router()
+                .merge(handlers::age_gate::repo_config_routes())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,
@@ -705,6 +706,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
             .nest("/smtp", handlers::smtp::router())
+            .nest("/age-gate", handlers::age_gate::admin_router())
             .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .layer(middleware::from_fn_with_state(
                 auth_service.clone(),

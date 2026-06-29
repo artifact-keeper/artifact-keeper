@@ -2595,7 +2595,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -2610,7 +2613,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(

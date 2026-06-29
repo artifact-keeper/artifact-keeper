@@ -59,6 +59,7 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "migration", description = "Data migration and import"),
         (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
+        (name = "age-gate", description = "Age-based proxy quality gate"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
         (name = "system", description = "Public system configuration"),
@@ -166,6 +167,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi());
     doc.merge(super::handlers::quality_gates::QualityGatesApiDoc::openapi());
     doc.merge(super::handlers::approval::ApprovalApiDoc::openapi());
+    doc.merge(super::handlers::age_gate::AgeGateApi::openapi());
     doc.merge(super::handlers::promotion_rules::PromotionRulesApiDoc::openapi());
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());

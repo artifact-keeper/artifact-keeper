@@ -81,6 +81,11 @@ pub enum AuditAction {
     TotpEnabled,
     TotpDisabled,
     SessionsInvalidated,
+
+    // Age gate
+    AgeGateQueued,
+    AgeGateApproved,
+    AgeGateRejected,
 }
 
 impl AuditAction {
@@ -129,6 +134,9 @@ impl AuditAction {
             AuditAction::TotpEnabled => "TOTP_ENABLED",
             AuditAction::TotpDisabled => "TOTP_DISABLED",
             AuditAction::SessionsInvalidated => "SESSIONS_INVALIDATED",
+            AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
+            AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
+            AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
         }
     }
 }

@@ -77,6 +77,7 @@ pub mod transfer_service;
 pub mod trivy_fs_scanner;
 pub mod upload_service;
 pub mod upstream_auth;
+pub mod upstream_metadata;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
@@ -87,6 +88,7 @@ pub mod webhook_secret_crypto;
 pub mod webhook_signing;
 
 // Observability & lifecycle
+pub mod age_gate_service;
 pub mod analytics_service;
 pub mod crash_reporting_service;
 pub mod curation_service;

@@ -438,6 +438,9 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         repo_type: row.get("repo_type"),
         upstream_url: row.get("upstream_url"),
         promotion_only: row.try_get("promotion_only").unwrap_or(false),
+        format: "generic".to_string(),
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     })
 }
 
