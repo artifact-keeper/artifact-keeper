@@ -989,7 +989,18 @@ fn extract_href_filename(anchor: &str) -> Option<String> {
     let rest = &anchor[href_start..];
     let href_end = rest.find('"')?;
     let href = &rest[..href_end];
-    href.rsplit('/').next().map(|s| s.to_string())
+    let basename = href.rsplit('/').next()?;
+    // PEP 503 simple-index anchors always carry a `#sha256=...` hash fragment
+    // (and may carry a query string). Strip both before the basename is handed
+    // to `parse_filename`, which otherwise rejects the whole anchor and the
+    // age-gate listing filter silently no-ops. Proxy-rewritten hrefs also carry
+    // a repo path prefix, but `rsplit('/')` already removes that.
+    let filename = basename.split(['#', '?']).next().unwrap_or(basename);
+    if filename.is_empty() {
+        None
+    } else {
+        Some(filename.to_string())
+    }
 }
 
 /// Extract the package version a PyPI simple-index anchor links to, if any.
@@ -1140,6 +1151,29 @@ mod tests {
     #[test]
     fn extract_href_filename_parses_anchor() {
         let html = r#"<a href="/packages/requests/2.31.0/requests-2.31.0.tar.gz">link</a>"#;
+        assert_eq!(
+            extract_href_filename(html),
+            Some("requests-2.31.0.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_href_filename_strips_sha256_fragment() {
+        // Real PEP 503 anchors always carry a `#sha256=...` hash fragment; the
+        // proxy also rewrites the href to a repo-relative path. Both must reduce
+        // to the bare filename, otherwise `parse_filename` rejects every anchor
+        // and the simple-index age-gate filter silently passes everything.
+        let html = r#"<a href="/pypi/pypi-proxy/simple/click/click-8.4.2-py3-none-any.whl#sha256=deadbeef">click-8.4.2-py3-none-any.whl</a>"#;
+        assert_eq!(
+            extract_href_filename(html),
+            Some("click-8.4.2-py3-none-any.whl".to_string())
+        );
+        assert_eq!(pypi_anchor_version(html), Some("8.4.2".to_string()));
+    }
+
+    #[test]
+    fn extract_href_filename_strips_query_string() {
+        let html = r#"<a href="../requests-2.31.0.tar.gz?foo=bar">link</a>"#;
         assert_eq!(
             extract_href_filename(html),
             Some("requests-2.31.0.tar.gz".to_string())
