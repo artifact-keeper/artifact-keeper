@@ -31,8 +31,10 @@ use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
-    validate_trivy_purl, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
+    validate_trivy_purl, ScanOutput, ScanReferenceResolution, ScanTarget, ScanWorkspace, Scanner,
+    VersionCache,
 };
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
@@ -288,6 +290,18 @@ pub struct GrypeScanner {
 struct LocalOciBlob {
     digest: String,
     storage_key: String,
+}
+
+/// The concrete single-platform image manifest a local OCI layout is built
+/// from. For a single-arch artifact this is the artifact's own manifest; for
+/// an image index it is the resolved child-platform manifest (#2053).
+struct LayoutManifest {
+    /// `sha256:...` digest of the manifest the layout's `index.json` points at.
+    digest: String,
+    /// The manifest body written as the layout's referenced manifest blob.
+    body: Bytes,
+    /// `mediaType` for the layout descriptor (empty ⇒ omitted).
+    media_type: String,
 }
 
 fn artifact_digest(checksum_sha256: &str) -> String {
@@ -591,6 +605,93 @@ impl GrypeScanner {
         result.map(Some)
     }
 
+    /// Resolve the concrete single-platform image manifest the local OCI
+    /// layout should be built from.
+    ///
+    /// For a single-arch image manifest the artifact's own manifest digest and
+    /// in-hand body are used directly (`mediaType` from `artifact.content_type`).
+    ///
+    /// For an image **index** / manifest list (#2053 follow-up), the artifact's
+    /// own manifest digest has no `manifest_blob_refs` rows (per migration 120,
+    /// only image manifests record config+layer edges), so the local-layout
+    /// path previously gave up and fell back to the broken `registry:` scan.
+    /// Instead we reuse [`resolve_scan_reference`] to pick a concrete scannable
+    /// child-platform digest, load that child manifest body from its
+    /// `oci-manifests/<digest>` storage key, and build the layout from the
+    /// **child** manifest (whose config+layer edges DO exist). The child
+    /// manifest body itself becomes the layout's single referenced manifest.
+    ///
+    /// Returns `None` when the index cannot be resolved to a local child
+    /// manifest (no storage context, missing child body), so the caller keeps
+    /// the existing `registry:` fallback.
+    async fn resolve_layout_manifest(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        reference: &str,
+        content: &Bytes,
+    ) -> Result<Option<LayoutManifest>> {
+        let artifact_manifest_digest = artifact_digest(&artifact.checksum_sha256);
+
+        // Single-arch / malformed / non-index bodies pass through unchanged so
+        // the dominant path is byte-for-byte identical to before.
+        let child_digest = match resolve_scan_reference(content, reference) {
+            ScanReferenceResolution::ResolvedIndexChild(digest) => digest,
+            ScanReferenceResolution::Passthrough(_)
+            | ScanReferenceResolution::UnresolvableIndex(_) => {
+                return Ok(Some(LayoutManifest {
+                    digest: artifact_manifest_digest,
+                    body: content.clone(),
+                    media_type: artifact.content_type.clone(),
+                }));
+            }
+        };
+
+        // The body is an image index. The child manifest is stored under its
+        // own `oci-manifests/<digest>` key with its config+layer edges recorded
+        // in `manifest_blob_refs`; load that body and build the layout from it.
+        let Some(storage) = target.storage else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                "No storage context available to resolve OCI index child for Grype; falling back to registry scan"
+            );
+            return Ok(None);
+        };
+        // Validate the child digest shape before using it in a storage key.
+        digest_hex(&child_digest)?;
+        let child_key = format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, child_digest);
+        let child_body = match storage.get(&child_key).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::debug!(
+                    artifact_id = %artifact.id,
+                    child_digest = %child_digest,
+                    "OCI index child manifest unavailable from local storage ({}); falling back to registry scan",
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        // Prefer the child manifest's own declared mediaType; fall back to the
+        // generic OCI image manifest type so the oci-dir descriptor is valid.
+        let media_type = serde_json::from_slice::<serde_json::Value>(&child_body)
+            .ok()
+            .and_then(|v| {
+                v.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+
+        Ok(Some(LayoutManifest {
+            digest: child_digest,
+            body: child_body,
+            media_type,
+        }))
+    }
+
     async fn prepare_local_oci_layout(
         &self,
         artifact: &Artifact,
@@ -603,7 +704,15 @@ impl GrypeScanner {
                 artifact.path
             ))
         })?;
-        let manifest_digest = artifact_digest(&artifact.checksum_sha256);
+        let Some(layout_manifest) = self
+            .resolve_layout_manifest(artifact, target, reference, content)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let manifest_digest = layout_manifest.digest;
+        let manifest_body = layout_manifest.body;
+        let manifest_media_type = layout_manifest.media_type;
         let blobs = fetch_local_oci_blobs(target, &manifest_digest).await?;
         if blobs.is_empty() {
             tracing::debug!(
@@ -651,7 +760,7 @@ impl GrypeScanner {
         .map_err(|e| AppError::Storage(format!("Failed to write OCI layout marker: {}", e)))?;
 
         let manifest_path = blob_dir.join(digest_hex(&manifest_digest)?);
-        tokio::fs::write(&manifest_path, content)
+        tokio::fs::write(&manifest_path, &manifest_body)
             .await
             .map_err(|e| {
                 AppError::Storage(format!(
@@ -667,16 +776,16 @@ impl GrypeScanner {
         }
 
         let mut descriptor = serde_json::json!({
-            "mediaType": artifact.content_type,
+            "mediaType": manifest_media_type,
             "digest": manifest_digest,
-            "size": content.len(),
+            "size": manifest_body.len(),
             "annotations": {
                 "org.opencontainers.image.ref.name": reference,
                 "io.artifact-keeper.repository": target.repository_key,
                 "io.artifact-keeper.image": image_name,
             }
         });
-        if artifact.content_type.is_empty() {
+        if manifest_media_type.is_empty() {
             descriptor
                 .as_object_mut()
                 .and_then(|o| o.remove("mediaType"));
@@ -1172,6 +1281,76 @@ mod tests {
         make_test_artifact(name, content_type, &format!("test/{}", name))
     }
 
+    /// Canonical config/layer digests reused by the local-OCI-layout tests.
+    const TEST_CONFIG_DIGEST: &str =
+        "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
+    const TEST_LAYER_DIGEST: &str =
+        "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+    /// A single-arch image manifest body referencing the two digests above.
+    const TEST_IMAGE_MANIFEST: &[u8] = br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#;
+
+    /// Insert the `oci_blobs` rows (config + layer) and the `manifest_blob_refs`
+    /// edges that link them to `manifest_digest`, scoped to `repo_id`. The
+    /// three `#[tokio::test]` layout cases share this setup verbatim; factoring
+    /// it keeps the duplicated SQL out of jscpd's reach.
+    async fn insert_image_manifest_refs(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        manifest_digest: &str,
+    ) {
+        let config_key = format!("oci-blobs/{TEST_CONFIG_DIGEST}");
+        let layer_key = format!("oci-blobs/{TEST_LAYER_DIGEST}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(repo_id)
+        .bind(TEST_CONFIG_DIGEST)
+        .bind(24_i64)
+        .bind(&config_key)
+        .execute(pool)
+        .await
+        .expect("insert config blob row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(repo_id)
+        .bind(TEST_LAYER_DIGEST)
+        .bind(11_i64)
+        .bind(&layer_key)
+        .execute(pool)
+        .await
+        .expect("insert layer blob row");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
+        )
+        .bind(manifest_digest)
+        .bind(TEST_CONFIG_DIGEST)
+        .bind(repo_id)
+        .bind(TEST_LAYER_DIGEST)
+        .execute(pool)
+        .await
+        .expect("insert manifest blob refs");
+    }
+
+    /// Write the config + layer blob bodies into `storage` under their
+    /// `oci-blobs/<digest>` keys (companion to [`insert_image_manifest_refs`]).
+    async fn put_image_blob_bodies(storage: &dyn StorageBackend) {
+        storage
+            .put(
+                &format!("oci-blobs/{TEST_CONFIG_DIGEST}"),
+                Bytes::from_static(br#"{"architecture":"arm64"}"#),
+            )
+            .await
+            .expect("write config blob");
+        storage
+            .put(
+                &format!("oci-blobs/{TEST_LAYER_DIGEST}"),
+                Bytes::from_static(b"layer bytes"),
+            )
+            .await
+            .expect("write layer blob");
+    }
+
     // -----------------------------------------------------------------------
     // is_applicable: #1160. OCI / Docker image manifests now route through
     // `grype registry:` mode against artifact-keeper's own registry, so
@@ -1645,58 +1824,12 @@ mod tests {
         };
 
         let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
-        let config_digest =
-            "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
-        let layer_digest =
-            "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+        let config_digest = TEST_CONFIG_DIGEST;
+        let layer_digest = TEST_LAYER_DIGEST;
         let manifest_digest = format!("sha256:{manifest_hex}");
-        let config_key = format!("oci-blobs/{config_digest}");
-        let layer_key = format!("oci-blobs/{layer_digest}");
 
-        fx.state
-            .storage
-            .put(
-                &config_key,
-                Bytes::from_static(br#"{"architecture":"arm64"}"#),
-            )
-            .await
-            .expect("write config blob");
-        fx.state
-            .storage
-            .put(&layer_key, Bytes::from_static(b"layer bytes"))
-            .await
-            .expect("write layer blob");
-
-        sqlx::query(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(fx.repo_id)
-        .bind(config_digest)
-        .bind(24_i64)
-        .bind(&config_key)
-        .execute(&fx.pool)
-        .await
-        .expect("insert config blob row");
-        sqlx::query(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(fx.repo_id)
-        .bind(layer_digest)
-        .bind(11_i64)
-        .bind(&layer_key)
-        .execute(&fx.pool)
-        .await
-        .expect("insert layer blob row");
-        sqlx::query(
-            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
-        )
-        .bind(&manifest_digest)
-        .bind(config_digest)
-        .bind(fx.repo_id)
-        .bind(layer_digest)
-        .execute(&fx.pool)
-        .await
-        .expect("insert manifest blob refs");
+        put_image_blob_bodies(fx.state.storage.as_ref()).await;
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &manifest_digest).await;
 
         let mut artifact = make_test_artifact(
             "alpine:3.20",
@@ -1705,9 +1838,7 @@ mod tests {
         );
         artifact.repository_id = fx.repo_id;
         artifact.checksum_sha256 = manifest_hex.to_string();
-        let manifest = Bytes::from_static(
-            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
-        );
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
         let workspace = fx
             .storage_dir
             .join("grype-layout-test")
@@ -1763,6 +1894,115 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #2053 follow-up: a multi-arch image **index** artifact has no
+    /// `manifest_blob_refs` rows under its own digest, so the local-layout
+    /// path must resolve the index to its concrete child-platform manifest
+    /// (whose config+layer edges DO exist), materialize the child layout, and
+    /// scan locally instead of falling back to the `registry:` path. Before
+    /// this fix the index case returned `None` and regressed to the broken
+    /// authenticated `registry:` scan (UNAUTHORIZED).
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_resolves_index_to_child_layout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        // The child (per-arch) image manifest the index points at. Its digest
+        // is what `manifest_blob_refs` is keyed on, NOT the index digest.
+        let child_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let child_digest = format!("sha256:{child_hex}");
+        let child_body = Bytes::from_static(TEST_IMAGE_MANIFEST);
+        let child_key = format!("oci-manifests/{child_digest}");
+
+        // The index/manifest-list body the artifact itself stores. It carries
+        // no blobs of its own — only child references.
+        let index_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+        let index_body = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{child_digest}","platform":{{"os":"linux","architecture":"{arch}"}}}}]}}"#,
+            arch = crate::services::scanner_service::runner_arch(),
+        ));
+
+        // Child manifest body lives under its oci-manifests/<digest> key; its
+        // config+layer blobs and edges are recorded against the CHILD digest.
+        fx.state
+            .storage
+            .put(&child_key, child_body.clone())
+            .await
+            .expect("write child manifest");
+        put_image_blob_bodies(fx.state.storage.as_ref()).await;
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &child_digest).await;
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.oci.image.index.v1+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = index_hex.to_string();
+
+        let workspace = fx
+            .storage_dir
+            .join("grype-layout-index-test")
+            .to_string_lossy()
+            .into_owned();
+        let scanner = GrypeScanner::new(workspace);
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: Some(fx.state.storage.as_ref()),
+        };
+
+        let layout = scanner
+            .prepare_local_oci_layout(&artifact, &target, &index_body)
+            .await
+            .expect("index layout materialization should succeed")
+            .expect("index should resolve to a local child layout, not registry fallback");
+
+        assert!(layout.join("oci-layout").exists());
+        assert!(layout.join("index.json").exists());
+        // The materialized manifest blob is the CHILD manifest (by child digest),
+        // not the index body.
+        assert_eq!(
+            tokio::fs::read(layout.join("blobs/sha256").join(child_hex))
+                .await
+                .expect("read child manifest"),
+            child_body.to_vec()
+        );
+        assert!(
+            tokio::fs::metadata(layout.join("blobs/sha256").join(index_hex))
+                .await
+                .is_err(),
+            "index manifest body must not be written as the scannable manifest"
+        );
+        // index.json points at the child manifest digest, so Grype scans a
+        // valid single-platform oci-dir.
+        let index_json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(layout.join("index.json")).await.unwrap())
+                .expect("parse layout index.json");
+        assert_eq!(
+            index_json["manifests"][0]["digest"].as_str(),
+            Some(child_digest.as_str())
+        );
+        // Child config + layer blobs were materialized from the child's edges.
+        assert!(layout
+            .join("blobs/sha256")
+            .join(TEST_CONFIG_DIGEST.trim_start_matches("sha256:"))
+            .exists());
+        assert!(layout
+            .join("blobs/sha256")
+            .join(TEST_LAYER_DIGEST.trim_start_matches("sha256:"))
+            .exists());
+
+        tokio::fs::remove_dir_all(&layout)
+            .await
+            .expect("cleanup layout");
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_prepare_local_oci_layout_returns_none_without_db_context() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -1793,9 +2033,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
         };
 
-        let manifest = Bytes::from_static(
-            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
-        );
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 
         assert!(scanner
             .prepare_local_oci_layout(&artifact, &target, &manifest)
@@ -1815,44 +2053,9 @@ mod tests {
         };
 
         let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
-        let config_digest =
-            "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
-        let layer_digest =
-            "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
         let manifest_digest = format!("sha256:{manifest_hex}");
-        let config_key = format!("oci-blobs/{config_digest}");
-        let layer_key = format!("oci-blobs/{layer_digest}");
 
-        sqlx::query(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(fx.repo_id)
-        .bind(config_digest)
-        .bind(24_i64)
-        .bind(&config_key)
-        .execute(&fx.pool)
-        .await
-        .expect("insert config blob row");
-        sqlx::query(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(fx.repo_id)
-        .bind(layer_digest)
-        .bind(11_i64)
-        .bind(&layer_key)
-        .execute(&fx.pool)
-        .await
-        .expect("insert layer blob row");
-        sqlx::query(
-            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
-        )
-        .bind(&manifest_digest)
-        .bind(config_digest)
-        .bind(fx.repo_id)
-        .bind(layer_digest)
-        .execute(&fx.pool)
-        .await
-        .expect("insert manifest blob refs");
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &manifest_digest).await;
 
         let mut artifact = make_test_artifact(
             "alpine:3.20",
@@ -1874,9 +2077,7 @@ mod tests {
             db: Some(&fx.pool),
             storage: None,
         };
-        let manifest = Bytes::from_static(
-            br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#,
-        );
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 
         assert!(scanner
             .prepare_local_oci_layout(&artifact, &target, &manifest)
