@@ -47,12 +47,13 @@ RUN if [ -n "${APP_VERSION}" ]; then \
     cargo build --release --features "$FEATURES" --bin artifact-keeper
 
 # ---------- Stage 4: Copy scanner CLIs from official images ----------
-# Trivy is pinned to the latest release (0.71.2). The bump from 0.71.0 clears
-# the golang.org/x/net (CVE-2026-25680/25681/27136/39821/42502/42506) and Go
-# stdlib (CVE-2026-27145/42504/42507) CVEs in the Trivy binary, including the
-# deps behind the code-scanning grpc finding. Residual containerd CVEs that
-# 0.71.2 has not yet rebuilt against are documented in /.trivyignore.
-FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy-bin
+# The trivy CLI is intentionally NOT bundled in the runtime image. The backend
+# drives Trivy in server mode against the trivy sidecar (TRIVY_URL) and falls
+# back to the pure-HTTP Twirp endpoint (`scan_with_trivy_http`) when the CLI is
+# absent, so the in-image binary is dead weight. Dropping it removes the trivy
+# binary's HIGH-severity Go-dependency CVEs and image size with no functional
+# loss. See issue #1544.
+#
 # Grype is pinned to v0.114.0, the latest upstream release. No newer Grype build
 # picks up fixed versions of its bundled Go deps (docker, containerd, stdlib),
 # so its residual CVEs are upstream-unfixable for now and are documented/
@@ -78,7 +79,7 @@ FROM alpine:3.24
 # current errata on every image build; the targeted `add` keeps the install
 # set explicit.
 RUN apk upgrade --no-cache && \
-    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
+    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs curl
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 
@@ -113,8 +114,8 @@ RUN rm -rf /var/cache/apk/* /tmp/*
 
 # --- End CIS hardening ---
 
-# Copy scanner CLIs (statically linked Go binaries)
-COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+# Copy the grype scanner CLI (statically linked Go binary). The trivy CLI is
+# deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=grype-bin /grype /usr/local/bin/
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)

@@ -8,6 +8,11 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
 
+# Strip symbols from the release binary. Reduces the shipped binary size with no
+# behavioral change; complements the runtime-image hardening in issue #1544.
+[profile.release]
+strip = true
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
