@@ -1328,8 +1328,18 @@ pub(crate) struct UpstreamClient {
     user_agent_cache: RwLock<HashMap<Uuid, (Option<String>, Instant)>>,
 }
 
+const CUSTOM_USER_AGENT_KEY: &str = "custom_user_agent";
+
 /// TTL for cached custom user-agent entries.
 const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
+
+/// Apply a custom User-Agent header to a request builder if one is configured.
+fn apply_custom_ua(req: reqwest::RequestBuilder, ua: Option<&str>) -> reqwest::RequestBuilder {
+    match ua {
+        Some(ua) => req.header(USER_AGENT, ua),
+        None => req,
+    }
+}
 
 impl UpstreamClient {
     /// Construct an `UpstreamClient` over the given HTTP client and db handle.
@@ -1377,9 +1387,7 @@ impl UpstreamClient {
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
-        if let Some(ref ua) = custom_ua {
-            request = request.header(USER_AGENT, ua.as_str());
-        }
+        request = apply_custom_ua(request, custom_ua.as_deref());
         // BUFFERED path sets `Accept` on the INITIAL request. The streaming
         // path deliberately does NOT — see `exchange_bearer_then` /
         // `fetch_stream` for why this asymmetry is intentional (#1618 S8).
@@ -1403,11 +1411,7 @@ impl UpstreamClient {
             // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
                 .exchange_bearer_then(response, url, &upstream_auth, |req| {
-                    let req = if let Some(ref ua) = custom_ua {
-                        req.header(USER_AGENT, ua.as_str())
-                    } else {
-                        req
-                    };
+                    let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
                     } else {
@@ -1514,9 +1518,7 @@ impl UpstreamClient {
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
-        if let Some(ref ua) = custom_ua {
-            request = request.header(USER_AGENT, ua.as_str());
-        }
+        request = apply_custom_ua(request, custom_ua.as_deref());
         // NOTE: the streaming path intentionally sets NO `Accept` header on the
         // initial request, in contrast to the buffered path which sets it on
         // both the initial request and the retry. This asymmetry is deliberate
@@ -1535,11 +1537,7 @@ impl UpstreamClient {
             // buffered path (#1618 S8).
             if let Some(retry_response) = self
                 .exchange_bearer_then(response, url, &upstream_auth, |req| {
-                    if let Some(ref ua) = custom_ua {
-                        req.header(USER_AGENT, ua.as_str())
-                    } else {
-                        req
-                    }
+                    apply_custom_ua(req, custom_ua.as_deref())
                 })
                 .await?
             {
@@ -1779,10 +1777,10 @@ impl UpstreamClient {
             }
         }
         let ua = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM repository_config \
-             WHERE repository_id = $1 AND key = 'custom_user_agent'",
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
         )
         .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
         .fetch_optional(&self.db)
         .await
         .ok()

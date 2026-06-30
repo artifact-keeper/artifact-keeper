@@ -257,6 +257,8 @@ async fn authorize_virtual_member_mutation(
 }
 
 /// Generic upsert helper for repository_config key-value pairs.
+const CUSTOM_USER_AGENT_KEY: &str = "custom_user_agent";
+
 ///
 /// Inserts a new row or updates an existing one for the given repository and
 /// config key. Used by multiple update paths (index_upstream_url, quarantine
@@ -585,9 +587,10 @@ async fn with_custom_user_agent(
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
     let result = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'custom_user_agent'",
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
     )
     .bind(repo_id)
+    .bind(CUSTOM_USER_AGENT_KEY)
     .fetch_optional(db)
     .await;
     if let Ok(Some(ua)) = result {
@@ -1464,7 +1467,7 @@ pub async fn create_repository(
 
     if let Some(ref ua) = payload.custom_user_agent {
         if !ua.is_empty() {
-            upsert_repo_config(&state.db, repo.id, "custom_user_agent", ua).await?;
+            upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
         }
     }
 
@@ -1736,16 +1739,15 @@ pub async fn update_repository(
             ));
         }
         if ua.is_empty() {
-            sqlx::query(
-                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'custom_user_agent'",
-            )
-            .bind(repo.id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                .bind(repo.id)
+                .bind(CUSTOM_USER_AGENT_KEY)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
         } else {
             validate_custom_user_agent(ua)?;
-            upsert_repo_config(&state.db, repo.id, "custom_user_agent", ua).await?;
+            upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
         }
     }
 
