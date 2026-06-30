@@ -490,15 +490,15 @@ impl StorageService {
             "s3" => {
                 // Build the proxy-cache S3 backend from the SAME env-derived
                 // config the primary storage uses (redirect_downloads, presign
-                // creds, CloudFront, path_format, TLS, pool tuning), then force
-                // the key prefix to None. Proxy-cache content lives at the
-                // bucket root (`proxy-cache/...`), not under S3_PREFIX, so the
-                // signed key must carry no prefix. Reusing from_env() (instead
-                // of S3Config::new, which hardcodes redirect_downloads=false and
-                // no presign creds) is what makes presigning actually fire on
-                // this handle (#1555).
-                let mut s3_config = crate::storage::s3::S3Config::from_env()?;
-                s3_config.prefix = None;
+                // creds, CloudFront, path_format, TLS, pool tuning, and
+                // S3_PREFIX). Proxy-cache writes go through this same handle, so
+                // the key prefix here must match the prefix applied at write
+                // time — otherwise presigned URLs resolve to a different S3 key
+                // than where the content was written, causing 404s. Reusing
+                // from_env() (instead of S3Config::new, which hardcodes
+                // redirect_downloads=false and no presign creds) is what makes
+                // presigning actually fire on this handle (#1555).
+                let s3_config = crate::storage::s3::S3Config::from_env()?;
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
                 Arc::new(S3BackendWrapper { inner })
             }

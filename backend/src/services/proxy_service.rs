@@ -6788,6 +6788,117 @@ SHA256:
     }
 
     // -----------------------------------------------------------------------
+    // CachePersister key-consistency: write path must pass raw CacheKeys keys
+    // to the backend without adding a caller-side prefix. The backend (shared
+    // with the presign path after the S3_PREFIX fix) is the single point that
+    // applies the object-key prefix, so the resulting S3 key is identical in
+    // both directions.
+    // -----------------------------------------------------------------------
+
+    use crate::services::storage_service::{
+        PutStreamResult as ServicePutStreamResult, StorageBackend as ServiceStorageBackend,
+        StorageService as RealStorageService,
+    };
+
+    /// Recording backend that captures every key passed to `put()`.
+    struct PutKeyCapture {
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PutKeyCapture {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                keys: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn keys_snapshot(&self) -> Vec<String> {
+            self.keys.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for PutKeyCapture {
+        async fn put(&self, key: &str, _content: Bytes) -> Result<()> {
+            self.keys.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// `CachePersister::write_buffered` must pass the raw keys from
+    /// `CacheKeys::derive` to the storage backend without adding a prefix.
+    /// The backend is the single point that applies `S3_PREFIX`, so writes
+    /// and presigned URLs (which go through the same backend) resolve to the
+    /// same S3 key.
+    #[tokio::test]
+    async fn test_cache_persister_write_buffered_uses_raw_cache_keys() {
+        let capture = PutKeyCapture::new();
+        let storage = Arc::new(RealStorageService::new(capture.clone()));
+        let persister = CachePersister::new(storage);
+
+        let keys =
+            CacheKeys::derive("npm-proxy", "lodash/-/lodash-4.17.21.tgz").expect("valid path");
+
+        persister
+            .write_buffered(
+                &keys.content,
+                &keys.metadata,
+                &Bytes::from_static(b"fake-package-bytes"),
+                Some("application/octet-stream".to_string()),
+                None,
+                None,
+                3600,
+                uuid::Uuid::new_v4(),
+                "lodash/-/lodash-4.17.21.tgz",
+                None,
+            )
+            .await
+            .expect("write_buffered must succeed");
+
+        let written = capture.keys_snapshot();
+        assert_eq!(written.len(), 2, "expected content write + metadata write, got {:?}", written);
+        assert_eq!(
+            written[0], keys.content,
+            "first write must be the raw content key from CacheKeys::derive"
+        );
+        assert_eq!(
+            written[1], keys.metadata,
+            "second write must be the raw metadata key from CacheKeys::derive"
+        );
+        assert!(
+            written[0].starts_with("proxy-cache/"),
+            "content key must be a raw proxy-cache key: {}",
+            written[0]
+        );
+        assert!(
+            written[1].starts_with("proxy-cache/"),
+            "metadata key must be a raw proxy-cache key: {}",
+            written[1]
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // tee_upstream_to_cache (#895): proxy slow-path streaming
     //
     // The tee forwards each upstream chunk to BOTH the client stream and a
@@ -6796,10 +6907,6 @@ SHA256:
     // be able to keep up under realistic chunk sizes.
     // -----------------------------------------------------------------------
 
-    use crate::services::storage_service::{
-        PutStreamResult as ServicePutStreamResult, StorageBackend as ServiceStorageBackend,
-        StorageService as RealStorageService,
-    };
     use futures::stream::BoxStream as ServiceBoxStream;
     use sha2::{Digest, Sha256};
 
