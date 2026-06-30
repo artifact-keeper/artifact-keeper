@@ -43,6 +43,7 @@ jobs:
   check-rust:
     name: 🦀 Check Rust
     runs-on: ak-ci-runners
+    timeout-minutes: 20
     # Disable debuginfo to cut peak compile memory on the ARC runner. The
     # lib-test target compile was OOMing ("sccache: Compile terminated by
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
@@ -108,6 +109,7 @@ jobs:
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
+    timeout-minutes: 25
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
@@ -236,6 +238,7 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
+    timeout-minutes: 35
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -627,6 +630,7 @@ jobs:
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
+    timeout-minutes: 40
     if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     # Disable incremental codegen (#1679): consistent with check-rust and the
     # other heavy Rust compile jobs. Useless in CI's clean checkout, inflates
@@ -872,6 +876,7 @@ jobs:
   detect-changes:
     name: 🔍 Detect Changes
     runs-on: ak-ci-runners
+    timeout-minutes: 8
     permissions:
       contents: read
       pull-requests: read
@@ -898,6 +903,7 @@ jobs:
   build-backend-image:
     name: 🐳 Build Backend Image
     runs-on: ak-ci-runners
+    timeout-minutes: 45
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
@@ -952,6 +958,7 @@ jobs:
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
     runs-on: ak-ci-runners
+    timeout-minutes: 30
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
     steps:
@@ -994,6 +1001,7 @@ jobs:
   security-audit:
     name: 🔒 Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
@@ -1014,6 +1022,7 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ak-ci-runners
+    timeout-minutes: 15
     needs: [check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
@@ -1104,6 +1113,7 @@ jobs:
   build-windows-dev:
     name: 🪟 Windows Cross-Build
     runs-on: ak-ci-runners
+    timeout-minutes: 30
     # Only build Windows on main push (not PRs).
     # The release workflow builds Windows binaries for actual releases.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
