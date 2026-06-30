@@ -408,6 +408,12 @@ pub struct S3BackendWrapper {
 
 impl S3BackendWrapper {
     pub async fn from_config(config: &Config) -> crate::error::Result<Self> {
+        // Read S3_PREFIX from the environment so this backend applies the same
+        // object-key prefix as the primary S3Backend (built via S3Backend::from_env
+        // in main.rs). Without this, proxy-cache writes land at raw keys while
+        // presigned URLs reference {S3_PREFIX}/{raw_key}, causing every presigned
+        // proxy-cache download to 404 when S3_PREFIX is non-empty.
+        let prefix = std::env::var("S3_PREFIX").ok();
         let s3_config = crate::storage::s3::S3Config::new(
             config.s3_bucket.clone().unwrap_or_default(),
             config
@@ -415,7 +421,7 @@ impl S3BackendWrapper {
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_string()),
             config.s3_endpoint.clone(),
-            None, // No prefix by default
+            prefix,
         );
         let inner = crate::storage::s3::S3Backend::new(s3_config).await?;
         Ok(Self { inner })
