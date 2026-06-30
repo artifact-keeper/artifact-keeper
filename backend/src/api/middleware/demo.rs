@@ -111,7 +111,10 @@ mod tests {
             "/api/v1/auth/sso/callback",
         ] {
             assert!(is_allowed_auth_write(path), "{path} should be allowed");
-            assert!(!should_block(&Method::POST, path), "{path} should not block");
+            assert!(
+                !should_block(&Method::POST, path),
+                "{path} should not block"
+            );
         }
     }
 
