@@ -630,9 +630,13 @@ fn validate_custom_user_agent(ua: &str) -> Result<()> {
             "custom_user_agent must be 256 characters or fewer".to_string(),
         ));
     }
-    if ua.chars().any(|c| c == '\r' || c == '\n') {
+    // RFC 7230 §3.2.6: field-value = *( field-vchar / SP / HTAB ) where field-vchar = VCHAR / obs-text.
+    // VCHAR is %x21-7E; SP (0x20) and HTAB (0x09) are the only allowed non-printable bytes.
+    // Everything below SP except HTAB, and DEL (0x7F), is forbidden.
+    if ua.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
         return Err(AppError::Validation(
-            "custom_user_agent must not contain newline characters".to_string(),
+            "custom_user_agent must not contain control characters (see RFC 7230 §3.2.6)"
+                .to_string(),
         ));
     }
     Ok(())
@@ -6359,21 +6363,24 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_custom_user_agent_rejects_newline() {
-        let err = validate_custom_user_agent("bad\nvalue").unwrap_err();
+    fn test_validate_custom_user_agent_rejects_control_chars() {
+        // LF, CR, NUL, BEL — all forbidden per RFC 7230 §3.2.6 field-value
+        for bad in ["\n", "\r", "\x00", "\x07"] {
+            let ua = format!("bad{bad}value");
+            let err = validate_custom_user_agent(&ua).unwrap_err();
+            match err {
+                AppError::Validation(msg) => assert!(msg.contains("control characters"), "{ua:?}"),
+                other => panic!("Expected Validation error, got: {:?}", other),
+            }
+        }
+        // DEL (0x7F) is also forbidden
+        let err = validate_custom_user_agent("bad\x7Fvalue").unwrap_err();
         match err {
-            AppError::Validation(msg) => assert!(msg.contains("newline")),
+            AppError::Validation(msg) => assert!(msg.contains("control characters")),
             other => panic!("Expected Validation error, got: {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_validate_custom_user_agent_rejects_carriage_return() {
-        let err = validate_custom_user_agent("bad\rvalue").unwrap_err();
-        match err {
-            AppError::Validation(msg) => assert!(msg.contains("newline")),
-            other => panic!("Expected Validation error, got: {:?}", other),
-        }
+        // HT (0x09) is explicitly allowed
+        assert!(validate_custom_user_agent("MyClient/1.0\t(tab ok)").is_ok());
     }
 
     #[test]
