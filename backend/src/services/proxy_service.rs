@@ -11,7 +11,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{
-    ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
+    ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, USER_AGENT, WWW_AUTHENTICATE,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -1323,7 +1323,13 @@ pub(crate) struct UpstreamClient {
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+    /// In-memory cache for per-repo custom user-agents. TTL: 60 s.
+    /// Key: repo_id, Value: (custom_ua, cached_at)
+    user_agent_cache: RwLock<HashMap<Uuid, (Option<String>, Instant)>>,
 }
+
+/// TTL for cached custom user-agent entries.
+const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
 
 impl UpstreamClient {
     /// Construct an `UpstreamClient` over the given HTTP client and db handle.
@@ -1334,6 +1340,7 @@ impl UpstreamClient {
             db,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
+            user_agent_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1364,10 +1371,14 @@ impl UpstreamClient {
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        if let Some(ref ua) = custom_ua {
+            request = request.header(USER_AGENT, ua.as_str());
         }
         // BUFFERED path sets `Accept` on the INITIAL request. The streaming
         // path deliberately does NOT — see `exchange_bearer_then` /
@@ -1386,12 +1397,17 @@ impl UpstreamClient {
         // Handle 401 with bearer token exchange (required by Docker Hub and
         // other OCI registries, even for anonymous/public pulls).
         if status == StatusCode::UNAUTHORIZED {
-            // The buffered closure RE-ADDS `Accept` on the bearer retry,
-            // mirroring the initial request. The bearer-exchange helper itself
-            // never touches `Accept`; the closure owns that decision so the
-            // buffered/streaming asymmetry is preserved (#1618 S8).
+            // The buffered closure RE-ADDS `Accept` (and the custom UA) on the
+            // bearer retry, mirroring the initial request. The bearer-exchange
+            // helper itself never touches these headers; the closure owns that
+            // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
                 .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    let req = if let Some(ref ua) = custom_ua {
+                        req.header(USER_AGENT, ua.as_str())
+                    } else {
+                        req
+                    };
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
                     } else {
@@ -1492,10 +1508,14 @@ impl UpstreamClient {
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        if let Some(ref ua) = custom_ua {
+            request = request.header(USER_AGENT, ua.as_str());
         }
         // NOTE: the streaming path intentionally sets NO `Accept` header on the
         // initial request, in contrast to the buffered path which sets it on
@@ -1510,11 +1530,17 @@ impl UpstreamClient {
         let status = response.status();
 
         if status == StatusCode::UNAUTHORIZED {
-            // The streaming closure is the IDENTITY transform: it adds NO
-            // `Accept` header on the bearer retry, preserving the asymmetry
-            // with the buffered path (#1618 S8).
+            // The streaming closure re-applies the custom UA on the bearer retry
+            // but adds NO `Accept` header, preserving the asymmetry with the
+            // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, |req| req)
+                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    if let Some(ref ua) = custom_ua {
+                        req.header(USER_AGENT, ua.as_str())
+                    } else {
+                        req
+                    }
+                })
                 .await?
             {
                 return Self::read_upstream_response_streaming(retry_response, url);
@@ -1739,6 +1765,33 @@ impl UpstreamClient {
         } else {
             None
         }
+    }
+
+    /// Return the custom user-agent for a repo, hitting the in-memory cache
+    /// first (60 s TTL) to avoid a DB round-trip on every upstream request.
+    async fn get_custom_user_agent(&self, repo_id: Uuid) -> Option<String> {
+        {
+            let cache = self.user_agent_cache.read().await;
+            if let Some((ua, cached_at)) = cache.get(&repo_id) {
+                if cached_at.elapsed() < Duration::from_secs(USER_AGENT_CACHE_TTL_SECS) {
+                    return ua.clone();
+                }
+            }
+        }
+        let ua = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'custom_user_agent'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten();
+        self.user_agent_cache
+            .write()
+            .await
+            .insert(repo_id, (ua.clone(), Instant::now()));
+        ua
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`

@@ -417,6 +417,9 @@ pub struct CreateRepositoryRequest {
     pub upstream_username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned in responses.
     pub upstream_password: Option<String>,
+    /// Custom User-Agent sent on outbound HTTP requests to the upstream for
+    /// this repository. Only valid for remote repositories. Max 256 characters.
+    pub custom_user_agent: Option<String>,
 }
 
 impl CreateRepositoryRequest {
@@ -473,6 +476,10 @@ pub struct UpdateRepositoryRequest {
     /// Pass an empty string to remove the link.
     /// Stored in `repository_config` under `release_repository_id`.
     pub release_repository_key: Option<String>,
+    /// Update the custom User-Agent for outbound HTTP requests to the upstream.
+    /// Only valid for remote repositories. Pass an empty string to remove.
+    /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
+    pub custom_user_agent: Option<String>,
 }
 
 impl UpdateRepositoryRequest {
@@ -512,6 +519,10 @@ pub struct RepositoryResponse {
     /// `repository_config` (#1770 B). `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_duration_minutes: Option<i64>,
+    /// Custom User-Agent used for outbound HTTP requests to the upstream,
+    /// read back from `repository_config`. `None` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_user_agent: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -547,6 +558,7 @@ fn repo_to_response(
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
+        custom_user_agent: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -564,6 +576,23 @@ async fn with_quarantine_settings(
     let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
+    response
+}
+
+async fn with_custom_user_agent(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    let result = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'custom_user_agent'",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await;
+    if let Ok(Some(ua)) = result {
+        response.custom_user_agent = Some(ua);
+    }
     response
 }
 
@@ -590,6 +619,20 @@ fn validate_repository_key(key: &str) -> Result<()> {
     if key.contains("..") {
         return Err(AppError::Validation(
             "Repository key must not contain consecutive dots".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_custom_user_agent(ua: &str) -> Result<()> {
+    if ua.len() > 256 {
+        return Err(AppError::Validation(
+            "custom_user_agent must be 256 characters or fewer".to_string(),
+        ));
+    }
+    if ua.chars().any(|c| c == '\r' || c == '\n') {
+        return Err(AppError::Validation(
+            "custom_user_agent must not contain newline characters".to_string(),
         ));
     }
     Ok(())
@@ -1335,6 +1378,15 @@ pub async fn create_repository(
     // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
+    if let Some(ref ua) = payload.custom_user_agent {
+        if repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        validate_custom_user_agent(ua)?;
+    }
+
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
         None => state.config.storage_backend.clone(),
@@ -1406,6 +1458,12 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
+    if let Some(ref ua) = payload.custom_user_agent {
+        if !ua.is_empty() {
+            upsert_repo_config(&state.db, repo.id, "custom_user_agent", ua).await?;
+        }
+    }
+
     // Add virtual repository members. Post-#1444, the validator accepts
     // `member_repos == None` (deferred-population pattern: caller will
     // POST /members later) and only rejects `Some(empty_vec)`. Treat the
@@ -1466,6 +1524,7 @@ pub async fn create_repository(
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
     }
+    response.custom_user_agent = payload.custom_user_agent.filter(|ua| !ua.is_empty());
     Ok(Json(response))
 }
 
@@ -1500,6 +1559,7 @@ pub async fn get_repository(
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let response = with_custom_user_agent(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -1665,6 +1725,26 @@ pub async fn update_repository(
         }
     }
 
+    if let Some(ref ua) = payload.custom_user_agent {
+        if existing.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        if ua.is_empty() {
+            sqlx::query(
+                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'custom_user_agent'",
+            )
+            .bind(repo.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        } else {
+            validate_custom_user_agent(ua)?;
+            upsert_repo_config(&state.db, repo.id, "custom_user_agent", ua).await?;
+        }
+    }
+
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     state.event_bus.emit_repository_event(
@@ -1675,7 +1755,14 @@ pub async fn update_repository(
 
     let repo_id = repo.id;
     let response = repo_to_response(repo, storage_used);
-    let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
+    if let Some(ref ua) = payload.custom_user_agent {
+        response.custom_user_agent = if ua.is_empty() {
+            None
+        } else {
+            Some(ua.clone())
+        };
+    }
     Ok(Json(response))
 }
 
@@ -6251,6 +6338,66 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_custom_user_agent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_custom_user_agent_valid() {
+        assert!(validate_custom_user_agent("MyClient/1.0").is_ok());
+        assert!(validate_custom_user_agent("artifact-keeper-proxy/2.0 (internal)").is_ok());
+        assert!(validate_custom_user_agent(&"a".repeat(256)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_user_agent_too_long() {
+        let ua = "a".repeat(257);
+        let err = validate_custom_user_agent(&ua).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("256")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_custom_user_agent_rejects_newline() {
+        let err = validate_custom_user_agent("bad\nvalue").unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("newline")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_custom_user_agent_rejects_carriage_return() {
+        let err = validate_custom_user_agent("bad\rvalue").unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("newline")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_request_deserializes_custom_user_agent() {
+        let json = r#"{"key":"npm-proxy","name":"NPM Proxy","format":"npm","repo_type":"remote","custom_user_agent":"MyClient/2.0"}"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some("MyClient/2.0"));
+    }
+
+    #[test]
+    fn test_update_request_deserializes_custom_user_agent() {
+        let json = r#"{"custom_user_agent":"MyClient/2.0"}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some("MyClient/2.0"));
+    }
+
+    #[test]
+    fn test_update_request_empty_custom_user_agent_clears() {
+        let json = r#"{"custom_user_agent":""}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some(""));
+    }
+
+    // -----------------------------------------------------------------------
     // parse_format
     // -----------------------------------------------------------------------
 
@@ -6568,6 +6715,7 @@ mod tests {
             upstream_auth_configured: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
+            custom_user_agent: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -7842,6 +7990,7 @@ mod tests {
             upstream_auth_configured: false,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
+            custom_user_agent: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
