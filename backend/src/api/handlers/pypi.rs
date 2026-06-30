@@ -1039,6 +1039,7 @@ fn merge_local_into_remote_simple_html(
 
 async fn download_or_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, project, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
@@ -1057,7 +1058,7 @@ async fn download_or_metadata(
     }
 
     // Regular file download
-    serve_file(&state, &repo, &repo_key, &project, &filename).await
+    serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref()).await
 }
 
 async fn serve_file(
@@ -1066,6 +1067,7 @@ async fn serve_file(
     repo_key: &str,
     project: &str,
     filename: &str,
+    auth: Option<&AuthExtension>,
 ) -> Result<Response, Response> {
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
@@ -1151,6 +1153,22 @@ async fn serve_file(
                     )
                     .into_response());
                 }
+
+                // #2073 (sibling of #1804, fixed for Maven by #1816): authorize
+                // each member against the caller BEFORE any of its bytes can be
+                // served. A public virtual repo must not become a confused
+                // deputy that streams its PRIVATE members' artifacts to
+                // anonymous / unprivileged callers. Members the caller could not
+                // read directly are dropped, so a denied member behaves exactly
+                // as if it did not contain the artifact (404) and its existence
+                // is never leaked. Routes through the SAME helper the Maven
+                // download path uses.
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.permission_service,
+                    auth,
+                    members,
+                )
+                .await;
 
                 // PEP 708 dependency-confusion guard (#1600), superseding the
                 // version-aware shadowing guard (#1217, #1582) and the
@@ -3655,7 +3673,8 @@ mod tests {
         // must construct a `get_remote_cached_or_refetch` call against
         // the storage backend; the helper hits the cache and returns the
         // wheel bytes; the handler wraps them in a PyPI download response.
-        let result = super::serve_file(&state, &repo_info, &fx.repo_key, project, filename).await;
+        let result =
+            super::serve_file(&state, &repo_info, &fx.repo_key, project, filename, None).await;
 
         // Clean up BEFORE asserting so a panic still leaves the DB clean.
         let cleanup_pool = fx.pool.clone();
@@ -5232,6 +5251,55 @@ mod tests {
             "serve_file MUST resolve the real upstream URL via \
              fetch_from_pypi_remote_streaming on a miss, never via a presumed \
              download URL (#1555).",
+        );
+    }
+
+    #[test]
+    fn test_pypi_virtual_blocks_private_member_2073() {
+        // Verified-bug regression for #2073: a public PyPI virtual repo must not
+        // serve a PRIVATE member's artifact to an anonymous / zero-grant caller.
+        // Sibling bug #1804 (fixed by #1816) added the per-member authorization
+        // helpers and wired them into the Maven download path, but the PyPI
+        // handler was never updated, so the confused-deputy leak persisted for
+        // PyPI. The fix routes serve_file's virtual branch through the SAME
+        // `authorize_virtual_members` filter Maven uses, dropping members the
+        // caller could not read directly BEFORE any of their bytes are fetched.
+        //
+        // This guards the wiring structurally (DB-free, runs in the offline lib
+        // suite): the virtual branch of serve_file MUST authorize the member
+        // list returned by fetch_virtual_members before iterating members, so a
+        // private member behaves exactly as a 404 for a caller who could not
+        // read it directly (its existence is never leaked).
+        let src = include_str!("pypi.rs");
+        let fn_start = src
+            .find("async fn serve_file(")
+            .expect("serve_file must exist");
+        let next = src[fn_start + 1..]
+            .find("\nasync fn ")
+            .map(|p| fn_start + 1 + p)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..next];
+
+        let fetch_pos = body
+            .find("fetch_virtual_members(")
+            .expect("serve_file virtual branch must fetch members");
+        let authz_pos = body.find("authorize_virtual_members(").expect(
+            "serve_file MUST authorize virtual members per-caller before serving \
+             any member's bytes (#2073)",
+        );
+        let loop_pos = body
+            .find("for member in &members")
+            .expect("serve_file must iterate virtual members");
+
+        assert!(
+            fetch_pos < authz_pos,
+            "members must be authorized AFTER they are fetched (#2073)"
+        );
+        assert!(
+            authz_pos < loop_pos,
+            "members must be authorized BEFORE the per-member fetch loop so a \
+             private member is dropped and never serves bytes to an \
+             unauthorized caller (#2073)"
         );
     }
 
