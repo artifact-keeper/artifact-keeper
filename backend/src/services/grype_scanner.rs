@@ -1251,7 +1251,15 @@ impl Scanner for GrypeScanner {
             // artifact paths omit the routing key, so Grype must validate that
             // a ref can be built with the owning repository key restored.
             // Path-only applicability: no manifest body at gate time (#1971).
-            return Self::oci_registry_target(artifact, target, None).is_some();
+            //
+            // when the orchestrator supplies the manifest body, also
+            // require the body to classify as a real container image so a
+            // Helm-OCI chart / cosign sig / SBOM / WASM module (which all share
+            // the image manifest mediaType but would fail in `scan` as an
+            // unsupported layer) is rejected as not-applicable up front rather
+            // than failing the scan.
+            return crate::services::scanner_service::oci_target_is_scannable_image(target)
+                && Self::oci_registry_target(artifact, target, None).is_some();
         }
         self.is_applicable(artifact)
     }
@@ -1623,6 +1631,59 @@ mod tests {
         assert!(!grype().is_applicable(&a));
     }
 
+    /// a Helm-OCI chart builds a valid registry ref (so the path gate
+    /// passes) but is not a container image. With the manifest body in the
+    /// target, GrypeScanner must reject it as not-applicable rather than
+    /// failing later in `scan` on the unsupported Helm layer.
+    #[test]
+    fn test_is_applicable_for_target_rejects_helm_oci_chart() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "demochart",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/demochart/manifests/0.1.0",
+        );
+        let helm_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.cncf.helm.chart.content.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "helm-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(helm_body),
+        };
+        assert!(
+            !grype().is_applicable_for_target(&target),
+            "a Helm-OCI chart must be not-applicable for Grype"
+        );
+    }
+
+    /// Regression guard: a real OCI image with a container config in the
+    /// body stays applicable for Grype registry-mode scanning.
+    #[test]
+    fn test_is_applicable_for_target_accepts_real_oci_image_with_body() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let image_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(image_body),
+        };
+        assert!(grype().is_applicable_for_target(&target));
+    }
+
     #[test]
     fn test_build_registry_image_ref_basic_path() {
         let _env = EnvGuard::new();
@@ -1905,6 +1966,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: None,
+            manifest_body: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -1950,6 +2012,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: None,
+            manifest_body: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -2015,6 +2078,7 @@ mod tests {
             repository_type: "local",
             db: Some(&fx.pool),
             storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
         };
 
         let layout = scanner
@@ -2118,6 +2182,7 @@ mod tests {
             repository_type: "local",
             db: Some(&fx.pool),
             storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
         };
 
         let layout = scanner
@@ -2195,6 +2260,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -2240,6 +2306,7 @@ mod tests {
             repository_type: "local",
             db: Some(&fx.pool),
             storage: None,
+            manifest_body: None,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 

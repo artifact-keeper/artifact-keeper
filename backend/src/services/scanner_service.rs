@@ -156,6 +156,96 @@ pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
         || artifact.path.contains("/manifests/")
 }
 
+/// Config mediaTypes whose presence means "this manifest describes a real,
+/// runnable container image rootfs" — the only configs the image-vuln
+/// scanners (Trivy/Grype `registry:` mode) should be routed to. OCI
+/// image-spec config and Docker schema2 container config. Anything else
+/// (Helm `vnd.cncf.helm.config`, WASM `vnd.wasm.config`, the empty-artifact
+/// `vnd.oci.empty`, SBOM/attestation configs) is NOT a container image.
+const CONTAINER_IMAGE_CONFIG_MEDIA_TYPES: [&str; 2] = [
+    crate::formats::oci::media_types::OCI_CONFIG, // application/vnd.oci.image.config.v1+json
+    crate::formats::oci::media_types::CONFIG,     // application/vnd.docker.container.image.v1+json
+];
+
+/// Layer mediaTypes that positively identify a NON-image OCI artifact even
+/// when its config mediaType is the standard image config. cosign signatures
+/// reuse `application/vnd.oci.image.config.v1+json` as their config (sigstore
+/// SIGNATURE_SPEC), so the config allow-list alone would admit them; the
+/// discriminating signal is the layer mediaType. Matched as a substring so
+/// versioned variants are covered.
+const NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS: [&str; 6] = [
+    "vnd.dev.cosign",              // cosign signature layer
+    "in-toto",                     // SLSA / in-toto attestation
+    "spdx",                        // SPDX SBOM
+    "cyclonedx",                   // CycloneDX SBOM
+    "vnd.cncf.helm.chart.content", // Helm chart payload (belt-and-suspenders)
+    "wasm",                        // WASM module payload (application/wasm, ...+wasm)
+];
+
+/// Decide whether an already-loaded OCI manifest `body` describes a real
+/// container image that the image-vuln scanners should run on.
+///
+/// Default-DENY. Returns `true` only when:
+///   * the body is an image **index** / manifest list (top-level `manifests`
+///     array): indexes carry no config, and `resolve_scan_reference` (#1971,
+///     #1992, #2054) rewrites the reference to a concrete scannable child,
+///     so an index must NEVER be denied at the gate; OR
+///   * the body is a single manifest whose `config.mediaType` is a container
+///     image config ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]) AND none of its
+///     `layers[].mediaType` is a known non-image marker
+///     ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]) — the layer guard rejects
+///     cosign signatures, which reuse the standard image config.
+///
+/// Returns `false` for Helm OCI charts, WASM modules, SBOM/attestation/empty
+/// artifacts, and any manifest with an unknown or absent config — these are
+/// not runnable images and a "completed/0-findings" scan on them is a false
+/// clean (the security-gate failure). A non-JSON / unparseable body
+/// returns `true` (fail-open): callers only consult this for artifacts that
+/// already passed `is_oci_image_artifact`, and a malformed body must not flip
+/// a possibly-real image to skipped (#1971 passthrough contract).
+pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
+    let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
+        // Anomalous body on an OCI route: do not flip the path-based decision.
+        return true;
+    };
+    // Index / manifest list: no config, resolved to a child downstream. Allow.
+    if !manifest.manifests.is_empty() {
+        return true;
+    }
+    // Single manifest: require a container-image config AND non-signature layers.
+    let Some(config) = manifest.config.as_ref() else {
+        // No config and no `manifests` array → not a distribution image. Deny.
+        return false;
+    };
+    let config_is_image = CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
+        .iter()
+        .any(|allowed| config.media_type == *allowed);
+    if !config_is_image {
+        return false;
+    }
+    // Layer guard: reject cosign/in-toto/spdx/cyclonedx/helm/wasm payloads even
+    // when the config is the standard image config (cosign reuses it).
+    let has_non_image_layer = manifest.layers.iter().any(|layer| {
+        let mt = layer.media_type.to_ascii_lowercase();
+        NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
+            .iter()
+            .any(|marker| mt.contains(marker))
+    });
+    !has_non_image_layer
+}
+
+/// Gate helper shared by the image-family scanners' `is_applicable_for_target`.
+/// Given a `ScanTarget` already known to pass [`is_oci_image_artifact`],
+/// returns `true` unless a manifest body is in hand AND that body positively
+/// classifies as a non-image OCI artifact. With no body (`None`) the decision
+/// is left to the caller's path-based predicate (#1971 fail-open).
+pub fn oci_target_is_scannable_image(target: &ScanTarget<'_>) -> bool {
+    match target.manifest_body {
+        Some(body) => oci_manifest_is_scannable_image(body),
+        None => true,
+    }
+}
+
 /// Parse a `v2/<name>/manifests/<reference>` registry path into `(name, ref)`.
 ///
 /// Used by ImageScanner (Trivy) and GrypeScanner (#1160) to reconstruct a
@@ -1411,6 +1501,17 @@ pub struct ScanTarget<'a> {
     pub repository_type: &'a str,
     pub db: Option<&'a PgPool>,
     pub storage: Option<&'a dyn StorageBackend>,
+    /// The manifest body the orchestrator already loaded for this artifact
+    /// (`content` at the construction site), when the artifact is served on
+    /// the OCI manifest route. Carries the bytes the image-family scanners
+    /// need to read `config.mediaType` / `layers[].mediaType` so they can
+    /// reject non-container OCI artifacts (Helm charts, cosign signatures,
+    /// SBOM/attestation, WASM modules) that are byte-identical to a real
+    /// image at the manifest mediaType level. `None` for callers with
+    /// no body in hand (legacy path-only applicability + unit tests); in
+    /// that case the gate falls back to the path/content-type predicate and
+    /// must never flip an artifact applicable→not-applicable (#1971).
+    pub manifest_body: Option<&'a [u8]>,
 }
 
 /// A pluggable vulnerability scanner.
@@ -2974,6 +3075,12 @@ impl ScannerService {
             repository_type: &repository_type,
             db: Some(&self.db),
             storage: Some(storage.as_ref()),
+            // thread the already-loaded manifest body so the image-vuln
+            // scanners can read config.mediaType / layers[].mediaType and
+            // reject non-container OCI artifacts (Helm/cosign/SBOM/WASM) that
+            // share the image manifest mediaType. Only meaningful for OCI
+            // manifest artifacts; the gate ignores it for everything else.
+            manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
         };
 
         for scanner in &self.scanners {
@@ -4897,6 +5004,149 @@ mod tests {
         // content type sniffed).
         let a = test_helpers::make_test_artifact("foo", "", "generic/foo");
         assert!(!is_oci_image_artifact(&a));
+    }
+
+    // -----------------------------------------------------------------------
+    // oci_manifest_is_scannable_image: config/layer-mediaType gate.
+    // Default-deny — a Helm/cosign/SBOM/WASM OCI artifact shares the image
+    // manifest mediaType but must NOT be routed to the image-vuln scanners.
+    // -----------------------------------------------------------------------
+
+    const OCI_IMAGE_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const DOCKER_SCHEMA2_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.docker.distribution.manifest.v2+json",
+      "config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.docker.image.rootfs.diff.tar.gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const HELM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.cncf.helm.chart.content.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const WASM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.wasm.config.v0+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/wasm","digest":"sha256:l1","size":9}]}"#;
+
+    const COSIGN_SIG_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.dev.cosign.simplesigning.v1+json","digest":"sha256:l1","size":9}]}"#;
+
+    const SBOM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "artifactType":"application/vnd.cyclonedx+json",
+      "config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa3","size":2},
+      "layers":[{"mediaType":"application/vnd.cyclonedx+json","digest":"sha256:l1","size":9}]}"#;
+
+    const OCI_INDEX_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.index.v1+json",
+      "manifests":[
+        {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:child","size":5,
+         "platform":{"os":"linux","architecture":"amd64"}}]}"#;
+
+    #[test]
+    fn test_scannable_image_oci_image_config_is_image() {
+        assert!(oci_manifest_is_scannable_image(OCI_IMAGE_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_docker_schema2_config_is_image() {
+        assert!(oci_manifest_is_scannable_image(
+            DOCKER_SCHEMA2_MANIFEST_BODY
+        ));
+    }
+
+    #[test]
+    fn test_scannable_image_index_is_image() {
+        // Multi-arch index has no config; resolution picks a child downstream.
+        assert!(oci_manifest_is_scannable_image(OCI_INDEX_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_helm_chart() {
+        // The core regression: demochart must NOT route to image scanners.
+        assert!(!oci_manifest_is_scannable_image(HELM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_wasm_module() {
+        assert!(!oci_manifest_is_scannable_image(WASM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_cosign_signature_despite_image_config() {
+        // cosign reuses the standard image config; the layer guard rejects it.
+        assert!(!oci_manifest_is_scannable_image(COSIGN_SIG_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_sbom_artifact() {
+        assert!(!oci_manifest_is_scannable_image(SBOM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_denies_manifest_with_no_config_and_no_manifests() {
+        // No config descriptor and no `manifests` array → not a distribution
+        // image → deny (default-deny).
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+        assert!(!oci_manifest_is_scannable_image(body));
+    }
+
+    #[test]
+    fn test_scannable_image_denies_unknown_config_media_type() {
+        let body = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.example.unknown.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/octet-stream","digest":"sha256:l1","size":9}]}"#;
+        assert!(!oci_manifest_is_scannable_image(body));
+    }
+
+    #[test]
+    fn test_scannable_image_failopen_on_non_json_body() {
+        // A non-JSON body on an OCI route must not flip a possibly-real image
+        // to skipped (#1971 passthrough): fail open.
+        assert!(oci_manifest_is_scannable_image(b"not json"));
+        assert!(oci_manifest_is_scannable_image(b""));
+    }
+
+    #[test]
+    fn test_oci_target_is_scannable_image_none_body_failopen() {
+        let artifact = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+        };
+        assert!(oci_target_is_scannable_image(&target));
+    }
+
+    #[test]
+    fn test_oci_target_is_scannable_image_helm_body_denies() {
+        let artifact = test_helpers::make_test_artifact(
+            "demochart",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/demochart/manifests/0.1.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "helm-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(HELM_OCI_MANIFEST_BODY),
+        };
+        assert!(!oci_target_is_scannable_image(&target));
     }
 
     #[test]
@@ -11473,6 +11723,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: None,
+            manifest_body: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11496,6 +11747,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: None,
+            manifest_body: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));

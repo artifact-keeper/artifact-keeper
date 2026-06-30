@@ -684,6 +684,18 @@ impl Scanner for ImageScanner {
         Self::is_container_image(artifact)
     }
 
+    /// an OCI manifest artifact passes `is_container_image` purely on its
+    /// manifest mediaType, which is byte-identical between a real image and a
+    /// Helm chart / cosign signature / SBOM / WASM module. When the
+    /// orchestrator supplies the manifest body, additionally require that the
+    /// body classify as a real container image (container config + non-
+    /// signature layers, or an image index). Bodyless callers (tests, legacy)
+    /// keep the path-only decision (#1971).
+    fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+        Self::is_container_image(target.artifact)
+            && crate::services::scanner_service::oci_target_is_scannable_image(target)
+    }
+
     /// Scanner version reported by the adapter on the last successful scan
     /// (e.g. `trivy-0.71.2`). `None` until a scan has run, because the
     /// in-image `trivy --version` probe was removed with the CLI (#2059).
@@ -1013,6 +1025,76 @@ mod tests {
         assert_eq!(ImageScanner::convert_findings(&report).len(), 0);
     }
 
+    /// a Helm-OCI chart has the image manifest mediaType (so
+    /// `is_container_image` is true) but a Helm config mediaType. With the
+    /// manifest body threaded through `ScanTarget`, ImageScanner must classify
+    /// it not-applicable so Trivy never produces a false clean scan.
+    #[test]
+    fn test_is_applicable_for_target_rejects_helm_oci_chart() {
+        use crate::services::scanner_service::Scanner;
+        let scanner = ImageScanner::new("http://trivy:8080".to_string());
+        let artifact = make_test_artifact(
+            "v2/demochart/manifests/0.1.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        let helm_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.cncf.helm.chart.content.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "helm-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(helm_body),
+        };
+        assert!(!scanner.is_applicable_for_target(&target));
+    }
+
+    /// a real OCI image with a container config stays applicable.
+    #[test]
+    fn test_is_applicable_for_target_accepts_real_oci_image() {
+        use crate::services::scanner_service::Scanner;
+        let scanner = ImageScanner::new("http://trivy:8080".to_string());
+        let artifact = make_test_artifact(
+            "v2/library/nginx/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        let image_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(image_body),
+        };
+        assert!(scanner.is_applicable_for_target(&target));
+    }
+
+    /// Regression guard: a bodyless target (legacy/path-only) keeps the
+    /// existing applicable decision so #1971 fail-open is preserved.
+    #[test]
+    fn test_is_applicable_for_target_bodyless_stays_applicable() {
+        use crate::services::scanner_service::Scanner;
+        let scanner = ImageScanner::new("http://trivy:8080".to_string());
+        let artifact = make_test_artifact(
+            "v2/library/nginx/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+        };
+        assert!(scanner.is_applicable_for_target(&target));
+    }
+
     #[test]
     fn test_trivy_report_deserialization() {
         let json = r#"{
@@ -1285,6 +1367,7 @@ mod tests {
             repository_type: "local",
             db: None,
             storage: None,
+            manifest_body: None,
         };
         let result = scanner.scan_target(&target, None, &Bytes::new()).await;
         assert!(
