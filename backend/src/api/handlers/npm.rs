@@ -35,6 +35,9 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::upstream_metadata::UpstreamMetadataCache;
+use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -847,13 +850,17 @@ async fn get_package_metadata(
                 )
                 .await?;
 
-                return Ok(rewrite_and_respond(
+                return rewrite_and_respond_with_age_gate(
+                    state,
+                    &repo,
+                    package_name,
                     content,
                     content_type,
                     base_url,
                     repo_key,
                     want_abbreviated,
-                ));
+                )
+                .await;
             }
         }
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -914,13 +921,21 @@ async fn get_package_metadata(
 
             match result {
                 Ok((content, content_type)) => {
-                    return Ok(rewrite_and_respond(
+                    let params =
+                        crate::services::age_gate_service::AgeGateRepoParams::from_repository(
+                            member,
+                        );
+                    return rewrite_and_respond_with_age_gate_params(
+                        state,
+                        &params,
+                        package_name,
                         content,
                         content_type,
                         base_url,
                         repo_key,
                         want_abbreviated,
-                    ));
+                    )
+                    .await;
                 }
                 Err(_e) => {
                     debug!(
@@ -1216,10 +1231,168 @@ fn build_json_metadata_response(json_string: String) -> Response {
     build_ok_response("application/json", json_string)
 }
 
-/// Try to parse upstream content as JSON, rewrite tarball URLs, and return the
-/// rewritten metadata. Falls back to a raw passthrough if the content is not
-/// valid JSON. Used by both the remote and virtual metadata paths.
-fn rewrite_and_respond(
+/// Build the tarball filename for an npm package version.
+fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
+    format!("{}-{}.tgz", npm_tarball_short_name(package_name), version)
+}
+
+/// Short tarball filename prefix for scoped packages (`@angular/core` -> `core`).
+fn npm_tarball_short_name(package_name: &str) -> &str {
+    if package_name.starts_with('@') {
+        package_name.rsplit('/').next().unwrap_or(package_name)
+    } else {
+        package_name
+    }
+}
+
+/// Build upstream tarball path using literal `/` scope separators (B7 / #1377).
+fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String {
+    build_tarball_upstream_path(package_name, filename)
+}
+
+/// Map an age-gate block decision with LKG into upstream path + filename.
+fn npm_lkg_redirect_from_decision(
+    decision: &AgeGateDecision,
+    package_name: &str,
+) -> Option<(String, String)> {
+    if let AgeGateDecision::Block {
+        last_known_good: Some(lkg),
+        ..
+    } = decision
+    {
+        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+        Some((lkg_path, lkg_filename))
+    } else {
+        None
+    }
+}
+
+async fn npm_publish_time_for_version(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    version: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+        let encoded_name = encode_package_name_for_upstream(package_name);
+        if let Ok((content, _)) =
+            proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &encoded_name).await
+        {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
+                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+                return times.get(version).copied();
+            }
+        }
+    }
+    None
+}
+
+async fn apply_npm_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    filename: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let svc = match state.age_gate_service.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(None);
+    }
+
+    let short_name = npm_tarball_short_name(package_name);
+    let version =
+        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
+            .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
+    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
+    let decision = svc
+        .check(&params, package_name, &version, published_at)
+        .await
+        .map_err(|e| e.into_response())?;
+    match decision {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id: _,
+            last_known_good: Some(_),
+        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                package_name,
+                &version,
+                repo.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_respond_with_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+    want_abbreviated: bool,
+) -> Result<Response, Response> {
+    rewrite_and_respond_with_age_gate_params(
+        state,
+        &proxy_helpers::age_gate_params(repo),
+        package_name,
+        content,
+        content_type,
+        base_url,
+        repo_key,
+        want_abbreviated,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_respond_with_age_gate_params(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package_name: &str,
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+    want_abbreviated: bool,
+) -> Result<Response, Response> {
+    let mut filtered = content.clone();
+    if let (Some(svc), Ok(mut json)) = (
+        state.age_gate_service.as_ref(),
+        serde_json::from_slice::<serde_json::Value>(&content),
+    ) {
+        if AgeGateService::is_applicable(params) {
+            svc.filter_npm_packument(params, package_name, &mut json)
+                .await
+                .map_err(|e| e.into_response())?;
+            filtered = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
+        }
+    }
+    Ok(rewrite_and_respond_inner(
+        filtered,
+        content_type,
+        base_url,
+        repo_key,
+        want_abbreviated,
+    ))
+}
+
+fn rewrite_and_respond_inner(
     content: Bytes,
     content_type: Option<String>,
     base_url: &str,
@@ -1372,17 +1545,22 @@ async fn serve_tarball(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            let mut fetch_path = upstream_path.clone();
+            let mut response_filename = filename.to_string();
+            if let Some((lkg_path, lkg_filename)) =
+                apply_npm_download_age_gate(state, &repo, package_name, filename).await?
+            {
+                fetch_path = lkg_path;
+                response_filename = lkg_filename;
+            }
+
             let (content, _content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
+                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &fetch_path)
                     .await?;
 
-            // The upstream registry may return application/octet-stream for
-            // npm tarballs, which also gets persisted by the proxy cache.
-            // Correct the cached artifact record so that SBOM generation and
-            // security scanners can identify the file as a gzip archive.
-            correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
+            correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
 
-            return Ok(build_tarball_response(content, filename, None));
+            return Ok(build_tarball_response(content, &response_filename, None));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
     }
@@ -2774,7 +2952,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -3353,6 +3534,51 @@ mod tests {
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
         assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    #[test]
+    fn test_npm_tarball_short_name_scoped_and_unscoped() {
+        assert_eq!(npm_tarball_short_name("@angular/core"), "core");
+        assert_eq!(npm_tarball_short_name("express"), "express");
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_uses_literal_slash_path() {
+        use crate::services::age_gate_service::LastKnownGood;
+
+        let decision = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: Some(LastKnownGood {
+                version: "16.0.0".to_string(),
+                artifact_path: "ignored".to_string(),
+            }),
+        };
+        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        assert_eq!(filename, "core-16.0.0.tgz");
+        assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
+        assert!(!path.contains("%2F"));
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_none_without_last_known_good() {
+        // Allow and Block-without-LKG decisions produce no redirect target.
+        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
+        let blocked_no_lkg = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: None,
+        };
+        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_scoped_tarball_uses_short_name() {
+        let filename = "core-17.0.0.tgz";
+        let version = crate::formats::npm::NpmHandler::extract_version_from_filename(
+            filename,
+            npm_tarball_short_name("@angular/core"),
+        )
+        .unwrap();
+        assert_eq!(version, "17.0.0");
     }
 
     // -----------------------------------------------------------------------

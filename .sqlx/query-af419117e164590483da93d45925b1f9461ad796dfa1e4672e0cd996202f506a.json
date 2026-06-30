@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO age_gate_reviews (\n                repository_id, package_name, package_version,\n                upstream_published_at, status\n            )\n            SELECT $1, $2, v, p, 'pending'\n            FROM UNNEST($3::text[], $4::timestamptz[]) AS t(v, p)\n            ON CONFLICT (repository_id, package_name, package_version)\n            DO UPDATE SET\n                request_count = age_gate_reviews.request_count + 1,\n                last_requested_at = NOW(),\n                upstream_published_at = COALESCE(EXCLUDED.upstream_published_at, age_gate_reviews.upstream_published_at)\n            WHERE age_gate_reviews.last_requested_at < $5\n            RETURNING id AS \"id!\", (request_count = 1) AS \"is_new!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "is_new!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "TextArray",
+        "TimestamptzArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "af419117e164590483da93d45925b1f9461ad796dfa1e4672e0cd996202f506a"
+}

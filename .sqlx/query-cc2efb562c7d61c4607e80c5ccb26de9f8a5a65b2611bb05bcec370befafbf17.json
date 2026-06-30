@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days,\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -184,11 +184,21 @@
       },
       {
         "ordinal": 19,
+        "name": "age_gate_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 20,
+        "name": "age_gate_min_age_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 21,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 20,
+        "ordinal": 22,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -301,8 +311,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "8e559769fc90c8a7c6e7d48551772602e3e60ee02b42d34d356ee4ab96c005c3"
+  "hash": "cc2efb562c7d61c4607e80c5ccb26de9f8a5a65b2611bb05bcec370befafbf17"
 }

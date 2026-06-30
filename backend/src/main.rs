@@ -625,6 +625,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    let age_gate_service = Arc::new(
+        artifact_keeper_backend::services::age_gate_service::AgeGateService::new(
+            db_pool.clone(),
+            app_state.event_bus.clone(),
+        ),
+    );
+    app_state.set_age_gate_service(age_gate_service);
+
     // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
     match SmtpService::new(&config) {
         Ok(smtp) => {
@@ -719,6 +727,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         scheduler_storage,
         storage_registry.clone(),
         state.smtp_service.clone(),
+        state.event_bus.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool

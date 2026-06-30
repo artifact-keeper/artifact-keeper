@@ -8718,6 +8718,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -8788,6 +8790,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -8868,6 +8872,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -8952,6 +8958,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9094,6 +9102,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -9778,6 +9788,8 @@ SHA256:
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
