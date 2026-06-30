@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, Result};
 use std::env;
+use std::path::Path;
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -994,6 +995,7 @@ impl Config {
         };
 
         config.validate_jwt_secret()?;
+        config.validate_storage_paths()?;
 
         Ok(config)
     }
@@ -1013,6 +1015,31 @@ impl Config {
                 "JWT_SECRET is unsuitable: {reason} \
                  Generate a secure random secret (e.g. `openssl rand -base64 48`)."
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate that the filesystem storage paths are absolute.
+    ///
+    /// The `filesystem` backend uses `storage_path` (and the scanner uses
+    /// `scan_workspace_path`) as a base directory that every blob/key is joined
+    /// onto. A relative value resolves against the process working directory at
+    /// runtime, so artifacts and scan workspaces silently land somewhere other
+    /// than the intended location depending on where the process was launched.
+    /// Reject such an operator misconfiguration at startup rather than serve
+    /// from an unintended directory. Object stores (`s3`/`gcs`) treat
+    /// `storage_path` as an object-key prefix that may be empty or relative, so
+    /// the check applies only to the `filesystem` backend. This is a
+    /// `from_env`-only check (like [`validate_jwt_secret`]); constructing
+    /// `Config` directly skips it. Detection lives in the pure, unit-testable
+    /// [`storage_path_error`] helper.
+    fn validate_storage_paths(&self) -> Result<()> {
+        if let Some(message) = storage_path_error(
+            &self.storage_backend,
+            &self.storage_path,
+            &self.scan_workspace_path,
+        ) {
+            return Err(AppError::Config(message));
         }
         Ok(())
     }
@@ -1118,6 +1145,47 @@ pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
 /// startup `from_env` check so callers get a single, ready-to-surface message.
 pub(crate) fn jwt_secret_strength_error(secret: &str) -> Option<&'static str> {
     jwt_secret_warnings(secret).first().map(|w| w.message())
+}
+
+/// Pure filesystem-storage path gate. Returns `Some(message)` describing the
+/// first offending path (naming the env var and value), or `None` if the paths
+/// are acceptable for the selected backend.
+///
+/// Only the `filesystem` backend uses `storage_path`/`scan_workspace_path` as
+/// local base directories that keys are joined onto, so a relative value there
+/// resolves against the process working directory at runtime. Object stores
+/// (`s3`/`gcs`) treat `storage_path` as an object-key prefix that may be empty
+/// or relative, so the check is skipped for them — gating only when the backend
+/// is `filesystem`. Used by the startup `from_env` check so the caller gets a
+/// single, ready-to-surface message; `Path::is_absolute` keeps the rule correct
+/// on the running platform.
+pub(crate) fn storage_path_error(
+    storage_backend: &str,
+    storage_path: &str,
+    scan_workspace_path: &str,
+) -> Option<String> {
+    // Only the filesystem backend treats these as local base directories; this
+    // mirrors the exact backend-selection match in StorageService.
+    if storage_backend != "filesystem" {
+        return None;
+    }
+
+    for (var, value) in [
+        ("STORAGE_PATH", storage_path),
+        ("SCAN_WORKSPACE_PATH", scan_workspace_path),
+    ] {
+        if !Path::new(value).is_absolute() {
+            return Some(format!(
+                "{var} must be an absolute path when STORAGE_BACKEND=filesystem, \
+                 but got `{value}`. A relative path resolves against the process \
+                 working directory at runtime, so artifacts would be stored in an \
+                 unintended location; set it to an absolute path \
+                 (e.g. /var/lib/artifact-keeper/artifacts)."
+            ));
+        }
+    }
+
+    None
 }
 
 /// Heuristic low-entropy detector for JWT secrets.
@@ -3150,5 +3218,59 @@ mod tests {
     fn strength_error_accepts_strong_secret() {
         // High-entropy, 32+ chars, >=16 distinct, and NO denied substring.
         assert!(jwt_secret_strength_error(STRONG_SECRET).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // storage_path_error (pure; filesystem absolute-path gate, #2025)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_path_error_rejects_relative_storage_path() {
+        // A relative STORAGE_PATH on the filesystem backend resolves against the
+        // process CWD at runtime — must be rejected, naming the var and value.
+        for value in ["data/artifacts", "./data"] {
+            let err = storage_path_error("filesystem", value, "/scan-workspace")
+                .expect("relative storage_path must be rejected");
+            assert!(err.contains("STORAGE_PATH"), "message names the var: {err}");
+            assert!(err.contains(value), "message names the value: {err}");
+        }
+    }
+
+    #[test]
+    fn storage_path_error_accepts_absolute_paths() {
+        assert!(storage_path_error(
+            "filesystem",
+            "/var/lib/artifact-keeper/artifacts",
+            "/scan-workspace",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn storage_path_error_rejects_relative_scan_workspace_path() {
+        // storage_path is fine; the scanner workspace path is relative.
+        let err = storage_path_error(
+            "filesystem",
+            "/var/lib/artifact-keeper/artifacts",
+            "scan-workspace",
+        )
+        .expect("relative scan_workspace_path must be rejected");
+        assert!(
+            err.contains("SCAN_WORKSPACE_PATH"),
+            "message names the var: {err}"
+        );
+        assert!(
+            err.contains("scan-workspace"),
+            "message names the value: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_path_error_skips_object_store_backends() {
+        // Object stores treat storage_path as an object-key prefix that may be
+        // empty or relative; the local absolute-path rule must not apply.
+        assert!(storage_path_error("s3", "artifact-keeper", "").is_none());
+        assert!(storage_path_error("s3", "", "").is_none());
+        assert!(storage_path_error("gcs", "some/prefix", "").is_none());
     }
 }
