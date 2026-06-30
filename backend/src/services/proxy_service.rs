@@ -3421,6 +3421,51 @@ impl ProxyService {
         }
     }
 
+    /// Cache-only, classifier- and quarantine-aware buffered read for the
+    /// virtual metadata first-match resolver (#2069).
+    ///
+    /// Unlike [`Self::get_cached_artifact_by_path`] (a raw, expiry-only read)
+    /// this runs the #1611 freshness classifier and the #1770 Package-Age-Policy
+    /// gate; unlike [`Self::read_cached_with_revalidation`] it NEVER contacts
+    /// upstream — a stale mutable entry is reported as a miss so the caller can
+    /// fall through to its own (parallel) upstream fetch instead of serializing
+    /// a revalidation here.
+    ///
+    /// Returns:
+    /// * `Ok(Some((body, content_type)))` — a fresh, non-quarantined cache hit;
+    /// * `Ok(None)` — miss / negative-cache / stale (caller re-fetches upstream);
+    /// * `Err(Conflict)` — a fresh entry held by Package-Age-Policy, so the
+    ///   caller skips this member (matching the buffered fetch path, which also
+    ///   surfaces the 409 rather than serving the held bytes).
+    pub async fn cached_metadata_if_servable(
+        &self,
+        repo: &Repository,
+        cache_path: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        let metadata = self
+            .load_cache_metadata(&metadata_key)
+            .await
+            .unwrap_or(None);
+        let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
+        match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
+            cache_classifier::Freshness::Fresh => {
+                check_quarantine_until(
+                    metadata
+                        .as_ref()
+                        .expect("fresh implies metadata present")
+                        .quarantine_until,
+                )?;
+                self.get_cached_artifact(&cache_key, &metadata_key).await
+            }
+            // Miss / NegativeHit / Stale: no upstream contact here — the caller
+            // falls through to its own (parallel) upstream fetch.
+            _ => Ok(None),
+        }
+    }
+
     /// Conditionally revalidate a stale (mutable, past-TTL) cache entry (#1611
     /// §2.2). Sends `If-None-Match` (and `If-Modified-Since` when available)
     /// derived from the cached validators:
@@ -8742,6 +8787,92 @@ SHA256:
             ct.as_deref(),
             Some("application/vnd.oci.image.manifest.v1+json"),
         );
+    }
+
+    /// `cached_metadata_if_servable` (#2069): the cache-only, classifier- and
+    /// quarantine-aware read used by the virtual metadata first-match resolver.
+    /// Pins the three load-bearing arms — a cold miss and a negative-cached 404
+    /// both read back as `Ok(None)` (so the caller falls through to its parallel
+    /// upstream fetch), and a fresh cache hit serves the body without contacting
+    /// upstream.
+    #[tokio::test]
+    async fn test_cached_metadata_if_servable_miss_fresh_and_negative() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"INDEX-BODY".as_ref()))
+            .mount(&server)
+            .await;
+        // "/missing.json" is intentionally NOT mounted → wiremock 404 → the
+        // fetch negative-caches it.
+
+        let tmp = std::env::temp_dir().join(format!("cached-meta-servable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "test-cached-meta-servable".to_string(),
+            name: "test-cached-meta-servable".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Cold miss: nothing cached yet → Ok(None).
+        let miss = proxy.cached_metadata_if_servable(&repo, "index.json").await;
+        assert!(
+            matches!(miss, Ok(None)),
+            "uncached path must read back as a miss, got {miss:?}"
+        );
+
+        // Prime the cache via a real upstream fetch, then a FRESH hit must serve
+        // the body (no upstream contact).
+        let (body, _ct) = proxy
+            .fetch_artifact(&repo, "index.json")
+            .await
+            .expect("prime cache from upstream");
+        assert_eq!(&body[..], b"INDEX-BODY");
+        match proxy.cached_metadata_if_servable(&repo, "index.json").await {
+            Ok(Some((bytes, _))) => assert_eq!(&bytes[..], b"INDEX-BODY"),
+            other => panic!("fresh cached entry must be servable, got {other:?}"),
+        }
+
+        // A negative-cached 404 reads back as Ok(None) (NOT an error, NOT a
+        // served body) so the caller's Pass-2 fetch re-honors the negative cache.
+        let _ = proxy.fetch_artifact(&repo, "missing.json").await; // 404 → negative cache
+        let neg = proxy
+            .cached_metadata_if_servable(&repo, "missing.json")
+            .await;
+        assert!(
+            matches!(neg, Ok(None)),
+            "negative-cached entry must map to Ok(None), got {neg:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
