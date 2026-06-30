@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::download_response::try_presigned_redirect;
-use crate::api::handlers::error_helpers::map_storage_err;
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::AppState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
@@ -86,13 +86,10 @@ pub async fn resolve_repo_by_key(
     .bind(repo_key)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    // Route through map_db_err so a saturated pool surfaces as 503 (capacity
+    // shed) instead of 500, and so the raw DB error text is not leaked to the
+    // client. This is the first DB acquire on every proxy GET (#1437).
+    .map_err(map_db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
 
     let fmt: String = repo.try_get("format").unwrap_or_default();
@@ -126,9 +123,18 @@ pub async fn resolve_repo_by_key(
 /// format!("... error: {}", e)).into_response()` block throughout the
 /// local_fetch helpers.
 pub(crate) fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
+    let text = e.to_string();
+    // A saturated sqlx pool is a transient capacity event, not a server fault.
+    // Every local/virtual-member artifact-lookup helper funnels DB errors
+    // through here, so route pool timeouts via map_db_err to surface 503 +
+    // Retry-After (clients back off) instead of a bare 500 (#1437). Non-DB
+    // labels (e.g. "Storage") never produce this phrase, so they are unaffected.
+    if crate::error::is_pool_timeout(&text) {
+        return map_db_err(text);
+    }
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("{} error: {}", label, e),
+        format!("{} error: {}", label, text),
     )
         .into_response()
 }
@@ -1441,13 +1447,9 @@ pub async fn fetch_virtual_members(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to resolve virtual members: {}", e),
-        )
-            .into_response()
-    })
+    // Route through map_db_err so pool saturation surfaces as 503 (capacity
+    // shed) instead of 500, and to avoid leaking raw DB error text (#1437).
+    .map_err(map_db_err)
 }
 
 /// Decide whether `auth` is allowed to read `member` directly, mirroring the
@@ -2100,7 +2102,7 @@ pub async fn virtual_non_remote_owns_name_version(
         .bind(package_name)
         .fetch_optional(db)
         .await
-        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+        .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
         return Ok(exists.is_some());
     };
 
@@ -2120,7 +2122,7 @@ pub async fn virtual_non_remote_owns_name_version(
     .bind(package_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
     Ok(pypi_version_owned(version, &stored_versions))
 }
@@ -2149,12 +2151,20 @@ fn pypi_version_owned(requested: &str, stored_versions: &[String]) -> bool {
         })
 }
 
-fn shadowing_guard_db_err(virtual_repo_id: Uuid, e: sqlx::Error) -> Response {
+fn shadowing_guard_db_err(virtual_repo_id: Uuid, format: &str, e: sqlx::Error) -> Response {
+    let text = e.to_string();
+    // Pool saturation is transient capacity, not a guard failure: shed to 503 +
+    // Retry-After so clients back off, instead of failing closed to 500 (#1437).
+    // Real query failures still fail closed to a non-leaking 500 below.
+    if crate::error::is_pool_timeout(&text) {
+        return map_db_err(text);
+    }
     tracing::error!(
         event = "shadowing_guard_db_error",
         virtual_repo_id = %virtual_repo_id,
-        error = %e,
-        "cross-format shadowing-guard DB query failed; failing closed to 500",
+        format = format,
+        error = %text,
+        "shadowing-guard DB query failed; failing closed to 500",
     );
     (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
 }
@@ -2205,7 +2215,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_all(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
     if owning_ids.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
@@ -2223,7 +2233,7 @@ pub async fn pypi_virtual_isolates_name(
     .bind(normalized_name)
     .fetch_one(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
     Ok(tracked == 0)
 }
@@ -2278,16 +2288,7 @@ pub async fn virtual_non_remote_owns_path(
     .bind(path)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        tracing::error!(
-            event = "shadowing_guard_db_error",
-            virtual_repo_id = %virtual_repo_id,
-            format = "generic",
-            error = %e,
-            "generic exact-path shadowing-guard DB query failed; failing closed to 500",
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
-    })?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "generic", e))?;
 
     Ok(exists.is_some())
 }
@@ -2363,16 +2364,7 @@ pub async fn virtual_non_remote_owns_maven_ga(
     .bind(&prefix)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        tracing::error!(
-            event = "shadowing_guard_db_error",
-            virtual_repo_id = %virtual_repo_id,
-            format = "maven",
-            error = %e,
-            "Maven shadowing-guard DB query failed; failing closed to 500",
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
-    })?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "maven", e))?;
 
     Ok(exists.is_some())
 }
@@ -3506,6 +3498,35 @@ mod tests {
     #[test]
     fn test_internal_error_returns_500() {
         let response = internal_error("Storage", "disk full");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_internal_error_pool_timeout_returns_503() {
+        // Every local/virtual artifact-lookup helper funnels DB errors through
+        // internal_error. A saturated pool must surface as 503 (capacity shed)
+        // so clients back off, not a bare 500 (#1437). Reproduce the exact sqlx
+        // Display string, which does not contain the "PoolTimedOut" variant name.
+        let response = internal_error("Database", sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_shadowing_guard_db_err_pool_timeout_returns_503() {
+        // The shadowing guard fails closed to 500 on real DB errors, but a
+        // saturated pool is transient capacity: it must shed to 503 so clients
+        // back off instead of paging ops (#1437).
+        let response =
+            shadowing_guard_db_err(uuid::Uuid::new_v4(), "maven", sqlx::Error::PoolTimedOut);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_shadowing_guard_db_err_other_error_fails_closed_500() {
+        // Non-timeout DB failures must still fail closed to 500 (no 503 shed)
+        // and must not leak the raw error text in the body.
+        let response =
+            shadowing_guard_db_err(uuid::Uuid::new_v4(), "generic", sqlx::Error::RowNotFound);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

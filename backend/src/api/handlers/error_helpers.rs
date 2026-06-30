@@ -44,6 +44,16 @@ mod tests {
     }
 
     #[test]
+    fn test_map_db_err_pool_timeout_returns_503() {
+        // Proxy/format handlers funnel sqlx errors through map_db_err after
+        // stringifying them. A pool timeout must surface as 503 (capacity
+        // shed) so saturated clients back off, not 500 (#1437). Reproduce the
+        // exact sqlx Display string rather than a synthetic one.
+        let resp = map_db_err(sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn test_map_storage_err_returns_500() {
         let resp = map_storage_err("disk full");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
