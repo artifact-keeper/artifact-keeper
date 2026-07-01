@@ -35,6 +35,19 @@ BOOTSTRAP_MARKER="/shared/.dtrack-bootstrapped"
 PUBLIC_ID_MARKER="/shared/.dtrack-publicid"
 FORCE_ROTATE="${DTRACK_INIT_FORCE_ROTATE:-false}"
 
+# Opt-in OSV mirror (#1972). The bundled bootstrap only enables the NVD mirror,
+# which matches by CPE, so purl-based application dependencies (Maven, PyPI, npm,
+# Go, NuGet, RubyGems, crates.io, Packagist, ...) get few or no findings. OSV
+# matches by purl and aggregates GitHub Security Advisories, PyPA, RustSec, Go
+# and npm advisories, so enabling it lets application-dependency analysis produce
+# real findings. Kept opt-in (default off) because the extra mirror adds
+# memory/CPU/Postgres load -- the same reason the bundled DT is opt-in (#1432).
+OSV_ENABLED="${DTRACK_INIT_OSV_ENABLED:-false}"
+# OSV ecosystems Artifact Keeper hosts that OSV supports, in OSV's own naming.
+# Overridable so operators can trim the mirror footprint to the ecosystems they
+# actually use.
+OSV_ECOSYSTEMS="${DTRACK_INIT_OSV_ECOSYSTEMS:-Maven,PyPI,npm,Go,NuGet,RubyGems,crates.io,Packagist}"
+
 REQUIRED_PERMISSIONS="
 BOM_UPLOAD
 PROJECT_CREATION_UPLOAD
@@ -296,6 +309,29 @@ if [ "$NVD_RESULT" = "200" ] || [ "$NVD_RESULT" = "201" ] || [ "$NVD_RESULT" = "
   echo "[dtrack-init] NVD REST API 2.0 mirroring enabled"
 else
   echo "[dtrack-init] WARNING: NVD API config returned HTTP $NVD_RESULT (may already be set)"
+fi
+
+# Opt-in OSV mirror (#1972). NVD alone matches by CPE and misses purl-based
+# language dependencies; OSV matches by purl. In Dependency-Track the
+# `google.osv.enabled` config property stores the comma-separated list of
+# ecosystems to mirror (empty == OSV disabled), so writing the ecosystem list
+# both enables OSV and scopes it to the ecosystems Artifact Keeper hosts.
+if [ "$OSV_ENABLED" = "true" ]; then
+  echo "[dtrack-init] Enabling OSV mirroring for ecosystems: $OSV_ECOSYSTEMS ..."
+
+  OSV_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST "$DT_URL/api/v1/configProperty" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"groupName\":\"vuln-source\",\"propertyName\":\"google.osv.enabled\",\"propertyValue\":\"${OSV_ECOSYSTEMS}\"}" || true)
+
+  if [ "$OSV_RESULT" = "200" ] || [ "$OSV_RESULT" = "201" ] || [ "$OSV_RESULT" = "204" ]; then
+    echo "[dtrack-init] OSV mirroring enabled"
+  else
+    echo "[dtrack-init] WARNING: OSV API config returned HTTP $OSV_RESULT (may already be set)"
+  fi
+else
+  echo "[dtrack-init] OSV mirroring not enabled (set DTRACK_INIT_OSV_ENABLED=true to mirror purl/language advisories; NVD-only misses most language-dependency CVEs -- #1972)"
 fi
 
 : > "$BOOTSTRAP_MARKER" 2>/dev/null || true

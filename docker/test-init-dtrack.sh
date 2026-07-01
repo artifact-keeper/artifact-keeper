@@ -92,6 +92,10 @@ state = {
 }
 KEY_LOG = os.environ["KEY_LOG"]
 PERM_LOG = os.environ["PERM_LOG"]
+# Every POST /api/v1/configProperty body is appended here (one JSON object per
+# line) so tests can assert which vuln-source mirrors the script enabled
+# (NVD always; OSV only when DTRACK_INIT_OSV_ENABLED=true -- #1972).
+CONFIG_LOG = os.environ["CONFIG_LOG"]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k):
@@ -133,6 +137,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, b"eyJhbGciOiJIUzI1NiJ9.mockjwt.signature",
                               ctype="text/plain")
         if self.path == "/api/v1/configProperty":
+            try:
+                with open(CONFIG_LOG, "a") as f:
+                    f.write(body.decode("utf-8", "replace") + "\n")
+            except Exception:
+                pass
             return self._send(200)
         if (self.path.startswith(f"/api/v1/permission/")
                 and self.path.endswith(f"/team/{TEAM_UUID}")):
@@ -186,6 +195,9 @@ KEY_LOG="$WORK_DIR/keys.log"
 PERM_LOG="$WORK_DIR/perms.log"
 : > "$PERM_LOG"
 
+CONFIG_LOG="$WORK_DIR/config.log"
+: > "$CONFIG_LOG"
+
 # start_mock <var=value>... — (re)launch the mock with the given env overrides.
 # Tests that need to inject foreign keys or fault-injection knobs restart
 # the mock between phases; a fresh server discards the previous state.
@@ -199,7 +211,7 @@ start_mock() {
   # KEY=val passed by callers are honored as env assignments. The shell
   # only treats inline VAR=val as an env override when it appears literally
   # at the start of a command — not when it arrives via "$@" expansion.
-  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" PERM_LOG="$PERM_LOG" \
+  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" PERM_LOG="$PERM_LOG" CONFIG_LOG="$CONFIG_LOG" \
     "$@" \
     python3 "$WORK_DIR/mock_dtrack.py" "$MOCK_PORT" >>"$WORK_DIR/mock.log" 2>&1 &
   MOCK_PID=$!
@@ -235,7 +247,7 @@ PUBLIC_ID_MARKER="$SHARED_DIR/.dtrack-publicid"
 
 fail() {
   echo "FAIL: $1" >&2
-  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6; do
+  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6 init7 init8; do
     if [ -f "$WORK_DIR/${f}.out" ] || [ -f "$WORK_DIR/${f}.err" ]; then
       echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" >&2 || true
       echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" >&2 || true
@@ -267,6 +279,15 @@ for PERM in "${REQUIRED_PERMISSIONS[@]}"; do
   grep -qx "/api/v1/permission/$PERM/team/11111111-2222-3333-4444-555555555555" "$PERM_LOG" || \
     fail "Phase 1: permission $PERM was not granted (mock POST log: $(tr '\n' ' ' < "$PERM_LOG"))"
 done
+
+# Phase 1 must enable the NVD mirror on cold start...
+grep -q '"propertyName":"nvd.api.enabled".*"propertyValue":"true"' "$CONFIG_LOG" || \
+  fail "Phase 1: NVD mirror (nvd.api.enabled) was not enabled (config log: $(tr '\n' ' ' < "$CONFIG_LOG"))"
+# ...but must NOT enable OSV unless the operator opts in (#1972). OSV is an
+# additional continuous mirror with a real resource footprint, so default off.
+if grep -q 'google.osv.enabled' "$CONFIG_LOG"; then
+  fail "Phase 1: OSV mirror was enabled without DTRACK_INIT_OSV_ENABLED (config log: $(tr '\n' ' ' < "$CONFIG_LOG"))"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2: warm restart — must NOT re-hit PUT /key, but must grant permissions
@@ -445,4 +466,39 @@ INIT_RC6=$(run_init init6)
 [ ! -f "$KEY_FILE.tmp" ] || \
   fail "Phase 6: failed init left a stale $KEY_FILE.tmp on disk"
 
-echo "PASS: init-dtrack.sh — bug #978 + foreign-key safety rail (#1041 follow-up)"
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 7: OSV opt-in (#1972) — DTRACK_INIT_OSV_ENABLED=true on a cold start
+# enables the OSV mirror scoped to the configured ecosystems, in addition to
+# NVD. Without this, DT only mirrors NVD (CPE matching) and finds no CVEs for
+# purl-based language dependencies.
+# ─────────────────────────────────────────────────────────────────────────────
+rm -f "$KEY_FILE" "$PUBLIC_ID_MARKER" "$SHARED_DIR/.dtrack-bootstrapped"
+: > "$KEY_LOG"
+: > "$CONFIG_LOG"
+start_mock
+
+INIT_RC7=$(run_init init7 env DTRACK_INIT_OSV_ENABLED=true)
+[ "$INIT_RC7" -eq 0 ] || fail "Phase 7: OSV opt-in cold start exited $INIT_RC7 (expected 0)"
+# NVD still enabled alongside OSV.
+grep -q '"propertyName":"nvd.api.enabled".*"propertyValue":"true"' "$CONFIG_LOG" || \
+  fail "Phase 7: NVD mirror not enabled under OSV opt-in (config log: $(tr '\n' ' ' < "$CONFIG_LOG"))"
+# OSV enabled with the default ecosystem list (comma-separated purl ecosystems).
+grep -q '"propertyName":"google.osv.enabled"' "$CONFIG_LOG" || \
+  fail "Phase 7: OSV mirror (google.osv.enabled) was not enabled with DTRACK_INIT_OSV_ENABLED=true (config log: $(tr '\n' ' ' < "$CONFIG_LOG"))"
+for ECO in Maven PyPI npm Go NuGet RubyGems crates.io Packagist; do
+  grep "google.osv.enabled" "$CONFIG_LOG" | grep -q "$ECO" || \
+    fail "Phase 7: OSV ecosystem '$ECO' missing from google.osv.enabled value (config log: $(tr '\n' ' ' < "$CONFIG_LOG"))"
+done
+
+# Phase 8: custom ecosystem list is honored (operators can trim the footprint).
+rm -f "$KEY_FILE" "$PUBLIC_ID_MARKER" "$SHARED_DIR/.dtrack-bootstrapped"
+: > "$KEY_LOG"
+: > "$CONFIG_LOG"
+start_mock
+INIT_RC8=$(run_init init8 env DTRACK_INIT_OSV_ENABLED=true DTRACK_INIT_OSV_ECOSYSTEMS=PyPI,npm)
+[ "$INIT_RC8" -eq 0 ] || fail "Phase 8: custom OSV ecosystem list exited $INIT_RC8 (expected 0)"
+OSV_LINE="$(grep 'google.osv.enabled' "$CONFIG_LOG")"
+echo "$OSV_LINE" | grep -q '"propertyValue":"PyPI,npm"' || \
+  fail "Phase 8: DTRACK_INIT_OSV_ECOSYSTEMS override not honored (got: $OSV_LINE)"
+
+echo "PASS: init-dtrack.sh — bug #978 + foreign-key safety rail (#1041 follow-up) + OSV opt-in (#1972)"

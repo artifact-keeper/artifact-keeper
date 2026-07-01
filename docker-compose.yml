@@ -129,6 +129,10 @@ services:
       - shared_config:/shared
     environment:
       DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
+      # Opt-in OSV mirror (#1972). NVD-only matches by CPE and misses purl-based
+      # language dependencies; set to true to also mirror OSV (purl matching).
+      DTRACK_INIT_OSV_ENABLED: ${DTRACK_INIT_OSV_ENABLED:-false}
+      DTRACK_INIT_OSV_ECOSYSTEMS: ${DTRACK_INIT_OSV_ECOSYSTEMS:-Maven,PyPI,npm,Go,NuGet,RubyGems,crates.io,Packagist}
       DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
     entrypoint: ["/bin/sh", "-c"]
     command:
