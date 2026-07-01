@@ -298,6 +298,42 @@ else
   echo "[dtrack-init] WARNING: NVD API config returned HTTP $NVD_RESULT (may already be set)"
 fi
 
+# Google OSV vulnerability mirror (opt-in; OFF by default).
+#
+# NVD (enabled above) matches by CPE, so purl-based application dependencies
+# get few or no findings from NVD alone, leaving Dependency-Track largely
+# redundant with the OS-package scanners for application code. OSV matches by
+# purl and aggregates GitHub Security Advisories, PyPA, RustSec, Go and npm
+# advisories, so enabling it makes app-dependency analysis actually produce
+# findings.
+#
+# Gated behind DTRACK_INIT_OSV_ENABLED and OFF by default: OSV is an additional
+# continuous mirror on top of NVD (and DT's default OSS-Index analyzer) and
+# adds memory/CPU/Postgres load — the same resource footprint that made the
+# bundled DT opt-in (#1432). The ecosystem set covers the purl-based package
+# formats Artifact Keeper hosts that OSV supports (Maven incl. sbt, PyPI, npm
+# incl. pnpm, Go, NuGet, RubyGems, Cargo/crates.io, Composer/Packagist);
+# narrow or extend it from the DT UI (Administration -> Vulnerability Sources
+# -> Google OSV) if needed.
+if [ "${DTRACK_INIT_OSV_ENABLED:-false}" = "true" ]; then
+  OSV_ECOSYSTEMS="Maven;PyPI;npm;Go;NuGet;RubyGems;crates.io;Packagist"
+  echo "[dtrack-init] Enabling Google OSV mirroring for: $OSV_ECOSYSTEMS"
+
+  OSV_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST "$DT_URL/api/v1/configProperty" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"groupName\":\"vuln-source\",\"propertyName\":\"google.osv.enabled\",\"propertyValue\":\"${OSV_ECOSYSTEMS}\"}" || true)
+
+  if [ "$OSV_RESULT" = "200" ] || [ "$OSV_RESULT" = "201" ] || [ "$OSV_RESULT" = "204" ]; then
+    echo "[dtrack-init] Google OSV mirroring enabled"
+  else
+    echo "[dtrack-init] WARNING: OSV config returned HTTP $OSV_RESULT (may already be set)"
+  fi
+else
+  echo "[dtrack-init] Google OSV mirroring disabled (set DTRACK_INIT_OSV_ENABLED=true for app-dependency CVE coverage)"
+fi
+
 : > "$BOOTSTRAP_MARKER" 2>/dev/null || true
 
 echo "[dtrack-init] Done"
