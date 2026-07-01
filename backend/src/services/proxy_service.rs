@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::header::{
     ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
 };
@@ -629,6 +631,25 @@ fn repo_key_from_cache_key(cache_key: &str) -> &str {
         .unwrap_or("unknown")
 }
 
+/// Matches the shape of an S3 *multipart* upload ETag: 32 hex digits (the MD5
+/// of the concatenated part digests) followed by `-<partcount>`, e.g.
+/// `d41d8cd98f00b204e9800998ecf8427e-3`.
+///
+/// Unlike a single-part ETag — which is the raw MD5 of the whole object body —
+/// a multipart ETag is an *opaque per-upload* value. Two replicas re-uploading
+/// byte-identical content produce different multipart ETags because the value
+/// depends on the upload's part boundaries, not just the bytes. It is therefore
+/// NOT a content hash and must not be used to prove two objects differ (#2120).
+static MULTIPART_ETAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[0-9a-fA-F]{32}-\d+$").unwrap());
+
+/// True when `etag` has the S3 multipart-upload shape (see
+/// [`MULTIPART_ETAG_RE`]). Surrounding double quotes — which S3 / `object_store`
+/// carry on the raw ETag header value — are stripped before matching so both
+/// `"<md5>-2"` and `<md5>-2` are recognized. Pure and side-effect free.
+fn is_multipart_etag(etag: &str) -> bool {
+    MULTIPART_ETAG_RE.is_match(etag.trim_matches('"'))
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -900,6 +921,27 @@ impl CacheStore {
             Some(ref pinned) => match self.storage.head_etag(cache_key).await {
                 Ok(Some(current)) => {
                     if current != *pinned {
+                        // #2120: S3 multipart ETags are opaque per-upload
+                        // values, not content hashes. Two replicas re-uploading
+                        // byte-identical pull-through content mint DIFFERENT
+                        // multipart ETags, so a value mismatch does NOT imply
+                        // the object changed. When either side is multipart-
+                        // shaped, treat the mismatch as inconclusive and fall
+                        // back to an existence check rather than forcing the
+                        // slow path — which would re-fetch + re-upload, mint yet
+                        // another ETag, and thrash the fast path permanently.
+                        // Single-part (real-MD5) ETags keep full
+                        // mismatch = not-fresh semantics below. The robust
+                        // cross-replica single-flight fix is tracked in #1609.
+                        if is_multipart_etag(pinned) || is_multipart_etag(&current) {
+                            tracing::debug!(
+                                cache_key = %cache_key,
+                                pinned_etag = %pinned,
+                                current_etag = %current,
+                                "proxy cache multipart ETag mismatch on fast-path revalidation; falling back to existence check (#2120)"
+                            );
+                            return matches!(self.storage.exists(cache_key).await, Ok(true));
+                        }
                         tracing::warn!(
                             cache_key = %cache_key,
                             pinned_etag = %pinned,
@@ -2047,10 +2089,15 @@ impl ProxyService {
     ///
     ///   * **S3 / GCS / Azure**: ETag is the backend's per-object value.
     ///     For S3 single-part PUTs this equals the MD5 of the body and
-    ///     gives cryptographic-grade replacement detection; for multipart
-    ///     uploads it is an opaque per-upload identifier that still
-    ///     changes on any rewrite. Both are sufficient for tamper
-    ///     detection in the cache-poisoning threat model.
+    ///     gives cryptographic-grade replacement detection; a genuine
+    ///     mismatch there still forces the slow path. For S3 *multipart*
+    ///     uploads the ETag is an opaque per-upload identifier (not a
+    ///     content hash): byte-identical re-uploads on different replicas
+    ///     mint different values, so a mismatch is not a reliable
+    ///     "replaced" signal. Per #2120 a multipart-shaped ETag mismatch
+    ///     therefore falls back to an existence check (relying on cache
+    ///     TTL for staleness) instead of thrashing the fast path. The
+    ///     robust cross-replica single-flight fix is tracked in #1609.
     ///   * **Filesystem**: no native ETag. `storage_etag` is `None` for
     ///     these entries, revalidation is a no-op, and behavior matches
     ///     pre-#1051 semantics — i.e. the local filesystem is the trust
@@ -6359,6 +6406,144 @@ SHA256:
             mock.head_etag_calls.load(AtomicOrdering::SeqCst),
             0,
             "no pin -> no revalidation HEAD"
+        );
+    }
+
+    // =======================================================================
+    // Multipart-ETag tolerance on fast-path revalidation (#2120)
+    //
+    // S3 multipart ETags are opaque per-upload values (<md5hex>-<partcount>),
+    // NOT content hashes. Two replicas re-uploading byte-identical pull-through
+    // content mint DIFFERENT multipart ETags, which under the strict #1051
+    // rule made every fast-path hit re-fetch + re-upload forever. When either
+    // the pinned or the current ETag is multipart-shaped, a value mismatch is
+    // now treated as inconclusive and falls back to an existence check.
+    // Single-part (real-MD5) ETags keep FULL mismatch = not-fresh semantics.
+    // =======================================================================
+
+    #[test]
+    fn test_is_multipart_etag_recognizes_multipart_shape() {
+        // 32 hex digits + "-" + part count, with and without the surrounding
+        // quotes S3 / object_store carry on the raw header value.
+        assert!(is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-3"));
+        assert!(is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e-3\""));
+        assert!(is_multipart_etag("D41D8CD98F00B204E9800998ECF8427E-12"));
+        assert!(is_multipart_etag("00000000000000000000000000000000-1"));
+    }
+
+    #[test]
+    fn test_is_multipart_etag_rejects_singlepart_and_junk() {
+        // A bare MD5 (single-part ETag) is NOT multipart.
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(!is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e\""));
+        // Wrong hex length, missing/garbled part count, or non-hex.
+        assert!(!is_multipart_etag("deadbeef-2"));
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-"));
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-x"));
+        assert!(!is_multipart_etag("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-2"));
+        assert!(!is_multipart_etag(""));
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_multipart_pin_vs_singlepart_current_and_present() {
+        // Pinned ETag is multipart-shaped; current HEAD returns a different,
+        // single-part value. Because the pin is multipart the mismatch is
+        // inconclusive and we fall back to an existence check — object present
+        // → fresh (no thrash). #2120.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "multipart-shaped pin mismatch with object present must fall back to existence → fresh"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "still HEADs exactly once"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "multipart mismatch path falls back to a single exists() probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_multipart_vs_multipart_differ_and_present() {
+        // Both pinned and current are multipart ETags for the same content but
+        // with different part counts (classic cross-replica re-upload). Object
+        // present → fresh. #2120.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e-7\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "multipart-vs-multipart mismatch with object present must yield fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_multipart_mismatch_but_content_gone() {
+        // Multipart mismatch but the existence fallback finds no object:
+        // still not fresh. Guards against serving a presigned URL to a 404.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ false,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e-7\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "multipart mismatch with missing content must still yield not-fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_singlepart_mismatch_still_not_fresh() {
+        // Both ETags are single-part (real MD5) and differ: this is a genuine
+        // replacement signal and MUST keep the strict #1051 not-fresh behavior
+        // — the #2120 tolerance is scoped to multipart-shaped ETags only.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"ffffffffffffffffffffffffffffffff\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "single-part ETag mismatch must remain not-fresh (no multipart tolerance)"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "single-part mismatch must NOT fall back to an existence probe"
         );
     }
 
