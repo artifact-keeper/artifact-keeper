@@ -1293,6 +1293,34 @@ fn resolve_archive_url(download: &serde_json::Value) -> Result<&str, Response> {
     })
 }
 
+/// Derive a scheme-less proxy-cache path for a network-mirror archive
+/// download from the registry-provided (frequently absolute) `download_url`.
+///
+/// `archive_url` is used directly as the upstream fetch target (absolute
+/// `http(s)://` URLs pass through `ProxyService::build_upstream_url`
+/// unchanged), but it cannot double as the proxy-cache path: the `https://`
+/// scheme's `//` trips `ProxyService::validate_cache_path`'s empty-segment
+/// guard. This instead derives a canonical
+/// `<namespace>/<type>/<version>/<os>/<arch>/<filename>` path from the
+/// archive URL's own filename, keeping cache keys stable regardless of which
+/// host or path shape the upstream registry serves archives from (#1998).
+fn mirror_archive_cache_path(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+    archive_url: &str,
+) -> String {
+    let filename = archive_url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("provider.zip");
+
+    format!("{namespace}/{type_name}/{version}/{os}/{arch}/{filename}")
+}
+
 /// Validated context for serving a network-mirror request against a remote
 /// Terraform repository: the resolved repo plus its upstream registry URL.
 struct MirrorRemote<'a> {
@@ -1443,14 +1471,21 @@ async fn mirror_download(
 
     let archive_url = resolve_archive_url(&download)?;
 
-    // `proxy_fetch_streaming` passes absolute URLs through unchanged, so the
-    // archive is streamed (and cached) directly from the registry-provided URL.
-    proxy_helpers::proxy_fetch_streaming(
+    // `archive_url` is frequently an absolute `https://` URL (#1998): fine as
+    // the upstream fetch target (absolute URLs pass through unchanged), but
+    // not as the proxy-cache path (its `https://` scheme trips the
+    // empty-segment guard). Fetch from `archive_url` but cache under a
+    // derived, scheme-less canonical path instead.
+    let cache_path =
+        mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
+
+    proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         remote.proxy,
         remote.repo.id,
         &repo_key,
         &remote.upstream_url,
         archive_url,
+        &cache_path,
         "application/zip",
     )
     .await
@@ -2483,6 +2518,80 @@ mod tests {
 
         let err2 = resolve_archive_url(&serde_json::json!({ "download_url": "" })).unwrap_err();
         assert_eq!(err2.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_hashicorp_release_url() {
+        // Reproduces the exact #1998 repro: an absolute releases.hashicorp.com
+        // archive URL must derive a clean, scheme-less canonical cache path.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip",
+        );
+        assert_eq!(
+            cache_path,
+            "hashicorp/null/3.2.3/linux/arm64/terraform-provider-null_3.2.3_linux_arm64.zip"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_third_party_host() {
+        // OpenTofu-style / third-party mirrors (e.g. a provider hosted on
+        // GitHub Releases) serve from a different host and path shape; only
+        // the archive's filename should influence the derived cache path.
+        let cache_path = mirror_archive_cache_path(
+            "carlpett",
+            "sops",
+            "1.0.0",
+            "darwin",
+            "arm64",
+            "https://github.com/carlpett/terraform-provider-sops/releases/download/v1.0.0/terraform-provider-sops_1.0.0_darwin_arm64.zip",
+        );
+        assert_eq!(
+            cache_path,
+            "carlpett/sops/1.0.0/darwin/arm64/terraform-provider-sops_1.0.0_darwin_arm64.zip"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_trailing_slash_falls_back_to_default_filename() {
+        // A URL ending in `/` has no filename segment; falling back to a
+        // fixed name avoids producing an empty final path segment.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://example.com/download/",
+        );
+        assert_eq!(cache_path, "hashicorp/null/3.2.3/linux/arm64/provider.zip");
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_accepted_by_cache_storage_key_1998() {
+        // Regression guard for #1998: the raw absolute archive URL must NOT
+        // be usable as a proxy-cache path (its `https://` scheme's `//`
+        // trips the empty-segment guard), but the derived cache path must be.
+        use crate::services::proxy_service::ProxyService;
+
+        let archive_url = "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip";
+
+        let raw_err = ProxyService::cache_storage_key("tf-mirror", archive_url).unwrap_err();
+        assert!(
+            raw_err.to_string().contains("empty segments"),
+            "raw absolute archive URL must be rejected as a cache path, got: {}",
+            raw_err
+        );
+
+        let cache_path =
+            mirror_archive_cache_path("hashicorp", "null", "3.2.3", "linux", "arm64", archive_url);
+        ProxyService::cache_storage_key("tf-mirror", &cache_path)
+            .expect("derived cache path must be a valid proxy-cache path");
     }
 
     #[test]
