@@ -36,7 +36,10 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Upload flow (must be registered before the parameterized routes
         // so that literal segments match before `:name` captures them)
-        .route("/:repo_key/api/packages/versions/new", post(new_upload_url))
+        // Spec: the "get upload URL" step is an HTTP GET, not POST. The Dart
+        // SDK issues `GET /api/packages/versions/new`; serving it as POST made
+        // the SDK receive 405 and abort with "Invalid server response" (#1997).
+        .route("/:repo_key/api/packages/versions/new", get(new_upload_url))
         .route(
             "/:repo_key/api/packages/versions/newUpload",
             post(upload_package),
@@ -540,11 +543,14 @@ async fn upload_package(
         pkg_name, pkg_version, filename, repo_key
     );
 
-    // Redirect to finalize endpoint per the Pub spec
+    // Per the Pub spec the upload POST must respond `204 No Content` with a
+    // `Location` header pointing at the finalize endpoint. The Dart SDK sets
+    // `followRedirects = false` and reads `Location` manually; a 3xx redirect
+    // is treated as an unexpected response and the publish aborts (#1997).
     let finish_url = format!("/pub/{}/api/packages/versions/newUploadFinish", repo_key);
 
     Ok(Response::builder()
-        .status(StatusCode::FOUND)
+        .status(StatusCode::NO_CONTENT)
         .header("Location", finish_url)
         .body(Body::empty())
         .unwrap())
@@ -726,6 +732,122 @@ mod db_cov_tests {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
+        fx.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod publish_protocol_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// Build a minimal, valid Pub package archive (a gzipped tar containing a
+    /// `pubspec.yaml` with the given name/version).
+    fn pub_archive(name: &str, version: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let pubspec = format!("name: {}\nversion: {}\n", name, version);
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("pubspec.yaml").unwrap();
+        header.set_size(pubspec.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append(&header, pubspec.as_bytes())
+            .expect("append pubspec");
+        let tar_bytes = tar_builder.into_inner().expect("finish tar");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// Encode a single-field (`file`) multipart/form-data body and return the
+    /// `(content_type, body)` pair for the request builder.
+    fn multipart_file(archive: &[u8]) -> (String, bytes::Bytes) {
+        let boundary = "ak1997boundary";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"pkg.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(archive);
+        body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+        (
+            format!("multipart/form-data; boundary={}", boundary),
+            bytes::Bytes::from(body),
+        )
+    }
+
+    // #1997 (DEV-1): the "get upload URL" step MUST be served on HTTP GET.
+    // Serving it as POST made the Dart SDK receive 405 and abort with
+    // "Invalid server response". After the fix a GET returns 200 with the
+    // `{url, fields}` envelope, and a POST to the same path is 405.
+    #[tokio::test]
+    async fn test_new_upload_url_is_get_not_post() {
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let uri = format!("/{}/api/packages/versions/new", fx.repo_key);
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+        assert_eq!(status, StatusCode::OK, "GET .../versions/new must be 200");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            json.get("url").is_some(),
+            "response must carry an upload url"
+        );
+        assert!(json.get("fields").is_some(), "response must carry fields");
+
+        // The old POST route must no longer exist.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::post(uri, "application/json", bytes::Bytes::new())).await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST .../versions/new must be 405 after the GET fix"
+        );
+        fx.teardown().await;
+    }
+
+    // #1997 (DEV-2): the multipart upload POST MUST answer 204 No Content with
+    // a `Location` header. The Dart SDK sets followRedirects=false and reads
+    // Location manually; a 3xx made it treat the response as unexpected. Drive
+    // the full handshake and assert 204 + Location, then that the finalize
+    // endpoint returns the success envelope.
+    #[tokio::test]
+    async fn test_upload_returns_204_with_location() {
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let archive = pub_archive("ak_test_pkg", "1.2.3");
+        let (ct, body) = multipart_file(&archive);
+
+        let upload_uri = format!("/{}/api/packages/versions/newUpload", fx.repo_key);
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::post(upload_uri, &ct, body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "upload POST must be 204 No Content per the Pub spec (not a redirect)"
+        );
+
+        // Finalize step returns the spec's success envelope.
+        let finish_uri = format!("/{}/api/packages/versions/newUploadFinish", fx.repo_key);
+        let app = fx.router_with_auth(super::router());
+        let (status, fbody) = tdh::send(app, tdh::get(finish_uri)).await;
+        assert_eq!(status, StatusCode::OK, "finalize must be 200");
+        let json: serde_json::Value = serde_json::from_slice(&fbody).expect("json body");
+        assert!(
+            json.get("success").and_then(|s| s.get("message")).is_some(),
+            "finalize must return {{\"success\": {{\"message\": ...}}}}"
+        );
         fx.teardown().await;
     }
 }

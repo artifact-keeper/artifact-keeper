@@ -819,14 +819,25 @@ async fn download(
 
     // 3. Check if this is a checksum request for a stored file
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
-        // First try to find a stored checksum file
-        let checksum_storage_key = format!("maven/{}", path);
-        if let Ok(content) = storage.get(&checksum_storage_key).await {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(content))
-                .unwrap());
+        // The `maven/` storage prefix is reserved for Hosted/Staging repos —
+        // only the PUT handler ever writes there. Remote proxy repos serve
+        // cached content exclusively from `proxy-cache/`, and Virtual repos
+        // resolve through their members, so probing `maven/{path}` for them
+        // always misses and needlessly touches the reserved prefix (#1547).
+        // Restrict the stored-sidecar lookup to repo types that can own objects
+        // under `maven/`. (The SNAPSHOT branch below is inherently hosted-only:
+        // `resolve_snapshot_artifact` reads the `artifacts` table, which never
+        // has rows for Remote/Virtual repos, so it short-circuits for them.)
+        if checksum_compute_eligible(&repo.repo_type) {
+            // First try to find a stored checksum file
+            let checksum_storage_key = format!("maven/{}", path);
+            if let Ok(content) = storage.get(&checksum_storage_key).await {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(content))
+                    .unwrap());
+            }
         }
 
         // If this is a SNAPSHOT path, try the stored checksum under the
@@ -4102,6 +4113,75 @@ mod remote_skip_tests {
         let (status, body) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, alias))).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(&body[..], b"snap-bytes");
+        fx.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod maven_prefix_reserved_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // #1547 (regression, hosted path preserved): a Hosted repo may still serve
+    // a checksum sidecar stored under the reserved `maven/` prefix. PUT a
+    // `.sha1` sidecar (which the upload handler stores at `maven/{path}`), then
+    // GET it and assert the stored bytes are returned. This exercises the
+    // eligibility-gated stored-sidecar lookup in `download`.
+    #[tokio::test]
+    async fn test_hosted_serves_stored_maven_checksum_sidecar() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let path = "com/example/lib/1.0/lib-1.0.jar.sha1";
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::put(
+                format!("/{}/{}", fx.repo_key, path),
+                bytes::Bytes::from(sha1),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "sidecar PUT stored"
+        );
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], sha1.as_bytes());
+        // The reserved prefix is legitimately populated for a Hosted repo.
+        assert!(
+            fx.storage_dir.join("maven").exists(),
+            "hosted checksum sidecar must live under the maven/ prefix"
+        );
+        fx.teardown().await;
+    }
+
+    // #1547 (fix): a Remote proxy repo must NOT touch the reserved `maven/`
+    // prefix when a Maven/Gradle client probes for a checksum sidecar. With no
+    // proxy service configured the request 404s, and crucially no `maven/`
+    // directory hierarchy is materialised — proxy content belongs under
+    // `proxy-cache/`, never `maven/`.
+    #[tokio::test]
+    async fn test_remote_checksum_probe_leaves_maven_prefix_untouched() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let path = "com/example/lib/1.0/lib-1.0.jar.sha1";
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "remote repo has no proxy service; checksum request must not succeed"
+        );
+        assert!(
+            !fx.storage_dir.join("maven").exists(),
+            "remote proxy checksum probe must not create anything under maven/ (#1547)"
+        );
         fx.teardown().await;
     }
 }
