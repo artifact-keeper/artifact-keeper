@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.version, a.checksum_sha256\n        FROM artifacts a\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND LOWER(a.name) = LOWER($2)\n        ORDER BY a.created_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "28c768e68a4087924dc66987aebbdd181986d67d917fc68e2a10d1a2519eed13"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET last_login_at = CASE\n                    WHEN last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes'\n                    THEN NOW()\n                    ELSE last_login_at\n                END,\n                failed_login_attempts = 0,\n                locked_until = NULL,\n                last_failed_login_at = NULL\n            WHERE id = $1\n              AND (\n                last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes'\n                OR failed_login_attempts > 0\n                OR locked_until IS NOT NULL\n                OR last_failed_login_at IS NOT NULL\n              )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0273efe9dd91e8d408206e2caa5bfff8073e0a3e4519ba268cfd070533e1d91f"
+}

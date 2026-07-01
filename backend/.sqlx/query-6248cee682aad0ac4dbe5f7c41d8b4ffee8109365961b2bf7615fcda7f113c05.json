@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE transfer_chunks\n            SET status = 'pending', source_peer_id = NULL\n            WHERE session_id = $1 AND chunk_index = $2 AND status = 'failed'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6248cee682aad0ac4dbe5f7c41d8b4ffee8109365961b2bf7615fcda7f113c05"
+}

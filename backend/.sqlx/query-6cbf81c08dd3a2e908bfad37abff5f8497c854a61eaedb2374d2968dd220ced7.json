@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT am.metadata->>'revision' as \"revision?\",\n               MAX(a.created_at) as \"created_at!\"\n        FROM artifacts a\n        JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND am.format = 'conan'\n          AND a.name = $2\n          AND a.version = $3\n          AND am.metadata->>'user' = $4\n          AND am.metadata->>'channel' = $5\n          AND am.metadata->>'revision' IS NOT NULL\n        GROUP BY am.metadata->>'revision'\n        ORDER BY \"created_at!\" DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revision?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "6cbf81c08dd3a2e908bfad37abff5f8497c854a61eaedb2374d2968dd220ced7"
+}

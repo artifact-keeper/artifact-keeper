@@ -951,15 +951,28 @@ impl AuthService {
             ));
         }
 
-        // Successful login: reset lockout counters and record last login
+        // Successful login: reset lockout counters and record last login.
+        // The write is skipped entirely when the row is already clean (no pending lockout
+        // counters) and last_login_at was updated within the last 5 minutes, avoiding
+        // unnecessary WAL writes on every package-manager re-authentication.
         sqlx::query!(
             r#"
             UPDATE users
-            SET last_login_at = NOW(),
+            SET last_login_at = CASE
+                    WHEN last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes'
+                    THEN NOW()
+                    ELSE last_login_at
+                END,
                 failed_login_attempts = 0,
                 locked_until = NULL,
                 last_failed_login_at = NULL
             WHERE id = $1
+              AND (
+                last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes'
+                OR failed_login_attempts > 0
+                OR locked_until IS NOT NULL
+                OR last_failed_login_at IS NOT NULL
+              )
             "#,
             user.id
         )
@@ -1867,9 +1880,9 @@ impl AuthService {
             ));
         }
 
-        // Update last login
+        // Update last login (throttled to at most one write every 5 minutes)
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)
@@ -1892,9 +1905,9 @@ impl AuthService {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
-        // Update last login
+        // Update last login (throttled to at most one write every 5 minutes)
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)

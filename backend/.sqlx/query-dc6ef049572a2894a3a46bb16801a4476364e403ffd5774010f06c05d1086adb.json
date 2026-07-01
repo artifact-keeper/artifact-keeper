@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE peer_repo_subscriptions\n            SET replication_mode = $3\n            WHERE peer_instance_id = $1 AND repository_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        {
+          "Custom": {
+            "name": "replication_mode",
+            "kind": {
+              "Enum": [
+                "push",
+                "pull",
+                "mirror",
+                "none"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dc6ef049572a2894a3a46bb16801a4476364e403ffd5774010f06c05d1086adb"
+}

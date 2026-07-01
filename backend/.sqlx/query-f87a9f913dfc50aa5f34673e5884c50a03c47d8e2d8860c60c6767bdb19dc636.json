@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE peer_instances\n                SET status = $2, last_sync_at = NOW(), updated_at = NOW()\n                WHERE id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "instance_status",
+            "kind": {
+              "Enum": [
+                "online",
+                "offline",
+                "syncing",
+                "degraded"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f87a9f913dfc50aa5f34673e5884c50a03c47d8e2d8860c60c6767bdb19dc636"
+}

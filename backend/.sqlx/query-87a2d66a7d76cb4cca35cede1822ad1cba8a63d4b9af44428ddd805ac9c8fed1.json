@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                st.id, st.peer_instance_id, st.artifact_id,\n                st.status as \"status: SyncStatus\",\n                st.priority, st.bytes_transferred, st.error_message,\n                st.started_at, st.completed_at, st.created_at,\n                a.storage_key, a.size_bytes as artifact_size\n            FROM sync_tasks st\n            JOIN artifacts a ON a.id = st.artifact_id\n            WHERE st.peer_instance_id = $1\n              AND st.status = 'pending'\n            ORDER BY st.priority DESC, st.created_at\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "peer_instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "status: SyncStatus",
+        "type_info": {
+          "Custom": {
+            "name": "sync_status",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "completed",
+                "failed",
+                "cancelled"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "priority",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "bytes_transferred",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "storage_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "artifact_size",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "87a2d66a7d76cb4cca35cede1822ad1cba8a63d4b9af44428ddd805ac9c8fed1"
+}

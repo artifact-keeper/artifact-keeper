@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE transfer_chunks\n            SET status = 'completed', checksum = $3, source_peer_id = $4,\n                downloaded_at = NOW(), attempts = attempts + 1\n            WHERE session_id = $1 AND chunk_index = $2 AND status != 'completed'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d15467732d290257e1b8e07e72d4bc5b245f8fa989370376367ab55e3f498ee2"
+}

@@ -1,0 +1,127 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "findings_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "info_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "scanner_version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ed379d747d009b0b496a3002cf1b10f97fc2838334e06e029e3ed6edbbf80dc2"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.created_at\n        FROM artifacts a\n        WHERE a.repository_id = $1\n          AND a.name = $2\n          AND a.version = $3\n          AND a.is_deleted = false\n        ORDER BY a.created_at ASC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "620837856882f303c882e52e1b2f1d9f218f5b2bb088425370bbc3626002a2ff"
+}

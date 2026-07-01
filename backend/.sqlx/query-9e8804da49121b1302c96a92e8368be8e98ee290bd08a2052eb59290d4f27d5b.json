@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                ca.peer_instance_id,\n                ca.available_chunks,\n                ca.total_chunks,\n                ca.chunk_bitmap\n            FROM chunk_availability ca\n            JOIN peer_instances pi ON pi.id = ca.peer_instance_id\n            WHERE ca.artifact_id = $1\n              AND ca.peer_instance_id != $2\n              AND ca.available_chunks > 0\n              AND pi.status IN ('online', 'syncing')\n            ORDER BY ca.available_chunks DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "peer_instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "available_chunks",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_chunks",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "chunk_bitmap",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9e8804da49121b1302c96a92e8368be8e98ee290bd08a2052eb59290d4f27d5b"
+}

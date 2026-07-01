@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT peer_instance_id, artifact_id, chunk_bitmap, total_chunks, available_chunks\n        FROM chunk_availability\n        WHERE peer_instance_id = $1 AND artifact_id = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "peer_instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "chunk_bitmap",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_chunks",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "available_chunks",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "43b8412d5cfdc55c8cbfe7dce7d811ebcde65ca05805be450dd88efb384fc98b"
+}

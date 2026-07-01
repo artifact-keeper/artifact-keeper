@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO promotion_history (\n                id, artifact_id, source_repo_id, target_repo_id,\n                promoted_by, policy_result, notes\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d50ad8ef23948188712a3c780dd2c338f92fa8de7947a3173d1bedf0a0d0804f"
+}

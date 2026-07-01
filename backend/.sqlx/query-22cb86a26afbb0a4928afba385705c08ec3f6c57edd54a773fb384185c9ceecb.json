@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE refresh_token_jti\n                    SET consumed_at = NOW()\n                    WHERE jti = $1 AND consumed_at IS NULL\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "22cb86a26afbb0a4928afba385705c08ec3f6c57edd54a773fb384185c9ceecb"
+}

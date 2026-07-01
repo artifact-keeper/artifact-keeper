@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                prs.repository_id as repo_id,\n                prs.replication_schedule as schedule,\n                prs.last_replicated_at\n            FROM peer_repo_subscriptions prs\n            JOIN repositories r ON r.id = prs.repository_id\n            WHERE prs.peer_instance_id = $1\n              AND prs.sync_enabled = true\n              AND prs.replication_mode = 'mirror'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "schedule",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "last_replicated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "201f9d338d4a5147e0260dca32c154acb9b5a28e1b68283fbb3c4fcf8e8f5f7f"
+}

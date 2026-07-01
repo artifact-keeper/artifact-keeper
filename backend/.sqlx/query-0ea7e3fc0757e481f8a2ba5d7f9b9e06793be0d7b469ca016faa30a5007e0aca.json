@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id, source_peer_id, target_peer_id,\n                status as \"status: PeerStatus\",\n                latency_ms, bandwidth_estimate_bps,\n                shared_artifacts_count, shared_chunks_count,\n                last_probed_at, last_transfer_at,\n                bytes_transferred_total, transfer_success_count, transfer_failure_count,\n                created_at, updated_at\n            FROM peer_connections\n            WHERE source_peer_id = $1\n              AND ($2::peer_status IS NULL OR status = $2)\n            ORDER BY latency_ms ASC NULLS LAST\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_peer_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "target_peer_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "status: PeerStatus",
+        "type_info": {
+          "Custom": {
+            "name": "peer_status",
+            "kind": {
+              "Enum": [
+                "active",
+                "probing",
+                "unreachable",
+                "disabled"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "latency_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "bandwidth_estimate_bps",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "shared_artifacts_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "shared_chunks_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_probed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "last_transfer_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "bytes_transferred_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "transfer_success_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "transfer_failure_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "peer_status",
+            "kind": {
+              "Enum": [
+                "active",
+                "probing",
+                "unreachable",
+                "disabled"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0ea7e3fc0757e481f8a2ba5d7f9b9e06793be0d7b469ca016faa30a5007e0aca"
+}

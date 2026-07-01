@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.display_name,\n                u.is_active,\n                COALESCE(t.cnt, 0) as \"token_count!: i64\",\n                u.created_at,\n                u.updated_at\n            FROM users u\n            LEFT JOIN (\n                SELECT user_id, COUNT(*) as cnt\n                FROM api_tokens\n                GROUP BY user_id\n            ) t ON t.user_id = u.id\n            WHERE u.is_service_account = true\n              AND ($1 OR u.is_active = true)\n            ORDER BY u.created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "token_count!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "ac7d61d787276eeb27d7f479c527435a850650cf0885ed67037f09100b74277e"
+}

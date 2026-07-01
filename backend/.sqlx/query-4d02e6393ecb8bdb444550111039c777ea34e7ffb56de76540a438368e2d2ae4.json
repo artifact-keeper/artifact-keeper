@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id FROM artifact_metadata\n        WHERE format = 'gitlfs_lock'\n          AND artifact_id = $1\n          AND metadata->>'path' = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4d02e6393ecb8bdb444550111039c777ea34e7ffb56de76540a438368e2d2ae4"
+}

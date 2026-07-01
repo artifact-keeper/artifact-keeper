@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO transfer_chunks\n                    (session_id, chunk_index, byte_offset, byte_length, checksum, status)\n                VALUES ($1, $2, $3, $4, '', 'pending')\n                ON CONFLICT (session_id, chunk_index) DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9f2aeefbe59fca7e6a021cd198078f7e6f4a3b235cfed6980ae41fee3ec051c4"
+}

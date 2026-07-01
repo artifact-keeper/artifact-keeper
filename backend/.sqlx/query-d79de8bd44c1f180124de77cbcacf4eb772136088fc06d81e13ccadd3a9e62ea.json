@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT handler_type as \"handler_type: FormatHandlerType\" FROM format_handlers WHERE format_key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "handler_type: FormatHandlerType",
+        "type_info": {
+          "Custom": {
+            "name": "format_handler_type",
+            "kind": {
+              "Enum": [
+                "core",
+                "wasm"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d79de8bd44c1f180124de77cbcacf4eb772136088fc06d81e13ccadd3a9e62ea"
+}

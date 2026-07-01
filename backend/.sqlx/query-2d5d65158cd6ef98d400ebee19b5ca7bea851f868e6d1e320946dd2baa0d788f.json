@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT sk.* FROM signing_keys sk\n            JOIN repository_signing_config rsc ON rsc.signing_key_id = sk.id\n            WHERE rsc.repository_id = $1 AND sk.is_active = true AND rsc.sign_metadata = true\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "key_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "fingerprint",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "key_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "public_key_pem",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "private_key_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 8,
+        "name": "algorithm",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "uid_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "uid_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 15,
+        "name": "rotated_from",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "last_used_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "2d5d65158cd6ef98d400ebee19b5ca7bea851f868e6d1e320946dd2baa0d788f"
+}

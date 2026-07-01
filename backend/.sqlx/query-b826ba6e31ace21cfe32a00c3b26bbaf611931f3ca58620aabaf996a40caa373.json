@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM format_handlers WHERE format_key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b826ba6e31ace21cfe32a00c3b26bbaf611931f3ca58620aabaf996a40caa373"
+}

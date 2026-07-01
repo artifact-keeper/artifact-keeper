@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "13b4fe8c9ab0eb9ce9b70b6706a97d7b4300afd4d0412d56b2135cc9e43a40ab"
+}

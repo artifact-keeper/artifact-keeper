@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT a.name,\n               MAX(a.version) as \"max_version?\",\n               MAX(am.metadata::text) as \"metadata_text?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')\n        GROUP BY a.name\n        ORDER BY a.name\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_version?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "metadata_text?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "f301c2a38f0dc7123cf6863b298b2d6fb1c502054fd032f566e96e1a284c7c0d"
+}

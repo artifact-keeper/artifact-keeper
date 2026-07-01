@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO repository_signing_config\n                (repository_id, signing_key_id, sign_metadata, sign_packages, require_signatures, updated_at)\n            VALUES ($1, $2, $3, $4, $5, NOW())\n            ON CONFLICT (repository_id) DO UPDATE SET\n                signing_key_id = $2,\n                sign_metadata = $3,\n                sign_packages = $4,\n                require_signatures = $5,\n                updated_at = NOW()\n            RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "signing_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "sign_metadata",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "sign_packages",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "require_signatures",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "375122517d1a943fabe4bc0555b1fea0fddfad602e776e0af9a05ae77e4c07ff"
+}

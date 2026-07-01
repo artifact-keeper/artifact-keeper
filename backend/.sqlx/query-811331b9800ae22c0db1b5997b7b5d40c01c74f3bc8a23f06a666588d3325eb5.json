@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id as \"row_id!\", metadata\n        FROM artifact_metadata\n        WHERE format = 'gitlfs_lock'\n          AND artifact_id = $1\n          AND metadata->>'lock_id' = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "row_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "811331b9800ae22c0db1b5997b7b5d40c01c74f3bc8a23f06a666588d3325eb5"
+}

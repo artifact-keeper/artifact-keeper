@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE transfer_sessions\n            SET completed_chunks = (\n                SELECT COUNT(*) FROM transfer_chunks\n                WHERE session_id = $1 AND status = 'completed'\n            ),\n            started_at = COALESCE(started_at, NOW())\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1d5b627432768d8ed73d2beb6fdbfd9fde2e8ace85853279fcb7c008d9330c6c"
+}
