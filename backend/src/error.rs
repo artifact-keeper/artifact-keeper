@@ -118,6 +118,26 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// True when this error is a SQLx connection-pool acquire timeout, in
+    /// either its typed (`Sqlx(PoolTimedOut)`) or stringified
+    /// (`Database("pool timed out …")`) form.
+    ///
+    /// This is the single source of truth for the POOL_EXHAUSTED -> 503
+    /// classification (#1437 / #2101 / #2102): `status_and_code` and
+    /// `user_message` consult it below, and callers outside this module reuse
+    /// it instead of re-deriving the variant/string check. In particular the
+    /// auth pre-check (`api::middleware::auth`) uses it to reclassify a
+    /// pool-acquire timeout during its own DB lookup as a retryable 503 rather
+    /// than flattening it to a misleading 401 (#2125). A pool timeout is a
+    /// transient capacity problem, never a bad credential.
+    pub(crate) fn is_pool_timeout(&self) -> bool {
+        match self {
+            Self::Sqlx(sqlx::Error::PoolTimedOut) => true,
+            Self::Database(msg) => is_pool_timeout(msg),
+            _ => false,
+        }
+    }
+
     /// Map error variant to HTTP status code and machine-readable error code.
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
@@ -128,12 +148,7 @@ impl AppError {
             // alerts and makes saturation look like a fault; 503 +
             // Retry-After lets clients back off and retry on the same
             // path. See #1437 / #1442.
-            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
-            }
-            Self::Database(msg) if is_pool_timeout(msg) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
-            }
+            e if e.is_pool_timeout() => (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED"),
             Self::Database(_) | Self::Sqlx(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
             }
@@ -179,10 +194,7 @@ impl AppError {
     fn user_message(&self) -> String {
         match self {
             // Server-side errors: return generic messages (details are logged)
-            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
-                "Database connection pool is saturated, retry shortly".to_string()
-            }
-            Self::Database(msg) if is_pool_timeout(msg) => {
+            e if e.is_pool_timeout() => {
                 "Database connection pool is saturated, retry shortly".to_string()
             }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
@@ -261,6 +273,23 @@ mod tests {
     // hid pool exhaustion behind alert fatigue and made saturated stress
     // tests look like backend bugs instead of capacity-shed events.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_pool_timeout_predicate_matches_typed_and_stringified() {
+        // Typed variant.
+        assert!(AppError::Sqlx(sqlx::Error::PoolTimedOut).is_pool_timeout());
+        // Stringified form the hot path (and the auth layer's
+        // `map_err(|e| AppError::Database(e.to_string()))`) produces.
+        assert!(AppError::Database(sqlx::Error::PoolTimedOut.to_string()).is_pool_timeout());
+        // Genuine non-pool errors must NOT be classified as pool timeouts, so
+        // real DB faults and bad credentials keep their existing status codes.
+        assert!(!AppError::Sqlx(sqlx::Error::RowNotFound).is_pool_timeout());
+        assert!(!AppError::Database("connection refused".to_string()).is_pool_timeout());
+        assert!(
+            !AppError::Authentication("Invalid username or password".to_string()).is_pool_timeout()
+        );
+        assert!(!AppError::Unauthorized("Token has been revoked".to_string()).is_pool_timeout());
+    }
 
     #[test]
     fn test_sqlx_pool_timed_out_maps_to_503() {

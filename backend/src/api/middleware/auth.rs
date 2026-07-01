@@ -299,7 +299,14 @@ pub async fn require_auth_with_bearer_fallback(
     let (user, _) = auth_service
         .authenticate(&username, &password)
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            // A pool-acquire timeout during the credential DB lookup is a
+            // transient capacity problem (POOL_EXHAUSTED), not a bad password:
+            // surface a retryable 503 rather than flattening it to a spurious
+            // 401 (#2125). Any genuine failure keeps the existing 401.
+            if e.is_pool_timeout() {
+                return service_unavailable_response();
+            }
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
@@ -537,6 +544,14 @@ pub async fn auth_middleware(
                         )
                             .into_response();
                     }
+                    // A pool-acquire timeout during the credential DB lookup is
+                    // a transient capacity problem (POOL_EXHAUSTED), not "wrong
+                    // password": surface the same retryable 503 the #2101/#2102
+                    // handlers return rather than flattening it to a spurious
+                    // 401 (#2125). Clients retry on 503 but abort on 401.
+                    Err(ref e) if e.is_pool_timeout() => {
+                        return service_unavailable_response();
+                    }
                     Err(_) => Err("Invalid credentials"),
                 }
             }
@@ -662,6 +677,13 @@ enum TokenAuthError {
 fn classify_token_validation_err(err: AppError) -> TokenAuthError {
     match err {
         AppError::ServiceUnavailable(_) => TokenAuthError::Overloaded,
+        // A pool-acquire timeout during the token's DB lookup is a transient
+        // capacity problem, not a bad token: surface it as a retryable 503
+        // (POOL_EXHAUSTED) exactly like the #2101/#2102 handler path instead of
+        // flattening it to a spurious 401 (#2125). Reuses the shared
+        // `AppError::is_pool_timeout` predicate so the classification stays
+        // consistent all the way up the stack.
+        ref e if e.is_pool_timeout() => TokenAuthError::Overloaded,
         _ => TokenAuthError::Invalid,
     }
 }
@@ -819,6 +841,12 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // while a single curl -u upload with the same credentials
                 // succeeds. See `AuthOutcome::Overloaded`.
                 Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
+                // A pool-acquire timeout is a retryable 503, never a 401.
+                // Short-circuit here so a saturated pool does not pay a second
+                // acquire-timeout on the API-token fallback below before the
+                // classifier reaches the same conclusion (#2125). See
+                // `AuthOutcome::Overloaded`.
+                Err(ref e) if e.is_pool_timeout() => return AuthOutcome::Overloaded,
                 Err(_) => {}
             }
             // Fall back to treating the password as an API token — compatible with
@@ -1166,6 +1194,11 @@ pub async fn admin_middleware(
             };
             match auth_service.authenticate(&username, &password).await {
                 Ok((user, _token_pair)) => AuthExtension::from(user),
+                // A pool-acquire timeout during the credential DB lookup is a
+                // transient capacity problem (POOL_EXHAUSTED), not a bad
+                // password: surface a retryable 503 rather than flattening it
+                // to a spurious 401 (#2125).
+                Err(ref e) if e.is_pool_timeout() => return service_unavailable_response(),
                 Err(_) => {
                     return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
                 }
@@ -3365,6 +3398,22 @@ mod tests {
         app.oneshot(request).await.unwrap()
     }
 
+    async fn run_through_admin_middleware(
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let auth_service = make_test_auth_service();
+        let app: Router = Router::new()
+            .route("/probe", any(|| async { (StatusCode::OK, "admin-ok") }))
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                admin_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
     fn empty_get(uri: &str) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method(Method::GET)
@@ -3411,13 +3460,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_middleware_rejects_bearer_with_unverifiable_token() {
-        // The Bearer branch first tries JWT decode (fails), then API token
-        // validation (fails because the lazy pool is unreachable). Both fall
-        // through to the "Invalid or expired token" 401.
+        // The Bearer branch first tries JWT decode (fails), then API-token
+        // validation. A token shorter than the 8-char prefix is rejected by
+        // `validate_api_token` BEFORE any DB lookup, so this isolates the
+        // genuine-invalid -> 401 path from the pool-timeout -> 503 path (the
+        // latter is covered by the dedicated #2125 tests). Both validators
+        // fail and fall through to the "Invalid or expired token" 401.
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
-            .header("Authorization", "Bearer not-a-real-jwt")
+            .header("Authorization", "Bearer badtok")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_auth_middleware(req).await;
@@ -3434,10 +3486,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_middleware_rejects_apikey_scheme_with_bad_token() {
+        // A token shorter than the 8-char prefix is rejected before any DB
+        // lookup, isolating the genuine-invalid -> 401 path from the
+        // pool-timeout -> 503 path (covered separately, #2125).
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
-            .header("Authorization", "ApiKey deadbeef")
+            .header("Authorization", "ApiKey badtok")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_auth_middleware(req).await;
@@ -3475,9 +3530,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_middleware_rejects_basic_with_unauthenticatable_user() {
-        // Valid base64 with `user:pass` shape, but the lazy pool means
-        // `authenticate` errors out, so the branch returns "Invalid credentials".
+    async fn test_auth_middleware_basic_pool_timeout_returns_503() {
+        // #2125: valid base64 with `user:pass` shape. The unreachable lazy pool
+        // makes `authenticate`'s credential lookup fail with a pool-acquire
+        // timeout. That is a transient capacity problem (POOL_EXHAUSTED), not a
+        // bad password, so the Basic branch must surface a retryable 503, NOT
+        // flatten it to a spurious 401 the way it did before this fix. (A
+        // genuinely wrong password against a reachable DB still returns 401;
+        // that path needs a real pool and is exercised by the integration
+        // suite.)
         let creds = base64::engine::general_purpose::STANDARD.encode("alice:wrong");
         let req = axum::http::Request::builder()
             .method(Method::GET)
@@ -3486,15 +3547,51 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_auth_middleware(req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(
-            text.contains("Invalid credentials"),
-            "expected invalid-credentials message, got: {text}"
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "pool-timeout 503 must carry a Retry-After hint so clients back off"
         );
+    }
+
+    #[tokio::test]
+    async fn test_admin_middleware_basic_pool_timeout_returns_503() {
+        // #2125: the admin gate's Basic branch runs a bcrypt credential lookup.
+        // When that lookup cannot acquire a DB connection (pool-acquire
+        // timeout), the transient capacity problem must surface as a retryable
+        // 503, not be flattened to the "Invalid credentials" 401.
+        let creds = base64::engine::general_purpose::STANDARD.encode("root:hunter2");
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Basic {}", creds))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_admin_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_require_auth_with_bearer_fallback_pool_timeout_returns_503() {
+        // #2125: the bearer-as-basic fallback used by download/read handlers
+        // also runs a credential DB lookup. A pool-acquire timeout there must
+        // become a retryable 503, not the "Invalid credentials" 401 it returned
+        // before this fix.
+        let token = base64::engine::general_purpose::STANDARD.encode("carol:pw");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let db = lazy_pool();
+        let config = crate::config::Config::default();
+        let result =
+            require_auth_with_bearer_fallback(None, &headers, &db, &config, "test-realm").await;
+        let resp = result.expect_err("unreachable pool must fail authentication");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -3521,10 +3618,13 @@ mod tests {
         // `?ticket=` query must NOT switch the response to the ticket-specific
         // message: otherwise an attacker could discover whether their bearer
         // token landed in the JWT or API-token bucket. Keep the header-error.
+        // The Bearer is rejected before any DB lookup (shorter than the 8-char
+        // prefix) so the header failure is a genuine invalid-token 401, not a
+        // pool-timeout 503 (#2125).
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe?ticket=xyz")
-            .header("Authorization", "Bearer not-a-real-jwt")
+            .header("Authorization", "Bearer badtok")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_auth_middleware(req).await;
@@ -3700,6 +3800,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_classify_token_validation_err_pool_timeout_is_overloaded() {
+        // #2125: a pool-acquire timeout during the token's DB lookup is a
+        // transient capacity problem, not a bad token. It must classify as
+        // Overloaded (retryable 503 / POOL_EXHAUSTED) so every token call site
+        // stops flattening pool exhaustion to a spurious 401. Both the typed
+        // variant and the stringified form the auth layer actually produces
+        // (`map_err(|e| AppError::Database(e.to_string()))`) must be covered.
+        assert_eq!(
+            classify_token_validation_err(AppError::Sqlx(sqlx::Error::PoolTimedOut)),
+            TokenAuthError::Overloaded
+        );
+        assert_eq!(
+            classify_token_validation_err(AppError::Database(
+                sqlx::Error::PoolTimedOut.to_string()
+            )),
+            TokenAuthError::Overloaded
+        );
+    }
+
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_invalid_for_garbage_scheme() {
         let auth_service = make_test_auth_service();
@@ -3712,10 +3832,12 @@ mod tests {
         // Bearer that decodes as neither a JWT nor any valid API token must
         // be flagged as Invalid, NOT NoCredential. Pre-#1371 this distinction
         // did not exist and optional-auth routes silently downgraded to
-        // anonymous.
+        // anonymous. The token is shorter than the 8-char prefix so every
+        // validator rejects it BEFORE any DB lookup, isolating this
+        // genuine-invalid case from the pool-timeout -> Overloaded case (#2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("not-a-real-jwt")).await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok")).await;
         assert!(
             matches!(outcome, AuthOutcome::InvalidCredential),
             "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
@@ -3725,10 +3847,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_invalid_for_bad_api_key() {
+        // Shorter than the 8-char prefix, so `validate_api_token` rejects it
+        // before any DB lookup: a genuine-invalid ApiKey stays InvalidCredential
+        // (the pool-timeout -> Overloaded case is covered separately, #2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("not-a-real-token"))
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok")).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -3742,6 +3866,25 @@ mod tests {
             try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic("not-base64-at-all"))
                 .await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_basic_pool_timeout_is_overloaded() {
+        // #2125: well-formed `user:password` Basic credentials whose bcrypt
+        // credential lookup cannot acquire a DB connection (the unreachable
+        // lazy pool times out) must resolve to `Overloaded`, so the optional /
+        // anonymous auth pre-check surfaces a retryable 503 instead of
+        // flattening pool exhaustion to a 401 (or anonymous) that hides a
+        // deactivation. A genuine bad credential still resolves to
+        // `InvalidCredential` (see the tests above).
+        let creds = base64::engine::general_purpose::STANDARD.encode("alice:secret");
+        let auth_service = make_test_auth_service();
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds)).await;
+        assert!(
+            matches!(outcome, AuthOutcome::Overloaded),
+            "pool-timeout during Basic auth pre-check must be Overloaded, got: {:?}",
+            outcome
+        );
     }
 
     #[test]
@@ -3778,11 +3921,13 @@ mod tests {
         // 200 (with public-only data on real endpoints). That masked the
         // post-deactivation cache rejection from /api/v1/repositories. The
         // ticket fallback also fails here (lazy pool, invalid ticket), so the
-        // outcome must be 401, not 200.
+        // outcome must be 401, not 200. The Bearer is rejected before any DB
+        // lookup (shorter than the 8-char prefix), so this is a genuine-invalid
+        // 401, not a pool-timeout 503 (#2125).
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe?ticket=xyz")
-            .header("Authorization", "Bearer not-a-real-jwt")
+            .header("Authorization", "Bearer badtok")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
@@ -3809,6 +3954,35 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "explicit invalid Authorization scheme must produce 401 (issue #1371)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optional_auth_middleware_pool_timeout_returns_503_not_401() {
+        // #2125: the optional / anonymous auth pre-check runs its own DB lookup
+        // BEFORE the request reaches the #2101/#2102 503-mappers. A Bearer whose
+        // API-token validation cannot acquire a DB connection (unreachable lazy
+        // pool -> pool-acquire timeout) must surface a retryable 503, not get
+        // flattened to a spurious 401. The token is >= the 8-char prefix so it
+        // actually reaches the timing-out DB lookup. No `?ticket=` here so the
+        // Overloaded outcome is not rescued by the ticket fallback.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "Bearer deadbeefdead")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_optional_auth(req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pool-timeout during the anonymous pre-check must be 503, not 401"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
         );
     }
 
