@@ -339,6 +339,14 @@ pub struct Config {
     /// recovery mechanism when SSO is misconfigured.
     pub allow_local_admin_login: bool,
 
+    /// Opt-in strict SSO enforcement (#2018). When true, the verified-admin
+    /// break-glass local login (issue #443) is disabled too, so a deployment
+    /// that wants "SSO-only, no exceptions" locks out *all* local logins —
+    /// including admin — while any SSO provider is enabled. Defaults to
+    /// `false`, preserving the historical break-glass behaviour so existing
+    /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
+    pub sso_disable_admin_break_glass: bool,
+
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
     /// When set, a second TCP listener is started on this port serving only
@@ -621,6 +629,7 @@ redacted_debug!(Config {
     show stuck_scan_reap_limit,
     show max_upload_size_bytes,
     show allow_local_admin_login,
+    show sso_disable_admin_break_glass,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -715,6 +724,7 @@ impl Default for Config {
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            sso_disable_admin_break_glass: false,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -893,6 +903,10 @@ impl Config {
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
+                Ok("true" | "1")
+            ),
+            sso_disable_admin_break_glass: matches!(
+                env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
             ),
             metrics_port: match env::var("METRICS_PORT") {
@@ -2127,6 +2141,41 @@ mod tests {
         } else {
             env::remove_var("ALLOW_LOCAL_ADMIN_LOGIN");
         }
+    }
+
+    #[test]
+    fn test_config_sso_disable_admin_break_glass() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is false: the admin break-glass stays enabled (#2018).
+        env::remove_var("SSO_DISABLE_ADMIN_BREAK_GLASS");
+        let config = Config::from_env().unwrap();
+        assert!(!config.sso_disable_admin_break_glass);
+
+        // "true" opts into strict SSO-only enforcement.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.sso_disable_admin_break_glass);
+
+        // "1" also opts in.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "1");
+        let config = Config::from_env().unwrap();
+        assert!(config.sso_disable_admin_break_glass);
+
+        // Any other value leaves the break-glass enabled.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.sso_disable_admin_break_glass);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
     }
 
     #[test]

@@ -171,24 +171,40 @@ enum LocalLoginGate {
 /// Evaluated AFTER `AuthService::authenticate` succeeds, so `user_is_admin`
 /// is a proven property of the caller, not a claim from the request. When any
 /// SSO provider is enabled (issue #213) non-admin local login stays disabled,
-/// but a verified admin always retains a break-glass recovery path so a
+/// but a verified admin retains a break-glass recovery path by default so a
 /// misconfigured SSO provider can be repaired in-band (issue #443). The
 /// legacy `ALLOW_LOCAL_ADMIN_LOGIN` flag (`allow_local_admin_login`) is kept
 /// as a back-compat input; it only ever applied to the admin account and must
 /// never broaden access for non-admin users.
+///
+/// A deployment that wants strict "SSO-only, no exceptions" enforcement can
+/// opt in via `SSO_DISABLE_ADMIN_BREAK_GLASS` (`disable_admin_break_glass`,
+/// #2018): when set, even the verified-admin break-glass is rejected while SSO
+/// is enabled. The flag defaults to `false`, so the historical break-glass
+/// behaviour is unchanged for existing deployments.
 fn local_login_gate(
     sso_enabled: bool,
     user_is_admin: bool,
     allow_local_admin_login: bool,
+    disable_admin_break_glass: bool,
 ) -> LocalLoginGate {
-    match (sso_enabled, user_is_admin, allow_local_admin_login) {
+    match (
+        sso_enabled,
+        user_is_admin,
+        allow_local_admin_login,
+        disable_admin_break_glass,
+    ) {
         // No SSO providers enabled: local login is unchanged for everyone.
-        (false, _, _) => LocalLoginGate::Allow,
-        // Verified-admin break-glass (supersedes the legacy flag, which only
-        // ever allowed the admin account).
-        (true, true, _) => LocalLoginGate::Allow,
-        // Non-admins must use SSO; the legacy flag never broadens them.
-        (true, false, _) => LocalLoginGate::RejectSso,
+        (false, _, _, _) => LocalLoginGate::Allow,
+        // Opt-in strict SSO-only (#2018): the admin break-glass is disabled,
+        // so even a verified admin must use SSO. This is the stricter posture
+        // and takes precedence over the legacy allow-local-admin flag.
+        (true, true, _, true) => LocalLoginGate::RejectSso,
+        // Verified-admin break-glass (default; supersedes the legacy flag,
+        // which only ever allowed the admin account).
+        (true, true, _, false) => LocalLoginGate::Allow,
+        // Non-admins must use SSO; neither flag ever broadens them.
+        (true, false, _, _) => LocalLoginGate::RejectSso,
     }
 }
 
@@ -211,6 +227,7 @@ async fn enforce_local_login_sso_policy(
         sso_enabled,
         user_is_admin,
         state.config.allow_local_admin_login,
+        state.config.sso_disable_admin_break_glass,
     ) {
         LocalLoginGate::Allow => Ok(sso_enabled),
         LocalLoginGate::RejectSso => {
@@ -824,32 +841,67 @@ mod tests {
 
     #[test]
     fn test_local_login_gate_no_sso_allows_everyone() {
-        assert_eq!(local_login_gate(false, true, false), LocalLoginGate::Allow);
-        assert_eq!(local_login_gate(false, false, false), LocalLoginGate::Allow);
-        assert_eq!(local_login_gate(false, true, true), LocalLoginGate::Allow);
-        assert_eq!(local_login_gate(false, false, true), LocalLoginGate::Allow);
+        // With no SSO, local login is allowed regardless of either flag,
+        // including the opt-in strict break-glass toggle (#2018).
+        for legacy in [false, true] {
+            for strict in [false, true] {
+                assert_eq!(
+                    local_login_gate(false, true, legacy, strict),
+                    LocalLoginGate::Allow
+                );
+                assert_eq!(
+                    local_login_gate(false, false, legacy, strict),
+                    LocalLoginGate::Allow
+                );
+            }
+        }
     }
 
     #[test]
     fn test_local_login_gate_sso_admin_break_glass_allowed() {
-        // Verified admin always retains a recovery path, with or without
-        // the legacy flag.
-        assert_eq!(local_login_gate(true, true, false), LocalLoginGate::Allow);
-        assert_eq!(local_login_gate(true, true, true), LocalLoginGate::Allow);
+        // Default (break-glass on): verified admin retains a recovery path,
+        // with or without the legacy flag.
+        assert_eq!(
+            local_login_gate(true, true, false, false),
+            LocalLoginGate::Allow
+        );
+        assert_eq!(
+            local_login_gate(true, true, true, false),
+            LocalLoginGate::Allow
+        );
     }
 
     #[test]
     fn test_local_login_gate_sso_non_admin_rejected() {
         assert_eq!(
-            local_login_gate(true, false, false),
+            local_login_gate(true, false, false, false),
             LocalLoginGate::RejectSso
         );
     }
 
     #[test]
     fn test_local_login_gate_legacy_flag_never_broadens_non_admins() {
+        // Neither the legacy allow-local-admin flag nor the strict toggle
+        // ever grants a non-admin a local login under SSO.
+        for strict in [false, true] {
+            assert_eq!(
+                local_login_gate(true, false, true, strict),
+                LocalLoginGate::RejectSso
+            );
+        }
+    }
+
+    #[test]
+    fn test_local_login_gate_strict_disables_admin_break_glass() {
+        // #2018 opt-in hardening: with SSO_DISABLE_ADMIN_BREAK_GLASS set, even
+        // a verified admin is rejected while SSO is enabled. The strict toggle
+        // takes precedence over the legacy allow-local-admin flag.
         assert_eq!(
-            local_login_gate(true, false, true),
+            local_login_gate(true, true, false, true),
+            LocalLoginGate::RejectSso
+        );
+        assert_eq!(
+            local_login_gate(true, true, true, true),
             LocalLoginGate::RejectSso
         );
     }

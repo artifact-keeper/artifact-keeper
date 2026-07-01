@@ -12232,6 +12232,9 @@ mod tests {
         // checksum + scan_type. The pre-existing completed row must not
         // be returned to the caller as the prepared id.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return; // skip cleanly when no DATABASE_URL
         };
@@ -12302,6 +12305,9 @@ mod tests {
         // `find_existing_scan_for_artifact` with the new dual-TTL
         // signature, exercising the else-branch added in #1469.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
@@ -12361,6 +12367,9 @@ mod tests {
         // produces an empty prepared vec regardless of bypass_dedup. This
         // hits the new signature on the no-artifact path.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };

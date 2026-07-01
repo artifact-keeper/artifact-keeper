@@ -3007,6 +3007,7 @@ mod tests {
                 stuck_scan_check_interval_secs: 600,
                 stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
+                sso_disable_admin_break_glass: false,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
                 database_max_connections: 20,

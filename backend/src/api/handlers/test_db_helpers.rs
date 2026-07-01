@@ -40,6 +40,59 @@ pub async fn try_pool() -> Option<PgPool> {
         .ok()
 }
 
+/// Advisory-lock key for [`scan_dedup_serial_lock`] (#2000).
+///
+/// A single-key `pg_advisory_lock(bigint)` — a lock space distinct from the
+/// two-key `pg_advisory_xact_lock(int4, int4)` used by
+/// `ScanResultService::prepare_scan_placeholder` and from the scheduler locks
+/// (9001-9099) documented in `scan_result_service`, so it cannot collide with
+/// application locks.
+const SCAN_DEDUP_TEST_LOCK_KEY: i64 = 0x5644_2000; // "SD" + issue #2000
+
+/// Cross-process serialization guard for the DB-backed scan-dedup tests
+/// (#2000). Holds a Postgres *session* advisory lock on a dedicated
+/// connection; the lock is released when the guard is dropped (its connection
+/// closes, ending the session), including on panic.
+///
+/// This exists because the `Code Coverage` CI job runs the suite under
+/// `cargo nextest`, which executes **each test in its own process**. An
+/// in-process `Mutex` (or the `serial_test` crate) therefore does NOT
+/// serialize tests across nextest processes. A database advisory lock does:
+/// every test process contends for the same key in the shared database, so
+/// only one scan-dedup test mutates `scan_results` at a time. That removes the
+/// cross-test interference that made
+/// `scanner_service::tests::test_prepare_artifact_scan_without_bypass_reuses_existing`
+/// intermittently fail under the coverage job's parallelism.
+pub struct ScanDedupSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide scan-dedup test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a scan-dedup DB test
+/// and bind the result for the whole test body.
+pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return ScanDedupSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return ScanDedupSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCAN_DEDUP_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return ScanDedupSerialGuard { _conn: None };
+    }
+    ScanDedupSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
@@ -98,6 +151,7 @@ fn cfg(storage_path: &str) -> Config {
         stuck_scan_check_interval_secs: 600,
         stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
+        sso_disable_admin_break_glass: false,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
