@@ -305,13 +305,7 @@ async fn fetch_package_entries(
     .bind(super::escape_like_literal(component))
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut entries = Vec::new();
     for a in &artifacts {
@@ -430,13 +424,7 @@ async fn discover_release_layout(
     .bind(repo_id)
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut components = BTreeSet::new();
     let mut architectures = BTreeSet::new();
@@ -1368,13 +1356,7 @@ async fn pool_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
 
     let artifact = match artifact {
@@ -1642,13 +1624,7 @@ async fn persist_debian_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());

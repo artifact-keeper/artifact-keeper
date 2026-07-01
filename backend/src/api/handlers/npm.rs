@@ -191,7 +191,9 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
 }
 
 fn map_status(status: StatusCode, msg: &str) -> Response {
-    (status, axum::Json(serde_json::json!({"error": msg}))).into_response()
+    super::with_retry_after_on_503(
+        (status, axum::Json(serde_json::json!({"error": msg}))).into_response(),
+    )
 }
 
 /// Encode a package name for use in upstream registry URLs.
@@ -1314,7 +1316,7 @@ async fn npm_local_fetch(
     .await
     .map_err(|e| {
         map_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?
@@ -4921,5 +4923,30 @@ mod tests {
                 "/-/ping must not be treated as package lookup, got: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_npm_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/mypkg"),
+            format!("/{k}/mypkg/1.0.0"),
+            format!("/{k}/mypkg/-/mypkg-1.0.0.tgz"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

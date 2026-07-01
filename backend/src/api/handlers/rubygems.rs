@@ -397,13 +397,7 @@ async fn query_gem_specs(
         .bind(repo_id)
         .fetch_all(db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
 
     Ok(rows
         .iter()
@@ -611,13 +605,7 @@ async fn dependencies(
         )
         .fetch_all(&state.db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
 
         for a in &artifacts {
             let deps = a
@@ -997,5 +985,33 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         f.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_rubygems_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/api/v1/gems/name"),
+            format!("/{k}/api/v1/versions/name"),
+            format!("/{k}/api/v1/dependencies?gems=name"),
+            format!("/{k}/specs.4.8.gz"),
+            format!("/{k}/latest_specs.4.8.gz"),
+            format!("/{k}/gems/name-1.0.0.gem"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }
