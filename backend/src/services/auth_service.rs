@@ -37,6 +37,35 @@ pub struct FederatedCredentials {
     pub groups: Vec<String>,
     /// Required group name for admin role (exact match); when set, replaces default pattern matching
     pub required_admin_group: Option<String>,
+    /// Whether a first-time login may auto-provision a local account for this
+    /// identity provider. When `false`, an authenticated principal that has no
+    /// existing local user is rejected instead of being created on the fly
+    /// (issue #2057, honours the OIDC "Auto Create Users" switch). Providers
+    /// without an explicit toggle (LDAP/SAML) pass `true` to preserve behaviour.
+    pub auto_create_users: bool,
+}
+
+/// Decide whether a federated login is allowed to proceed given the provider's
+/// auto-provisioning policy (issue #2057).
+///
+/// An identity provider may authenticate a principal that has no local account
+/// yet. Auto-creating that account is gated behind the provider's "Auto Create
+/// Users" switch: when it is off, the login is refused instead of silently
+/// creating a user. Principals that already have a local account are always
+/// allowed through so existing users keep working regardless of the toggle.
+///
+/// Returns `Err(AppError::Authorization)` (HTTP 403) when provisioning is
+/// required but disabled, and `Ok(())` otherwise.
+#[allow(clippy::result_large_err)]
+fn guard_federated_provisioning(user_exists: bool, auto_create_users: bool) -> Result<()> {
+    if !user_exists && !auto_create_users {
+        return Err(AppError::Authorization(
+            "This identity provider does not allow automatic account creation; \
+             ask an administrator to create your account first"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Result of group-to-role mapping
@@ -2238,6 +2267,11 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #2057: honour the provider's "Auto Create Users" switch. A brand-new
+        // federated principal may only be provisioned when auto-create is on;
+        // otherwise the login is rejected rather than silently creating a user.
+        guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
+
         let user = if let Some(existing) = existing_user {
             // Update existing user with latest information from provider
             sqlx::query_as!(
@@ -3276,10 +3310,41 @@ mod tests {
             display_name: Some("Fed User".to_string()),
             groups: vec!["devs".to_string(), "admin".to_string()],
             required_admin_group: None,
+            auto_create_users: true,
         };
         let debug = format!("{:?}", creds);
         assert!(debug.contains("feduser"));
         assert!(debug.contains("ext-123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // guard_federated_provisioning (#2057, pure function, no DB)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_allows_existing_user_when_auto_create_off() {
+        // Existing users must always be allowed through regardless of toggle.
+        assert!(guard_federated_provisioning(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_guard_allows_existing_user_when_auto_create_on() {
+        assert!(guard_federated_provisioning(true, true).is_ok());
+    }
+
+    #[test]
+    fn test_guard_allows_new_user_when_auto_create_on() {
+        // First login + auto-create enabled -> provisioning proceeds.
+        assert!(guard_federated_provisioning(false, true).is_ok());
+    }
+
+    #[test]
+    fn test_guard_rejects_new_user_when_auto_create_off() {
+        // The regression case for #2057: no local account + toggle off must be
+        // refused with a 403 rather than silently creating the user.
+        let err = guard_federated_provisioning(false, false)
+            .expect_err("new user with auto-create disabled must be rejected");
+        assert!(matches!(err, AppError::Authorization(_)));
     }
 
     // -----------------------------------------------------------------------

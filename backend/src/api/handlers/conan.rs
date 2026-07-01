@@ -71,6 +71,14 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions",
             get(recipe_revisions),
         )
+        // Package search for a recipe revision (#2058). Conan 2's `download`
+        // enumerates a recipe revision's package IDs via this endpoint; without
+        // it the client 404s after `/latest` and the download fails. For remote
+        // repos the query is forwarded to the (authenticated) upstream.
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/search",
+            get(recipe_package_search),
+        )
         // Recipe files list (must precede the wildcard route below so axum
         // matches exact `/files` requests here rather than treating them as
         // a wildcard with an empty path segment).
@@ -540,6 +548,24 @@ fn parse_package_revisions_json(bytes: &[u8]) -> Vec<PackageRevisionRow> {
         .collect()
 }
 
+/// Parse an upstream Conan v2 package-search response body (`#2058`).
+///
+/// The endpoint returns a JSON object keyed by package ID, each value being
+/// that package's configuration (settings/options/requires). We keep the shape
+/// verbatim so a forwarded upstream response is passed through unchanged.
+/// Anything that is not a JSON object (malformed body, empty upstream) degrades
+/// to an empty map so the handler still returns `200 {}` rather than `500`.
+fn parse_package_search_json(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => serde_json::Map::new(),
+        Err(e) => {
+            tracing::warn!("conan package_search: failed to parse upstream JSON: {}", e);
+            serde_json::Map::new()
+        }
+    }
+}
+
 /// Parse an upstream Conan `time` string. Conan Center emits times with a
 /// numeric `+0000` offset (e.g. `2025-12-09T12:51:39.337+0000`) which is NOT
 /// strict RFC3339 (RFC3339 requires `Z` or `+00:00`), so try RFC3339 first and
@@ -623,6 +649,40 @@ async fn recipe_revisions_from_remote(
                 repo_key
             );
             Vec::new()
+        }
+    }
+}
+
+/// Forward a package-search query for a recipe revision to a remote upstream
+/// and parse the returned package map (#2058). Applies the repository's
+/// configured upstream credentials via [`proxy_helpers::proxy_fetch`] (which
+/// loads them by `repo_id`), so an authenticated upstream registry is queried
+/// with the stored basic/bearer auth. Returns an empty map on any non-2xx
+/// response or parse error so a flaky/offline upstream degrades to local-only.
+#[allow(clippy::too_many_arguments)]
+async fn package_search_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/search",
+        name, version, user, channel, revision
+    );
+    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+        Ok((bytes, _ct)) => parse_package_search_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan package_search: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            serde_json::Map::new()
         }
     }
 }
@@ -1056,6 +1116,152 @@ async fn recipe_revisions(
         "revisions": revisions
     });
 
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET .../revisions/{rev}/search — Package search for a recipe revision (#2058)
+// ---------------------------------------------------------------------------
+
+/// Distinct package IDs stored locally for a given recipe revision.
+///
+/// Backs the hosted arm of [`recipe_package_search`]: Conan 2's `download`
+/// enumerates a recipe revision's packages through the `/search` endpoint, so
+/// we surface every `packageId` we hold for the (name, version, user, channel,
+/// recipe-revision) tuple.
+async fn package_ids_for_recipe_revision(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT am.metadata->>'packageId' as "package_id?"
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'type' = 'package'
+          AND am.metadata->>'packageId' IS NOT NULL
+        "#,
+        repository_id,
+        name,
+        version,
+        normalize_user(user),
+        normalize_channel(channel),
+        revision,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(|r| r.package_id).collect())
+}
+
+async fn recipe_package_search(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // Package ID -> configuration map. Hosted rows contribute an empty object
+    // (the ID is what `download` needs); a remote upstream contributes the full
+    // configuration and takes precedence for shared IDs.
+    let mut packages = serde_json::Map::new();
+    let add_local = |packages: &mut serde_json::Map<String, serde_json::Value>,
+                     ids: Vec<String>| {
+        for id in ids {
+            packages
+                .entry(id)
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
+    };
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type.is_hosted() {
+                let ids = package_ids_for_recipe_revision(
+                    &state.db, member.id, &name, &version, &user, &channel, &revision,
+                )
+                .await
+                .map_err(map_db_err)?;
+                add_local(&mut packages, ids);
+            } else if member.repo_type == RepositoryType::Remote {
+                if let (Some(upstream_url), Some(proxy)) = (
+                    member.upstream_url.as_deref(),
+                    state.proxy_service.as_deref(),
+                ) {
+                    let remote = package_search_from_remote(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        &name,
+                        &version,
+                        &user,
+                        &channel,
+                        &revision,
+                    )
+                    .await;
+                    packages.extend(remote);
+                }
+            }
+        }
+    } else if repo.repo_type == RepositoryType::Remote {
+        let ids = package_ids_for_recipe_revision(
+            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        add_local(&mut packages, ids);
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = package_search_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+            )
+            .await;
+            packages.extend(remote);
+        }
+    } else {
+        let ids = package_ids_for_recipe_revision(
+            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        add_local(&mut packages, ids);
+    }
+
+    let json = serde_json::Value::Object(packages);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
@@ -7339,6 +7545,231 @@ mod agent2_recipe_reads {
             user_id,
         )
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_package_search (#2058): /revisions/{rrev}/search
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_package_search_lists_hosted_package_ids() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        // Two distinct package IDs under the same recipe revision.
+        let _ = seed_package_row(
+            &pool,
+            repo_id,
+            "pslib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_ps",
+            "pkgid_a",
+            "prev1",
+            "conaninfo.txt",
+        )
+        .await;
+        let _ = seed_package_row(
+            &pool,
+            repo_id,
+            "pslib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_ps",
+            "pkgid_b",
+            "prev1",
+            "conaninfo.txt",
+        )
+        .await;
+        // A package under a DIFFERENT recipe revision must NOT appear.
+        let _ = seed_package_row(
+            &pool,
+            repo_id,
+            "pslib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_other",
+            "pkgid_c",
+            "prev1",
+            "conaninfo.txt",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/pslib/1.0/_/_/revisions/rrev_ps/search",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let map = json
+            .as_object()
+            .expect("search response must be a JSON object");
+        assert!(
+            map.contains_key("pkgid_a") && map.contains_key("pkgid_b"),
+            "hosted package search must list both package IDs for the revision, got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !map.contains_key("pkgid_c"),
+            "packages from other recipe revisions must not leak, got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_package_search_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, member_id, virtual_dir, member_dir, user_id, state, auth) =
+            setup_virtual_with_member(&pool).await;
+
+        let _ = seed_package_row(
+            &pool,
+            member_id,
+            "vpslib",
+            "1.0",
+            "_",
+            "_",
+            "rrev_v",
+            "pkgid_v",
+            "prev1",
+            "conaninfo.txt",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/vpslib/1.0/_/_/revisions/rrev_v/search",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let map = json.as_object().expect("object");
+        assert!(
+            map.contains_key("pkgid_v"),
+            "virtual package search must aggregate hosted member package IDs, got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+
+        cleanup_virtual_pair(
+            &pool,
+            virtual_id,
+            member_id,
+            &virtual_dir,
+            &member_dir,
+            user_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn recipe_package_search_remote_without_proxy_returns_local_only() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        // `build_state` leaves `proxy_service` as None, so the Remote arm must
+        // skip the upstream forward and return only locally-cached package IDs.
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "remote").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let _ = seed_package_row(
+            &pool,
+            repo_id,
+            "rpslib",
+            "2.0",
+            "_",
+            "_",
+            "rrev_r",
+            "pkgid_r",
+            "prev1",
+            "conaninfo.txt",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/rpslib/2.0/_/_/revisions/rrev_r/search",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let map = json.as_object().expect("object");
+        assert!(
+            map.contains_key("pkgid_r"),
+            "remote-without-proxy search must still return the local package ID, got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn test_parse_package_search_json_happy() {
+        let body = br#"{"pkgid_a":{"settings":{"os":"Linux"}},"pkgid_b":{}}"#;
+        let map = super::parse_package_search_json(body);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("pkgid_a"));
+        assert_eq!(
+            map.get("pkgid_a").and_then(|v| v.get("settings")),
+            Some(&serde_json::json!({"os": "Linux"}))
+        );
+    }
+
+    #[test]
+    fn test_parse_package_search_json_non_object_is_empty() {
+        // Upstream that returns a non-object (e.g. an array or a string) must
+        // degrade to an empty map, not error.
+        assert!(super::parse_package_search_json(br#"["a","b"]"#).is_empty());
+        assert!(super::parse_package_search_json(br#""nope""#).is_empty());
+    }
+
+    #[test]
+    fn test_parse_package_search_json_malformed_is_empty() {
+        assert!(super::parse_package_search_json(b"not json {").is_empty());
+        assert!(super::parse_package_search_json(b"").is_empty());
     }
 
     // -----------------------------------------------------------------------
