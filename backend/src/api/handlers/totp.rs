@@ -442,9 +442,9 @@ pub async fn verify_totp(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Update last login
+    // Update last login (throttled to at most one write every 5 minutes)
     sqlx::query!(
-        "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+        "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
         claims.sub
     )
     .execute(&state.db)

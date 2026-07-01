@@ -513,8 +513,20 @@ impl OidcService {
                 r#"
                 UPDATE users
                 SET email = $1, display_name = $2, is_admin = $3,
-                    last_login_at = NOW(), updated_at = NOW()
+                    last_login_at = CASE
+                        WHEN last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes'
+                        THEN NOW()
+                        ELSE last_login_at
+                    END,
+                    updated_at = NOW()
                 WHERE id = $4
+                  AND (
+                    email IS DISTINCT FROM $1
+                    OR display_name IS DISTINCT FROM $2
+                    OR is_admin IS DISTINCT FROM $3
+                    OR last_login_at IS NULL
+                    OR last_login_at < NOW() - INTERVAL '5 minutes'
+                  )
                 "#,
                 oidc_user.email,
                 oidc_user.display_name,
