@@ -273,6 +273,7 @@ async fn create_provider(pool: &PgPool, idp: &MockIdp) -> Uuid {
             auto_create_users: Some(true),
             pkce_enabled: Some(true),
             map_groups_to_groups: Some(false),
+            allow_legacy_rsa_keys: None,
         },
     )
     .await

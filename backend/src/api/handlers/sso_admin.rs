@@ -873,6 +873,7 @@ mod tests {
             auto_create_users: false,
             pkce_enabled: true,
             map_groups_to_groups: false,
+            allow_legacy_rsa_keys: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

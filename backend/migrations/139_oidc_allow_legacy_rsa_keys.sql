@@ -1,0 +1,23 @@
+-- Opt-in compatibility flag: when true, OIDC ID tokens signed with RSA keys
+-- shorter than 2048 bits are accepted on signature verification through a
+-- manual `rsa` + `sha2` PKCS#1 v1.5 path, instead of the default
+-- jsonwebtoken + aws_lc_rs path that rejects every modulus < 2048 bits per
+-- NIST SP 800-131A Rev.2 (RSA < 2048 disallowed since 2014).
+--
+-- The defaulting policy is intentional: the column defaults to false so
+-- every existing OIDC configuration stays on the strict path and keeps
+-- meeting the OWASP ASVS 4.0 V6.2.5 baseline (RSA modulus >= 2048 bits) on
+-- upgrade with zero behavioural change. Operators only flip the flag on for
+-- the specific provider whose IdP signs ID tokens with a 1024-bit RSA key
+-- (e.g. Lark AnyCross at the time of writing — their issued JWKS exposes a
+-- 1024-bit RS256 key that current Rust JWT stacks decline), and then only
+-- after acknowledging that they are accepting a key strength below the
+-- modern baseline.
+--
+-- The fallback path is also scope-limited at the application layer: it
+-- accepts only RS256, RS384 and RS512 (PKCS#1 v1.5 over the RSA primitive
+-- the `rsa` crate supports), never relaxes the audience / issuer / exp /
+-- nonce checks, and refuses to sign-verify EC / PS / HS tokens through the
+-- legacy path regardless of this flag.
+ALTER TABLE oidc_configs
+    ADD COLUMN IF NOT EXISTS allow_legacy_rsa_keys BOOLEAN NOT NULL DEFAULT false;
