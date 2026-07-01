@@ -425,12 +425,20 @@ async fn enforce_release_target_link(
 /// approval/governance workflow could be bypassed by promoting directly via
 /// the `/promote` routes.
 ///
-/// Split into a pure helper so the admin-gate decision is shared by the single
-/// and bulk promote handlers and can be unit tested without a DB or storage.
-fn ensure_promotion_authorized(is_admin: bool) -> Result<()> {
-    if !is_admin {
+/// Split into a pure helper so the gate decision is shared by the single and
+/// bulk promote handlers and can be unit tested without a DB or storage.
+///
+/// Promotion is authorized when the caller is an admin OR presents an API token
+/// carrying the grantable `promote:artifacts` scope. The scope is admin-only to
+/// mint (see [`crate::services::token_service::ADMIN_ONLY_SCOPES`]) and only ever
+/// consulted for API-token principals at the call sites, so a JWT/session user
+/// cannot acquire promote capability through it. The tenant-ownership and
+/// approval/governance gates run independently and still apply to scoped tokens.
+fn ensure_promotion_authorized(is_admin: bool, has_promote_scope: bool) -> Result<()> {
+    if !is_admin && !has_promote_scope {
         return Err(AppError::Authorization(
-            "Only admins can promote artifacts".to_string(),
+            "Only admins or tokens with the 'promote:artifacts' scope can promote artifacts"
+                .to_string(),
         ));
     }
     Ok(())
@@ -549,7 +557,12 @@ pub async fn promote_artifact(
     Path((repo_key, artifact_id)): Path<(String, Uuid)>,
     Json(req): Json<PromoteArtifactRequest>,
 ) -> Result<Json<PromotionResponse>> {
-    ensure_promotion_authorized(auth.is_admin)?;
+    // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
+    // Only trust it for API-token principals: `has_scope` returns true for JWT
+    // sessions, so the `is_api_token` guard prevents a session user from gaining
+    // promote capability they were never granted.
+    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
+    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
 
@@ -846,7 +859,12 @@ pub async fn promote_artifacts_bulk(
     Path(repo_key): Path<String>,
     Json(req): Json<BulkPromoteRequest>,
 ) -> Result<Json<BulkPromotionResponse>> {
-    ensure_promotion_authorized(auth.is_admin)?;
+    // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
+    // Only trust it for API-token principals: `has_scope` returns true for JWT
+    // sessions, so the `is_api_token` guard prevents a session user from gaining
+    // promote capability they were never granted.
+    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
+    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
 
@@ -1558,7 +1576,17 @@ mod tests {
 
     #[test]
     fn test_ensure_promotion_authorized_admin_ok() {
-        assert!(ensure_promotion_authorized(true).is_ok());
+        // Admin passes regardless of scope.
+        assert!(ensure_promotion_authorized(true, false).is_ok());
+        assert!(ensure_promotion_authorized(true, true).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_promotion_authorized_promote_scope_ok() {
+        // A non-admin caller presenting the `promote:artifacts` scope is
+        // authorized (the scope is admin-only to mint and is only consulted
+        // for API-token principals at the call sites).
+        assert!(ensure_promotion_authorized(false, true).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1622,11 +1650,12 @@ mod tests {
 
     #[test]
     fn test_ensure_promotion_authorized_non_admin_denied() {
-        let err = ensure_promotion_authorized(false).unwrap_err();
+        // Neither admin nor promote scope -> denied.
+        let err = ensure_promotion_authorized(false, false).unwrap_err();
         // Non-admin promotion is an authorization failure (HTTP 403), matching
         // the approval workflow's approve/reject endpoints.
         assert!(matches!(err, AppError::Authorization(_)));
-        assert!(err.to_string().contains("admin"));
+        assert!(err.to_string().contains("promote"));
     }
 
     // -----------------------------------------------------------------------
@@ -3175,6 +3204,23 @@ mod tests {
             }
         }
 
+        /// A NON-admin service-account API token bearing the given scopes. Used to
+        /// exercise the grantable `promote:artifacts` capability (#2042): promote
+        /// is authorized for such a token, but the tenant-ownership gate still
+        /// applies via the user's per-repo role grants.
+        fn scoped_token_ext(user_id: Uuid, scopes: &[&str]) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: "pr2042-sa".to_string(),
+                email: "pr2042-sa@test.local".to_string(),
+                is_admin: false,
+                is_api_token: true,
+                is_service_account: true,
+                scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+                allowed_repo_ids: None,
+            }
+        }
+
         /// Storage backend resolved through the repo's own storage_location().
         async fn storage_for(
             state: &SharedState,
@@ -3390,6 +3436,93 @@ mod tests {
             assert!(target_has_artifact(&pool, tgt, "st").await);
 
             cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        // ---- #2042: grantable promote:artifacts scope on service-account tokens
+
+        /// A non-admin SERVICE-ACCOUNT token that holds the `promote:artifacts`
+        /// scope AND owns both repos (per-repo grants) may promote: the scope
+        /// satisfies the promote-authorization gate and the tenant gate passes.
+        #[tokio::test]
+        async fn test_single_promote_scoped_token_with_grant_allowed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr2042-ok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr2042-ok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sa-ok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sa-ok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sa-ok").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "saok").await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["promote:artifacts"])),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("scoped-token promote with grants must succeed");
+            assert!(res.0.promoted, "scoped-token promote must promote");
+            assert!(target_has_artifact(&pool, tgt, "saok").await);
+
+            cleanup(&pool, &[src, tgt], sa).await;
+        }
+
+        /// A non-admin service-account token WITHOUT the `promote:artifacts`
+        /// scope is denied at the promote-authorization gate (403), even when it
+        /// owns both repos — the scope is the grantable promote capability.
+        #[tokio::test]
+        async fn test_single_promote_scoped_token_without_scope_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr2042-no-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr2042-no-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sa-no-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sa-no-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sa-no").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sano").await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["read:artifacts", "write:artifacts"])),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("token without promote:artifacts must be rejected");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "missing promote scope must be a 403; got {:?}",
+                err
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "sano").await,
+                "a denied promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], sa).await;
         }
 
         /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.

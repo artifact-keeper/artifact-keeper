@@ -390,8 +390,7 @@ pub async fn list_webhooks(
     request_body = CreateWebhookRequest,
     responses(
         (status = 200, description = "Webhook created. Body includes the raw secret exactly once (omitted when created unsigned).", body = WebhookSecretCreatedResponse),
-        (status = 422, description = "Validation error"),
-        (status = 503, description = "A secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest"),
+        (status = 422, description = "Validation error, including: a secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted at rest (create the webhook without a secret, or have an administrator configure the signing key)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -507,8 +506,10 @@ struct PreparedSecret {
 /// Behavior (B4 fix):
 /// - Caller supplied a secret, key configured: encrypt and store it.
 /// - Caller supplied a secret, NO key configured: return a clear
-///   `ServiceUnavailable` (503) error, never a bare 500. The caller asked
-///   to sign but the deployment cannot encrypt the secret at rest.
+///   `Validation` (4xx) error, never a bare 500 or a retryable 503. The
+///   caller asked to sign but the deployment cannot encrypt the secret at
+///   rest; this is a permanent client-side condition, and the secret is
+///   never stored in the clear.
 /// - No secret supplied, key configured: generate a fresh secret, encrypt
 ///   and store it (preserves the pre-fix signing-by-default behavior).
 /// - No secret supplied, NO key configured: store nothing. The webhook is
@@ -526,12 +527,17 @@ fn prepare_secret_for_storage(
     let supplied = supplied_secret.filter(|s| !s.trim().is_empty());
 
     let raw_secret = match (supplied, key_configured) {
-        // Caller wants signing but we cannot encrypt: clear, non-500 error.
+        // Caller wants signing but the deployment has no signing key, so the
+        // secret cannot be encrypted at rest. This is a permanent client-side
+        // condition, not a transient server fault: returning 503 wrongly
+        // implies the request is retryable and drives CI retry loops. Surface
+        // a clear validation (4xx) error and never store the secret in the
+        // clear. Enabling signing is an operator action (see #950).
         (Some(_), false) => {
-            return Err(AppError::ServiceUnavailable(
-                "webhook secret signing is not configured on this deployment \
+            return Err(AppError::Validation(
+                "webhook secret signing is not enabled on this deployment \
                  (AK_WEBHOOK_SECRET_KEY is unset); create the webhook without \
-                 a secret or configure the key"
+                 a secret, or ask an administrator to configure the signing key"
                     .to_string(),
             ));
         }
@@ -3059,36 +3065,43 @@ mod tests {
     #[test]
     fn prepare_secret_supplied_secret_without_key_is_clear_non_500_error() {
         // The one case that must error: caller wants signing but the
-        // deployment cannot encrypt at rest. Must be a clear, non-500 error,
-        // not a bare AppError::Internal (which maps to 500 INTERNAL_ERROR).
+        // deployment cannot encrypt at rest. Must be a clear client-side
+        // Validation error, not a bare AppError::Internal (500) nor a
+        // retryable AppError::ServiceUnavailable (503) that drives CI retry
+        // loops. The message must name the missing env var.
         let err = prepare_secret_for_storage(Some("whsec_caller_supplied"), false, || {
             panic!("must not generate")
         })
         .expect_err("supplied secret with no key must error");
         match err {
-            AppError::ServiceUnavailable(msg) => {
+            AppError::Validation(msg) => {
                 assert!(
                     msg.contains("AK_WEBHOOK_SECRET_KEY"),
                     "error should name the missing key var, got: {msg}"
                 );
             }
-            other => panic!("expected ServiceUnavailable (503), got {other:?}"),
+            other => panic!("expected Validation, got {other:?}"),
         }
     }
 
     #[test]
-    fn prepare_secret_supplied_secret_without_key_maps_to_503_not_500() {
+    fn prepare_secret_supplied_secret_without_key_maps_to_client_error_not_5xx() {
         use axum::response::IntoResponse;
         let err = prepare_secret_for_storage(Some("whsec_x"), false, || unreachable!())
             .expect_err("must error");
         // Drive the error through the real IntoResponse path the handler uses
         // so we assert the wire status, not an internal detail. The whole
-        // point of B4: never a bare 500 on a normal-ish create.
+        // point: a permanent client-side condition must be a 4xx, never a 5xx
+        // (500 looks like a server fault; 503 looks retryable).
         let response = err.into_response();
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "supplied-secret-no-key must map to 503, not 500"
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "supplied-secret-no-key must map to a 4xx client error, got {status}"
+        );
+        assert!(
+            !status.is_server_error(),
+            "supplied-secret-no-key must not be a 5xx, got {status}"
         );
     }
 

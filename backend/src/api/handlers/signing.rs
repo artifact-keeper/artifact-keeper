@@ -13,6 +13,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
+use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{CreateKeyRequest, SigningService};
 
 /// Create signing key management routes.
@@ -114,6 +115,7 @@ async fn list_keys(
     responses(
         (status = 200, description = "Created signing key", body = SigningKeyPublic),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -123,6 +125,18 @@ async fn create_key(
     Json(payload): Json<CreateKeyPayload>,
 ) -> Result<Json<SigningKeyPublic>> {
     require_signing_admin(&auth)?;
+
+    // Validate a repository-scoped key names an existing repository before
+    // handing off to the signing service. Without this, a nonexistent
+    // repository_id hits the FK constraint at INSERT and surfaces as an opaque
+    // 500 DATABASE_ERROR; `get_by_id` returns a clean NotFound (404) instead.
+    // Global keys (repository_id = None) carry no FK and skip the lookup.
+    if let Some(repo_id) = payload.repository_id {
+        RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+    }
+
     let svc = signing_service(&state);
     let key = svc
         .create_key(CreateKeyRequest {
@@ -846,5 +860,117 @@ mod tests {
         assert!(merged_meta);
         assert!(merged_pkg);
         assert!(merged_req);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2044: create_key validates a repository-scoped key names an existing
+    // repository BEFORE the signing service, so a bad repository_id yields a
+    // clean 404 instead of an opaque 500 from the FK violation at INSERT.
+    // DB-backed: runtime-skips when DATABASE_URL is unset (no-op locally,
+    // runs in CI which seeds Postgres).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_key_nonexistent_repository_id_is_not_found() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let sdir = std::env::temp_dir().join(format!("sk2044-nf-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let payload = CreateKeyPayload {
+            repository_id: Some(Uuid::new_v4()), // random, does not exist
+            name: format!("k-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: Some("rsa".to_string()),
+            algorithm: Some("rsa2048".to_string()),
+            uid_name: None,
+            uid_email: None,
+        };
+        let err = create_key(State(state), Extension(admin_jwt()), Json(payload))
+            .await
+            .expect_err("nonexistent repository_id must error");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "nonexistent repo must be 404 NotFound, not a 500 DATABASE_ERROR; got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_key_existing_repository_id_succeeds() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        // signing_keys.created_by is FK -> users(id); use a real admin user.
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk2044-ok-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let payload = CreateKeyPayload {
+            repository_id: Some(repo_id),
+            name: format!("k-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: Some("rsa".to_string()),
+            algorithm: Some("rsa2048".to_string()),
+            uid_name: None,
+            uid_email: None,
+        };
+        let res = create_key(State(state), Extension(admin), Json(payload)).await;
+        assert!(
+            res.is_ok(),
+            "create_key against an existing repo must succeed; got {:?}",
+            res.err()
+        );
+        let _ = sqlx::query("DELETE FROM signing_keys WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_key_global_no_repository_id_succeeds() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // signing_keys.created_by is FK -> users(id); use a real admin user.
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk2044-gl-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let name = format!("global-k-{}", &Uuid::new_v4().to_string()[..8]);
+        let payload = CreateKeyPayload {
+            repository_id: None, // global key: skips the repo lookup
+            name: name.clone(),
+            key_type: Some("rsa".to_string()),
+            algorithm: Some("rsa2048".to_string()),
+            uid_name: None,
+            uid_email: None,
+        };
+        let res = create_key(State(state), Extension(admin), Json(payload)).await;
+        assert!(
+            res.is_ok(),
+            "global (no repository_id) create_key must succeed; got {:?}",
+            res.err()
+        );
+        let _ = sqlx::query("DELETE FROM signing_keys WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 }

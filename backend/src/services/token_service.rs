@@ -92,6 +92,7 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     "read:artifacts",
     "write:artifacts",
     "delete:artifacts",
+    "promote:artifacts",
     "read:repositories",
     "write:repositories",
     "delete:repositories",
@@ -128,6 +129,10 @@ pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(),
 ///     authorization decision rests solely on the token's scope set).
 ///   * `delete:artifacts`, `delete:repositories` — destructive
 ///     scope-gated operations.
+///   * `promote:artifacts` — promotes artifacts across repositories and
+///     is a privileged release-management capability; only an admin may
+///     mint a token that carries it (the holder still passes the tenant
+///     and approval gates at promote time).
 ///   * `write:users` — user-management write capability.
 ///
 /// `write:artifacts` and `write:repositories` are deliberately NOT on
@@ -140,6 +145,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "*",
     "delete:artifacts",
     "delete:repositories",
+    "promote:artifacts",
     "write:users",
 ];
 
@@ -815,6 +821,26 @@ mod tests {
         let res = enforce_admin_only_scopes(&scopes, false);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains('*'));
+    }
+
+    #[test]
+    fn test_validate_scopes_promote_artifacts_allowed() {
+        // `promote:artifacts` is a first-class, grantable scope.
+        let scopes = vec!["promote:artifacts".to_string()];
+        assert!(validate_scopes_pure(&scopes).is_ok());
+        assert!(ALLOWED_SCOPES.contains(&"promote:artifacts"));
+    }
+
+    #[test]
+    fn test_promote_artifacts_scope_is_admin_only() {
+        // Minting `promote:artifacts` is a privileged release-management
+        // capability: an admin may grant it, a non-admin may not.
+        assert!(ADMIN_ONLY_SCOPES.contains(&"promote:artifacts"));
+        let scopes = vec!["promote:artifacts".to_string()];
+        assert!(enforce_admin_only_scopes(&scopes, true).is_ok());
+        let res = enforce_admin_only_scopes(&scopes, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("promote:artifacts"));
     }
 
     // -----------------------------------------------------------------------
