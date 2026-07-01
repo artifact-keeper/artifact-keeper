@@ -508,13 +508,14 @@ async fn upload_object(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Insert artifact record
-    sqlx::query!(
+    let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
             repository_id, path, name, version, size_bytes,
             checksum_sha256, content_type, storage_key, uploaded_by
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
         "#,
         repo.id,
         artifact_path,
@@ -526,7 +527,7 @@ async fn upload_object(
         storage_key,
         user_id,
     )
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await
     .map_err(|e| {
         lfs_error_response(
@@ -534,6 +535,9 @@ async fn upload_object(
             &format!("Database error: {}", e),
         )
     })?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Update repository timestamp
     let _ = sqlx::query!(

@@ -910,6 +910,9 @@ async fn store_apk(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Store Alpine-specific metadata
     let alpine_metadata = serde_json::json!({
         "name": pkg_name,

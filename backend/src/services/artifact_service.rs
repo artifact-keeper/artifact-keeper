@@ -454,35 +454,15 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Apply quarantine hold if enabled for this repository
-        {
-            use crate::services::quarantine_service;
-            let qconfig = quarantine_service::resolve_config(&self.db, repository_id).await;
-            if quarantine_service::should_quarantine(&qconfig) {
-                let now = chrono::Utc::now();
-                let until = quarantine_service::quarantine_until(&qconfig, now);
-                if let Err(e) = quarantine_service::set_quarantine(
-                    &self.db,
-                    artifact.id,
-                    "quarantined",
-                    Some(until),
-                )
-                .await
-                {
-                    tracing::error!(
-                        artifact_id = %artifact.id,
-                        error = %e,
-                        "Failed to set quarantine status on uploaded artifact"
-                    );
-                } else {
-                    tracing::info!(
-                        artifact_id = %artifact.id,
-                        quarantine_until = %until,
-                        "Artifact quarantined on upload"
-                    );
-                }
-            }
-        }
+        // Apply quarantine hold if enabled for this repository. This is the
+        // shared upload path (pypi/debian/incus/generic), which only ever
+        // handles hosted uploads, so it calls the helper directly.
+        crate::services::quarantine_service::apply_upload_hold(
+            &self.db,
+            repository_id,
+            artifact.id,
+        )
+        .await;
 
         // Check quota warning threshold after successful upload
         if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {

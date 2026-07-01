@@ -1782,6 +1782,9 @@ async fn store_npm_version(
     .await
     .map_err(map_db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
+        .await;
+
     // Store metadata
     let npm_metadata = serde_json::json!({
         "name": package_name,

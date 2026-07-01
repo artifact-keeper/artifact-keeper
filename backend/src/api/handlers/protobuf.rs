@@ -1167,6 +1167,13 @@ async fn upload(
 
         let artifact_id: uuid::Uuid = row.get("id");
 
+        crate::services::quarantine_service::apply_upload_hold_hosted(
+            &state.db,
+            repo.id,
+            artifact_id,
+        )
+        .await;
+
         // Build metadata including dependency refs
         let dep_names: Vec<String> = content
             .dep_refs
