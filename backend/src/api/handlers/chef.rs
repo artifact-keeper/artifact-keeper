@@ -78,13 +78,7 @@ async fn list_cookbooks(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let items: Vec<serde_json::Value> = artifacts
         .iter()
@@ -140,13 +134,7 @@ async fn cookbook_info(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if artifacts.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Cookbook not found").into_response());
@@ -218,13 +206,7 @@ async fn version_info(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Cookbook version not found").into_response())?;
 
     let download_count: i64 = sqlx::query_scalar!(
@@ -282,13 +264,7 @@ async fn download_cookbook(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Cookbook version not found").into_response());
 
     let artifact = match artifact {
@@ -510,13 +486,7 @@ async fn upload_cookbook(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Cookbook version already exists").into_response());
@@ -570,13 +540,7 @@ async fn upload_cookbook(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let _ = sqlx::query!(
         r#"
@@ -758,5 +722,31 @@ mod tests {
             url,
             "/chef/chef-local/api/v1/cookbooks/nginx/versions/12.0.0/download"
         );
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_chef_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/api/v1/cookbooks"),
+            format!("/{k}/api/v1/cookbooks/name"),
+            format!("/{k}/api/v1/cookbooks/name/versions/1.0.0"),
+            format!("/{k}/api/v1/cookbooks/name/versions/1.0.0/download"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

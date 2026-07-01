@@ -381,11 +381,13 @@ struct GetResourcesResponse {
 
 fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     let body = serde_json::json!({ "code": code, "message": message });
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +405,7 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
     .await
     .map_err(|e| {
         connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "internal",
             &format!("Database error: {}", e),
         )
@@ -628,7 +630,7 @@ async fn load_label_index(
     .await
     .map_err(|e| {
         connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "internal",
             &format!("Database error loading labels: {}", e),
         )
@@ -670,7 +672,7 @@ async fn save_label_index(
     .await
     .map_err(|e| {
         connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "internal",
             &format!("Database error: {}", e),
         )
@@ -699,7 +701,7 @@ async fn save_label_index(
             .await
             .map_err(|e| {
                 connect_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    crate::api::handlers::db_status(&e),
                     "internal",
                     &format!("Database error creating label index: {}", e),
                 )
@@ -720,7 +722,7 @@ async fn save_label_index(
     .await
     .map_err(|e| {
         connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "internal",
             &format!("Database error saving labels: {}", e),
         )
@@ -842,7 +844,7 @@ async fn get_modules(
         .await
         .map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -943,7 +945,7 @@ async fn get_commits(
 
         let row = row.map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1008,7 +1010,7 @@ async fn list_commits(
     .await
     .map_err(|e| {
         connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "internal",
             &format!("Database error: {}", e),
         )
@@ -1089,7 +1091,7 @@ async fn upload(
         .await
         .map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1157,7 +1159,7 @@ async fn upload(
         .await
         .map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1294,7 +1296,7 @@ async fn download(
 
         let artifact_row = artifact_row.map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1537,7 +1539,7 @@ async fn create_or_update_labels(
         .await
         .map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1645,7 +1647,7 @@ async fn get_graph(
 
         let row = row.map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )
@@ -1738,7 +1740,7 @@ async fn get_resources(
 
         let row = row.map_err(|e| {
             connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 "internal",
                 &format!("Database error: {}", e),
             )

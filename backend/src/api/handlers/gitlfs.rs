@@ -200,7 +200,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?
@@ -257,11 +257,13 @@ fn lfs_error_response(status: StatusCode, message: &str) -> Response {
         "message": message,
         "request_id": uuid::Uuid::new_v4().to_string(),
     });
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, LFS_CONTENT_TYPE)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, LFS_CONTENT_TYPE)
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +338,7 @@ async fn batch(
         .await
         .map_err(|e| {
             lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 &format!("Database error: {}", e),
             )
         })?;
@@ -476,7 +478,7 @@ async fn upload_object(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -528,7 +530,7 @@ async fn upload_object(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -579,7 +581,7 @@ async fn download_object(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -713,7 +715,7 @@ async fn verify_object(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?
@@ -775,7 +777,7 @@ async fn create_lock(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -793,7 +795,7 @@ async fn create_lock(
         .await
         .map_err(|e| {
             lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 &format!("Database error: {}", e),
             )
         })?;
@@ -822,7 +824,7 @@ async fn create_lock(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -870,7 +872,7 @@ async fn list_locks(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -926,7 +928,7 @@ async fn verify_locks(
         .await
         .map_err(|e| {
             lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 &format!("Database error: {}", e),
             )
         })?;
@@ -945,7 +947,7 @@ async fn verify_locks(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -1016,7 +1018,7 @@ async fn delete_lock(
         .await
         .map_err(|e| {
             lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 &format!("Database error: {}", e),
             )
         })?;
@@ -1037,7 +1039,7 @@ async fn delete_lock(
     .await
     .map_err(|e| {
         lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?
@@ -1077,7 +1079,7 @@ async fn delete_lock(
         .await
         .map_err(|e| {
             lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::db_status(&e),
                 &format!("Database error: {}", e),
             )
         })?;

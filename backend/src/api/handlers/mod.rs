@@ -134,16 +134,59 @@ pub fn json_response(value: &serde_json::Value) -> axum::response::Response {
         .into_response()
 }
 
-/// Map a database error to a 500 plain-text "Database error: {e}" response.
+/// Map a database error to an HTTP response.
+///
 /// Centralizes the boilerplate that every format handler otherwise repeats
 /// after `sqlx::query!(...).fetch_*().await.map_err(...)` calls.
+///
+/// A saturated sqlx pool is a transient capacity event, not a server fault, so
+/// it is shed to 503 + `Retry-After` (via `map_db_err`, which also sanitizes
+/// the body) so clients back off instead of retrying into the saturation
+/// (#2083). Every other DB failure keeps the previous behaviour: a 500
+/// plain-text "Database error: {e}" response.
 pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let text = e.to_string();
+    if crate::error::is_pool_timeout(&text) {
+        return error_helpers::map_db_err(text);
+    }
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Database error: {}", e),
+        format!("Database error: {}", text),
     )
         .into_response()
+}
+
+/// Pick the HTTP status for a database error when the response envelope is
+/// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
+///
+/// A saturated sqlx pool is transient capacity, so it must surface as 503
+/// (clients back off); every other DB failure stays 500. Callers keep their
+/// own format-specific error body and pass this for the status argument
+/// (#2083).
+pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
+    if crate::error::is_pool_timeout(&e.to_string()) {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// Attach `Retry-After: 1` to a 503 response (capacity shed) so clients back
+/// off; no-op for any other status.
+///
+/// `AppError::into_response` already adds this for `db_err`-routed responses;
+/// format-specific error envelopes (npm/OCI/Git-LFS/protobuf-Connect/upload)
+/// build responses manually, so they wrap their output with this to stay
+/// consistent when `db_status` selects 503 (#2083).
+pub fn with_retry_after_on_503(mut resp: axum::response::Response) -> axum::response::Response {
+    if resp.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    resp
 }
 
 /// Build a `/`-joined path prefix from user-supplied components, escaping
@@ -368,6 +411,47 @@ mod tests {
     fn test_db_err_returns_500() {
         let resp = db_err("connection refused");
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_db_err_pool_timeout_returns_503() {
+        // A stringified sqlx pool timeout must shed to 503 (transient capacity),
+        // not 500, so format-handler clients back off under saturation (#2083).
+        let resp = db_err(sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_db_status_sheds_pool_timeout_only() {
+        // Format-specific envelopes (npm/OCI/Git-LFS/etc.) keep their body and
+        // pass db_status for the status: 503 on pool timeout, 500 otherwise.
+        assert_eq!(
+            db_status(&sqlx::Error::PoolTimedOut.to_string()),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            db_status("connection refused"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_with_retry_after_on_503_adds_header_only_for_503() {
+        use axum::response::IntoResponse;
+        let r503 = with_retry_after_on_503(
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "x").into_response(),
+        );
+        assert_eq!(
+            r503.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "1"
+        );
+        let r500 = with_retry_after_on_503(
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "x").into_response(),
+        );
+        assert!(r500
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 
     #[test]

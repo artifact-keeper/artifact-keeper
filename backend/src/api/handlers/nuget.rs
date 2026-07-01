@@ -299,13 +299,7 @@ async fn search_packages(
     .bind(skip)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     // Get total count for pagination.
     let total_count: i64 = sqlx::query_scalar(
@@ -321,13 +315,7 @@ async fn search_packages(
     .bind(&search_pattern)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let data: Vec<serde_json::Value> = packages
         .iter()
@@ -403,13 +391,7 @@ async fn registration_index(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if artifacts.is_empty() {
         // Cache miss: proxy the registration index from upstream.
@@ -572,13 +554,7 @@ async fn flatcontainer_versions(
     .bind(&package_id_lower)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     versions.sort_by(|a, b| match version_compare(a, b) {
         n if n < 0 => std::cmp::Ordering::Less,
@@ -688,13 +664,7 @@ async fn flatcontainer_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package version not found").into_response());
 
     let artifact = match artifact {
@@ -944,11 +914,7 @@ async fn push_package(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        crate::api::handlers::db_err(e)
     })?;
 
     if existing.is_some() {
@@ -1022,13 +988,7 @@ async fn push_package(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     // Store metadata.
     let _ = sqlx::query!(

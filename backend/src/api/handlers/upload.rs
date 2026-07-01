@@ -808,11 +808,16 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::IncompleteChunks { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::SizeMismatch { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::RepositoryNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        UploadError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()),
+        UploadError::Database(msg) => (
+            crate::api::handlers::db_status(msg),
+            "Database error".into(),
+        ),
         UploadError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "I/O error".into()),
     };
 
-    (status, axum::Json(serde_json::json!({"error": msg}))).into_response()
+    super::with_retry_after_on_503(
+        (status, axum::Json(serde_json::json!({"error": msg}))).into_response(),
+    )
 }
 
 /// Map any displayable error to an HTTP error response.
@@ -2153,6 +2158,14 @@ mod tests {
         assert_eq!(json["error"], "Database error");
         // Must NOT contain the raw sqlx error
         assert!(!json["error"].as_str().unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn test_map_upload_err_database_pool_timeout_returns_503() {
+        // A saturated pool during publish must shed to 503 (transient capacity),
+        // not 500, so clients back off instead of retrying into it (#2083).
+        let resp = map_upload_err(UploadError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

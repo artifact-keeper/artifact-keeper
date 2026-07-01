@@ -428,13 +428,7 @@ async fn list_versions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let body = versions
         .into_iter()
@@ -464,13 +458,7 @@ async fn list_versions(
             )
             .fetch_all(&state.db)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                )
-                    .into_response()
-            })?;
+            .map_err(crate::api::handlers::db_err)?;
 
             let member_body = member_versions
                 .into_iter()
@@ -532,13 +520,7 @@ async fn version_info(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -573,13 +555,8 @@ async fn version_info(
                 )
                 .fetch_optional(&state.db)
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Database error: {}", e),
-                    )
-                        .into_response()
-                })? {
+                .map_err(crate::api::handlers::db_err)?
+                {
                     let time_str = member_row
                         .created_at
                         .format("%Y-%m-%dT%H:%M:%SZ")
@@ -648,13 +625,7 @@ async fn get_mod_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -791,13 +762,7 @@ async fn download_zip(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -933,13 +898,7 @@ async fn latest_version(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1002,11 +961,7 @@ async fn upload_zip(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        crate::api::handlers::db_err(e)
     })?;
 
     if existing.is_some() {
@@ -1061,13 +1016,7 @@ async fn upload_zip(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     // Store metadata
     let metadata = serde_json::json!({
@@ -1129,11 +1078,7 @@ async fn upload_mod(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        crate::api::handlers::db_err(e)
     })?;
 
     if existing.is_some() {
@@ -1188,13 +1133,7 @@ async fn upload_mod(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     // Store metadata
     let metadata = serde_json::json!({

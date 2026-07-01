@@ -64,11 +64,13 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
         }],
     };
     let json = serde_json::to_string(&body).unwrap_or_default();
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(json))
-        .unwrap()
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json))
+            .unwrap(),
+    )
 }
 
 fn oci_internal_error(message: &str) -> Response {
@@ -1135,7 +1137,7 @@ async fn claim_oci_upload_session_for_completion(
     .await
     .map_err(|e| {
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -1304,7 +1306,7 @@ async fn fetch_oci_upload_session(
     .await
     .map_err(|e| {
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -1334,7 +1336,7 @@ async fn fetch_oci_upload_parts(
     .await
     .map_err(|e| {
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -1462,7 +1464,7 @@ async fn recover_committed_patch_after_commit_error(
     .await
     .map_err(|e| {
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -1542,7 +1544,7 @@ async fn recover_committed_completion_after_commit_error(
     .await
     .map_err(|e| {
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -2104,8 +2106,11 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
     };
 
     let map_db_err = |e: sqlx::Error| {
+        // A saturated pool is transient capacity: shed to 503 so Docker/OCI
+        // clients back off instead of failing the pull on a 500 (#2083). The
+        // OCI error envelope (spec-mandated) is preserved either way.
         oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
             &e.to_string(),
         )
@@ -4069,7 +4074,7 @@ async fn handle_start_upload(
     .await
     {
         delete_storage_key_best_effort(&storage, &temp_key, "upload session insert failed").await;
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
     }
     if let Some(part_digest) = computed_digest.as_ref() {
         // `computed_digest` is Some exactly when bytes_received > 0, i.e. a real
@@ -4086,7 +4091,7 @@ async fn handle_start_upload(
         {
             delete_storage_key_best_effort(&storage, &temp_key, "initial upload part insert failed")
                 .await;
-            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
         }
     }
     if let Err(e) = tx.commit().await {
@@ -4274,7 +4279,7 @@ async fn handle_patch_upload(
         {
             delete_storage_key_best_effort(&storage, &part_key, "legacy first part backfill failed")
                 .await;
-            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
         }
     }
 
@@ -4293,7 +4298,7 @@ async fn handle_patch_upload(
         if is_pg_unique_violation(&e) {
             return upload_session_conflict("upload session changed while PATCH body was streaming");
         }
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
     }
 
     let update_result = match sqlx::query(
@@ -4311,7 +4316,7 @@ async fn handle_patch_upload(
         Ok(result) => result,
         Err(e) => {
             delete_storage_key_best_effort(&storage, &part_key, "PATCH session update failed").await;
-            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
         }
     };
     if update_result.rows_affected() != 1 {
@@ -5310,7 +5315,7 @@ async fn handle_complete_upload(
         {
             return reset_resp;
         }
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
     }
 
     let deleted = match sqlx::query(
@@ -5344,7 +5349,7 @@ async fn handle_complete_upload(
             {
                 return reset_resp;
             }
-            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
         }
     };
     if deleted != 1 {

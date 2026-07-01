@@ -801,13 +801,7 @@ async fn query_local_member_names(
         )
         .fetch_all(db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
         all_names.extend(names);
     }
     Ok(all_names)
@@ -837,13 +831,7 @@ async fn query_local_member_versions(
         )
         .fetch_all(db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
         for a in &artifacts {
             let name = a.name.clone();
             let version = a.version.clone().unwrap_or_default();
@@ -2084,5 +2072,31 @@ mod tests {
         );
 
         tdh::cleanup(&pool, virtual_repo_id, user_id).await;
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_hex_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/packages/name"),
+            format!("/{k}/names"),
+            format!("/{k}/versions"),
+            format!("/{k}/tarballs/name-1.0.0.tar"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

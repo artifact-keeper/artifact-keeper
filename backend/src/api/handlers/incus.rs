@@ -1438,11 +1438,7 @@ pub async fn sweep_orphan_staging_files(storage_path: &str, max_age_hours: i64) 
 
 /// Build an `INTERNAL_SERVER_ERROR` response for database errors.
 fn db_err(e: impl Display) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Database error: {}", e),
-    )
-        .into_response()
+    crate::api::handlers::db_err(e)
 }
 
 /// Build an `INTERNAL_SERVER_ERROR` response for filesystem/IO errors.
