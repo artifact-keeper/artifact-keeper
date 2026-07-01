@@ -966,9 +966,13 @@ async fn list_source_repositories(
     // Fetch connection (owner-scoped)
     let connection = load_connection_owned(&state, &auth, id).await?;
 
-    // Create source registry client
-    let client = create_source_client(&connection)
-        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+    // Create source registry client. A build failure here is a property of the
+    // stored connection config (e.g. an http base_url under https_only, an
+    // undecryptable credential, or an unknown auth type), not a server fault,
+    // so surface it as a typed 400 rather than a generic 500 (issue #2097).
+    let client = create_source_client(&connection).map_err(|e| {
+        AppError::Validation(format!("Invalid source connection configuration: {}", e))
+    })?;
 
     // List repositories from source
     let repos = client
@@ -1597,6 +1601,30 @@ async fn list_migration_items(
     }))
 }
 
+/// Terminal migration job states, i.e. those where the job has stopped and an
+/// audit report is meaningful. Mirrors the terminal set used by the progress
+/// stream loop.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+/// Fetch the persisted report row for a job, if one exists.
+async fn fetch_migration_report(
+    db: &sqlx::PgPool,
+    job_id: Uuid,
+) -> Result<Option<MigrationReportRow>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT id, job_id, generated_at, summary, warnings, errors, recommendations
+        FROM migration_reports
+        WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(db)
+    .await?)
+}
+
 /// Get migration report
 #[utoipa::path(
     get,
@@ -1621,19 +1649,29 @@ async fn get_migration_report(
     Query(query): Query<ReportQuery>,
 ) -> Result<impl IntoResponse> {
     // The report belongs to its parent job; gate on the job's owner.
-    load_job_owned(&state, &auth, id).await?;
+    let job = load_job_owned(&state, &auth, id).await?;
 
-    let report: MigrationReportRow = sqlx::query_as(
-        r#"
-        SELECT id, job_id, generated_at, summary, warnings, errors, recommendations
-        FROM migration_reports
-        WHERE job_id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Migration report not found".into()))?;
+    let report = match fetch_migration_report(&state.db, id).await? {
+        Some(report) => report,
+        None if is_terminal_status(&job.status) => {
+            // A report row is only materialised at a terminal transition. The
+            // cancel path writes it inline, but a job that reached a terminal
+            // state by another route (notably a *successful* completion) never
+            // did, so the report endpoint would 404 forever for a job that
+            // plainly finished (issue #2097). Synthesise it lazily on first
+            // read. generate_report upserts on the UNIQUE job_id, so this is
+            // idempotent and never duplicates a row.
+            let service = MigrationService::new(state.db.clone());
+            service
+                .generate_report(id)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to generate report: {}", e)))?;
+            fetch_migration_report(&state.db, id)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Migration report not found".into()))?
+        }
+        None => return Err(AppError::NotFound("Migration report not found".into())),
+    };
 
     match query.format.as_deref() {
         Some("html") => {
@@ -3025,6 +3063,189 @@ mod tests {
 
         cleanup_user(&pool, victor).await;
         cleanup_user(&pool, admin_id).await;
+    }
+
+    /// Mark a seeded job terminal so the report endpoint can synthesise a
+    /// report for it (mirrors what the worker does on successful completion).
+    async fn mark_job_completed(pool: &sqlx::PgPool, job: Uuid) {
+        sqlx::query(
+            "UPDATE migration_jobs SET status = 'completed', \
+             started_at = NOW() - INTERVAL '1 minute', finished_at = NOW() WHERE id = $1",
+        )
+        .bind(job)
+        .execute(pool)
+        .await
+        .expect("mark job completed");
+    }
+
+    async fn report_row_count(pool: &sqlx::PgPool, job: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM migration_reports WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .expect("count reports")
+    }
+
+    // Issue #2097 Gap 1: a report must be readable after a *successful*
+    // migration (previously 404), and re-reading must not duplicate the row.
+    #[tokio::test]
+    async fn test_completed_job_report_synthesized_and_idempotent() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await;
+        mark_job_completed(&pool, job).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // First read materialises the report lazily -> 200, not 404.
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{job}/report"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "completed job must expose its report"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["job_id"], job.to_string());
+        assert_eq!(report_row_count(&pool, job).await, 1);
+
+        // Second read must reuse the same row (idempotent upsert).
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{job}/report"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            report_row_count(&pool, job).await,
+            1,
+            "re-reading must not duplicate the report row"
+        );
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    // A non-terminal (e.g. pending) job has no report and must still 404 --
+    // lazy synthesis only applies to terminal jobs.
+    #[tokio::test]
+    async fn test_non_terminal_job_report_is_404() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await; // status = 'pending'
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{job}/report"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            report_row_count(&pool, job).await,
+            0,
+            "no report must be created for a running job"
+        );
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    // The cancel path must still materialise a report (preserved behaviour).
+    #[tokio::test]
+    async fn test_cancel_then_report_available() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await; // 'pending' -> cancellable
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let app = app_as(state.clone(), tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{job}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "owner must cancel his own job");
+
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{job}/report"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "cancelled job must expose a report");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    // Issue #2097 Gap 2: an unbuildable source client (here, undecryptable
+    // credentials) must surface as a typed 4xx, not a generic 500.
+    #[tokio::test]
+    async fn test_list_source_repositories_bad_config_returns_4xx() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        // seed_connection stores non-decryptable credentials_enc, so
+        // create_source_client fails to build the client.
+        let conn = seed_connection(&pool, marco).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(marco, &marco_name));
+        let (status, _) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/connections/{conn}/repositories"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "bad source config must map to 400, not 500"
+        );
+
+        cleanup_user(&pool, marco).await;
     }
 }
 
