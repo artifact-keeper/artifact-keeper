@@ -839,6 +839,30 @@ jobs:
       attestations: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # The scanner-adapter has its own independent semver (source of truth:
+      # docker/scanner-adapter/VERSION), decoupled from AK's appVersion/git tag.
+      # MAJOR encodes the backend compatibility contract (Harbor Pluggable
+      # Scanner API v1). Derive version / major.minor / major from that file.
+      - name: Read adapter version
+        id: adapter_version
+        env:
+          GH_REF: ${{ github.ref }}
+        run: |
+          V=$(cat docker/scanner-adapter/VERSION)
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "minor=${V%.*}" >> "$GITHUB_OUTPUT"
+          echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
+          # Publish the version/major.minor/major/latest tags on main-branch
+          # builds and clean (non-prerelease) v-tag builds only.
+          if [[ "$GH_REF" == "refs/heads/main" || ( "$GH_REF" == refs/tags/v* && "$GH_REF" != *-* ) ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -870,15 +894,17 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+          # Tags come from the adapter's own VERSION file, NOT the AK git-tag
+          # semver used by backend/web/openscap. dev + sha-<sha> are kept on
+          # main builds for traceability.
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_version.outputs.publish == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Extract metadata (Docker Hub)
@@ -886,15 +912,16 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
         with:
           images: docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}
+          # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
+          # AK git-tag semver. Same tags published to both registries.
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_version.outputs.publish == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Create manifest list and push (ghcr.io)

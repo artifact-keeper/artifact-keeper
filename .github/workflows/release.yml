@@ -213,11 +213,15 @@ jobs:
             "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
-            "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:${VERSION}"
+            # scanner-adapter has its own independent semver (see
+            # docker/scanner-adapter/VERSION); the chart pins its MAJOR, so the
+            # release verifies the adapter's major tag (currently 1) rather than
+            # the AK release ${VERSION}, which no adapter tag would match.
+            "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:1"
             "docker.io|artifactkeeper/backend:${VERSION}"
             "docker.io|artifactkeeper/openscap:${VERSION}"
             "docker.io|artifactkeeper/web:${VERSION}"
-            "docker.io|artifactkeeper/scanner-adapter:${VERSION}"
+            "docker.io|artifactkeeper/scanner-adapter:1"
           )
 
           # Common Accept headers cover OCI index, Docker manifest list,
