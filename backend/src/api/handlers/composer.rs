@@ -1039,6 +1039,9 @@ async fn upload(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Store metadata
     let composer_metadata = serde_json::json!({
         "name": full_name,

@@ -1637,6 +1637,9 @@ async fn recipe_file_upload(
     .await
     .map_err(map_db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Store metadata
     let _ = sqlx::query!(
         r#"
@@ -2420,6 +2423,9 @@ async fn package_file_upload(
     .fetch_one(&state.db)
     .await
     .map_err(map_db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Store metadata
     let _ = sqlx::query!(

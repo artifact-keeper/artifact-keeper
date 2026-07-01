@@ -3365,6 +3365,14 @@ pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, 
     .fetch_one(db)
     .await
     .map_err(|e| internal_error("Database", e))?;
+
+    // Apply the upload-time quarantine hold at the shared chokepoint used by the
+    // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
+    // rpm, huggingface). Scoped to hosted repositories so proxy/remote cache
+    // inserts — which carry their own sidecar quarantine state — are not
+    // double-held. Best-effort: never fails the insert.
+    crate::services::quarantine_service::apply_upload_hold_hosted(db, art.repository_id, id).await;
+
     Ok(id)
 }
 
