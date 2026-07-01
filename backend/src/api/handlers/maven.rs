@@ -993,6 +993,32 @@ async fn download(
     serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
 }
 
+/// Fetch a single Remote virtual member's Maven metadata document at `path`
+/// from upstream (via the proxy cache), as a UTF-8 string. Returns `None` for a
+/// non-Remote member or any miss.
+///
+/// Extracted so the Maven virtual metadata-merge loops can fan out across remote
+/// members CONCURRENTLY (#2069): a cold metadata merge then costs the slowest
+/// single upstream rather than the sum of every member's round-trip. Member
+/// (priority) order is preserved by collecting the per-member futures with
+/// `join_all`, so the merge precedence is unchanged.
+async fn fetch_remote_member_metadata(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Option<String> {
+    if member.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = member.upstream_url.as_deref()?;
+    let proxy = state.proxy_service.as_ref()?;
+    let (content, _) =
+        proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, path)
+            .await
+            .ok()?;
+    std::str::from_utf8(&content).ok().map(|s| s.to_string())
+}
+
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1023,45 +1049,32 @@ async fn fetch_maven_metadata_bytes(
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let mut all_versions: Vec<String> = Vec::new();
 
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: proxy metadata from upstream directly.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
+            // metadata from upstream, Local/Staging members generate it from
+            // artifact rows. Batching bounds concurrent upstream connections;
+            // `join_all` preserves within-batch (member) order.
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let member_docs = futures::future::join_all(chunk.iter().map(|member| async {
+                    if member.repo_type == RepositoryType::Remote {
+                        fetch_remote_member_metadata(state, member, path).await
+                    } else {
+                        generate_metadata_for_artifact(
+                            &state.db,
                             member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
+                            &group_id,
+                            &artifact_id,
                         )
                         .await
-                        {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                if let Some((_, _, versions)) =
-                                    crate::formats::maven::parse_metadata_versions(xml_str)
-                                {
-                                    all_versions.extend(versions);
-                                }
-                            }
-                        }
+                        .ok()
                     }
-                } else {
-                    // Local/Staging members: generate from artifact rows.
-                    if let Ok(xml) = generate_metadata_for_artifact(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                    )
-                    .await
+                }))
+                .await;
+                for xml in member_docs.into_iter().flatten() {
+                    if let Some((_, _, versions)) =
+                        crate::formats::maven::parse_metadata_versions(&xml)
                     {
-                        if let Some((_, _, versions)) =
-                            crate::formats::maven::parse_metadata_versions(&xml)
-                        {
-                            all_versions.extend(versions);
-                        }
+                        all_versions.extend(versions);
                     }
                 }
             }
@@ -1095,38 +1108,32 @@ async fn fetch_maven_metadata_bytes(
             // parse_metadata_path but carries <plugins> entries instead of a
             // <versions> block. Collect each member's plugin-prefix metadata
             // and serve the union of <plugin> entries deduped by <prefix>.
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`, preserving member order so
+            // the prefix-dedup precedence is unchanged and bounding concurrent
+            // upstream connections. Remote members fetch from upstream;
+            // Local/Staging members read their stored metadata file.
             let mut member_docs: Vec<String> = Vec::new();
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: fetch from upstream.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
-                        )
-                        .await
-                        {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                member_docs.push(xml_str.to_string());
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                    if member.repo_type == RepositoryType::Remote {
+                        fetch_remote_member_metadata(state, member, path).await
+                    } else {
+                        let member_storage_key = format!("maven/{}", path);
+                        match state.storage_for_repo(&member.storage_location()) {
+                            Ok(member_storage) => {
+                                member_storage.get(&member_storage_key).await.ok().and_then(
+                                    |content| {
+                                        std::str::from_utf8(&content).ok().map(|s| s.to_string())
+                                    },
+                                )
                             }
+                            Err(_) => None,
                         }
                     }
-                } else {
-                    // Local/Staging members: try stored metadata file.
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                member_docs.push(xml_str.to_string());
-                            }
-                        }
-                    }
-                }
+                }))
+                .await;
+                member_docs.extend(batch.into_iter().flatten());
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
@@ -1138,48 +1145,47 @@ async fn fetch_maven_metadata_bytes(
         // parse_metadata_path returns None for `g/a/v-SNAPSHOT/maven-metadata.xml`
         // paths, so handle those separately.
         if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`, preserving member order
+            // and bounding concurrent upstream connections. Remote members proxy
+            // snapshot metadata from upstream; Local/Staging members combine
+            // their stored metadata file with entries from artifact rows.
             let mut all_entries: Vec<SnapshotEntry> = Vec::new();
-
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: proxy snapshot metadata from upstream.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
-                        )
-                        .await
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let per_member = futures::future::join_all(chunk.iter().map(|member| async {
+                    let mut entries: Vec<SnapshotEntry> = Vec::new();
+                    if member.repo_type == RepositoryType::Remote {
+                        if let Some(xml_str) =
+                            fetch_remote_member_metadata(state, member, path).await
                         {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                            entries.extend(parse_snapshot_versions_xml(&xml_str));
+                        }
+                    } else {
+                        let member_storage_key = format!("maven/{}", path);
+                        if let Ok(member_storage) =
+                            state.storage_for_repo(&member.storage_location())
+                        {
+                            if let Ok(content) = member_storage.get(&member_storage_key).await {
+                                if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                    entries.extend(parse_snapshot_versions_xml(xml_str));
+                                }
                             }
                         }
+                        entries.extend(
+                            collect_snapshot_entries(
+                                &state.db,
+                                member.id,
+                                &group_id,
+                                &artifact_id,
+                                &version,
+                            )
+                            .await,
+                        );
                     }
-                } else {
-                    // Local/Staging members: try stored metadata file, then
-                    // collect entries from artifact rows.
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
-                            }
-                        }
-                    }
-
-                    let entries = collect_snapshot_entries(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                        &version,
-                    )
-                    .await;
+                    entries
+                }))
+                .await;
+                for entries in per_member {
                     all_entries.extend(entries);
                 }
             }
@@ -4156,6 +4162,120 @@ mod tests {
         assert_ne!(
             sha1, "0000bogussha1value0000",
             "resolver must not forward the upstream's mismatched sidecar"
+        );
+    }
+
+    /// VIRTUAL maven repo merging a LOCAL member's versions with a REMOTE
+    /// member's versions proxied from upstream — exercises the CONCURRENT
+    /// metadata-merge fan-out (#2069): `fetch_remote_member_metadata` plus the
+    /// versions-merge loop's Remote branch. The merged document must list
+    /// versions contributed by BOTH members. Uses a wiremock upstream (no real
+    /// egress). DB-gated (runs in CI where Postgres exists).
+    #[tokio::test]
+    async fn test_virtual_metadata_merges_local_and_remote_versions_2069() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let group_id = "com.example.cov2069merge";
+        let artifact_id = "lib";
+        let meta_path = format!(
+            "{}/{}/maven-metadata.xml",
+            group_id.replace('.', "/"),
+            artifact_id
+        );
+        // Remote upstream serves metadata listing a version the local lacks.
+        let upstream_meta = generate_metadata_xml(
+            group_id,
+            artifact_id,
+            &["3.0.0".to_string()],
+            "3.0.0",
+            Some("3.0.0"),
+        );
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&mock)
+            .await;
+
+        let (local_id, _lk, dir_l) = tdh::create_repo(&pool, "local", "maven").await;
+        let (remote_id, _rk, dir_r) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        seed_maven_version(&pool, local_id, user_id, group_id, artifact_id, "1.0.0").await;
+
+        // Virtual repo: local (priority 0) + remote (priority 1).
+        let virtual_id = uuid::Uuid::new_v4();
+        let virtual_key = format!("v-cov2069-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("cov2069-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(virtual_dir.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+        for (i, m) in [local_id, remote_id].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(m)
+            .bind(i as i32)
+            .execute(&pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir_r.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir_r.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+
+        let resp = download(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((virtual_key.clone(), meta_path.clone())),
+        )
+        .await
+        .expect("virtual metadata download must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read merged metadata body");
+        let body_str = String::from_utf8(body.to_vec()).expect("merged metadata is utf-8");
+
+        // cleanup
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_l);
+        let _ = std::fs::remove_dir_all(&dir_r);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert!(
+            body_str.contains("1.0.0") && body_str.contains("3.0.0"),
+            "virtual maven metadata must merge LOCAL (1.0.0) + REMOTE (3.0.0) \
+             versions via the concurrent fan-out (#2069); got: {body_str}"
         );
     }
 
