@@ -676,14 +676,18 @@ pub async fn saml_login(
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
-    // Create SSO session for CSRF
-    let _session = AuthConfigService::create_sso_session(&state.db, "saml", id).await?;
-
     // Build ACS URL — per-provider opt-in to absolute form (migration 139).
     // The trusted base MUST come from AK_EXTERNAL_URL, not from request
     // headers; otherwise a spoofed X-Forwarded-Host would let an attacker
     // steer the IdP into POSTing the signed assertion elsewhere.
     let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
+
+    // Expected ACS URL for the callback-side Destination/Recipient binding.
+    // Only computed when AK_EXTERNAL_URL is set (the trusted absolute form);
+    // otherwise `None` disables the binding check. This is independent of the
+    // wire-format opt-in above — a strict IdP echoes the absolute ACS it
+    // delivered to regardless of whether we advertised it relatively.
+    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -694,6 +698,7 @@ pub async fn saml_login(
         Some(&row.certificate),
         &row.sp_entity_id,
         &acs_url,
+        expected_acs.as_deref(),
         &row.name_id_format,
         &row.attribute_mapping,
         row.sign_requests,
@@ -703,6 +708,17 @@ pub async fn saml_login(
 
     // Generate AuthnRequest
     let authn_request = saml_svc.create_authn_request()?;
+
+    // Persist the AuthnRequest ID as a single-use SSO session so the ACS
+    // callback can require + consume a matching `InResponseTo` (replay +
+    // unsolicited-response protection). The state column is the request_id.
+    let _session = AuthConfigService::create_sso_session_with_state(
+        &state.db,
+        "saml",
+        id,
+        &authn_request.request_id,
+    )
+    .await?;
 
     Ok(Redirect::temporary(&authn_request.redirect_url))
 }
@@ -744,6 +760,10 @@ pub async fn saml_acs(
     // header either.
     let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
 
+    // Expected ACS for the Destination/Recipient binding — same trusted-only
+    // derivation as `saml_login` so the two sides agree.
+    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
+
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
         state.db.clone(),
@@ -753,6 +773,7 @@ pub async fn saml_acs(
         Some(&row.certificate),
         &row.sp_entity_id,
         &acs_url,
+        expected_acs.as_deref(),
         &row.name_id_format,
         &row.attribute_mapping,
         row.sign_requests,
@@ -2680,5 +2701,34 @@ mod tests {
              anything else lets an attacker-controllable request header be \
              interpolated into the signed AuthnRequest"
         );
+    }
+
+    /// RED-TEAM regression (#2096 review): `build_saml_acs_url` takes only the
+    /// *trusted* base (resolved from `AK_EXTERNAL_URL` via
+    /// `trusted_external_url()`). There is deliberately no request-header
+    /// parameter, so a spoofed `Host` / `X-Forwarded-Host` simply is not an
+    /// input and cannot change the emitted ACS. This pins that the emitted
+    /// host is always the trusted one, on both flag states, and that an
+    /// attacker-shaped string never appears unless it *is* the configured
+    /// trusted base.
+    #[test]
+    fn test_build_saml_acs_url_uses_trusted_base_only_never_spoofable_host() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap();
+        let trusted = "https://pkg.trusted.example";
+
+        // Flag ON: the only host that can appear is the trusted base.
+        let on = build_saml_acs_url(true, Some(trusted), id);
+        assert_eq!(
+            on,
+            "https://pkg.trusted.example/api/v1/auth/sso/saml/\
+             00000000-0000-0000-0000-000000000009/acs"
+        );
+        assert!(!on.contains("attacker"));
+
+        // Flag OFF: no host is emitted at all — a spoofed header has nothing
+        // to attach to.
+        let off = build_saml_acs_url(false, Some(trusted), id);
+        assert!(off.starts_with('/'));
+        assert!(!off.contains("pkg.trusted.example"));
     }
 }

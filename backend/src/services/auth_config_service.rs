@@ -1458,6 +1458,47 @@ impl AuthConfigService {
         Ok(session)
     }
 
+    /// Create an SSO session whose `state` is an explicit caller-supplied
+    /// value rather than a freshly generated random one.
+    ///
+    /// Used by the SAML SP-initiated flow to persist the AuthnRequest
+    /// `request_id` (the value the IdP echoes back as `InResponseTo`) so the
+    /// ACS callback can require + single-use-consume it via
+    /// [`validate_sso_session`]. Reuses the existing `sso_sessions` table
+    /// (migration 037): the `state` column is UNIQUE, so a duplicate
+    /// request_id is rejected, and the row carries its own 10-minute
+    /// expiry. A random `nonce` is still generated for parity with the other
+    /// session-creation paths.
+    pub async fn create_sso_session_with_state(
+        pool: &PgPool,
+        provider_type: &str,
+        provider_id: Uuid,
+        state: &str,
+    ) -> Result<SsoSession> {
+        let id = Uuid::new_v4();
+        let nonce = Uuid::new_v4().to_string();
+
+        let session = sqlx::query_as::<_, SsoSession>(
+            r#"
+            INSERT INTO sso_sessions (id, provider_type, provider_id, state, nonce, pkce_code_verifier)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, provider_type, provider_id, state, nonce, pkce_code_verifier,
+                      created_at, expires_at
+            "#,
+        )
+        .bind(id)
+        .bind(provider_type)
+        .bind(provider_id)
+        .bind(state)
+        .bind(&nonce)
+        .bind(Option::<String>::None)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create SSO session: {e}")))?;
+
+        Ok(session)
+    }
+
     /// Validate an SSO session state: checks existence, deletes the row, and
     /// verifies it has not expired. Returns the session if valid.
     pub async fn validate_sso_session(pool: &PgPool, state: &str) -> Result<SsoSession> {

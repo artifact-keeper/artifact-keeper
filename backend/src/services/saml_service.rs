@@ -33,6 +33,17 @@ pub struct SamlConfig {
     pub sp_entity_id: String,
     /// Assertion Consumer Service (ACS) URL
     pub acs_url: String,
+    /// Expected ACS URL used to bind the IdP-asserted `Destination`
+    /// (`<Response>`) and `Recipient` (`<SubjectConfirmationData>`) values.
+    ///
+    /// `Some` only when a trusted absolute base is available (i.e.
+    /// `AK_EXTERNAL_URL` is set); `None` disables the binding check entirely,
+    /// so permissive IdPs and deployments without a trusted external URL are
+    /// unaffected. When `Some`, the check still only fires if the IdP
+    /// actually asserted the corresponding attribute (conditional
+    /// defense-in-depth on top of the existing status/issuer/audience/time/
+    /// signature validation).
+    pub sp_acs_url: Option<String>,
     /// Attribute containing username
     pub username_attr: String,
     /// Attribute containing email
@@ -56,6 +67,7 @@ redacted_debug!(SamlConfig {
     redact_option idp_certificate,
     show sp_entity_id,
     show acs_url,
+    show sp_acs_url,
     show username_attr,
     show email_attr,
     show display_name_attr,
@@ -80,6 +92,9 @@ impl SamlConfig {
                 .unwrap_or_else(|_| "artifact-keeper".to_string()),
             acs_url: std::env::var("SAML_ACS_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/auth/saml/acs".to_string()),
+            // Env-driven SAML config predates the DB-backed trusted-URL
+            // plumbing; leave the binding check disabled for this path.
+            sp_acs_url: None,
             username_attr: std::env::var("SAML_USERNAME_ATTR")
                 .unwrap_or_else(|_| "NameID".to_string()),
             email_attr: std::env::var("SAML_EMAIL_ATTR").unwrap_or_else(|_| "email".to_string()),
@@ -136,6 +151,11 @@ pub struct SamlResponse {
     pub id: String,
     /// In response to (request ID)
     pub in_response_to: Option<String>,
+    /// `Destination` attribute on the `<Response>` element — the ACS URL the
+    /// IdP asserts it delivered this response to. Bound against the SP's own
+    /// ACS URL on the callback (defense-in-depth against response
+    /// redirection). `None` when the IdP omits it.
+    pub destination: Option<String>,
     /// Issuer (IdP entity ID)
     pub issuer: String,
     /// Status code
@@ -157,6 +177,12 @@ pub struct SamlAssertion {
     pub name_id: String,
     /// NameID format
     pub name_id_format: Option<String>,
+    /// `Recipient` attribute on `<SubjectConfirmationData>` — the ACS URL the
+    /// IdP asserts this assertion was issued for. Bound against the SP's own
+    /// ACS URL on the callback (defense-in-depth against assertion
+    /// redirection / token reuse at another SP endpoint). `None` when the IdP
+    /// omits it.
+    pub recipient: Option<String>,
     /// Session index
     pub session_index: Option<String>,
     /// Not before timestamp
@@ -194,6 +220,16 @@ fn collect_xml_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, Stri
         .collect()
 }
 
+/// Compare two ACS URLs for the SAML `Destination`/`Recipient` binding
+/// checks, treating a single trailing slash as insignificant so that
+/// `https://sp.example.com/acs` and `https://sp.example.com/acs/` are
+/// considered equal. The comparison is otherwise exact (scheme, host, port
+/// and path all matter) — this is a security check, not a display
+/// normalization.
+fn acs_urls_match(expected: &str, asserted: &str) -> bool {
+    expected.trim_end_matches('/') == asserted.trim_end_matches('/')
+}
+
 /// Mutable state used while walking a SAML response XML document.
 struct SamlResponseParser {
     response: SamlResponse,
@@ -210,6 +246,7 @@ impl SamlResponseParser {
             response: SamlResponse {
                 id: String::new(),
                 in_response_to: None,
+                destination: None,
                 issuer: String::new(),
                 status_code: String::new(),
                 status_message: None,
@@ -222,6 +259,7 @@ impl SamlResponseParser {
                 name_id_format: None,
                 session_index: None,
                 not_before: None,
+                recipient: None,
                 not_on_or_after: None,
                 audiences: Vec::new(),
                 attributes: HashMap::new(),
@@ -246,6 +284,7 @@ impl SamlResponseParser {
             "Conditions" => self.handle_conditions_start(e),
             "AuthnStatement" => self.handle_authn_statement(e),
             "Attribute" => self.handle_attribute_start(e),
+            "SubjectConfirmationData" => self.handle_subject_confirmation_data(e),
             _ => {}
         }
     }
@@ -256,6 +295,8 @@ impl SamlResponseParser {
         match name.as_str() {
             "StatusCode" => self.handle_status_code(e),
             "AuthnStatement" => self.handle_authn_statement(e),
+            // `<SubjectConfirmationData>` is very commonly emitted self-closing.
+            "SubjectConfirmationData" => self.handle_subject_confirmation_data(e),
             _ => {}
         }
     }
@@ -308,8 +349,18 @@ impl SamlResponseParser {
             match key.as_str() {
                 "ID" => self.response.id = value,
                 "InResponseTo" => self.response.in_response_to = Some(value),
+                "Destination" => self.response.destination = Some(value),
                 _ => {}
             }
+        }
+    }
+
+    /// `<SubjectConfirmationData>` carries the `Recipient` attribute — the ACS
+    /// URL the IdP asserts this assertion was minted for. Captured here and
+    /// bound against the SP's own ACS URL in `validate_response`.
+    fn handle_subject_confirmation_data(&mut self, e: &quick_xml::events::BytesStart<'_>) {
+        if let Some(recipient) = get_xml_attr(e, "Recipient") {
+            self.assertion.recipient = Some(recipient);
         }
     }
 
@@ -400,6 +451,7 @@ impl SamlService {
         certificate: Option<&str>,
         sp_entity_id: &str,
         acs_url: &str,
+        expected_acs: Option<&str>,
         _name_id_format: &str,
         attribute_mapping: &serde_json::Value,
         sign_requests: bool,
@@ -425,6 +477,7 @@ impl SamlService {
             idp_certificate: certificate.map(String::from),
             sp_entity_id: sp_entity_id.to_string(),
             acs_url: acs_url.to_string(),
+            sp_acs_url: expected_acs.map(String::from),
             username_attr,
             email_attr,
             display_name_attr,
@@ -514,6 +567,33 @@ impl SamlService {
         // Validate response (including XML signature verification)
         self.validate_response(&response, &xml_string)?;
 
+        // Enforce InResponseTo: AK only ever issues SP-initiated AuthnRequests,
+        // each of which persisted its request_id as a single-use SSO session
+        // (see `create_sso_session_with_state`). The response MUST carry a
+        // matching `InResponseTo` and that session MUST still exist and not be
+        // expired. Consuming it here (the DELETE ... RETURNING inside
+        // `validate_sso_session`) makes the request single-use, so a captured
+        // response cannot be replayed and an unsolicited IdP-initiated
+        // assertion (no InResponseTo, or an unknown one) is rejected.
+        let request_id = response.in_response_to.as_deref().ok_or_else(|| {
+            AppError::Authentication(
+                "SAML response is missing InResponseTo; unsolicited (IdP-initiated) \
+                 responses are not accepted"
+                    .to_string(),
+            )
+        })?;
+        crate::services::auth_config_service::AuthConfigService::validate_sso_session(
+            &self.db, request_id,
+        )
+        .await
+        .map_err(|_| {
+            AppError::Authentication(
+                "SAML response InResponseTo does not match a pending authentication request \
+                 (unknown, already used, or expired)"
+                    .to_string(),
+            )
+        })?;
+
         // Extract user info from assertion
         let assertion = response
             .assertion
@@ -578,8 +658,42 @@ impl SamlService {
             )));
         }
 
+        // Bind the IdP-asserted delivery target (`Destination` on the
+        // `<Response>`) to the SP's own ACS URL. Only enforced when the SP
+        // has a trusted ACS URL to compare against (AK_EXTERNAL_URL set) AND
+        // the IdP actually asserted a Destination — permissive IdPs that omit
+        // it, and deployments without a trusted external URL, are unaffected.
+        // This is defense-in-depth against response redirection: an assertion
+        // minted for a different SP endpoint should not be replayed here.
+        if let Some(expected_acs) = &self.config.sp_acs_url {
+            if let Some(destination) = &response.destination {
+                if !acs_urls_match(expected_acs, destination) {
+                    return Err(AppError::Authentication(format!(
+                        "SAML Response Destination does not match this SP's ACS URL: \
+                         expected {expected_acs}, got {destination}"
+                    )));
+                }
+            }
+        }
+
         // Validate assertion if present
         if let Some(assertion) = &response.assertion {
+            // Bind the assertion `Recipient` (`<SubjectConfirmationData>`) to
+            // the SP's own ACS URL, under the same conditions as the
+            // `Destination` check above (trusted ACS present + attribute
+            // asserted). Defense-in-depth against assertion reuse at another
+            // SP endpoint.
+            if let Some(expected_acs) = &self.config.sp_acs_url {
+                if let Some(recipient) = &assertion.recipient {
+                    if !acs_urls_match(expected_acs, recipient) {
+                        return Err(AppError::Authentication(format!(
+                            "SAML assertion Recipient does not match this SP's ACS URL: \
+                             expected {expected_acs}, got {recipient}"
+                        )));
+                    }
+                }
+            }
+
             // Check audience restriction
             if !assertion.audiences.is_empty() {
                 let valid_audience = assertion
@@ -1246,6 +1360,7 @@ mod tests {
             idp_certificate: None,
             sp_entity_id: "artifact-keeper".to_string(),
             acs_url: "http://localhost:8080/auth/saml/acs".to_string(),
+            sp_acs_url: None,
             username_attr: "NameID".to_string(),
             email_attr: "email".to_string(),
             display_name_attr: "displayName".to_string(),
@@ -1438,6 +1553,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Requester".to_string(),
             status_message: Some("Auth failed".to_string()),
@@ -1456,6 +1572,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://evil-idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1474,6 +1591,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1484,6 +1602,7 @@ mod tests {
                 name_id_format: None,
                 session_index: None,
                 not_before: None,
+                recipient: None,
                 not_on_or_after: None,
                 audiences: vec!["wrong-sp-entity-id".to_string()],
                 attributes: HashMap::new(),
@@ -1502,6 +1621,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1512,6 +1632,7 @@ mod tests {
                 name_id_format: None,
                 session_index: None,
                 not_before: None,
+                recipient: None,
                 not_on_or_after: None,
                 audiences: vec![],
                 attributes: HashMap::new(),
@@ -1529,6 +1650,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1539,6 +1661,7 @@ mod tests {
                 name_id_format: None,
                 session_index: None,
                 not_before: None,
+                recipient: None,
                 not_on_or_after: Some("2020-01-01T00:00:00Z".to_string()),
                 audiences: vec!["artifact-keeper".to_string()],
                 attributes: HashMap::new(),
@@ -1557,6 +1680,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1567,6 +1691,7 @@ mod tests {
                 name_id_format: None,
                 session_index: None,
                 not_before: Some("2099-01-01T00:00:00Z".to_string()),
+                recipient: None,
                 not_on_or_after: None,
                 audiences: vec!["artifact-keeper".to_string()],
                 attributes: HashMap::new(),
@@ -1585,6 +1710,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1595,6 +1721,7 @@ mod tests {
                 name_id_format: None,
                 session_index: None,
                 not_before: None,
+                recipient: None,
                 not_on_or_after: None,
                 audiences: vec![
                     "other-sp".to_string(),
@@ -1615,6 +1742,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Responder".to_string(),
             status_message: None,
@@ -1644,6 +1772,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1668,6 +1797,7 @@ mod tests {
         let response = SamlResponse {
             id: "_resp1".to_string(),
             in_response_to: None,
+            destination: None,
             issuer: "https://idp.example.com".to_string(),
             status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
             status_message: None,
@@ -1694,6 +1824,7 @@ mod tests {
             ),
             session_index: Some("session_123".to_string()),
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: {
@@ -1737,6 +1868,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: {
@@ -1769,6 +1901,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: HashMap::new(),
@@ -1788,6 +1921,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: HashMap::new(),
@@ -1808,6 +1942,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: HashMap::new(),
@@ -1827,6 +1962,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: HashMap::new(),
@@ -1853,6 +1989,7 @@ mod tests {
             name_id_format: None,
             session_index: None,
             not_before: None,
+            recipient: None,
             not_on_or_after: None,
             audiences: vec![],
             attributes: attrs,
@@ -2137,6 +2274,7 @@ mod tests {
             Some("-----BEGIN CERTIFICATE-----\nMIIC..."),
             "artifact-keeper",
             "http://localhost:8080/auth/saml/acs",
+            None,
             "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
             &attr_mapping,
             false,
@@ -2167,6 +2305,7 @@ mod tests {
             None,
             "sp",
             "http://localhost/acs",
+            None,
             "unspecified",
             &attr_mapping,
             false,
@@ -2844,6 +2983,7 @@ mod tests {
             idp_certificate: Some("-----BEGIN CERTIFICATE-----\nMIIC8jCCAdqgAwI...".to_string()),
             sp_entity_id: "https://registry.example.com".to_string(),
             acs_url: "https://registry.example.com/api/v1/auth/saml/callback".to_string(),
+            sp_acs_url: None,
             username_attr: "NameID".to_string(),
             email_attr: "email".to_string(),
             display_name_attr: "displayName".to_string(),
@@ -2858,5 +2998,303 @@ mod tests {
         assert!(!debug.contains("BEGIN CERTIFICATE"));
         assert!(!debug.contains("MIIC8jCCAdqgAwI"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    // =======================================================================
+    // #2096: SAML response-binding validation
+    //   - Destination / Recipient extraction + enforcement (defense-in-depth)
+    //   - InResponseTo single-use consumption (replay + unsolicited rejection)
+    // =======================================================================
+
+    fn make_saml_service_with_expected_acs(expected: Option<&str>) -> SamlService {
+        let mut config = make_test_saml_config();
+        config.sp_acs_url = expected.map(String::from);
+        SamlService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            config,
+        )
+    }
+
+    /// An otherwise-valid parsed response (Success status, correct issuer,
+    /// empty audience, no signature required) carrying the given `Destination`
+    /// and assertion `Recipient`, so the binding checks are the only variable
+    /// under test.
+    fn binding_test_response(destination: Option<&str>, recipient: Option<&str>) -> SamlResponse {
+        SamlResponse {
+            id: "_resp".to_string(),
+            in_response_to: None,
+            destination: destination.map(String::from),
+            issuer: "https://idp.example.com".to_string(),
+            status_code: "urn:oasis:names:tc:SAML:2.0:status:Success".to_string(),
+            status_message: None,
+            assertion: Some(SamlAssertion {
+                id: "_a".to_string(),
+                issuer: "https://idp.example.com".to_string(),
+                name_id: "user@example.com".to_string(),
+                name_id_format: None,
+                recipient: recipient.map(String::from),
+                session_index: None,
+                not_before: None,
+                not_on_or_after: None,
+                audiences: Vec::new(),
+                attributes: HashMap::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_acs_urls_match_normalizes_single_trailing_slash() {
+        assert!(acs_urls_match(
+            "https://sp.example.com/acs",
+            "https://sp.example.com/acs/"
+        ));
+        assert!(acs_urls_match(
+            "https://sp.example.com/acs/",
+            "https://sp.example.com/acs"
+        ));
+        assert!(acs_urls_match(
+            "https://sp.example.com/acs",
+            "https://sp.example.com/acs"
+        ));
+        // Different host / path must NOT match — this is a security check.
+        assert!(!acs_urls_match(
+            "https://sp.example.com/acs",
+            "https://evil.example.com/acs"
+        ));
+        assert!(!acs_urls_match(
+            "https://sp.example.com/acs",
+            "https://sp.example.com/other"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_rejects_destination_mismatch() {
+        let service = make_saml_service_with_expected_acs(Some("https://sp.example.com/acs"));
+        let response = binding_test_response(Some("https://evil.example.com/acs"), None);
+        let err = service
+            .validate_response(&response, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Destination"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_rejects_recipient_mismatch() {
+        let service = make_saml_service_with_expected_acs(Some("https://sp.example.com/acs"));
+        let response = binding_test_response(
+            Some("https://sp.example.com/acs"),
+            Some("https://evil.example.com/acs"),
+        );
+        let err = service
+            .validate_response(&response, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Recipient"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_accepts_matching_destination_and_recipient() {
+        let service = make_saml_service_with_expected_acs(Some("https://sp.example.com/acs"));
+        // Trailing slash on one side must not break the match.
+        let response = binding_test_response(
+            Some("https://sp.example.com/acs/"),
+            Some("https://sp.example.com/acs"),
+        );
+        assert!(service.validate_response(&response, "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_permissive_when_binding_attrs_absent() {
+        // sp_acs_url is Some, but the IdP omitted both attributes -> the
+        // conditional check is skipped (permissive IdP support).
+        let service = make_saml_service_with_expected_acs(Some("https://sp.example.com/acs"));
+        let response = binding_test_response(None, None);
+        assert!(service.validate_response(&response, "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_response_skips_binding_when_no_expected_acs() {
+        // sp_acs_url None (AK_EXTERNAL_URL unset) -> back-compat: even hostile
+        // Destination/Recipient values are not enforced (pre-#2096 behaviour).
+        let service = make_saml_service_with_expected_acs(None);
+        let response = binding_test_response(
+            Some("https://evil.example.com/acs"),
+            Some("https://evil.example.com/acs"),
+        );
+        assert!(service.validate_response(&response, "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_parser_extracts_destination_and_recipient() {
+        let service = make_test_saml_service();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_response123"
+                InResponseTo="_request456"
+                Destination="https://sp.example.com/api/v1/auth/sso/saml/x/acs"
+                Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_assertion789" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">john.doe@example.com</saml:NameID>
+            <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                <saml:SubjectConfirmationData Recipient="https://sp.example.com/api/v1/auth/sso/saml/x/acs" NotOnOrAfter="2099-12-31T23:59:59Z"/>
+            </saml:SubjectConfirmation>
+        </saml:Subject>
+    </saml:Assertion>
+</samlp:Response>"#;
+        let response = service.parse_saml_response(xml).unwrap();
+        assert_eq!(
+            response.destination.as_deref(),
+            Some("https://sp.example.com/api/v1/auth/sso/saml/x/acs")
+        );
+        let assertion = response.assertion.expect("assertion present");
+        assert_eq!(
+            assertion.recipient.as_deref(),
+            Some("https://sp.example.com/api/v1/auth/sso/saml/x/acs")
+        );
+    }
+
+    /// Build an otherwise-valid SAML response XML string, optionally carrying
+    /// an `InResponseTo` attribute. Success status, correct issuer + audience,
+    /// no signature (config used in these tests does not require one).
+    fn valid_saml_response_xml(in_response_to: Option<&str>) -> String {
+        let irt_attr = in_response_to
+            .map(|v| format!(r#" InResponseTo="{v}""#))
+            .unwrap_or_default();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_response123"{irt_attr}
+                Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_assertion789" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">john.doe@example.com</saml:NameID>
+        </saml:Subject>
+        <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2099-12-31T23:59:59Z">
+            <saml:AudienceRestriction>
+                <saml:Audience>artifact-keeper</saml:Audience>
+            </saml:AudienceRestriction>
+        </saml:Conditions>
+    </saml:Assertion>
+</samlp:Response>"#
+        )
+    }
+
+    fn make_db_saml_service(pool: PgPool) -> SamlService {
+        // sp_acs_url None so these tests isolate the InResponseTo machinery.
+        let config = make_test_saml_config();
+        SamlService::with_config(pool, config)
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_consumes_matching_in_response_to_and_rejects_replay() {
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let provider_id = Uuid::new_v4();
+        let request_id = format!("_id{}", Uuid::new_v4());
+        crate::services::auth_config_service::AuthConfigService::create_sso_session_with_state(
+            &pool,
+            "saml",
+            provider_id,
+            &request_id,
+        )
+        .await
+        .expect("create sso session with state");
+
+        let service = make_db_saml_service(pool.clone());
+        let b64 = base64_encode(valid_saml_response_xml(Some(&request_id)).as_bytes());
+
+        // First delivery of the response consumes the pending request.
+        let user = service.authenticate(&b64).await.expect("authenticate ok");
+        assert_eq!(user.name_id, "john.doe@example.com");
+
+        // Replaying the exact same response must fail: the session is gone.
+        let replay = service.authenticate(&b64).await;
+        assert!(replay.is_err(), "captured response replay must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_rejects_unknown_in_response_to() {
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let service = make_db_saml_service(pool.clone());
+        // No session was ever created for this request id.
+        let b64 = base64_encode(valid_saml_response_xml(Some("_id-never-issued-0000")).as_bytes());
+        let result = service.authenticate(&b64).await;
+        assert!(
+            result.is_err(),
+            "response with an unknown InResponseTo must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_rejects_absent_in_response_to() {
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let service = make_db_saml_service(pool.clone());
+        // Unsolicited (IdP-initiated) response: no InResponseTo at all.
+        let b64 = base64_encode(valid_saml_response_xml(None).as_bytes());
+        let result = service.authenticate(&b64).await;
+        assert!(
+            result.is_err(),
+            "unsolicited response without InResponseTo must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_sso_session_with_state_round_trips_and_consumes() {
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let provider_id = Uuid::new_v4();
+        let request_id = format!("_id{}", Uuid::new_v4());
+        let session =
+            crate::services::auth_config_service::AuthConfigService::create_sso_session_with_state(
+                &pool,
+                "saml",
+                provider_id,
+                &request_id,
+            )
+            .await
+            .expect("create session with state");
+        assert_eq!(session.state, request_id);
+        assert_eq!(session.provider_id, provider_id);
+
+        // Consume once -> ok.
+        let consumed =
+            crate::services::auth_config_service::AuthConfigService::validate_sso_session(
+                &pool,
+                &request_id,
+            )
+            .await
+            .expect("first consume ok");
+        assert_eq!(consumed.state, request_id);
+
+        // Consume again -> the row is gone (single-use).
+        let again = crate::services::auth_config_service::AuthConfigService::validate_sso_session(
+            &pool,
+            &request_id,
+        )
+        .await;
+        assert!(again.is_err(), "state must be single-use");
     }
 }
