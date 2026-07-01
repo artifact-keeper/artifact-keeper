@@ -128,6 +128,14 @@ fn parse_external_url(raw: &str) -> Option<String> {
 /// Operator-configured external base URL, read once from `AK_EXTERNAL_URL`
 /// and cached for the process lifetime. When set, this overrides whatever
 /// [`request_base_url_from_request`] derives from request metadata.
+///
+/// This is the ONLY *trusted* source of the SP base URL — the value comes
+/// from a process env var set by the operator, never from
+/// attacker-influenceable request headers (`Host`, `X-Forwarded-Host`, etc.).
+/// Use [`trusted_external_url`] from outside this module when the caller
+/// needs a base URL that must not be spoofable — e.g. when embedding it in
+/// signed material like a SAML `AssertionConsumerServiceURL` that the SP
+/// asks the IdP to POST assertions to (see PR #2040 review).
 fn configured_external_url() -> Option<&'static str> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
@@ -136,6 +144,27 @@ fn configured_external_url() -> Option<&'static str> {
             parse_external_url(&raw)
         })
         .as_deref()
+}
+
+/// Public accessor for the *trusted* external base URL — the value of
+/// `AK_EXTERNAL_URL` if the operator set it, otherwise `None`.
+///
+/// Prefer this over [`RequestBaseUrl`] whenever the resulting URL will
+/// feed a security-relevant sink where an attacker-influenceable
+/// request header could cause harm — the two production sinks that
+/// motivated exposing this accessor are:
+///
+/// - the SAML `AssertionConsumerServiceURL` embedded in the outbound
+///   AuthnRequest (a spoofed `Host` header could advertise an attacker
+///   ACS and a permissive IdP would POST the signed assertion there),
+/// - the SAML `Destination`/`Recipient` value the SP recomputes on the
+///   ACS callback to validate the asserted delivery target.
+///
+/// Callers that only need a display URL (e.g. building a link back to
+/// the app in an email) should keep using [`RequestBaseUrl`], which
+/// falls back to request-derived headers when the env var is unset.
+pub fn trusted_external_url() -> Option<&'static str> {
+    configured_external_url()
 }
 
 /// External base URL derived from request metadata.
